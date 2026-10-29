@@ -32,9 +32,10 @@ use crate::config::HeadNodeConfig;
 use crate::ingest::{Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
+use crate::rpc::HeadCalls;
 use crate::runtime::RemoteAgentRuntime;
 
-/// JSON-RPC "method not found", for node requests head does not serve yet.
+/// JSON-RPC "method not found", for node requests head cannot serve.
 const UNSUPPORTED_CODE: i32 = -32601;
 
 /// Timing knobs; tests shorten them.
@@ -207,14 +208,21 @@ impl std::fmt::Debug for RemoteNode {
 
 impl RemoteNode {
     /// Register the node and its lease if needed, then start dialing.
-    pub(crate) async fn start(store: Store, config: HeadNodeConfig) -> Result<Self> {
-        Self::start_with(store, config, Tuning::default()).await
+    /// Forwarded `workspace_api` calls from the node's agents are answered
+    /// with `calls`; without it, every node request is refused.
+    pub(crate) async fn start(
+        store: Store,
+        config: HeadNodeConfig,
+        calls: Option<HeadCalls>,
+    ) -> Result<Self> {
+        Self::start_with(store, config, Tuning::default(), calls).await
     }
 
     pub(crate) async fn start_with(
         store: Store,
         config: HeadNodeConfig,
         tuning: Tuning,
+        calls: Option<HeadCalls>,
     ) -> Result<Self> {
         let lease = HeadLease::open(store, &config).await?;
         #[cfg(test)]
@@ -247,6 +255,7 @@ impl RemoteNode {
             config.endpoint,
             lease,
             Ingest::new(acked),
+            calls,
         ));
         Ok(Self { shared })
     }
@@ -343,7 +352,13 @@ impl RemoteNode {
     }
 }
 
-async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut ingest: Ingest) {
+async fn run(
+    shared: Arc<Shared>,
+    endpoint: NodeEndpoint,
+    lease: HeadLease,
+    mut ingest: Ingest,
+    calls: Option<HeadCalls>,
+) {
     let mut backoff = shared.tuning.backoff.clone();
     let mut shutdown = shared.shutdown.subscribe();
     loop {
@@ -394,7 +409,12 @@ async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut 
         claim(&shared, &welcome, &link).await;
         shared.flush_stops().await;
         let git = serve_git(&shared, &endpoint, &link).await;
-        serve(&shared, &lease, &mut ingest, &link, events, &mut shutdown).await;
+        let served = Served {
+            lease: &lease,
+            link: &link,
+            calls: calls.as_ref(),
+        };
+        serve(&shared, served, &mut ingest, events, &mut shutdown).await;
         if let Some(git) = git {
             git.abort();
         }
@@ -416,13 +436,19 @@ async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut 
     }
 }
 
-/// Ingest one link's journal until it closes, a live gap needs a rebind,
-/// or shutdown.
+/// What one bound link is served with.
+struct Served<'a> {
+    lease: &'a HeadLease,
+    link: &'a NodeLink,
+    calls: Option<&'a HeadCalls>,
+}
+
+/// Ingest one link's journal and answer its requests until it closes, a
+/// live gap needs a rebind, or shutdown.
 async fn serve(
-    shared: &Shared,
-    lease: &HeadLease,
+    shared: &Arc<Shared>,
+    Served { lease, link, calls }: Served<'_>,
     ingest: &mut Ingest,
-    link: &NodeLink,
     mut events: LinkEvents,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -473,7 +499,10 @@ async fn serve(
                     LinkEvent::Frame(frame) => {
                         tracing::debug!(channel = ?frame.channel(), "remote node: ignoring an unexpected frame");
                     }
-                    LinkEvent::Request(request) => answer_unsupported(request),
+                    LinkEvent::Request(request) => match calls {
+                        Some(calls) => calls.answer(shared.clone(), request),
+                        None => answer_unsupported(request),
+                    },
                 }
             }
             () = sleep_until(due), if due.is_some() => {
@@ -631,7 +660,7 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
     }
 }
 
-/// Head serves no node requests yet: answer each with "unsupported".
+/// Without services to answer with, refuse a node request.
 fn answer_unsupported(request: IncomingRequest) {
     // caller-binding: allow — only answers the link request; no service call
     tokio::spawn(async move {

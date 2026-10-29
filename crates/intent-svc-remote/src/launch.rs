@@ -229,13 +229,16 @@ impl RemoteLaunchPort for RemoteLaunch {
                         "node-agent-unplaced: agent {agent_id} has no remote placement"
                     ))
                 })?;
-            let provider = session.provider.unwrap_or_default();
+            let provider = session.provider.clone().unwrap_or_default();
             // Resolved at every start, so the node runs with the profile's
             // current values; an unresolvable profile fails the start.
             let profile_env = svc
                 .resolve_remote_profile_env(&provider)
                 .await?
                 .map(|profile| LaunchProfileEnv(profile.to_node_wire()));
+            let agent_features = serde_json::to_value(svc.session_agent_features(&session))
+                .map_err(|e| Error::Internal(format!("encode the agent's features: {e}")))?;
+            let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
             let checkout = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout)).await?;
             let runtime = node
@@ -247,6 +250,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                     base_commit: view.base_commit,
                     repo_key,
                     profile_env,
+                    agent_features,
+                    is_sub_agent,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

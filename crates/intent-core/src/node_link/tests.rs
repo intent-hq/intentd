@@ -140,6 +140,8 @@ fn every_frame() -> Vec<LinkFrame> {
                 "fingerprint": "f1",
                 "env": [{ "key": "CLAUDE_CONFIG_DIR", "value": "~/.claude-work" }],
             }))),
+            agent_features: serde_json::json!({}),
+            is_sub_agent: false,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -310,6 +312,8 @@ fn launch_profile_env_never_debug_renders_its_values() {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: false,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "codex@work",
             "fingerprint": "f1",
@@ -335,6 +339,8 @@ fn launch_without_a_profile_omits_profile_env() {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: false,
         profile_env: None,
     };
     let wire = serde_json::to_value(&command).unwrap();

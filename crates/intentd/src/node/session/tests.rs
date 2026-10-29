@@ -33,6 +33,7 @@ fn harness() -> Harness {
         checkouts: crate::node::checkout::PlainCheckouts::new(storage),
         journal,
         home: None,
+        mcp_bridge_exe: std::env::current_exe().unwrap(),
     });
     Harness { runner, _dir: dir }
 }
@@ -55,6 +56,8 @@ fn launch(id: &str) -> LinkFrame {
         base_commit: "base".into(),
         repo_key: "repo".into(),
         profile_env: None,
+        agent_features: serde_json::json!({}),
+        is_sub_agent: false,
     })
 }
 

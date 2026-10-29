@@ -2985,6 +2985,32 @@ pub(crate) fn reject_self_targeted_send(
     Ok(())
 }
 
+/// Refuse a message carrying attachments to a remote agent: attachments are
+/// stored on head and its provider runs on the execution node, which cannot
+/// read them yet. Checked before any state change. An empty list is no
+/// attachment.
+pub(crate) fn reject_remote_attachments(
+    session: &AgentSession,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Result<()> {
+    let carries = |blocks: Option<&Value>| match blocks {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    };
+    if (carries(image_blocks) || carries(file_blocks))
+        && intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+    {
+        return Err(Error::InvalidParams(format!(
+            "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
+            intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
 /// entry must carry a non-empty attachment-registry `attachmentId`
 /// reference. Inline file `data` is no longer accepted: an entry carrying
@@ -4049,7 +4075,8 @@ impl Services {
     /// cannot decode). Respawns read this instead of the live settings so a
     /// settings change never alters an existing session's tools/prompt —
     /// matching what `harnessFeatures` reports on the wire.
-    pub(crate) fn session_agent_features(
+    #[must_use]
+    pub fn session_agent_features(
         &self,
         session: &AgentSession,
     ) -> intent_core::settings_file::AgentFeaturesSettings {
@@ -8766,6 +8793,7 @@ impl Services {
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        reject_remote_attachments(&session, image_blocks.as_ref(), file_blocks.as_ref())?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // Image references must name registered attachments
         // (monorepo#3338) — rejected before any state change.

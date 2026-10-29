@@ -29,6 +29,7 @@ use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
 
 use super::checkout::Checkouts;
+use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
 pub(super) mod codes {
@@ -86,6 +87,9 @@ pub(super) struct RunnerConfig {
     /// The node user's home: a leading `~` in a profile's account directory
     /// expands against it.
     pub home: Option<PathBuf>,
+    /// The executable providers run as `mcp-bridge` to reach an agent's
+    /// workspace MCP server.
+    pub mcp_bridge_exe: PathBuf,
 }
 
 /// The node's agents. Cloning shares them.
@@ -100,6 +104,9 @@ struct Inner {
     providers: BTreeMap<String, ProviderLaunch>,
     checkouts: Arc<dyn Checkouts>,
     home: Option<PathBuf>,
+    mcp_bridge_exe: PathBuf,
+    /// The newest bound link; agents forward control-plane calls on it.
+    head: HeadLink,
     journal: Arc<Mutex<Journal>>,
     appended: watch::Sender<NodeCounter>,
     state: Mutex<State>,
@@ -129,6 +136,9 @@ struct Agent {
     /// The commit head launched the agent at, and the checkout cache key.
     base_commit: String,
     repo_key: String,
+    /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
+    /// its workspace API.
+    gates: workspace_api::Gates,
     /// The agent's working directory, once prepared.
     worktree: Mutex<Option<PathBuf>>,
     /// Serializes the agent's WIP pushes.
@@ -395,6 +405,8 @@ impl Runner {
                 providers: config.providers,
                 checkouts: config.checkouts,
                 home: config.home,
+                mcp_bridge_exe: config.mcp_bridge_exe,
+                head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
                 state: Mutex::new(State::default()),
@@ -413,6 +425,12 @@ impl Runner {
         let mut ids: Vec<AgentId> = lock(&self.inner.state).agents.keys().cloned().collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
         ids
+    }
+
+    /// The link agents forward control-plane calls on; the newest session
+    /// sets it when it adopts its lease.
+    pub(super) fn head_link(&self) -> &HeadLink {
+        &self.inner.head
     }
 
     /// The binding of the newest link session; see `session.rs`.
@@ -478,6 +496,8 @@ impl Runner {
             base_commit,
             repo_key,
             profile_env,
+            agent_features,
+            is_sub_agent,
         } = command;
         let exited = |error: String| JournalEntry {
             agent_id: agent_id.clone(),
@@ -540,6 +560,10 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             base_commit,
             repo_key,
+            gates: workspace_api::Gates {
+                agent_features,
+                is_sub_agent,
+            },
             worktree: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
             stop: Mutex::new(Some(stop_tx)),
@@ -664,19 +688,36 @@ impl Runner {
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
             Some(Ok(cwd)) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                self.start(
-                    &agent,
-                    (&launch, profile.as_ref()),
-                    model.as_deref(),
-                    notes,
-                    cwd,
+                match workspace_api::serve(
+                    &agent.id,
+                    &agent.workspace_id,
+                    &cwd,
+                    &agent.gates,
+                    self.inner.head.clone(),
+                    &self.inner.mcp_bridge_exe,
                 )
-                .map_err(|error| Some(format!("{}: {error}", codes::START)))
+                .await
+                {
+                    Err(error) => Err(Some(format!(
+                        "{}: the workspace API server did not start: {error}",
+                        codes::START
+                    ))),
+                    Ok((bridge, mcp)) => self
+                        .start(
+                            &agent,
+                            (&launch, profile.as_ref()),
+                            model.as_deref(),
+                            notes,
+                            cwd,
+                        )
+                        .map(|started| (started, bridge, mcp))
+                        .map_err(|error| Some(format!("{}: {error}", codes::START))),
+                }
             }
         };
         let (exit_code, error) = match started {
             Err(error) => (None, error),
-            Ok((mut child, connection, serve, cwd)) => {
+            Ok(((mut child, connection, serve, cwd), bridge, mcp)) => {
                 // Read before waiting: a reaped child no longer reports it,
                 // and its process group can outlive it.
                 let pid = child.id();
@@ -701,10 +742,12 @@ impl Runner {
                         &mut child,
                         &mut stop,
                         &ready,
-                        &cwd,
+                        (&cwd, mcp),
                         (pid, &agent.descendants),
                     )
                     .await;
+                // The agent's workspace API stops with its provider.
+                drop(bridge);
                 if let Some(tracker) = tracker {
                     tracker.abort();
                 }
@@ -804,12 +847,14 @@ impl Runner {
         child: &mut Child,
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
-        cwd: &std::path::Path,
+        (cwd, mcp): (&std::path::Path, intent_acp::session::McpServer),
         (pid, descendants): (Option<u32>, &Mutex<Vec<i32>>),
     ) -> Outcome {
+        // The agent's workspace MCP server rides `session/new`, which every
+        // ACP agent accepts stdio servers on.
         let setup = async {
             intent_acp::handshake(connection, &launch.config).await?;
-            intent_acp::session::new_session(connection, cwd, Vec::new(), None).await
+            intent_acp::session::new_session(connection, cwd, vec![mcp], None).await
         };
         let session = tokio::select! {
             result = setup => match result {

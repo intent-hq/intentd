@@ -143,6 +143,13 @@ pub struct LaunchCommand {
     /// Names the node's checkout cache for the workspace's repository, so
     /// agents of one repository share fetched history. Opaque to the node.
     pub repo_key: String,
+    /// The session's captured `agentFeatures` snapshot
+    /// (`AgentFeaturesSettings`): the node gates the agent's `workspace_api`
+    /// with it, as a local agent's bridge is gated.
+    pub agent_features: Value,
+    /// Whether the agent is a sub-agent (delegated or background), for the
+    /// same top-level-only gates a local bridge applies.
+    pub is_sub_agent: bool,
     /// The selected provider profile's environment overlay, or absent when
     /// no profile is selected and the node uses its own provider login.
     #[serde(default, skip_serializing_if = "Option::is_none")]

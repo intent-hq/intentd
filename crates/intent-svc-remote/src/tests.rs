@@ -297,7 +297,7 @@ impl Head {
     }
 
     async fn start(&self, config: HeadNodeConfig) -> RemoteNode {
-        RemoteNode::start_with(self.store.clone(), config, tuning())
+        RemoteNode::start_with(self.store.clone(), config, tuning(), None)
             .await
             .unwrap()
     }
@@ -738,7 +738,7 @@ async fn a_node_whose_lease_ended_is_not_bound_again() {
         )
         .await
         .unwrap();
-    let error = RemoteNode::start_with(head.store.clone(), fake.config(), tuning())
+    let error = RemoteNode::start_with(head.store.clone(), fake.config(), tuning(), None)
         .await
         .unwrap_err();
     assert!(
@@ -928,9 +928,14 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
     let head = Head::new().await;
     let mut slow = tuning();
     slow.link_loss_grace = wait();
-    let node = RemoteNode::start_with(head.store.clone(), config_for(address, &certificate), slow)
-        .await
-        .unwrap();
+    let node = RemoteNode::start_with(
+        head.store.clone(),
+        config_for(address, &certificate),
+        slow,
+        None,
+    )
+    .await
+    .unwrap();
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
     let prompt = {
@@ -980,7 +985,7 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
     let head = Head::new().await;
     let flaky = tuning();
     let fail = flaky.fail_ack_writes.clone();
-    let node = RemoteNode::start_with(head.store.clone(), fake.config(), flaky)
+    let node = RemoteNode::start_with(head.store.clone(), fake.config(), flaky, None)
         .await
         .unwrap();
     let agent = AgentId::new();
@@ -1087,7 +1092,8 @@ mod launch {
                 })
                 .await
                 .unwrap();
-            let node = RemoteNode::start_with(store, fake.config(), tuning())
+            let calls = crate::rpc::HeadCalls::new(services.clone());
+            let node = RemoteNode::start_with(store, fake.config(), tuning(), Some(calls))
                 .await
                 .unwrap();
             crate::install_node(&services, node.clone());
@@ -1306,6 +1312,14 @@ mod launch {
         assert_eq!(launch.profile_env, None);
         assert_eq!(launch.base_commit, f.base);
         assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
+        // The node gates the agent's workspace API with its session's
+        // captured features (review of intentd#2786).
+        let session = f.services.store().get_agent_session(&agent).await.unwrap();
+        assert_eq!(
+            launch.agent_features,
+            serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
+        );
+        assert!(!launch.is_sub_agent);
         assert!(runtime.is_alive());
 
         link.journal(JournalRecord {
@@ -1493,9 +1507,10 @@ mod launch {
             welcome_running(vec![claimed.clone(), stray.clone()]),
         )
         .await;
-        let node = RemoteNode::start_with(f.services.store().clone(), fake.config(), tuning())
-            .await
-            .unwrap();
+        let node =
+            RemoteNode::start_with(f.services.store().clone(), fake.config(), tuning(), None)
+                .await
+                .unwrap();
         assert_eq!(node.status().lease_id, config.lease_id);
         crate::install_node(&f.services, node.clone());
         let mut link = fake.accept().await;
@@ -1551,6 +1566,167 @@ mod launch {
         stale.generation = NodeCounter(binding.generation.0 - 1);
         assert!(access.repository(&stale, &remote(&agent)).await.is_err());
         let _ = GitService::UploadPack;
+        f.node.shutdown();
+    }
+
+    /// Forward one `workspace_api` frame for `agent` over the node's link.
+    async fn forward(link: &NodeEnd, agent: &AgentId, method: &str, args: Value) -> LinkOutcome {
+        link.link
+            .call(
+                agent.clone(),
+                intent_core::remote_launch::workspace_api::CALL_METHOD,
+                json!({ "method": method, "args": args }),
+                wait(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn refused(outcome: LinkOutcome) -> intent_core::node_link::LinkRpcError {
+        match outcome {
+            LinkOutcome::Err(error) => error,
+            LinkOutcome::Ok(value) => panic!("expected a refusal, got {value}"),
+        }
+    }
+
+    /// A placed agent's forwarded frame runs on head as that agent, in its
+    /// workspace.
+    #[tokio::test]
+    async fn a_lease_agents_forwarded_call_runs_on_head_as_the_agent() {
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        let created = match forward(
+            &link,
+            &agent,
+            "note.create",
+            json!({ "title": "From the node", "content": "remote body" }),
+        )
+        .await
+        {
+            LinkOutcome::Ok(value) => value,
+            LinkOutcome::Err(error) => panic!("forwarded call failed: {error:?}"),
+        };
+        let notes = f.services.store().list_notes(&workspace()).await.unwrap();
+        let note = notes
+            .iter()
+            .find(|note| note.title == "From the node")
+            .unwrap_or_else(|| panic!("note created on head: {created}"));
+        assert_eq!(created["id"], json!(note.id.as_str()), "{created}");
+        f.node.shutdown();
+    }
+
+    /// Head refuses what the node must not get: an agent not on the lease,
+    /// a frame head does not forward (even if the node sends it), a
+    /// malformed call and an unknown link method.
+    #[tokio::test]
+    async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let unplaced = f.agent(&view).await;
+
+        let other = refused(forward(&link, &unplaced, "note.list", json!({})).await);
+        assert!(other.message.starts_with("node-agent-denied"), "{other:?}");
+        let unknown = refused(forward(&link, &AgentId::new(), "note.list", json!({})).await);
+        assert!(
+            unknown.message.starts_with("node-agent-denied"),
+            "{unknown:?}"
+        );
+
+        for method in ["script.list", "file.read", "hook.list", "workspace.info"] {
+            let error = refused(forward(&link, &agent, method, json!({})).await);
+            assert!(
+                error.message.starts_with("remote-agent-unsupported"),
+                "{method}: {error:?}"
+            );
+        }
+        let malformed = refused(
+            link.link
+                .call(
+                    agent.clone(),
+                    intent_core::remote_launch::workspace_api::CALL_METHOD,
+                    json!({ "args": {} }),
+                    wait(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(malformed.code, -32602, "{malformed:?}");
+        let method = refused(
+            link.link
+                .call(agent.clone(), "note.list", json!({}), wait())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(method.code, -32601, "{method:?}");
+        assert!(f
+            .services
+            .store()
+            .list_notes(&workspace())
+            .await
+            .unwrap()
+            .is_empty());
+        f.node.shutdown();
+    }
+
+    /// A request that arrived on a replaced binding is refused.
+    #[tokio::test]
+    async fn a_forwarded_call_on_a_replaced_binding_is_refused() {
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        let calls = crate::rpc::HeadCalls::new(f.services.clone());
+        let shared = f.node.shared();
+        let current = link.hello.binding.clone();
+        let mut stale = current.clone();
+        stale.generation = NodeCounter(current.generation.0 - 1);
+        let request = intent_core::node_link::LinkRequest {
+            request_id: uuid::Uuid::new_v4(),
+            agent_id: agent.clone(),
+            method: intent_core::remote_launch::workspace_api::CALL_METHOD.into(),
+            params: json!({ "method": "note.list", "args": {} }),
+            timeout_ms: 5_000,
+        };
+        for current in [Some(&current), None] {
+            let error = refused(calls.outcome(&shared, current, &stale, &request).await);
+            assert!(error.message.starts_with("node-link-stale"), "{error:?}");
+        }
+        let fresh = calls
+            .outcome(&shared, Some(&current), &current, &request)
+            .await;
+        assert!(matches!(fresh, LinkOutcome::Ok(_)), "{fresh:?}");
+        f.node.shutdown();
+    }
+
+    /// Review of intentd#2786: the node reads the workspace's auto-commit
+    /// policy before an agent-initiated commit; head answers it only for a
+    /// lease agent, from the workspace's own setting.
+    #[tokio::test]
+    async fn the_commit_policy_is_the_workspaces_and_only_for_lease_agents() {
+        use intent_core::remote_launch::workspace_api::COMMIT_POLICY_METHOD;
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        for enabled in [false, true] {
+            f.services
+                .store()
+                .set_workspace_auto_commit(&workspace(), enabled)
+                .await
+                .unwrap();
+            match forward(&link, &agent, COMMIT_POLICY_METHOD, Value::Null).await {
+                LinkOutcome::Ok(value) => assert_eq!(value, json!({ "autoCommit": enabled })),
+                LinkOutcome::Err(error) => panic!("policy read failed: {error:?}"),
+            }
+        }
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let unplaced = f.agent(&view).await;
+        let denied = refused(forward(&link, &unplaced, COMMIT_POLICY_METHOD, Value::Null).await);
+        assert!(
+            denied.message.starts_with("node-agent-denied"),
+            "{denied:?}"
+        );
         f.node.shutdown();
     }
 }

@@ -19,10 +19,14 @@
 // "exit" answers and then exits with code 0, leaving its `sleep` child
 // running; "spawn-exit" starts another `sleep` in its own process group,
 // writes its pid to `late-helper.pid`, answers and exits at once; every turn
-// first streams one agent_message_chunk "echo: <text>". A `<system>` block
-// in the prompt is ignored.
+// first streams one agent_message_chunk "echo: <text>". A prompt
+// "wsapi <code>" instead runs <code> through the session's workspace MCP
+// server (the `--connect` address of its `workspace-mcp` entry in
+// session/new) and streams "wsapi: <result text>" (or "wsapi-error: ...").
+// A `<system>` block in the prompt is ignored.
 import readline from 'node:readline';
 import fs from 'node:fs';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 
 const argv = process.argv.slice(2);
@@ -39,6 +43,55 @@ fs.writeFileSync('agent.pid', JSON.stringify({ agent: process.pid, child: sleepe
 
 const SESSION = 'node-test-session';
 const parked = [];
+let mcpServers = [];
+
+// One workspace_api call over the bridge's newline-delimited JSON-RPC: by
+// running the entry's stdio command (`intentd mcp-bridge --connect ...`, as a
+// real provider does) when it is intentd, else (unit tests, whose command is
+// the test binary) by connecting to its `--connect` address directly. The
+// stdio path records the command it ran in `mcp-bridge.json`.
+function workspaceApi(code) {
+  const server = mcpServers.find((s) => s.name === 'workspace-mcp');
+  if (!server) return Promise.resolve({ isError: true, content: [{ text: 'no workspace-mcp server' }] });
+  return new Promise((resolve, reject) => {
+    let input;
+    let output;
+    let done;
+    if (/(^|\/)intentd$/.test(server.command)) {
+      const env = { ...process.env };
+      for (const { name, value } of server.env ?? []) env[name] = value;
+      fs.writeFileSync('mcp-bridge.json', JSON.stringify({ command: server.command, args: server.args }));
+      const child = spawn(server.command, server.args, { env, stdio: ['pipe', 'pipe', 'ignore'] });
+      child.on('error', reject);
+      input = child.stdin;
+      output = child.stdout;
+      done = () => child.kill();
+    } else {
+      const [host, port] = server.args[server.args.indexOf('--connect') + 1].split(':');
+      const socket = net.connect(Number(port), host);
+      socket.on('error', reject);
+      input = socket;
+      output = socket;
+      done = () => socket.end();
+    }
+    let buffered = '';
+    output.on('data', (data) => {
+      buffered += data;
+      let newline;
+      while ((newline = buffered.indexOf('\n')) >= 0) {
+        const reply = JSON.parse(buffered.slice(0, newline));
+        buffered = buffered.slice(newline + 1);
+        if (reply.id === 2) {
+          done();
+          resolve(reply.result ?? { isError: true, content: [{ text: JSON.stringify(reply.error) }] });
+        }
+      }
+    });
+    const frame = (message) => input.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+    frame({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'node-test-agent', version: '0' } } });
+    frame({ id: 2, method: 'tools/call', params: { name: 'workspace_api', arguments: { code, summary: 'node test' } } });
+  });
+}
 
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
@@ -74,6 +127,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: {} });
     case 'session/new':
       if (hangSetup) return;
+      mcpServers = msg.params?.mcpServers ?? [];
       if (failSetupVar) {
         const value = process.env[failSetupVar];
         return send({
@@ -84,6 +138,24 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
+      if (text.startsWith('wsapi ')) {
+        let line;
+        try {
+          const result = await workspaceApi(text.slice('wsapi '.length));
+          const body = (result.content?.[0]?.text ?? '').replace(/\s+/g, ' ');
+          line = `${result.isError ? 'wsapi-error' : 'wsapi'}: ${body}`;
+        } catch (error) {
+          line = `wsapi-error: ${error}`;
+        }
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: line } },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       send({
         method: 'session/update',
         params: {

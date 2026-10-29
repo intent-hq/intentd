@@ -60,6 +60,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         )]),
         checkouts: checkouts.clone(),
         journal,
+        mcp_bridge_exe: std::env::current_exe().unwrap(),
         home: Some(dir.path().join("home")),
     });
     let home = dir.path().join("home");
@@ -80,7 +81,9 @@ fn launch(id: &str) -> LaunchCommand {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        agent_features: serde_json::json!({}),
         profile_env: None,
+        is_sub_agent: false,
     }
 }
 
@@ -638,6 +641,62 @@ async fn node_runner_reports_a_failed_checkout_as_the_agents_exit() {
     assert!(!all.iter().any(started("a1")), "{all:#?}");
     assert!(h.runner.running().is_empty());
     assert!(h.checkouts.pushes.lock().unwrap().is_empty());
+}
+
+/// The text of the turn's `wsapi` line (the fixture's `workspace_api` result).
+fn wsapi_line(all: &[JournalRecord], turn: &str) -> String {
+    all.iter()
+        .filter(|r| r.turn_id.as_deref() == Some(turn))
+        .find_map(|r| match &r.body {
+            JournalBody::Notification { notification } => notification["update"]["content"]["text"]
+                .as_str()
+                .filter(|text| text.starts_with("wsapi"))
+                .map(str::to_owned),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no wsapi output in turn {turn}: {all:#?}"))
+}
+
+/// A launched agent's provider gets the workspace MCP server in
+/// `session/new`: its file calls land in its own working directory on the
+/// node, and a namespace the node cannot serve fails by name.
+#[tokio::test]
+async fn node_runner_gives_each_agent_its_workspace_api_on_the_node() {
+    let Some(h) = harness(1, &[]) else { return };
+    let id = AgentId::from("w1");
+    h.runner.launch(launch("w1")).await;
+    h.runner
+        .prompt(
+            &id,
+            "t1".into(),
+            text(r#"wsapi return JSON.stringify(await ws.file.write("made.txt", "on the node"));"#),
+        )
+        .await;
+    let all = wait_for(&h.runner, "first turn end", turn_ended("w1", "t1")).await;
+    let line = wsapi_line(&all, "t1");
+    assert!(line.starts_with("wsapi: "), "{line}");
+    let dir = h.storage.agent_dir(&id).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("made.txt")).unwrap(),
+        "on the node"
+    );
+
+    h.runner
+        .prompt(
+            &id,
+            "t2".into(),
+            text("wsapi return await ws.script.list();"),
+        )
+        .await;
+    let all = wait_for(&h.runner, "second turn end", turn_ended("w1", "t2")).await;
+    let line = wsapi_line(&all, "t2");
+    assert!(line.starts_with("wsapi-error: "), "{line}");
+    assert!(
+        line.contains("is not supported on remote agents yet"),
+        "{line}"
+    );
+    h.runner.stop(&id);
+    wait_for(&h.runner, "exit", exited("w1")).await;
 }
 
 const CANARY: &str = "canary-profile-secret-5b1e";
