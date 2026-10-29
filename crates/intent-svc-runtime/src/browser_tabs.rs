@@ -343,7 +343,9 @@ impl BrowserTabRoutingExt for Services {
     /// Guards, each failing closed:
     /// - **Liveness.** A superseded id with a live hello'd connection keeps
     ///   its tabs — it is still an active host. Liveness is read while holding
-    ///   the tab gate; without a reverse registry it is unknown, so nothing
+    ///   the tab gate, both before the move and again after it commits (rows
+    ///   of an old host that came online in between go back before anything
+    ///   is published); without a reverse registry it is unknown, so nothing
     ///   moves.
     /// - **Workspace access.** A collaborator caller moves a host only when it
     ///   may manage the browser in every workspace that host has open tabs in
@@ -388,14 +390,6 @@ impl BrowserTabRoutingExt for Services {
             return Ok(0);
         }
         let _gate = self.feature_browser_tab_gate().lock().await;
-        // Liveness is read under the gate every host report takes, so an old
-        // host that reconnected while this request waited keeps its tabs.
-        let live: HashSet<ClientId> = dispatch
-            .live_clients()
-            .into_iter()
-            .map(|c| c.client_id)
-            .collect();
-        candidates.retain(|id| !live.contains(id));
         if intent_services::feature_api::event_ops::is_collaborator_caller() {
             let mut allowed = Vec::with_capacity(candidates.len());
             'host: for host in candidates {
@@ -412,13 +406,50 @@ impl BrowserTabRoutingExt for Services {
             }
             candidates = allowed;
         }
+        // Liveness is read under the gate every host report takes, so an old
+        // host that reconnected while this request waited keeps its tabs.
+        let live_now = || -> HashSet<ClientId> {
+            dispatch
+                .live_clients()
+                .into_iter()
+                .map(|c| c.client_id)
+                .collect()
+        };
+        let live = live_now();
+        candidates.retain(|id| !live.contains(id));
         if candidates.is_empty() {
             return Ok(0);
         }
-        let moved = self
+        let mut origin: HashMap<String, ClientId> = HashMap::new();
+        for host in &candidates {
+            for tab in self.store().list_browser_tabs_by_host(host).await? {
+                origin.insert(tab.tab_id, host.clone());
+            }
+        }
+        let mut moved = self
             .store()
             .reassign_browser_tabs_from_hosts(client_id, &candidates)
             .await?;
+        // Binding a connection does not take the gate, so an old host can come
+        // online between the snapshot above and the commit. Re-read liveness
+        // before anything is published and hand such a host its rows back;
+        // its own reports are still queued behind the gate, so it never sees
+        // the moved state. A bind after this point is ordered after the rehome.
+        let live = live_now();
+        if candidates.iter().any(|id| live.contains(id)) {
+            let mut kept = Vec::with_capacity(moved.len());
+            for (tab, changes) in moved {
+                match origin.get(&tab.tab_id).filter(|old| live.contains(*old)) {
+                    Some(old) => {
+                        self.store()
+                            .reassign_browser_tab_host(&tab.tab_id, old, None)
+                            .await?;
+                    }
+                    None => kept.push((tab, changes)),
+                }
+            }
+            moved = kept;
+        }
         let mut claimed_workspaces: Vec<&WorkspaceId> = moved
             .iter()
             .filter(|(tab, _)| tab.owner_agent_id.is_some())

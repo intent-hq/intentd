@@ -565,18 +565,25 @@ async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
     );
 }
 
-/// A reverse registry whose live set the test flips at will.
+/// A reverse registry whose live set the test flips at will; `bind_on_read`
+/// joins the live set right after the first `live_clients` read, as a host
+/// binding between a rehome's liveness snapshot and its commit would.
 #[derive(Default)]
-struct LiveSet(std::sync::Mutex<Vec<ClientId>>);
+struct LiveSet(
+    std::sync::Mutex<Vec<ClientId>>,
+    std::sync::Mutex<Option<ClientId>>,
+);
 
 impl intent_core::AgentReverseDispatch for LiveSet {
     fn is_connected(&self) -> bool {
         !self.0.lock().unwrap().is_empty()
     }
     fn live_clients(&self) -> Vec<intent_core::ReverseLiveClient> {
-        self.0
-            .lock()
-            .unwrap()
+        let snapshot = self.0.lock().unwrap().clone();
+        if let Some(late) = self.1.lock().unwrap().take() {
+            self.0.lock().unwrap().push(late);
+        }
+        snapshot
             .iter()
             .map(|id| intent_core::ReverseLiveClient {
                 principal_id: None,
@@ -776,5 +783,58 @@ async fn collaborator_rehome_skips_hosts_with_tabs_in_unmanaged_workspaces() {
             .host_client_id
             .as_str(),
         "p-mem:dev"
+    );
+}
+
+/// An old host that binds after the rehome's liveness snapshot but before
+/// anything is published gets its rows back and no event goes out.
+#[tokio::test]
+async fn hello_rehome_hands_rows_back_to_an_old_host_that_binds_mid_rehome() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, store, services, live, ws) = rehome_fixture(&["dev-1", "x:dev-1"]).await;
+    let bus = EventBus::new(store.clone());
+    let services = services.with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec!["browser:*".to_string()],
+        ..Default::default()
+    });
+    let mut seeded = input(&ws, "bound-late");
+    seeded.displayed = Some(true);
+    services
+        .browser_tab_upsert(ClientId::from_string("dev-1"), seeded)
+        .await
+        .expect("seed");
+    let opened = recv_one(&mut sub).await;
+    assert_eq!(opened[0].event_type, BROWSER_TAB_OPENED);
+
+    *live.1.lock().unwrap() = Some(ClientId::from_string("dev-1"));
+    let moved = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:dev-1"),
+            vec![ClientId::from_string("dev-1")],
+        )
+        .await
+        .expect("rehome");
+    assert_eq!(moved, 0, "the late-bound old host keeps its tabs");
+    assert_eq!(
+        store
+            .get_browser_tab("bound-late")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "dev-1"
+    );
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
+        "no rehome event"
     );
 }
