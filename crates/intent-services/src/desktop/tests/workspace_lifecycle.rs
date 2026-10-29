@@ -194,16 +194,31 @@ async fn watchdog_ends_control_once_the_workspace_is_archived_or_retired() {
                 .await
                 .unwrap());
         }
-        // One 5s watchdog tick, scaled for loaded hosts. Wait for the native
-        // end call, the last teardown step: control reads Inactive as soon as
-        // the watchdog drops it, before the terminal record, ended event and
-        // native call land, so polling the state races `assert_ended`.
+        // One 5s watchdog tick, scaled for loaded hosts. Control reads Inactive
+        // as soon as the watchdog drops it, before the terminal record and the
+        // native end call land, so wait for both (in any order) rather than
+        // the state; `assert_ended` then checks settled teardown. The ended
+        // event is awaited there.
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(7));
-        while end_calls(&h, &session_id) == 0 {
+        loop {
+            let calls = end_calls(&h, &session_id);
+            let reason = h
+                .services
+                .store
+                .desktop_terminal(&session_id)
+                .await
+                .unwrap()
+                .map(|record| record["reason"].clone());
+            if calls > 0 && reason.as_ref().is_some_and(|r| !r.is_null()) {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "watchdog never sent the native end call (retired={retired})"
+                "watchdog teardown incomplete (retired={retired}): \
+                 endControl calls={calls}, terminal reason={reason:?}, \
+                 state={:?}",
+                h.services.desktop.state(&h.agent)
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
