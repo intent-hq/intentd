@@ -320,3 +320,32 @@ async fn auto_archive_skips_a_workspace_with_unpushed_commits() {
     assert_eq!(report.archived, 1, "{report:?}");
     assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
 }
+
+/// Activity that lands while the sweep runs its git scan wins: the final
+/// step re-reads the row and leaves a workspace that is no longer idle
+/// Active, then archives it once it is idle again.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_rechecks_the_idle_clock_after_the_git_scan() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let cutoff = days_from_now(1);
+
+    let during_scan = days_from_now(2)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    f.store
+        .bump_workspace_last_activity(&ws.id, &during_scan)
+        .await
+        .expect("bump activity");
+    assert_eq!(
+        f.svc.archive_if_still_idle(&ws.id, cutoff).await,
+        crate::auto_archive::IdleArchive::NoLongerDue
+    );
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
+
+    assert_eq!(
+        f.svc.archive_if_still_idle(&ws.id, days_from_now(3)).await,
+        crate::auto_archive::IdleArchive::Archived
+    );
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
+}

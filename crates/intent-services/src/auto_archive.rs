@@ -18,7 +18,9 @@
 
 use std::time::Duration;
 
-use intent_core::{Workspace, WorkspaceActivity, WorkspaceListFilter, WorkspaceStatus};
+use intent_core::{
+    Workspace, WorkspaceActivity, WorkspaceId, WorkspaceListFilter, WorkspaceStatus,
+};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -42,6 +44,16 @@ pub struct AutoArchiveReport {
     /// Workspaces whose archive attempt failed (logged as a warning;
     /// retried next sweep).
     pub failed: usize,
+}
+
+/// How [`Services::archive_if_still_idle`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleArchive {
+    Archived,
+    /// Activity, an archive or a delete since the sweep listed it.
+    NoLongerDue,
+    AgentRunning,
+    Failed,
 }
 
 /// The newest parseable idle-clock timestamp of `ws`: `lastContentActivity`,
@@ -116,8 +128,9 @@ impl Services {
                 report.skipped += 1;
                 continue;
             }
-            // The listed row may be stale: re-read right before archiving so
-            // a message or a manual archive since the listing wins.
+            // The listed row may be stale: re-read so a message or a manual
+            // archive since the listing wins, and evaluate the folder of the
+            // fresh row.
             let fresh = match self.store.get_workspace(&ws.id).await {
                 Ok(fresh) if auto_archive_due(&fresh, cutoff) => fresh,
                 Ok(_) => continue,
@@ -127,8 +140,7 @@ impl Services {
                     continue;
                 }
             };
-            // The only check that runs git: after the cheap checks and the
-            // re-read, as close to the archive as possible.
+            // The only check that runs git, after the cheap ones.
             if let Some(reason) = self
                 .blocked_by_local_work(&fresh, crate::local_work::LocalWorkRule::Archive)
                 .await
@@ -137,12 +149,8 @@ impl Services {
                 report.skipped += 1;
                 continue;
             }
-            if self.workspace_activity(&ws.id) == WorkspaceActivity::AgentRunning {
-                report.skipped += 1;
-                continue;
-            }
-            match intent_core::WorkspaceApi::archive_workspace(self, ws.id.clone(), None).await {
-                Ok(_) => {
+            match self.archive_if_still_idle(&ws.id, cutoff).await {
+                IdleArchive::Archived => {
                     report.archived += 1;
                     tracing::info!(
                         workspace = %ws.id,
@@ -150,13 +158,41 @@ impl Services {
                         "auto-archive: archived idle workspace"
                     );
                 }
-                Err(e) => {
-                    report.failed += 1;
-                    tracing::warn!(workspace = %ws.id, error = %e, "auto-archive: archive failed");
-                }
+                IdleArchive::NoLongerDue => {}
+                IdleArchive::AgentRunning => report.skipped += 1,
+                IdleArchive::Failed => report.failed += 1,
             }
         }
         report
+    }
+
+    /// The last step of a sweep, after the git scan (which can take a
+    /// while): re-read `id` and archive it only if it is still idle past
+    /// `cutoff` with no agent turn running, so activity that arrived during
+    /// the scan (a message, a note edit) wins.
+    pub(crate) async fn archive_if_still_idle(
+        &self,
+        id: &WorkspaceId,
+        cutoff: OffsetDateTime,
+    ) -> IdleArchive {
+        match self.store.get_workspace(id).await {
+            Ok(fresh) if auto_archive_due(&fresh, cutoff) => {}
+            Ok(_) => return IdleArchive::NoLongerDue,
+            Err(e) => {
+                tracing::warn!(workspace = %id, error = %e, "auto-archive: re-read failed");
+                return IdleArchive::Failed;
+            }
+        }
+        if self.workspace_activity(id) == WorkspaceActivity::AgentRunning {
+            return IdleArchive::AgentRunning;
+        }
+        match intent_core::WorkspaceApi::archive_workspace(self, id.clone(), None).await {
+            Ok(_) => IdleArchive::Archived,
+            Err(e) => {
+                tracing::warn!(workspace = %id, error = %e, "auto-archive: archive failed");
+                IdleArchive::Failed
+            }
+        }
     }
 
     /// Why an idle workspace must not be archived automatically right now;
