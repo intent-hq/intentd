@@ -173,7 +173,7 @@ async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }
 
-/// The machine-level CoW probe resolves the workspaces root through the
+/// The machine-level `CoW` probe resolves the workspaces root through the
 /// non-panicking `try_default_workspaces_root`; with no injected root it must
 /// not create `~/intent/workspaces` in the real home (caught by the CI
 /// backstop: `created workspaces` under the runner's home).
