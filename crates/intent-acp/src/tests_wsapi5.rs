@@ -1731,12 +1731,18 @@ async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest(
 
     let refused = call(&srv, "return await ws.script.list();").await;
     assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
-    assert!(text(&refused).contains("refused by the router"), "{refused}");
+    assert!(
+        text(&refused).contains("refused by the router"),
+        "{refused}"
+    );
     assert_eq!(*api.script_list_calls.lock().unwrap(), 0);
 
     let local = call(&srv, r#"return await ws.file.read("a.txt");"#).await;
     assert_eq!(local["result"]["isError"], json!(false), "{local}");
-    assert_eq!(*api.file_read_calls.lock().unwrap(), vec!["a.txt".to_owned()]);
+    assert_eq!(
+        *api.file_read_calls.lock().unwrap(),
+        vec!["a.txt".to_owned()]
+    );
 
     let seen: Vec<String> = router
         .seen

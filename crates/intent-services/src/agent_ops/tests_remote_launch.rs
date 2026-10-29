@@ -430,7 +430,10 @@ async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
             "{result:?}"
         );
     }
-    assert_eq!(svc.store.get_agent_messages(&id, None).await.unwrap().len(), before);
+    assert_eq!(
+        svc.store.get_agent_messages(&id, None).await.unwrap().len(),
+        before
+    );
     svc.agent_send_message_op(id.clone(), "look".into(), None, Some(json!([])), None, None)
         .await
         .unwrap();

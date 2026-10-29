@@ -13,7 +13,8 @@
 pub const CALL_METHOD: &str = "workspace.call";
 
 /// Namespaces forwarded to head.
-pub const FORWARDED_NAMESPACES: &[&str] = &["note", "task", "agent", "pr", "mr", "comment", "event"];
+pub const FORWARDED_NAMESPACES: &[&str] =
+    &["note", "task", "agent", "pr", "mr", "comment", "event"];
 
 /// Methods that run on the node, against the agent's checkout.
 pub const LOCAL_METHODS: &[&str] = &[
@@ -48,7 +49,9 @@ pub fn route(method: &str) -> Route {
         return Route::Local;
     }
     match method.split_once('.') {
-        Some((namespace, rest)) if !rest.is_empty() && FORWARDED_NAMESPACES.contains(&namespace) => {
+        Some((namespace, rest))
+            if !rest.is_empty() && FORWARDED_NAMESPACES.contains(&namespace) =>
+        {
             Route::Forward
         }
         _ => Route::Unsupported,
@@ -58,7 +61,9 @@ pub fn route(method: &str) -> Route {
 /// The error a refused frame fails with.
 #[must_use]
 pub fn unsupported_message(method: &str) -> String {
-    let namespace = method.split_once('.').map_or(method, |(namespace, _)| namespace);
+    let namespace = method
+        .split_once('.')
+        .map_or(method, |(namespace, _)| namespace);
     let what = if method == "file.getAttachment" {
         "attachments are".to_owned()
     } else {
@@ -130,7 +135,12 @@ mod tests {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
         let message = unsupported_message("script.list");
-        assert!(message.starts_with("remote-agent-unsupported: `script.list` is not supported on remote agents yet"), "{message}");
+        assert!(
+            message.starts_with(
+                "remote-agent-unsupported: `script.list` is not supported on remote agents yet"
+            ),
+            "{message}"
+        );
         assert!(message.contains("ws.script.*"), "{message}");
         assert!(unsupported_message("file.getAttachment").contains("attachments are"));
     }
