@@ -379,30 +379,34 @@ impl SecretVault {
 /// wins, and replaced text is never scanned again, so a value containing
 /// another is hidden whole. Empty values are ignored.
 pub(crate) fn redact(text: &str, secrets: &[(String, Zeroizing<String>)]) -> String {
-    let mut ordered: Vec<(&str, &str)> = secrets
+    let (names, values): (Vec<&str>, Vec<&str>) = secrets
         .iter()
         .filter(|(_, value)| !value.is_empty())
         .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    if ordered.is_empty() {
+        .unzip();
+    if values.is_empty() {
         return text.to_string();
     }
-    ordered.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
+    // Leftmost-longest, non-overlapping: at each position the longest value
+    // wins and replaced text is never rescanned — one linear pass.
+    let Ok(matcher) = aho_corasick::AhoCorasick::builder()
+        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+        .build(&values)
+    else {
+        // Unreachable for these bounded inputs; fail closed rather than
+        // return unredacted output.
+        return "[secret output withheld: redaction unavailable]".to_string();
+    };
     let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < text.len() {
-        let rest = &text[index..];
-        if let Some((name, value)) = ordered.iter().find(|(_, value)| rest.starts_with(value)) {
-            out.push_str("[secret:");
-            out.push_str(name);
-            out.push(']');
-            index += value.len();
-        } else {
-            let ch = rest.chars().next().expect("index is a char boundary");
-            out.push(ch);
-            index += ch.len_utf8();
-        }
+    let mut last = 0;
+    for found in matcher.find_iter(text) {
+        out.push_str(&text[last..found.start()]);
+        out.push_str("[secret:");
+        out.push_str(names[found.pattern().as_usize()]);
+        out.push(']');
+        last = found.end();
     }
+    out.push_str(&text[last..]);
     out
 }
 
@@ -514,6 +518,17 @@ impl Services {
                     "this agent already has {MAX_PENDING_PER_AGENT} unanswered secret requests; end your turn and wait for the user to answer them"
                 ))
             })?;
+        // A delete or retire that cleared the vault between the session read
+        // above and the insert would orphan this request: re-check and drop
+        // it so nothing outlives the agent.
+        let alive = matches!(
+            self.store.get_agent_session_summary(&agent_id).await,
+            Ok(session) if session.retired_at.is_none()
+        );
+        if !alive {
+            self.secret_vault.clear_agent(&agent_id);
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
         Ok(json!({
             "requestId": ticket.request_id,
             "agentId": agent_id.0,
@@ -615,8 +630,10 @@ impl Services {
 
     /// `ws.host.exec` from an agent or its hook: resolve `secretEnv` from the
     /// caller's own secrets, overlay them last on `env`, run, and redact the
-    /// resolved values from `stdout` / `stderr`. Without `secretEnv` this is
-    /// the plain workspace `host.exec`.
+    /// resolved values from `stdout` / `stderr`. Without `secretEnv` (or with
+    /// `secretEnv: null`) this is the plain workspace `host.exec`. Wiping is
+    /// best-effort: the transient copies handed to the child's environment
+    /// are ordinary strings, freed when the call returns.
     pub(crate) async fn agent_host_exec_op(
         &self,
         workspace_id: WorkspaceId,
@@ -632,8 +649,11 @@ impl Services {
                 ))
             }
         };
-        let Some(spec) = map.remove("secretEnv") else {
-            return WorkspaceApi::host_exec(self, workspace_id, Value::Object(map)).await;
+        let spec = match map.remove("secretEnv") {
+            None | Some(Value::Null) => {
+                return WorkspaceApi::host_exec(self, workspace_id, Value::Object(map)).await
+            }
+            Some(spec) => spec,
         };
         let pairs = parse_secret_env(&spec)?;
         let names: Vec<&str> = pairs.iter().map(|(_, name)| name.as_str()).collect();
@@ -878,6 +898,11 @@ mod tests {
             "héllo [secret:W]rld"
         );
         assert_eq!(redact("abc", &[("E".to_string(), secret(""))]), "abc");
+        assert_eq!(
+            redact("aaaa", &[("A".to_string(), secret("aa"))]),
+            "[secret:A][secret:A]"
+        );
+        assert_eq!(redact("", &secrets), "");
     }
 
     #[test]

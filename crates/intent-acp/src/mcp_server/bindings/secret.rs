@@ -118,7 +118,11 @@ async fn request(
         .ok_or_else(|| "secret request returned no requestId".to_string())?
         .to_string();
     let created = ticket.get("created").and_then(Value::as_bool) == Some(true);
-    if created {
+    // Queue the card on a reused request too: the earlier card may have been
+    // dropped (turn-attachment TTL, a cancelled turn), and without a card the
+    // pending request could never be answered. Clients key cards by
+    // `requestId`, so a repeat shows the same request again.
+    {
         let payload = json!({
             "requestId": request_id,
             "agentId": caller.0,
@@ -145,7 +149,7 @@ async fn request(
         "message": if created {
             "Secret request queued: the user sees a masked input card when this turn ends. End your turn now. You will get a message when the user provides or declines it; never ask for the value in chat."
         } else {
-            "A request for this secret is already waiting for the user; no new card was added. End your turn and wait for the user's answer."
+            "A request for this secret was already waiting for the user; its card is shown again when this turn ends. End your turn and wait for the user's answer."
         },
     }))
 }
@@ -214,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reused_request_adds_no_second_card() {
+    async fn reused_request_shows_its_card_again() {
         let registry = Arc::new(TurnAttachmentRegistry::new());
         let out = dispatch(
             &api(),
@@ -227,7 +231,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["requestId"], json!("sec-1"));
-        assert!(registry.finish_turn(&agent()).is_empty());
+        let cards = registry.finish_turn(&agent());
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].uri, "intent-secret-request://sec-1");
     }
 
     #[tokio::test]

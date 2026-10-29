@@ -2615,8 +2615,8 @@ async fn dispatch(
             Ok(result)
         }
         // Secret requests (PROTOCOL §5.56). `secret.provide` carries a secret
-        // value: it is moved straight into the service call and never logged,
-        // echoed or copied into an error.
+        // value: it is handed to the service call and never logged, echoed or
+        // copied into an error (the request params own the original string).
         "secret.provide" => {
             let ws = require_ws_note(params)?;
             let request_id = require_str_param(params, "requestId")?;

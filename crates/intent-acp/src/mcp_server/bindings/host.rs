@@ -47,7 +47,7 @@ async fn exec(
     secrets: bool,
     args: &Value,
 ) -> Result<Value, String> {
-    if args.get("secretEnv").is_some() {
+    if args.get("secretEnv").is_some_and(|spec| !spec.is_null()) {
         let Some(caller) = caller.filter(|_| secrets) else {
             return Err(format!(
                 "host: secretEnv is unavailable — {}",
