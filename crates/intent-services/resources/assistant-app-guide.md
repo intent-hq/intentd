@@ -775,6 +775,8 @@ workspace's agent browser tabs and tunnels. When that client is offline, the men
 button shows a red dot and **Primary client** reads **Offline**, even if the
 workspace has no browser tabs yet: agent browser tabs and tunnels fail until that
 client reconnects or another connected, browser-capable client is set as primary.
+It also reads **Offline** when no primary is set but the workspace's agent browser
+tabs are on a client that is not connected; choosing **This app** moves them.
 
 To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Primary client** → **This app**, and confirm **Set as

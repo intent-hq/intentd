@@ -4971,15 +4971,17 @@ impl Services {
     /// right now ([`Self::driving_client_target`]: pin → client of an active
     /// desktop session → host of the workspace's claimed tabs →
     /// first-connected eligible client), `null`
-    /// when that client is offline or no eligible client is connected. Chief
-    /// has no row and always reports the default.
+    /// when that client is offline or no eligible client is connected — and,
+    /// for an unpinned workspace the desktop-session or claimed-tab rule
+    /// routed, `target: { clientId, via }` naming that client even while it
+    /// is offline. Chief has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
         let pinned = if id.is_chief() {
             None
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.driving_client_target(id).await?;
+        let (target, via) = self.driving_client_route(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -4998,6 +5000,13 @@ impl Services {
             }
         }
         out.insert("resolved".into(), resolved);
+        if let (intent_core::ReverseTarget::Client(client_id), "desktop" | "tabs") = (&target, via)
+        {
+            out.insert(
+                "target".into(),
+                serde_json::json!({ "clientId": client_id.as_str(), "via": via }),
+            );
+        }
         Ok(serde_json::Value::Object(out))
     }
 
