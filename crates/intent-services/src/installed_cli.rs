@@ -36,10 +36,47 @@ fn private_hash(value: &impl Hash) -> u64 {
     HASHER.get_or_init(RandomState::new).hash_one(value)
 }
 
+/// An installed-CLI discovery failure that remembers whether the CLI itself
+/// is missing, so the model catalog can label it `warningKind:
+/// "cli-missing"` (PROTOCOL §5.30) without matching the message text.
+#[derive(Debug, Clone)]
+pub struct DiscoveryError {
+    /// The human-readable reason, unchanged from the untyped path.
+    pub message: String,
+    /// `true` when no canonical executable was found on the host.
+    pub cli_missing: bool,
+}
+
+impl DiscoveryError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            cli_missing: false,
+        }
+    }
+}
+
+impl From<DiscoveryError> for String {
+    fn from(err: DiscoveryError) -> Self {
+        err.message
+    }
+}
+
 impl InstalledContext {
     pub fn resolve(cli: InstalledCli) -> Result<Self, String> {
-        let runtime = cli.resolve().map_err(|e| e.to_string())?;
-        Self::with_runtime(runtime)
+        Self::classify(cli.resolve()).map_err(String::from)
+    }
+
+    /// Build a context from a CLI lookup, keeping a missing CLI distinct
+    /// from every later failure.
+    pub(crate) fn classify(
+        found: Result<InstalledCliRuntime, intent_providers::installed_cli::MissingInstalledCli>,
+    ) -> Result<Self, DiscoveryError> {
+        let runtime = found.map_err(|missing| DiscoveryError {
+            message: missing.to_string(),
+            cli_missing: true,
+        })?;
+        Self::with_runtime(runtime).map_err(DiscoveryError::other)
     }
 
     fn with_runtime(runtime: InstalledCliRuntime) -> Result<Self, String> {
@@ -146,9 +183,21 @@ impl InstalledContext {
         cli: InstalledCli,
         profile: Option<Arc<ProfileEnv>>,
     ) -> Result<Self, String> {
-        tokio::task::spawn_blocking(move || Self::resolve(cli).map(|c| c.with_profile(profile)))
+        Self::discover_classified(cli, profile)
             .await
-            .map_err(|_| "installed CLI discovery failed".to_owned())?
+            .map_err(String::from)
+    }
+
+    /// [`Self::discover_for`] keeping whether the CLI itself is missing.
+    pub(crate) async fn discover_classified(
+        cli: InstalledCli,
+        profile: Option<Arc<ProfileEnv>>,
+    ) -> Result<Self, DiscoveryError> {
+        tokio::task::spawn_blocking(move || {
+            Self::classify(cli.resolve()).map(|c| c.with_profile(profile))
+        })
+        .await
+        .map_err(|_| DiscoveryError::other("installed CLI discovery failed"))?
     }
 
     pub async fn with_catalog_fingerprint(mut self) -> Result<Self, String> {

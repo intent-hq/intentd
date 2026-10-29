@@ -262,16 +262,24 @@ impl AcpAdapterCommand {
         self.prepare_with_context(context).await
     }
 
-    pub(crate) async fn prepare_installed_catalog(self) -> Result<Self, String> {
+    pub(crate) async fn prepare_installed_catalog(
+        self,
+    ) -> Result<Self, crate::installed_cli::DiscoveryError> {
+        use crate::installed_cli::DiscoveryError;
+        let other = |message: String| DiscoveryError {
+            message,
+            cli_missing: false,
+        };
         let cli = self
             .installed_cli
-            .ok_or("catalog requires an installed CLI")?;
+            .ok_or_else(|| other("catalog requires an installed CLI".into()))?;
         let context =
-            crate::installed_cli::InstalledContext::discover_for(cli, self.profile.clone())
+            crate::installed_cli::InstalledContext::discover_classified(cli, self.profile.clone())
                 .await?
                 .with_catalog_fingerprint()
-                .await?;
-        self.prepare_with_context(context).await
+                .await
+                .map_err(other)?;
+        self.prepare_with_context(context).await.map_err(other)
     }
 
     pub(crate) async fn prepare_with_context(
