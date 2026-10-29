@@ -382,7 +382,29 @@ async fn read_asset(
 ) -> Result<Value, String> {
     let asset = req_str(args, "asset").map_err(|_| "Asset ID or URL is required".to_string())?;
     let r = api.read_asset(ws.clone(), asset).await.map_err(map_err)?;
-    serde_json::to_value(r).map_err(|e| e.to_string())
+    // Raster images become a native MCP image block (dispatch passes
+    // `__mcpContentItems` through) so the model sees the pixels, not base64.
+    let image_mime = match r.mime_type.as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    };
+    let items = image_mime.map(|mime_type| {
+        let meta = json!({ "assetId": r.asset_id, "mimeType": mime_type, "sizeKb": r.size_kb });
+        json!([
+            { "type": "text", "text": meta.to_string() },
+            { "type": "image", "mimeType": mime_type, "data": r.data },
+        ])
+    });
+    // Keep the documented fields so JS callers can still read `data` etc.;
+    // dispatch only uses the marker when this value is returned directly.
+    let mut value = serde_json::to_value(r).map_err(|e| e.to_string())?;
+    if let (Some(items), Some(obj)) = (items, value.as_object_mut()) {
+        obj.insert("__mcpContentItems".to_string(), items);
+    }
+    Ok(value)
 }
 
 async fn save_asset(

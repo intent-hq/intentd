@@ -98,6 +98,56 @@ requires a refreshed identity; the remote-owner panel needs Remote
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
+## Inline visuals (unreleased)
+
+Inline HTML visuals are under development; do not recommend them in ordinary app
+help. Discuss or test them only when explicitly asked, and confirm the frontend
+supports them. A newer daemon or agent instruction version does not prove support
+in the installed client.
+
+For development testing, run both component branches and create a new agent with
+harness 3.5. Existing agents retain their creation-time prompts. If controls do
+not respond in a scaled embedded-browser preview, choose **Fit panel** in its size
+menu and retry.
+
+In a supporting development frontend, an agent can put raw, self-contained
+HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
+in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
+The preview shows a skeleton while its content streams or the sandbox starts.
+Scrolling continues through chat when the visual has no more content to scroll.
+Use this for exploring comparisons or changing inputs. Keep simple explanations
+in text and shareable charts in saved files. Visuals use app semantic CSS variables
+for both themes and cannot use external libraries, network access, arbitrary app APIs,
+navigation, forms, popups, or embedded frames. **Source** shows the code;
+**Reload** starts it again with its last published configuration restored.
+
+With the persistent-visual development extension, authored code publishes bounded
+JSON state plus named inputs and derived results through `window.intentVisual`.
+The host toolbar can **Save scenario** (up to six), compare, restore or remove
+scenarios. **Use this configuration** appends selected inputs/results to the
+editable composer draft without sending it. **Export** saves JSON and editable
+source to fixed workspace paths; the visual cannot choose paths or send messages.
+This extension does not promise arbitrary SVG/PNG export. A labeled file input
+can read an explicitly user-picked local CSV, JSON or image with the browser File
+API; it cannot read arbitrary paths or fetch data automatically.
+
+The development preview supplies app typography, compact controls and optional
+drawing styles from the diagrams: neutral surfaces and thin lines that stay thin
+as the drawing resizes, plus six theme chart colors for data and depicted
+things. Use HTML labels for readable text in narrow chat columns.
+Playback buttons, sliders and their values share a compact row. Authored styles
+can override the defaults. Figures share the surrounding content gutter; keep
+headings, chart labels, controls and results on common edges, with row values
+aligned at the right.
+
+Before showing a visual, an agent in a supporting development frontend checks it
+with the browser `previewHtml` action: a screenshot at a chosen width and light or
+dark appearance, its content height and console messages. A frontend without that
+action reports it as unsupported; the agent then says preview is unavailable.
+Asked for an image to share elsewhere, the agent saves a PNG file instead.
+
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.5/common.md; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
+
 ## Finding things
 
 Answer location questions with the destination and action first. Read settings only
