@@ -188,6 +188,33 @@ fn resolve_login_shell(
 /// non-UTF-8 `pw_shell`.
 #[cfg(unix)]
 fn user_db_shell() -> Option<String> {
+    user_db_field(|pwd| pwd.pw_shell)
+}
+
+#[cfg(not(unix))]
+fn user_db_shell() -> Option<String> {
+    None
+}
+
+/// The current user's home directory from the user database (`pw_dir` via
+/// `getpwuid_r`), independent of `$HOME`. `None` on lookup failure, a null,
+/// empty or non-UTF-8 entry, and on non-unix targets.
+#[cfg(unix)]
+#[must_use]
+pub fn user_db_home() -> Option<std::path::PathBuf> {
+    user_db_field(|pwd| pwd.pw_dir).map(std::path::PathBuf::from)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn user_db_home() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Read one string field of the current user's `getpwuid_r` entry. Returns
+/// `None` on lookup failure or a null, empty, or non-UTF-8 field.
+#[cfg(unix)]
+fn user_db_field(field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     use std::ffi::CStr;
 
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -213,21 +240,17 @@ fn user_db_shell() -> Option<String> {
         }
         // On success `result` points at `pwd`, which getpwuid_r filled in, so
         // read the field from `pwd` rather than dereferencing the raw pointer.
-        if pwd.pw_shell.is_null() {
+        let value = field(&pwd);
+        if value.is_null() {
             return None;
         }
-        let shell = unsafe { CStr::from_ptr(pwd.pw_shell) };
-        return shell
+        let value = unsafe { CStr::from_ptr(value) };
+        return value
             .to_str()
             .ok()
-            .filter(|shell| !shell.is_empty())
+            .filter(|value| !value.is_empty())
             .map(str::to_string);
     }
-}
-
-#[cfg(not(unix))]
-fn user_db_shell() -> Option<String> {
-    None
 }
 
 /// Helper to attempt the login-shell capture with specific shell flags.
