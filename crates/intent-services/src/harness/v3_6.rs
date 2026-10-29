@@ -40,6 +40,22 @@ mod tests {
                 "verifier",
                 "f1e7caa77c837942b2e0643cd017417ea8958d163a94f4a9c991b11e56f6aaa9",
             ),
+            (
+                "developer-legacy",
+                "14b08458a96ebdb53c8ad1244c3181b8013cdea99185d30e46a1ebce69db870f",
+            ),
+            (
+                "coordinator-legacy",
+                "9c37755b2464c55537c5666b6468f1b5827c5e46fe70e62babb13de498a8efaf",
+            ),
+            (
+                "implementor-legacy",
+                "4a00641fee14572683c7264233499de3fd4c11ed18515e5a5520d45b99c46bf4",
+            ),
+            (
+                "verifier-legacy",
+                "42ebe6fee95eef659ceeac955dd91a985eeba154dc5ad68fe5e48152882d5396",
+            ),
         ] {
             let content = super::ENTRY
                 .doctrine
@@ -58,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_6_versions_only_the_four_workflow_specialists() {
+    fn v3_6_versions_four_workflows_and_adds_legacy_choices() {
         let current = super::super::resolve_entry("3.6");
         let previous = super::super::resolve_entry("3.5");
         assert_eq!(current.version, "3.6");
@@ -71,7 +87,7 @@ mod tests {
         assert_eq!(current.feature_labels, previous.feature_labels);
         assert_eq!(
             current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len()
+            previous.doctrine.specialists.len() + 4
         );
         for ((old_id, old), (new_id, new)) in previous
             .doctrine

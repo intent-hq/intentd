@@ -506,6 +506,39 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "persisted session carries the canonical id"
     );
 
+    let listed = wss_rpc(&mut ws, 10, "specialist.list", json!({})).await;
+    let catalog = listed["specialists"]
+        .as_array()
+        .expect("specialist catalog");
+    for (id, name, restricted) in [
+        ("developer-legacy", "Developer (Legacy)", false),
+        ("coordinator-legacy", "Coordinator (Legacy)", true),
+        ("implementor-legacy", "Implementor (Legacy)", false),
+        ("verifier-legacy", "Verifier (Legacy)", false),
+    ] {
+        assert!(catalog.iter().any(|def| def["id"] == id));
+        let legacy = wss_rpc(
+            &mut ws,
+            11,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "specialistId": id,
+                "model": "opus",
+                "provider": "auggie"
+            }),
+        )
+        .await;
+        assert_eq!(legacy["agent"]["name"], name);
+        let legacy_id = legacy["agent"]["id"].as_str().expect("legacy agent id");
+        let stored = wss_rpc(&mut ws, 12, "agent.get", json!({"agentId": legacy_id})).await;
+        assert_eq!(stored["agent"]["metadata"]["specialist"], id);
+        assert_eq!(
+            stored["agent"]["metadata"]["specialistIsOrchestrator"],
+            restricted
+        );
+    }
+
     // An UNKNOWN specialist id is rejected with `-32602` naming the id and
     // the known catalog ids (monorepo#3497) — no session is created.
     let rejected = wss_rpc_raw(
@@ -655,15 +688,19 @@ async fn embedded_bundled_catalog_over_wss() {
         ids,
         [
             "chief-of-staff",
+            "coordinator-legacy",
             "developer",
+            "developer-legacy",
             "implementor",
+            "implementor-legacy",
             "pr-reviewer",
             "spec-writer",
             "ui-designer",
             "verifier",
+            "verifier-legacy",
             "vulnerability-scanner",
         ],
-        "bundled catalog over WSS is exactly the eight catalog-visible embedded ids"
+        "bundled catalog over WSS contains the current and opt-in legacy specialists"
     );
     assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {

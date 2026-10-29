@@ -275,6 +275,12 @@ test evidence, and preserve required repository checks. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
+The previous Developer, Coordinator, Implementor, and Verifier remain available
+as **(Legacy)** choices in the agent specialist picker. To start a workspace with
+the old planning-and-delegation workflow, choose **Coordinator (Legacy)** in the
+specialist dropdown. It keeps its editing restrictions and uses the Legacy
+Implementor and Verifier. Lead remains the default for the team card.
+
 <!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.6/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_6.rs}. -->
 
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
