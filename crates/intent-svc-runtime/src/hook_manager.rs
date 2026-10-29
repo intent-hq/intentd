@@ -965,7 +965,9 @@ impl HookServicesExt for Services {
                     .into(),
             ));
         }
-        let agent_features = self.effective_settings().agent_features;
+        let mut agent_features = self.effective_settings().agent_features;
+        // Secret requests follow the owner's creation-time snapshot (§5.56).
+        agent_features.secret_requests = self.agent_captured_secret_requests(agent_id).await;
         if !agent_features.background_hooks {
             return Err(Error::InvalidParams(
                 "hook.schedule: disabled in settings (agentFeatures.backgroundHooks = false)"
@@ -1834,7 +1836,11 @@ impl HookServicesExt for Services {
         // daemon restarts, so the current effective `[agentFeatures]` gate is
         // the same one a newly created session's bridge would capture. The
         // owner's sub-agent status is likewise re-derived per run.
-        let agent_features = self.effective_settings().agent_features;
+        let mut agent_features = self.effective_settings().agent_features;
+        // Except secret requests (§5.56): they follow the owner's
+        // creation-time snapshot, so a later toggle change never takes
+        // secrets away from (or grants them to) an existing agent's hooks.
+        agent_features.secret_requests = self.agent_captured_secret_requests(&hook.agent_id).await;
         let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
         let evaluation = async {
             #[cfg(test)]

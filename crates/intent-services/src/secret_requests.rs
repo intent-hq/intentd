@@ -479,6 +479,21 @@ fn declined_notice(name: &str) -> String {
 }
 
 impl Services {
+    /// Whether `agent_id`'s session captured secret requests as available
+    /// (`secretRequests` with `hostExec`, from its creation-time feature
+    /// snapshot). Background hooks use this instead of the live settings so
+    /// a toggle change applies to new sessions only (PROTOCOL §5.56). A
+    /// missing session is `false`.
+    pub async fn agent_captured_secret_requests(&self, agent_id: &AgentId) -> bool {
+        match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => {
+                let features = self.session_agent_features(&session);
+                features.secret_requests && features.host_exec
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Resolve `agent_id`'s session and require it to live in `workspace_id`.
     async fn secret_agent_session(
         &self,
@@ -587,6 +602,16 @@ impl Services {
             .ok_or_else(|| unknown_request(&request_id))?;
         self.require_agent_member_in(&owner.agent_id, &workspace_id)
             .await?;
+        // Never store a value for an agent that is gone or retired: drop its
+        // leftovers and report the request as unknown.
+        let alive = matches!(
+            self.secret_agent_session(&workspace_id, &owner.agent_id).await,
+            Ok(session) if session.retired_at.is_none()
+        );
+        if !alive {
+            self.secret_vault.clear_agent(&owner.agent_id);
+            return Err(unknown_request(&request_id));
+        }
         let answer = self
             .secret_vault
             .answer(&workspace_id, &request_id, outcome, value)

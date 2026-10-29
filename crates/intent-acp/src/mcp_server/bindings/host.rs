@@ -59,9 +59,13 @@ async fn exec(
             .await
             .map_err(map_err);
     }
-    api.host_exec(ws.clone(), args.clone())
-        .await
-        .map_err(map_err)
+    // `secretEnv: null` is the same as omitting it: drop the key so the
+    // plain exec's parser (which rejects any present `secretEnv`) accepts it.
+    let mut args = args.clone();
+    if let Some(fields) = args.as_object_mut() {
+        fields.remove("secretEnv");
+    }
+    api.host_exec(ws.clone(), args).await.map_err(map_err)
 }
 
 #[cfg(test)]
@@ -117,6 +121,26 @@ mod tests {
             .unwrap();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi { root });
         (api, WorkspaceId::from_string("ws-host"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn null_secret_env_runs_a_plain_exec() {
+        let (api, ws) = api("nullsecret");
+        for secrets in [false, true] {
+            let r = dispatch(
+                &api,
+                &ws,
+                None,
+                secrets,
+                "exec",
+                &json!({ "command": "echo", "args": ["ok"], "secretEnv": null }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r["exitCode"], json!(0), "{r}");
+            assert_eq!(r["stdout"], json!("ok\n"), "{r}");
+        }
     }
 
     #[cfg(unix)]

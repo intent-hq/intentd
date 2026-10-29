@@ -795,3 +795,96 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
         "unconfirmed pre-observer owner survives all handles"
     );
 }
+
+/// A `ws.secret.request` that lands while an agent delete is between its
+/// first steps and the row DELETE must not survive the deleted agent: the
+/// post-DELETE sweep removes it, and a later provide is refused (§5.56).
+#[intent_test_macros::daemon_test]
+async fn secret_request_racing_agent_delete_does_not_survive() {
+    let h = Harness::new().await;
+    let (pause, resume) = h
+        .services
+        .pending_delete_test_gate
+        .arm("agent-secret-window", &h.agent.0);
+    let finished = h.services.pending_delete_test_gate.completion(&h.agent.0);
+    h.services
+        .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
+        .await
+        .unwrap();
+    reached(&pause).await;
+    let ticket = h
+        .services
+        .secret_request_op(h.ws.clone(), h.agent.clone(), "KEY".into(), "race".into())
+        .await
+        .expect("the row still exists while deletion is paused");
+    let request_id = ticket["requestId"].as_str().unwrap().to_string();
+    resume.notify_one();
+    reached(&finished).await;
+    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .secret_vault
+        .pending_owner(&h.ws, &request_id)
+        .is_none());
+    assert!(h
+        .services
+        .secret_vault
+        .resolve(&h.ws, &h.agent, &["KEY"])
+        .is_err());
+    let provided = h
+        .services
+        .secret_answer_op(
+            h.ws.clone(),
+            request_id,
+            crate::secret_requests::Outcome::Provided,
+            Some(zeroize::Zeroizing::new("v".to_string())),
+        )
+        .await;
+    assert!(
+        matches!(
+            provided,
+            Err(intent_core::Error::SecretRequest {
+                code: "secret-request-unknown",
+                ..
+            })
+        ),
+        "{provided:?}"
+    );
+}
+
+/// Hooks resolve secret-request eligibility from the owner's creation-time
+/// snapshot, not the live setting (§5.56: changes apply to new sessions).
+#[intent_test_macros::daemon_test]
+async fn captured_secret_requests_follow_the_session_snapshot() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let on = AgentId::new();
+    let mut session_on = session(&ws, &on.0);
+    session_on.harness_features =
+        Some(serde_json::json!({ "secretRequests": true, "hostExec": true }));
+    store.insert_agent_session(&session_on).await.unwrap();
+    let no_exec = AgentId::new();
+    let mut session_no_exec = session(&ws, &no_exec.0);
+    session_no_exec.harness_features =
+        Some(serde_json::json!({ "secretRequests": true, "hostExec": false }));
+    store.insert_agent_session(&session_no_exec).await.unwrap();
+    let off = AgentId::new();
+    let mut session_off = session(&ws, &off.0);
+    session_off.harness_features = Some(serde_json::json!({ "hostExec": true }));
+    store.insert_agent_session(&session_off).await.unwrap();
+    let services = Services::new(store);
+    assert!(
+        !services.effective_settings().agent_features.secret_requests,
+        "the live setting is off"
+    );
+    assert!(services.agent_captured_secret_requests(&on).await);
+    assert!(!services.agent_captured_secret_requests(&no_exec).await);
+    assert!(!services.agent_captured_secret_requests(&off).await);
+    assert!(
+        !services
+            .agent_captured_secret_requests(&AgentId::new())
+            .await
+    );
+}

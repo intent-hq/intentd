@@ -6123,8 +6123,10 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
-        // Memory-held secrets and pending requests die with their agent (§5.56).
-        self.secret_vault.clear_agent(&agent_id);
+        #[cfg(all(test, unix))]
+        self.pending_delete_test_gate
+            .pause("agent-secret-window", &agent_id.0)
+            .await;
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -6142,6 +6144,11 @@ impl Services {
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
+        // Memory-held secrets and pending requests die with their agent
+        // (§5.56). Swept only AFTER the row is gone: a concurrent
+        // `ws.secret.request` either inserted before this sweep (removed
+        // here) or re-reads the session after the DELETE and drops itself.
+        self.secret_vault.clear_agent(&agent_id);
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
