@@ -770,6 +770,17 @@ struct InstalledSelection {
 /// Whether a prior installed selection still describes the requested launch:
 /// observed after the request (or recently, when not forced) and prepared
 /// under exactly the same profile settings.
+/// Cache key for an installed-CLI catalog whose command could not be
+/// prepared. The failure's kind is part of it, so a changed cause (Node.js
+/// installed, CLI still missing) never reads the previous cause's negative
+/// entry — and its `warningKind` — for the rest of the 60s window.
+fn unavailable_key(provider: &str, kind: Option<ModelWarningKind>) -> String {
+    match kind {
+        Some(kind) => format!("installed-unavailable:{provider}:{}", kind.as_wire()),
+        None => format!("installed-unavailable:{provider}"),
+    }
+}
+
 fn reusable_selection(
     prior: &InstalledSelection,
     requested: tokio::time::Instant,
@@ -842,7 +853,9 @@ impl ModelCatalogCache {
                     .as_ref()
                     .ok()
                     .and_then(crate::acp_adapter::AcpAdapterCommand::installed_key)
-                    .unwrap_or_else(|| format!("installed-unavailable:{provider}"));
+                    .unwrap_or_else(|| {
+                        unavailable_key(provider, command.as_ref().err().and_then(|e| e.kind))
+                    });
                 let selection = InstalledSelection {
                     observed: tokio::time::Instant::now(),
                     profile_key: profile_key.clone(),
@@ -1135,7 +1148,7 @@ impl ModelCatalogCache {
                 InstalledSelection {
                     observed: tokio::time::Instant::now(),
                     profile_key: None,
-                    key: format!("installed-unavailable:{provider}"),
+                    key: unavailable_key(provider, err.kind),
                     command: Err(err),
                 },
             );

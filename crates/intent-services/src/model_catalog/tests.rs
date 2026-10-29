@@ -1685,3 +1685,25 @@ async fn installed_cli_command_error_kind_reaches_the_resolved_catalog() {
         assert_eq!(resolved.warning_kind, kind);
     }
 }
+
+#[tokio::test]
+async fn a_changed_installed_cli_failure_is_not_served_the_old_cached_kind() {
+    // Installing Node.js fixes the npx prerequisite but the CLI is still
+    // missing: inside the 60s negative window the new cause must win.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    for (kind, reason) in [
+        (ModelWarningKind::PrerequisiteMissing, "npx missing"),
+        (ModelWarningKind::CliMissing, "codex missing"),
+    ] {
+        cache.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: reason.into(),
+                kind: Some(kind),
+            },
+        );
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert_eq!(resolved.warning.as_deref(), Some(reason));
+        assert_eq!(resolved.warning_kind, Some(kind));
+    }
+}

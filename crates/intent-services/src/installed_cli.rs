@@ -48,7 +48,8 @@ pub struct DiscoveryError {
 }
 
 impl DiscoveryError {
-    fn other(message: impl Into<String>) -> Self {
+    /// A failure other than a missing CLI.
+    pub(crate) fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             cli_missing: false,

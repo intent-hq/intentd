@@ -266,20 +266,18 @@ impl AcpAdapterCommand {
         self,
     ) -> Result<Self, crate::installed_cli::DiscoveryError> {
         use crate::installed_cli::DiscoveryError;
-        let other = |message: String| DiscoveryError {
-            message,
-            cli_missing: false,
-        };
         let cli = self
             .installed_cli
-            .ok_or_else(|| other("catalog requires an installed CLI".into()))?;
+            .ok_or_else(|| DiscoveryError::other("catalog requires an installed CLI"))?;
         let context =
             crate::installed_cli::InstalledContext::discover_classified(cli, self.profile.clone())
                 .await?
                 .with_catalog_fingerprint()
                 .await
-                .map_err(other)?;
-        self.prepare_with_context(context).await.map_err(other)
+                .map_err(DiscoveryError::other)?;
+        self.prepare_with_context(context)
+            .await
+            .map_err(DiscoveryError::other)
     }
 
     pub(crate) async fn prepare_with_context(
