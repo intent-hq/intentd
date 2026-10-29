@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::map_err;
@@ -22,14 +22,20 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// `secrets` is whether agent secret requests are effective for this caller
+/// (see [`super::secret_requests_effective`]); only then does `secretEnv`
+/// reach the agent-scoped exec, which resolves it from the caller's own
+/// memory-held secrets (PROTOCOL §5.56).
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    secrets: bool,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "exec" => exec(api, ws, args).await,
+        "exec" => exec(api, ws, caller, secrets, args).await,
         other => Err(format!("host: unknown method `host.{other}`")),
     }
 }
@@ -37,8 +43,22 @@ pub(crate) async fn dispatch(
 async fn exec(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    secrets: bool,
     args: &Value,
 ) -> Result<Value, String> {
+    if args.get("secretEnv").is_some() {
+        let Some(caller) = caller.filter(|_| secrets) else {
+            return Err(format!(
+                "host: secretEnv is unavailable — {}",
+                super::secret::SECRET_REQUESTS_UNAVAILABLE
+            ));
+        };
+        return api
+            .agent_host_exec(ws.clone(), caller.clone(), args.clone())
+            .await
+            .map_err(map_err);
+    }
     api.host_exec(ws.clone(), args.clone())
         .await
         .map_err(map_err)
@@ -106,6 +126,8 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
+            false,
             "exec",
             &json!({ "command": "echo", "args": ["hi"] }),
         )
@@ -129,7 +151,7 @@ mod tests {
             .unwrap()
             .worktree_path
             .unwrap();
-        let r = dispatch(&api, &ws, "exec", &json!({ "command": "pwd" }))
+        let r = dispatch(&api, &ws, None, false, "exec", &json!({ "command": "pwd" }))
             .await
             .unwrap();
         assert_eq!(r["exitCode"], 0);
@@ -150,6 +172,8 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
+            false,
             "exec",
             &json!({ "command": "sh", "args": ["-c", "exit 7"] }),
         )
@@ -166,6 +190,8 @@ mod tests {
         let r = dispatch(
             &api,
             &ws,
+            None,
+            false,
             "exec",
             &json!({ "command": "sleep", "args": ["30"], "timeoutMs": 100 }),
         )
@@ -180,6 +206,8 @@ mod tests {
         let err = dispatch(
             &api,
             &ws,
+            None,
+            false,
             "exec",
             &json!({ "command": "echo", "cwd": "../../outside" }),
         )
@@ -194,7 +222,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_rejects_unknown_method() {
         let (api, ws) = api("unknown");
-        let err = dispatch(&api, &ws, "nope", &json!({})).await.unwrap_err();
+        let err = dispatch(&api, &ws, None, false, "nope", &json!({}))
+            .await
+            .unwrap_err();
         assert!(err.contains("unknown method"));
     }
 }

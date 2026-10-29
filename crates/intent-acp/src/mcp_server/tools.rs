@@ -149,10 +149,11 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — attributed commits + secondary git root registry
-  ws.event.* — activity queries + event subscriptions
+  ws.git.* — commits, git roots
+  ws.event.* — activity queries + subscriptions
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
+  ws.secret.* — secrets for host.exec
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
   ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
@@ -302,6 +303,10 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
+  ws.secret.request({ name, reason }) → { ok, requestId, message }  // Ask the user for a secret (API key, token) through a masked card shown when your turn ends; the value never reaches you or the chat, so never ask for one in chat. `name`: 1-64 characters of A-Z, 0-9 and _ starting with a letter (e.g. OPENROUTER_API_KEY); `reason`: why you need it. End your turn after asking; a message tells you when the user provides or declines. Use a provided secret ONLY as `secretEnv` on ws.host.exec — an array of names (`secretEnv: ["NAME"]` sets $NAME) or an object mapping variable to name (`secretEnv: { OPENAI_API_KEY: "NAME" }`); the command gets the value in its environment and its output shows `[secret:NAME]` instead. Secrets are yours alone, held in memory, and lost when Intent restarts: on a `secret-unavailable` error, request it again. Saved scripts (ws.script.*) cannot use secrets; never print, echo or write a secret value.
+  ws.secret.list() → { secrets, pendingRequests }  // Names of your held secrets and your requests still waiting for the user; never values.
+  ws.secret.forget(name) → { ok, forgotten }  // Drop one of your held secrets.
+
   ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
@@ -428,8 +433,8 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — attributed commits + secondary git root registry
-  ws.event.* — activity queries + event subscriptions
+  ws.git.* — commits, git roots
+  ws.event.* — activity queries + subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.desktop.* — desktop control
@@ -755,6 +760,9 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
     }
     if !features.structured_questions {
         out.push(("ws.app.question.", "agentFeatures.structuredQuestions"));
+    }
+    if !features.secret_requests || !features.host_exec {
+        out.push(("ws.secret.", "agentFeatures.secretRequests"));
     }
     if !features.attention_requests {
         out.push((
@@ -1282,6 +1290,12 @@ pub(super) fn help_namespace(
                     super::dispatch::SUB_AGENT_QUESTION_DENIED
                 ));
             }
+            if is_sub_agent && prefix == "ws.secret." {
+                return Err(format!(
+                    "namespace `{ns}` — {}",
+                    super::dispatch::SUB_AGENT_SECRET_DENIED
+                ));
+            }
             return Err(format!(
                 "namespace `{ns}` is disabled in settings ({feature} = false)"
             ));
@@ -1468,6 +1482,7 @@ mod tests {
     const BINDINGS_HOST: &str = include_str!("bindings/host.rs");
     const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
+    const BINDINGS_SECRET: &str = include_str!("bindings/secret.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_MCP: &str = include_str!("bindings/mcp.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
@@ -1503,6 +1518,7 @@ mod tests {
             ("host", BINDINGS_HOST),
             ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
+            ("secret", BINDINGS_SECRET),
             ("terminal", BINDINGS_TERMINAL),
             ("mcp", BINDINGS_MCP),
             ("file", BINDINGS_FILE),
@@ -1815,6 +1831,7 @@ mod tests {
                 desktop_control: false,
                 rich_chat_blocks: false,
                 structured_questions: false,
+                secret_requests: false,
                 attention_requests: false,
                 state_snapshot: false,
                 pr_monitor: false,
@@ -2569,7 +2586,7 @@ mod tests {
             (false, WORKSPACE_API_DESCRIPTION),
             (true, WORKSPACE_API_DESCRIPTION_CHIEF),
         ] {
-            let index = help_index(is_chief, &AgentFeaturesSettings::default());
+            let index = help_index(is_chief, &all_gates_open());
             assert!(index.starts_with("Namespaces"));
             for ns in index_namespaces(desc) {
                 assert!(
@@ -2738,7 +2755,8 @@ mod tests {
     fn feature_cases() -> Vec<FeatureCase> {
         vec![
             (&["ws.hook."], |f| f.background_hooks = false),
-            (&["ws.host."], |f| f.host_exec = false),
+            (&["ws.host.", "ws.secret."], |f| f.host_exec = false),
+            (&["ws.secret."], |f| f.secret_requests = false),
             (&["ws.script."], |f| f.scripts = false),
             (&["ws.terminal."], |f| f.terminal_access = false),
             (&["ws.browser."], |f| f.browser_automation = false),
@@ -2790,8 +2808,13 @@ mod tests {
     }
 
     // Every gate is open by default.
+    /// Every gate open: the defaults plus the off-by-default
+    /// `secretRequests` toggle (PROTOCOL §5.56).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings::default()
+        AgentFeaturesSettings {
+            secret_requests: true,
+            ..AgentFeaturesSettings::default()
+        }
     }
 
     // Hard requirement: with every gate open (the defaults), the assembled
@@ -2984,6 +3007,7 @@ mod tests {
             desktop_control: false,
             rich_chat_blocks: false,
             structured_questions: false,
+            secret_requests: false,
             attention_requests: false,
             state_snapshot: false,
             pr_monitor: false,
@@ -3551,6 +3575,7 @@ const run = async (s, out) => {{
             desktop_control: false,
             rich_chat_blocks: false,
             structured_questions: false,
+            secret_requests: false,
             attention_requests: false,
             state_snapshot: false,
             pr_monitor: false,

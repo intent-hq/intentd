@@ -6123,6 +6123,8 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        // Memory-held secrets and pending requests die with their agent (§5.56).
+        self.secret_vault.clear_agent(&agent_id);
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -6507,6 +6509,8 @@ impl Services {
             return Ok(None);
         }
         self.desktop_terminate_agent(&session.id).await;
+        // A retired agent is inert: drop its secrets and pending requests (§5.56).
+        self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire
         // caller retires another agent, whose current worker must be aborted;
         // MCP self-retirement instead lets its own response unwind normally.

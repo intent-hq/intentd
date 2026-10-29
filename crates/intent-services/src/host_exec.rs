@@ -115,6 +115,14 @@ impl HostExecError {
 ///
 /// Returns an invalid-params `HostExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecError> {
+    // `secretEnv` belongs to the agent `ws.host.exec` binding only (PROTOCOL
+    // §5.56): the agent path resolves and strips it before parsing, so its
+    // presence here means a client connection, which has no agent identity.
+    if params.contains_key("secretEnv") {
+        return Err(HostExecError::invalid(
+            "Invalid parameter: secretEnv is only available to agents through ws.host.exec",
+        ));
+    }
     let command = params
         .get("command")
         .and_then(Value::as_str)

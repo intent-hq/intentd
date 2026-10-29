@@ -2556,6 +2556,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~180 tokens/session"),
         boolean(
+            "agentFeatures.secretRequests",
+            "Secret requests",
+            "Let top-level agents ask you for secrets (ws.secret.*) that Intent holds in memory and passes only to that agent's ws.host.exec calls; needs Host exec; applies to new sessions only",
+            "agentFeatures",
+            false,
+        )
+        .with_token_impact("~260 tokens/session"),
+        boolean(
             "agentFeatures.attentionRequests",
             "Attention requests",
             "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
@@ -7560,6 +7568,7 @@ mod tests {
             ("agentFeatures.desktopControl", true),
             ("agentFeatures.richChatBlocks", true),
             ("agentFeatures.structuredQuestions", true),
+            ("agentFeatures.secretRequests", false),
             ("agentFeatures.attentionRequests", true),
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
@@ -7663,6 +7672,7 @@ mod tests {
             ("agentFeatures.desktopControl", "~50 tokens/session"),
             ("agentFeatures.richChatBlocks", "~310 tokens/session"),
             ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+            ("agentFeatures.secretRequests", "~260 tokens/session"),
             ("agentFeatures.attentionRequests", "~340 tokens/session"),
             ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
             ("agentFeatures.prMonitor", "~290 tokens/session"),
