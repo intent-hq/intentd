@@ -20,6 +20,7 @@ fn ok_fetch(tag: &'static str) -> impl FnOnce() -> BoxFuture<'static, ModelFetch
             ModelFetchResult {
                 models: Some(rows(tag)),
                 warning: None,
+                warning_kind: None,
             }
         })
     }
@@ -31,6 +32,7 @@ fn failing_fetch() -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
             ModelFetchResult {
                 models: None,
                 warning: Some("probe failed".to_string()),
+                warning_kind: None,
             }
         })
     }
@@ -54,6 +56,7 @@ fn counting_fetch(
             ModelFetchResult {
                 models: Some(rows(tag)),
                 warning: None,
+                warning_kind: None,
             }
         })
     }
@@ -294,6 +297,7 @@ async fn background_refreshes_respect_global_concurrency_cap() {
                 ModelFetchResult {
                     models: Some(rows("refreshed")),
                     warning: None,
+                    warning_kind: None,
                 }
             })
         };
@@ -331,6 +335,7 @@ async fn aged_entry_empty_success_background_refresh_stores_nothing() {
             ModelFetchResult {
                 models: Some(vec![]),
                 warning: None,
+                warning_kind: None,
             }
         }) as BoxFuture<'static, ModelFetchResult>
     };
@@ -448,6 +453,7 @@ async fn empty_success_is_served_but_not_cached() {
             ModelFetchResult {
                 models: Some(Vec::new()),
                 warning: Some("gated".to_string()),
+                warning_kind: None,
             }
         })
     };
@@ -667,6 +673,7 @@ async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
             from_provider_fetch(crate::provider_models::ProviderModelsFetch {
                 models: None,
                 warning: Some("droid: droid binary not found".to_string()),
+                warning_kind: None,
             })
         })
     };
@@ -831,6 +838,7 @@ async fn only_the_leader_records_the_probe_outcome() {
         .set(ModelFetchResult {
             models: None,
             warning: Some("stale failure".to_string()),
+            warning_kind: None,
         })
         .is_ok());
     // Simulate the newer probe's success landing first.
@@ -1156,6 +1164,7 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
                 ModelFetchResult {
                     models: Some(rows("model-a")),
                     warning: None,
+                    warning_kind: None,
                 }
             })
         })
@@ -1245,6 +1254,7 @@ async fn installed_cli_obsolete_inflight_probe_cannot_overwrite_or_serve_new_sou
                     ModelFetchResult {
                         models: Some(vec![serde_json::json!({"id":"old"})]),
                         warning: None,
+                        warning_kind: None,
                     }
                 })
             },
@@ -1292,6 +1302,7 @@ async fn installed_cli_failed_refresh_only_serves_same_runtime_and_auth_last_goo
             ModelFetchResult {
                 models: None,
                 warning: Some("offline".into()),
+                warning_kind: None,
             }
         }) as intent_core::BoxFuture<'static, ModelFetchResult>
     };
@@ -1559,4 +1570,140 @@ fn installed_selection_is_reused_only_for_the_same_profile_settings() {
         false,
         current.as_deref()
     ));
+}
+
+fn failing_fetch_kind(
+    kind: ModelWarningKind,
+) -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
+    move || {
+        Box::pin(async move {
+            ModelFetchResult {
+                models: None,
+                warning: Some("probe failed".to_string()),
+                warning_kind: Some(kind),
+            }
+        })
+    }
+}
+
+#[test]
+fn warning_kind_wire_values_are_kebab_case() {
+    assert_eq!(ModelWarningKind::CliMissing.as_wire(), "cli-missing");
+    assert_eq!(
+        ModelWarningKind::PrerequisiteMissing.as_wire(),
+        "prerequisite-missing"
+    );
+    let mut out = json!({ "warning": "w" });
+    insert_warning_kind(&mut out, Some(ModelWarningKind::CliMissing));
+    assert_eq!(out["warningKind"], "cli-missing");
+    let mut out = json!({ "warning": "w" });
+    insert_warning_kind(&mut out, None);
+    assert!(out.get("warningKind").is_none());
+    // Never without a warning (PROTOCOL §5.30 "Warning kind").
+    let mut out = json!({ "models": [] });
+    insert_warning_kind(&mut out, Some(ModelWarningKind::CliMissing));
+    assert!(out.get("warningKind").is_none());
+}
+
+#[tokio::test]
+async fn failed_probe_kind_is_served_and_kept_in_negative_window() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let kind = ModelWarningKind::CliMissing;
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch_kind(kind)).await;
+    assert!(r.models.is_none());
+    assert_eq!(r.warning_kind, Some(kind));
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000 + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert!(r.models.is_none());
+    assert_eq!(r.warning.as_deref(), Some("probe failed"));
+    assert_eq!(r.warning_kind, Some(kind));
+}
+
+#[tokio::test]
+async fn stale_fallback_carries_the_failure_kind() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let kind = ModelWarningKind::PrerequisiteMissing;
+    cache.store("p", "v1", rows("last-good"), 0);
+    let aged = STALE_MS + 10;
+    // Forced failure: last-good served stale with the failure's kind.
+    let r = resolve_with_cache(&cache, "p", "v1", true, aged, failing_fetch_kind(kind)).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert_eq!(r.warning_kind, Some(kind));
+    // Aged entry re-served inside the negative window: same kind.
+    let r = resolve_with_cache(&cache, "p", "v1", false, aged + 1, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert_eq!(r.warning_kind, Some(kind));
+}
+
+#[tokio::test]
+async fn generic_failure_and_background_refresh_notice_have_no_kind() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.warning.is_some());
+    assert_eq!(r.warning_kind, None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 0);
+    let r = resolve_with_cache(&cache, "p", "v1", false, STALE_MS + 10, ok_fetch("new")).await;
+    assert!(r.stale);
+    assert!(r.warning.is_some());
+    assert_eq!(r.warning_kind, None);
+}
+
+#[tokio::test]
+async fn installed_cli_command_error_kind_reaches_the_resolved_catalog() {
+    for kind in [
+        Some(ModelWarningKind::CliMissing),
+        Some(ModelWarningKind::PrerequisiteMissing),
+        None,
+    ] {
+        let cache = Arc::new(ModelCatalogCache::new(None));
+        let mut selection = installed_selection("installed-unavailable:codex");
+        selection.command = Err(crate::provider_models::CatalogUnavailable {
+            reason: "codex catalog unavailable".into(),
+            kind,
+        });
+        cache
+            .installed
+            .lock()
+            .unwrap()
+            .insert("codex".into(), selection);
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert!(resolved.models.is_none());
+        assert_eq!(
+            resolved.warning.as_deref(),
+            Some("codex catalog unavailable")
+        );
+        assert_eq!(resolved.warning_kind, kind);
+    }
+}
+
+#[tokio::test]
+async fn a_changed_installed_cli_failure_is_not_served_the_old_cached_kind() {
+    // Installing Node.js fixes the npx prerequisite but the CLI is still
+    // missing: inside the 60s negative window the new cause must win.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    for (kind, reason) in [
+        (ModelWarningKind::PrerequisiteMissing, "npx missing"),
+        (ModelWarningKind::CliMissing, "codex missing"),
+    ] {
+        cache.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: reason.into(),
+                kind: Some(kind),
+            },
+        );
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert_eq!(resolved.warning.as_deref(), Some(reason));
+        assert_eq!(resolved.warning_kind, Some(kind));
+    }
 }

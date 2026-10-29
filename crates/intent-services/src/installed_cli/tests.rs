@@ -2347,3 +2347,17 @@ fn profile_path_consumes_captured_shell_credentials_like_default() {
         Some("personal-captured".into())
     );
 }
+
+#[test]
+fn missing_cli_discovery_is_classified_as_cli_missing() {
+    use intent_providers::installed_cli::InstalledCli;
+    for cli in [InstalledCli::Codex, InstalledCli::Claude] {
+        let Err(err) = InstalledContext::classify(cli.resolve_in_dirs(&[], false)) else {
+            panic!("no search dirs ⇒ missing CLI");
+        };
+        assert!(err.cli_missing, "{cli:?}");
+        let expected = cli.resolve_in_dirs(&[], false).unwrap_err().to_string();
+        assert_eq!(err.message, expected, "warning text is unchanged");
+        assert_eq!(String::from(err), expected);
+    }
+}

@@ -112,6 +112,9 @@ def violations(text, filename):
 
 # Free labels may still be listed; the route always gives them their GitHub label.
 POOLED = {'gh-linux-8x', 'gh-linux-16x', 'ubuntu-22.04', 'ubuntu-24.04'}
+# Pool -> the labels it serves, from runner-route.yml's `hosted` map (what a `pools` entry may name).
+HOSTED = {pool: re.findall(r"'([\w.-]+)'", labels) for pool, labels in re.findall(
+    r"^ +(\w+): \[([^\]]*)\],$", re.search(r"const hosted = \{(.*?)\};", (ROOT / '.github/workflows/runner-route.yml').read_text(), re.S)[1], re.M)}
 SLOT_READ = re.compile(r"outputs\.slots \|\| '\{\}'\)\[(?:'([\w-]+)'|format\('([\w-]+)-\{0\}', matrix\.\w+\))\] \|\| (?:fromJSON\('\[\"([\w.-]+)\"\]'\)|fromJSON\(needs\.[\w-]+\.outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\])")
 
 
@@ -135,6 +138,10 @@ def slot_violations(text):
         # must never turn a free label paid or shrink a job.
         if 'burst' in entry and (entry.get('label'), entry['burst']) != ('gh-linux-8x', 'gh-linux-16x'):
             errors.append(f"{entry['key']}: burst {entry['burst']} must upsize gh-linux-8x to gh-linux-16x")
+        if 'pools' in entry:
+            pools, serving = entry['pools'], {pool for pool, labels in HOSTED.items() if entry.get('label') in labels}
+            if not (isinstance(pools, list) and pools and all(pool in serving for pool in pools)):
+                errors.append(f"{entry['key']}: pools {pools} must be a non-empty list of pools serving {entry.get('label')}")
     for job, body in jobs(text).items():
         runner = re.search(r'^    runs-on: (.+)$', body, re.M)
         # A matrix row may read its own slot in its `os` value (runs-on: matrix.os).
@@ -253,6 +260,14 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(slot_violations(rows.format('gh-linux-16x') + row), [])
         self.assertEqual(slot_violations(rows.format('gh-linux-8x') + row), ['b: fallback warp-ubuntu-2404-x64-16x differs from warp-ubuntu-2404-x64-8x for listed gh-linux-8x'])
         self.assertEqual(slot_violations('jobs:\n' + row), ['b: reads an unlisted slot'])
+        # `pools` must be a non-empty list of pools that serve the entry's label (runner-route.yml `hosted`).
+        pooled = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"gh-linux-16x","pools":{}}}]\njobs:\n'
+        self.assertEqual(slot_violations(pooled.format('["xl"]') + row), [])
+        self.assertEqual(slot_violations(pooled.format('["xl","bigmem"]') + row), [])
+        for pools in ('"xl"', '[]', '["bigmen"]', '["linux"]'):
+            with self.subTest(pools=pools):
+                self.assertEqual(slot_violations(pooled.format(pools) + row),
+                                 [f'b-linux: pools {json.loads(pools)} must be a non-empty list of pools serving gh-linux-16x'])
         # A queue-only matrix row must list only that event, or it holds a slot on other events.
         queued = row.replace('    strategy:', "    if: github.event_name == 'merge_group'\n    strategy:", 1)
         events = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"gh-linux-16x"{}}}]\njobs:\n'
@@ -278,7 +293,10 @@ class RunnerPolicy(unittest.TestCase):
         # raise fs.inotify.max_user_instances to 32768 (infra/runners/sysctl.conf).
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         listed = {entry['key']: entry for entry in slot_list(ci)}
-        self.assertEqual(listed['coverage-all'], {'key': 'coverage-all', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 22, 'events': ['merge_group']})
+        # coverage-all sets the queue's pace: on an 8-CPU bigmem slot it took p50 27 / p90 39 min
+        # against 17.5 on xl, so it takes only an xl slot and otherwise bursts to WarpBuild 16x.
+        self.assertEqual(listed['coverage-all'], {'key': 'coverage-all', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 22,
+                                                  'events': ['merge_group'], 'pools': ['xl']})
         self.assertEqual(listed['coverage-e2e'], {'key': 'coverage-e2e', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 11, 'events': ['merge_group']})
         self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
         body = jobs(ci)
