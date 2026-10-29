@@ -35705,9 +35705,10 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
         superseded: Vec<ClientId>,
     ) -> BoxFuture<'_, Result<usize>> {
-        let svc = self.clone();
         Box::pin(async move {
-            svc.client_rehome_superseded_tabs(client_id, superseded)
+            self.ports
+                .runtime()
+                .rehome_superseded_browser_tabs(self, client_id, superseded)
                 .await
         })
     }

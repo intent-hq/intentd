@@ -418,23 +418,7 @@ impl Store {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("list claimed browser tabs failed: {e}")))?;
-                let mut moved = Vec::with_capacity(rows.len());
-                let now = now_iso();
-                for row in &rows {
-                    let mut tab = map_row(row, &displayed)?.tab;
-                    let mut changes = serde_json::Map::new();
-                    changes.insert(
-                        "hostClientId".to_string(),
-                        serde_json::Value::String(new_host.0.clone()),
-                    );
-                    if tab.displayed.take().is_some() {
-                        changes.insert("displayed".to_string(), serde_json::Value::Null);
-                    }
-                    tab.host_client_id = new_host.clone();
-                    tab.updated_at.clone_from(&now);
-                    rehome_tab(&mut tx, &tab).await?;
-                    moved.push((tab, serde_json::Value::Object(changes)));
-                }
+                let moved = rehome_rows(&mut tx, &rows, new_host, &displayed).await?;
                 commit(tx, "reassign claimed browser tabs").await?;
                 displayed.forget_all(moved.iter().map(|(t, _)| t.tab_id.as_str()));
                 Ok(moved)
@@ -459,11 +443,7 @@ impl Store {
         new_host: &ClientId,
         old_hosts: &[ClientId],
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
-        let old_hosts: Vec<ClientId> = old_hosts
-            .iter()
-            .filter(|h| *h != new_host)
-            .cloned()
-            .collect();
+        let old_hosts: Vec<ClientId> = old_hosts.to_vec();
         if old_hosts.is_empty() {
             return Ok(Vec::new());
         }
@@ -488,23 +468,7 @@ impl Store {
                 let rows = query.fetch_all(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("list superseded browser tabs failed: {e}"))
                 })?;
-                let mut moved = Vec::with_capacity(rows.len());
-                let now = now_iso();
-                for row in &rows {
-                    let mut tab = map_row(row, &displayed)?.tab;
-                    let mut changes = serde_json::Map::new();
-                    changes.insert(
-                        "hostClientId".to_string(),
-                        serde_json::Value::String(new_host.0.clone()),
-                    );
-                    if tab.displayed.take().is_some() {
-                        changes.insert("displayed".to_string(), serde_json::Value::Null);
-                    }
-                    tab.host_client_id = new_host.clone();
-                    tab.updated_at.clone_from(&now);
-                    rehome_tab(&mut tx, &tab).await?;
-                    moved.push((tab, serde_json::Value::Object(changes)));
-                }
+                let moved = rehome_rows(&mut tx, &rows, new_host, &displayed).await?;
                 commit(tx, "rehome superseded browser tabs").await?;
                 displayed.forget_all(moved.iter().map(|(t, _)| t.tab_id.as_str()));
                 Ok(moved)
@@ -674,7 +638,7 @@ async fn write_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> 
 }
 
 /// The one write allowed to move an open row to another host: the daemon-
-/// initiated claim / driving-client migration (`reassign_*` above). Only the
+/// initiated claim / driving-client / superseded-host migration (`reassign_*` above). Only the
 /// host, the owner and `updated_at` change; everything else stays as the
 /// previous host last reported it.
 async fn rehome_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()> {
@@ -690,6 +654,37 @@ async fn rehome_tab(conn: &mut SqliteConnection, tab: &BrowserTab) -> Result<()>
     .await
     .map_err(|e| Error::Internal(format!("rehome browser tab failed: {e}")))?;
     Ok(())
+}
+
+/// Move every selected open row to `new_host` within `tx` (the shared body of
+/// the daemon-side migrations): each moved row with its `changes` —
+/// `{ hostClientId }`, plus `displayed: null` when the previous host had
+/// reported the layout fact, which the move clears. The caller commits, then
+/// drops the moved ids from the `displayed` overlay.
+async fn rehome_rows(
+    tx: &mut SqliteConnection,
+    rows: &[SqliteRow],
+    new_host: &ClientId,
+    displayed: &DisplayedOverlay,
+) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
+    let mut moved = Vec::with_capacity(rows.len());
+    let now = now_iso();
+    for row in rows {
+        let mut tab = map_row(row, displayed)?.tab;
+        let mut changes = serde_json::Map::new();
+        changes.insert(
+            "hostClientId".to_string(),
+            serde_json::Value::String(new_host.0.clone()),
+        );
+        if tab.displayed.take().is_some() {
+            changes.insert("displayed".to_string(), serde_json::Value::Null);
+        }
+        tab.host_client_id = new_host.clone();
+        tab.updated_at.clone_from(&now);
+        rehome_tab(tx, &tab).await?;
+        moved.push((tab, serde_json::Value::Object(changes)));
+    }
+    Ok(moved)
 }
 
 async fn delete_row(conn: &mut SqliteConnection, tab_id: &str) -> Result<()> {

@@ -17,12 +17,12 @@
 //! for an id followed by a stale `tab-opened` from an earlier snapshot).
 //! Host reports are low-frequency, so one process-wide gate suffices.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use intent_core::events::{BROWSER_TAB_CLOSED, BROWSER_TAB_OPENED, BROWSER_TAB_UPDATED};
 use intent_core::{
     now_iso, ActorType, AgentId, BrowserTab, BrowserTabInput, BrowserTabUpsertOutcome, ClientId,
-    Error, EventActor, Result, ReverseDispatchError, ReverseTarget, WorkspaceId,
+    Error, EventActor, PrincipalId, Result, ReverseDispatchError, ReverseTarget, WorkspaceId,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -67,6 +67,11 @@ pub(crate) trait BrowserTabRoutingExt {
         new_host: &ClientId,
     ) -> Result<()>;
     async fn browser_tab_force_close(&self, tab_id: &str) -> Result<Option<BrowserTab>>;
+    async fn browser_tabs_rehome_superseded(
+        &self,
+        client_id: &ClientId,
+        superseded: Vec<ClientId>,
+    ) -> Result<usize>;
 }
 
 impl BrowserTabRoutingExt for Services {
@@ -326,6 +331,94 @@ impl BrowserTabRoutingExt for Services {
             .await;
         }
         Ok(closed)
+    }
+
+    /// `client.hello` follow-up (intent-hq/intent#8045): move the open tabs
+    /// still hosted by `superseded` — earlier ids of the hello'd device, which
+    /// the transport has already limited to ids the caller may act as — onto
+    /// `client_id`, publishing one `browser:tab-updated { changes: {
+    /// hostClientId, displayed?: null } }` per moved tab. Returns how many
+    /// tabs moved.
+    ///
+    /// Guards, each failing closed:
+    /// - **Liveness.** A superseded id with a live hello'd connection keeps
+    ///   its tabs — it is still an active host. Without a reverse registry
+    ///   liveness is unknown, so nothing moves.
+    /// - **No change of who may act as the host.** Besides the
+    ///   administrator, only principal `P` may hello as `P:…`. An id's
+    ///   *namespace owner* is its head segment when that names a principal of
+    ///   this daemon, else none (prefixes left by other backends' principals
+    ///   add no one). A superseded id moves only when its namespace owner
+    ///   equals `client_id`'s, so a move neither hands an administrator-only
+    ///   host to a collaborator nor takes a collaborator's host away.
+    async fn browser_tabs_rehome_superseded(
+        &self,
+        client_id: &ClientId,
+        superseded: Vec<ClientId>,
+    ) -> Result<usize> {
+        if superseded.is_empty() {
+            return Ok(0);
+        }
+        let Some(dispatch) = self.feature_reverse_dispatch() else {
+            return Ok(0);
+        };
+        let live: HashSet<ClientId> = dispatch
+            .live_clients()
+            .into_iter()
+            .map(|c| c.client_id)
+            .collect();
+        let mut candidates: Vec<ClientId> = superseded
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let head = |id: &ClientId| id.as_str().split_once(':').map(|(h, _)| h.to_string());
+        let heads: Vec<PrincipalId> = std::iter::once(client_id)
+            .chain(candidates.iter())
+            .filter_map(head)
+            .map(PrincipalId::from_string)
+            .collect();
+        let principals: HashSet<String> = self
+            .store()
+            .get_principals(&heads)
+            .await?
+            .into_iter()
+            .map(|p| p.id.0)
+            .collect();
+        let owner = |id: &ClientId| head(id).filter(|h| principals.contains(h));
+        let target_owner = owner(client_id);
+        candidates.retain(|id| owner(id) == target_owner);
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let _gate = self.feature_browser_tab_gate().lock().await;
+        let moved = self
+            .store()
+            .reassign_browser_tabs_from_hosts(client_id, &candidates)
+            .await?;
+        let mut claimed_workspaces: Vec<&WorkspaceId> = moved
+            .iter()
+            .filter(|(tab, _)| tab.owner_agent_id.is_some())
+            .map(|(tab, _)| &tab.workspace_id)
+            .collect();
+        claimed_workspaces.sort();
+        claimed_workspaces.dedup();
+        for workspace in &claimed_workspaces {
+            self.feature_desktop().assignment_changed(workspace);
+        }
+        for (tab, changes) in &moved {
+            publish_event(
+                self.feature_event_bus(),
+                tab_event(BROWSER_TAB_UPDATED, client_id, tab, Some(changes)),
+            )
+            .await;
+        }
+        if !claimed_workspaces.is_empty() {
+            self.feature_desktop().changed.notify_waiters();
+        }
+        Ok(moved.len())
     }
 }
 

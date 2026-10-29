@@ -273,8 +273,12 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
     }
 }
 
-/// Identity changes do not migrate persistent pins, tab hosts or old drafts.
-/// Safe recovery has to be explicit: a common suffix is not ownership proof.
+/// Identity changes do not migrate persistent pins, tab hosts or old drafts on
+/// their own: routing, pins and drafts never resolve an id by a common suffix,
+/// which is not ownership proof. The one implicit move is the guarded
+/// `client.hello` rehome of open tabs from superseded ids
+/// (`hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts`), which
+/// leaves pins and drafts alone.
 #[tokio::test]
 async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts() {
     use intent_core::{AgentId, ReverseTarget};
@@ -398,6 +402,10 @@ async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
         "x:live-old",
         "desktop",
         "p-bob:desktop",
+        "p-bob:bobs-device",
+        "zzz:p-bob:bobs-device",
+        "user-old",
+        "x:user-old",
     ] {
         store
             .upsert_client(
@@ -420,10 +428,16 @@ async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
     let mut stranded = input(&ws, "stranded");
     stranded.owner_agent_id = Some(AgentId::from_string("agent-1"));
     stranded.visibility = BrowserTabVisibility::Hidden;
+    store
+        .set_workspace_browser_client(&ws, Some(&ClientId::from_string("60420340")))
+        .await
+        .expect("pin");
     for (host, tab) in [
         ("60420340", stranded),
         ("live-old", input(&ws, "live-tab")),
         ("desktop", input(&ws, "admin-tab")),
+        ("p-bob:bobs-device", input(&ws, "bob-tab")),
+        ("user-old", input(&ws, "user-tab")),
     ] {
         services
             .browser_tab_upsert(ClientId::from_string(host), tab)
@@ -459,6 +473,11 @@ async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
     let row = store.get_browser_tab("stranded").await.unwrap().unwrap();
     assert_eq!(row.host_client_id, current);
     assert_eq!(row.owner_agent_id, Some(AgentId::from_string("agent-1")));
+    assert_eq!(
+        store.workspace_browser_client(&ws).await.unwrap(),
+        Some(ClientId::from_string("60420340")),
+        "pins are never migrated implicitly"
+    );
 
     let live = services
         .rehome_superseded_browser_tabs(
@@ -496,5 +515,52 @@ async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
             .host_client_id
             .as_str(),
         "desktop"
+    );
+
+    let narrowed = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("zzz:p-bob:bobs-device"),
+            vec![ClientId::from_string("p-bob:bobs-device")],
+        )
+        .await
+        .expect("narrowed rehome");
+    assert_eq!(narrowed, 0, "p-bob could not hello as the new id");
+    assert_eq!(
+        store
+            .get_browser_tab("bob-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "p-bob:bobs-device"
+    );
+
+    let unclaimed = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:user-old"),
+            vec![ClientId::from_string("user-old")],
+        )
+        .await
+        .expect("unclaimed rehome");
+    assert_eq!(unclaimed, 1, "unclaimed tabs move too");
+
+    let blind = crate::test_runtime::with_runtime(Services::new(store.clone()));
+    let mut seed = input(&ws, "blind-tab");
+    seed.owner_agent_id = None;
+    services
+        .browser_tab_upsert(ClientId::from_string("user-old"), seed)
+        .await
+        .expect("seed blind tab");
+    assert_eq!(
+        blind
+            .rehome_superseded_browser_tabs(
+                ClientId::from_string("x:user-old"),
+                vec![ClientId::from_string("user-old")],
+            )
+            .await
+            .expect("blind rehome"),
+        0,
+        "without a reverse registry liveness is unknown: nothing moves"
     );
 }
