@@ -643,7 +643,7 @@ async fn node_runner_reports_a_failed_checkout_as_the_agents_exit() {
 const CANARY: &str = "canary-profile-secret-5b1e";
 
 /// A launch with the selected profile's overlay, as head sends it.
-fn launch_with_profile(id: &str, env: Value) -> LaunchCommand {
+fn launch_with_profile(id: &str, env: &Value) -> LaunchCommand {
     LaunchCommand {
         profile_env: Some(intent_core::node_link::LaunchProfileEnv(json!({
             "providerRef": "codex@work",
@@ -713,7 +713,7 @@ async fn node_runner_applies_the_profile_with_local_launch_precedence_and_node_h
     h.runner
         .launch(launch_with_profile(
             "a1",
-            json!([
+            &json!([
                 { "key": "CODEX_HOME", "value": "~/.codex-work" },
                 { "key": "CODEX_ACCESS_TOKEN", "value": CANARY },
                 { "key": "EMPTY_VALUE", "value": "" },
@@ -771,7 +771,7 @@ async fn node_runner_fails_a_launch_whose_profile_folder_is_missing_without_leak
         h.runner
             .launch(launch_with_profile(
                 id,
-                json!([
+                &json!([
                     { "key": key, "value": "~/.missing-account" },
                     { "key": "CODEX_ACCESS_TOKEN", "value": CANARY },
                 ]),
@@ -802,7 +802,7 @@ async fn node_runner_refuses_a_malformed_profile_overlay() {
     let Some(h) = harness(1, &["--dump-env"]) else {
         return;
     };
-    let mut command = launch_with_profile("a1", json!([]));
+    let mut command = launch_with_profile("a1", &json!([]));
     command.profile_env = Some(intent_core::node_link::LaunchProfileEnv(json!({
         "providerRef": "codex@work",
         "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }],
@@ -824,7 +824,7 @@ async fn node_runner_keeps_profile_secrets_out_of_logs_and_the_journal() {
     h.runner
         .launch(launch_with_profile(
             "a1",
-            json!([{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }]),
+            &json!([{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }]),
         ))
         .await;
     h.runner

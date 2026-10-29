@@ -1331,9 +1331,9 @@ mod launch {
     /// account directories as typed (the node expands `~`).
     #[tokio::test]
     async fn a_profile_agent_launches_with_the_profiles_environment() {
+        use intent_core::WorkspaceApi as _;
         let mut fake = FakeNode::start().await;
         let (f, mut link) = Fixture::start(&mut fake).await;
-        use intent_core::WorkspaceApi as _;
         let created = intent_core::caller::with_caller(
             intent_core::caller::Caller::Daemon,
             f.services.provider_profiles_create(json!({
