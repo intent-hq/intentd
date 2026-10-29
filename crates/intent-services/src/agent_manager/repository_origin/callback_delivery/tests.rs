@@ -9525,7 +9525,7 @@ mod genuine_native_startup {
                 .unwrap();
             let bus = crate::events::EventBus::new(store.clone());
             let services = Arc::new(
-                Services::new(store)
+                Services::new_isolated(store)
                     .with_settings_registry(registry)
                     .with_event_bus(bus.clone())
                     .with_workspaces_root(scratch.path().join("workspaces")),

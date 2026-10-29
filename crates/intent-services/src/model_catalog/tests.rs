@@ -1336,7 +1336,7 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
     if let Ok(key) = std::env::var(CHILD) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
-            let services = crate::Services::new(
+            let services = crate::Services::new_isolated(
                 intent_store::Store::open(&root.join("test.db"))
                     .await
                     .unwrap(),

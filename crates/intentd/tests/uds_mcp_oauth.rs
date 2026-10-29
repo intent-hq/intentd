@@ -108,7 +108,7 @@ async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );

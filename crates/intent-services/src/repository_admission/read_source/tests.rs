@@ -1315,7 +1315,7 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
             "https://github.com/Actual/Repository.git",
         ],
     );
-    let services = Services::new(git.store.clone());
+    let services = Services::new_isolated(git.store.clone());
     intent_core::caller::with_caller(Caller::Daemon, async {
         let captured = CapturedReview::capture(&services, git.workspace.id.clone(), 4);
         assert!(captured.host.is_err());
@@ -1351,7 +1351,7 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
 #[intent_test_macros::daemon_test]
 async fn implicit_github_read_of_metadata_workspace_resolves_automatic_selection() {
     let git = GitFixture::with_repository_metadata("actual", "repository").await;
-    let services = Services::new(git.store.clone());
+    let services = Services::new_isolated(git.store.clone());
     let root = git.root();
     intent_core::caller::with_caller(Caller::Daemon, async {
         assert_eq!(
@@ -1422,7 +1422,7 @@ async fn implicit_github_read_refuses_unresolved_historical_selection() {
             "https://github.com/Actual/Repository.git",
         ],
     );
-    let services = Services::new(git.store.clone());
+    let services = Services::new_isolated(git.store.clone());
     intent_core::caller::with_caller(Caller::Daemon, async {
         assert!(matches!(
             SelectionFacts::read(&services, &git.root())
@@ -1479,7 +1479,7 @@ async fn unresolved_history_refusal_logs_stage_and_reason() {
             "https://github.com/Actual/Repository.git",
         ],
     );
-    let services = Services::new(git.store.clone());
+    let services = Services::new_isolated(git.store.clone());
     let agent = AgentId::new();
     let session: AgentSession = serde_json::from_value(json!({
         "id":agent,"workspaceId":git.workspace.id,"name":"refusal-log",

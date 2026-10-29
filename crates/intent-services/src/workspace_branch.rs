@@ -89,7 +89,7 @@ mod tests {
             .await
             .unwrap();
         let bus = EventBus::new(store.clone());
-        (db, Services::new(store).with_event_bus(bus), ws)
+        (db, Services::new_isolated(store).with_event_bus(bus), ws)
     }
 
     #[intent_test_macros::daemon_test]

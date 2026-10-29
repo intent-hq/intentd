@@ -211,7 +211,7 @@ async fn boot() -> Fixture {
         .expect("seed agent");
 
     let services = Arc::new(intent_app::compose(
-        Services::new(store.clone())
+        Services::new_isolated(store.clone())
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone()),
     ));

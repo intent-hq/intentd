@@ -276,7 +276,7 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
             .admit_script_run(&h.ws, &id, "pending-restart")
             .await
             .unwrap();
-        let svc = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+        let svc = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
         svc.hydrate_scripts().await.unwrap();
         let recovered = svc
             .store()
@@ -298,7 +298,7 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
             -1
         );
         assert_eq!(svc.hydrate_scripts().await.unwrap(), 0);
-        let again = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+        let again = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
         again.hydrate_scripts().await.unwrap();
         let next = again
             .store()
@@ -429,7 +429,7 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
         "failed settlement publishes no invented result or archive"
     );
     assert_eq!(changes[0].data["action"], "created");
-    let recovered = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let recovered = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     assert_eq!(recovered.hydrate_scripts().await.unwrap(), 1);
     let row = recovered
         .store()
@@ -503,7 +503,7 @@ async fn retirement_dropped_run_waiter_finishes_and_shutdown_recovers_pending_st
         .await
         .unwrap()
         .unwrap();
-    let svc = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let svc = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     svc.hydrate_scripts().await.unwrap();
     let def = svc
         .store()
@@ -685,7 +685,7 @@ async fn retirement_shutdown_in_restart_teardown_recovers_only_predecessor() {
             .unwrap();
     }
     drop(guard);
-    let svc = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let svc = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     svc.hydrate_scripts().await.unwrap();
     let def = svc
         .store()
@@ -752,7 +752,7 @@ async fn retirement_shutdown_drains_known_result_before_returning() {
         settled.last_run.as_ref().unwrap().outcome,
         intent_core::ScriptRunOutcome::Succeeded
     );
-    let fresh = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let fresh = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     fresh.hydrate_scripts().await.unwrap();
     assert_eq!(
         fresh
@@ -784,7 +784,7 @@ async fn retirement_recovery_fences_a_pending_finalizer() {
         .unwrap();
     // A new daemon has independent admission locks. Its CAS consumes the same
     // durable token; a delayed old finalizer cannot overwrite the recovery.
-    let fresh = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let fresh = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     fresh.hydrate_scripts().await.unwrap();
     let recovered = fresh
         .store()
@@ -925,7 +925,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
         })
         .await
         .unwrap();
-        let fresh = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+        let fresh = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
         fresh.hydrate_scripts().await.unwrap();
         let after = fresh
             .store()
@@ -966,7 +966,7 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
         settled.last_run.unwrap().outcome,
         intent_core::ScriptRunOutcome::Succeeded
     );
-    let fresh = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
+    let fresh = crate::test_runtime::with_runtime(Services::new_isolated(Store::open(&h.tmp.path).await.unwrap()));
     fresh.hydrate_scripts().await.unwrap();
     let def = fresh
         .store()

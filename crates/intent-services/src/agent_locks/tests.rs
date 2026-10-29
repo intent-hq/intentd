@@ -95,7 +95,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws_id = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws_id)).await.unwrap();
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
     (tmp, services, ws_id)
 }
 
@@ -399,7 +399,7 @@ async fn setup_with_worktree(worktree: &std::path::Path) -> (TempDb, Services, W
     let mut ws = workspace(&ws_id);
     ws.worktree_path = Some(worktree.to_string_lossy().to_string());
     store.insert_workspace(&ws).await.unwrap();
-    (tmp, Services::new(store), ws_id)
+    (tmp, Services::new_isolated(store), ws_id)
 }
 
 /// Regression (intent-hq/intent#7266): only paths git still reports as

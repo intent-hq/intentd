@@ -534,7 +534,7 @@ impl Harness {
             Services::new_repository_fixture(store.clone(), secrets, Some(descriptor.clone()))
         } else {
             // The feature is compiled, but ordinary composition still has no fixture grant.
-            Services::new(store.clone())
+            Services::new_isolated(store.clone())
         };
         let services = Arc::new(
             services

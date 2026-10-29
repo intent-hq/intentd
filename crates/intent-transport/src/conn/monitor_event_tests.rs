@@ -182,7 +182,7 @@ async fn check_retirement(action: &str, wss: bool) {
     };
     assert!(store.insert_pr_monitor(&row).await.unwrap());
     let bus = EventBus::new(store.clone());
-    let services = Arc::new(Services::new(store.clone()).with_event_bus(bus.clone()));
+    let services = Arc::new(Services::new_isolated(store.clone()).with_event_bus(bus.clone()));
     services.initialize_repository_wire().await.unwrap();
     let caller = Caller::Wire {
         principal_id: store.get_primary_principal().await.unwrap().id,
@@ -374,7 +374,7 @@ async fn check_chat_retirement(action: &str, wss: bool, progressive: bool) {
         .await
         .unwrap();
     let bus = EventBus::new(store.clone());
-    let services = Arc::new(Services::new(store.clone()).with_event_bus(bus.clone()));
+    let services = Arc::new(Services::new_isolated(store.clone()).with_event_bus(bus.clone()));
     services.initialize_repository_wire().await.unwrap();
     let caller = Caller::Wire {
         principal_id: store.get_primary_principal().await.unwrap().id,

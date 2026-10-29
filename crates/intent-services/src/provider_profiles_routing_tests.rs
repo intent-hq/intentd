@@ -42,7 +42,7 @@ impl Fixture {
         std::fs::create_dir_all(&specialists).unwrap();
         let registry =
             Arc::new(SettingsRegistry::load(data.join("config.toml")).expect("load registry"));
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_settings_registry(registry)
             .with_secret_store(Arc::new(InMemorySecretStore::default()))
             .with_specialist_dirs(Some(specialists.clone()), Some(specialists))

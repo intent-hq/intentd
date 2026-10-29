@@ -472,7 +472,7 @@ async fn removing_queued_monitor_wake_suppresses_durable_restart_delivery() {
     );
     svc.store.close().await;
     drop(svc);
-    let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+    let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     assert_eq!(restarted.rehydrate_agent_queues().await.unwrap(), 0);
     assert!(restarted.find_queued_message(&agent, &queued.id).is_none());
 }

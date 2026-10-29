@@ -160,7 +160,7 @@ async fn boot_with_limits(
     );
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);

@@ -73,7 +73,7 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
     let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");

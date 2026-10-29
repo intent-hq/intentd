@@ -259,10 +259,11 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         assert!(rows
             .iter()
             .any(|row| row.id == event.id && row.data == event.data));
-        let reloaded = crate::test_runtime::with_runtime(Services::new(svc.store().clone()))
-            .with_settings_registry(Arc::new(
-                intent_services::feature_api::SettingsRegistry::load(path.clone()).unwrap(),
-            ));
+        let reloaded =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()))
+                .with_settings_registry(Arc::new(
+                    intent_services::feature_api::SettingsRegistry::load(path.clone()).unwrap(),
+                ));
         assert_eq!(
             with_caller(caller(&member), reloaded.host_execution_context())
                 .await
@@ -586,8 +587,9 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
     assert_eq!(saved[0].workspace_id, WorkspaceId::chief().as_str());
     assert_eq!(saved[0].command, "echo protected");
 
-    let restarted =
-        crate::test_runtime::with_runtime(Services::new(Store::open(&tmp.path).await.unwrap()));
+    let restarted = crate::test_runtime::with_runtime(Services::new_isolated(
+        Store::open(&tmp.path).await.unwrap(),
+    ));
     assert_eq!(restarted.hydrate_scripts().await.unwrap(), 1);
     let restored = with_caller(Caller::Daemon, restarted.script_list(WorkspaceId::chief()))
         .await
