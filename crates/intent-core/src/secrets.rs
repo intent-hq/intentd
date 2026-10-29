@@ -910,7 +910,21 @@ mod tests {
         env.remove(SECRETS_FILE_ENV);
         env.set(FORBIDDEN_HOME, &home.0);
 
+        // A stale file at the old PID-only scratch location must not leak in.
+        let stale = std::env::temp_dir().join(format!(
+            "intentd-test-default-secrets-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(".secrets.json"), r#"{"test-only":"stale"}"#).unwrap();
+
         let store = FileSecretStore::new();
+        let _ = std::fs::remove_dir_all(&stale);
+        assert_eq!(
+            store.load("test-only").unwrap(),
+            None,
+            "the scratch store must start empty, never reopen a stale PID-keyed file"
+        );
         assert!(
             !store.path().starts_with(&home.0),
             "default store must be redirected, got {}",

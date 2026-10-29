@@ -230,6 +230,14 @@ mod tests {
                 .join("..")
                 .join("..")
                 .join("x"),
+            intent
+                .join("workspaces")
+                .join("ws")
+                .join("missing")
+                .join("..")
+                .join("..")
+                .join("..")
+                .join(".secrets.json"),
         ];
         let allowed = [
             intent.join("workspaces").join("ws").join("repo"),
