@@ -197,7 +197,12 @@ async fn watchdog_ends_control_once_the_workspace_is_archived_or_retired() {
         // One 5s watchdog tick, scaled for loaded hosts.
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(7));
-        while h.services.desktop.state(&h.agent) != DesktopState::Inactive {
+        // `desktop_end` drops the live session (state goes Inactive) before
+        // it records the end and sends the native `endControl`, so wait for
+        // the teardown call too or a loaded host races `assert_ended`.
+        while h.services.desktop.state(&h.agent) != DesktopState::Inactive
+            || end_calls(&h, &session_id) == 0
+        {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "watchdog left control active (retired={retired})"
