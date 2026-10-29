@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.73] - 2026-10-29
+
+### 🔧 Refactor
+
+- Remove unused provider access-token settings ([#2751](https://github.com/intent-hq/intentd/pull/2751))
+
+
+## [0.11.72] - 2026-10-29
+
+### 🚀 Features
+
+- *(browser)* Report the routed client as target on workspace.getBrowserClient ([#2788](https://github.com/intent-hq/intentd/pull/2788))
+
+### 🐛 Bug Fixes
+
+- *(models)* Report warningKind for missing CLI and npx on models.list ([#2787](https://github.com/intent-hq/intentd/pull/2787))
+- *(test)* Await one-off settlement before listing in out-of-band kill e2e ([#2785](https://github.com/intent-hq/intentd/pull/2785))
+
+
 ## [0.11.71] - 2026-10-28
 
 ### 📚 Documentation
