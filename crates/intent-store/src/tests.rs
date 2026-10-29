@@ -23,6 +23,7 @@ mod script_initialization;
 mod script_monitors;
 mod sharing;
 mod workspace_delete;
+mod workspace_label;
 mod workspace_retired;
 
 mod metadata_key_json;

@@ -66,6 +66,7 @@ changelog_include = [
     "intent-sourcecontrol",
     "intent-store",
     "intent-svc-remote",
+    "intent-svc-runtime",
     "intent-svc-transfer",
     "intent-transport",
 ]
@@ -168,6 +169,12 @@ version_group = "intentd"
 
 [[package]]
 name = "intent-svc-remote"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-svc-runtime"
 release = true
 git_only = true
 version_group = "intentd"

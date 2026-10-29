@@ -8,13 +8,7 @@
 //! per-item archive goldens; the sweeps emit through `harness::latest()`).
 
 use crate::harness::Harness;
-
-pub(crate) const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
-    unarchived. While it was archived, ";
-
-pub(crate) const RE_ARM_HOOKS: &str =
-    "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
-pub(crate) const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";
+use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 
 fn v2_7() -> &'static dyn Harness {
     let entry = crate::harness::resolve_entry("2.7");

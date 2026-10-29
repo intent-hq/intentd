@@ -849,6 +849,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "browserClientId",
             "defaultModel",
             "isRemote",
+            "label",
             "lastActivity",
             "mcpServerToggled",
             "members",

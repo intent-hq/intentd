@@ -164,18 +164,18 @@ Namespaces (index — full signatures in API below):
   ws.mr.* — pr aliases
 
 API:
-  ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
+  ws.help(namespace?) → string  // Offline API docs: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Robust to clients that truncate this description. Namespaces disabled in settings are omitted and error when requested.
 
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags, setupStatus }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary. `setupStatus` is `{ state, exitCode?, terminalId?, startedAt?, finishedAt? }` — the workspace setup script's stage: `pending` (worktree ready, script not yet resolved), `running` (script executing in terminal `terminalId` — the worktree is provisional until it finishes), `completed` (`exitCode` 0), `failed` (non-zero `exitCode`, or none when the spawn failed), `skipped` (no setup script), `unknown` (no record in this daemon lifetime, e.g. a workspace created before restart). Optional fields are omitted, never null.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
-  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
+  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the workspace card's status: one plain sentence, ideally under 15 words. Name what is being worked on and where it stands (no counts, check lists, or implementation details); this user-facing message does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the Assistant workspace.
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the Assistant workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the Assistant workspace.
   ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposalId, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
-  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path? }`; the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
+  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path?, link, markdownLink }` (share `markdownLink` to point the user at it); the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
 
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
@@ -251,7 +251,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // Your own queue returns `{ ok: false, refused: true, error, agentId, queueLength, queue: [] }`: messages arrive after the current turn through normal delivery. Other agents' full pending message queue is in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName?, author }` — `author` is always present: the resolved `{ principalId, login, displayName, avatarUrl }` on human-sent entries (which carry no agent attribution), `null` on agent-sent and automatic ones. Check it for an entry with your `fromAgentId` before sending again — the single-pending-message rule on `ws.agent.send` refuses a second send while one is pending.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected. This is the remediation when `ws.agent.send` / `ws.agent.sendToTask` refuse a second send under the single-pending-message rule: remove the pending entry, then re-send ONE combined message.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals. Your own queue retains its count with empty entries, including in workspace-wide results.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`). It covers active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
@@ -260,7 +260,7 @@ API:
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.resolveBlocker(reason) → { ok, resolved, reason }  // After confirming recovery, clear your own pending blocker with a nonblank evidence reason. Returns resolved:false for no blocker, a discussion, or repeat recovery. Preserves questions and other agents. Only a still-blocked linked task resumes; complete/cancelled tasks stay terminal. Ordinary automatic wakes do not clear foreground attention; a daemon-raised provider-stall blocker clears after the agent's next successful turn.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
-  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { gitRootId?, files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -302,13 +302,13 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
-  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: for `delayMs` hooks `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]); for `cron` hooks it defaults to and is capped at 7 days; a `runAt` hook's expiry is its fire time plus a 1h grace window. The TTL is persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it. A retired hook's script stays recoverable via `ws.hook.get(hookId)`, so re-arming with a fresh `ws.hook.schedule` call never requires keeping the code in context.
   ws.hook.list({ includeRetired? }?) → [hooks]  // List active workspace hooks from every agent. ACTIVE (scheduled|running) hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `code` (the hook script), `state`, `nextRunAt`, `expiresAt` (TTL deadline), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run). `includeRetired: true` appends the retired rows (dispatched|evicted|cancelled|expired) as a LIGHT projection — no `code`, `lastState`, or `lastLogs` — so read a retired hook's script with `ws.hook.get(hookId)`.
-  ws.hook.get(hookId) → hook  // One hook row by id — the FULL row including `code`, returned for retired hooks (dispatched|evicted|cancelled|expired) as well as active ones: the way to recover a retired hook's script so you can re-arm it with `ws.hook.schedule`.
+  ws.hook.get(hookId) → hook  // One FULL hook row by id, including `code`, for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
@@ -329,6 +329,7 @@ API:
     Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. `displayed` is a layout fact (visible AND its panel's active tab), not a paint guarantee, and is absent (unknown, not `false`) whenever the daemon holds no current host report for it. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result. Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) mount an unmounted tab on demand under one request deadline — succeeding with the same `warning` when the workspace is not in view — and otherwise fail as action-result errors with a structured `errorCode`: `workspace-not-visible`, `deadline-exhausted`, `still-loading`, `navigated-away`, or `not-painting` (capture timed out at its own cap or returned an empty image — `showTab` / `focusTab` it, then retry); `navigate` mounts on demand too but without the deadline, settle, or origin check, so of these codes it yields only `workspace-not-visible` (ownership and uncoded failures still apply).
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.listTabs(scope?) → [tabs]  // This workspace's tabs from the daemon registry, all clients. `scope` is `"mine"` | `"unclaimed"` | `"all"` (default `all`). Each entry carries the `listTabs` action's fields (`tabId`, `url`, `title?`, `ownerAgentId`, `ownerAgentName?`, `mode` + `width`/`height` when emulated, `visibility`) plus `hostClientId`, `hostName?`, and `hostConnected` naming the client that renders it. Same data as `ws.browser.exec([{ action: "listTabs", scope }])`, unwrapped to the bare array.
+  ws.browser.clients() → { clients, unpinned, workspace }  // Read-only: connected apps, their live connections, and where a browser request would go now. Each client lists `connections` (`connectionId`, `transport`, `connectedAt`, `canHostBrowser`; oldest first); `unpinned` is the default route and `workspace` this workspace's route with `source` (`workspace` pin, `desktop` control, claimed `tabs` host, or `default`). A route names `clientId` + `connectionId`, or has `connectionId: null` and an `error`. `clientId` matches `listTabs` `hostClientId`. Use it when `ws.browser.exec` times out.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
@@ -338,7 +339,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired).
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 
@@ -348,7 +349,7 @@ API:
   ws.file.delete(path) → { ok, path, deleted }  // Deletes a file. Directories must use other tooling.
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
-  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
+  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment into your working directory and returns the relative `path` to read it from. The attachment is referenced by an attachment notice in a message; the default destination is `.intent/attachments/` (git-ignored). Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
   ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements, pausedUntil?, adoptedFrom? }  // Watch a PR with the daemon’s shared merge checklist. PREFERRED PR watch: monitors `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) with the checklist — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `ancestry`, `branchUpdateRequired?`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`, `latestReviews?`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     Qualified PR/MR watches require addressed support from this session and daemon in addition to the captured `agentFeatures.prMonitor` switch. They are prepared but production-disabled; an installed alias or connected account alone is not support. Native polling needs neither gh nor glab. With support, use the same `gitRootId` or `target` options described under `ws.pr.snapshot`, for example `ws.mr.monitor(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Existing watches keep their original target/account through remote changes and restart; never re-register them against a new origin. Reconnect the original account for `reconnect-required`; restricted, disabled, unsupported or unresolved monitors do not permit a replacement-account fallback. Retained pending changes are not delivery confirmation: use the existing Check/Flush controls with a fresh check for explicit recovery. An unchanged check can leave pending changes intact; interrupted external work cannot be recalled or guaranteed exactly once.
@@ -363,7 +364,7 @@ API:
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // List your active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule). The result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable.
     Both observation aliases accept exactly one address selector when the session and daemon support addressed requests: `gitRootId: "registered-root-id"` (that root's saved review selection), or `target: { repository: { provider, instanceBaseUrl, projectPath }, kind, number }`. The target number must equal `prNumber`, a positive JavaScript-safe project-local PR number or MR iid. Do not combine selectors or pass a null new selector. `repo: "owner/name"` remains the legacy GitHub.com override, including through `ws.mr`; omitted selection must never be guessed from alias spelling. A per-call target changes no saved selection or existing watch.
     Explicit GitLab example (requires addressed support): `ws.mr.snapshot(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Mixed-forge comparison: `ws.pr.snapshot(7, { repo: "team/app" })` reads GitHub.com PR #7; the explicit GitLab target reads MR !7 in a different project even though the number is the same. Preserve nested paths, instance ports/prefixes, returned `resource`, `monitorAvailability` and URLs; never manufacture a GitHub link for an MR.
     On structured `selection-required` or `repository-unavailable`, read current authorized repository context and ask for a root/target selection; do not discard unresolved candidates, prefer origin or retry a different forge. Connection/capability changes require a fresh observation, not a rewritten old target. Reconnect the original account through the existing connection settings when required. Native reads need neither gh nor glab; capability support, current access and CLI login are separate. Unknown/restricted facts stay unknown, not zero or merge permission.
@@ -441,18 +442,18 @@ Namespaces (index — full signatures in API below):
   ws.mr.* — pr aliases
 
 API:
-  ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
+  ws.help(namespace?) → string  // Offline API docs: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Robust to clients that truncate this description. Namespaces disabled in settings are omitted and error when requested.
 
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags, setupStatus }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary. `setupStatus` is `{ state, exitCode?, terminalId?, startedAt?, finishedAt? }` — the workspace setup script's stage: `pending` (worktree ready, script not yet resolved), `running` (script executing in terminal `terminalId` — the worktree is provisional until it finishes), `completed` (`exitCode` 0), `failed` (non-zero `exitCode`, or none when the spawn failed), `skipped` (no setup script), `unknown` (no record in this daemon lifetime, e.g. a workspace created before restart). Optional fields are omitted, never null.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
-  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the user-facing workspace status message shown on the workspace card: one plain sentence, ideally under 15 words, naming what is being worked on and where it stands (no counts, check lists, or implementation details); does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
+  ws.workspace.setStatusMessage(message) → { ok, statusMessage }  // Set or clear the workspace card's status: one plain sentence, ideally under 15 words. Name what is being worked on and where it stands (no counts, check lists, or implementation details); this user-facing message does not change lifecycle `status` or task statuses. Pass an empty string or null to clear.
   ws.workspace.setStatusImage({ data, mimeType, originalName? } | null) → { ok, statusImageAssetId, url? }  // Set or clear the workspace status screenshot shown on the workspace card. `data` is base64 image bytes (a `data:` URL prefix is accepted), `mimeType` must be image/*. Pass null to clear. Unavailable in the Assistant workspace.
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the Assistant workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the Assistant workspace.
   ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposalId, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
-  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path? }`; the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
+  ws.workspace.applyProposal(proposalIdOrIdempotencyKey, { userRequested: true, title?, initialPrompt? }) → { ok, proposalId, outcome, workspace, initialAgent?, overrides?, alreadyResolved?, resolveWarning? }  // Apply one of YOUR OWN pending sibling-workspace proposals on the user's explicit chat instruction (`userRequested: true` is a required attestation). Creates exactly the workspace the proposal card would — `workspace` is `{ id, title, branch?, path?, link, markdownLink }` (share `markdownLink` to point the user at it); the stored idempotencyKey is reused, so agent Apply, card Apply and card Retry converge on one workspace — and marks the card applied. `title` / `initialPrompt` optionally override those two proposal fields (the result's `overrides` names them); repository, baseRef and specialist stay locked to the proposal. A proposal emitted in the CURRENT turn is pending only at turn end, so end your turn and wait for the user's instruction first. An already-applied id returns `alreadyResolved: true` without creating again; a dismissed one is refused; address a resolved proposal by proposalId — the idempotencyKey only matches while pending. Foreground top-level agents only.
 
   ws.app.agents.list({ workspaceId?, includeCompleted?, limit?, cursor? }?) → { threads, total, returned, nextCursor? }  // Assistant workspace only. Lists readable agent threads across app workspaces; metadata only, no transcript content. Defaults to 50 threads, max 200.
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Assistant workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
@@ -559,7 +560,7 @@ API:
     `defaultModel` is `{ provider, model, reasoningEffort? }` with bare `model` (what a no-`model` delegate would pin, including the effort it would apply; omitted when resolution yields the provider default); `modelOptions` is `[{ provider?, model, hint?, reasoningEffort? }]` with bare `model` (pass `provider` when the option pins one).
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Your own pending queue exposes queueLength with an empty queue and a queueNotice; messages arrive after the current turn.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals. Your own queue retains its count with empty entries, including in workspace-wide results.
-  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`). It covers active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
   ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
@@ -568,7 +569,7 @@ API:
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.resolveBlocker(reason) → { ok, resolved, reason }  // After confirming recovery, clear your own pending blocker with a nonblank evidence reason. Returns resolved:false for no blocker, a discussion, or repeat recovery. Preserves questions and other agents. Only a still-blocked linked task resumes; complete/cancelled tasks stay terminal. Ordinary automatic wakes do not clear foreground attention; a daemon-raised provider-stall blocker clears after the agent's next successful turn.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
-  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { gitRootId?, files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -608,13 +609,13 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, use `const {runId}=await ws.script.start(scriptId); if(!runId) throw new Error("Missing start runId"); const watch=await ws.script.monitor(scriptId,{ttlMs:600000,runId}); if(watch.ok) return {waiting:true,runId}; if(watch.reason!=="run-finished") return watch; const unavailable={waiting:false,runId,outputAvailable:false}; try { const before=await ws.script.status(scriptId); if(before.runId!==runId || watch.runId!==runId) return unavailable; const output=await ws.script.output(scriptId); const after=await ws.script.status(scriptId); return after.runId===runId ? {waiting:false,runId,outputAvailable:true,output} : unavailable; } catch { return unavailable; }` Only waiting:true means end the turn to await a wake. Require a nonempty start runId. A run-finished refusal requires immediate known-ID handling; never wait or rearm without that runId. For already-monitored follow the owner instruction. Attribute output to the refused run only when status-before.runId, refusal.runId and status-after.runId agree around the output read; missing/changed identity or any read failure means unavailable attribution. Read `ws.script.output(scriptId)` after an accepted wake. Choose TTL for the expected runtime plus margin. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: for `delayMs` hooks `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]); for `cron` hooks it defaults to and is capped at 7 days; a `runAt` hook's expiry is its fire time plus a 1h grace window. The TTL is persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it. A retired hook's script stays recoverable via `ws.hook.get(hookId)`, so re-arming with a fresh `ws.hook.schedule` call never requires keeping the code in context.
   ws.hook.list({ includeRetired? }?) → [hooks]  // List active workspace hooks from every agent. ACTIVE (scheduled|running) hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `code` (the hook script), `state`, `nextRunAt`, `expiresAt` (TTL deadline), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run). `includeRetired: true` appends the retired rows (dispatched|evicted|cancelled|expired) as a LIGHT projection — no `code`, `lastState`, or `lastLogs` — so read a retired hook's script with `ws.hook.get(hookId)`.
-  ws.hook.get(hookId) → hook  // One hook row by id — the FULL row including `code`, returned for retired hooks (dispatched|evicted|cancelled|expired) as well as active ones: the way to recover a retired hook's script so you can re-arm it with `ws.hook.schedule`.
+  ws.hook.get(hookId) → hook  // One FULL hook row by id, including `code`, for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
@@ -635,6 +636,7 @@ API:
     Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. `displayed` is a layout fact (visible AND its panel's active tab), not a paint guarantee, and is absent (unknown, not `false`) whenever the daemon holds no current host report for it. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result. Capture ops (`screenshot`, `getAccessibilityTree`, `evaluate`) mount an unmounted tab on demand under one request deadline — succeeding with the same `warning` when the workspace is not in view — and otherwise fail as action-result errors with a structured `errorCode`: `workspace-not-visible`, `deadline-exhausted`, `still-loading`, `navigated-away`, or `not-painting` (capture timed out at its own cap or returned an empty image — `showTab` / `focusTab` it, then retry); `navigate` mounts on demand too but without the deadline, settle, or origin check, so of these codes it yields only `workspace-not-visible` (ownership and uncoded failures still apply).
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.listTabs(scope?) → [tabs]  // This workspace's tabs from the daemon registry, all clients. `scope` is `"mine"` | `"unclaimed"` | `"all"` (default `all`). Each entry carries the `listTabs` action's fields (`tabId`, `url`, `title?`, `ownerAgentId`, `ownerAgentName?`, `mode` + `width`/`height` when emulated, `visibility`) plus `hostClientId`, `hostName?`, and `hostConnected` naming the client that renders it. Same data as `ws.browser.exec([{ action: "listTabs", scope }])`, unwrapped to the bare array.
+  ws.browser.clients() → { clients, unpinned, workspace }  // Read-only: connected apps, their live connections, and where a browser request would go now. Each client lists `connections` (`connectionId`, `transport`, `connectedAt`, `canHostBrowser`; oldest first); `unpinned` is the default route and `workspace` this workspace's route with `source` (`workspace` pin, `desktop` control, claimed `tabs` host, or `default`). A route names `clientId` + `connectionId`, or has `connectionId: null` and an `error`. `clientId` matches `listTabs` `hostClientId`. Use it when `ws.browser.exec` times out.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
@@ -644,7 +646,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired).
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 
@@ -654,7 +656,7 @@ API:
   ws.file.delete(path) → { ok, path, deleted }  // Deletes a file. Directories must use other tooling.
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
-  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
+  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment into your working directory and returns the relative `path` to read it from. The attachment is referenced by an attachment notice in a message; the default destination is `.intent/attachments/` (git-ignored). Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
   ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements, pausedUntil?, adoptedFrom? }  // Watch a PR with the daemon’s shared merge checklist. PREFERRED PR watch: monitors `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) with the checklist — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `ancestry`, `branchUpdateRequired?`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`, `latestReviews?`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     Qualified PR/MR watches require addressed support from this session and daemon in addition to the captured `agentFeatures.prMonitor` switch. They are prepared but production-disabled; an installed alias or connected account alone is not support. Native polling needs neither gh nor glab. With support, use the same `gitRootId` or `target` options described under `ws.pr.snapshot`, for example `ws.mr.monitor(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Existing watches keep their original target/account through remote changes and restart; never re-register them against a new origin. Reconnect the original account for `reconnect-required`; restricted, disabled, unsupported or unresolved monitors do not permit a replacement-account fallback. Retained pending changes are not delivery confirmation: use the existing Check/Flush controls with a fresh check for explicit recovery. An unchanged check can leave pending changes intact; interrupted external work cannot be recalled or guaranteed exactly once.
@@ -669,7 +671,7 @@ API:
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // List your active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule). The result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable.
     Both observation aliases accept exactly one address selector when the session and daemon support addressed requests: `gitRootId: "registered-root-id"` (that root's saved review selection), or `target: { repository: { provider, instanceBaseUrl, projectPath }, kind, number }`. The target number must equal `prNumber`, a positive JavaScript-safe project-local PR number or MR iid. Do not combine selectors or pass a null new selector. `repo: "owner/name"` remains the legacy GitHub.com override, including through `ws.mr`; omitted selection must never be guessed from alias spelling. A per-call target changes no saved selection or existing watch.
     Explicit GitLab example (requires addressed support): `ws.mr.snapshot(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Mixed-forge comparison: `ws.pr.snapshot(7, { repo: "team/app" })` reads GitHub.com PR #7; the explicit GitLab target reads MR !7 in a different project even though the number is the same. Preserve nested paths, instance ports/prefixes, returned `resource`, `monitorAvailability` and URLs; never manufacture a GitHub link for an MR.
     On structured `selection-required` or `repository-unavailable`, read current authorized repository context and ask for a root/target selection; do not discard unresolved candidates, prefer origin or retry a different forge. Connection/capability changes require a fresh observation, not a rewritten old target. Reconnect the original account through the existing connection settings when required. Native reads need neither gh nor glab; capability support, current access and CLI login are separate. Unknown/restricted facts stay unknown, not zero or merge permission.
@@ -1099,23 +1101,83 @@ pub fn condensed_workspace_api_description(
             // full text stays reachable via ws.help("<namespace>").
             continue;
         }
-        out.push_str(condensed_method_line(line));
-        out.push('\n');
+        if let Some(condensed) = condensed_method_line(line) {
+            out.push_str(&condensed);
+            out.push('\n');
+        }
     }
     inject_model_options(&out, model_options).unwrap_or(out)
 }
 
-/// One `API:` section line of the condensed rendering: a method doc line has
-/// its `//` summary cut at the first sentence end; any other line (blank
-/// separators, lines without a comment) passes through verbatim.
-fn condensed_method_line(line: &str) -> &str {
+/// Summary prefix of an alias method line (`ws.mr.*` → `ws.pr.*`). The
+/// condensed rendering drops these lines: the namespace index entry already
+/// names the alias, and the target's line carries the signature.
+const ALIAS_SUMMARY_PREFIX: &str = "Alias of `";
+
+/// One `API:` section line of the condensed rendering, or `None` when the
+/// line is dropped. A method doc line loses three things, all still served
+/// by `ws.help("<namespace>")`:
+/// - alias lines (summary starting with [`ALIAS_SUMMARY_PREFIX`]) are dropped;
+/// - nested objects in the return shape collapse to `{…}`
+///   ([`collapse_nested_return_shape`]);
+/// - the `//` summary is cut at the first sentence end.
+///
+/// Any other line (blank separators, lines without a comment) passes through
+/// verbatim.
+fn condensed_method_line(line: &str) -> Option<Cow<'_, str>> {
     let Some(sep) = line.find("  // ") else {
-        return line;
+        return Some(Cow::Borrowed(line));
     };
     let comment_start = sep + "  // ".len();
-    match first_sentence_end(&line[comment_start..]) {
-        Some(end) if comment_start + end < line.len() => &line[..comment_start + end],
-        _ => line,
+    let comment = &line[comment_start..];
+    if comment.starts_with(ALIAS_SUMMARY_PREFIX) {
+        return None;
+    }
+    let comment = match first_sentence_end(comment) {
+        Some(end) if end < comment.len() => &comment[..end],
+        _ => comment,
+    };
+    let signature = collapse_nested_return_shape(&line[..sep]);
+    if matches!(signature, Cow::Borrowed(_)) && comment_start + comment.len() == line.len() {
+        return Some(Cow::Borrowed(line));
+    }
+    Some(Cow::Owned(format!("{signature}  // {comment}")))
+}
+
+/// Collapse every object nested inside a method signature's return shape
+/// (the text after ` → `) to `{…}`, keeping the top-level field names:
+/// `→ { a, b: { c, d } }` becomes `→ { a, b: {…} }`. Arguments are left
+/// untouched. Signatures without nested return objects are returned as-is.
+fn collapse_nested_return_shape(signature: &str) -> Cow<'_, str> {
+    const ARROW: &str = " → ";
+    let Some(arrow) = signature.find(ARROW) else {
+        return Cow::Borrowed(signature);
+    };
+    let (head, shape) = signature.split_at(arrow + ARROW.len());
+    let mut depth = 0usize;
+    let mut collapsed = false;
+    let mut out = String::with_capacity(signature.len());
+    out.push_str(head);
+    for ch in shape.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth == 2 {
+                    out.push_str("{…}");
+                    collapsed = true;
+                }
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth < 2 && !(ch == '}' && depth == 1) {
+            out.push(ch);
+        }
+    }
+    if collapsed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(signature)
     }
 }
 
@@ -1368,13 +1430,14 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_workspace_api_description, condensed_workspace_api_description, denied_feature,
-        first_sentence_end, help_index, help_namespace, workspace_api_description,
-        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
-        HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
-        PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
-        PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
+        collapse_nested_return_shape, compact_workspace_api_description,
+        condensed_workspace_api_description, denied_feature, first_sentence_end, help_index,
+        help_namespace, workspace_api_description, workspace_api_description_with_model_options,
+        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
+        ALIAS_SUMMARY_PREFIX, HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF,
+        NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF,
+        PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS,
+        PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
         SCRIPT_COMPLETION_HOOK_LINE, SCRIPT_RUN_MONITOR_RECIPE, TASK_GRAPH_BATCH_FORM_LINE,
         TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
         TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
@@ -2078,6 +2141,17 @@ mod tests {
         )
     }
 
+    // A full method line as the condensed rendering must start it: `None`
+    // for a dropped alias line, otherwise the line with its return shape
+    // collapsed (the summary is checked separately for its sentence cut).
+    fn condensed_reference_line(line: &str) -> Option<String> {
+        let (signature, rest) = line.split_at(line.find("  // ").unwrap_or(line.len()));
+        if rest.starts_with(&format!("  // {ALIAS_SUMMARY_PREFIX}")) {
+            return None;
+        }
+        Some(format!("{}{rest}", collapse_nested_return_shape(signature)))
+    }
+
     // The condensed rendering is a pure derivation of the full assembly:
     // preamble and Examples block byte-identical, every indent-2 method line
     // present with its signature intact and its summary either whole or cut
@@ -2110,10 +2184,15 @@ mod tests {
                     "chief={is_chief}: Examples block drifted"
                 );
 
-                let full_methods: Vec<&str> = full_api
+                let full_methods: Vec<String> = full_api
                     .lines()
                     .filter(|l| l.starts_with("  ws."))
+                    .filter_map(condensed_reference_line)
                     .collect();
+                assert!(
+                    !cond_api.contains(&format!("  // {ALIAS_SUMMARY_PREFIX}")),
+                    "chief={is_chief}: condensed API section kept an alias line"
+                );
                 let cond_methods: Vec<&str> = cond_api
                     .lines()
                     .filter(|l| l.starts_with("  ws."))
@@ -2175,6 +2254,9 @@ mod tests {
                     if !line.starts_with("  ws.") {
                         continue;
                     }
+                    let Some(line) = condensed_reference_line(line) else {
+                        continue;
+                    };
                     let has_continuation = full_lines.peek().is_some_and(|next| {
                         let t = next.trim_start();
                         !t.is_empty() && next.len() - t.len() >= 4
@@ -2182,7 +2264,7 @@ mod tests {
                     if has_continuation {
                         let cond_line = cond_methods
                             .iter()
-                            .find(|c| line.starts_with(*c))
+                            .find(|c| line.starts_with(**c))
                             .unwrap_or_else(|| {
                                 panic!("chief={is_chief}: no condensed line for:\n{line}")
                             });
@@ -2206,9 +2288,49 @@ mod tests {
         }
     }
 
-    // Keep the existing system-prompt budget independently of desktop control.
-    // Its signatures get a bounded incremental allowance; the compact
-    // tool description itself must still fit the unchanged 2000-byte limit.
+    /// Byte budget for the default condensed `workspace_api` description —
+    /// the "Workspace API Reference" every agent carries in its system
+    /// prompt. Set on 2026-10-27 at the measured 22,528 bytes plus a
+    /// 972-byte allowance for future calls (about six condensed method lines
+    /// at ~150 bytes each). Before this, the limit was raised by a few
+    /// hundred bytes in nine PRs (intentd#1641 … #2749), which made it a
+    /// ratchet rather than a budget: win room back before raising it.
+    const CONDENSED_DESCRIPTION_BUDGET: usize = 23_500;
+
+    /// Bytes desktop-control signatures may add on top of the rest.
+    const DESKTOP_SIGNATURES_ALLOWANCE: usize = 1_500;
+
+    /// Advice shared by the budget failure messages: what to try, in order.
+    fn condensed_budget_options(condensed: &str) -> String {
+        use std::fmt::Write as _;
+        let mut lines: Vec<&str> = condensed
+            .lines()
+            .filter(|l| l.starts_with("  ws."))
+            .collect();
+        lines.sort_by_key(|l| std::cmp::Reverse(l.len()));
+        let mut largest = String::new();
+        for line in lines.iter().take(5) {
+            let name = line.trim_start().split('(').next().unwrap_or(line);
+            let _ = write!(largest, "\n      {:>4} bytes  {name}", line.len());
+        }
+        format!(
+            "Options, in order:\n  \
+             1. Shorten the FIRST sentence of the new `//` summary. Only that sentence \
+             reaches the prompt; later sentences and continuation lines are dropped \
+             here and still served by ws.help(\"<namespace>\").\n  \
+             2. Keep return shapes flat: nested objects already collapse to `{{…}}`, \
+             but long top-level field lists do not.\n  \
+             3. Win back room elsewhere. Largest condensed lines:{largest}\n  \
+             4. Only if 1–3 cannot work, raise CONDENSED_DESCRIPTION_BUDGET in this PR \
+             and say why in the PR body.\n\
+             Check locally before pushing (CI runs this only in coverage-changed):\n  \
+             make test-select E='test(condensed_description_size_budget)'"
+        )
+    }
+
+    // Keeps the system-prompt reference a real budget: the failure message
+    // reports size, budget and overrun with the options above, and a pass
+    // prints the remaining headroom (visible with `--no-capture`).
     #[test]
     fn condensed_description_size_budget() {
         let features = AgentFeaturesSettings::default();
@@ -2221,13 +2343,80 @@ mod tests {
             },
             &[],
         );
-        assert!(without_desktop.len() < 24_000);
+        let desktop = condensed.len() - without_desktop.len();
         assert!(
-            condensed.len() - without_desktop.len() <= 1_500,
-            "desktop signatures exceed their 1500-byte allowance: {}",
-            condensed.len() - without_desktop.len()
+            desktop <= DESKTOP_SIGNATURES_ALLOWANCE,
+            "desktop-control signatures add {desktop} bytes to the condensed description, \
+             over their {DESKTOP_SIGNATURES_ALLOWANCE}-byte allowance by {} bytes.\n{}",
+            desktop - DESKTOP_SIGNATURES_ALLOWANCE,
+            condensed_budget_options(&condensed),
         );
-        assert!(condensed.len() < 25_500, "{}", condensed.len());
+        let size = condensed.len();
+        assert!(
+            size <= CONDENSED_DESCRIPTION_BUDGET,
+            "the condensed workspace_api description (system-prompt \"Workspace API \
+             Reference\") is {size} bytes, over its {CONDENSED_DESCRIPTION_BUDGET}-byte \
+             budget by {} bytes.\n{}",
+            size - CONDENSED_DESCRIPTION_BUDGET,
+            condensed_budget_options(&condensed),
+        );
+        eprintln!(
+            "condensed workspace_api description: {size} / {CONDENSED_DESCRIPTION_BUDGET} \
+             bytes, {} bytes of headroom (desktop signatures {desktop} / \
+             {DESKTOP_SIGNATURES_ALLOWANCE})",
+            CONDENSED_DESCRIPTION_BUDGET - size,
+        );
+    }
+
+    // Nested return objects collapse to `{…}` at any depth, top-level field
+    // names and arguments stay, and a signature with nothing to collapse is
+    // borrowed unchanged (including the same-length `{ x }` → `{…}` case).
+    #[test]
+    fn collapse_nested_return_shape_keeps_top_level_fields() {
+        let cases = [
+            (
+                "ws.a.b({ x? }) → { a, b: { c, d: { e } }, f? }",
+                "ws.a.b({ x? }) → { a, b: {…}, f? }",
+            ),
+            (
+                "ws.a.b() → { servers: [{ id, name }] }",
+                "ws.a.b() → { servers: [{…}] }",
+            ),
+            ("ws.a.b() → { a: { x } }", "ws.a.b() → { a: {…} }"),
+            (
+                "ws.a.b({ c: { d } }) → { ok }",
+                "ws.a.b({ c: { d } }) → { ok }",
+            ),
+            ("ws.a.b() → [{ id, title }]", "ws.a.b() → [{ id, title }]"),
+            ("ws.a.b(x)", "ws.a.b(x)"),
+        ];
+        for (signature, expected) in cases {
+            let collapsed = collapse_nested_return_shape(signature);
+            assert_eq!(collapsed, expected);
+            assert_eq!(
+                matches!(collapsed, Cow::Borrowed(_)),
+                signature == expected,
+                "only a changed signature may allocate: {signature}"
+            );
+        }
+    }
+
+    // The condensed reference drops `ws.mr.*` alias lines and collapses the
+    // `ws.pr.snapshot` nested return shape, while the full text and
+    // ws.help("pr") keep both, and the condensed index still names the
+    // alias namespace.
+    #[test]
+    fn condensed_description_drops_aliases_and_nested_shapes() {
+        let features = AgentFeaturesSettings::default();
+        let full = workspace_api_description(false, &features);
+        let condensed = condensed_workspace_api_description(false, &features, &[]);
+        assert!(full.contains("  ws.mr.snapshot("));
+        assert!(!condensed.contains("  ws.mr.snapshot("));
+        assert!(condensed.contains("ws.mr.* — pr aliases"));
+        assert!(full.contains("checks: { total,"));
+        assert!(condensed.contains("checks: {…}, reviews: {…}"));
+        let help = help_namespace(false, &features, false, "pr").unwrap();
+        assert!(help.contains("requirements: { state,"), "{help}");
     }
 
     // `[agentFeatures]` gating composes: a disabled namespace is absent from
@@ -3703,7 +3892,8 @@ mod desktop_feature_tests {
 mod script_recipe_tests {
     use super::SCRIPT_RUN_MONITOR_RECIPE;
     use serde_json::json;
-    // Mirrored from intent docs/protocol/fixtures/scripts/compact.json at 6f6ecc27.
+    // Copy of intent docs/protocol/fixtures/scripts/compact.json; its lock
+    // tests/fixtures/scripts-compact.lock.json names the monorepo commit.
     const COMPACT: &str = include_str!("../../tests/fixtures/scripts-compact.json");
     #[tokio::test]
     async fn quick_exit_recipe_waits_only_for_active_success_and_checks_both_run_identities() {

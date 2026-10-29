@@ -346,11 +346,11 @@ async fn test_script_list_bootstrap_from_repo() {
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
+    let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
         Services::new(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
-    );
+    ));
 
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
@@ -495,8 +495,9 @@ async fn concurrent_script_list_no_duplicates() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
+        Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()),
+    ));
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");

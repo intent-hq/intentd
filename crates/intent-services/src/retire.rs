@@ -48,6 +48,8 @@ pub(crate) struct RevivedCheckout {
     pub(crate) previous_branch: String,
     pub(crate) branch: String,
     pub(crate) base_commit_sha: String,
+    /// The revive flip cleared the unchanged purge `statusMessage`.
+    pub(crate) cleared_purge_status: bool,
 }
 
 impl Services {
@@ -242,6 +244,7 @@ impl Services {
                             "retiredAt": ws.retired_at,
                             "archived": true,
                             "archivedAt": ws.archived_at,
+                            "statusMessage": ws.status_message,
                         }),
                     ),
                 )
@@ -299,9 +302,16 @@ impl Services {
     /// retire sweep) is detached and trashed first. Returns `None` when the
     /// row is no longer retired (nothing provisioned). On a failed row flip
     /// the new worktree and branch are removed again (best-effort).
+    ///
+    /// The flip also leaves the one-time folder-purged prompt notice
+    /// ([`crate::agent_manager::workspace_revived_prompt_notice`]) pending on
+    /// every agent session except `triggering_agent` (whose own turn carries
+    /// it), in the same store transaction, so no turn can observe the
+    /// revived workspace before its notice is durable.
     pub(crate) async fn revive_retired_checkout(
         &self,
         ws: &Workspace,
+        triggering_agent: Option<&AgentId>,
     ) -> Result<Option<RevivedCheckout>> {
         retire_supported(ws)?;
         // Same ownership proof as retire: revive detaches whatever sits at
@@ -367,9 +377,21 @@ impl Services {
             };
             drop(self.store_tasks.spawn_draining(removal));
         }
+        let notice =
+            crate::agent_manager::workspace_revived_prompt_notice(&previous_branch, &branch);
         let flipped = self
             .store
-            .revive_workspace_if_retired(&ws.id, &branch, Some(&sha), &now_iso())
+            .revive_workspace_if_retired_with_notice(
+                &ws.id,
+                &branch,
+                Some(&sha),
+                &now_iso(),
+                Some((
+                    intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY,
+                    &notice,
+                    triggering_agent,
+                )),
+            )
             .await;
         if !matches!(flipped, Ok(true)) {
             // Roll back the checkout this call provisioned: the row is not
@@ -403,6 +425,8 @@ impl Services {
             previous_branch,
             branch,
             base_commit_sha: sha,
+            cleared_purge_status: ws.status_message.as_deref()
+                == Some(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE),
         }))
     }
 

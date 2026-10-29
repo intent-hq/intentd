@@ -9395,6 +9395,19 @@ mod wsapi3_bindings_tests {
         assert!(text(&resp).contains("Note not found"));
     }
 
+    /// A bracketed title stays one Markdown link (shared escaping with the
+    /// workspace links).
+    #[tokio::test]
+    async fn note_create_markdown_link_escapes_brackets_in_the_title() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.create('Fix [beta]', 'x');").await;
+        let v = body(&resp);
+        assert_eq!(
+            v["markdownLink"],
+            json!(r"[Fix \[beta\]](intent://local/amber-forest/note/n-new)")
+        );
+    }
+
     #[tokio::test]
     async fn note_create_returns_link_and_markdown_link() {
         let (srv, api) = server();
@@ -9968,6 +9981,9 @@ mod wsapi6_bindings_tests {
         /// seam the production `Services::browser_exec` uses — so the JS
         /// dispatch tests exercise real shaping instead of canned replies.
         browser_exec_fe_envelope: Mutex<Option<Value>>,
+        /// When set, `browser_exec` fails with this internal error.
+        browser_exec_error: Mutex<Option<String>>,
+        browser_clients_calls: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -10080,6 +10096,9 @@ mod wsapi6_bindings_tests {
                 agent_id.map(|a| a.as_str().to_string()),
             ));
             let fe_envelope = self.browser_exec_fe_envelope.lock().unwrap().clone();
+            if let Some(error) = self.browser_exec_error.lock().unwrap().clone() {
+                return Box::pin(async move { Err(intent_core::Error::Internal(error)) });
+            }
             // Reference parity: a single-action batch yields the sole action's
             // envelope; multi-action yields `{ results: [...] }`. The fake
             // stands in for what the reverse channel would have returned.
@@ -10109,6 +10128,37 @@ mod wsapi6_bindings_tests {
                             .collect::<Vec<_>>()
                     }))
                 }
+            })
+        }
+
+        fn browser_clients(
+            &self,
+            ws: WorkspaceId,
+            agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.browser_clients_calls.lock().unwrap().push((
+                ws.as_str().to_string(),
+                agent_id.map(|a| a.as_str().to_string()),
+            ));
+            Box::pin(async {
+                Ok(json!({
+                    "clients": [{
+                        "clientId": "desktop-a",
+                        "name": "Desktop A",
+                        "canHostBrowser": true,
+                        "connections": [{
+                            "connectionId": 4,
+                            "transport": "wss",
+                            "connectedAt": "2026-10-27T09:00:00Z",
+                            "canHostBrowser": true,
+                        }],
+                    }],
+                    "unpinned": { "clientId": "desktop-a", "name": "Desktop A", "connectionId": 4 },
+                    "workspace": {
+                        "clientId": "desktop-a", "name": "Desktop A", "connectionId": 4,
+                        "source": "default",
+                    },
+                }))
             })
         }
     }
@@ -10163,6 +10213,20 @@ mod wsapi6_bindings_tests {
         assert!(v.is_array());
         assert_eq!(v[0]["id"], json!("sibling-1"));
         assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
+    }
+
+    /// Each sibling row carries a ready-made workspace link so agents can
+    /// reference the workspace by a clickable title instead of its bare ID.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rows_carry_workspace_links() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.crossWorkspace.listSiblings();").await;
+        let v = body(&resp);
+        assert_eq!(v[0]["link"], json!("intent://local/workspace/sibling-1"));
+        assert_eq!(
+            v[0]["markdownLink"],
+            json!("[Sib One](intent://local/workspace/sibling-1)")
+        );
     }
 
     /// `includeRetired` is strictly boolean: omission and explicit `false`
@@ -10639,6 +10703,84 @@ mod wsapi6_bindings_tests {
             // First line is the topic heading (`# Browser ...`).
             assert!(doc.starts_with("# Browser"), "topic {topic}: {doc:.40}");
         }
+    }
+
+    // `ws.browser.clients()`: the services snapshot passes through unchanged,
+    // scoped to the server's workspace, with no browser.exec dispatch.
+    #[tokio::test]
+    async fn browser_clients_returns_the_services_snapshot() {
+        let (srv, api) = server_with_caller("agent-77");
+        let resp = call(&srv, "return await ws.browser.clients();").await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let v = body(&resp);
+        assert_eq!(v["clients"][0]["connections"][0]["connectionId"], json!(4));
+        assert_eq!(v["unpinned"]["connectionId"], json!(4));
+        assert_eq!(v["workspace"]["source"], json!("default"));
+        assert_eq!(
+            *api.browser_clients_calls.lock().unwrap(),
+            vec![("amber-forest".to_string(), Some("agent-77".to_string()))]
+        );
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    // A timed-out `browser.exec` points to `ws.browser.clients()`; other
+    // failures are left as they were.
+    #[tokio::test]
+    async fn browser_exec_timeout_points_to_browser_clients() {
+        let (srv, api) = server();
+        *api.browser_exec_error.lock().unwrap() = Some(
+            "browser.exec: reverse request timed out: browser.exec: browser client \
+             \"Desktop A\" (desktop-a) on connection 4 over wss, connected \
+             2026-10-27T09:00:00Z did not accept or answer the request within 30s"
+                .to_string(),
+        );
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let message = text(&resp);
+        assert!(message.contains("on connection 4 over wss"), "{message}");
+        assert!(
+            message.contains("Call ws.browser.clients() to see this client's live connections"),
+            "{message}"
+        );
+
+        // An error the client itself returned (no daemon deadline suffix)
+        // gets no hint, even though its text says "timed out".
+        *api.browser_exec_error.lock().unwrap() =
+            Some("browser.exec: reverse request timed out: browser.exec".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        let message = text(&resp);
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("ws.browser.clients()"), "{message}");
+
+        *api.browser_exec_error.lock().unwrap() =
+            Some("browser.exec: no client connected".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        let message = text(&resp);
+        assert!(message.contains("no client connected"), "{message}");
+        assert!(!message.contains("ws.browser.clients()"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn browser_docs_overview_explains_timeouts_and_clients() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('overview');").await;
+        let v = body(&resp);
+        let doc = v.as_str().expect("docs return string");
+        assert!(doc.contains("## Troubleshooting Timeouts"));
+        assert!(doc.contains("ws.browser.clients()"));
+        assert!(doc.contains("reverse request timed out"));
     }
 
     #[tokio::test]
@@ -14487,6 +14629,11 @@ mod workspace_apply_proposal_tests {
         assert_eq!(out["workspace"]["title"], "Follow up");
         assert_eq!(out["workspace"]["branch"], "ws-new-branch");
         assert_eq!(out["workspace"]["path"], "/checkouts/ws-new");
+        assert_eq!(out["workspace"]["link"], "intent://local/workspace/ws-new");
+        assert_eq!(
+            out["workspace"]["markdownLink"],
+            "[Follow up](intent://local/workspace/ws-new)"
+        );
         assert_eq!(out["initialAgent"]["id"], "agent-new");
         assert!(
             out["initialAgent"].get("notificationsMuted").is_none(),

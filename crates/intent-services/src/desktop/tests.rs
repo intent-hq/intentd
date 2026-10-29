@@ -214,7 +214,8 @@ impl Harness {
                 ("providers.paths".into(), json!({"auggie":"/bin/sh"})),
             ])
             .unwrap();
-        let mut services = Services::new(store.clone());
+        let mut services =
+            crate::test_support::fake_runtime::FakeRuntime::install(Services::new(store.clone()));
         if let Some(root) = dirs.get(1) {
             services = services.with_workspaces_root(root.path().to_path_buf());
         }

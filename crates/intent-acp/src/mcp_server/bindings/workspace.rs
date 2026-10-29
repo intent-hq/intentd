@@ -658,7 +658,7 @@ async fn apply_proposal(
                     "workspace {} exists (it was created by this call), but the proposal had \
                      already been resolved '{persisted}' from the UI while it was being created; \
                      that resolution was kept and the card does not show applied — tell the user \
-                     the workspace exists",
+                     the workspace exists, linking it with `workspace.markdownLink`",
                     created.workspace.id.as_str()
                 )),
             ),
@@ -667,7 +667,8 @@ async fn apply_proposal(
         Err(e) => (
             PROPOSAL_OUTCOME_APPLIED.to_string(),
             Some(format!(
-                "workspace {} was created but the proposal could not be marked applied: {e}",
+                "workspace {} was created but the proposal could not be marked applied: {e}; \
+                 link it for the user with `workspace.markdownLink`",
                 created.workspace.id.as_str()
             )),
         ),
@@ -684,6 +685,7 @@ async fn apply_proposal(
             "path": created.workspace.effective_path(),
         },
     });
+    super::insert_workspace_links(&mut out["workspace"]);
     if let Some(mut agent) = created.initial_agent {
         strip_agent_hidden_fields(&mut agent);
         out["initialAgent"] = agent;

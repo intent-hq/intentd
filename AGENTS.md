@@ -41,6 +41,7 @@ crates/
 ├── intent-services/       # WorkspaceApi implementation (business logic)
 ├── intent-svc-transfer/   # feature crate: workspace transfer, above intent-services
 ├── intent-svc-remote/     # feature crate: remote agents on an execution node (head connector, journal ingest)
+├── intent-svc-runtime/    # feature crate: scripts, hooks, terminals, browser tabs, sandboxes
 ├── intent-app/            # composition root: registers the feature crates (compose)
 ├── intent-transport/      # UDS + WSS listeners, JSON-RPC router
 ├── intent-acp/            # ACP client + agent provider plumbing

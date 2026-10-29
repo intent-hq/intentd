@@ -198,6 +198,13 @@ pub(crate) static V3_3: InstructionSet = InstructionSet {
     ..V3_1
 };
 
+/// Harness v3.4 keeps every v3.3 body except the common guidance, which
+/// teaches linking other workspaces by title instead of their internal IDs.
+pub(crate) static V3_4: InstructionSet = InstructionSet {
+    common: instr!("v3.4", "common"),
+    ..V3_3
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -507,8 +514,9 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.10 app file-link guidance.
-    const COMMON_LATEST: &str = V2_10.common;
+    /// The latest common body: v2.10 app file-link guidance plus the v3.4
+    /// workspace-link guidance.
+    const COMMON_LATEST: &str = V3_4.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
@@ -712,8 +720,10 @@ mod tests {
 
     #[test]
     fn specialist_agent_types_are_unchanged_by_3_3() {
+        // Pinned to 3.3 on purpose: it describes that release, not whichever
+        // version is current (3.4 changes the common body).
         let previous = crate::harness::resolve_entry("3.2").doctrine.instructions;
-        let current = crate::harness::latest_entry().doctrine.instructions;
+        let current = crate::harness::resolve_entry("3.3").doctrine.instructions;
         for agent_type in [
             "workspace",
             "workspace-agent",
@@ -1058,7 +1068,8 @@ mod tests {
         assert!(!out.contains("ws.agent.requestDiscussion"));
         // Neighboring sections survive intact, with clean separation.
         assert!(out.contains("(which replaces everything).\n\n## Open workspace files in the app"));
-        assert!(out.contains("rich chat blocks.\n\n## Show media"));
+        assert!(out.contains("rich chat blocks.\n\n## Link other workspaces"));
+        assert!(out.contains("ready-made `markdownLink` to share.\n\n## Show media"));
         assert!(
             out.contains("for the workspace card screenshot.\n\n## Waiting on External Conditions")
         );

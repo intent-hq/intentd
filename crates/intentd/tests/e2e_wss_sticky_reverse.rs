@@ -93,11 +93,13 @@ async fn boot_with(opts: WsOptions) -> Fixture {
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let registry = Arc::new(PrimaryReverseRegistry::new());
-    let services = Services::new(store)
-        .with_assets_root(dir.join("assets"))
-        .with_workspaces_root(workspaces_root)
-        .with_event_bus(bus.clone())
-        .with_reverse_dispatch(registry.clone());
+    let services = intent_app::compose(
+        Services::new(store)
+            .with_assets_root(dir.join("assets"))
+            .with_workspaces_root(workspaces_root)
+            .with_event_bus(bus.clone())
+            .with_reverse_dispatch(registry.clone()),
+    );
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
         base_port: 0,

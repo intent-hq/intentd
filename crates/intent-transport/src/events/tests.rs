@@ -1965,16 +1965,14 @@ async fn guest_roles_script_delivery_rechecks_downgrade_without_visibility_cache
     .await;
 }
 
-/// Frozen monorepo contract: 531eb9ee2f231f383fcd192f7c33b022bb795ead.
-/// Keep this byte-for-byte corpus shared with the frontend consumer.
+/// The monorepo's `docs/protocol/fixtures/event-stream-recovery/contract.json`,
+/// copied through its shared fixture-copy tool
+/// (`scripts/event-stream-recovery-contract.mjs`): the lock
+/// `fixtures/event-stream-recovery.lock.json` names the monorepo commit and CI
+/// verifies the copy against it. Re-export the copy instead of editing it.
 #[test]
-fn recovery_fixture_provenance() {
-    use sha2::{Digest, Sha256};
+fn recovery_fixture_request_validation() {
     let bytes = include_bytes!("fixtures/event-stream-recovery.json");
-    assert_eq!(
-        hex::encode(Sha256::digest(bytes)),
-        "972219db1abdff8b90e62800ab50b2806c8701c382569fdc556f7fbe022435a9"
-    );
     let corpus: Value = serde_json::from_slice(bytes).unwrap();
     for case in corpus["requestValidation"].as_array().unwrap() {
         // Presence of an id is connection admission, checked by the transport

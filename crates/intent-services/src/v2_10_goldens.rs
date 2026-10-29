@@ -100,7 +100,17 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
                 );
             }
             if agent_type != "interactive" {
-                assert_eq!(prompts[0], prompts[1], "new session uses latest doctrine");
+                // 3.4 adds only the workspace-link section to the common body.
+                let heading = "## Link other workspaces\n";
+                let start = prompts[1].find(heading).unwrap();
+                let body = start + heading.len();
+                let end = prompts[1][body..].find("\n## ").unwrap() + body + 1;
+                let without_workspace_links =
+                    format!("{}{}", &prompts[1][..start], &prompts[1][end..]);
+                assert_eq!(
+                    prompts[0], without_workspace_links,
+                    "new session uses latest doctrine"
+                );
             }
             assert!(prompts[0].contains(PDF_LINK), "new {agent_type} prompt must teach app file links with richChatBlocks={rich_chat_blocks}");
             assert!(!prompts[2].contains(PDF_LINK), "v2.9 stays frozen");
