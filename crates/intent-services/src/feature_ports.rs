@@ -2245,11 +2245,14 @@ mod tests {
     async fn a_registered_port_passes_the_startup_check_and_receives_calls() {
         let tmp = TempDb::new();
         let port = Arc::new(UnavailableTransfer::default());
-        let svc = bare_services(&tmp)
-            .await
-            .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>)
-            .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>)
-            .with_remote_launch_port(Arc::new(UnavailableRemoteLaunch) as Arc<dyn RemoteLaunchPort>);
+        let svc =
+            bare_services(&tmp)
+                .await
+                .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>)
+                .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>)
+                .with_remote_launch_port(
+                    Arc::new(UnavailableRemoteLaunch) as Arc<dyn RemoteLaunchPort>
+                );
         assert!(svc.unregistered_feature_ports().is_empty());
         svc.ensure_feature_ports_registered()
             .expect("every port registered");
