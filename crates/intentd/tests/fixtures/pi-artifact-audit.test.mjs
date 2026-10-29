@@ -144,9 +144,12 @@ test('orphan cleanup keeps every diagnostic category when nested Windows errors 
 test('harness reaps a known child after its launcher has already exited', async t => {
   const value = 'SYNTHETIC_ORPHAN_SETUP_CREDENTIAL_1234';
   const scenarios = ['ready', 'child failure', 'observer failure', 'readiness timeout', 'observer close failure',
-    'observer close failure with late stderr'];
+    'observer close failure with late stderr', 'observer close failure with held stderr'];
   for (const scenario of scenarios) await t.test(scenario, async () => {
     const closeFailure = scenario.startsWith('observer close failure');
+    // The held variant keeps stderr open past the drain bound: cleanup must
+    // fail on the timeout itself, then still reap the untracked writer.
+    const heldStderr = scenario === 'observer close failure with held stderr';
     const root = mkdtempSync(join(tmpdir(), 'pi-orphan-fixture-'));
     const directory = join(root, 'witness');
     mkdirSync(directory);
@@ -169,9 +172,11 @@ test('harness reaps a known child after its launcher has already exited', async 
       // pipe can: the report must wait for stderr to close, not for PID death.
       const writeFailure = scenario === 'observer close failure'
         ? `fs.writeSync(2, 'observer close publication failed\\ntoken=${value}\\n');`
-        : `require('node:child_process').spawn(process.execPath, ['-e',
-            'setTimeout(() => require("node:fs").writeSync(2, "observer close publication failed\\\\ntoken=${value}\\\\n"), 1500)'],
-            { detached: true, stdio: ['ignore', 'ignore', 2] }).unref();`;
+        : `const writer = require('node:child_process').spawn(process.execPath, ['-e',
+            'setTimeout(() => require("node:fs").writeSync(2, "observer close publication failed\\\\ntoken=${value}\\\\n"), ${heldStderr ? 60000 : 1500})'],
+            { detached: true, stdio: ['ignore', 'ignore', 2] });
+          writer.unref();
+          fs.writeFileSync(${JSON.stringify(join(root, 'late-writer.pid'))}, String(writer.pid));`;
       writeFileSync(observerEntry, `const fs = require('node:fs');
         const rename = fs.renameSync;
         fs.renameSync = (from, to) => {
@@ -289,8 +294,18 @@ test('harness reaps a known child after its launcher has already exited', async 
         new Promise(resolve => { drainTimer = setTimeout(resolve, 5000, false); })]);
       clearTimeout(drainTimer);
       if (!drained) failures.push(new Error('Fixture stderr did not close within 5000ms of cleanup'));
+      // The late writer is outside the observer group; reap it after the drain
+      // so its delayed write is observed, and include it in survivor checks.
+      const writerFile = join(root, 'late-writer.pid');
+      const allPids = existsSync(writerFile) ? [...pids, Number(readFileSync(writerFile, 'utf8'))] : pids;
+      if (allPids.length > pids.length) {
+        try { process.kill(allPids.at(-1), 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') failures.push(error); }
+        const writerDeadline = Date.now() + 3000;
+        while (alive(allPids.at(-1)) && Date.now() < writerDeadline) await delay(20);
+        if (alive(allPids.at(-1))) failures.push(new Error('Late stderr writer survived cleanup'));
+      }
       const observerStderr = capture.snapshot(true);
-      const survivingPids = pids.filter(alive);
+      const survivingPids = allPids.filter(alive);
       launcher.stderr.destroy();
       if (launcher.connected) launcher.disconnect();
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -307,11 +322,18 @@ test('harness reaps a known child after its launcher has already exited', async 
         assert.equal(parsed.cleanupErrors[0].method.text, 'Fixture observer failed');
         assert.equal(parsed.independentChild.close, null);
         assert.match(parsed.independentChild.observerError.text, /injected observer close publication failure/);
-        assert.match(report, /observer close publication failed/);
+        if (heldStderr) {
+          assert.equal(drained, false, report);
+          assert.match(report, /Fixture stderr did not close within 5000ms of cleanup/);
+          assert.doesNotMatch(report, /observer close publication failed/);
+        } else {
+          assert.equal(drained, true, report);
+          assert.match(report, /observer close publication failed/);
+        }
         assert.ok(!report.includes(value));
         auditText(report);
         assert.ok(Buffer.byteLength(report) <= diagnostics.LIMITS.report);
-        assert.equal(pids.some(alive), false, report);
+        assert.equal(allPids.some(alive), false, report);
       } else {
         assert.ok(!primaryError && failures.length === 0, report);
       }
