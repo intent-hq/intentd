@@ -173,9 +173,9 @@ pub struct SpecialistsSettings {
     pub dir: Option<String>,
 }
 
-/// Default `workspace.autoArchiveIdleAfterDays`: idle workspaces are
-/// archived after a week unless the user turns the sweep off with `0`.
-pub const DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS: u32 = 7;
+/// Default `workspace.autoArchiveIdleAfterDays`: `0`, the idle auto-archive
+/// sweep is off until the user picks a number of days.
+pub const DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS: u32 = 0;
 
 /// `[workspace]` — workspace/git-adjacent knobs (`workspace.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,7 +197,7 @@ pub struct WorkspaceSettings {
     pub cow_isolation: bool,
     /// `workspace.autoArchiveIdleAfterDays` — archive workspaces idle for
     /// this many days (PROTOCOL §5.12). Defaults to
-    /// [`DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS`]; `0` turns the sweep off.
+    /// [`DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS`] (`0`, off).
     pub auto_archive_idle_after_days: u32,
     /// `workspace.purgeArchivedAfterDays` — purge (retire) the folders of
     /// workspaces archived longer than this many days (PROTOCOL §5.12).
@@ -1827,8 +1827,9 @@ providerSettings = {}
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
-# Auto-archive -- archive workspaces idle for this many days (0 = off).
-autoArchiveIdleAfterDays = 7
+# Auto-archive -- archive workspaces idle for this many days (0 = off);
+# workspaces with uncommitted changes or unpushed commits are skipped.
+autoArchiveIdleAfterDays = 0
 # Purge archived workspaces -- delete the folders of workspaces archived
 # longer than this many days; conversations, notes and the git branch are
 # kept, and folders with uncommitted changes are skipped (absent = off).
@@ -2849,19 +2850,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_archive_idle_after_days_defaults_to_seven_and_accepts_zero() {
+    fn auto_archive_idle_after_days_defaults_to_off_and_accepts_a_window() {
         assert_eq!(
             SettingsFile::default()
                 .workspace
                 .auto_archive_idle_after_days,
             DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS
         );
-        assert_eq!(DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS, 7);
-        let off = SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = 0\n").unwrap();
-        assert_eq!(off.workspace.auto_archive_idle_after_days, 0);
+        assert_eq!(DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS, 0, "off by default");
+        let absent = SettingsFile::parse_str("[workspace]\n").unwrap();
+        assert_eq!(absent.workspace.auto_archive_idle_after_days, 0);
+        let on = SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = 7\n").unwrap();
+        assert_eq!(on.workspace.auto_archive_idle_after_days, 7);
         assert!(SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = -1\n").is_err());
         let template = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
-        assert_eq!(template.workspace.auto_archive_idle_after_days, 7);
+        assert_eq!(template.workspace.auto_archive_idle_after_days, 0);
+        assert_eq!(template.workspace.purge_archived_after_days, None);
     }
 
     #[test]
