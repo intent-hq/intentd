@@ -5,6 +5,7 @@
 
 #![cfg(test)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use intent_core::{
@@ -19,12 +20,15 @@ use crate::WorkspaceMcpServer;
 /// One stored note whose content each mutation really rewrites.
 struct StoreApi {
     content: Mutex<String>,
+    /// `get_note` calls, so a test can prove a rejected read never loaded the note.
+    reads: AtomicUsize,
 }
 
 impl StoreApi {
     fn new(content: String) -> Arc<Self> {
         Arc::new(Self {
             content: Mutex::new(content),
+            reads: AtomicUsize::new(0),
         })
     }
 
@@ -66,6 +70,7 @@ impl WorkspaceApi for StoreApi {
     }
 
     fn get_note(&self, ws: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let content = self.content();
         Box::pin(async move { Ok(note(ws, note_id, content)) })
     }
@@ -495,4 +500,70 @@ async fn bounded_read_rejects_invalid_options() {
         text.contains("startLine (2) exceeds total lines in note (0)"),
         "{text}"
     );
+}
+
+/// `JSON.stringify` turns `NaN` / `±Infinity` into `null`, which the Rust side
+/// reads as an absent option. Such a value must be rejected before the call
+/// rather than silently becoming an unbounded read of a huge note.
+#[tokio::test]
+async fn bounded_read_rejects_non_finite_options_without_loading_the_note() {
+    let (srv, api) = server(numbered_lines(1_500_000));
+    for key in ["startLine", "maxLines"] {
+        for value in ["NaN", "Infinity", "-Infinity", "0 / 0", "2 ** 64"] {
+            for opts in [
+                format!("{{ {key}: {value} }}"),
+                format!("{{ startLine: 1, maxLines: 5, {key}: {value} }}"),
+            ] {
+                let (is_error, text) =
+                    call(&srv, &format!("return await ws.note.read('big', {opts});")).await;
+                assert!(
+                    is_error,
+                    "{opts} must be rejected, got: {}",
+                    &text[..text.len().min(200)]
+                );
+                assert!(
+                    text.contains(&format!("{key} must be a positive integer")),
+                    "{opts}: {}",
+                    &text[..text.len().min(200)]
+                );
+            }
+        }
+    }
+    assert_eq!(
+        api.reads.load(Ordering::SeqCst),
+        0,
+        "a rejected read must not load the note"
+    );
+}
+
+/// Every option rejected by validation fails before the note is loaded.
+#[tokio::test]
+async fn bounded_read_rejects_invalid_values_before_loading_the_note() {
+    let (srv, api) = server("a\nb\nc".to_string());
+    for opts in [
+        "{ startLine: 0 }",
+        "{ maxLines: 1.5 }",
+        "{ maxLines: true }",
+        "{ maxLines: {} }",
+        "{ maxLines: [3] }",
+        "{ maxLines: 'NaN' }",
+        "{ maxLines: 'Infinity' }",
+    ] {
+        let (is_error, text) =
+            call(&srv, &format!("return await ws.note.read('big', {opts});")).await;
+        assert!(is_error, "{opts} must be rejected, got: {text}");
+        assert!(
+            text.contains("must be a positive integer"),
+            "{opts}: {text}"
+        );
+    }
+    assert_eq!(api.reads.load(Ordering::SeqCst), 0);
+    // Numeric strings stay accepted, like `editLines`.
+    let (is_error, text) = call(
+        &srv,
+        "const n = await ws.note.read('big', { startLine: '2', maxLines: '1' }); return n.rawContent;",
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(text, "\"b\"");
 }

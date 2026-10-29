@@ -20,7 +20,16 @@ use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.note = {
-        read: (id, options) => host({ method: 'note.read', args: { ...(options || {}), id } }),
+        read: (id, options) => {
+            const args = { ...(options || {}), id };
+            for (const key of ['startLine', 'maxLines']) {
+                const value = args[key];
+                if (typeof value === 'number' && !(Number.isSafeInteger(value) && value >= 1)) {
+                    throw new Error(`${key} must be a positive integer`);
+                }
+            }
+            return host({ method: 'note.read', args });
+        },
         create: (title, content, tags) =>
             host({ method: 'note.create', args: { title, content, tags } }),
         list: (tag) => host({ method: 'note.list', args: { tag } }),
@@ -106,6 +115,9 @@ struct LineWindow {
 }
 
 /// Parse an optional positive line option; `null` / absent is `None`.
+/// `NaN` / `±Infinity` serialize to `null`, so the JS wrapper rejects
+/// non-integer numbers before the host call; this check stays authoritative
+/// for every other value.
 /// Numeric strings are tolerated for parity with `editLines`' `req_i64`.
 fn opt_positive_line(args: &Value, key: &str) -> Result<Option<usize>, String> {
     let invalid = || format!("{key} must be a positive integer");
