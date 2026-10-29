@@ -633,18 +633,24 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
 In **Home → Workspaces**, right-click a workspace and choose **Archive** to put
 it away while keeping its folder. Archiving stops its agents, hooks and PR
 monitors. Choose **Unarchive**, or send an agent a message, to continue.
 
-Daemon versions with idle archiving archive workspaces after 7 days without
-messages, note edits or agent activity, unless work is still running or the
-workspace is shared with guests. In matching app versions, change this in
-**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`).
-On a supporting daemon, `autoArchiveIdleAfterDays` under `[workspace]` in
-`config.toml` sets the days; `0` turns it off. Older apps may not show this setting.
+Newer daemon versions default automatic idle archiving to off; existing positive
+day settings remain enabled. Older versions may default to 7 days. In matching app versions, use **Workspace setup →
+Archive idle workspaces** (`/settings?tab=setup#git-workspace`) and set a day count
+(7 when first enabled). On a supporting daemon, `autoArchiveIdleAfterDays` under
+`[workspace]` in `config.toml` sets the days; `0` turns it off. Older apps may not
+show this setting.
+
+Automatic archiving skips ongoing agent, script, hook and PR-monitor work,
+workspaces shared with guests, and uncommitted changes in the workspace folder,
+including nested repositories. For repositories with remote refs, unpushed
+commits also block it. Unreadable local-change state blocks the sweep; linked
+repositories outside the folder do not.
 
 In app and daemon versions offering folder cleanup, choose **Purge workspace
 folder** on an archived workspace, then confirm. This deletes the folder,

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.74] - 2026-10-29
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Default auto-archive to off and skip workspaces with local git work ([#2795](https://github.com/intent-hq/intentd/pull/2795))
+
+### 🧪 Testing
+
+- *(desktop)* Wait for the native end call in the watchdog lifecycle test ([#2794](https://github.com/intent-hq/intentd/pull/2794))
+
+
 ## [0.11.73] - 2026-10-29
 
 ### 🔧 Refactor
