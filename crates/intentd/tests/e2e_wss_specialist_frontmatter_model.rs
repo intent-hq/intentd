@@ -531,10 +531,16 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         .await;
         assert_eq!(legacy["agent"]["name"], name);
         let legacy_id = legacy["agent"]["id"].as_str().expect("legacy agent id");
-        let stored = wss_rpc(&mut ws, 12, "agent.get", json!({"agentId": legacy_id})).await;
-        assert_eq!(stored["agent"]["metadata"]["specialist"], id);
+        let stored = wss_rpc(
+            &mut ws,
+            12,
+            "agent.getSession",
+            json!({"agentId": legacy_id}),
+        )
+        .await;
+        assert_eq!(stored["session"]["specialist"], id);
         assert_eq!(
-            stored["agent"]["metadata"]["specialistIsOrchestrator"],
+            stored["session"]["metadata"]["specialistIsOrchestrator"],
             restricted
         );
     }
