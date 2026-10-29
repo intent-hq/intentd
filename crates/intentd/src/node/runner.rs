@@ -149,9 +149,12 @@ struct Agent {
 
 /// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
 /// provider-originated text the node journals or logs (session updates and
-/// provider error messages, which can echo a rejected credential). Values
-/// shorter than [`Redactor::MIN_LEN`] and account-folder paths are not
-/// treated as secrets, so ordinary text such as `1` is never scrubbed.
+/// provider error messages, which can echo a rejected credential). Every
+/// value of a credential-named variable (`*_API_KEY`, `*_TOKEN`, `*SECRET*`,
+/// `*PASSWORD*`, ...; [`intent_acp::is_likely_secret_env_key`]) is masked
+/// whatever its length; another variable's value is masked from
+/// [`Redactor::MIN_LEN`] bytes, so a short setting such as `1` does not
+/// scrub ordinary text. Account-folder paths are not secrets.
 #[derive(Default)]
 struct Redactor {
     /// Longest first, so a secret containing another is masked whole.
@@ -171,9 +174,11 @@ impl Redactor {
                     .iter()
                     .any(|dir| dir.eq_ignore_ascii_case(key))
             })
-            .filter_map(|(_, value)| value)
-            .filter(|value| value.len() >= Self::MIN_LEN)
-            .map(str::to_owned)
+            .filter_map(|(key, value)| {
+                let value = value.filter(|value| !value.is_empty())?;
+                (intent_acp::is_likely_secret_env_key(key) || value.len() >= Self::MIN_LEN)
+                    .then(|| value.to_owned())
+            })
             .collect();
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         secrets.dedup();

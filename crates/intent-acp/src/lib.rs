@@ -54,6 +54,7 @@ pub use mcp_config::{
     to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config, NormalizedMcpServer,
     NormalizedMcpServers,
 };
+pub use mcp_env::is_likely_secret_env_key;
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
