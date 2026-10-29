@@ -665,6 +665,7 @@ mod tests {
 
     #[test]
     fn env_override_takes_precedence() {
+        let _env = EnvScope::new();
         let override_path = std::env::temp_dir().join("intent-core-secrets-env-override.json");
         std::env::set_var(SECRETS_FILE_ENV, &override_path);
         let resolved = default_secrets_path();
@@ -720,6 +721,179 @@ mod tests {
         let store = FileSecretStore::with_path(tmp.0.join(".secrets.json"));
         assert_eq!(store.load("a").unwrap(), None);
         assert!(legacy.exists(), "explicit-path stores must not migrate");
+    }
+
+    /// Environment variable names the home-isolation tests drive. Spelled as
+    /// literals so the tests stay independent of the guard's implementation.
+    const FORBIDDEN_HOME: &str = "INTENTD_TEST_FORBIDDEN_HOME";
+
+    /// Serializes the tests that mutate process env (`HOME`, the secrets
+    /// override, the forbidden-home marker) and restores every touched
+    /// variable on drop, so plain `cargo test` threads cannot observe them.
+    struct EnvScope {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl EnvScope {
+        fn new() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = ["HOME", "USERPROFILE", SECRETS_FILE_ENV, FORBIDDEN_HOME]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            std::env::set_var(key, value);
+        }
+
+        fn remove(&self, key: &str) {
+            std::env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Recursive `(relative path, bytes, mtime)` listing of `root`, used to
+    /// prove a sentinel home is byte-for-byte untouched.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            out: &mut Vec<(PathBuf, Vec<u8>, std::time::SystemTime)>,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let meta = std::fs::metadata(&path).unwrap();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if meta.is_dir() {
+                    out.push((rel, Vec::new(), meta.modified().unwrap()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, std::fs::read(&path).unwrap(), meta.modified().unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A sentinel "real home" holding a legacy `intent/secrets.json` that
+    /// `FileSecretStore::new` would otherwise migrate.
+    fn sentinel_home() -> TempDir {
+        let home = TempDir::new();
+        std::fs::create_dir_all(home.0.join("intent")).unwrap();
+        std::fs::write(
+            home.0.join("intent").join(LEGACY_SECRETS_FILE_NAME),
+            r#"{"real":"user-secret"}"#,
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn home_isolation_default_store_refuses_forbidden_home() {
+        let env = EnvScope::new();
+        let home = sentinel_home();
+        let before = snapshot(&home.0);
+        env.set("HOME", &home.0);
+        env.set("USERPROFILE", &home.0);
+        env.remove(SECRETS_FILE_ENV);
+        env.set(FORBIDDEN_HOME, &home.0);
+
+        let outcome = std::panic::catch_unwind(FileSecretStore::new);
+
+        assert!(
+            outcome.is_err(),
+            "FileSecretStore::new must refuse to resolve inside the forbidden home"
+        );
+        assert_eq!(snapshot(&home.0), before, "sentinel home must stay untouched");
+    }
+
+    #[test]
+    fn home_isolation_explicit_path_refuses_forbidden_home() {
+        let env = EnvScope::new();
+        let home = sentinel_home();
+        let before = snapshot(&home.0);
+        env.set(FORBIDDEN_HOME, &home.0);
+
+        let target = home.0.join("intent").join(".secrets.json");
+        let outcome = std::panic::catch_unwind(|| FileSecretStore::with_path(target));
+
+        assert!(
+            outcome.is_err(),
+            "FileSecretStore::with_path must refuse a path inside the forbidden home"
+        );
+        assert_eq!(snapshot(&home.0), before, "sentinel home must stay untouched");
+    }
+
+    #[test]
+    fn home_isolation_allows_redirected_home_and_override() {
+        let env = EnvScope::new();
+        let forbidden = sentinel_home();
+        let before = snapshot(&forbidden.0);
+        env.set(FORBIDDEN_HOME, &forbidden.0);
+        env.remove(SECRETS_FILE_ENV);
+
+        let other = sentinel_home();
+        env.set("HOME", &other.0);
+        env.set("USERPROFILE", &other.0);
+        let store = FileSecretStore::new();
+        assert_eq!(store.path(), other.0.join("intent").join(".secrets.json"));
+        assert_eq!(
+            store.load("real").unwrap(),
+            Some("user-secret".to_string()),
+            "a tempdir HOME keeps the default resolution and legacy migration"
+        );
+
+        env.set("HOME", &forbidden.0);
+        env.set("USERPROFILE", &forbidden.0);
+        let override_path = other.0.join("override.json");
+        env.set(SECRETS_FILE_ENV, &override_path);
+        let store = FileSecretStore::new();
+        assert_eq!(store.path(), override_path);
+        store.store("a", "1").unwrap();
+
+        assert_eq!(snapshot(&forbidden.0), before, "forbidden home must stay untouched");
+    }
+
+    /// The nextest harness (`.config/nextest.toml` setup script) must export
+    /// the forbidden-home marker for every test process, naming the real
+    /// `HOME` the run started with.
+    #[test]
+    fn home_isolation_nextest_harness_exports_forbidden_home() {
+        if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+            return;
+        }
+        let forbidden = std::env::var_os(FORBIDDEN_HOME)
+            .filter(|v| !v.is_empty())
+            .expect("nextest runs must export INTENTD_TEST_FORBIDDEN_HOME");
+        let home = std::env::var_os("HOME").expect("HOME");
+        assert_eq!(
+            std::fs::canonicalize(&forbidden).unwrap(),
+            std::fs::canonicalize(&home).unwrap(),
+            "the forbidden home must be the real HOME"
+        );
     }
 
     #[cfg(unix)]
