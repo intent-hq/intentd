@@ -101,11 +101,12 @@ jobs:
           # on its burst runner, WarpBuild (on an 8-CPU slot its p90 of 38 min
           # would outlast coverage-all, which sets the queue's pace).
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
-          # only in the queue and take a free xl or bigmem slot there (longest
-          # first, so coverage-all gets the xl slot), or burst to WarpBuild.
-          # coverage-all sets the queue's pace and takes only xl ("pools"):
-          # on an 8-CPU bigmem slot it took p50 27 / p90 39 min against 17.5
-          # on xl, so with no xl slot free it bursts to WarpBuild 16x.
+          # only in the queue. coverage-e2e and daemon-lifecycle take a free xl
+          # or bigmem slot there, or burst to WarpBuild. coverage-all ranks
+          # first and sets the queue's pace, so it takes only xl ("pools"): on
+          # an 8-CPU bigmem slot it took p50 27 / p90 39 min against 17.5 on
+          # xl, so with no xl slot free it bursts to WarpBuild 16x (or takes a
+          # bigmem slot while WarpBuild's queue is stuck).
           # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
           # CPUs and 19.7 GB), so it takes an xl slot when one is left after
           # coverage-changed, else a bigmem heavy slot (30 GB or more; one of its
@@ -278,7 +279,8 @@ jobs:
             // A label listed under several pools takes the first with a free slot.
             const hosted = {
               // 16-core jobs prefer xl slots and overflow only to bigmem heavy
-              // slots before bursting: a 12 GB heavy slot OOM-kills their rustc.
+              // slots before bursting (unless a listed job's `pools` excludes
+              // bigmem): a 12 GB heavy slot OOM-kills their rustc.
               // 8-core jobs never take an xl slot and use every heavy slot.
               xl: ['gh-linux-16x'],
               bigmem: ['gh-linux-16x'],
@@ -293,7 +295,8 @@ jobs:
             // their burst runner directly, sized by `burst` when set (a CPU-bound
             // job keeps its slot size but bursts bigger); matrix legs are ranked
             // separately. A job with `pools` takes a slot only in the pools it lists
-            // (e.g. ["xl"]: no overflow to bigmem heavy slots).
+            // (e.g. ["xl"]: no overflow to bigmem heavy slots), except while its
+            // WarpBuild burst runner is stuck, when any pool serving its label will do.
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
@@ -307,7 +310,7 @@ jobs:
             const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
             for (const r of ranked) {
               const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
-              const allowed = (k) => !Array.isArray(r.pools) || r.pools.includes(k);
+              const allowed = (k) => !Array.isArray(r.pools) || r.pools.includes(k) || warpStuck[family(cloud(r.burst || r.label)[0])] === true;
               const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && allowed(k) && hasSlot(k));
               if (key) {
                 slotsFree[key] -= 1;

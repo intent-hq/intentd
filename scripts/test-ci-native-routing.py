@@ -1030,7 +1030,6 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 slots = json.loads(result["outputs"]["slots"])
                 self.assertEqual({key: slots[key] for key in expected}, expected)
                 self.assertEqual(slots["coverage-changed"], warp16)
-                self.assertNotEqual(slots["coverage-all"], BIG, "coverage-all never takes a bigmem slot")
         # A queue run with only 12 GB heavy slots free never puts check there.
         result = run_route(self.workflow, org=[small_heavy_slot(), small_heavy_slot()], eventName="merge_group")
         self.assertEqual(json.loads(result["outputs"]["slots"])["check"], warp16)
