@@ -126,11 +126,16 @@ impl FileSecretStore {
     ///
     /// Under the test harness, a default that lands in the real home's Intent
     /// state is redirected to an empty per-process scratch file and never
-    /// migrated (see [`crate::test_isolation::redirect_default_secrets`]).
+    /// migrated (see [`crate::test_isolation::redirect_default_secrets`]); an
+    /// explicit `INTENTD_SECRETS_FILE` into the real home aborts instead.
     #[must_use]
     pub fn new() -> Self {
         let path = default_secrets_path();
-        if let Some(scratch) = crate::test_isolation::redirect_default_secrets(&path) {
+        if env_override_active() {
+            // An explicit `INTENTD_SECRETS_FILE` into the real home is a
+            // test's deliberate choice: fail loudly rather than redirect it.
+            crate::test_isolation::assert_outside_forbidden_home(&path, "INTENTD_SECRETS_FILE");
+        } else if let Some(scratch) = crate::test_isolation::redirect_default_secrets(&path) {
             return Self::with_path(scratch);
         }
         if !env_override_active() {
@@ -861,9 +866,15 @@ mod tests {
         let Some(mode) = std::env::var_os(CHILD_ENV) else {
             return;
         };
-        assert_eq!(mode, "explicit");
         let home = PathBuf::from(std::env::var_os(SENTINEL_ENV).unwrap());
-        let store = FileSecretStore::with_path(home.join("intent").join(".secrets.json"));
+        let target = home.join("intent").join(".secrets.json");
+        let store = if mode == "override" {
+            std::env::set_var(SECRETS_FILE_ENV, &target);
+            FileSecretStore::new()
+        } else {
+            assert_eq!(mode, "explicit");
+            FileSecretStore::with_path(target)
+        };
         store.store("test-only", "leak").unwrap();
         println!("home-isolation-child: reached the forbidden home");
     }
@@ -928,6 +939,13 @@ mod tests {
     #[test]
     fn home_isolation_explicit_path_refuses_forbidden_home() {
         assert_child_aborted("explicit");
+    }
+
+    /// An explicit `INTENTD_SECRETS_FILE` into the forbidden home is a test's
+    /// deliberate choice, so it aborts instead of being redirected.
+    #[test]
+    fn home_isolation_env_override_into_forbidden_home_aborts() {
+        assert_child_aborted("override");
     }
 
     #[test]

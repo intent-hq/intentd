@@ -1622,8 +1622,10 @@ impl Services {
     /// secrets file instead of the home default, so a test can never read,
     /// write or migrate the developer's real `~/intent/.secrets.json` (or its
     /// `.collaboration` sibling). The scratch dir lives until the last clone
-    /// drops. Under nextest the default constructor panics instead (see
-    /// [`intent_core::test_isolation`]); use this in every test.
+    /// drops. Use this in every test: under nextest the default constructor
+    /// only avoids the real home by falling back to one scratch store shared
+    /// by the whole test process (see [`intent_core::test_isolation`]), and
+    /// plain `cargo test` has no guard at all.
     ///
     /// # Panics
     ///

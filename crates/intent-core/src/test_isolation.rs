@@ -49,16 +49,41 @@ pub const CHECKOUT_ROOTS: &[&str] = &["workspaces", "worktrees"];
 
 /// The forbidden `<home>/intent` directory, or `None` when the guard is
 /// inactive (neither [`FORBIDDEN_HOME_ENV`] nor [`NEXTEST_RUN_ENV`] is set —
-/// every production process).
+/// every production process). Under nextest the home is the user-database
+/// home, falling back to `$HOME` when that lookup fails (an unlisted container
+/// UID), so the guard never silently switches off. Cached per input env.
 #[must_use]
 pub fn forbidden_intent_dir() -> Option<PathBuf> {
-    let home = if let Some(home) = std::env::var_os(FORBIDDEN_HOME_ENV).filter(|v| !v.is_empty()) {
-        PathBuf::from(home)
-    } else {
-        std::env::var_os(NEXTEST_RUN_ENV).filter(|v| !v.is_empty())?;
-        crate::path_utils::user_db_home()?
+    type Key = (
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    );
+    static CACHE: std::sync::Mutex<Option<(Key, Option<PathBuf>)>> = std::sync::Mutex::new(None);
+    let non_empty = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+    let key: Key = (
+        non_empty(FORBIDDEN_HOME_ENV),
+        non_empty(NEXTEST_RUN_ENV),
+        non_empty("HOME"),
+    );
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached, dir)) = cache.as_ref() {
+        if *cached == key {
+            return dir.clone();
+        }
+    }
+    let home = match &key {
+        (Some(home), _, _) => Some(PathBuf::from(home)),
+        (None, Some(_), home) => {
+            crate::path_utils::user_db_home().or_else(|| home.clone().map(PathBuf::from))
+        }
+        (None, None, _) => None,
     };
-    Some(normalize(&home.join("intent")))
+    let dir = home.map(|home| normalize(&home.join("intent")));
+    *cache = Some((key, dir.clone()));
+    dir
 }
 
 /// Whether `path` is inside the forbidden `<home>/intent` state (see the
@@ -84,8 +109,8 @@ pub fn is_in_forbidden_home(path: &Path) -> bool {
 /// Under the test harness, the scratch file that replaces a default secrets
 /// path landing in the real home (see the module docs): `None` when the guard
 /// is inactive or `path` is outside the forbidden home. The file lives in a
-/// per-process directory under the system temp dir and is only created if a
-/// test writes through the default store.
+/// unique per-process directory under the system temp dir and is only created
+/// if a test writes through the default store.
 ///
 /// Aborts (via [`assert_outside_forbidden_home`]) if the temp dir itself is
 /// inside the forbidden home, rather than writing there.
@@ -94,14 +119,28 @@ pub fn redirect_default_secrets(path: &Path) -> Option<PathBuf> {
     if !is_in_forbidden_home(path) {
         return None;
     }
-    let scratch = std::env::temp_dir()
-        .join(format!(
-            "intentd-test-default-secrets-{}",
-            std::process::id()
-        ))
-        .join(".secrets.json");
+    let scratch = scratch_secrets_path();
     assert_outside_forbidden_home(&scratch, "the redirected default secrets store");
     Some(scratch)
+}
+
+/// This process's scratch secrets file: a unique, unpredictable directory
+/// name (pid + random UUID) so a later process reusing the PID can never
+/// inherit its secrets and no other user can pre-create it. The directory
+/// is created (owner-only) on first write by the store itself.
+fn scratch_secrets_path() -> PathBuf {
+    static SCRATCH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SCRATCH
+        .get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "intentd-test-default-secrets-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .join(".secrets.json")
+        })
+        .clone()
 }
 
 /// Abort the process when `path` is inside the forbidden home (see the
@@ -127,33 +166,35 @@ pub fn assert_outside_forbidden_home(path: &Path, what: &str) {
     }
 }
 
-/// Resolve symlinks for the longest existing prefix of `path` (so
-/// `/var` → `/private/var` and `..` cannot dodge the comparison) and append
-/// the not-yet-existing remainder unchanged.
+/// Resolve `path` the way the OS would: make it absolute, then walk its
+/// components, canonicalizing every prefix that exists (so `/var` →
+/// `/private/var` and symlinked homes compare equal) and applying `..` to the
+/// resolved prefix, never lexically past a symlink. Components below the
+/// first missing one are appended (with `..` popping them) unchanged.
 fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     };
-    let mut existing = absolute.as_path();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(canonical) = std::fs::canonicalize(existing) {
-            let mut out = canonical;
-            for part in rest.iter().rev() {
-                out.push(part);
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
             }
-            return out;
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_os_string());
-                existing = parent;
+            Component::Normal(name) => {
+                out.push(name);
+                if let Ok(canonical) = std::fs::canonicalize(&out) {
+                    out = canonical;
+                }
             }
-            _ => return absolute,
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -177,6 +218,18 @@ mod tests {
             intent.join("workspaces").join("new-ws"),
             intent.join("worktrees"),
             intent.join("logs").join("x.log"),
+            intent
+                .join("workspaces")
+                .join("new")
+                .join("..")
+                .join("..")
+                .join(".secrets.json"),
+            intent
+                .join("workspaces")
+                .join("ws")
+                .join("..")
+                .join("..")
+                .join("x"),
         ];
         let allowed = [
             intent.join("workspaces").join("ws").join("repo"),
@@ -205,6 +258,39 @@ mod tests {
             !inert,
             "with no marker only the user-database home is forbidden"
         );
+    }
+
+    #[test]
+    fn normalize_applies_parent_dirs_inside_missing_tails() {
+        let dir = std::env::temp_dir().join(format!("intent-core-iso-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("intent").join("workspaces")).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            normalize(
+                &dir.join("intent")
+                    .join("workspaces")
+                    .join("new")
+                    .join("..")
+                    .join("..")
+                    .join(".secrets.json")
+            ),
+            canonical.join("intent").join(".secrets.json")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_resolves_parent_dirs_through_symlinks() {
+        let dir = std::env::temp_dir().join(format!("intent-core-iso-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("real").join("inner")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real").join("inner"), dir.join("link")).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            normalize(&dir.join("link").join("..").join("x")),
+            canonical.join("real").join("x")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

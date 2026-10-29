@@ -51,6 +51,20 @@ class HomeIntentGuardTests(unittest.TestCase):
         result = run("verify", self.state, self.home)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_writes_directly_inside_a_checkout_id_are_ignored(self):
+        self.snapshot()
+        (self.intent / "workspaces" / "ws" / "lock").write_text("x")
+        result = run("verify", self.state, self.home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_symlinked_intent_dir_is_followed(self):
+        target = Path(self._tmp.name) / "data-intent"
+        (self.intent).rename(target)
+        self.intent.symlink_to(target)
+        self.snapshot()
+        (target / ".secrets.json.collaboration").mkdir()
+        self.assert_flags("created  .secrets.json.collaboration")
+
     def test_secrets_write_is_flagged(self):
         self.snapshot()
         path = self.intent / ".secrets.json"
