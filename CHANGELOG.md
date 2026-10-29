@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.75] - 2026-10-29
+
+### 🧪 Testing
+
+- Drain orphan fixture stderr before the cleanup report ([#2796](https://github.com/intent-hq/intentd/pull/2796))
+
+
 ## [0.11.74] - 2026-10-29
 
 ### 🐛 Bug Fixes
