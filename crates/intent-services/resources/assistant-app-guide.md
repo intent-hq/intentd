@@ -827,8 +827,8 @@ where available or reconnect, and check the app and daemon versions.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{driving-indicator.ts,SetPrimaryClientConfirmDialog.svelte}; src/features/workspace/components/WorkspaceActionItems.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
-Agent browser tabs and tunnels require the workspace's primary browser client to
-be connected and browser-capable. If it is offline, reconnect it or, when asked,
+Agent browser tabs and tunnels require the client used by the workspace to be
+connected and browser-capable. If it is offline, reconnect it or, when asked,
 select another eligible client.
 
 In released app versions with the offline sidebar warning, hover over it for
@@ -838,7 +838,10 @@ Primary**.
 
 Newer or test builds may instead offer a **Primary client** submenu. Where present,
 it shows the current primary client and **Offline** when disconnected; the menu
-button may also show a red dot. Choose **This app**, then confirm **Set as Primary**.
+button may also show a red dot. With matching app and daemon support, **Offline**
+can also appear when no primary is saved but the workspace's agent tabs or desktop
+session still use a client that is offline or cannot run agent browser tabs.
+Choose **This app**, then confirm **Set as Primary**.
 When missing access or browser support blocks the choice, a line below explains
 why. It can also be unavailable while client or connection information refreshes,
 or when this app is already selected. The submenu replaces the separate warning

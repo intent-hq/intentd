@@ -7626,7 +7626,8 @@ impl Services {
             )
             .await
         };
-        match resolved.models {
+        let kind = resolved.warning_kind;
+        let mut out = match resolved.models {
             Some(models) => {
                 let mut out =
                     json!({ "providerId": provider_id, "models": models, "source": provider_id });
@@ -7636,15 +7637,17 @@ impl Services {
                 if let Some(w) = resolved.warning {
                     out["warning"] = Value::String(w);
                 }
-                Ok(out)
+                out
             }
-            None => Ok(static_provider_response(
+            None => static_provider_response(
                 &provider_id,
                 &resolved
                     .warning
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
-            )),
-        }
+            ),
+        };
+        crate::model_catalog::insert_warning_kind(&mut out, kind);
+        Ok(out)
     }
 
     /// `models.list { providerId: providerRef }` (PROTOCOL §5.54): the
@@ -7664,13 +7667,16 @@ impl Services {
             .models_catalog
             .resolve_installed_for(&reference, profile, force_refresh)
             .await;
+        let kind = resolved.warning_kind;
         let Some(models) = resolved.models else {
-            return Ok(static_provider_response(
+            let mut out = static_provider_response(
                 &reference,
                 &resolved
                     .warning
                     .unwrap_or_else(|| format!("model discovery for '{reference}' failed")),
-            ));
+            );
+            crate::model_catalog::insert_warning_kind(&mut out, kind);
+            return Ok(out);
         };
         let models: Vec<Value> = models
             .into_iter()
@@ -7688,6 +7694,7 @@ impl Services {
         if let Some(w) = resolved.warning {
             out["warning"] = Value::String(w);
         }
+        crate::model_catalog::insert_warning_kind(&mut out, kind);
         Ok(out)
     }
 
@@ -7759,12 +7766,14 @@ impl Services {
                         Some(models) => crate::model_catalog::ModelFetchResult {
                             models: Some(models),
                             warning: None,
+                            warning_kind: None,
                         },
                         None => crate::model_catalog::ModelFetchResult {
                             models: None,
                             warning: Some(
                                 "auggie CLI unavailable or returned no models".to_string(),
                             ),
+                            warning_kind: None,
                         },
                     }
                 })

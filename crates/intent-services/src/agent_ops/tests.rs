@@ -49623,3 +49623,37 @@ async fn task_push_assignment_cleanup_publishes_complete_metadata() {
     assert!(events[0].data["note"].get("content").is_none());
     bus.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn models_list_codex_reports_warning_kind_only_for_known_causes() {
+    use crate::model_catalog::ModelWarningKind;
+    for (kind, wire) in [
+        (Some(ModelWarningKind::CliMissing), Some("cli-missing")),
+        (
+            Some(ModelWarningKind::PrerequisiteMissing),
+            Some("prerequisite-missing"),
+        ),
+        (None, None),
+    ] {
+        let (_t, svc, _ws) = setup().await;
+        svc.models_catalog.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: "codex catalog unavailable".into(),
+                kind,
+            },
+        );
+        let res = svc
+            .models_list_op(Some("codex".to_string()), false)
+            .await
+            .expect("models.list codex");
+        assert_eq!(res["providerId"], "codex");
+        assert_eq!(res["source"], "static");
+        assert_eq!(res["warning"], "codex catalog unavailable", "{res}");
+        assert_eq!(
+            res.get("warningKind").and_then(serde_json::Value::as_str),
+            wire,
+            "{res}"
+        );
+    }
+}
