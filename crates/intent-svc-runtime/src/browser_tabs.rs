@@ -343,10 +343,9 @@ impl BrowserTabRoutingExt for Services {
     /// Guards, each failing closed:
     /// - **Liveness.** A superseded id with a live hello'd connection keeps
     ///   its tabs — it is still an active host. Liveness is read while holding
-    ///   the tab gate, both before the move and again after it commits (rows
-    ///   of an old host that came online in between go back before anything
-    ///   is published); without a reverse registry it is unknown, so nothing
-    ///   moves.
+    ///   the tab gate and finally inside the move's write transaction, so an
+    ///   old host that came online in between is never written; without a
+    ///   reverse registry it is unknown, so nothing moves.
     /// - **Workspace access.** A collaborator caller moves a host only when it
     ///   may manage the browser in every workspace that host has open tabs in
     ///   (the transport has already required current host execution
@@ -420,36 +419,17 @@ impl BrowserTabRoutingExt for Services {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let mut origin: HashMap<String, ClientId> = HashMap::new();
-        for host in &candidates {
-            for tab in self.store().list_browser_tabs_by_host(host).await? {
-                origin.insert(tab.tab_id, host.clone());
-            }
-        }
-        let mut moved = self
-            .store()
-            .reassign_browser_tabs_from_hosts(client_id, &candidates)
-            .await?;
         // Binding a connection does not take the gate, so an old host can come
-        // online between the snapshot above and the commit. Re-read liveness
-        // before anything is published and hand such a host its rows back;
-        // its own reports are still queued behind the gate, so it never sees
-        // the moved state. A bind after this point is ordered after the rehome.
-        let live = live_now();
-        if candidates.iter().any(|id| live.contains(id)) {
-            let mut kept = Vec::with_capacity(moved.len());
-            for (tab, changes) in moved {
-                match origin.get(&tab.tab_id).filter(|old| live.contains(*old)) {
-                    Some(old) => {
-                        self.store()
-                            .reassign_browser_tab_host(&tab.tab_id, old, None)
-                            .await?;
-                    }
-                    None => kept.push((tab, changes)),
-                }
-            }
-            moved = kept;
-        }
+        // online after the snapshot above. The final liveness read happens
+        // inside the write transaction, right before the rows move: a host
+        // bound by then is never written (nothing speculative is committed or
+        // visible to readers), and a bind after it is ordered after the move.
+        let still_offline =
+            |host: &ClientId| !dispatch.live_clients().iter().any(|c| c.client_id == *host);
+        let moved = self
+            .store()
+            .reassign_browser_tabs_from_hosts(client_id, &candidates, &still_offline)
+            .await?;
         let mut claimed_workspaces: Vec<&WorkspaceId> = moved
             .iter()
             .filter(|(tab, _)| tab.owner_agent_id.is_some())

@@ -786,10 +786,11 @@ async fn collaborator_rehome_skips_hosts_with_tabs_in_unmanaged_workspaces() {
     );
 }
 
-/// An old host that binds after the rehome's liveness snapshot but before
-/// anything is published gets its rows back and no event goes out.
+/// An old host that binds after the rehome's first liveness snapshot is
+/// rejected by the final in-transaction check: its row is never written
+/// (host, `displayed` and `updatedAt` unchanged) and no event goes out.
 #[tokio::test]
-async fn hello_rehome_hands_rows_back_to_an_old_host_that_binds_mid_rehome() {
+async fn hello_rehome_never_writes_rows_of_an_old_host_that_binds_mid_rehome() {
     use intent_core::WorkspaceApi;
 
     let (_tmp, store, services, live, ws) = rehome_fixture(&["dev-1", "x:dev-1"]).await;
@@ -808,6 +809,8 @@ async fn hello_rehome_hands_rows_back_to_an_old_host_that_binds_mid_rehome() {
         .expect("seed");
     let opened = recv_one(&mut sub).await;
     assert_eq!(opened[0].event_type, BROWSER_TAB_OPENED);
+    let before = store.get_browser_tab("bound-late").await.unwrap().unwrap();
+    assert_eq!(before.displayed, Some(true));
 
     *live.1.lock().unwrap() = Some(ClientId::from_string("dev-1"));
     let moved = services
@@ -818,15 +821,10 @@ async fn hello_rehome_hands_rows_back_to_an_old_host_that_binds_mid_rehome() {
         .await
         .expect("rehome");
     assert_eq!(moved, 0, "the late-bound old host keeps its tabs");
+    let after = store.get_browser_tab("bound-late").await.unwrap().unwrap();
     assert_eq!(
-        store
-            .get_browser_tab("bound-late")
-            .await
-            .unwrap()
-            .unwrap()
-            .host_client_id
-            .as_str(),
-        "dev-1"
+        after, before,
+        "the row is never written: host, displayed, updatedAt kept"
     );
     assert!(
         tokio::time::timeout(

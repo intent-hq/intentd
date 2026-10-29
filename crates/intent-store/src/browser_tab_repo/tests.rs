@@ -889,7 +889,7 @@ async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
 
     let moved = f
         .store
-        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a))
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a), &|_| true)
         .await
         .unwrap();
     let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
@@ -927,13 +927,13 @@ async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
 
     let again = f
         .store
-        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a))
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a), &|_| true)
         .await
         .unwrap();
     assert!(again.is_empty(), "idempotent");
     let none = f
         .store
-        .reassign_browser_tabs_from_hosts(&new_host, &[])
+        .reassign_browser_tabs_from_hosts(&new_host, &[], &|_| true)
         .await
         .unwrap();
     assert!(none.is_empty());

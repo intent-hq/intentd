@@ -434,6 +434,11 @@ impl Store {
     /// oldest first. Tombstones stay with their old host, which still owes the
     /// drop acknowledgement. An empty `old_hosts` is a no-op.
     ///
+    /// `still_movable` is the caller's final decision per old host, evaluated
+    /// inside the write transaction right before the rows are read and moved:
+    /// a host it rejects is left untouched (no write, its `displayed` fact
+    /// kept), so the move is never committed speculatively.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails; nothing is
@@ -442,6 +447,7 @@ impl Store {
         &self,
         new_host: &ClientId,
         old_hosts: &[ClientId],
+        still_movable: &(dyn Fn(&ClientId) -> bool + Send + Sync),
     ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
         let old_hosts: Vec<ClientId> = old_hosts.to_vec();
         if old_hosts.is_empty() {
@@ -455,6 +461,11 @@ impl Store {
             let old_hosts = old_hosts.clone();
             async move {
                 let mut tx = begin(&pool, "rehome superseded browser tabs").await?;
+                let old_hosts: Vec<ClientId> =
+                    old_hosts.into_iter().filter(|h| still_movable(h)).collect();
+                if old_hosts.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let placeholders = vec!["?"; old_hosts.len()].join(", ");
                 let sql = format!(
                     "SELECT {COLUMNS} FROM browser_tab \
