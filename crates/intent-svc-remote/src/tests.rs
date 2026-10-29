@@ -1413,7 +1413,7 @@ mod launch {
         );
         assert!(
             tokio::time::timeout(
-                Duration::from_millis(200),
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
                 link.expect(|frame| match frame {
                     LinkFrame::Launch(command) => Some(command),
                     _ => None,
