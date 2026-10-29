@@ -276,6 +276,12 @@ enabled provider/model. New agents and quick actions cannot run on a disabled
 provider; update their saved selections or re-enable it. Intent does not choose an
 arbitrary replacement for a disabled app default.
 
+<!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
+Auggie appears in provider lists, including onboarding, only when its CLI is
+installed or it is already enabled. An enabled but missing installation stays
+visible so you can disable it; it disappears afterward. Sign-in is not required
+for an installed Auggie to appear.
+
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
