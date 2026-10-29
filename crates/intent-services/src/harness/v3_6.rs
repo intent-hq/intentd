@@ -17,6 +17,8 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -45,7 +47,13 @@ mod tests {
                 .iter()
                 .find_map(|(candidate, content)| (*candidate == id).then_some(*content))
                 .expect("versioned specialist");
-            assert_eq!(format!("{:x}", Sha256::digest(content)), expected, "{id}");
+            let actual = Sha256::digest(content)
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                });
+            assert_eq!(actual, expected, "{id}");
         }
     }
 
