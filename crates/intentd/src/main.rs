@@ -2109,6 +2109,11 @@ async fn cmd_serve_owned(
         // first; an already-set target is never clobbered.
         intent_services::migrate_active_provider_setting(&settings_registry)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time rename of `workspace.autoRetireArchivedAfterDays` to
+        // `workspace.purgeArchivedAfterDays` (comment-preserving rewrite; runs
+        // only when the legacy key exists; an already-set new key wins).
+        intent_services::migrate_auto_retire_setting(&settings_registry)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         // One-time legacy handling: retired keys still present in config.toml
         // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
         // captured by the load above; import any that still have a catalog entry
@@ -2606,11 +2611,16 @@ async fn cmd_serve_owned(
     // `scripts.outputRetentionHours` (read live; `0` disables), keeping the
     // current run of any running script. Aborted on clean shutdown.
     let script_output_sweep = startup_work.spawn(|| services.spawn_script_output_sweep_loop());
-    // Automatic retire (PROTOCOL §5.1): shortly after startup and then
-    // hourly, retire workspaces archived longer than
-    // `workspace.autoRetireArchivedAfterDays` (read live; absent = off).
+    // Automatic purge (PROTOCOL §5.1): shortly after startup and then
+    // hourly, retire (purge the folders of) workspaces archived longer than
+    // `workspace.purgeArchivedAfterDays` (read live; absent = off).
     // Aborted on clean shutdown.
     let auto_retire_loop = startup_work.spawn(|| services.spawn_auto_retire_loop());
+    // Automatic archive (PROTOCOL §5.1): shortly after startup and then
+    // hourly, archive workspaces idle longer than
+    // `workspace.autoArchiveIdleAfterDays` (read live; default 7, 0 = off).
+    // Aborted on clean shutdown.
+    let auto_archive_loop = startup_work.spawn(|| services.spawn_auto_archive_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -3297,6 +3307,8 @@ async fn cmd_serve_owned(
     let _ = script_output_sweep.await;
     auto_retire_loop.abort();
     let _ = auto_retire_loop.await;
+    auto_archive_loop.abort();
+    let _ = auto_archive_loop.await;
     execution_context_loop.abort();
     let _ = execution_context_loop.await;
     if let Some(reap_task) = reap_task {

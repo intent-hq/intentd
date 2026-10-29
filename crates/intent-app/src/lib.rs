@@ -26,7 +26,7 @@ pub use intent_svc_remote as remote;
 
 /// Runtime (scripts, hooks, terminals, browser tabs, sandboxes) entry points
 /// the daemon calls on [`Services`] at startup.
-pub use intent_services::feature_api::RuntimeServicesExt;
+pub use intent_svc_runtime::RuntimeServicesExt;
 
 /// Register every feature crate on `services`, then run the startup check.
 ///
@@ -40,6 +40,7 @@ pub use intent_services::feature_api::RuntimeServicesExt;
 /// answering that feature's calls with its "unavailable" error.
 #[must_use]
 pub fn compose(services: Services) -> Services {
+    let services = intent_svc_runtime::register(services);
     let services = intent_svc_transfer::register(services);
     let services = intent_svc_remote::register(services);
     assert_feature_ports_registered(&services);

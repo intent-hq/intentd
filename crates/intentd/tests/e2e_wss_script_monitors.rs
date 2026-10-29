@@ -210,11 +210,11 @@ async fn boot() -> Fixture {
         .await
         .expect("seed agent");
 
-    let services = Arc::new(
+    let services = Arc::new(intent_app::compose(
         Services::new(store.clone())
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone()),
-    );
+    ));
     let api: Arc<dyn WorkspaceApi> = services.clone();
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());

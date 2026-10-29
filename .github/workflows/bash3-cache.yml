@@ -1,0 +1,30 @@
+# Fill intentd's Actions cache with the pinned Bash 3.2 build.
+#
+# The monorepo-consumer-checks job (ci.yml) runs the monorepo's reusable
+# consumer-checks.yml, which sets up Bash 3.2 through the monorepo's
+# .github/actions/setup-bash3 when this PR changes the changed-tests scripts.
+# That step restores the build from the Actions cache of the repository the
+# run belongs to, which is intentd, and merge-queue runs can read only the
+# default branch's entries. So intentd's main has to save the entry: this
+# calls the monorepo's bash3-cache.yml (the same action, installer and key)
+# daily, which also keeps the entry from expiring as idle and picks up a new
+# key within a day of a monorepo pin or installer change, on demand, and
+# when this file changes. Without it, every selected queue run compiles Bash
+# 3.2 again (about 2 minutes).
+name: Bash 3.2 cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bash3-cache.yml
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fill:
+    uses: intent-hq/intent/.github/workflows/bash3-cache.yml@main

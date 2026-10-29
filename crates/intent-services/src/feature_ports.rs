@@ -605,6 +605,15 @@ pub trait RuntimePort: Send + Sync + 'static {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    /// Word a `browser.*` reverse-dispatch error for its caller: an offline
+    /// client is named (falling back to its stored name). Core's
+    /// `ws.browser.clients()` route view uses the runtime's wording.
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String>;
+
     /// `browser.navigateTab`.
     fn browser_navigate_tab<'a>(
         &'a self,
@@ -1002,7 +1011,7 @@ pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
         .flatten()
 }
 
-/// How a cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook),
+/// How a cancel transition (the runtime's `HookServicesExt::cancel_active_hook`,
 /// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
 /// completion watches. A completion watch on an idle owner defers while the
 /// owner has active hooks / PR monitors, so cancelling the LAST one must
@@ -1661,6 +1670,14 @@ impl RuntimePort for UnavailableRuntime {
         DEFAULT_WORKSPACE_API.browser_exec(workspace_id, actions, tab_id, agent_id)
     }
 
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        _svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move { err.to_string() })
+    }
+
     fn browser_navigate_tab<'a>(
         &'a self,
         _svc: &'a Services,
@@ -2204,7 +2221,6 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::RuntimeStateExt;
     use std::sync::Arc;
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
@@ -2289,12 +2305,12 @@ mod tests {
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
-            ["transfer", "remote_launch"],
-            "Services::new registers the in-crate runtime and agent-wake features"
+            ["transfer", "runtime", "remote_launch"],
+            "Services::new registers only the in-crate agent-wake feature"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
-            Err(Error::Internal(m)) if m == "feature ports not registered: transfer, remote_launch"
+            Err(Error::Internal(m)) if m == "feature ports not registered: transfer, runtime, remote_launch"
         ));
     }
 
@@ -2306,6 +2322,7 @@ mod tests {
             bare_services(&tmp)
                 .await
                 .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>)
+                .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>)
                 .with_remote_launch_port(
                     Arc::new(UnavailableRemoteLaunch) as Arc<dyn RemoteLaunchPort>
                 );
@@ -2320,20 +2337,6 @@ mod tests {
                 .export_in_progress(ws.as_str()),
             "the forwarders and clones reach the registered object"
         );
-    }
-
-    #[tokio::test]
-    async fn services_new_registers_one_runtime_feature_shared_by_clones() {
-        let tmp = TempDb::new();
-        let svc = bare_services(&tmp).await;
-        assert!(!svc.unregistered_feature_ports().contains(&"runtime"));
-        let clone = svc.clone();
-        assert!(std::ptr::eq(svc.runtime(), clone.runtime()));
-        assert!(std::ptr::eq(
-            svc.runtime(),
-            svc.feature::<crate::runtime::RuntimeFeature>()
-                .expect("registered")
-        ));
     }
 
     #[tokio::test]

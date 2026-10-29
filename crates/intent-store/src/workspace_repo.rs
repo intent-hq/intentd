@@ -27,7 +27,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity, retired_at";
+    browser_client_id, last_content_activity, retired_at, label";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -263,7 +263,7 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -302,6 +302,7 @@ impl Store {
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(&ws.last_content_activity)
             .bind(&ws.retired_at)
+            .bind(&ws.label)
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -365,6 +366,9 @@ impl Store {
     /// snapshot read before a concurrent archive can never resurrect the
     /// workspace behind the archive's guest sweep (the `workspace.archive`
     /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
+    /// `label` is never written here either: it moves only through
+    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
     ///
     /// # Errors
     ///
@@ -1404,6 +1408,27 @@ impl Store {
         Ok(())
     }
 
+    /// Scoped write of the Home workspace label (`workspace.update { label }`):
+    /// `None` clears it. After insert this is the only writer of the column —
+    /// `update_workspace` never touches it — so a stale [`Workspace`]
+    /// snapshot passed to a full-row update cannot revert a newer label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET label = ? WHERE id = ?")
+            .bind(label)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set workspace label failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// The persisted per-workspace auto-commit override. `Ok(None)` for
     /// pre-migration rows (NULL column) — the caller resolves NULL against
     /// the global `git.autoCommit` setting. `NotFound` when the workspace
@@ -1530,7 +1555,9 @@ impl Store {
     }
 
     /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
-    /// set `status = Retired`, `retired_at`, and `updated_at` ONLY when the
+    /// set `status = Retired`, `retired_at`, `updated_at` and the purge
+    /// `status_message` ([`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`],
+    /// replacing the previous message) ONLY when the
     /// row is currently archived and not already retired. The caller runs
     /// the archive flip first for an Active workspace, so a retired row is
     /// always `archived = 1` (`archived_at` kept). Every other column —
@@ -1548,12 +1575,13 @@ impl Store {
     ) -> Result<bool> {
         let retired = enum_to_db(&WorkspaceStatus::Retired)?;
         let res = sqlx::query(
-            "UPDATE workspace SET status=?, retired_at=?, updated_at=? \
+            "UPDATE workspace SET status=?, retired_at=?, updated_at=?, status_message=? \
              WHERE id=? AND archived=1 AND status <> ?",
         )
         .bind(&retired)
         .bind(retired_at)
         .bind(retired_at)
+        .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
         .bind(&id.0)
         .bind(&retired)
         .execute(self.write_pool())
@@ -1579,8 +1607,10 @@ impl Store {
     /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
     /// `Retired` row back to `Active` — clear `archived`, `archived_at` and
     /// `retired_at` — and record the fresh checkout's `branch` and
-    /// `base_commit_sha`, ONLY when the row is currently retired. Every other
-    /// column is untouched. Returns whether this call performed the flip;
+    /// `base_commit_sha`, ONLY when the row is currently retired. The purge
+    /// `status_message` is cleared when it still equals
+    /// [`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`]; a message changed
+    /// since the retire is kept. Every other column is untouched. Returns whether this call performed the flip;
     /// `NotFound` when the workspace does not exist. Same archive-binding
     /// lifecycle bracket as [`Self::unarchive_workspace_if_archived`] (a
     /// retired row is always archived).
@@ -1594,6 +1624,29 @@ impl Store {
         branch: &str,
         base_commit_sha: Option<&str>,
         updated_at: &str,
+    ) -> Result<bool> {
+        self.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, None)
+            .await
+    }
+
+    /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
+    /// prompt notice pending on the workspace's agent sessions **in the same
+    /// `BEGIN IMMEDIATE` transaction** as the flip: no reader can observe the
+    /// revived (Active) row without the notices, and a crash can never commit
+    /// one without the other. `notice` is `(metadata key, text, excluded
+    /// session)`; every session of the workspace except the excluded one
+    /// gets the key set. Nothing is written when the row is not retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired_with_notice(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+        notice: Option<(&str, &str, Option<&AgentId>)>,
     ) -> Result<bool> {
         let retired = enum_to_db(&WorkspaceStatus::Retired)?;
         let mut lifecycle = self.repository_lifecycle_write().await?;
@@ -1610,21 +1663,65 @@ impl Store {
             return Ok(false);
         }
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
-        let res = sqlx::query(
-            "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
-             branch=?, base_commit_sha=?, updated_at=? WHERE id=? AND status=?",
-        )
-        .bind(enum_to_db(&WorkspaceStatus::Active)?)
-        .bind(branch)
-        .bind(base_commit_sha)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&retired)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
-        lifecycle.settle_after_retirement().await?;
-        Ok(res.rows_affected() > 0)
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace begin failed: {e}")))?;
+        let body: Result<bool> = async {
+            let res = sqlx::query(
+                "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
+                 branch=?, base_commit_sha=?, updated_at=?, \
+                 status_message=CASE WHEN status_message=? THEN NULL ELSE status_message END \
+                 WHERE id=? AND status=?",
+            )
+            .bind(enum_to_db(&WorkspaceStatus::Active)?)
+            .bind(branch)
+            .bind(base_commit_sha)
+            .bind(updated_at)
+            .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+            .bind(&id.0)
+            .bind(&retired)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Ok(false);
+            }
+            if let Some((key, text, excluded)) = notice {
+                sqlx::query(
+                    "UPDATE agent_session SET \
+                     metadata = json_set(\
+                         CASE \
+                             WHEN metadata IS NULL THEN '{}' \
+                             WHEN json_type(metadata) = 'object' THEN metadata \
+                             ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                         END, \
+                         '$.' || ?, ?) \
+                     WHERE workspace_id = ? AND (? IS NULL OR id <> ?)",
+                )
+                .bind(key)
+                .bind(text)
+                .bind(&id.0)
+                .bind(excluded.map(|a| a.0.as_str()))
+                .bind(excluded.map(|a| a.0.as_str()))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("revive pending notice write failed: {e}")))?;
+            }
+            Ok(true)
+        }
+        .await;
+        let result =
+            crate::commit_with_rollback_guard(conn, body, "revive workspace commit failed").await;
+        let settled = lifecycle.settle_after_retirement().await;
+        let flipped = result?;
+        settled?;
+        Ok(flipped)
     }
 
     /// Ordinary workspace keys for inherited host access, without hydrating
@@ -1905,6 +2002,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         token_usage,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
+        label: col(row, "label")?,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
         // wait/script/background flags, `cowSupported`, `diskUsage`,

@@ -288,4 +288,27 @@ port, call idempotent `openTunnel { remotePort }`, and use the returned current
 `http://127.0.0.1:<localPort>` URL. This works whether the previous forward survived or
 had to be re-created.
 
+## Troubleshooting Timeouts
+
+A `ws.browser.exec` call that gets no answer fails with `reverse request timed out:
+browser.exec: browser client "<name>" (<clientId>) on connection <n> over <transport>,
+connected <time> did not accept or answer the request within <s>s`. Call the read-only
+`ws.browser.clients()` to see what the daemon holds right now:
+
+- `clients` — every connected app (`clientId`, `name?`, `canHostBrowser`) with its live
+  `connections`, oldest first: `connectionId` (the `<n>` in the error), `transport`
+  (`uds` / `wss`), `connectedAt`, `canHostBrowser`. `clientId` matches `listTabs`
+  `hostClientId`.
+- `unpinned` — where a request with no pin would go: the first-connected client that can
+  host a browser, via its newest connection.
+- `workspace` — where this workspace's `ws.browser.exec` goes, with `source`:
+  `workspace` (the workspace's browser-client pin), `desktop` (the client controlling
+  this workspace's desktop), `tabs` (the host of this workspace's claimed tabs) or
+  `default` (same as `unpinned`).
+
+A route names `clientId` and `connectionId`; when nothing would answer it has
+`connectionId: null` and an `error` (for example `no client connected`). If the
+connection that timed out is not the newest one of its client, or several connections
+of one app are listed, include the `ws.browser.clients()` output when you report it.
+
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.

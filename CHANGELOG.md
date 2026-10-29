@@ -2,6 +2,78 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.71] - 2026-10-28
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the primary client in the workspace menu ([#2778](https://github.com/intent-hq/intentd/pull/2778))
+
+
+## [0.11.70] - 2026-10-28
+
+### 🧪 Testing
+
+- Verify four protocol fixture copies with the shared lock tool ([#2774](https://github.com/intent-hq/intentd/pull/2774))
+
+
+## [0.11.69] - 2026-10-28
+
+### 🚀 Features
+
+- Persist and serve Workspace.label ([#2760](https://github.com/intent-hq/intentd/pull/2760))
+
+
+## [0.11.68] - 2026-10-28
+
+### 📚 Documentation
+
+- Explain local HTTP browsing on iOS ([#2691](https://github.com/intent-hq/intentd/pull/2691))
+
+
+## [0.11.67] - 2026-10-28
+
+### ⚙️ Miscellaneous Tasks
+
+- *(acp)* Win back room in the condensed ws.* prompt reference ([#2770](https://github.com/intent-hq/intentd/pull/2770))
+
+
+## [0.11.66] - 2026-10-27
+
+### 🔧 Refactor
+
+- *(services)* Move runtime into intent-svc-runtime ([#2767](https://github.com/intent-hq/intentd/pull/2767))
+
+### 📚 Documentation
+
+- Describe Multiplayer as always on in the assistant guide ([#2753](https://github.com/intent-hq/intentd/pull/2753))
+
+
+## [0.11.65] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Prepare runtime-side tests for the runtime crate move ([#2761](https://github.com/intent-hq/intentd/pull/2761))
+
+
+## [0.11.64] - 2026-10-27
+
+### 🚀 Features
+
+- Teach agents to link other workspaces instead of naming their IDs ([#2754](https://github.com/intent-hq/intentd/pull/2754))
+- Auto-archive idle workspaces and purge archived folders ([#2756](https://github.com/intent-hq/intentd/pull/2756))
+
+### 🧪 Testing
+
+- *(transport)* Run the shared browser-routing cases against the router ([#2752](https://github.com/intent-hq/intentd/pull/2752))
+
+
+## [0.11.63] - 2026-10-27
+
+### 🚀 Features
+
+- *(browser)* Add ws.browser.clients() to show live client connections and routes ([#2749](https://github.com/intent-hq/intentd/pull/2749))
+
+
 ## [0.11.62] - 2026-10-27
 
 ### 🐛 Bug Fixes

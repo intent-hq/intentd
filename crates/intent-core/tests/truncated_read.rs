@@ -1,13 +1,14 @@
 //! The truncated-read cut rule (`truncated_content_len`, `note_bounded_row`)
 //! checked against the protocol vectors in
 //! `docs/protocol/fixtures/notes/truncated-read.json` (monorepo). The vectors
-//! are copied to `tests/fixtures/truncated-read.json`; when this crate is
-//! built inside the monorepo the copy must equal the protocol file, so a
-//! contract change cannot silently leave intentd checking old cases.
+//! are copied to `tests/fixtures/truncated-read.json` through the monorepo's
+//! shared fixture-copy tool (`scripts/note-truncated-read-contract.mjs`): the
+//! lock `tests/fixtures/truncated-read.lock.json` names the monorepo commit, CI
+//! verifies the copy against it, and a lagging copy only warns there, so the
+//! docs can change first. Re-export the copy instead of editing it.
 
 use intent_core::{note_bounded_row, truncated_content_len, Note};
 use serde_json::{json, Value};
-use std::path::Path;
 
 const FIXTURE: &str = include_str!("fixtures/truncated-read.json");
 
@@ -33,21 +34,6 @@ fn note(content: &str) -> Note {
         "updatedAt": "t1"
     }))
     .expect("note")
-}
-
-#[test]
-fn copy_matches_the_protocol_fixture_when_in_the_monorepo() {
-    let protocol = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../docs/protocol/fixtures/notes/truncated-read.json");
-    if let Ok(text) = std::fs::read_to_string(&protocol) {
-        let parsed: Value = serde_json::from_str(&text).expect("protocol fixture json");
-        assert_eq!(
-            parsed,
-            fixture(),
-            "tests/fixtures/truncated-read.json drifted from {}",
-            protocol.display()
-        );
-    }
 }
 
 #[test]

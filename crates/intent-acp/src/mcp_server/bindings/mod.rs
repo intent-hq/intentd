@@ -200,6 +200,7 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "agent.snapshot",
     "agent.status",
     "agent.summary",
+    "browser.clients",
     "browser.docs",
     "browser.listTabs",
     "comment.getThread",
@@ -509,6 +510,55 @@ pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }
 
+/// A Markdown link `[label](url)` whose label has `[`, `]` and `\\` escaped,
+/// so a title like `Fix [beta] login` still forms one link.
+pub(crate) fn markdown_link(label: &str, url: &str) -> String {
+    let mut out = String::with_capacity(label.len() + url.len() + 4);
+    out.push('[');
+    for c in label.chars() {
+        if matches!(c, '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str("](");
+    out.push_str(url);
+    out.push(')');
+    out
+}
+
+/// The app link that opens workspace `id`, plus a Markdown link labelled with
+/// its title (`Untitled` when blank): `(intent://local/workspace/{id},
+/// [Title](intent://local/workspace/{id}))`. Returned beside workspace IDs so
+/// agents share a clickable workspace instead of its internal ID.
+pub(crate) fn workspace_links(id: &str, title: &str) -> (String, String) {
+    let link = format!("intent://local/workspace/{id}");
+    let label = if title.trim().is_empty() {
+        "Untitled"
+    } else {
+        title
+    };
+    let markdown_link = markdown_link(label, &link);
+    (link, markdown_link)
+}
+
+/// Add `link` and `markdownLink` (see [`workspace_links`]) to a JSON object
+/// that has string `id` and `title` fields; any other value is left alone.
+pub(crate) fn insert_workspace_links(row: &mut Value) {
+    let Some(obj) = row.as_object_mut() else {
+        return;
+    };
+    let (Some(id), Some(title)) = (
+        obj.get("id").and_then(Value::as_str),
+        obj.get("title").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let (link, markdown_link) = workspace_links(id, title);
+    obj.insert("link".to_string(), Value::String(link));
+    obj.insert("markdownLink".to_string(), Value::String(markdown_link));
+}
+
 /// Per-session fields the agent must never learn about
 /// (`intent_core::model::AGENT_HIDDEN_FIELDS`): stripped from every
 /// `ws.agent.*` and `ws.event.*` result (however deeply nested) before it
@@ -516,6 +566,45 @@ pub(crate) fn map_err(e: intent_core::Error) -> String {
 /// per-event `data` copied into parent-wake message metadata, so the shared
 /// definition lives in `intent-core`.
 pub(crate) use intent_core::model::strip_agent_hidden_fields;
+
+#[cfg(test)]
+mod workspace_link_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workspace_links_build_the_app_link_and_escape_the_label() {
+        assert_eq!(
+            workspace_links("cold-heron", "Fix login"),
+            (
+                "intent://local/workspace/cold-heron".to_string(),
+                "[Fix login](intent://local/workspace/cold-heron)".to_string(),
+            )
+        );
+        assert_eq!(
+            workspace_links("w", r"Fix [beta] a\b").1,
+            r"[Fix \[beta\] a\\b](intent://local/workspace/w)"
+        );
+        assert_eq!(
+            workspace_links("w", "  ").1,
+            "[Untitled](intent://local/workspace/w)"
+        );
+    }
+
+    #[test]
+    fn insert_workspace_links_needs_an_id_and_a_title() {
+        let mut row = json!({ "id": "w", "title": "T", "branch": "b" });
+        insert_workspace_links(&mut row);
+        assert_eq!(row["link"], "intent://local/workspace/w");
+        assert_eq!(row["markdownLink"], "[T](intent://local/workspace/w)");
+        assert_eq!(row["branch"], "b");
+        for mut other in [json!({ "id": "w" }), json!({ "title": "T" }), json!("w")] {
+            let before = other.clone();
+            insert_workspace_links(&mut other);
+            assert_eq!(other, before);
+        }
+    }
+}
 
 #[cfg(test)]
 mod hidden_field_tests {

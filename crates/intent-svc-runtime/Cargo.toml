@@ -1,0 +1,48 @@
+[package]
+name = "intent-svc-runtime"
+version = "0.11.71"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Scripts, hooks, terminals, browser tabs and sandboxes for intentd, built on intent-services"
+
+[dependencies]
+intent-services = { path = "../intent-services", version = "0.11.71" }
+intent-core = { path = "../intent-core", version = "0.11.71" }
+intent-store = { path = "../intent-store", version = "0.11.71" }
+intent-git = { path = "../intent-git", version = "0.11.71" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.71" }
+intent-providers = { path = "../intent-providers", version = "0.11.71" }
+intent-acp = { path = "../intent-acp", version = "0.11.71" }
+intent-js = { path = "../intent-js", version = "0.11.71" }
+intent-pty = { path = "../intent-pty", version = "0.11.71" }
+base64 = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+croner = "4.0.0"
+git2 = { workspace = true }
+regex = "1.12"
+serde_json = { workspace = true }
+tempfile = "3"
+time = { workspace = true, features = ["formatting", "local-offset"] }
+tokio = { workspace = true }
+toml_edit = "0.25.5"
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target."cfg(unix)".dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["signal", "process", "fs"] }
+
+[dev-dependencies]
+intent-services = { path = "../intent-services", version = "0.11.71", features = ["test-hooks", "repository-test-fixtures"] }
+intent-providers = { path = "../intent-providers", version = "0.11.71", features = ["test-support"] }
+intent-store = { path = "../intent-store", version = "0.11.71", features = ["test-support"] }
+intent-acp = { path = "../intent-acp", version = "0.11.71", features = ["test-hooks"] }
+intent-test-macros = { path = "../intent-test-macros" }
+intentd-test-support = { path = "../intentd-test-support" }
+sqlx.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
