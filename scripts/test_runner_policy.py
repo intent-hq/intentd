@@ -278,7 +278,10 @@ class RunnerPolicy(unittest.TestCase):
         # raise fs.inotify.max_user_instances to 32768 (infra/runners/sysctl.conf).
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         listed = {entry['key']: entry for entry in slot_list(ci)}
-        self.assertEqual(listed['coverage-all'], {'key': 'coverage-all', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 22, 'events': ['merge_group']})
+        # coverage-all sets the queue's pace: on an 8-CPU bigmem slot it took p50 27 / p90 39 min
+        # against 17.5 on xl, so it takes only an xl slot and otherwise bursts to WarpBuild 16x.
+        self.assertEqual(listed['coverage-all'], {'key': 'coverage-all', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 22,
+                                                  'events': ['merge_group'], 'pools': ['xl']})
         self.assertEqual(listed['coverage-e2e'], {'key': 'coverage-e2e', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 11, 'events': ['merge_group']})
         self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
         body = jobs(ci)

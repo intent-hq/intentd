@@ -103,6 +103,9 @@ jobs:
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
           # only in the queue and take a free xl or bigmem slot there (longest
           # first, so coverage-all gets the xl slot), or burst to WarpBuild.
+          # coverage-all sets the queue's pace and takes only xl ("pools"):
+          # on an 8-CPU bigmem slot it took p50 27 / p90 39 min against 17.5
+          # on xl, so with no xl slot free it bursts to WarpBuild 16x.
           # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
           # CPUs and 19.7 GB), so it takes an xl slot when one is left after
           # coverage-changed, else a bigmem heavy slot (30 GB or more; one of its
@@ -130,7 +133,7 @@ jobs:
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
             {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
-            {"key":"coverage-all","label":"gh-linux-16x","rust":true,"minutes":22,"events":["merge_group"]},
+            {"key":"coverage-all","label":"gh-linux-16x","rust":true,"minutes":22,"events":["merge_group"],"pools":["xl"]},
             {"key":"coverage-e2e","label":"gh-linux-16x","rust":true,"minutes":11,"events":["merge_group"]},
             {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
             ]
@@ -289,7 +292,8 @@ jobs:
             // list order. Listed jobs that do not fit, or that skip this event, get
             // their burst runner directly, sized by `burst` when set (a CPU-bound
             // job keeps its slot size but bursts bigger); matrix legs are ranked
-            // separately.
+            // separately. A job with `pools` takes a slot only in the pools it lists
+            // (e.g. ["xl"]: no overflow to bigmem heavy slots).
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
@@ -303,7 +307,8 @@ jobs:
             const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
             for (const r of ranked) {
               const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
-              const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && hasSlot(k));
+              const allowed = (k) => !Array.isArray(r.pools) || r.pools.includes(k);
+              const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && allowed(k) && hasSlot(k));
               if (key) {
                 slotsFree[key] -= 1;
                 granted[key] += 1;
