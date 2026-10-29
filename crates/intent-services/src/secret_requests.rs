@@ -931,6 +931,24 @@ mod tests {
     }
 
     #[test]
+    fn feature_snapshots_carry_secret_requests_only_when_on() {
+        use intent_core::settings_file::AgentFeaturesSettings;
+        let off =
+            crate::agent_ops::agent_features_snapshot(&AgentFeaturesSettings::default()).unwrap();
+        assert!(off.get("secretRequests").is_none(), "{off}");
+        let decoded: AgentFeaturesSettings = serde_json::from_value(off).unwrap();
+        assert!(!decoded.secret_requests);
+        let on = crate::agent_ops::agent_features_snapshot(&AgentFeaturesSettings {
+            secret_requests: true,
+            ..AgentFeaturesSettings::default()
+        })
+        .unwrap();
+        assert_eq!(on["secretRequests"], json!(true));
+        let decoded: AgentFeaturesSettings = serde_json::from_value(on).unwrap();
+        assert!(decoded.secret_requests);
+    }
+
+    #[test]
     fn unavailable_error_names_the_secret_and_the_retry() {
         let err = unavailable("KEY");
         assert!(matches!(
