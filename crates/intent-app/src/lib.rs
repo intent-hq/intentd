@@ -43,11 +43,6 @@ pub fn compose(services: Services) -> Services {
     let services = intent_svc_runtime::register(services);
     let services = intent_svc_transfer::register(services);
     let services = intent_svc_remote::register(services);
-    // The remote feature does not launch agents yet: every remote launch
-    // fails as `placement-unavailable` until it registers its port.
-    let services = services.with_remote_launch_port(std::sync::Arc::new(
-        intent_services::feature_api::feature_ports::UnavailableRemoteLaunch,
-    ));
     assert_feature_ports_registered(&services);
     services
 }

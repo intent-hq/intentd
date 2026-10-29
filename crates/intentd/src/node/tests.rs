@@ -56,7 +56,13 @@ impl Running {
     }
 
     async fn start_with(root: &std::path::Path, config: &Config) -> Self {
-        let node = Node::start(config, root).await.unwrap();
+        // Agents work in plain directories here: no head serves git. The
+        // git checkout path is covered by the e2e_remote_launch tests.
+        let node = Node::start_with_checkouts(config, root, |storage, _cache| {
+            crate::node::checkout::PlainCheckouts::new(storage)
+        })
+        .await
+        .unwrap();
         let endpoint = NodeEndpoint {
             url: format!("wss://{}", node.listener.local_addr()),
             pin: CertificatePin::parse(&node.certificate_sha256).unwrap(),
@@ -102,6 +108,8 @@ fn refused_launch(id: &str) -> LinkFrame {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
     })
 }
 
@@ -323,6 +331,8 @@ async fn node_shutdown_settles_launches_arriving_on_a_live_link() {
             workspace_id: WorkspaceId::from("ws-1"),
             provider: "mock".into(),
             model: None,
+            base_commit: "base".into(),
+            repo_key: "repo".into(),
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();
@@ -335,11 +345,12 @@ async fn node_shutdown_settles_launches_arriving_on_a_live_link() {
         })
         .await
         .unwrap();
-    // Shut down while a0's burst is being journaled.
-    assert!(matches!(
-        next_record(&mut dialed).await.body,
-        JournalBody::Notification { .. }
-    ));
+    // Shut down while a0's burst is being journaled (after its Started).
+    let mut first = next_record(&mut dialed).await;
+    if matches!(first.body, JournalBody::Started { .. }) {
+        first = next_record(&mut dialed).await;
+    }
+    assert!(matches!(first.body, JournalBody::Notification { .. }));
     let _ = node.stop.take().unwrap().send(());
     for i in 1..=20 {
         if dialed.link.send(&launch(format!("late{i}"))).await.is_err() {

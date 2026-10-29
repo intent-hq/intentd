@@ -23,6 +23,9 @@ const BINDING: &str = "binding.json";
 const TLS: &str = "tls.json";
 const JOURNAL: &str = "journal";
 const AGENTS: &str = "agents";
+const CACHE: &str = "cache";
+const BIN: &str = "bin";
+const GIT_SOCKET: &str = "git.sock";
 
 /// The persisted TLS identity. The key never leaves this file.
 #[derive(Serialize, Deserialize)]
@@ -122,7 +125,39 @@ impl Storage {
         }
     }
 
+    /// Where `agent_id`'s git worktree lives. Its parent exists; the
+    /// worktree itself is created by `git worktree add`.
+    pub(super) fn agent_worktree(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        ensure!(
+            valid_id(&agent_id.0),
+            "agent id is not a safe path component"
+        );
+        let parent = self.root.join(AGENTS).join(&agent_id.0);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&parent)
+            .context("create agent directory")?;
+        Ok(parent.join("work"))
+    }
+
+    /// The per-repository bare caches holding agent worktrees.
+    pub(super) fn cache_dir(&self) -> PathBuf {
+        self.root.join(CACHE)
+    }
+
+    /// Where the `git-remote-intent` helper link is installed.
+    pub(super) fn helper_dir(&self) -> PathBuf {
+        self.root.join(BIN)
+    }
+
+    /// The local socket the helper reaches head's git sessions through.
+    pub(super) fn git_socket(&self) -> PathBuf {
+        self.root.join(GIT_SOCKET)
+    }
+
     /// A fresh working directory for `agent_id`, created on demand.
+    #[cfg(test)]
     pub(super) fn agent_dir(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
         ensure!(
             valid_id(&agent_id.0),

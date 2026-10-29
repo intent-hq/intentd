@@ -135,6 +135,11 @@ impl HeadNodeConfig {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| node_id.clone());
+        if name.len() > 128 || name.chars().any(char::is_control) {
+            return Err(invalid(
+                "name must be 1-128 UTF-8 bytes without control characters",
+            ));
+        }
         Ok(Self {
             node_id,
             name,

@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
+use crate::node::storage::Storage;
 
 const PROVIDER: &str = "mock";
 
@@ -17,6 +18,7 @@ fn wait() -> Duration {
 struct Harness {
     runner: Runner,
     storage: Arc<Storage>,
+    checkouts: Arc<crate::node::checkout::PlainCheckouts>,
     _dir: tempfile::TempDir,
 }
 
@@ -43,6 +45,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(Storage::open(&dir.path().join("node")).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
+    let checkouts = crate::node::checkout::PlainCheckouts::new(storage.clone());
     let runner = Runner::new(RunnerConfig {
         max_agents,
         policy: PermissionPolicy::AllowAll,
@@ -53,12 +56,13 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
                 binary: node,
             },
         )]),
-        storage: storage.clone(),
+        checkouts: checkouts.clone(),
         journal,
     });
     Some(Harness {
         runner,
         storage,
+        checkouts,
         _dir: dir,
     })
 }
@@ -69,6 +73,8 @@ fn launch(id: &str) -> LaunchCommand {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: PROVIDER.into(),
         model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
     }
 }
 
@@ -551,4 +557,79 @@ fn node_test_agent_fixture_exists() {
         "/tests/fixtures/node-test-agent.mjs"
     ))
     .is_file());
+}
+
+fn started(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
+    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::Started { .. })
+}
+
+/// Wait until the runner asked for `count` WIP pushes.
+async fn wait_pushes(h: &Harness, count: usize) -> Vec<AgentId> {
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let pushes = h.checkouts.pushes.lock().unwrap().clone();
+        if pushes.len() >= count {
+            return pushes;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {count} WIP pushes, got {pushes:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A launched agent reports `Started` (with the launched commit) once its
+/// checkout and session are ready, before any turn output; its work is
+/// pushed back after every turn and once more when it exits, before head
+/// hears of the exit.
+#[tokio::test]
+async fn node_runner_reports_started_and_pushes_wip_after_turns_and_on_exit() {
+    let Some(h) = harness(2, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "started", started("a1")).await;
+    let record = find(&all, started("a1"));
+    assert!(
+        matches!(&record.body, JournalBody::Started { base_commit } if base_commit == "base"),
+        "{record:#?}"
+    );
+    assert!(h.checkouts.pushes.lock().unwrap().is_empty());
+
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    let start = all.iter().position(started("a1")).unwrap();
+    let first_output = all
+        .iter()
+        .position(|r| r.turn_id.as_deref() == Some("t1"))
+        .unwrap();
+    assert!(start < first_output, "{all:#?}");
+    assert_eq!(wait_pushes(&h, 1).await, vec![AgentId::from("a1")]);
+
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    assert_eq!(
+        h.checkouts.pushes.lock().unwrap().len(),
+        2,
+        "the exit push happens before the exit is journaled"
+    );
+}
+
+/// A checkout head cannot serve ends the launch with `node-checkout-failed`
+/// and no `Started`, and frees the slot.
+#[tokio::test]
+async fn node_runner_reports_a_failed_checkout_as_the_agents_exit() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.checkouts
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let error = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(error.starts_with(codes::CHECKOUT), "{error}");
+    assert!(error.contains("head refused the fetch"), "{error}");
+    assert!(!all.iter().any(started("a1")), "{all:#?}");
+    assert!(h.runner.running().is_empty());
+    assert!(h.checkouts.pushes.lock().unwrap().is_empty());
 }

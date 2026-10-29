@@ -77,6 +77,12 @@ impl RemoteAgentRuntime {
         &self.agent_id
     }
 
+    /// Neither stopped by head nor exited on the node.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.stopped.load(Ordering::SeqCst) && self.sink.exit().is_none()
+    }
+
     /// The node's exit report, once the agent's provider exited.
     #[must_use]
     pub fn exit_error(&self) -> Option<String> {

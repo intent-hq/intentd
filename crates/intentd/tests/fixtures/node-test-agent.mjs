@@ -13,7 +13,8 @@
 // "exit" answers and then exits with code 0, leaving its `sleep` child
 // running; "spawn-exit" starts another `sleep` in its own process group,
 // writes its pid to `late-helper.pid`, answers and exits at once; every turn
-// first streams one agent_message_chunk "echo: <text>".
+// first streams one agent_message_chunk "echo: <text>". A `<system>` block
+// in the prompt is ignored.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -34,8 +35,14 @@ function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 }
 
+// The user's text: head's `<system>` instructions block (sent with a remote
+// agent's first prompt) is dropped so its words never trigger a behavior.
 function promptText(params) {
-  return (params?.prompt ?? []).map((block) => block?.text ?? '').join('');
+  return (params?.prompt ?? [])
+    .map((block) => block?.text ?? '')
+    .join('')
+    .replace(/<system>[\s\S]*?<\/system>/g, '')
+    .trim();
 }
 
 readline.createInterface({ input: process.stdin }).on('line', async (line) => {

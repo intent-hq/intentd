@@ -10851,6 +10851,10 @@ mod wsapi4_bindings_tests {
         agent_delete_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_retire_calls: Mutex<Vec<RetireCall>>,
         agent_create_calls: Mutex<Vec<CreateCall>>,
+        /// `(method, placement)` of every create / delegate / wakeOrCreate.
+        placements: Mutex<Vec<(&'static str, Option<Value>)>>,
+        /// What `agent_placement_help` answers.
+        placement_help: Mutex<Option<String>>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
         /// calls — `create({ topLevel: true })` must never make one.
         agent_watch_completion_calls: Mutex<u32>,
@@ -10926,6 +10930,12 @@ mod wsapi4_bindings_tests {
             last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -11260,6 +11270,14 @@ mod wsapi4_bindings_tests {
             context_message: String,
             input: intent_core::AgentWakeOrCreateInput,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "wakeOrCreate",
+                input
+                    .create
+                    .as_ref()
+                    .and_then(|create| create.placement.as_ref())
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_wake_or_create_calls.lock().unwrap().push((
                 task_note_id.as_str().to_string(),
                 context_message,
@@ -11281,6 +11299,14 @@ mod wsapi4_bindings_tests {
             idempotency_key: Option<String>,
             extra: intent_core::AgentCreateExtra,
         ) -> BoxFuture<'_, Result<Value>> {
+            let placed = extra.placement.is_some();
+            self.placements.lock().unwrap().push((
+                "create",
+                extra
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_create_calls.lock().unwrap().push((
                 name,
                 specialist_id,
@@ -11289,7 +11315,20 @@ mod wsapi4_bindings_tests {
                 extra.metadata,
                 extra.is_background,
             ));
-            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+            Box::pin(async move {
+                if placed {
+                    return Ok(json!({
+                        "agent": { "id": "child-1", "name": "child", "nodeId": "node-1", "nodeName": "Mac" },
+                        "notice": "Uncommitted changes in the workspace are not carried",
+                    }));
+                }
+                Ok(json!({ "agent": { "id": "child-1", "name": "child" } }))
+            })
+        }
+
+        fn agent_placement_help(&self, _ws: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+            let help = self.placement_help.lock().unwrap().clone();
+            Box::pin(async move { help })
         }
 
         fn agent_watch_completion(
@@ -11308,6 +11347,13 @@ mod wsapi4_bindings_tests {
             input: AgentDelegateInput,
             caller: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "delegate",
+                input
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_delegate_calls.lock().unwrap().push((
                 input.wait_mode.clone(),
                 caller.as_ref().map(|c| c.as_str().to_string()),
@@ -13177,6 +13223,85 @@ mod wsapi4_bindings_tests {
         assert_eq!(calls[0].3.as_ref().unwrap()["type"], json!("agent_message"));
     }
 
+    /// `placement` reaches every create seam unchanged; `null` and invalid
+    /// objects are refused before any call; a remote create reports its
+    /// node and launch notice.
+    #[tokio::test]
+    async fn placement_is_threaded_through_create_delegate_and_wake_or_create() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('n', 'go', { placement: { target: 'remote', os: 'macos' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"nodeName\": \"Mac\"") || text.contains("\"nodeName\":\"Mac\""),
+            "{text}"
+        );
+        assert!(text.contains("not carried"), "{text}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { arch: 'aarch64' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { create: { placement: { target: 'remote' } } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-2', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        assert_eq!(
+            *api.placements.lock().unwrap(),
+            vec![
+                ("create", Some(json!({"target": "remote", "os": "macos"}))),
+                ("delegate", Some(json!({"arch": "aarch64"}))),
+                ("wakeOrCreate", Some(json!({"target": "remote"}))),
+                ("wakeOrCreate", None),
+            ]
+        );
+
+        for code in [
+            "return await ws.agent.create('n', 'go', { placement: null });",
+            "return await ws.agent.create('n', 'go', { placement: { node: 'x' } });",
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { os: 'windows' } });",
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { placement: {} });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{code}: {resp}");
+        }
+        assert_eq!(
+            api.placements.lock().unwrap().len(),
+            4,
+            "refused before any call"
+        );
+    }
+
+    /// `ws.help("agent")` appends the daemon's live placement discovery when
+    /// it has an execution node, and nothing otherwise.
+    #[tokio::test]
+    async fn agent_help_includes_live_placement_discovery() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let plain = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!plain.contains("Remote placement"), "{plain}");
+        *api.placement_help.lock().unwrap() =
+            Some("Remote placement (experimental): node \"Mac\"".into());
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Remote placement (experimental)"), "{text}");
+        let resp = call(&srv, "return await ws.help('note');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
+    }
+
     #[tokio::test]
     async fn agent_delegate_threads_wait_mode_and_caller() {
         let (srv, api) = server_with_caller("coord-1");
@@ -14269,6 +14394,12 @@ mod workspace_apply_proposal_tests {
             last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
             id: AgentId::from(CALLER),
             workspace_id: WorkspaceId::from_string(WS),
             parent_agent_id: None,

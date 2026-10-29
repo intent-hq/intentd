@@ -279,7 +279,19 @@ pub(crate) async fn try_dispatch(
     args: &Value,
 ) -> Result<Option<Value>, String> {
     if let Some(rest) = method.strip_prefix("help.") {
-        return help::dispatch(workspace_id, features, is_sub_agent, rest, args).map(Some);
+        let mut help = help::dispatch(workspace_id, features, is_sub_agent, rest, args)?;
+        // Live remote-placement discovery on the agent namespace, present
+        // only when the daemon has a configured execution node.
+        if opt_str(args, "namespace").as_deref() == Some("agent") {
+            if let (Value::String(text), Some(extra)) = (
+                &mut help,
+                api.agent_placement_help(workspace_id.clone()).await,
+            ) {
+                text.push('\n');
+                text.push_str(&extra);
+            }
+        }
+        return Ok(Some(help));
     }
     // Retired workspaces are read-only (PROTOCOL §5.1): an agent or hook
     // still running there (the agent that retired its own workspace, mid

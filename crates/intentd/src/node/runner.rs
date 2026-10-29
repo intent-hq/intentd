@@ -28,7 +28,7 @@ use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
 
-use super::storage::Storage;
+use super::checkout::Checkouts;
 
 /// Error codes at the start of a journaled launch or turn error.
 pub(super) mod codes {
@@ -38,6 +38,8 @@ pub(super) mod codes {
     pub const PROVIDER: &str = "node-provider-unavailable";
     /// The provider process could not be started or set up.
     pub const START: &str = "node-agent-start-failed";
+    /// The agent's checkout of its base commit could not be prepared.
+    pub const CHECKOUT: &str = "node-checkout-failed";
     /// The agent is not running on this node.
     pub const NOT_RUNNING: &str = "node-agent-not-running";
     /// The agent already has a turn running.
@@ -75,7 +77,7 @@ pub(super) struct RunnerConfig {
     pub max_agents: u32,
     pub policy: PermissionPolicy,
     pub providers: BTreeMap<String, ProviderLaunch>,
-    pub storage: Arc<Storage>,
+    pub checkouts: Arc<dyn Checkouts>,
     pub journal: Journal,
 }
 
@@ -89,7 +91,7 @@ struct Inner {
     max_agents: usize,
     policy: PermissionPolicy,
     providers: BTreeMap<String, ProviderLaunch>,
-    storage: Arc<Storage>,
+    checkouts: Arc<dyn Checkouts>,
     journal: Arc<Mutex<Journal>>,
     appended: watch::Sender<NodeCounter>,
     state: Mutex<State>,
@@ -116,6 +118,13 @@ struct State {
 struct Agent {
     id: AgentId,
     workspace_id: WorkspaceId,
+    /// The commit head launched the agent at, and the checkout cache key.
+    base_commit: String,
+    repo_key: String,
+    /// The agent's working directory, once prepared.
+    worktree: Mutex<Option<PathBuf>>,
+    /// Serializes the agent's WIP pushes.
+    wip: tokio::sync::Mutex<()>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
     /// Whether a turn is running; refuses a second one.
@@ -137,6 +146,8 @@ struct Ready {
 /// What the agent's pump handles after every notification already
 /// received.
 enum Mark {
+    /// The checkout and provider session are ready.
+    Started { base_commit: String },
     /// Tag notifications with `turn_id` from now on; acknowledged once every
     /// earlier notification is journaled, before the prompt is sent.
     TurnStarted {
@@ -179,7 +190,7 @@ impl Runner {
                 max_agents: config.max_agents as usize,
                 policy: config.policy,
                 providers: config.providers,
-                storage: config.storage,
+                checkouts: config.checkouts,
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
                 state: Mutex::new(State::default()),
@@ -260,6 +271,8 @@ impl Runner {
             workspace_id,
             provider,
             model,
+            base_commit,
+            repo_key,
         } = command;
         let exited = |error: String| JournalEntry {
             agent_id: agent_id.clone(),
@@ -310,6 +323,10 @@ impl Runner {
         let agent = Arc::new(Agent {
             id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
+            base_commit,
+            repo_key,
+            worktree: Mutex::new(None),
+            wip: tokio::sync::Mutex::new(()),
             stop: Mutex::new(Some(stop_tx)),
             ready: ready_rx,
             busy: Mutex::new(false),
@@ -368,6 +385,9 @@ impl Runner {
                     (turn.clone(), JournalBody::Notification { notification: note.params })
                 }
                 Some(mark) = marks.recv() => match mark {
+                    Mark::Started { base_commit } => {
+                        (None, JournalBody::Started { base_commit })
+                    }
                     Mark::TurnStarted { turn_id, ack } => {
                         turn = Some(turn_id);
                         let _ = ack.send(());
@@ -406,8 +426,26 @@ impl Runner {
         ready: watch::Sender<Option<Arc<Ready>>>,
         mut stop: oneshot::Receiver<()>,
     ) {
-        let (exit_code, error) = match self.start(&agent, &launch, model.as_deref(), notes) {
-            Err(error) => (None, Some(format!("{}: {error}", codes::START))),
+        let prepared = tokio::select! {
+            prepared = self.inner.checkouts.prepare(
+                &agent.id,
+                &agent.workspace_id,
+                &agent.base_commit,
+                &agent.repo_key,
+            ) => Some(prepared),
+            _ = &mut stop => None,
+        };
+        let started = match prepared {
+            None => Err(None),
+            Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
+            Some(Ok(cwd)) => {
+                *lock(&agent.worktree) = Some(cwd.clone());
+                self.start(&agent, &launch, model.as_deref(), notes, cwd)
+                    .map_err(|error| Some(format!("{}: {error}", codes::START)))
+            }
+        };
+        let (exit_code, error) = match started {
+            Err(error) => (None, error),
             Ok((mut child, connection, serve, cwd)) => {
                 // Read before waiting: a reaped child no longer reports it,
                 // and its process group can outlive it.
@@ -427,6 +465,7 @@ impl Runner {
                 });
                 let outcome = self
                     .supervise(
+                        &agent,
                         &launch,
                         &connection,
                         &mut child,
@@ -459,6 +498,8 @@ impl Runner {
         };
         // Turns still waiting for the session see it is gone.
         drop(ready);
+        // Whatever the agent did is sent back before head hears it exited.
+        self.push_wip(&agent).await;
         {
             let mut state = lock(&self.inner.state);
             if state
@@ -478,8 +519,8 @@ impl Runner {
         launch: &ProviderLaunch,
         model: Option<&str>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
+        cwd: PathBuf,
     ) -> anyhow::Result<(Child, Arc<Connection>, tokio::task::JoinHandle<()>, PathBuf)> {
-        let cwd = self.inner.storage.agent_dir(&agent.id)?;
         let (requests_tx, mut requests) = mpsc::unbounded_channel::<IncomingRequest>();
         let hooks = ConnectionHooks {
             requests: Some(requests_tx),
@@ -526,6 +567,7 @@ impl Runner {
     )]
     async fn supervise(
         &self,
+        agent: &Agent,
         launch: &ProviderLaunch,
         connection: &Arc<Connection>,
         child: &mut Child,
@@ -553,6 +595,9 @@ impl Runner {
             let found = intent_acp::descendant_pids(pid).await;
             *lock(descendants) = found;
         }
+        let _ = agent.marks.send(Mark::Started {
+            base_commit: agent.base_commit.clone(),
+        });
         ready.send_replace(Some(Arc::new(Ready {
             connection: connection.clone(),
             session_id: session.session_id.to_string(),
@@ -615,6 +660,7 @@ impl Runner {
             }
             *busy = true;
         }
+        let runner = self.clone();
         // caller-binding: allow — node-local ACP turn; the node has no service layer
         tokio::spawn(async move {
             let (stop_reason, error) = run_turn(&agent, &turn_id, prompt).await;
@@ -624,8 +670,27 @@ impl Runner {
                 error,
             });
             *lock(&agent.busy) = false;
+            // The agent is idle: send its work back.
+            runner.push_wip(&agent).await;
         });
         None
+    }
+
+    /// Push the agent's work to head, if its checkout was prepared. Failures
+    /// are logged: the next push sends the same refs again.
+    async fn push_wip(&self, agent: &Agent) {
+        let Some(worktree) = lock(&agent.worktree).clone() else {
+            return;
+        };
+        let _serial = agent.wip.lock().await;
+        if let Err(error) = self
+            .inner
+            .checkouts
+            .push_wip(&agent.id, &agent.workspace_id, &worktree)
+            .await
+        {
+            tracing::warn!(agent = %agent.id, error = %format!("{error:#}"), "node: WIP push failed");
+        }
     }
 
     /// Ask the agent's provider to cancel its running turn.

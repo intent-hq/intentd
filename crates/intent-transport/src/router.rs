@@ -2490,6 +2490,13 @@ async fn dispatch(
                 file_blocks: opt_value(params, "fileBlocks"),
                 is_background: opt_bool(params, "isBackground"),
                 name_explicitly_set,
+                // The documented placement object; omitted means local,
+                // `null` or an invalid object is `-32602`.
+                placement: params
+                    .get("placement")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|e| invalid_params(format!("placement: {e}")))?,
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api

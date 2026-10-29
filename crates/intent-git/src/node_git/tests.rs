@@ -288,3 +288,39 @@ async fn pushes_outside_the_agents_prefix_are_rejected() {
         assert_eq!(try_ref(head, &target), before, "{target} changed");
     }
 }
+
+#[test]
+fn head_commit_and_repo_key_name_the_shared_repository() {
+    let repo = init_repo("node-git-head");
+    commit_file(repo.path(), "a.txt", "a\n");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(head_commit(repo.path()).unwrap(), head);
+
+    // A linked worktree of the same repository shares its cache key.
+    let linked = repo.path().join("linked");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let key = repo_key(repo.path()).unwrap();
+    assert_eq!(repo_key(&linked).unwrap(), key);
+    assert!(key.starts_with("repo-") && key.len() == 5 + 32, "{key}");
+    assert!(hub::component(&key).is_ok());
+
+    let other = init_repo("node-git-other");
+    commit_file(other.path(), "b.txt", "b\n");
+    assert_ne!(repo_key(other.path()).unwrap(), key);
+}
+
+#[test]
+fn head_commit_fails_without_a_commit() {
+    let empty = tempfile::tempdir().unwrap();
+    git(empty.path(), &["init", "--quiet"]);
+    assert!(head_commit(empty.path()).is_err());
+}

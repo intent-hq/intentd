@@ -137,6 +137,12 @@ pub struct LaunchCommand {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The commit head recorded as the agent's `base` ref; the node fetches
+    /// it over the git connection and checks it out for the agent.
+    pub base_commit: String,
+    /// Names the node's checkout cache for the workspace's repository, so
+    /// agents of one repository share fetched history. Opaque to the node.
+    pub repo_key: String,
 }
 
 /// A request over the link: node to head for forwarded workspace API calls.
@@ -307,6 +313,10 @@ pub struct JournalRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JournalBody {
+    /// The agent's isolated checkout is ready at `base_commit` and its
+    /// provider session is set up; prompts can run.
+    #[serde(rename_all = "camelCase")]
+    Started { base_commit: String },
     /// An ACP notification from the provider (`session/update` params).
     #[serde(rename_all = "camelCase")]
     Notification { notification: Value },

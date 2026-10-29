@@ -31215,6 +31215,13 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await.ok()?;
+            self.ports.remote_launch().placement_help(self).await
+        })
+    }
+
     fn agent_get_creation_preferences(
         &self,
         workspace_id: WorkspaceId,

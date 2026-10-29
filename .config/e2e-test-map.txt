@@ -54,3 +54,11 @@ crates/intent-providers/src/config.rs                    intentd::suite_wss_agen
 crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      agent_workers::tests
 crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      model_preference::tests
 crates/intent-providers/data/adapter-cli-packages.json   intentd::suite_wss_agents e2e_wss_agent_workers
+
+# Remote launch: the head connector and port, the node runtime and its git
+# checkouts, and the git-over-link pieces they compose, against a real
+# `intentd node` process.
+crates/intent-svc-remote/src/*                       intentd::suite_e2e        e2e_remote_launch
+crates/intent-git/src/node_git.rs                    intentd::suite_e2e        e2e_remote_launch
+crates/intent-transport/src/node_link/*              intentd::suite_e2e        e2e_remote_launch
+crates/intent-core/src/remote_launch.rs              intentd::suite_e2e        e2e_remote_launch

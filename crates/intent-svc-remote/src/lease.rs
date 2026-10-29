@@ -23,6 +23,10 @@ pub(crate) struct HeadLease {
 }
 
 impl HeadLease {
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// Find this head's live lease on the configured node, registering the
     /// node and a new lease on first use. The head id is this installation's
     /// existing one, or a new random id when it has registered no node yet.

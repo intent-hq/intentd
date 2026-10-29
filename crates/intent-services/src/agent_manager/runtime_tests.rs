@@ -325,3 +325,361 @@ async fn fake_runtime_map_drop_stops_even_with_a_borrowed_runtime() {
     assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
     assert!(!fake.is_alive());
 }
+
+/// A remote-launch port whose agents all run on `runtime`.
+struct RemoteRuntimes {
+    runtime: Option<Arc<FakeRuntime>>,
+    asked: AtomicUsize,
+}
+
+impl crate::feature_ports::RemoteLaunchPort for RemoteRuntimes {
+    fn placements<'a>(
+        &'a self,
+        _svc: &'a Services,
+    ) -> BoxFuture<'a, intent_core::Result<intent_core::placement::PlatformAvailability>> {
+        Box::pin(async { Ok(intent_core::placement::PlatformAvailability::none(now_iso())) })
+    }
+    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+    fn admit<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _placement: &'a intent_core::placement::AgentPlacement,
+    ) -> BoxFuture<'a, intent_core::Result<intent_core::remote_launch::RemotePlacementView>> {
+        Box::pin(async { Ok(remote_view()) })
+    }
+    fn launch<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _request: intent_core::remote_launch::RemoteLaunchRequest,
+    ) -> BoxFuture<'a, intent_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn runtime<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, intent_core::Result<Arc<crate::feature_ports::RemoteRuntime>>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .map(|r| r as Arc<crate::feature_ports::RemoteRuntime>)
+                .ok_or_else(|| Error::InvalidParams("node-unavailable: no node".into()))
+        })
+    }
+}
+
+/// A manager whose services use `port` for remote launch, with agent `id`
+/// placed on a node.
+async fn remote_manager(
+    port: Arc<RemoteRuntimes>,
+    id: &AgentId,
+    ws: &WorkspaceId,
+) -> (TempDb, Arc<AgentManager>) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone())
+    .with_remote_launch_port(port);
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+    seed_agent(&mgr, ws, id).await;
+    let view = intent_core::remote_launch::RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac".into(),
+        placement: intent_core::placement::AgentPlacement::default(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: "base".into(),
+    };
+    mgr.services
+        .store
+        .set_agent_session_metadata_key_json(
+            ws,
+            id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.attach_agent_manager(&mgr);
+    (tmp, mgr)
+}
+
+fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
+    intent_core::remote_launch::RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac".into(),
+        placement: intent_core::placement::AgentPlacement::default(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: "base".into(),
+    }
+}
+
+/// A placed agent's turns run on the runtime the remote-launch port hands
+/// out (asked once, then reused), never on a local process; transcripts
+/// are written as for a local agent.
+#[tokio::test]
+async fn a_placed_agent_runs_its_turns_on_the_remote_runtime() {
+    let ws = WorkspaceId::from("ws-remote-turns");
+    let id = AgentId::from("agent-remote-turns");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+
+    for (turn, text) in [(1, "first"), (2, "second")] {
+        mgr.send_message(
+            id.clone(),
+            ws.clone(),
+            text.into(),
+            None,
+            super::super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+        fake.wait_prompts(turn).await;
+        fake.finish.add_permits(1);
+        wait_idle(&mgr, &id).await;
+    }
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        1,
+        "the live runtime is reused"
+    );
+    assert!(fake
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(session, _)| *session == format!("remote:{id}")));
+    assert!(mgr.agent_root_pids().is_empty(), "no local process");
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "assistant").count(),
+        2,
+        "the remote runtime's output reaches the transcript"
+    );
+
+    // Stopping the agent stops its remote runtime.
+    assert!(mgr.stop(&id).await);
+    assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+}
+
+/// With no node to run it, a placed agent's turn fails; it never falls
+/// back to a local process.
+#[tokio::test]
+async fn a_placed_agent_never_starts_locally() {
+    let ws = WorkspaceId::from("ws-remote-none");
+    let id = AgentId::from("agent-remote-none");
+    let port = Arc::new(RemoteRuntimes {
+        runtime: None,
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let result = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("node-unavailable")),
+        "{result:?}"
+    );
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert!(!mgr.contains(&id));
+    assert!(mgr.agent_root_pids().is_empty());
+}
+
+/// Review of intentd#2779: a live remote run is not reused once the
+/// session's identity changed; it is stopped and the turn is refused.
+#[tokio::test]
+async fn a_live_remote_run_is_not_reused_after_an_identity_change() {
+    let ws = WorkspaceId::from("ws-remote-identity");
+    let id = AgentId::from("agent-remote-identity");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert!(mgr.contains(&id));
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.model = Some("another-model".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    let result = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-model-change-unsupported")),
+        "{result:?}"
+    );
+    assert!(!mgr.contains(&id), "the old run is not kept");
+    assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+}
+
+/// Review of intentd#2779: a remote agent's instructions (an explicit
+/// `behaviorPrompt`, or a specialist's frozen body and role) reach the node
+/// with its first prompt, as a `<system>` prepend, and only once.
+#[tokio::test]
+async fn a_remote_agents_instructions_ride_its_first_prompt() {
+    for specialist in [false, true] {
+        let ws = WorkspaceId::from(format!("ws-remote-prompt-{specialist}").as_str());
+        let id = AgentId::from(format!("agent-remote-prompt-{specialist}").as_str());
+        let fake = FakeRuntime::new();
+        let port = Arc::new(RemoteRuntimes {
+            runtime: Some(fake.clone()),
+            asked: AtomicUsize::new(0),
+        });
+        let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+        let marker = if specialist {
+            "SPECIALIST-BODY-MARKER"
+        } else {
+            "BEHAVIOR-PROMPT-MARKER"
+        };
+        let store = &mgr.services.store;
+        store
+            .set_agent_session_metadata_key(&ws, &id, "behaviorPrompt", marker, None, None)
+            .await
+            .unwrap();
+        if specialist {
+            let mut session = store.get_agent_session(&id).await.unwrap();
+            session.specialist = Some("implementor".into());
+            store.update_agent_session(&ws, &session).await.unwrap();
+            store
+                .set_agent_session_metadata_key(
+                    &ws,
+                    &id,
+                    "specialistName",
+                    "Implementor",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for (turn, text) in [(1, "first"), (2, "second")] {
+            mgr.send_message(
+                id.clone(),
+                ws.clone(),
+                text.into(),
+                None,
+                super::super::TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+            fake.wait_prompts(turn).await;
+            fake.finish.add_permits(1);
+            wait_idle(&mgr, &id).await;
+        }
+        let prompts = fake.prompts.lock().unwrap().clone();
+        let first = serde_json::to_string(&prompts[0].1).unwrap();
+        let second = serde_json::to_string(&prompts[1].1).unwrap();
+        assert!(first.contains("<system>"), "{first}");
+        assert!(first.contains(marker), "{first}");
+        if specialist {
+            assert!(first.contains("Implementor"), "{first}");
+        }
+        assert!(
+            !second.contains(marker),
+            "the instructions are sent once: {second}"
+        );
+        let persisted = store.get_agent_session(&id).await.unwrap().system_prompt;
+        assert!(persisted.is_some_and(|p| p.contains(marker)));
+    }
+}
+
+/// Review of intentd#2779: an explicit `behaviorPrompt` on a remote
+/// delegation reaches the child's first prompt through the real delegate
+/// path.
+#[tokio::test]
+async fn a_remote_delegations_behavior_prompt_rides_its_first_prompt() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
+    let ws = WorkspaceId::from("ws-remote-delegate");
+    let parent = AgentId::from("agent-remote-delegate-parent");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &parent, &ws).await;
+    let delegated = mgr
+        .services
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                task_text: Some("Do the remote thing".into()),
+                provider: Some("mock".into()),
+                behavior_prompt: Some("CUSTOM-INSTRUCTION".into()),
+                placement: Some(serde_json::from_value(json!({"target": "remote"})).unwrap()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &child).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(first.contains("<system>"), "{first}");
+    assert!(first.contains("CUSTOM-INSTRUCTION"), "{first}");
+}
+
+/// Review of intentd#2779: when the instructions cannot be stored, the turn
+/// fails before the node starts anything, and the next turn prepares again.
+#[tokio::test]
+async fn a_remote_run_never_starts_without_its_instructions() {
+    let ws = WorkspaceId::from("ws-remote-prepare");
+    let id = AgentId::from("agent-remote-prepare");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let pool = mgr.services.store.write_pool();
+    sqlx::query("CREATE TRIGGER fail_system_prompt BEFORE UPDATE OF system_prompt ON agent_session BEGIN SELECT RAISE(FAIL, 'injected'); END")
+        .execute(pool)
+        .await
+        .unwrap();
+    let failed = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&failed, Err(Error::Internal(m)) if m.contains("could not store its instructions")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        0,
+        "nothing started on the node"
+    );
+    assert!(!mgr.contains(&id));
+
+    sqlx::query("DROP TRIGGER fail_system_prompt")
+        .execute(pool)
+        .await
+        .unwrap();
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert!(mgr.prepend_pending.lock().unwrap().contains(&id));
+}

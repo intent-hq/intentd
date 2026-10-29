@@ -3541,6 +3541,13 @@ impl AgentManager {
             .services
             .specialist_model_options_for_workspace(&workspace_id)
             .await;
+        // Platform discovery for remote placement; `None` (the default
+        // description) unless an execution node is configured.
+        let remote_placement_help = self
+            .services
+            .feature_remote_launch_port()
+            .placement_help(&self.services)
+            .await;
         let server_blueprint = {
             let workspace_id = workspace_id.clone();
             let agent_id = agent_id.clone();
@@ -3548,6 +3555,7 @@ impl AgentManager {
             let attachments = self.services.turn_attachments();
             let features = agent_features.clone();
             let compact = opts.provider.truncates_tool_descriptions;
+            let remote_placement_help = remote_placement_help.clone();
             ServerBlueprint::new(read_owner, move || {
                 WorkspaceMcpServer::for_agent_type(api.clone(), workspace_id.clone(), &agent_type)
                     .with_caller_agent_id(Some(agent_id.clone()))
@@ -3574,6 +3582,7 @@ impl AgentManager {
                             .collect(),
                     )
                     .with_compact_tool_descriptions(compact)
+                    .with_remote_placement_help(remote_placement_help.clone())
             })
             .with_original_services(original_services, session.clone())
         };
@@ -11528,6 +11537,15 @@ impl AgentManager {
         // the common case for every turn after the first.
         boxed_await(|| self.services.await_sandbox_provisioning(agent_id)).await;
         let mut session = boxed_await(|| self.services.require_agent_session(agent_id)).await?;
+        // A remote agent runs on its execution node, never here: an agent
+        // created with a remote placement carries the daemon-owned
+        // `remotePlacement` view, and its turns use the node's runtime.
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return boxed_await(|| self.ensure_remote_started(agent_id, workspace_id, &session))
+                .await;
+        }
         // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
         // row still carrying harness_features = NULL gets its snapshot
         // materialized at this activation choke point — every turn (first
@@ -11976,6 +11994,175 @@ impl AgentManager {
         .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
+    }
+
+    /// [`Self::ensure_started_owned`] for a remote agent: reuse its live
+    /// runtime, or ask the remote-launch feature for one (which starts the
+    /// agent on its node when it is not running there) and install it like
+    /// a local agent's. There is no local process, MCP bridge or ACP session
+    /// on head; the session id is a stable placeholder the runtime ignores.
+    async fn ensure_remote_started(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+    ) -> Result<StartedSession> {
+        let session_id = format!("remote:{agent_id}");
+        // The node runs the identity the agent was launched with. A changed
+        // provider or model is refused at `agent.setModel`; should one still
+        // reach here, stop the old run rather than keep using it silently.
+        let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
+            Some(h.spawned_provider.as_str()) != session.provider.as_deref()
+                || h.spawned_model != session.model
+        });
+        if identity_changed {
+            boxed_await(|| self.kill_child_only(agent_id)).await;
+            return Err(Error::InvalidParams(
+                "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
+            ));
+        }
+        if self.handle_is_live(agent_id) {
+            return Ok(StartedSession {
+                session_id,
+                turn: self.capture_turn(agent_id)?,
+            });
+        }
+        if self.contains(agent_id) {
+            boxed_await(|| self.kill_child_only(agent_id)).await;
+        }
+        // The node opens the provider session with no prompt injection, so
+        // the agent's instructions (base prompt, specialist body or explicit
+        // `behaviorPrompt`, rules) ride its first prompt as the
+        // `FirstTurnPrepend` `<system>` block, as for local providers without
+        // native injection. Prepared before the node starts anything: a
+        // failure fails this turn, and the next one prepares again.
+        boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session)).await?;
+        let runtime = self
+            .services
+            .feature_remote_launch_port()
+            .runtime(&self.services, agent_id)
+            .await?;
+        let origin = RepositoryOrigin::unavailable();
+        let provider = session.provider.clone().unwrap_or_default();
+        let handle = AgentHandle {
+            execution: RuntimeHandle::custom(runtime),
+            repository_origin: origin.clone(),
+            antigravity_profile: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: session.model.clone(),
+            session_open_filled_model: None,
+            spawned_provider: provider.clone(),
+            spawned_selection: provider,
+            _activation: None,
+            thought_level: None,
+            config_options: None,
+            confirmed_effort: None,
+            wake_gate: Arc::new(AtomicUsize::new(0)),
+            wake_listener: None,
+        };
+        // Same teardown fence as a local install: a stop or workspace
+        // teardown that armed first wins, and the runtime is stopped.
+        let refused = {
+            let closed = self.admission_closed.lock().unwrap();
+            let retired = self.retired.lock().unwrap();
+            let stopping = self.stopping.lock().unwrap();
+            if *closed || retired.contains(agent_id) || stopping.contains(agent_id) {
+                Some(handle)
+            } else {
+                let mut slots = self.handles.lock().unwrap();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    slots.entry(agent_id.clone())
+                {
+                    entry.insert(handle);
+                    self.registry.register(
+                        agent_id.clone(),
+                        self.make_original_kill(agent_id.clone(), Arc::downgrade(&origin)),
+                    );
+                    None
+                } else {
+                    Some(handle)
+                }
+            }
+        };
+        if let Some(mut handle) = refused {
+            handle.repository_origin.retire();
+            if let Some(teardown) = RuntimeTeardown::take(&mut handle) {
+                teardown.kill_tree().await;
+            }
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
+        // Output the node streams between turns becomes implicit turns, as
+        // for a local agent.
+        let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id.clone());
+        match self.handles.lock().unwrap().get_mut(agent_id) {
+            Some(h) => h.wake_listener = Some(listener),
+            None => listener.abort(),
+        }
+        Ok(StartedSession {
+            session_id,
+            turn: self.capture_turn(agent_id)?,
+        })
+    }
+
+    /// Assemble a remote agent's system prompt the way `create_agent` does
+    /// for a local one (no workspace tool reference: remote agents have no
+    /// workspace tools yet), persist it on the session, and arm the
+    /// first-turn prepend that delivers it with the next prompt.
+    ///
+    /// # Errors
+    ///
+    /// When the prompt cannot be stored: the turn fails rather than start a
+    /// run without its instructions.
+    async fn prepare_remote_system_prompt(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+    ) -> Result<()> {
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let cwd = workspace.as_ref().and_then(crate::git_ops::worktree_path);
+        let specialist = self
+            .services
+            .agent_specialist_injection(agent_id, cwd.as_deref())
+            .await;
+        let agent_type = derive_agent_type(&self.services, session, workspace.as_ref());
+        let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+        let settings = self.services.effective_settings();
+        let auto_commit_enabled = self.services.effective_auto_commit(workspace_id).await;
+        let agent_features = self.services.session_agent_features(session);
+        let Some(prompt) = crate::rules::assemble_system_prompt(
+            &self.services.store,
+            cwd.as_deref(),
+            &agent_type,
+            specialist.as_ref(),
+            is_sub_agent,
+            auto_commit_enabled,
+            settings.rtk.enabled,
+            &agent_features,
+            workspace.as_ref(),
+            Some(session),
+            None,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        self.services
+            .store
+            .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "remote agent: could not store its instructions before starting it: {e}"
+                ))
+            })?;
+        self.prepend_pending
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
+        Ok(())
     }
 
     /// Close admission before the composition root performs any teardown await.

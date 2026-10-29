@@ -778,6 +778,26 @@ impl Store {
             .collect())
     }
 
+    /// Where `agent_id` runs remotely, if it does.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
+        let row = sqlx::query(
+            "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent WHERE agent_id = ?",
+        )
+        .bind(agent_id.as_str())
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(row.map(|row| RemoteAgentRecord {
+            agent_id: AgentId::from(row.get::<String, _>("agent_id")),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            node_id: row.get("node_id"),
+            lease_id: row.get("lease_id"),
+            created_at: row.get("created_at"),
+        }))
+    }
+
     /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
     /// # Errors
     /// Returns database errors.

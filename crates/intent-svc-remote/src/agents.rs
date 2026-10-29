@@ -94,8 +94,16 @@ impl AgentSink {
         lock(&self.state).exit.clone()
     }
 
+    /// Neither exited on the node nor stopped by head.
+    fn is_live(&self) -> bool {
+        let state = lock(&self.state);
+        state.exit.is_none() && !state.closed
+    }
+
     fn deliver(&self, record: JournalRecord) {
         match record.body {
+            // The connector records it on the agent's placement.
+            JournalBody::Started { .. } => {}
             JournalBody::Notification { notification } => {
                 self.requests.fetch_add(1, Ordering::SeqCst);
                 // The manager may have dropped the stream; nothing to do then.
@@ -136,6 +144,20 @@ impl Agents {
         let sink = Arc::new(AgentSink::new(workspace_id));
         lock(&self.sinks).insert(agent_id.clone(), sink.clone());
         sink
+    }
+
+    /// Whether `agent_id` has a sink.
+    pub(crate) fn is_attached(&self, agent_id: &AgentId) -> bool {
+        lock(&self.sinks).contains_key(agent_id)
+    }
+
+    /// Attached agents that neither exited nor were stopped: the node slots
+    /// head counts as taken.
+    pub(crate) fn live_count(&self) -> usize {
+        lock(&self.sinks)
+            .values()
+            .filter(|sink| sink.is_live())
+            .count()
     }
 
     /// Detach `agent_id` if `sink` is still its sink.

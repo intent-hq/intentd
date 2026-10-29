@@ -30,7 +30,7 @@ fn harness() -> Harness {
         max_agents: 1,
         policy: PermissionPolicy::DenyAll,
         providers: BTreeMap::new(),
-        storage,
+        checkouts: crate::node::checkout::PlainCheckouts::new(storage),
         journal,
     });
     Harness { runner, _dir: dir }
@@ -51,6 +51,8 @@ fn launch(id: &str) -> LinkFrame {
         workspace_id: WorkspaceId::from("ws-1"),
         provider: "codex".into(),
         model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
     })
 }
 
