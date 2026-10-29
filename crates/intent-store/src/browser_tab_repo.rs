@@ -443,6 +443,76 @@ impl Store {
         .await
     }
 
+    /// Superseded-host rehome (intent-hq/intent#8045): every **open** row
+    /// hosted by one of `old_hosts` moves to `new_host`, claimed or not.
+    /// Returns each moved row with its `changes` (`{ hostClientId }`, plus
+    /// `displayed: null` when the old host had reported the layout fact),
+    /// oldest first. Tombstones stay with their old host, which still owes the
+    /// drop acknowledgement. An empty `old_hosts` is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; nothing is
+    /// persisted in that case.
+    pub async fn reassign_browser_tabs_from_hosts(
+        &self,
+        new_host: &ClientId,
+        old_hosts: &[ClientId],
+    ) -> Result<Vec<(BrowserTab, serde_json::Value)>> {
+        let old_hosts: Vec<ClientId> = old_hosts
+            .iter()
+            .filter(|h| *h != new_host)
+            .cloned()
+            .collect();
+        if old_hosts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.write_pool().clone();
+        let displayed = self.browser_tab_displayed.clone();
+        crate::with_write_txn_retry(|| {
+            let pool = pool.clone();
+            let displayed = displayed.clone();
+            let old_hosts = old_hosts.clone();
+            async move {
+                let mut tx = begin(&pool, "rehome superseded browser tabs").await?;
+                let placeholders = vec!["?"; old_hosts.len()].join(", ");
+                let sql = format!(
+                    "SELECT {COLUMNS} FROM browser_tab \
+                     WHERE closed_at IS NULL AND host_client_id IN ({placeholders}) \
+                     ORDER BY created_at, tab_id"
+                );
+                let mut query = sqlx::query(&sql);
+                for host in &old_hosts {
+                    query = query.bind(&host.0);
+                }
+                let rows = query.fetch_all(&mut *tx).await.map_err(|e| {
+                    Error::Internal(format!("list superseded browser tabs failed: {e}"))
+                })?;
+                let mut moved = Vec::with_capacity(rows.len());
+                let now = now_iso();
+                for row in &rows {
+                    let mut tab = map_row(row, &displayed)?.tab;
+                    let mut changes = serde_json::Map::new();
+                    changes.insert(
+                        "hostClientId".to_string(),
+                        serde_json::Value::String(new_host.0.clone()),
+                    );
+                    if tab.displayed.take().is_some() {
+                        changes.insert("displayed".to_string(), serde_json::Value::Null);
+                    }
+                    tab.host_client_id = new_host.clone();
+                    tab.updated_at.clone_from(&now);
+                    rehome_tab(&mut tx, &tab).await?;
+                    moved.push((tab, serde_json::Value::Object(changes)));
+                }
+                commit(tx, "rehome superseded browser tabs").await?;
+                displayed.forget_all(moved.iter().map(|(t, _)| t.tab_id.as_str()));
+                Ok(moved)
+            }
+        })
+        .await
+    }
+
     /// Host snapshot reconciliation (`browser.syncTabs`, REV-2 Model 6), one
     /// transaction for the whole reconcile. `snapshot` is the host's full tab
     /// set across workspaces (duplicate ids after the first are ignored). Per

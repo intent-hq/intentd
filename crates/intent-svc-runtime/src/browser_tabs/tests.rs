@@ -360,3 +360,141 @@ async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts
         services.browser_tab_remove(old, tab.tab_id).await.unwrap();
     }
 }
+
+/// Superseded-id rehome on `client.hello` (intent-hq/intent#8045): a tab
+/// stranded under an earlier id of the hello'd device moves to its current
+/// id with one `browser:tab-updated { changes: { hostClientId } }`; a
+/// superseded id that is live right now keeps its tabs; and an
+/// administrator-only id never moves under an id whose head is a principal of
+/// this daemon (a collaborator could hello as it).
+#[tokio::test]
+async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
+    use intent_core::{AgentId, Principal, PrincipalId, WorkspaceApi};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let collaborator = Principal {
+        id: PrincipalId::from_string("p-bob"),
+        identity: None,
+        github_user_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: intent_core::now_iso(),
+        updated_at: intent_core::now_iso(),
+    };
+    store
+        .upsert_principal(&collaborator)
+        .await
+        .expect("principal");
+    for id in [
+        "60420340",
+        "4d61d017:60420340",
+        "aaccc21a:4d61d017:60420340",
+        "live-old",
+        "x:live-old",
+        "desktop",
+        "p-bob:desktop",
+    ] {
+        store
+            .upsert_client(
+                &ClientId::from_string(id),
+                Some("Desktop"),
+                Some(&json!({ "browserExec": true })),
+                &ClientHostInfo::default(),
+            )
+            .await
+            .expect("client");
+    }
+    let bus = EventBus::new(store.clone());
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        .with_event_bus(bus.clone())
+        .with_reverse_dispatch(super::browser_client_pin_tests::FakeRegistry::new(&[(
+            "live-old",
+            Some("Still here"),
+            true,
+        )]));
+    let mut stranded = input(&ws, "stranded");
+    stranded.owner_agent_id = Some(AgentId::from_string("agent-1"));
+    stranded.visibility = BrowserTabVisibility::Hidden;
+    for (host, tab) in [
+        ("60420340", stranded),
+        ("live-old", input(&ws, "live-tab")),
+        ("desktop", input(&ws, "admin-tab")),
+    ] {
+        services
+            .browser_tab_upsert(ClientId::from_string(host), tab)
+            .await
+            .expect("seed tab");
+    }
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec!["browser:*".to_string()],
+        ..Default::default()
+    });
+
+    let current = ClientId::from_string("aaccc21a:4d61d017:60420340");
+    let moved = services
+        .rehome_superseded_browser_tabs(
+            current.clone(),
+            vec![
+                ClientId::from_string("4d61d017:60420340"),
+                ClientId::from_string("60420340"),
+            ],
+        )
+        .await
+        .expect("rehome");
+    assert_eq!(moved, 1);
+    let events = recv_one(&mut sub).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, BROWSER_TAB_UPDATED);
+    assert_eq!(tab_id_of(&events[0]), "stranded");
+    assert_eq!(
+        events[0].data["changes"],
+        json!({ "hostClientId": "aaccc21a:4d61d017:60420340" })
+    );
+    let row = store.get_browser_tab("stranded").await.unwrap().unwrap();
+    assert_eq!(row.host_client_id, current);
+    assert_eq!(row.owner_agent_id, Some(AgentId::from_string("agent-1")));
+
+    let live = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:live-old"),
+            vec![ClientId::from_string("live-old")],
+        )
+        .await
+        .expect("live rehome");
+    assert_eq!(live, 0, "a live superseded host keeps its tabs");
+    assert_eq!(
+        store
+            .get_browser_tab("live-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "live-old"
+    );
+
+    let widened = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("p-bob:desktop"),
+            vec![ClientId::from_string("desktop")],
+        )
+        .await
+        .expect("widened rehome");
+    assert_eq!(widened, 0, "p-bob could hello as the new id");
+    assert_eq!(
+        store
+            .get_browser_tab("admin-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "desktop"
+    );
+}

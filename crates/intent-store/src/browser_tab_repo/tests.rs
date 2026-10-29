@@ -843,3 +843,98 @@ async fn workspace_delete_evicts_displayed_overlay() {
     assert!(matches!(reopened, BrowserTabUpsertOutcome::Opened(_)));
     assert_eq!(reopened.tab().displayed, None);
 }
+
+/// Superseded-host rehome (intent-hq/intent#8045): every **open** row
+/// hosted by one of `old_hosts` moves to `new_host` (claimed or not), with
+/// `changes: { hostClientId }` plus `displayed: null` when the fact was set;
+/// rows of other hosts and tombstones of an old host stay put.
+#[tokio::test]
+async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
+    let f = fixture().await;
+    let new_host = ClientId("scope:client-a".to_string());
+    f.store
+        .upsert_client(
+            &new_host,
+            Some("Desktop A"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .unwrap();
+    let agent = AgentId("agent-1".to_string());
+    let mut claimed = input(&f.ws, "stranded-claimed", "https://a.test/");
+    claimed.owner_agent_id = Some(agent.clone());
+    claimed.visibility = BrowserTabVisibility::Hidden;
+    claimed.displayed = Some(true);
+    f.store
+        .upsert_browser_tab(&f.host_a, claimed)
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_a, input(&f.ws, "stranded-user", "https://b.test/"))
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(
+            &f.host_a,
+            input(&f.ws, "stranded-closed", "https://c.test/"),
+        )
+        .await
+        .unwrap();
+    f.store.close_browser_tab("stranded-closed").await.unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_b, input(&f.ws, "other-host", "https://d.test/"))
+        .await
+        .unwrap();
+
+    let moved = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
+    assert_eq!(ids, ["stranded-claimed", "stranded-user"]);
+    assert_eq!(
+        moved[0].1,
+        json!({ "hostClientId": "scope:client-a", "displayed": null })
+    );
+    assert_eq!(moved[1].1, json!({ "hostClientId": "scope:client-a" }));
+    assert_eq!(moved[0].0.owner_agent_id.as_ref(), Some(&agent));
+
+    let rows = f.store.list_browser_tabs(&f.ws).await.unwrap();
+    let host_of = |id: &str| {
+        rows.iter()
+            .find(|t| t.tab_id == id)
+            .map(|t| t.host_client_id.0.clone())
+    };
+    assert_eq!(
+        host_of("stranded-claimed").as_deref(),
+        Some("scope:client-a")
+    );
+    assert_eq!(host_of("stranded-user").as_deref(), Some("scope:client-a"));
+    assert_eq!(host_of("other-host").as_deref(), Some("client-b"));
+    let tomb = f
+        .store
+        .get_stored_tab("stranded-closed")
+        .await
+        .unwrap()
+        .expect("tombstone kept");
+    assert!(tomb.closed);
+    assert_eq!(
+        tomb.tab.host_client_id, f.host_a,
+        "tombstones stay with the old host"
+    );
+
+    let again = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a))
+        .await
+        .unwrap();
+    assert!(again.is_empty(), "idempotent");
+    let none = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, &[])
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
