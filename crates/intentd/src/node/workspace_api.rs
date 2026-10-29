@@ -21,6 +21,7 @@ use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
 use intent_core::node_link::LinkOutcome;
 use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     AgentId, BoxFuture, Error, GitAgentCommitResult, NoteId, Result, Workspace, WorkspaceApi,
     WorkspaceGitRootId, WorkspaceId,
@@ -50,6 +51,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What gates an agent's workspace API, as head sent it in the launch.
+pub(super) struct Gates {
+    /// The session's `agentFeatures` snapshot (`AgentFeaturesSettings`).
+    pub agent_features: Value,
+    pub is_sub_agent: bool,
+}
+
 /// Start `agent_id`'s workspace MCP server and return it with the
 /// `session/new` server entry that points the provider at it. The server
 /// stops when the returned bridge is dropped.
@@ -57,10 +65,11 @@ pub(super) async fn serve(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
+    gates: &Gates,
     head: HeadLink,
     bridge_exe: &Path,
 ) -> std::io::Result<(McpBridge, McpServer)> {
-    let server = Arc::new(server(agent_id, workspace_id, worktree, head));
+    let server = Arc::new(server(agent_id, workspace_id, worktree, gates, head)?);
     let bridge = intent_acp::serve_workspace_mcp_tcp(server).await?;
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
         bridge_exe,
@@ -88,13 +97,20 @@ pub(super) async fn serve(
     Ok((bridge, entry))
 }
 
-/// `agent_id`'s workspace MCP server over its worktree and the head link.
+/// `agent_id`'s workspace MCP server over its worktree and the head link,
+/// gated like a local agent's bridge. A feature snapshot the node cannot
+/// read starts nothing.
 fn server(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
+    gates: &Gates,
     head: HeadLink,
-) -> WorkspaceMcpServer {
+) -> std::io::Result<WorkspaceMcpServer> {
+    let features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
+        .map_err(|e| {
+            std::io::Error::other(format!("the agent's feature settings are invalid: {e}"))
+        })?;
     let router = Router {
         agent_id: agent_id.clone(),
         head,
@@ -106,12 +122,14 @@ fn server(
         head: router.clone(),
     });
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
-        .with_caller_agent_id(Some(agent_id.clone()));
+        .with_caller_agent_id(Some(agent_id.clone()))
+        .with_agent_features(features)
+        .with_sub_agent(gates.is_sub_agent);
     let router = Router {
         timeout: server.workspace_api_timeout(),
         ..router
     };
-    server.with_frame_router(Arc::new(router))
+    Ok(server.with_frame_router(Arc::new(router)))
 }
 
 /// How long the node waits for head to answer its own policy read.

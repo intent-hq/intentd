@@ -31,6 +31,14 @@ fn workspace() -> WorkspaceId {
     WorkspaceId::from("ws-remote")
 }
 
+/// A top-level agent with every feature on.
+fn gates() -> Gates {
+    Gates {
+        agent_features: serde_json::to_value(AgentFeaturesSettings::default()).unwrap(),
+        is_sub_agent: false,
+    }
+}
+
 async fn call(server: &WorkspaceMcpServer, code: &str) -> (bool, String) {
     let response = server
         .handle_message(&json!({
@@ -73,7 +81,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
 #[tokio::test]
 async fn file_calls_run_on_the_agents_worktree_and_stay_inside_it() {
     let dir = tempfile::tempdir().unwrap();
-    let server = server(&agent(), &workspace(), dir.path(), HeadLink::default());
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
 
     ok_json(
         call(
@@ -128,7 +143,14 @@ async fn file_calls_run_on_the_agents_worktree_and_stay_inside_it() {
 #[tokio::test]
 async fn host_exec_runs_in_the_agents_worktree() {
     let dir = tempfile::tempdir().unwrap();
-    let server = server(&agent(), &workspace(), dir.path(), HeadLink::default());
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
     let ran = ok_json(
         call(
             &server,
@@ -157,7 +179,14 @@ async fn git_commit_commits_the_agents_work_in_its_worktree() {
     git(dir.path(), &["init", "--quiet"]);
     std::fs::write(dir.path().join("one.txt"), "1").unwrap();
     std::fs::write(dir.path().join("two.txt"), "2").unwrap();
-    let server = server(&agent(), &workspace(), dir.path(), HeadLink::default());
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
 
     let first = ok_json(
         call(
@@ -195,7 +224,14 @@ async fn git_commit_commits_the_agents_work_in_its_worktree() {
 #[tokio::test]
 async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
     let dir = tempfile::tempdir().unwrap();
-    let server = server(&agent(), &workspace(), dir.path(), HeadLink::default());
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
     for code in [
         "return await ws.script.list();",
         "return await ws.terminal.list();",
@@ -220,7 +256,14 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
 #[tokio::test]
 async fn a_forwarded_call_without_a_link_fails_clearly() {
     let dir = tempfile::tempdir().unwrap();
-    let server = server(&agent(), &workspace(), dir.path(), HeadLink::default());
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
     let (failed, text) = call(&server, r#"return await ws.note.read("n-1");"#).await;
     assert!(failed, "{text}");
     assert!(text.contains("node-link-unavailable"), "{text}");
@@ -290,7 +333,7 @@ async fn control_plane_calls_are_forwarded_to_head_for_the_agent() {
     let (node_end, mut head_end) = bound_link(dir.path()).await;
     let head = HeadLink::default();
     head.set(node_end);
-    let server = server(&agent(), &workspace(), dir.path(), head);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
     let answering = tokio::spawn(async move {
         let mut seen = Vec::new();
         while let Some(event) = head_end.events.recv().await {
@@ -360,14 +403,14 @@ async fn git_commit_honors_the_workspaces_auto_commit_setting_from_head() {
     git(&repo, &["init", "--quiet"]);
     std::fs::write(repo.join("one.txt"), "1").unwrap();
 
-    let unlinked = server(&agent(), &workspace(), &repo, HeadLink::default());
+    let unlinked = server(&agent(), &workspace(), &repo, &gates(), HeadLink::default()).unwrap();
     let (failed, text) = call(&unlinked, r#"return await ws.git.commit("one");"#).await;
     assert!(failed && text.contains("auto-commit setting"), "{text}");
 
     let (node_end, mut head_end) = bound_link(dir.path()).await;
     let head = HeadLink::default();
     head.set(node_end);
-    let server = server(&agent(), &workspace(), &repo, head);
+    let server = server(&agent(), &workspace(), &repo, &gates(), head).unwrap();
     let answering = tokio::spawn(async move {
         let mut policies = Vec::new();
         for enabled in [false, true] {
@@ -409,4 +452,53 @@ async fn git_commit_honors_the_workspaces_auto_commit_setting_from_head() {
     assert!(policies
         .iter()
         .all(|params| params["method"] == json!(COMMIT_POLICY_METHOD)));
+}
+
+/// Review of intentd#2786: the session's captured features gate the node's
+/// local calls exactly as a local bridge's do, and a snapshot the node cannot
+/// read starts no server.
+#[tokio::test]
+async fn the_sessions_feature_snapshot_gates_local_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let features = AgentFeaturesSettings {
+        host_exec: false,
+        ..AgentFeaturesSettings::default()
+    };
+    let gated = Gates {
+        agent_features: serde_json::to_value(features).unwrap(),
+        is_sub_agent: true,
+    };
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gated,
+        HeadLink::default(),
+    )
+    .unwrap();
+    let (failed, text) = call(
+        &server,
+        r#"return await host({ method: "host.exec", args: { command: "pwd" } });"#,
+    )
+    .await;
+    assert!(failed && text.contains("hostExec = false"), "{text}");
+    let missing = call(&server, "return typeof ws.host;").await;
+    assert_eq!(ok_json(missing), json!("undefined"));
+    ok_json(
+        call(
+            &server,
+            r#"return JSON.stringify(await ws.file.write("a.txt", "x"));"#,
+        )
+        .await,
+    );
+
+    let unreadable = Gates {
+        agent_features: json!({ "noSuchFeature": true }),
+        is_sub_agent: false,
+    };
+    assert!(server_fails(dir.path(), &unreadable));
+}
+
+fn server_fails(dir: &Path, gates: &Gates) -> bool {
+    server(&agent(), &workspace(), dir, gates, HeadLink::default()).is_err()
 }

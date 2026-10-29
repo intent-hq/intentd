@@ -128,6 +128,9 @@ struct Agent {
     /// The commit head launched the agent at, and the checkout cache key.
     base_commit: String,
     repo_key: String,
+    /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
+    /// its workspace API.
+    gates: workspace_api::Gates,
     /// The agent's working directory, once prepared.
     worktree: Mutex<Option<PathBuf>>,
     /// Serializes the agent's WIP pushes.
@@ -288,6 +291,8 @@ impl Runner {
             model,
             base_commit,
             repo_key,
+            agent_features,
+            is_sub_agent,
         } = command;
         let exited = |error: String| JournalEntry {
             agent_id: agent_id.clone(),
@@ -340,6 +345,10 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             base_commit,
             repo_key,
+            gates: workspace_api::Gates {
+                agent_features,
+                is_sub_agent,
+            },
             worktree: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
             stop: Mutex::new(Some(stop_tx)),
@@ -459,6 +468,7 @@ impl Runner {
                     &agent.id,
                     &agent.workspace_id,
                     &cwd,
+                    &agent.gates,
                     self.inner.head.clone(),
                     &self.inner.mcp_bridge_exe,
                 )

@@ -1303,6 +1303,14 @@ mod launch {
         assert_eq!(launch.provider, "mock");
         assert_eq!(launch.base_commit, f.base);
         assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
+        // The node gates the agent's workspace API with its session's
+        // captured features (review of intentd#2786).
+        let session = f.services.store().get_agent_session(&agent).await.unwrap();
+        assert_eq!(
+            launch.agent_features,
+            serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
+        );
+        assert!(!launch.is_sub_agent);
         assert!(runtime.is_alive());
 
         link.journal(JournalRecord {

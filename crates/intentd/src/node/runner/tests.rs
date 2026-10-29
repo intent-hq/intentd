@@ -76,6 +76,8 @@ fn launch(id: &str) -> LaunchCommand {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        agent_features: serde_json::json!({}),
+        is_sub_agent: false,
     }
 }
 
