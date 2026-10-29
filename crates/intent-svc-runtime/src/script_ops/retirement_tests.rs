@@ -1180,31 +1180,33 @@ async fn retirement_out_of_band_kill_exits_before_settlement_archives() {
         "an exited one-off stays listed until settlement: {listed}"
     );
 
+    let changes = h
+        .services
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(h.ws.clone()),
+            event_types: vec![SCRIPT_CHANGED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        changes
+            .iter()
+            .filter(|e| e.data["scriptId"] == id)
+            .all(|e| e.data["action"] == "created"),
+        "no archive change is published while settlement is parked: {changes:?}"
+    );
+
     park.release.notify_one();
-    let mut exited_seen = false;
-    let archived = tokio::time::timeout(LIVENESS, async {
-        loop {
-            for event in sub.recv().await.expect("subscription open") {
-                let event = serde_json::to_value(event).unwrap();
-                if event["data"]["scriptId"] != id {
-                    continue;
-                }
-                if event["type"] == "script:state" && event["data"]["status"] == "exited" {
-                    exited_seen = true;
-                }
-                if event["type"] == "script:changed" {
-                    assert!(
-                        exited_seen,
-                        "exited script:state precedes the archive change: {event}"
-                    );
-                    assert_eq!(event["data"]["action"], "updated", "{event}");
-                    return event;
-                }
-            }
-        }
+    // Ordered reads: an archive change ahead of `exited` would be consumed by
+    // `await_state` and leave `await_script_change` to time out naming it.
+    await_state(&mut sub, LIVENESS, |v| {
+        v["data"]["scriptId"] == id && v["data"]["status"] == "exited"
     })
-    .await
-    .expect("settlement publishes the archive change");
+    .await;
+    let archived = await_script_change(&mut sub, "updated").await;
+    assert_eq!(archived["data"]["scriptId"], id, "{archived}");
     assert!(
         archived["data"]["script"]["archivedAt"].is_string(),
         "settlement change carries archivedAt: {archived}"

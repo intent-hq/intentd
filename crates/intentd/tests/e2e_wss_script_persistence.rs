@@ -752,15 +752,16 @@ fn assert_lost_command_state(st: &Value, ctx: &str) {
 }
 
 /// Read `script:state` / `script:changed` events off a subscribed connection
-/// until one for `script_id` satisfies `pred` (given the whole event);
-/// asserts the §6.5 notification envelope on every frame and returns the
-/// matching event `data`. The actor is not asserted: settlement is
+/// until one satisfies `pred` (given the whole event); asserts the §6.5
+/// notification envelope and `script_id` on every frame and returns the
+/// matching event `data`. `awaiting` names the wait in the timeout panic. The actor is not asserted: settlement is
 /// daemon-attributed.
 async fn next_script_event<S, F>(
     ws: &mut WebSocketStream<S>,
     subscription_id: &str,
     workspace_id: &str,
     script_id: &str,
+    awaiting: &str,
     mut pred: F,
 ) -> Value
 where
@@ -770,7 +771,7 @@ where
     loop {
         let next = timeout(common::rpc_read_timeout(), ws.next())
             .await
-            .expect("script event timed out");
+            .unwrap_or_else(|_| panic!("timed out awaiting {awaiting} for {script_id}"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let frame: Value = serde_json::from_str(&text).expect("json frame");
@@ -789,9 +790,10 @@ where
                     "event type: {frame}"
                 );
                 assert_eq!(event["workspaceId"], workspace_id, "workspace: {frame}");
+                assert_eq!(event["data"]["scriptId"], script_id, "script: {frame}");
                 assert!(event["id"].is_string(), "event id: {frame}");
                 assert!(event["timestamp"].is_string(), "timestamp: {frame}");
-                if event["data"]["scriptId"] == script_id && pred(event) {
+                if pred(event) {
                     return event["data"].clone();
                 }
             }
@@ -926,15 +928,34 @@ async fn out_of_band_kill_reaches_exited_over_wss() {
 
     // The terminal transition is published as script:state with the same
     // exitCode the status read reported.
-    let event = next_script_event(&mut sub, &subscription_id, &ws_id, "oob-1", |event| {
-        event["type"] == "script:state" && event["data"]["status"] == json!("exited")
-    })
+    let event = next_script_event(
+        &mut sub,
+        &subscription_id,
+        &ws_id,
+        "oob-1",
+        "exited script:state",
+        |event| {
+            assert!(
+                event["type"] != "script:changed"
+                    || event["data"]["script"]["archivedAt"].is_null(),
+                "archive change precedes the exited script:state: {event}"
+            );
+            event["type"] == "script:state" && event["data"]["status"] == json!("exited")
+        },
+    )
     .await;
     // Settlement follows `exited`: only its archive change makes the retired
     // one-off absent from the active list.
-    let settled = next_script_event(&mut sub, &subscription_id, &ws_id, "oob-1", |event| {
-        event["type"] == "script:changed" && event["data"]["script"]["archivedAt"].is_string()
-    })
+    let settled = next_script_event(
+        &mut sub,
+        &subscription_id,
+        &ws_id,
+        "oob-1",
+        "settlement script:changed carrying archivedAt",
+        |event| {
+            event["type"] == "script:changed" && event["data"]["script"]["archivedAt"].is_string()
+        },
+    )
     .await;
     assert_eq!(settled["action"], "updated", "settlement change: {settled}");
     let listed = wss_rpc(&mut ws, 200, "script.list", json!({ "workspaceId": ws_id })).await;
