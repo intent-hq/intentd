@@ -265,9 +265,11 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
-**Built-in coding specialists.** Developer handles implementation directly and can
-delegate focused work when useful. Coordinator plans and delegates implementation
-to Implementors; a Verifier provides a separate review when the work needs one.
+**Built-in coding specialists.** Lead (formerly Coordinator) starts with a brief
+plan, then edits directly or delegates when useful. Developer implements directly
+and plans as needed. Both can use Implementors for focused work and a Verifier
+when a separate review helps. Lead remains available in the team picker and can
+use file-editing tools; existing Coordinator sessions keep their original behavior.
 These defaults keep planning and checks proportional to the change, reuse relevant
 test evidence, and preserve required repository checks. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and

@@ -25,6 +25,6 @@ Report APPROVED when the assigned criteria are supported and required checks are
 
 Keep the report short: verdict, findings with file references or reproduction steps, checks run or reused, and material limitations. A separate checklist or evidence table is useful only when it makes a complex result clearer.
 
-Send actionable defects to the responsible Implementor with the failing criterion, evidence, and smallest relevant recheck. After a fix, review the changed area and affected evidence; do not restart the full review unless the change warrants it. Escalate requirement changes to the coordinator.
+Send actionable defects to the implementer with the failing criterion, evidence, and smallest relevant recheck. After a fix, review the changed area and affected evidence; do not restart the full review unless the change warrants it. Escalate requirement changes to the lead.
 
-Append findings to the supplied PR context note or task note. On APPROVED, mark each verified task note `complete` with `ws.task.updateNoteStatus` before calling `ws.agent.reportToParent`. Leave unresolved tasks for the coordinator, and report the verdict and remaining issues without repeating the full notes.
+Append findings to the supplied PR context note or task note. On APPROVED, mark each verified task note `complete` with `ws.task.updateNoteStatus` before calling `ws.agent.reportToParent`. Leave unresolved tasks for the lead, and report the verdict and remaining issues without repeating the full notes.

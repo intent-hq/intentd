@@ -26,19 +26,19 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "1348b1d2841ac50dfed5c0b8432deecb2b0e243813804b2a240ef6c4e2f5a67e",
+                "da2e7af947cfab164c7195a2a1dce2eb338781051bd2667564b3586e41477ffb",
             ),
             (
                 "implementor",
-                "97845965252272d19d9a273510efb49d03d506216e7433f1d6b661d3446320ae",
+                "9112d15e740935b67492fcca7b88fa906aa36178c2303f4b32c430fe9edd57fb",
             ),
             (
                 "spec-writer",
-                "b5f04fff9a330727b405c99e0a7d36219e68cb90d5d2c111beb9c3714d404676",
+                "23519f72689f58af8f88174b11886662278f8fd844c63f1f0f6db0b51dbe3d93",
             ),
             (
                 "verifier",
-                "2c3661cc46cd9787186491752c6106375109e45b318d1a88e53943df1f662a2e",
+                "f1e7caa77c837942b2e0643cd017417ea8958d163a94f4a9c991b11e56f6aaa9",
             ),
         ] {
             let content = super::ENTRY
@@ -87,8 +87,13 @@ mod tests {
                 assert_ne!(old, new, "{new_id}");
                 let (old_meta, _) = crate::specialists::parse_frontmatter(old);
                 let (new_meta, _) = crate::specialists::parse_frontmatter(new);
-                for key in ["name", "role", "teamAgents", "icon", "aliases", "model"] {
-                    assert_eq!(old_meta.get(key), new_meta.get(key), "{new_id}: {key}");
+                let keys = if *new_id == "spec-writer" {
+                    &["teamAgents", "icon", "model"][..]
+                } else {
+                    &["name", "role", "teamAgents", "icon", "aliases", "model"][..]
+                };
+                for key in keys {
+                    assert_eq!(old_meta.get(*key), new_meta.get(*key), "{new_id}: {key}");
                 }
             } else {
                 assert_eq!(old, new, "{new_id}");

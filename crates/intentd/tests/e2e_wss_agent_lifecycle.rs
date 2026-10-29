@@ -11218,7 +11218,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// Specialist-derived default name over WSS (PROTOCOL §5.1/§5.5):
 /// `workspace.create` with a name-less `initialAgent` carrying a specialist
 /// derives the agent's name from the specialist's resolved display name
-/// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
+/// (frontmatter `name` — "Lead" for the embedded `spec-writer`) and
 /// leaves it generated, so the opening-turn `setAgentName` can give it a
 /// task-specific name.
 #[intent_test_macros::daemon_test]
@@ -11267,7 +11267,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         .expect("initial agent returned")
         .to_string();
     assert_eq!(
-        created["initialAgent"]["name"], "Coordinator",
+        created["initialAgent"]["name"], "Lead",
         "name derived from spec-writer's display name: {created}"
     );
     assert_eq!(
@@ -11277,7 +11277,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
 
     // The derived name is persisted, not just projected into the create result.
     let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
-    assert_eq!(got["agent"]["name"], "Coordinator");
+    assert_eq!(got["agent"]["name"], "Lead");
     assert_eq!(got["agent"]["nameExplicitlySet"], false);
 }
 

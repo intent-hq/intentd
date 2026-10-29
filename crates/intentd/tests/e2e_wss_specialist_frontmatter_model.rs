@@ -502,7 +502,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         created["agent"]["metadata"]["specialist"], "spec-writer",
         "alias create persists the canonical id, not the alias"
     );
-    assert_eq!(created["agent"]["name"], "Coordinator");
+    assert_eq!(created["agent"]["name"], "Lead");
 
     // agent.get round-trips the canonical id from the persisted row.
     let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
@@ -1221,6 +1221,32 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
         got["specialist"]["role"], created["specialist"]["role"],
         "create response agrees with the following get over WSS"
     );
+
+    let lead = wss_rpc(
+        &mut ws,
+        51,
+        "specialist.edit",
+        json!({"id":"sigma", "scope":"user", "spec":{
+            "name":"Sigma", "description":"Planning first", "role":"lead",
+            "teamAgents":["implementor"], "prompt":"Plan then edit or delegate."
+        }}),
+    )
+    .await;
+    assert_eq!(lead["specialist"]["role"], "lead");
+    let got = wss_rpc(&mut ws, 52, "specialist.get", json!({"id":"sigma"})).await;
+    assert_eq!(got["specialist"]["role"], "lead");
+
+    let created_lead = wss_rpc(
+        &mut ws,
+        53,
+        "specialist.create",
+        json!({"id":"planning-lead", "scope":"user", "spec":{
+            "name":"Planning lead", "description":"Planning first", "role":"lead",
+            "prompt":"Plan then edit or delegate."
+        }}),
+    )
+    .await;
+    assert_eq!(created_lead["specialist"]["role"], "lead");
 
     // edit — the explicit clears drop the fields.
     let edited = wss_rpc(

@@ -488,7 +488,7 @@ pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// intent-hq/monorepo#718): an omitted key keeps the lower tiers' effective
 /// value, an explicit empty value (`model: ""`) clears it, and an explicit
 /// non-empty value overrides it.
-/// `role` is the picker-orchestration enum (`orchestrator` | `internal`;
+/// `role` is the picker-orchestration enum (`lead` | `orchestrator` | `internal`;
 /// absent = standard) and `icon` names a client-side avatar design. `icon`
 /// is render-only picker metadata; `role` additionally gates the spawn-time
 /// orchestrator tool denylist (§18.4,
@@ -524,10 +524,11 @@ const INHERITED_CONFIG_KEYS: &[&str] = &[
 ];
 
 /// Wire/frontmatter values accepted for the `role` enum on write (PROTOCOL
-/// §5.11): `orchestrator` (powers the team-mode card), `internal` (excluded
+/// §5.11): `lead` and `orchestrator` (team-mode card; only the latter
+/// restricts editing tools), `internal` (excluded
 /// from the New Workspace modal's single-agent picker only), or the
 /// explicit-clear empty string.
-const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
+const ROLE_VALUES: &[&str] = &["lead", "orchestrator", "internal", ""];
 
 /// The tier-folded resolution state of a specialist's `role` frontmatter
 /// ([`SpecialistsService::resolve_role_state`]): the wire def drops the
@@ -588,7 +589,7 @@ fn validate_role_spec(value: Option<&Value>) -> Result<()> {
     match value.as_str() {
         Some(s) if ROLE_VALUES.contains(&s) => Ok(()),
         _ => Err(Error::InvalidParams(
-            "role must be \"orchestrator\", \"internal\", or \"\"".to_string(),
+            "role must be \"lead\", \"orchestrator\", \"internal\", or \"\"".to_string(),
         )),
     }
 }
@@ -1513,7 +1514,7 @@ impl SpecialistsService {
     }
 
     /// Resolve a specialist's `role` frontmatter enum (PROTOCOL §5.11:
-    /// `orchestrator` | `internal`) through the 3-tier order (project >
+    /// `lead` | `orchestrator` | `internal`) through the 3-tier order (project >
     /// user > bundled). Returns `None` when the specialist is unknown or
     /// carries no effective role (omitted, explicitly cleared, or
     /// normalized-out on read); callers that must tell the explicit
@@ -2358,16 +2359,20 @@ mod tests {
         assert!(!svc.resolve_is_orchestrator("plain", None));
     }
 
-    /// The bundled orchestrator still resolves as one via its v1.1 `role`
-    /// frontmatter — including through the `coordinator` alias — while the
-    /// bundled internal specialists do not.
     #[test]
-    fn resolve_is_orchestrator_bundled_spec_writer_and_alias() {
+    fn bundled_lead_keeps_editing_tools_and_legacy_coordinator_stays_restricted() {
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
-        assert!(svc.resolve_is_orchestrator("spec-writer", None));
-        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        for id in ["spec-writer", "coordinator", "lead"] {
+            assert_eq!(svc.canonical_id(id, None).as_deref(), Some("spec-writer"));
+            assert_eq!(svc.resolve_role(id, None).as_deref(), Some("lead"));
+            assert!(!svc.resolve_is_orchestrator(id, None));
+        }
         assert!(!svc.resolve_is_orchestrator("implementor", None));
+        let old = service_over(&dir).with_embedded(EMBEDDED_BUNDLED_V3_1);
+        assert!(old.resolve_is_orchestrator("spec-writer", None));
+        assert!(old.resolve_is_orchestrator("coordinator", None));
+        assert!(old.canonical_id("lead", None).is_none());
     }
 
     /// Name-based fallback: sessions can carry an orchestrator id without a
@@ -2549,7 +2554,7 @@ mod tests {
         );
         let def = svc.resolve("coordinator", None).expect("alias resolves");
         assert_eq!(def["id"], "spec-writer");
-        assert_eq!(def["name"], "Coordinator");
+        assert_eq!(def["name"], "Lead");
     }
 
     /// Strict-seam contract (monorepo#3497): `canonical_id_or_err` accepts
@@ -4246,12 +4251,12 @@ mod tests {
     #[test]
     fn embedded_bundle_carries_picker_metadata() {
         // The latest embedded bundle resolves the picker-metadata fields:
-        // spec-writer is the orchestrator with its advisory roster,
+        // spec-writer is the lead with its advisory roster,
         // implementor/verifier are internal, and every def carries an icon.
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
         let sw = svc.get("spec-writer", None).unwrap();
-        assert_eq!(sw["specialist"]["role"], "orchestrator");
+        assert_eq!(sw["specialist"]["role"], "lead");
         assert_eq!(
             sw["specialist"]["teamAgents"],
             json!(["implementor", "verifier"])
