@@ -735,13 +735,17 @@ client without the user's instruction.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
+They share available width up to a compact limit, then stay grouped at the left.
 Hover over an icon for its section name; scroll the row horizontally when space
 is tight. Faded edges show where more tabs are hidden and clear when you reach
 that end. **Agents** opens by default; your selected section is remembered. Its
 tab shows the main agent's avatar, or a robot while no main agent is available.
+A token-usage total appears beside **Agents** once tokens have been used.
+The workspace status image appears as a compact thumbnail in **Context**; click
+it to view the full image.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
 a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
@@ -756,10 +760,13 @@ opens the first terminal, creating one when none exists. A click in the collapse
 rail opens the section's default content immediately. Moving keyboard focus
 across the expanded row only selects the sidebar section; its focus ring stays
 inside the tab when the row scrolls. Enter or Space acts
-like a click in either layout. The rail's sidebar toggle pins it open;
+like a click in either layout. The rail's toggle stays visible as its tabs scroll
+and pins the sidebar open;
 the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
+Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
+When collapsed, this opens the matching floating section beside the rail.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
