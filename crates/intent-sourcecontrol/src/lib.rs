@@ -215,10 +215,11 @@ pub trait SourceControl: Send + Sync {
         Err(Error::Unsupported("complete review discussions".into()))
     }
 
-    /// Open PRs whose head branch is `head_ref`, from any head repository
-    /// (forks included), in one bounded read. More matches than one page is
-    /// an error rather than a truncated answer. The default suits forges
-    /// whose `head` filter is the bare source branch (GitLab).
+    /// Open PRs whose head branch is `head_ref` in the workspace's own head
+    /// repository, in one bounded read. More matches than one page is an
+    /// error rather than a truncated answer. The default suits forges whose
+    /// `head` filter is the bare source branch (GitLab); GitHub scopes the
+    /// head by repository owner (intent-hq/intent#8010).
     async fn list_open_prs_by_head(
         &self,
         repo: &RepoRef,

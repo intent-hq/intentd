@@ -139,8 +139,8 @@ struct Key {
     scope: CacheScope,
     repo: RepoRef,
     number: Option<u64>,
-    /// Open PRs of one head branch, forks included: the oversized-repository
-    /// path. Costed and capped like a single record read.
+    /// Open PRs of one head branch in the repository owner's account (other
+    /// forks' same-name heads excluded): the oversized-repository path. Costed and capped like a single record read.
     head: Option<String>,
 }
 
