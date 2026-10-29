@@ -143,7 +143,10 @@ test('orphan cleanup keeps every diagnostic category when nested Windows errors 
 
 test('harness reaps a known child after its launcher has already exited', async t => {
   const value = 'SYNTHETIC_ORPHAN_SETUP_CREDENTIAL_1234';
-  for (const scenario of ['ready', 'child failure', 'observer failure', 'readiness timeout', 'observer close failure']) await t.test(scenario, async () => {
+  const scenarios = ['ready', 'child failure', 'observer failure', 'readiness timeout', 'observer close failure',
+    'observer close failure with late stderr'];
+  for (const scenario of scenarios) await t.test(scenario, async () => {
+    const closeFailure = scenario.startsWith('observer close failure');
     const root = mkdtempSync(join(tmpdir(), 'pi-orphan-fixture-'));
     const directory = join(root, 'witness');
     mkdirSync(directory);
@@ -151,22 +154,30 @@ test('harness reaps a known child after its launcher has already exited', async 
     const childEntry = join(root, 'child.cjs');
     writeFileSync(childEntry, scenario === 'child failure'
       ? `process.stderr.write('token=${value}\\n'); process.exitCode = 17;`
-      : `setTimeout(() => process.stderr.write(${JSON.stringify(['ready', 'observer close failure'].includes(scenario) ? 'child alive\n' : 'child not ready\n')}), 200); setInterval(() => {}, 1000);`);
+      : `setTimeout(() => process.stderr.write(${JSON.stringify(scenario === 'ready' || closeFailure ? 'child alive\n' : 'child not ready\n')}), 200); setInterval(() => {}, 1000);`);
     let observerEntry = fixture('./pi-startup-witness.cjs');
     if (scenario === 'observer failure') {
       observerEntry = join(root, 'broken-observer.cjs');
       writeFileSync(observerEntry, `require('node:fs').writeSync(2, 'observer setup failed\\ntoken=${value}\\n' + 'é'.repeat(100000)); process.exitCode = 17;`);
     }
-    if (scenario === 'observer close failure') {
+    if (closeFailure) {
       observerEntry = join(root, 'close-failure-observer.cjs');
       // Fail the real witness publication after a live child exits. This leaves
       // missing close evidence even though cleanup must still reap every PID.
+      // The late variant hands the stderr phrase to an untracked writer that
+      // delivers it well after every tracked PID is dead, as a slow Windows
+      // pipe can: the report must wait for stderr to close, not for PID death.
+      const writeFailure = scenario === 'observer close failure'
+        ? `fs.writeSync(2, 'observer close publication failed\\ntoken=${value}\\n');`
+        : `require('node:child_process').spawn(process.execPath, ['-e',
+            'setTimeout(() => require("node:fs").writeSync(2, "observer close publication failed\\\\ntoken=${value}\\\\n"), 1500)'],
+            { detached: true, stdio: ['ignore', 'ignore', 2] }).unref();`;
       writeFileSync(observerEntry, `const fs = require('node:fs');
         const rename = fs.renameSync;
         fs.renameSync = (from, to) => {
           const record = JSON.parse(fs.readFileSync(from, 'utf8'));
           if (record.exit || record.close) {
-            fs.writeSync(2, 'observer close publication failed\\ntoken=${value}\\n');
+            ${writeFailure}
             throw new Error('injected observer close publication failure');
           }
           return rename(from, to);
@@ -190,6 +201,9 @@ test('harness reaps a known child after its launcher has already exited', async 
     let records = [];
     let primaryError;
     launcher.stderr.on('data', chunk => capture.push(chunk));
+    // PID death is not stderr completion: a pipe can deliver data after every
+    // writer is gone (observed on Windows), so the report waits for 'close'.
+    const stderrClosed = new Promise(resolve => launcher.stderr.once('close', () => resolve(true)));
     launcher.on('error', error => { launchError = error; });
     launcher.on('exit', (code, signal) => { launcherExit = { code, signal }; });
     launcher.on('message', message => {
@@ -220,7 +234,7 @@ test('harness reaps a known child after its launcher has already exited', async 
       assert.ok(!setupReport.includes(value));
       assert.ok(Buffer.byteLength(setupReport) <= diagnostics.LIMITS.report);
       t.diagnostic(setupReport);
-      assert.equal(ready, ['ready', 'observer close failure'].includes(scenario), setupReport);
+      assert.equal(ready, scenario === 'ready' || closeFailure, setupReport);
       if (ready) {
         // Exit the launcher only AFTER readiness, then prove the orphan is still
         // live before asking the harness to clean it up.
@@ -270,6 +284,11 @@ test('harness reaps a known child after its launcher has already exited', async 
       const cleanupDeadline = Date.now() + 3000;
       while (pids.some(alive) && Date.now() < cleanupDeadline) await delay(20);
       if (pids.some(alive)) failures.push(new Error('Fixture process survived cleanup'));
+      let drainTimer;
+      const drained = await Promise.race([stderrClosed,
+        new Promise(resolve => { drainTimer = setTimeout(resolve, 5000, false); })]);
+      clearTimeout(drainTimer);
+      if (!drained) failures.push(new Error('Fixture stderr did not close within 5000ms of cleanup'));
       const observerStderr = capture.snapshot(true);
       const survivingPids = pids.filter(alive);
       launcher.stderr.destroy();
@@ -278,7 +297,7 @@ test('harness reaps a known child after its launcher has already exited', async 
       // Preserve the first failure even when cleanup also fails. The observer
       // can emit its useful error only after the readiness snapshot above.
       const report = orphanCleanupReport(primaryError, failures, observerStderr, survivingPids, records);
-      if (scenario === 'observer close failure') {
+      if (closeFailure) {
         assert.ok(primaryError, 'The missing close must fail the original cleanup');
         assert.ok(failures.length, 'Repeated cleanup must not waive missing close evidence');
         const parsed = JSON.parse(report);
