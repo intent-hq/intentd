@@ -162,7 +162,7 @@ async fn git_commit_commits_the_agents_work_in_its_worktree() {
     let first = ok_json(
         call(
             &server,
-            r#"return JSON.stringify(await ws.git.commit("one", { files: ["one.txt"] }));"#,
+            r#"return JSON.stringify(await ws.git.commit("one", { files: ["one.txt"], userRequested: true }));"#,
         )
         .await,
     );
@@ -174,14 +174,18 @@ async fn git_commit_commits_the_agents_work_in_its_worktree() {
     let second = ok_json(
         call(
             &server,
-            r#"return JSON.stringify(await ws.git.commit("the rest"));"#,
+            r#"return JSON.stringify(await ws.git.commit("the rest", { userRequested: true }));"#,
         )
         .await,
     );
     assert_eq!(second["files"], json!(["two.txt"]), "{second}");
     assert_eq!(git(dir.path(), &["log", "--format=%s"]), "the rest\none");
 
-    let empty = call(&server, r#"return await ws.git.commit("nothing");"#).await;
+    let empty = call(
+        &server,
+        r#"return await ws.git.commit("nothing", { userRequested: true });"#,
+    )
+    .await;
     assert!(
         empty.0 && empty.1.contains("nothing to commit"),
         "{empty:?}"
@@ -339,4 +343,70 @@ async fn control_plane_calls_are_forwarded_to_head_for_the_agent() {
         .all(|request| request.agent_id == agent() && request.method == CALL_METHOD));
     assert_eq!(seen[0].params["method"], json!("note.read"));
     assert_eq!(seen[0].params["args"]["id"], json!("n-1"));
+}
+
+/// Review of intentd#2786: an agent-initiated commit passes the same
+/// auto-commit gate a local one does, with the policy read from head; with
+/// no answer from head it is refused, and `userRequested` bypasses the gate.
+#[tokio::test]
+async fn git_commit_honors_the_workspaces_auto_commit_setting_from_head() {
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("one.txt"), "1").unwrap();
+
+    let unlinked = server(&agent(), &workspace(), &repo, HeadLink::default());
+    let (failed, text) = call(&unlinked, r#"return await ws.git.commit("one");"#).await;
+    assert!(failed && text.contains("auto-commit setting"), "{text}");
+
+    let (node_end, mut head_end) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), &repo, head);
+    let answering = tokio::spawn(async move {
+        let mut policies = Vec::new();
+        for enabled in [false, true] {
+            loop {
+                let Some(LinkEvent::Request(request)) = head_end.events.recv().await else {
+                    continue;
+                };
+                policies.push(request.request().params.clone());
+                request
+                    .respond(LinkOutcome::Ok(json!({ "autoCommit": enabled })))
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        (policies, head_end)
+    });
+    let (failed, text) = call(&server, r#"return await ws.git.commit("one");"#).await;
+    assert!(failed && text.contains("Auto-commit is disabled"), "{text}");
+    let head_commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(!head_commit.status.success(), "nothing was committed");
+    let allowed = ok_json(
+        call(
+            &server,
+            r#"return JSON.stringify(await ws.git.commit("one"));"#,
+        )
+        .await,
+    );
+    assert_eq!(allowed["files"], json!(["one.txt"]), "{allowed}");
+    let (policies, _head_end) = tokio::time::timeout(wait(), answering)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(policies
+        .iter()
+        .all(|params| params["method"] == json!(COMMIT_POLICY_METHOD)));
 }

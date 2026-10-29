@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
 use intent_core::node_link::LinkOutcome;
-use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD};
+use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
 use intent_core::{
     AgentId, BoxFuture, Error, GitAgentCommitResult, NoteId, Result, Workspace, WorkspaceApi,
     WorkspaceGitRootId, WorkspaceId,
@@ -95,22 +95,31 @@ fn server(
     worktree: &Path,
     head: HeadLink,
 ) -> WorkspaceMcpServer {
+    let router = Router {
+        agent_id: agent_id.clone(),
+        head,
+        timeout: DEFAULT_TIMEOUT,
+    };
     let api = Arc::new(NodeApi {
         workspace_id: workspace_id.clone(),
         worktree: worktree.to_path_buf(),
+        head: router.clone(),
     });
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
         .with_caller_agent_id(Some(agent_id.clone()));
-    let router = Arc::new(Router {
-        agent_id: agent_id.clone(),
-        head,
+    let router = Router {
         timeout: server.workspace_api_timeout(),
-    });
-    server.with_frame_router(router)
+        ..router
+    };
+    server.with_frame_router(Arc::new(router))
 }
+
+/// How long the node waits for head to answer its own policy read.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Routes one agent's frames: local ones to [`NodeApi`], forwarded ones to
 /// head, the rest refused.
+#[derive(Clone)]
 struct Router {
     agent_id: AgentId,
     head: HeadLink,
@@ -129,24 +138,48 @@ impl HostFrameRouter for Router {
                 let message = workspace_api::unsupported_message(method);
                 Some(Box::pin(async move { Err(message) }))
             }
-            Route::Forward => {
-                let link = self.head.get();
-                let agent_id = self.agent_id.clone();
-                let params = json!({ "method": method, "args": args });
-                let timeout = self.timeout;
-                Some(Box::pin(async move {
-                    let link = link.ok_or_else(|| {
-                        "node-link-unavailable: head is not connected to this node; try again shortly"
-                            .to_owned()
-                    })?;
-                    match link.call(agent_id, CALL_METHOD, params, timeout).await {
-                        Ok(LinkOutcome::Ok(value)) => Ok(value),
-                        Ok(LinkOutcome::Err(error)) => Err(error.message),
-                        Err(error) => Err(format!("the call did not reach head: {error}")),
-                    }
-                }))
+            Route::Forward => Some(Box::pin(self.forward(method, args))),
+        }
+    }
+}
+
+impl Router {
+    /// Forward the frame `method(args)` to head for the agent.
+    fn forward(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, String>> + Send + 'static
+    {
+        let link = self.head.get();
+        let agent_id = self.agent_id.clone();
+        let params = json!({ "method": method, "args": args });
+        let timeout = self.timeout;
+        async move {
+            let link = link.ok_or_else(|| {
+                "node-link-unavailable: head is not connected to this node; try again shortly"
+                    .to_owned()
+            })?;
+            match link.call(agent_id, CALL_METHOD, params, timeout).await {
+                Ok(LinkOutcome::Ok(value)) => Ok(value),
+                Ok(LinkOutcome::Err(error)) => Err(error.message),
+                Err(error) => Err(format!("the call did not reach head: {error}")),
             }
         }
+    }
+
+    /// Whether the workspace lets agents commit on their own, as head
+    /// resolves it. Fails closed: no answer is no.
+    async fn auto_commit(&self) -> Result<bool> {
+        let answer = self
+            .forward(COMMIT_POLICY_METHOD, &Value::Null)
+            .await
+            .map_err(|error| {
+                Error::Internal(format!(
+                    "could not check the workspace's auto-commit setting with head ({error}); retry, or pass userRequested: true if the user asked for this commit"
+                ))
+            })?;
+        Ok(answer.get("autoCommit").and_then(Value::as_bool) == Some(true))
     }
 }
 
@@ -156,6 +189,8 @@ impl HostFrameRouter for Router {
 struct NodeApi {
     workspace_id: WorkspaceId,
     worktree: PathBuf,
+    /// Asks head for the workspace's auto-commit policy.
+    head: Router,
 }
 
 impl NodeApi {
@@ -285,7 +320,7 @@ impl WorkspaceApi for NodeApi {
         _agent_id: Option<AgentId>,
         _linked_note_id: Option<NoteId>,
         files: Option<Vec<String>>,
-        _user_requested: bool,
+        user_requested: bool,
         git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         let checked = self.check(&workspace_id);
@@ -295,6 +330,13 @@ impl WorkspaceApi for NodeApi {
             if git_root_id.is_some() {
                 return Err(no_git_roots());
             }
+            // The same gate a local agent's commit passes: the workspace's
+            // auto-commit setting (resolved on head), unless the user asked.
+            let enabled = user_requested || self.head.auto_commit().await?;
+            intent_services::feature_api::git_ops::assert_agent_commit_allowed(
+                enabled,
+                user_requested,
+            )?;
             tokio::task::spawn_blocking(move || commit(&worktree, &message, files.as_deref()))
                 .await
                 .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))?
@@ -311,7 +353,8 @@ fn no_git_roots() -> Error {
 
 /// Commit in the agent's worktree: the named `files`, or every change. Its
 /// committed `HEAD` reaches head as the agent's `head` ref on the next WIP
-/// push (after the turn). Uses the node's git identity, or a fixed agent
+/// push (after the turn). The caller checked the auto-commit gate. Uses
+/// the node's git identity, or a fixed agent
 /// identity when the node has none.
 fn commit(
     worktree: &Path,

@@ -162,7 +162,7 @@ pub mod file_ops {
 
 /// Workspace git locations.
 pub mod git_ops {
-    pub use crate::git_ops::worktree_path;
+    pub use crate::git_ops::{assert_agent_commit_allowed, worktree_path};
 }
 
 /// The hook wake and notice framing of the latest harness.

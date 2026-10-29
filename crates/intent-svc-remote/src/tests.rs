@@ -1582,4 +1582,34 @@ mod launch {
         assert!(matches!(fresh, LinkOutcome::Ok(_)), "{fresh:?}");
         f.node.shutdown();
     }
+
+    /// Review of intentd#2786: the node reads the workspace's auto-commit
+    /// policy before an agent-initiated commit; head answers it only for a
+    /// lease agent, from the workspace's own setting.
+    #[tokio::test]
+    async fn the_commit_policy_is_the_workspaces_and_only_for_lease_agents() {
+        use intent_core::remote_launch::workspace_api::COMMIT_POLICY_METHOD;
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        for enabled in [false, true] {
+            f.services
+                .store()
+                .set_workspace_auto_commit(&workspace(), enabled)
+                .await
+                .unwrap();
+            match forward(&link, &agent, COMMIT_POLICY_METHOD, Value::Null).await {
+                LinkOutcome::Ok(value) => assert_eq!(value, json!({ "autoCommit": enabled })),
+                LinkOutcome::Err(error) => panic!("policy read failed: {error:?}"),
+            }
+        }
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let unplaced = f.agent(&view).await;
+        let denied = refused(forward(&link, &unplaced, COMMIT_POLICY_METHOD, Value::Null).await);
+        assert!(
+            denied.message.starts_with("node-agent-denied"),
+            "{denied:?}"
+        );
+        f.node.shutdown();
+    }
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
-use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD};
+use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
 use intent_core::{Caller, Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
@@ -89,7 +89,7 @@ impl HeadCalls {
         let Some(method) = request.params.get("method").and_then(Value::as_str) else {
             return refusal(INVALID_PARAMS, "workspace.call needs a string `method`");
         };
-        if workspace_api::route(method) != Route::Forward {
+        if method != COMMIT_POLICY_METHOD && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
         let record = match shared.store.get_remote_agent(&request.agent_id).await {
@@ -114,6 +114,13 @@ impl HeadCalls {
             }
             Err(error) => return refusal(CALL_FAILED, error.to_string()),
         };
+        if method == COMMIT_POLICY_METHOD {
+            let enabled = self
+                .services
+                .effective_auto_commit(&record.workspace_id)
+                .await;
+            return LinkOutcome::Ok(serde_json::json!({ "autoCommit": enabled }));
+        }
         let features = self.services.session_agent_features(&session);
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
         let budget = Duration::from_millis(u64::from(request.timeout_ms)).min(MAX_BUDGET);

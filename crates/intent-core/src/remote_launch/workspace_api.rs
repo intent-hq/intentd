@@ -12,6 +12,11 @@
 /// `{ "method": <frame method>, "args": <frame args> }`.
 pub const CALL_METHOD: &str = "workspace.call";
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) to read the workspace's effective auto-commit policy
+/// before an agent-initiated `git.commit`. Head answers `{ "autoCommit": bool }`.
+pub const COMMIT_POLICY_METHOD: &str = "git.commitPolicy";
+
 /// Namespaces forwarded to head.
 pub const FORWARDED_NAMESPACES: &[&str] =
     &["note", "task", "agent", "pr", "mr", "comment", "event"];
@@ -128,6 +133,7 @@ mod tests {
             "mcp.listTools",
             "file.getAttachment",
             "git.registerRoot",
+            COMMIT_POLICY_METHOD,
             "note",
             "note.",
             "",
