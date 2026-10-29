@@ -906,7 +906,7 @@ a paid size never runs on GitHub: a job whose route job failed falls back to the
 WarpBuild label, and fork pull requests (auto-closed) get free standard runners. `check` takes an 8-CPU heavy slot but bursts as
 `gh-linux-16x` (WarpBuild 16x), as do coverage and release compilation; Windows
 uses `gh-windows-16x` (WarpBuild 16x) and Apple Silicon uses `macos-26-xlarge`
-(WarpBuild 12x). Physical-host pruning remains scheduled.
+(WarpBuild 6x). Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
 `CI_MACOS_RUNNER_DISABLED=true`.

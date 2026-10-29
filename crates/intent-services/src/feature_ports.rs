@@ -31,7 +31,7 @@ use intent_core::transfer::TransferPlan;
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::Services;
@@ -601,6 +601,15 @@ pub trait RuntimePort: Send + Sync + 'static {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    /// Word a `browser.*` reverse-dispatch error for its caller: an offline
+    /// client is named (falling back to its stored name). Core's
+    /// `ws.browser.clients()` route view uses the runtime's wording.
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String>;
+
     /// `browser.navigateTab`.
     fn browser_navigate_tab<'a>(
         &'a self,
@@ -632,14 +641,6 @@ pub trait RuntimePort: Send + Sync + 'static {
         workspace_id: WorkspaceId,
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
-
-    /// The [`ReverseTarget`] an agent `browser.exec` for `workspace_id`
-    /// dispatches to: the workspace's driving client (REV-2 Model 10).
-    fn driving_client_target<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>>;
 
     /// Re-home every claimed browser tab of `workspace_id` to `new_host`,
     /// the workspace's new driving-client pin (REV-2 Model 10).
@@ -831,6 +832,21 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// scripts loaded.
     fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
 
+    /// After a workspace import commits: recover script monitors, start
+    /// their maintenance loop, and refresh the live definitions of the
+    /// imported `script_ids` of `workspace_id`. Best-effort: failures are
+    /// logged, never returned.
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()>;
+
+    /// Re-arm the active hooks from the store; resolves to the number of
+    /// hooks resumed.
+    fn rehydrate_hooks<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
+
     /// Command-mode script runs in flight and the last settlement time.
     fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity;
 
@@ -991,7 +1007,7 @@ pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
         .flatten()
 }
 
-/// How a cancel transition ([`Services::cancel_active_hook`],
+/// How a cancel transition (the runtime's `HookServicesExt::cancel_active_hook`,
 /// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
 /// completion watches. A completion watch on an idle owner defers while the
 /// owner has active hooks / PR monitors, so cancelling the LAST one must
@@ -1526,6 +1542,14 @@ impl RuntimePort for UnavailableRuntime {
         DEFAULT_WORKSPACE_API.browser_exec(workspace_id, actions, tab_id, agent_id)
     }
 
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        _svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move { err.to_string() })
+    }
+
     fn browser_navigate_tab<'a>(
         &'a self,
         _svc: &'a Services,
@@ -1560,14 +1584,6 @@ impl RuntimePort for UnavailableRuntime {
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         DEFAULT_WORKSPACE_API.sandbox_discard(workspace_id, sandbox_id)
-    }
-
-    fn driving_client_target<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>> {
-        Box::pin(async { Err(runtime_unavailable()) })
     }
 
     fn migrate_claimed_browser_tabs<'a>(
@@ -1750,6 +1766,19 @@ impl RuntimePort for UnavailableRuntime {
     }
 
     fn hydrate_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn rehydrate_hooks<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async { Ok(0) })
     }
 
@@ -2140,12 +2169,12 @@ mod tests {
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
-            ["transfer"],
-            "Services::new registers the in-crate runtime and agent-wake features"
+            ["transfer", "runtime"],
+            "Services::new registers only the in-crate agent-wake feature"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
-            Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
+            Err(Error::Internal(m)) if m == "feature ports not registered: transfer, runtime"
         ));
     }
 
@@ -2155,7 +2184,8 @@ mod tests {
         let port = Arc::new(UnavailableTransfer::default());
         let svc = bare_services(&tmp)
             .await
-            .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>);
+            .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>)
+            .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>);
         assert!(svc.unregistered_feature_ports().is_empty());
         svc.ensure_feature_ports_registered()
             .expect("every port registered");
@@ -2167,20 +2197,6 @@ mod tests {
                 .export_in_progress(ws.as_str()),
             "the forwarders and clones reach the registered object"
         );
-    }
-
-    #[tokio::test]
-    async fn services_new_registers_one_runtime_feature_shared_by_clones() {
-        let tmp = TempDb::new();
-        let svc = bare_services(&tmp).await;
-        assert!(!svc.unregistered_feature_ports().contains(&"runtime"));
-        let clone = svc.clone();
-        assert!(std::ptr::eq(svc.runtime(), clone.runtime()));
-        assert!(std::ptr::eq(
-            svc.runtime(),
-            svc.feature::<crate::runtime::RuntimeFeature>()
-                .expect("registered")
-        ));
     }
 
     #[tokio::test]
@@ -2575,10 +2591,6 @@ mod tests {
             );
         };
         refused(
-            "driving_client_target",
-            format!("{:?}", port.driving_client_target(&svc, &ws).await),
-        );
-        refused(
             "migrate_claimed_browser_tabs",
             format!(
                 "{:?}",
@@ -2619,6 +2631,15 @@ mod tests {
             (false, None),
             "an unregistered runtime runs no setup script"
         );
+        assert_eq!(
+            format!("{:?}", port.rehydrate_hooks(&svc).await),
+            "Ok(0)",
+            "an unregistered runtime resumes no hooks"
+        );
+        // Best-effort and infallible: an unregistered runtime has no
+        // imported scripts to recover.
+        port.recover_imported_scripts(&svc, &ws, &["script".to_owned()])
+            .await;
     }
 
     #[derive(Debug, Default)]

@@ -212,7 +212,7 @@ async fn discussion_agents_cannot_target_private_foreign_retired_or_forged_recip
     .unwrap();
     let private = with_caller(
         human(&people[1].id),
-        svc.discussion_send_to_op(
+        svc.seed_legacy_discussion(
             &ws,
             "private",
             "secret",
@@ -949,7 +949,7 @@ async fn discussion_agent_reactions_are_granted_bound_idempotent_and_never_wake(
     .is_err());
     let private = with_caller(
         human(&people[1].id),
-        svc.discussion_send_to_op(
+        svc.seed_legacy_discussion(
             &ws,
             "private-react",
             "private",
@@ -994,4 +994,99 @@ async fn discussion_agent_reactions_are_granted_bound_idempotent_and_never_wake(
         writer.commit().await.unwrap();
         assert!(matches!(pending.await, Err(Error::NotFound(_))));
     }
+}
+
+#[tokio::test]
+async fn discussion_named_conversations_grant_agents_independently_and_delete_revokes() {
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "named-agent").await;
+    let target = DiscussionTarget {
+        create_conversation: true,
+        ..addressed(std::slice::from_ref(&a))
+    };
+    let first = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "named-first", "Review", &target),
+    )
+    .await
+    .unwrap();
+    let second = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "named-second", "Another", &new_conversation()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(svc.queue_snapshot(&a).len(), 1);
+    assert!(with_caller(
+        as_agent(&a),
+        svc.discussion_history_op(&ws, &second.conversation.id, None, None, 50)
+    )
+    .await
+    .is_err());
+    let visible = with_caller(as_agent(&a), svc.discussion_conversations_op(&ws, None, 50))
+        .await
+        .unwrap();
+    assert_eq!(visible["conversations"].as_array().unwrap().len(), 1);
+    assert_eq!(visible["conversations"][0]["id"], first.conversation.id);
+    let reply = with_caller(
+        as_agent(&a),
+        svc.discussion_send_to_op(
+            &ws,
+            "named-reply",
+            "Done",
+            &DiscussionTarget {
+                conversation_id: Some(first.conversation.id.clone()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.message.sequence, 2);
+    let reaction = with_caller(
+        as_agent(&a),
+        svc.discussion_react_op(&ws, &first.conversation.id, &first.message.id, "👀", true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reaction.reactions[0].count, 1);
+    let request = intent_core::discussion::DiscussionAgentControl {
+        workspace_id: ws.clone(),
+        conversation_id: first.conversation.id.clone(),
+        message_id: first.message.id.clone(),
+        agent_id: a.clone(),
+        attempt: 1,
+    };
+    let stopped = with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request.clone(), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped["activity"]["state"], "stopped");
+    let retry = with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry["activity"]["attempt"], 2);
+    with_caller(
+        human(&people[0].id),
+        svc.discussion_manage_op(&ws, &first.conversation.id, None),
+    )
+    .await
+    .unwrap();
+    assert!(with_caller(
+        as_agent(&a),
+        svc.discussion_history_op(&ws, &first.conversation.id, None, None, 50)
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        with_caller(as_agent(&a), svc.discussion_conversations_op(&ws, None, 50))
+            .await
+            .unwrap()["conversations"],
+        json!([])
+    );
 }

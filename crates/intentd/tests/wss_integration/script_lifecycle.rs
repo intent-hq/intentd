@@ -559,9 +559,11 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
                 .unwrap();
             legacy.cwd = Some("/outside-workspace".into());
             srv.store.upsert_script(&legacy).await.unwrap();
-            let services = Services::new(srv.store.clone())
-                .with_event_bus(srv.bus.clone())
-                .with_settings_registry(srv.registry.clone());
+            let services = intent_app::compose(
+                Services::new(srv.store.clone())
+                    .with_event_bus(srv.bus.clone())
+                    .with_settings_registry(srv.registry.clone()),
+            );
             assert_eq!(services.hydrate_scripts().await.unwrap(), 1);
             let tls = ensure_tls_certificate(srv.dir.path()).unwrap();
             let tokens = Arc::new(MemTokenStore::default());

@@ -2,6 +2,148 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.71] - 2026-10-28
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the primary client in the workspace menu ([#2778](https://github.com/intent-hq/intentd/pull/2778))
+
+
+## [0.11.70] - 2026-10-28
+
+### 🧪 Testing
+
+- Verify four protocol fixture copies with the shared lock tool ([#2774](https://github.com/intent-hq/intentd/pull/2774))
+
+
+## [0.11.69] - 2026-10-28
+
+### 🚀 Features
+
+- Persist and serve Workspace.label ([#2760](https://github.com/intent-hq/intentd/pull/2760))
+
+
+## [0.11.68] - 2026-10-28
+
+### 📚 Documentation
+
+- Explain local HTTP browsing on iOS ([#2691](https://github.com/intent-hq/intentd/pull/2691))
+
+
+## [0.11.67] - 2026-10-28
+
+### ⚙️ Miscellaneous Tasks
+
+- *(acp)* Win back room in the condensed ws.* prompt reference ([#2770](https://github.com/intent-hq/intentd/pull/2770))
+
+
+## [0.11.66] - 2026-10-27
+
+### 🔧 Refactor
+
+- *(services)* Move runtime into intent-svc-runtime ([#2767](https://github.com/intent-hq/intentd/pull/2767))
+
+### 📚 Documentation
+
+- Describe Multiplayer as always on in the assistant guide ([#2753](https://github.com/intent-hq/intentd/pull/2753))
+
+
+## [0.11.65] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Prepare runtime-side tests for the runtime crate move ([#2761](https://github.com/intent-hq/intentd/pull/2761))
+
+
+## [0.11.64] - 2026-10-27
+
+### 🚀 Features
+
+- Teach agents to link other workspaces instead of naming their IDs ([#2754](https://github.com/intent-hq/intentd/pull/2754))
+- Auto-archive idle workspaces and purge archived folders ([#2756](https://github.com/intent-hq/intentd/pull/2756))
+
+### 🧪 Testing
+
+- *(transport)* Run the shared browser-routing cases against the router ([#2752](https://github.com/intent-hq/intentd/pull/2752))
+
+
+## [0.11.63] - 2026-10-27
+
+### 🚀 Features
+
+- *(browser)* Add ws.browser.clients() to show live client connections and routes ([#2749](https://github.com/intent-hq/intentd/pull/2749))
+
+
+## [0.11.62] - 2026-10-27
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Report GitHub's updatedAt for monitor-only PR pool entries ([#2745](https://github.com/intent-hq/intentd/pull/2745))
+
+
+## [0.11.61] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Run core agent/watch tests against a runtime test double ([#2736](https://github.com/intent-hq/intentd/pull/2736))
+
+
+## [0.11.60] - 2026-10-27
+
+### 🚀 Features
+
+- *(desktop)* Accept windowId targets and add focusWindow ([#2734](https://github.com/intent-hq/intentd/pull/2734))
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.3.0 ([#2739](https://github.com/intent-hq/intentd/pull/2739))
+- *(transport)* Route unpinned browser.exec to the client's newest connection ([#2733](https://github.com/intent-hq/intentd/pull/2733))
+
+### 🧪 Testing
+
+- *(pr-monitor)* Check every optional saved field survives an upgrade ([#2735](https://github.com/intent-hq/intentd/pull/2735))
+
+
+## [0.11.59] - 2026-10-27
+
+### 🧪 Testing
+
+- *(core)* Lint against hard-coded current harness version literals ([#2726](https://github.com/intent-hq/intentd/pull/2726))
+
+
+## [0.11.58] - 2026-10-26
+
+### 🚀 Features
+
+- *(discussions)* Add workspace-wide creation and role management ([#2616](https://github.com/intent-hq/intentd/pull/2616))
+
+
+## [0.11.57] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Gather runtime-dependent core tests beside the runtime ([#2730](https://github.com/intent-hq/intentd/pull/2730))
+
+
+## [0.11.56] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route remaining runtime calls through ports before the crate move ([#2728](https://github.com/intent-hq/intentd/pull/2728))
+
+
+## [0.11.55] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route runtime through public core accessors ([#2719](https://github.com/intent-hq/intentd/pull/2719))
+- *(core)* Define harness guidance version sets in intent-core ([#2717](https://github.com/intent-hq/intentd/pull/2717))
+
+### 📚 Documentation
+
+- *(guide)* Describe the pinned Default profile in Settings → Providers ([#2718](https://github.com/intent-hq/intentd/pull/2718))
+
+
 ## [0.11.54] - 2026-10-26
 
 ### 🐛 Bug Fixes

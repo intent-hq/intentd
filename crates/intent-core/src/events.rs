@@ -211,6 +211,12 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_CREATED: &str = "discussion:created";
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_UPDATED: &str = "discussion:updated";
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_DELETED: &str = "discussion:deleted";
 /// Versioned activity of an explicitly addressed discussion invocation.
 pub const DISCUSSION_ACTIVITY: &str = "discussion:activity";
 /// A newly persisted discussion message.
@@ -664,6 +670,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
     DISCUSSION_MESSAGE,
+    DISCUSSION_CREATED,
+    DISCUSSION_UPDATED,
+    DISCUSSION_DELETED,
     DISCUSSION_ACTIVITY,
     DISCUSSION_REACTION,
     NOTE_CREATED,
@@ -840,6 +849,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "browserClientId",
             "defaultModel",
             "isRemote",
+            "label",
             "lastActivity",
             "mcpServerToggled",
             "members",
@@ -949,8 +959,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (DESKTOP_PERMISSION_RESOLVED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
     (DESKTOP_SESSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
     (DISCUSSION_ACTIVITY, "Discussion: versioned activity for one explicitly addressed invocation."),
+    (DISCUSSION_CREATED, "Workspace-wide discussion created."),
+    (DISCUSSION_DELETED, "Workspace-wide discussion deleted."),
     (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
     (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
+    (DISCUSSION_UPDATED, "Workspace-wide discussion updated."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),

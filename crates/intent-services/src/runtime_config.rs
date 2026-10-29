@@ -6,11 +6,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 use intent_core::Error;
 
 /// A run shorter than this is treated as a config error — do not auto-restart.
@@ -31,7 +31,7 @@ pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
 /// Test-only fault injector for hook-run persistence steps: called with the
 /// step name before each attempt; `Some(err)` fails that attempt in place of
 /// the real store call (see `Services::with_hook_store_fault`).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub type HookStoreFault = Arc<Mutex<Box<dyn FnMut(&str) -> Option<Error> + Send>>>;
 
 /// Test seam for a race window: lets a test hold a task inside a window

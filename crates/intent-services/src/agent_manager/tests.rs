@@ -3686,7 +3686,7 @@ async fn winning_try_begin_revives_a_retired_workspace() {
     let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
     let text = last["text"].as_str().expect("text block");
     assert!(
-        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        text.starts_with("[SYSTEM NOTICE] This workspace's folder was purged"),
         "{text}"
     );
     assert!(text.contains("are gone"), "{text}");
@@ -3709,7 +3709,7 @@ async fn winning_try_begin_revives_a_retired_workspace() {
     assert!(
         !serde_json::to_string(&next)
             .unwrap()
-            .contains("was retired"),
+            .contains("folder was purged"),
         "the notice must not replay on later turns"
     );
     mgr.end_turn(&id).await;
@@ -3722,6 +3722,229 @@ async fn winning_try_begin_revives_a_retired_workspace() {
             .len(),
         1,
         "no second notice row"
+    );
+}
+
+/// A retired workspace with two agents, `a` and `b`, both seeded. Returns
+/// the checkout path the revive provisions.
+async fn retired_workspace_with_two_agents(
+    mgr: &AgentManager,
+    root: &std::path::Path,
+    repo: &std::path::Path,
+    ws: &WorkspaceId,
+    a: &AgentId,
+    b: &AgentId,
+) -> std::path::PathBuf {
+    seed_agent(mgr, ws, a).await;
+    let mut other = mgr.services.store.get_agent_session(a).await.unwrap();
+    other.id = b.clone();
+    other.name = "Reviewer".to_string();
+    mgr.services
+        .store
+        .insert_agent_session(&other)
+        .await
+        .expect("second session");
+    init_revive_repo(repo);
+    let wt = root.join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(ws).await.unwrap();
+    row.repository_path = Some(repo.to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(ws, &now_iso())
+        .await
+        .expect("retire row"));
+    wt
+}
+
+const PURGE_NOTICE_PREFIX: &str = "[SYSTEM NOTICE] This workspace's folder was purged";
+
+/// How many times the folder-purged notice appears in `id`'s next prompt.
+async fn purge_notices_in_next_prompt(mgr: &AgentManager, id: &AgentId, ws: &WorkspaceId) -> usize {
+    assert!(mgr.try_begin(id, ws).await, "claim wins");
+    let prompt = mgr
+        .build_turn_prompt(id, ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    mgr.end_turn(id).await;
+    serde_json::to_string(&prompt)
+        .unwrap()
+        .matches(PURGE_NOTICE_PREFIX)
+        .count()
+}
+
+fn has_pending_purge_notice(session: &AgentSession) -> bool {
+    session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY))
+        .is_some()
+}
+
+/// A revive triggered by agent `a`'s turn tells `a` once, in that turn, and
+/// leaves the folder-purged notice pending for `b` — never for `a`, so `a`
+/// is never told twice. `b`'s next turn carries it exactly once; the turn
+/// after carries nothing.
+#[tokio::test]
+async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents() {
+    let root = test_tempdir("intentd-purge-notice-root-");
+    let repo = test_tempdir("intentd-purge-notice-repo-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-purge-notice");
+    let (a, b) = (AgentId::from("a-trigger"), AgentId::from("a-other"));
+    let wt = retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
+
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &a, &ws).await,
+        1,
+        "trigger told once"
+    );
+    assert!(wt.join("README.md").is_file(), "revived");
+    assert!(!has_pending_purge_notice(
+        &mgr.services.store.get_agent_session(&a).await.unwrap()
+    ));
+    assert!(has_pending_purge_notice(
+        &mgr.services.store.get_agent_session(&b).await.unwrap()
+    ));
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &a, &ws).await,
+        0,
+        "a is not told twice"
+    );
+
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        1,
+        "b told on its next turn"
+    );
+    assert!(!has_pending_purge_notice(
+        &mgr.services.store.get_agent_session(&b).await.unwrap()
+    ));
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        0,
+        "one-shot"
+    );
+}
+
+/// A manual unarchive of a purged workspace starts no turn, writes no
+/// transcript row, and leaves the notice pending (durably, on the session
+/// row) for every agent; each agent's next turn carries it exactly once and
+/// names the old and the new branch.
+#[intent_test_macros::daemon_test]
+async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_every_agent() {
+    let root = test_tempdir("intentd-purge-manual-root-");
+    let repo = test_tempdir("intentd-purge-manual-repo-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-purge-manual");
+    let (a, b) = (AgentId::from("a-first"), AgentId::from("a-second"));
+    let wt = retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
+
+    let revived = intent_core::WorkspaceApi::unarchive_workspace(&mgr.services, ws.clone())
+        .await
+        .expect("manual unarchive revives");
+    assert_eq!(revived.status, WorkspaceStatus::Active);
+    assert!(wt.join("README.md").is_file());
+    assert!(!mgr.busy.lock().unwrap().contains(&a), "no turn started");
+    assert!(!mgr.busy.lock().unwrap().contains(&b), "no turn started");
+
+    for id in [&a, &b] {
+        let session = mgr.services.store.get_agent_session(id).await.unwrap();
+        assert!(
+            has_pending_purge_notice(&session),
+            "{id} has a pending notice"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no transcript row for {id}"
+        );
+    }
+
+    assert!(mgr.try_begin(&a, &ws).await);
+    let prompt = mgr
+        .build_turn_prompt(&a, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    mgr.end_turn(&a).await;
+    let text = serde_json::to_string(&prompt).unwrap();
+    assert_eq!(text.matches(PURGE_NOTICE_PREFIX).count(), 1, "{text}");
+    assert!(
+        text.contains("feat-old"),
+        "names the kept old branch: {text}"
+    );
+    assert!(
+        text.contains(&revived.branch),
+        "names the new branch: {text}"
+    );
+    assert!(!text.contains("retired"), "no retire wording: {text}");
+
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &a, &ws).await,
+        0,
+        "one-shot for a"
+    );
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        1,
+        "b told once"
+    );
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        0,
+        "one-shot for b"
+    );
+}
+
+/// Review regression (intentd#2756): a pending folder-purged notice survives
+/// an ORDINARY unarchive. After a manual revive, the workspace is archived
+/// again before agent `b` ever ran; `b`'s next message auto-unarchives it and
+/// that turn carries both the auto-unarchive notice and the purge warning.
+#[intent_test_macros::daemon_test]
+async fn pending_purge_notice_survives_a_later_ordinary_unarchive() {
+    let root = test_tempdir("intentd-purge-rearchive-root-");
+    let repo = test_tempdir("intentd-purge-rearchive-repo-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-purge-rearchive");
+    let (a, b) = (AgentId::from("a-reviver"), AgentId::from("a-idle"));
+    retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
+
+    intent_core::WorkspaceApi::unarchive_workspace(&mgr.services, ws.clone())
+        .await
+        .expect("manual revive");
+    intent_core::WorkspaceApi::archive_workspace(&mgr.services, ws.clone(), None)
+        .await
+        .expect("archive again");
+
+    assert!(mgr.try_begin(&b, &ws).await, "b's message auto-unarchives");
+    let prompt = mgr
+        .build_turn_prompt(&b, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    mgr.end_turn(&b).await;
+    let text = serde_json::to_string(&prompt).unwrap();
+    assert!(text.contains("automatically unarchived"), "{text}");
+    assert_eq!(text.matches(PURGE_NOTICE_PREFIX).count(), 1, "{text}");
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        0,
+        "one-shot"
     );
 }
 
@@ -3814,7 +4037,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
     let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
     let text = last["text"].as_str().expect("text block");
     assert!(
-        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        text.starts_with("[SYSTEM NOTICE] This workspace's folder was purged"),
         "the triggering turn carries the revive notice: {text}"
     );
     mgr.end_turn(&id).await;
@@ -3829,7 +4052,7 @@ async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
         !next["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("[SYSTEM NOTICE] This workspace was retired"),
+            .contains("[SYSTEM NOTICE] This workspace's folder was purged"),
         "the notice is one-shot"
     );
     mgr.end_turn(&id).await;

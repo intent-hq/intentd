@@ -109,7 +109,10 @@ pub(super) async fn dispatch(
             let mut failure: DesktopError = error
                 .data
                 .and_then(|data| serde_json::from_value(data).ok())
-                .unwrap_or_else(|| DesktopError::new("desktop-outcome-unknown", error.message));
+                .map_or_else(
+                    || DesktopError::new("desktop-outcome-unknown", error.message),
+                    DesktopError::sanitized,
+                );
             // A lost reply cannot establish whether submitted input ran. Keep
             // explicit native classifications, but never default an uncertain
             // execute outcome to the agent boundary's pre-execution status.
@@ -177,6 +180,39 @@ mod tests {
                 .code,
             "forbidden"
         );
+    }
+
+    /// intent-hq/intent#7902: `Default` resolves the first-connected client
+    /// through its newest connection, so a stale older socket of the same
+    /// desktop is not the desktop-control target either.
+    #[test]
+    fn default_resolves_the_newest_connection_of_the_first_client() {
+        let registry = PrimaryReverseRegistry::new();
+        let principal = PrincipalId::from("owner");
+        let identity = |id: &str| ReverseClientIdentity {
+            client_id: ClientId::from(id),
+            name: None,
+            capabilities: json!({"browserExec":true,"desktopControl":1}),
+            host: ClientHostInfo::default(),
+        };
+        let mut guards = Vec::new();
+        for id in ["x", "y", "x"] {
+            let guard = registry.register(
+                ReverseChannel::new(mpsc::channel(4).0),
+                ReverseTransport::Uds,
+            );
+            guard.bind_device(identity(id), principal.clone());
+            guard.bind(identity(id));
+            guards.push(guard);
+        }
+        let default = registry
+            .desktop_resolve(&ReverseTarget::Default, &principal)
+            .unwrap();
+        let newest = registry
+            .desktop_resolve(&ReverseTarget::Client(ClientId::from("x")), &principal)
+            .unwrap();
+        assert_eq!(default.client_id.as_str(), "x");
+        assert_eq!(default.connection_epoch, newest.connection_epoch);
     }
 
     #[tokio::test]

@@ -35,12 +35,12 @@ crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  s
 # Script monitors: registration, completion wakes and the start-time monitor.
 crates/intent-core/src/script_monitor.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
 crates/intent-core/src/script_monitor.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
-crates/intent-services/src/script_monitor.rs         intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
-crates/intent-services/src/script_monitor.rs         intentd::suite_wss_s_z    e2e_wss_script_monitors
-crates/intent-services/src/script_ops.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
-crates/intent-services/src/script_ops.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
-crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
-crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_monitor.rs      intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_monitor.rs      intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_ops.rs          intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_ops.rs          intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_ops/monitors.rs intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_ops/monitors.rs intentd::suite_wss_s_z    e2e_wss_script_monitors
 
 # Adapter pins (claude-agent-acp / codex-acp): the guards that must move with
 # a pin bump live in intent-services' unit tests and an intentd end-to-end

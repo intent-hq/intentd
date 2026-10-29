@@ -176,14 +176,14 @@ impl Host {
             intent_sourcecontrol::GitHubSourceControl::new(repository_token, Some(&forge.url))
                 .unwrap();
         let bus = EventBus::new(store.clone());
-        let services = Arc::new(
+        let services = Arc::new(intent_app::compose(
             Services::new(store.clone())
                 .with_workspaces_root(dir.path().join("workspaces"))
                 .with_settings_registry(registry)
                 .with_secret_store(secrets)
                 .with_event_bus(bus.clone())
                 .with_source_control(Arc::new(github)),
-        );
+        ));
         let worker = services.spawn_execution_context_loop();
         let tls = intent_transport::ensure_tls_certificate(dir.path()).unwrap();
         let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));

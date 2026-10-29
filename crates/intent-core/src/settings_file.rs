@@ -173,8 +173,12 @@ pub struct SpecialistsSettings {
     pub dir: Option<String>,
 }
 
+/// Default `workspace.autoArchiveIdleAfterDays`: idle workspaces are
+/// archived after a week unless the user turns the sweep off with `0`.
+pub const DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS: u32 = 7;
+
 /// `[workspace]` — workspace/git-adjacent knobs (`workspace.*`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct WorkspaceSettings {
     /// `workspace.branchPrefix` — prefix for agent-created branches.
@@ -191,10 +195,35 @@ pub struct WorkspaceSettings {
     /// `workspace.create` falls back to a linked worktree (local repository)
     /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
-    /// `workspace.autoRetireArchivedAfterDays` — retire workspaces archived
-    /// longer than this many days (PROTOCOL §5.12). Absent (`None`, the
-    /// default) = off; a hand-edited `0` also reads as off.
+    /// `workspace.autoArchiveIdleAfterDays` — archive workspaces idle for
+    /// this many days (PROTOCOL §5.12). Defaults to
+    /// [`DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS`]; `0` turns the sweep off.
+    pub auto_archive_idle_after_days: u32,
+    /// `workspace.purgeArchivedAfterDays` — purge (retire) the folders of
+    /// workspaces archived longer than this many days (PROTOCOL §5.12).
+    /// Absent (`None`, the default) = off; a hand-edited `0` also reads as
+    /// off.
+    pub purge_archived_after_days: Option<u32>,
+    /// `workspace.autoRetireArchivedAfterDays` — the deprecated predecessor
+    /// of `purgeArchivedAfterDays`. Still parsed so an upgraded config.toml
+    /// loads; the boot migration rewrites it to the new key, and the purge
+    /// sweep falls back to it while the new key is unset.
     pub auto_retire_archived_after_days: Option<u32>,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            branch_prefix: None,
+            worktrees_location: None,
+            ssh_key_path: None,
+            default_shell: None,
+            cow_isolation: false,
+            auto_archive_idle_after_days: DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS,
+            purge_archived_after_days: None,
+            auto_retire_archived_after_days: None,
+        }
+    }
 }
 
 /// `[git]` — git behavior (`git.*`).
@@ -1798,9 +1827,12 @@ providerSettings = {}
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
-# Auto-retire -- retire workspaces archived longer than this many days
-# (deletes their checkout folders; absent = off).
-# autoRetireArchivedAfterDays = 7
+# Auto-archive -- archive workspaces idle for this many days (0 = off).
+autoArchiveIdleAfterDays = 7
+# Purge archived workspaces -- delete the folders of workspaces archived
+# longer than this many days; conversations, notes and the git branch are
+# kept, and folders with uncommitted changes are skipped (absent = off).
+# purgeArchivedAfterDays = 7
 
 [git]
 # Auto-commit -- allow agents to commit without explicit user request.
@@ -2792,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_retire_archived_after_days_parses_and_defaults_to_off() {
+    fn auto_retire_archived_after_days_still_parses_for_migration() {
         assert_eq!(
             SettingsFile::default()
                 .workspace
@@ -2802,7 +2834,34 @@ mod tests {
         let file =
             SettingsFile::parse_str("[workspace]\nautoRetireArchivedAfterDays = 7\n").unwrap();
         assert_eq!(file.workspace.auto_retire_archived_after_days, Some(7));
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# autoRetireArchivedAfterDays = 7"));
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoRetireArchivedAfterDays"));
+    }
+
+    #[test]
+    fn purge_archived_after_days_parses_and_defaults_to_off() {
+        assert_eq!(
+            SettingsFile::default().workspace.purge_archived_after_days,
+            None
+        );
+        let file = SettingsFile::parse_str("[workspace]\npurgeArchivedAfterDays = 3\n").unwrap();
+        assert_eq!(file.workspace.purge_archived_after_days, Some(3));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# purgeArchivedAfterDays = 7"));
+    }
+
+    #[test]
+    fn auto_archive_idle_after_days_defaults_to_seven_and_accepts_zero() {
+        assert_eq!(
+            SettingsFile::default()
+                .workspace
+                .auto_archive_idle_after_days,
+            DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS
+        );
+        assert_eq!(DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS, 7);
+        let off = SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = 0\n").unwrap();
+        assert_eq!(off.workspace.auto_archive_idle_after_days, 0);
+        assert!(SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = -1\n").is_err());
+        let template = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert_eq!(template.workspace.auto_archive_idle_after_days, 7);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use intent_core::{AgentId, AgentReverseDispatch};
 use intent_sourcecontrol::SourceControl;
 
 use crate::delivery_tasks::DeliveryTasks;
-use crate::feature_ports::{AgentWakePort, TransferPort};
+use crate::feature_ports::{AgentWakePort, RuntimePort, TransferPort};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::model_catalog::ModelCatalogCache;
 use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
@@ -43,6 +43,8 @@ pub use crate::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use crate::test_support;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use crate::Subscription;
 
 /// Agent turn and recovery helpers.
 pub mod agent_ops {
@@ -58,7 +60,7 @@ pub mod agent_manager {
     pub use crate::agent_manager::{AgentManager, TeardownFence};
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub use crate::agent_manager::imported_spawn_selection_for_test;
+    pub use crate::agent_manager::{imported_spawn_selection_for_test, BusEventSink, TurnOptions};
 
     /// Test fixtures the agent manager tests share.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -70,6 +72,18 @@ pub mod agent_manager {
 /// Provider resolution for agent sessions.
 pub mod agent_session {
     pub use crate::agent_session::{derived_default_provider, resolve_provider_id};
+}
+
+/// The discovered-binary search path.
+pub mod auggie_discovery {
+    pub use crate::auggie_discovery::enhanced_path_dirs;
+}
+
+/// Browser-exec request and response shaping.
+pub mod browser_ops {
+    pub use crate::browser_ops::{
+        build_forward_params, shape_agent_result, shape_result, successful_claims, BrowserExecArgs,
+    };
 }
 
 /// Caller gating.
@@ -99,11 +113,22 @@ pub mod desktop {
 /// Script output configuration and test parks that core owns.
 pub mod runtime_config {
     pub use crate::runtime_config::{ScriptOutputConfig, ScriptParks, SupervisePark};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::runtime_config::HookStoreFault;
+}
+
+/// Per-repository `.intent` configuration.
+pub mod repo_config {
+    pub use crate::repo_config::read_repo_config;
 }
 
 /// The async secret store.
 pub mod settings {
     pub use crate::settings::AsyncSecretStore;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::settings::{InMemorySecretStore, SecretStore};
 }
 
 /// Caller classification for event-producing operations.
@@ -114,6 +139,17 @@ pub mod event_ops {
 /// The task-local execution scope and its credential policy.
 pub mod execution_call {
     pub use crate::execution_call::{expose_git_credential, github_execution_host};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::execution_call::forge_error_for_test;
+}
+
+/// The event bus.
+pub mod events {
+    pub use crate::events::{EventBus, SubscriptionFilter};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::events::Subscription;
 }
 
 /// Workspace file locations.
@@ -124,6 +160,16 @@ pub mod file_ops {
 /// Workspace git locations.
 pub mod git_ops {
     pub use crate::git_ops::worktree_path;
+}
+
+/// The hook wake and notice framing of the latest harness.
+pub mod harness {
+    pub use crate::harness::{latest_hook_framing, HookFraming};
+
+    /// Harness v1 constants.
+    pub mod v1 {
+        pub use crate::harness::v1::HOOK_WAKE_LOGS_CAP;
+    }
 }
 
 /// The cached model catalog.
@@ -336,7 +382,7 @@ impl Services {
     }
 
     /// The hook-evaluation test park (unset in production).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_eval_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
@@ -344,7 +390,7 @@ impl Services {
     }
 
     /// The hook-wake test park (unset in production).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_wake_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
@@ -364,6 +410,13 @@ impl Services {
     #[must_use]
     pub fn models_catalog_for_test(&self) -> &Arc<ModelCatalogCache> {
         &self.models_catalog
+    }
+
+    /// The registered runtime feature.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_runtime(&self) -> &dyn RuntimePort {
+        self.ports.runtime()
     }
 
     /// The registered agent-wake feature.
@@ -417,7 +470,7 @@ impl Services {
     }
 
     /// The hook-run persistence fault injector (test wiring only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_store_fault(&self) -> Option<&crate::runtime_config::HookStoreFault> {
@@ -425,14 +478,14 @@ impl Services {
     }
 
     /// Test seam: park hook wakes inside their classify window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn set_hook_wake_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
         self.hook_wake_park = Some(park);
     }
 
     /// Test seam: park hook evaluations inside their window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn set_hook_eval_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
         self.hook_eval_park = Some(park);

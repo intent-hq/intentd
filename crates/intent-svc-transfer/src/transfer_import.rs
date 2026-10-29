@@ -603,22 +603,24 @@ impl TransferImportExt for Services {
         // Boot hydration may have cached the reclaimed orphan definitions.
         // Refresh only imported IDs, after commit so a failed import leaves
         // both the durable rows and their live definitions untouched.
-        // Resolve imported monitor deadlines/results before compact run recovery
-        // manufactures an interruption. No source process is resumed here.
-        if let Err(error) = self.script_manager().recover_monitors().await {
-            tracing::warn!(%error, "post-import script monitor recovery failed");
-        }
-        self.start_script_monitor_maintenance();
-        if let Some((_, scripts)) = outcome.rows.iter().find(|(table, _)| table == "script") {
-            let manager = self.script_manager();
-            for script in scripts {
-                if let Some(id) = script.get("id").and_then(serde_json::Value::as_str) {
-                    if let Err(error) = manager.refresh_imported(&workspace_id, id).await {
-                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
-                    }
-                }
-            }
-        }
+        // The runtime feature resolves imported monitor deadlines/results
+        // before compact run recovery manufactures an interruption. No source
+        // process is resumed here.
+        let imported_script_ids: Vec<String> = outcome
+            .rows
+            .iter()
+            .find(|(table, _)| table == "script")
+            .map(|(_, scripts)| {
+                scripts
+                    .iter()
+                    .filter_map(|script| script.get("id").and_then(serde_json::Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.feature_runtime()
+            .recover_imported_scripts(self, &workspace_id, &imported_script_ids)
+            .await;
         self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
             .await;
 
@@ -848,10 +850,14 @@ impl TransferImportExt for Services {
                 tracing::warn!(error = %e, "post-import event subscription rehydration failed");
                 0
             });
-        let hooks = self.rehydrate_hooks().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "post-import hook rehydration failed");
-            0
-        });
+        let hooks = self
+            .feature_runtime()
+            .rehydrate_hooks(self)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import hook rehydration failed");
+                0
+            });
         let pr_monitors = self.rehydrate_pr_monitors().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "post-import PR monitor rehydration failed");
             0
@@ -1380,7 +1386,8 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
 /// - **`workspace_discussion_message`**: keep the immutable author snapshot;
 ///   clear the private retry principal so a destination identity collision
-///   cannot consume an imported message as a new send's retry.
+///   cannot consume an imported message as a new send's retry. Clear selected
+///   principal notification identities while retaining historical body text.
 /// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
@@ -1410,6 +1417,13 @@ fn transform_rows(
                         .is_some_and(|payload| has_discussion_reference(&payload))
                 });
             }
+            "workspace_discussion_conversation" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    map.insert("first_principal_id".into(), serde_json::Value::Null);
+                    map.insert("first_client_message_id".into(), serde_json::Value::Null);
+                }
+            }
             "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;
@@ -1419,6 +1433,7 @@ fn transform_rows(
                     }
                     if table == "workspace_discussion_message" {
                         map.insert("agent_activity_json".into(), serde_json::json!("[]"));
+                        map.insert("principal_mentions_json".into(), serde_json::json!("[]"));
                     }
                 }
             }
@@ -1833,6 +1848,21 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn discussion_import_clears_principal_mentions_before_store_insertion() {
+        let mentions =
+            serde_json::json!([{"principalId":"collision","name":"Bob","start":0,"end":4}]);
+        let transformed = transform_rows(vec![("workspace_discussion_message".into(), vec![serde_json::json!({"body":"@Bob","principal_mentions_json":mentions.to_string()})])], &ws(), &root(), "now").unwrap();
+        let message = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "workspace_discussion_message")
+            .unwrap()
+            .1[0];
+        assert_eq!(message["principal_mentions_json"], "[]");
+        assert_eq!(message["body"], "@Bob");
     }
 
     #[tokio::test]
@@ -3359,13 +3389,6 @@ mod tests {
             .unwrap();
             sqlx::query("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('script-keeper', 'keeper', 'Keep', 'echo keep', 'command', 'user', 't0'), ('script-unlisted', 'ws-reimport', 'Unlisted', 'echo unlisted', 'command', 'user', 't0')")
                 .execute(svc.store().write_pool()).await.unwrap();
-            assert_eq!(svc.hydrate_scripts().await.unwrap(), 3);
-            let manager = svc.script_manager();
-            let cached_before = manager.list_for_test(&ws).await.unwrap();
-            let keeper_before = manager
-                .list_for_test(&WorkspaceId::from("keeper"))
-                .await
-                .unwrap();
             sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'att-live', 'old', 't0')")
                 .bind(&ws.0).execute(svc.store().write_pool()).await.unwrap();
             let before = svc.store().transfer_export_rows(&ws).await.unwrap();
@@ -3398,46 +3421,21 @@ mod tests {
                 assert!(err.to_string().contains("attachments.file_name"), "{err}");
                 assert!(!file.exists(), "failed insert unwinds materialized files");
                 assert_eq!(svc.store().transfer_export_rows(&ws).await.unwrap(), before);
-                assert_eq!(manager.list_for_test(&ws).await.unwrap(), cached_before);
                 svc.workspace_import_abort_op(id).await.unwrap();
             } else {
                 let result = result.unwrap();
                 assert_eq!(result["workspace"]["id"], ws.0);
                 assert_eq!(tokio::fs::read(file).await.unwrap(), b"attachment-bytes");
-                let scripts = manager.list_for_test(&ws).await.unwrap();
-                let imported = scripts["scripts"]
-                    .as_array()
+                // The runtime's script cache refresh after an import is
+                // pinned by intent-app's transfer_runtime_e2e. Here, the rows.
+                let script = svc
+                    .store()
+                    .get_script_in_workspace(&ws, "script-reimport")
+                    .await
                     .unwrap()
-                    .iter()
-                    .find(|script| script["id"] == "script-reimport")
-                    .unwrap();
-                assert_eq!(imported["command"], "echo imported > imported-script.txt");
-                assert_eq!(imported["cwd"], ".intent/attachments");
-                let unlisted = scripts["scripts"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|script| script["id"] == "script-unlisted")
-                    .unwrap();
-                assert_eq!(unlisted["command"], "echo unlisted");
-                #[cfg(unix)]
-                {
-                    manager
-                        .run_for_test(&ws, "script-reimport", None, Some(5))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        tokio::fs::read_to_string(
-                            root.0
-                                .join(&ws.0)
-                                .join("repo/.intent/attachments/imported-script.txt")
-                        )
-                        .await
-                        .unwrap()
-                        .trim(),
-                        "imported"
-                    );
-                }
+                    .expect("imported script row");
+                assert_eq!(script.command, "echo imported > imported-script.txt");
+                assert_eq!(script.cwd.as_deref(), Some(".intent/attachments"));
                 let resolution: String = sqlx::query_scalar(
                     "SELECT resolution FROM interrupted_agent WHERE agent_id='agent-live'",
                 )
@@ -3449,13 +3447,6 @@ mod tests {
                     "incoming interruption replaces stale resolved history"
                 );
             }
-            assert_eq!(
-                manager
-                    .list_for_test(&WorkspaceId::from("keeper"))
-                    .await
-                    .unwrap(),
-                keeper_before
-            );
             let retry_keys: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM attachment_idempotency_keys WHERE workspace_id=?",
             )
@@ -3575,7 +3566,12 @@ mod tests {
             committed["interruptedAgents"],
             serde_json::json!(["agent-live"])
         );
-        assert!(committed["rehydrated"]["hooks"].as_u64().unwrap() >= 1);
+        // Re-arming the imported hook is the runtime's: intent-app's
+        // transfer_runtime_e2e pins the rehydrated count. Here, the row landed.
+        svc.store()
+            .get_hook(&intent_core::HookId::from("h-1"))
+            .await
+            .expect("imported hook row");
         assert!(committed["importedRows"].as_u64().unwrap() >= 4);
 
         // Draft dropped; asset placed.

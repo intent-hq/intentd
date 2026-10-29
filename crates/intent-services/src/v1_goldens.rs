@@ -14,17 +14,16 @@
 //! `agent_ops::tests::delegate_appends_task_note_preamble_to_first_message`.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
     now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceId,
 };
-use intent_store::Store;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+pub(crate) use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
 use crate::Services;
 
 fn sha256_hex(s: &str) -> String {
@@ -47,44 +46,6 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         updated_at: ts,
         ..Default::default()
     }
-}
-
-/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
-/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
-pub(crate) struct TempDb {
-    path: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-impl TempDb {
-    fn new() -> Self {
-        let dir = crate::test_support::test_tempdir("intentd-goldens-");
-        let path = dir.path().join("goldens.db");
-        Self { path, _dir: dir }
-    }
-}
-
-pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-    let ws = WorkspaceId::new();
-    store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    // monorepo#3044: delegation requires a resolvable provider (no positional
-    // fallback) — seed a configured default with a deterministic
-    // `providers.paths` override so availability checks pass hermetically.
-    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
-    let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-    registry
-        .apply(&[
-            ("model.defaultProvider".into(), json!("auggie")),
-            ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
-            // Goldens assert the legacy immediate report wake — disable the
-            // default 30s report debounce.
-            ("agents.reportToParentDebounceSeconds".into(), json!(0)),
-        ])
-        .expect("seed default provider");
-    let services = Services::new(store).with_settings_registry(registry);
-    (tmp, services, ws)
 }
 
 /// A child-completion event as `handle_completion_event` sees it.
@@ -614,103 +575,6 @@ fn golden_unblocked_section() {
 // Hook wake framing and notices (`hook_manager.rs`)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn golden_hook_wake_logs_section() {
-    assert_eq!(crate::hook_manager::with_wake_logs("msg", None), "msg");
-    assert_eq!(crate::hook_manager::with_wake_logs("msg", Some("")), "msg");
-    assert_eq!(
-        crate::hook_manager::with_wake_logs("msg", Some("line1\nline2")),
-        "msg\n\n[hook logs]\nline1\nline2"
-    );
-    // Over-cap logs are head-truncated with the marker line: exactly the
-    // LAST 2048 chars survive, nothing more. Positionally distinct bytes
-    // pin which end is retained and the exact cap.
-    let logs: String = (0..3000)
-        .map(|i| char::from(b'a' + u8::try_from(i % 26).expect("< 26")))
-        .collect();
-    assert_eq!(
-        crate::hook_manager::with_wake_logs("msg", Some(&logs)),
-        format!(
-            "msg\n\n[hook logs]\n[earlier log lines truncated]\n{}",
-            &logs[3000 - 2048..]
-        )
-    );
-}
-
-/// End-to-end hook wake bytes: schedule a one-shot hook whose validation run
-/// dispatches, and pin the exact framed message (framing + dispatch body +
-/// retired-state note) delivered to the owner.
-#[tokio::test]
-async fn golden_hook_dispatch_wake_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-hooks");
-    seed_agent(&svc, &ws, &owner).await;
-    let out = svc
-        .hook_schedule_op(
-            &ws,
-            &owner,
-            &json!({
-                "name": "ci-watch",
-                "code": "return { dispatch: true, message: 'CI is green' };",
-                "delayMs": 10_000,
-            }),
-        )
-        .await
-        .expect("schedule");
-    assert_eq!(out["dispatched"], json!(true));
-    let hook_id = out["hook"]["hookId"].as_str().expect("hookId").to_string();
-    let text = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        text,
-        vec![format!(
-            "[Background hook \"ci-watch\"] CI is green\n\
-             \n\
-             [This hook is now retired and will not run again — recover its script via \
-             ws.hook.get(\"{hook_id}\") and reschedule via ws.hook.schedule if still needed.]"
-        )]
-    );
-}
-
-/// Perpetual dispatch wake: the active-state note names the TTL deadline.
-#[tokio::test]
-async fn golden_hook_perpetual_dispatch_wake_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-hooks");
-    seed_agent(&svc, &ws, &owner).await;
-    let out = svc
-        .hook_schedule_op(
-            &ws,
-            &owner,
-            &json!({
-                "name": "pr-watch",
-                "code": "return { dispatch: true, message: 'PR moved' };",
-                "delayMs": 10_000,
-                "perpetual": true,
-            }),
-        )
-        .await
-        .expect("schedule");
-    assert_eq!(out["dispatched"], json!(true));
-    let expires_at = out["hook"]["expiresAt"]
-        .as_str()
-        .expect("expiresAt")
-        .to_string();
-    let text = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        text,
-        vec![format!(
-            "[Background hook \"pr-watch\"] PR moved\n\
-             \n\
-             [This hook remains active until {expires_at} — cancel via ws.hook.cancel \
-             when no longer needed.]"
-        )]
-    );
-}
-
 // ---------------------------------------------------------------------------
 // PR monitor wakes (`pr_monitor.rs`)
 // ---------------------------------------------------------------------------
@@ -775,29 +639,9 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         status_checks: Some(Vec::new()),
         required_check_names: None,
         observed_at: None,
+        pr_updated_at: None,
         checks_not_started_delivered: None,
         latest_reviews_carried: false,
-    }
-}
-
-pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
-    intent_core::PrMonitor {
-        monitor_id: intent_core::PrMonitorId::from("prmon-1"),
-        workspace_id: WorkspaceId::from("ws-1"),
-        agent_id: AgentId::from("agent-pr"),
-        repo_owner: "o".to_string(),
-        repo_name: "r".to_string(),
-        pr_number: 42,
-        state: intent_core::PrMonitorState::Active,
-        last_snapshot: None,
-        baseline_snapshot: None,
-        pending_changes: vec![],
-        pending_since: None,
-        last_change_at: None,
-        last_polled_at: None,
-        last_error: None,
-        created_at: "2026-01-02T03:04:05Z".to_string(),
-        updated_at: "2026-01-02T03:04:05Z".to_string(),
     }
 }
 
@@ -939,121 +783,6 @@ fn golden_pr_monitor_checklist_branch_lines() {
     );
 }
 
-/// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
-/// to the owning agent. (The archive sweep's consolidated notice is a v2.7
-/// surface, pinned in `v2_7_goldens.rs`.)
-#[tokio::test]
-async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-cancel");
-    seed_agent(&svc, &ws, &owner).await;
-    // Hook FE-cancel (caller = None).
-    let out = svc
-        .hook_schedule_op(
-            &ws,
-            &owner,
-            &json!({
-                "name": "watcher",
-                "code": "return { dispatch: false };",
-                "delayMs": 10_000,
-            }),
-        )
-        .await
-        .expect("schedule");
-    let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
-    svc.hook_cancel_op(&ws, &hook_id, None)
-        .await
-        .expect("cancel");
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec!["[Background hook \"watcher\"] This hook was cancelled from the app.".to_string()]
-    );
-    // PR monitor FE-cancel notice.
-    let mut monitor = pr_monitor_row();
-    monitor.workspace_id = ws.clone();
-    monitor.agent_id = owner.clone();
-    assert!(svc
-        .store()
-        .insert_pr_monitor(&monitor)
-        .await
-        .expect("insert"));
-    svc.pr_monitor_cancel(&ws, &monitor.monitor_id, None)
-        .await
-        .expect("cancel monitor");
-    let texts = wake_texts_when(&svc, &owner, 2).await;
-    assert_eq!(
-        texts[1],
-        "[PR monitor o/r#42] This monitor was cancelled from the app — it will not \
-         report again."
-    );
-}
-
-/// Hook expiry notices: exact bytes for the one-shot ("without a dispatch")
-/// and perpetual ("N runs, N dispatches") tallies, including singular and
-/// plural forms.
-#[tokio::test]
-async fn golden_hook_expiry_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-exp");
-    seed_agent(&svc, &ws, &owner).await;
-    let past = "2026-01-02T03:04:05Z".to_string();
-    let hook =
-        |id: &str, name: &str, perpetual: bool, runs: i64, dispatches: i64| intent_core::Hook {
-            hook_id: intent_core::HookId::from(id),
-            workspace_id: ws.clone(),
-            agent_id: owner.clone(),
-            name: name.to_string(),
-            code: "return { dispatch: false };".to_string(),
-            delay_ms: 600_000,
-            cron: None,
-            run_at: None,
-            state: intent_core::HookState::Scheduled,
-            created_at: past.clone(),
-            last_run_at: None,
-            next_run_at: None,
-            run_count: runs,
-            last_error: None,
-            last_logs: None,
-            last_state: None,
-            expires_at: Some(past.clone()),
-            perpetual,
-            dispatch_count: dispatches,
-        };
-    // One-shot, plural runs; rehydration expires already-past hooks at boot.
-    svc.store()
-        .insert_hook(&hook("hook-exp-1", "one-shot", false, 2, 0))
-        .await
-        .expect("insert 1");
-    // Perpetual, singular tallies.
-    svc.store()
-        .insert_hook(&hook("hook-exp-2", "perpetual", true, 1, 1))
-        .await
-        .expect("insert 2");
-    svc.rehydrate_hooks().await.expect("rehydrate");
-    let mut texts = wake_texts_when(&svc, &owner, 2).await;
-    texts.sort();
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"one-shot\"] Your background hook \"one-shot\" expired after \
-             reaching its TTL (2 runs completed without a dispatch). Schedule a new hook via \
-             ws.hook.schedule if the condition is still worth watching — the original script \
-             is retrievable via ws.hook.get(\"hook-exp-1\")."
-                .to_string(),
-            "[Background hook \"perpetual\"] Your background hook \"perpetual\" expired after \
-             reaching its TTL (1 run, 1 dispatch). Schedule a new hook via ws.hook.schedule \
-             if the condition is still worth watching — the original script is retrievable \
-             via ws.hook.get(\"hook-exp-2\")."
-                .to_string(),
-        ]
-    );
-}
-
 /// One-shot `runAt` fired notice: exact bytes (fired wording, not the TTL
 /// expiry wording — the fire is the timer's purpose).
 #[test]
@@ -1064,107 +793,6 @@ fn golden_hook_run_at_fired_notice_bytes() {
         "Your one-shot timer hook \"reminder\" (scheduled for 2026-01-02T03:04:05Z) fired and \
          is now retired. Schedule a new hook via ws.hook.schedule if you need another timer — \
          the original script is retrievable via ws.hook.get(\"hook-fire-1\")."
-    );
-}
-
-/// Hook eviction notice: exact bytes for a throwing run (failed-run wording
-/// + terminal note).
-#[tokio::test]
-async fn golden_hook_eviction_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-evict");
-    seed_agent(&svc, &ws, &owner).await;
-    // Seed a scheduled row directly (a throwing script would fail the
-    // schedule-time validation run) and drive one run via runNow.
-    let hook = intent_core::Hook {
-        hook_id: intent_core::HookId::from("hook-evict-1"),
-        workspace_id: ws.clone(),
-        agent_id: owner.clone(),
-        name: "will-throw".to_string(),
-        code: "throw new Error('kaput');".to_string(),
-        delay_ms: 600_000,
-        cron: None,
-        run_at: None,
-        state: intent_core::HookState::Scheduled,
-        created_at: now_iso(),
-        last_run_at: None,
-        next_run_at: None,
-        run_count: 0,
-        last_error: None,
-        last_logs: None,
-        last_state: None,
-        expires_at: None,
-        perpetual: false,
-        dispatch_count: 0,
-    };
-    svc.store().insert_hook(&hook).await.expect("insert");
-    svc.rehydrate_hooks().await.expect("rehydrate");
-    svc.hook_run_now_op(&ws, &hook.hook_id)
-        .await
-        .expect("runNow");
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"will-throw\"] Your background hook \"will-throw\" was \
-             evicted after a failed run: Error: kaput\n\
-             \n\
-             [This hook will not run again. Recover its script via \
-             ws.hook.get(\"hook-evict-1\") and schedule a new hook via ws.hook.schedule \
-             if the condition is still worth watching.]"
-                .to_string()
-        ]
-    );
-}
-
-/// Hook eviction notice, internal-error variant: exact bytes when the
-/// scheduler evicts after a store error (`evict_hook_after_store_error`).
-#[tokio::test]
-async fn golden_hook_eviction_internal_error_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-evict-2");
-    seed_agent(&svc, &ws, &owner).await;
-    let mut hook = intent_core::Hook {
-        hook_id: intent_core::HookId::from("hook-evict-2"),
-        workspace_id: ws.clone(),
-        agent_id: owner.clone(),
-        name: "store-victim".to_string(),
-        code: "return { dispatch: false };".to_string(),
-        delay_ms: 600_000,
-        cron: None,
-        run_at: None,
-        state: intent_core::HookState::Scheduled,
-        created_at: now_iso(),
-        last_run_at: None,
-        next_run_at: None,
-        run_count: 0,
-        last_error: None,
-        last_logs: None,
-        last_state: None,
-        expires_at: None,
-        perpetual: false,
-        dispatch_count: 0,
-    };
-    svc.store().insert_hook(&hook).await.expect("insert");
-    let cause = intent_core::Error::Internal("db locked".to_string());
-    svc.evict_hook_after_store_error(&mut hook, &cause).await;
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"store-victim\"] Your background hook \"store-victim\" was \
-             evicted after an internal error: scheduler stopped after a store error: \
-             internal error: db locked\n\
-             \n\
-             [This hook will not run again. Recover its script via \
-             ws.hook.get(\"hook-evict-2\") and schedule a new hook via ws.hook.schedule \
-             if the condition is still worth watching.]"
-                .to_string()
-        ]
     );
 }
 
@@ -1193,94 +821,6 @@ fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
 // ---------------------------------------------------------------------------
 // Delegation preamble + notices (`agent_ops.rs`)
 // ---------------------------------------------------------------------------
-
-/// Seed a bare agent session row owned by `ws` (mirrors the hook tests).
-pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
-    let ts = now_iso();
-    let session = intent_core::AgentSession {
-        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-        harness_features: None,
-        id: id.clone(),
-        workspace_id: ws.clone(),
-        parent_agent_id: None,
-        backend_session_id: None,
-        acp_session_id: None,
-        name: "Builder".to_string(),
-        name_explicitly_set: false,
-        model: None,
-        reasoning_effort: None,
-        effort_levels: None,
-        provider: None,
-        system_prompt: None,
-        specialist: None,
-        status: intent_core::AgentStatus::Active,
-        is_active: false,
-        messages: vec![],
-        stats: None,
-        task_note_id: None,
-        skip_auto_commit: false,
-        completion_report: None,
-        completion_report_timestamp: None,
-        attention_request_kind: None,
-        attention_request_reason: None,
-        attention_request_timestamp: None,
-        delegation_depth: None,
-        initial_message: None,
-        context_references: None,
-        image_blocks: None,
-        file_blocks: None,
-        is_background: false,
-        metadata: None,
-        created_at: ts.clone(),
-        updated_at: ts,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
-        stop_reason: None,
-        stop_reason_timestamp: None,
-        session_corrupted: false,
-        pending_delete_at: None,
-        retired_at: None,
-        notifications_muted: false,
-    };
-    svc.store()
-        .insert_agent_session(&session)
-        .await
-        .expect("seed agent");
-}
-
-/// All persisted message texts for an agent (each message's text blocks
-/// joined), oldest-first — the wake-delivery capture used by the goldens.
-/// Wake persistence can lag the op return, so poll until at least `expected`
-/// messages are present (generous deadline, monorepo#1358 precedent); on
-/// timeout return whatever was seen and let the caller's assert report it.
-pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now()
-        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
-    loop {
-        let session = svc.store().get_agent_session(id).await.expect("session");
-        let texts: Vec<String> = session
-            .messages
-            .iter()
-            .map(|m| {
-                m.content
-                    .as_array()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
-        if texts.len() >= expected || std::time::Instant::now() >= deadline {
-            return texts;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
 
 /// Questions-dismissed notice: exact bytes for the zero-question fallback
 /// noun ("questions" — the count is 0 for an unknown message id).

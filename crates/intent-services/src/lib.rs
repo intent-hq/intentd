@@ -60,6 +60,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
+mod auto_archive;
 mod auto_retire;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
@@ -73,7 +74,6 @@ mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
-mod browser_tabs;
 mod bundled_cli;
 mod capability;
 #[cfg(all(test, unix))]
@@ -113,7 +113,6 @@ mod git_status_cache;
 mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
-mod host_execution;
 mod installed_cli;
 mod workspace_mutations;
 
@@ -207,7 +206,6 @@ mod direct_secret_ops;
 mod fast_mode;
 mod harness;
 mod history_xml;
-mod hook_manager;
 #[cfg(test)]
 mod human_attribution_tests;
 mod image_dimensions;
@@ -253,13 +251,7 @@ mod rate_limit;
 pub mod repo_config;
 pub mod retention;
 mod rtk;
-mod runtime;
 mod runtime_config;
-mod sandbox_ops;
-mod script_monitor;
-mod script_ops;
-mod script_output_cleanup;
-mod script_output_store;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
@@ -270,7 +262,8 @@ mod shell;
 mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
-mod terminal_ops;
+#[cfg(any(test, feature = "test-hooks"))]
+mod test_seams;
 pub mod tool_block;
 #[cfg(test)]
 mod truncated_read_guard_tests;
@@ -315,15 +308,16 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
+pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
     host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
-    max_concurrent_agents, migrate_active_provider_setting, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
-    InMemorySecretStore, SecretStore,
+    max_concurrent_agents, migrate_active_provider_setting, migrate_auto_retire_setting,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -941,9 +935,9 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_wake_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
@@ -1409,7 +1403,7 @@ pub struct Services {
     /// Test-only fault injector consulted before every hook-run persistence
     /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
     /// touching the store. `None` in production wiring.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_store_fault: Option<runtime_config::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
@@ -1730,9 +1724,9 @@ impl Services {
             script_too_fast_ms: runtime_config::TOO_FAST_MS,
             script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_wake_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
@@ -1843,7 +1837,7 @@ impl Services {
             hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
@@ -1892,7 +1886,7 @@ impl Services {
             ports: feature_ports::FeaturePorts::default(),
             features: feature_ports::FeatureSet::default(),
         };
-        let services = agent_wake::register(runtime::register(services));
+        let services = agent_wake::register(services);
         services
             .gitlab_credential_gate
             .attach_repository(services.repository_connection_directory(), descriptor)
@@ -2001,8 +1995,10 @@ impl Services {
 
     /// Test-only: compress the hook script eval budget so timeout-eviction
     /// coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.hook_eval_timeout = timeout;
         self
     }
@@ -2010,19 +2006,20 @@ impl Services {
     /// Test-only: inject a shared clock skew (milliseconds) into the hook
     /// TTL expiry math so a test can move a deadline deterministically
     /// instead of racing wall clock.
-    #[cfg(test)]
-    pub(crate) fn with_hook_clock_skew(
-        mut self,
-        skew_ms: Arc<std::sync::atomic::AtomicI64>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_clock_skew(mut self, skew_ms: Arc<std::sync::atomic::AtomicI64>) -> Self {
         self.hook_clock_skew = Some(skew_ms);
         self
     }
 
     /// Test-only: compress the backoff between hook persistence retries so
     /// store-failure coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
         self.hook_store_retry_base = base;
         self
     }
@@ -2030,8 +2027,10 @@ impl Services {
     /// Test-only: inject a fault into hook-run persistence steps. The
     /// injector is called with the step name before every attempt and fails
     /// the attempt when it returns `Some(err)`.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
         self.hook_store_fault = Some(fault);
         self
     }
@@ -2537,8 +2536,10 @@ impl Services {
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
     /// decision is independent of scheduler load (monorepo#514). Production
     /// wiring keeps the [`runtime_config::TOO_FAST_MS`] default.
-    #[cfg(test)]
-    pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
         self
     }
@@ -2546,19 +2547,20 @@ impl Services {
     /// Test seam (monorepo#1180): park `script.*` supervisors in their
     /// pre-registration window so teardown-vs-registration races are
     /// deterministic. Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_supervise_park(
-        mut self,
-        park: Arc<runtime_config::SupervisePark>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_supervise_park(mut self, park: Arc<runtime_config::SupervisePark>) -> Self {
         self.script_parks.supervise = Some(park);
         self
     }
 
     /// Test seam: park every script launch before its PTY spawns and its
     /// output log opens (including service auto-restarts).
-    #[cfg(test)]
-    pub(crate) fn with_script_before_spawn_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_before_spawn_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2568,8 +2570,10 @@ impl Services {
 
     /// Test seam: park workspace deletion after its scripts stop, before the
     /// script output folder is deleted.
-    #[cfg(test)]
-    pub(crate) fn with_script_workspace_closed_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_workspace_closed_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2579,8 +2583,10 @@ impl Services {
 
     /// Test seam: park `script.create` after its retired/closing checks,
     /// before the definition is persisted.
-    #[cfg(test)]
-    pub(crate) fn with_script_create_admitted_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_create_admitted_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2592,8 +2598,10 @@ impl Services {
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
     /// Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_mark_running_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_mark_running_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2620,7 +2628,7 @@ impl Services {
     /// before the durable wake is sent) so a concurrent delivery pass for
     /// the same child inside that window is deterministic. Production
     /// wiring keeps `None` (no parking).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_claim_park = Some(park);
         self
@@ -3345,8 +3353,9 @@ impl Services {
     /// [`Self::enrich_workspace_aggregates_with_unread`] (the list path
     /// threads its batch unread set, `workspace.get` its pre-read external
     /// PR inputs); this no-argument form remains for tests.
-    #[cfg(test)]
-    pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         self.enrich_workspace_aggregates_with_unread(ws, None, None)
             .await;
     }
@@ -4959,8 +4968,9 @@ impl Services {
     /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
     /// `resolved` — the driving client an agent `browser.exec` would reach
-    /// right now ([`Self::driving_client_target`]: pin → host of the
-    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// right now ([`Self::driving_client_target`]: pin → client of an active
+    /// desktop session → host of the workspace's claimed tabs →
+    /// first-connected eligible client), `null`
     /// when that client is offline or no eligible client is connected. Chief
     /// has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
@@ -4969,7 +4979,7 @@ impl Services {
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.ports.runtime().driving_client_target(self, id).await?;
+        let target = self.driving_client_target(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -4989,6 +4999,76 @@ impl Services {
         }
         out.insert("resolved".into(), resolved);
         Ok(serde_json::Value::Object(out))
+    }
+
+    /// The `ws.browser.clients()` payload for `id` (see
+    /// [`WorkspaceApi::browser_clients`]): one registry snapshot carrying
+    /// every client's live connections, the unpinned (`Default`) route and
+    /// this workspace's driving-client route with its `source`. A route
+    /// to an offline client carries the error `browser.exec` would report.
+    /// Without a dispatcher no client is listed and both routes report `no
+    /// client connected`.
+    async fn browser_clients_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        use intent_core::{ReverseConnectionSnapshot, ReverseDispatchError, ReverseRoute};
+
+        let (target, source) = self.driving_client_route(id).await?;
+        let targets = [intent_core::ReverseTarget::Default, target];
+        let snapshot = self.reverse_dispatch.as_ref().map_or_else(
+            || ReverseConnectionSnapshot {
+                clients: Vec::new(),
+                routes: targets
+                    .iter()
+                    .map(|_| ReverseRoute::failed(&ReverseDispatchError::NoClient))
+                    .collect(),
+            },
+            |d| d.connection_snapshot(id, &targets),
+        );
+        let Ok([unpinned, workspace]) = <[ReverseRoute; 2]>::try_from(snapshot.routes) else {
+            return Err(Error::Internal(
+                "browser.clients: the dispatcher did not report one route per target".to_string(),
+            ));
+        };
+        let mut routes = Vec::with_capacity(2);
+        for (route, target) in [unpinned, workspace].into_iter().zip(&targets) {
+            routes.push(self.browser_route_value(route, target).await?);
+        }
+        let mut workspace = routes.pop().expect("two routes");
+        let unpinned = routes.pop().expect("two routes");
+        workspace["source"] = source.into();
+        Ok(serde_json::json!({
+            "clients": snapshot.clients,
+            "unpinned": unpinned,
+            "workspace": workspace,
+        }))
+    }
+
+    /// One `ws.browser.clients()` route as JSON. An offline named client's
+    /// error is reworded exactly as `browser.exec` reports it (with the
+    /// stored client name when no live connection supplies one).
+    async fn browser_route_value(
+        &self,
+        mut route: intent_core::ReverseRoute,
+        target: &intent_core::ReverseTarget,
+    ) -> Result<serde_json::Value> {
+        use intent_core::{ReverseDispatchError, ReverseTarget};
+
+        if route.connection_id.is_none() {
+            if let (Some(client_id), ReverseTarget::Client(_) | ReverseTarget::Pinned(_)) =
+                (route.client_id.clone(), target)
+            {
+                let error = ReverseDispatchError::ClientOffline {
+                    client_id,
+                    name: route.name.clone(),
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                };
+                route.error = Some(
+                    self.feature_runtime()
+                        .browser_dispatch_error_message(self, error)
+                        .await,
+                );
+            }
+        }
+        serde_json::to_value(route).map_err(|e| Error::Internal(e.to_string()))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -7896,10 +7976,17 @@ impl Services {
         // through and run the advisory-ALLOWED delivery variant instead.
         let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
         if !advisory_pending
-            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+            && (!self
+                .ports
+                .runtime()
+                .active_hooks_for_agent(self, child_id)
+                .await
+                .is_empty()
                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                     || !self
-                        .active_script_monitors_for_agent(child_id)
+                        .ports
+                        .runtime()
+                        .active_script_monitors_for_agent(self, child_id)
                         .await
                         .is_empty()))
         {
@@ -7983,7 +8070,10 @@ impl Services {
         // (omitted) here unless the monorepo#1945 report bypass passed the
         // active-hooks guard above (or a hook was scheduled in the window),
         // matching the live emit sites' shape.
-        self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        self.ports
+            .runtime()
+            .annotate_waiting_on_hooks(self, child_id, &mut data)
+            .await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
         // shape-parity stamp — empty (omitted) here unless the report bypass
         // passed the active-pr-monitors guard above.
@@ -8586,12 +8676,18 @@ impl Services {
         // kept: the advisory wake below names them.
         let active_hooks: Vec<serde_json::Value> =
             if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_hooks_for_agent(child_id).await
+                self.ports
+                    .runtime()
+                    .active_hooks_for_agent(self, child_id)
+                    .await
             } else {
                 Vec::new()
             };
         let active_script_monitors = if event.event_type == AGENT_IDLE && !completion_reported {
-            self.active_script_monitors_for_agent(child_id).await
+            self.ports
+                .runtime()
+                .active_script_monitors_for_agent(self, child_id)
+                .await
         } else {
             Vec::new()
         };
@@ -9661,7 +9757,11 @@ impl Services {
             grouped,
             child_of_recipient,
         );
-        let script_waits = self.active_script_monitors_for_agent(child_id).await;
+        let script_waits = self
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(self, child_id)
+            .await;
         if !script_waits.is_empty() {
             use std::fmt::Write as _;
             wake.push_str("\nActive script monitors:");
@@ -9676,7 +9776,9 @@ impl Services {
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
-        self.annotate_waiting_on_script_monitors(child_id, &mut metadata)
+        self.ports
+            .runtime()
+            .annotate_waiting_on_script_monitors(self, child_id, &mut metadata)
             .await;
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
@@ -18210,7 +18312,9 @@ impl Services {
             // Keep the permit through cleanup and terminal event publication.
             let _deletion = services.workspace_mutations.delete(&id).await;
             services
-                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .ports
+                .runtime()
+                .cancel_script_monitors(&services, &id, None, "workspace-deleted")
                 .await?;
             // Refuse new script launches, auto-restarts and output logs, and
             // stop the running scripts, so nothing writes a log after the
@@ -19155,6 +19259,9 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
+            caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
+            caps.insert("discussionManagement".into(), serde_json::json!(1));
+            caps.insert("workspaceLabels".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -23600,8 +23707,23 @@ impl WorkspaceApi for Services {
                 normalised.status_image_asset_id = Some(None);
             }
         }
+        // A set `label` persists trimmed, so the delta carries the trimmed
+        // value; an invalid one is refused below before any write.
+        let label_error = match normalised.label.as_mut() {
+            Some(Some(raw)) => match intent_core::normalize_workspace_label(raw) {
+                Ok(trimmed) => {
+                    *raw = trimmed;
+                    None
+                }
+                Err(e) => Some(e),
+            },
+            _ => None,
+        };
         let mut changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            if let Some(e) = label_error {
+                return Err(e);
+            }
             // `Retired` is entered only through `workspace.retire` / the
             // automatic sweep (ownership proof, teardown, folder removal):
             // a generic status write must never produce it.
@@ -23675,6 +23797,11 @@ impl WorkspaceApi for Services {
             // PR fields below.
             if let Some(v) = update.status_image_asset_id {
                 ws.status_image_asset_id = v.filter(|s| !s.trim().is_empty());
+            }
+            // Home label (§9.1): `null` clears, a string sets the trimmed
+            // value validated above, missing leaves it untouched.
+            if let Some(v) = normalised.label.clone() {
+                ws.label = v;
             }
             if let Some(v) = update.branch {
                 ws.branch = v;
@@ -23774,6 +23901,11 @@ impl WorkspaceApi for Services {
                 ws.branch = store
                     .update_workspace_with_branch(&ws, branch_update.as_deref())
                     .await?;
+                // The full-row write leaves `label` alone so a stale snapshot
+                // elsewhere cannot revert it; persist an explicit change here.
+                if let Some(label) = normalised.label.as_ref() {
+                    store.set_workspace_label(&ws.id, label.as_deref()).await?;
+                }
                 if let Some(archived) = want_archived {
                     // Delegate the lifecycle flip to the fenced path: it
                     // returns the derived record (`lastActivity` /
@@ -23942,7 +24074,9 @@ impl WorkspaceApi for Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
-            this.cancel_script_monitors(&id, None, "workspace-archived")
+            this.ports
+                .runtime()
+                .cancel_script_monitors(&this, &id, None, "workspace-archived")
                 .await?;
             let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
@@ -25144,6 +25278,20 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&id).await?;
             self.browser_client_state(&id).await
+        })
+    }
+
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
+            self.require_member(&id).await?;
+            self.browser_clients_state(&id).await
         })
     }
 
@@ -34338,6 +34486,29 @@ impl WorkspaceApi for Services {
             .await
         })
     }
+    fn discussion_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, Some(&name))
+                .await
+        })
+    }
+
+    fn discussion_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, None)
+                .await
+        })
+    }
+
     fn discussion_conversations(
         &self,
         workspace_id: WorkspaceId,
@@ -35738,7 +35909,7 @@ impl WorkspaceApi for Services {
 impl Services {
     /// Archive tail: queue ONE consolidated wake per agent whose background
     /// hooks and/or PR monitors the archive sweeps
-    /// ([`Services::cancel_workspace_hooks`],
+    /// (the runtime's `HookServicesExt::cancel_workspace_hooks`,
     /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
     /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
     /// surface naming every cancelled hook (`name` + id) and monitor
@@ -35878,7 +36049,17 @@ impl Services {
             };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
-                let revived = self.revive_retired_checkout(&current).await?;
+                // The agent whose turn triggered the revive gets its notice in
+                // that turn; every other agent's notice is written with the
+                // flip (see `revive_retired_checkout`).
+                let trigger = auto_unarchive
+                    .as_ref()
+                    .and_then(|stamp| stamp.get("agentId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(AgentId::from);
+                let revived = self
+                    .revive_retired_checkout(&current, trigger.as_ref())
+                    .await?;
                 (revived.is_some(), revived)
             } else {
                 let flipped = store
@@ -35968,6 +36149,9 @@ impl Services {
             changes["baseCommitSha"] = serde_json::json!(revived.base_commit_sha);
             changes["revived"] =
                 auto_unarchive.unwrap_or_else(|| serde_json::json!({ "reason": "manual" }));
+            if revived.cleared_purge_status && ws.status_message.is_none() {
+                changes["statusMessage"] = serde_json::Value::Null;
+            }
         } else if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
@@ -38435,401 +38619,6 @@ pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Resul
 )]
 pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     tokio::fs::write(path, contents).await
-}
-
-/// Platform-parametrized runner selection for the workspace setup-script
-/// terminal (`workspace.create`). POSIX always spawns the historic
-/// `/bin/sh -c SETUP_SCRIPT_WRAPPER` invocation byte-for-byte. Windows
-/// prefers a discovered Git-for-Windows `sh.exe` running the same POSIX
-/// wrapper (so bash setup scripts keep working) and falls back to a
-/// cmd.exe-native `.cmd` wrapper preserving the same completion-summary line
-/// format. The helpers take an explicit `is_windows` flag so the logic is
-/// unit-testable on any host OS; the call site wires `cfg!(windows)`.
-pub(crate) mod setup_runner {
-    use std::path::{Path, PathBuf};
-
-    /// How the setup-script terminal runs the script file.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) enum SetupScriptRunner {
-        /// A POSIX `sh` runs the inline timing wrapper
-        /// (`<sh> -c <wrapper> sh <script>`). On POSIX `sh` is always
-        /// `/bin/sh`; on Windows it is a discovered Git-for-Windows `sh.exe`.
-        PosixSh { sh: PathBuf, is_windows: bool },
-        /// Windows with no POSIX sh available: `cmd.exe` runs a generated
-        /// `.cmd` timing wrapper file with the script path as `%1`.
-        CmdWrapper,
-    }
-
-    /// Select the runner for the platform. POSIX ignores `windows_sh` and
-    /// always picks `/bin/sh`; Windows uses the discovered sh when present,
-    /// else the cmd.exe wrapper fallback.
-    pub(crate) fn select(is_windows: bool, windows_sh: Option<PathBuf>) -> SetupScriptRunner {
-        if !is_windows {
-            return SetupScriptRunner::PosixSh {
-                sh: PathBuf::from("/bin/sh"),
-                is_windows: false,
-            };
-        }
-        match windows_sh {
-            Some(sh) => SetupScriptRunner::PosixSh {
-                sh,
-                is_windows: true,
-            },
-            None => SetupScriptRunner::CmdWrapper,
-        }
-    }
-
-    impl SetupScriptRunner {
-        /// Extension for the on-disk script file: `sh` for POSIX-sh runs
-        /// (unchanged unix behavior), `cmd` for the cmd.exe fallback.
-        pub(crate) fn script_extension(&self) -> &'static str {
-            match self {
-                Self::PosixSh { .. } => "sh",
-                Self::CmdWrapper => "cmd",
-            }
-        }
-
-        /// True when a `.cmd` wrapper file must be written next to the script
-        /// before spawning.
-        pub(crate) fn needs_cmd_wrapper_file(&self) -> bool {
-            matches!(self, Self::CmdWrapper)
-        }
-
-        /// Build the `(program, args, extra_env)` triple for the PTY spawn.
-        /// `wrapper_path` is the on-disk `.cmd` wrapper (required for
-        /// `CmdWrapper`, ignored otherwise). The POSIX shape is byte-identical
-        /// to the historic `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>`
-        /// spawn; the Windows sh path forward-slashes the script argument and
-        /// templates the discovered sh into the wrapper (MSYS sh has no
-        /// `/bin/sh` guarantee from a native-process spawn).
-        ///
-        /// `CmdWrapper` passes the script path via `extra_env`
-        /// (`INTENT_SETUP_SCRIPT`) rather than as a second argv token: with
-        /// both the wrapper and script under the same (spaces-prone)
-        /// `.intent` dir, `portable-pty` double-quotes each spaced argument,
-        /// and cmd.exe's `/C` quote handling only preserves quoting when
-        /// *exactly two* quote characters appear on the whole command line.
-        /// Two quoted args produce four quotes and get mis-parsed; one
-        /// quoted arg (the wrapper) keeps the count at two.
-        pub(crate) fn command(
-            &self,
-            script_path: &Path,
-            wrapper_path: Option<&Path>,
-        ) -> (String, Vec<String>, Vec<(String, String)>) {
-            match self {
-                Self::PosixSh { sh, is_windows } => {
-                    let (wrapper, script_arg) = if *is_windows {
-                        (
-                            wrapper_for_sh(&forward_slashes(sh)),
-                            forward_slashes(script_path),
-                        )
-                    } else {
-                        (
-                            crate::SETUP_SCRIPT_WRAPPER.to_string(),
-                            script_path.to_string_lossy().to_string(),
-                        )
-                    };
-                    (
-                        sh.to_string_lossy().to_string(),
-                        vec!["-c".to_string(), wrapper, "sh".to_string(), script_arg],
-                        Vec::new(),
-                    )
-                }
-                Self::CmdWrapper => {
-                    let wrapper = wrapper_path.expect("CmdWrapper requires a wrapper file path");
-                    (
-                        "cmd.exe".to_string(),
-                        vec![
-                            "/d".to_string(),
-                            "/c".to_string(),
-                            wrapper.to_string_lossy().to_string(),
-                        ],
-                        vec![(
-                            "INTENT_SETUP_SCRIPT".to_string(),
-                            script_path.to_string_lossy().to_string(),
-                        )],
-                    )
-                }
-            }
-        }
-    }
-
-    /// Forward-slash a path for MSYS `sh` consumption (`C:\x` → `C:/x`);
-    /// a no-op on paths without backslashes.
-    fn forward_slashes(p: &Path) -> String {
-        p.to_string_lossy().replace('\\', "/")
-    }
-
-    /// [`crate::SETUP_SCRIPT_WRAPPER`] with the inner interpreter templated:
-    /// identical text except the script runs through the double-quoted `sh`
-    /// instead of bare `/bin/sh` (drift-guarded against the const in tests).
-    pub(crate) fn wrapper_for_sh(sh: &str) -> String {
-        format!(
-            r#"start=$(date +%s); "{sh}" "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#
-        )
-    }
-
-    /// cmd.exe-native timing wrapper (Windows fallback when no POSIX sh is
-    /// found): the script path is read from the `INTENT_SETUP_SCRIPT`
-    /// environment variable rather than passed as `%1`, so the spawn only
-    /// has one quoted argv token (the wrapper itself) — see the doc comment
-    /// on [`SetupScriptRunner::command`] for why a second quoted path
-    /// argument breaks under cmd.exe's `/C` quote-stripping when the
-    /// workspace path contains spaces. Mirrors the POSIX wrapper's output
-    /// contract — blank separator line, then `Setup script completed in <N>s
-    /// (exit code <C>)` (or the `failed` variant) — and exits with the
-    /// script's own code. Elapsed seconds derive from `%TIME%` (space padding
-    /// normalized to `0`, `1%x%-100` avoids octal parsing of zero-padded
-    /// fields, day rollover corrected). CRLF line endings for cmd.exe.
-    pub(crate) const SETUP_SCRIPT_WRAPPER_CMD: &str = concat!(
-        "@echo off\r\n",
-        "setlocal\r\n",
-        "set \"_st=%TIME: =0%\"\r\n",
-        "call \"%INTENT_SETUP_SCRIPT%\"\r\n",
-        "set \"code=%ERRORLEVEL%\"\r\n",
-        "set \"_en=%TIME: =0%\"\r\n",
-        "set /a \"_s=(1%_st:~0,2%-100)*3600+(1%_st:~3,2%-100)*60+(1%_st:~6,2%-100)\"\r\n",
-        "set /a \"_e=(1%_en:~0,2%-100)*3600+(1%_en:~3,2%-100)*60+(1%_en:~6,2%-100)\"\r\n",
-        "if %_e% lss %_s% set /a \"_e+=86400\"\r\n",
-        "set /a \"elapsed=_e-_s\"\r\n",
-        "if %code%==0 (set \"verb=completed\") else (set \"verb=failed\")\r\n",
-        "echo.\r\n",
-        "echo Setup script %verb% in %elapsed%s (exit code %code%)\r\n",
-        "exit /b %code%\r\n",
-    );
-
-    /// Standard Git-for-Windows `sh.exe` install locations under the given
-    /// environment roots (`%ProgramFiles%`, `%ProgramFiles(x86)%`,
-    /// `%LocalAppData%`), in probe order. Pure so tests can drive it on any
-    /// host.
-    pub(crate) fn git_sh_candidates(
-        program_files: Option<&str>,
-        program_files_x86: Option<&str>,
-        local_app_data: Option<&str>,
-    ) -> Vec<PathBuf> {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        for pf in [program_files, program_files_x86].into_iter().flatten() {
-            roots.push(Path::new(pf).join("Git"));
-        }
-        if let Some(lad) = local_app_data {
-            roots.push(Path::new(lad).join("Programs").join("Git"));
-        }
-        let mut out = Vec::new();
-        for git in roots {
-            out.push(git.join("bin").join("sh.exe"));
-            out.push(git.join("usr").join("bin").join("sh.exe"));
-        }
-        out
-    }
-
-    /// Scan a PATH-style string for a directory containing `sh.exe`. The
-    /// separator is parametrized (`;` on Windows) so the scan is testable on
-    /// POSIX hosts; empty entries are skipped.
-    pub(crate) fn find_sh_in_path(path_var: &str, separator: char) -> Option<PathBuf> {
-        path_var
-            .split(separator)
-            .filter(|d| !d.is_empty())
-            .map(|d| Path::new(d).join("sh.exe"))
-            .find(|p| p.is_file())
-    }
-
-    /// Discover a POSIX `sh.exe` on Windows: Git-for-Windows standard install
-    /// locations first, then a `%PATH%` scan. `None` when no sh is found (the
-    /// caller falls back to the cmd.exe wrapper).
-    pub(crate) fn find_windows_sh() -> Option<PathBuf> {
-        let pf = std::env::var("ProgramFiles").ok();
-        let pf86 = std::env::var("ProgramFiles(x86)").ok();
-        let lad = std::env::var("LOCALAPPDATA").ok();
-        git_sh_candidates(pf.as_deref(), pf86.as_deref(), lad.as_deref())
-            .into_iter()
-            .find(|p| p.is_file())
-            .or_else(|| {
-                std::env::var("PATH")
-                    .ok()
-                    .and_then(|p| find_sh_in_path(&p, ';'))
-            })
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn posix_select_ignores_windows_sh_and_is_bin_sh() {
-            let runner = select(false, Some(PathBuf::from("C:/Git/bin/sh.exe")));
-            assert_eq!(
-                runner,
-                SetupScriptRunner::PosixSh {
-                    sh: PathBuf::from("/bin/sh"),
-                    is_windows: false
-                }
-            );
-            assert_eq!(runner.script_extension(), "sh");
-            assert!(!runner.needs_cmd_wrapper_file());
-        }
-
-        /// The POSIX spawn shape is byte-identical to the historic
-        /// `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>` invocation.
-        #[test]
-        fn posix_command_is_byte_identical_to_historic_spawn() {
-            let runner = select(false, None);
-            let (program, args, extra_env) =
-                runner.command(Path::new("/w/.intent/setup-a.sh"), None);
-            assert_eq!(program, "/bin/sh");
-            assert_eq!(
-                args,
-                vec![
-                    "-c".to_string(),
-                    crate::SETUP_SCRIPT_WRAPPER.to_string(),
-                    "sh".to_string(),
-                    "/w/.intent/setup-a.sh".to_string(),
-                ]
-            );
-            assert!(extra_env.is_empty());
-        }
-
-        #[test]
-        fn windows_with_sh_runs_posix_wrapper_through_it() {
-            let sh = PathBuf::from(r"C:\Program Files\Git\bin\sh.exe");
-            let runner = select(true, Some(sh.clone()));
-            assert_eq!(runner.script_extension(), "sh");
-            assert!(!runner.needs_cmd_wrapper_file());
-            let (program, args, extra_env) =
-                runner.command(Path::new(r"C:\w\.intent\setup-a.sh"), None);
-            assert_eq!(program, sh.to_string_lossy());
-            assert_eq!(args[0], "-c");
-            assert!(
-                args[1].contains(r#""C:/Program Files/Git/bin/sh.exe" "$1""#),
-                "wrapper must template the forward-slashed sh: {}",
-                args[1]
-            );
-            assert!(args[1].contains(r"printf '\nSetup script completed in %ss (exit code %s)\n'"));
-            assert!(args[1].contains(r"printf '\nSetup script failed in %ss (exit code %s)\n'"));
-            assert_eq!(args[2], "sh");
-            assert_eq!(args[3], "C:/w/.intent/setup-a.sh");
-            assert!(extra_env.is_empty());
-        }
-
-        /// The script path travels via env (`INTENT_SETUP_SCRIPT`), not as a
-        /// second quoted argv token, so a spaced workspace path (common on
-        /// Windows, e.g. under `C:\Users\John Smith\...`) doesn't blow past
-        /// cmd.exe's `/C` exactly-two-quotes rule (only the wrapper path is
-        /// quoted on the command line).
-        #[test]
-        fn windows_without_sh_falls_back_to_cmd_wrapper() {
-            let runner = select(true, None);
-            assert_eq!(runner, SetupScriptRunner::CmdWrapper);
-            assert_eq!(runner.script_extension(), "cmd");
-            assert!(runner.needs_cmd_wrapper_file());
-            let (program, args, extra_env) = runner.command(
-                Path::new(r"C:\w\.intent\setup-a.cmd"),
-                Some(Path::new(r"C:\w\.intent\setup-wrapper-a.cmd")),
-            );
-            assert_eq!(program, "cmd.exe");
-            assert_eq!(
-                args,
-                vec![
-                    "/d".to_string(),
-                    "/c".to_string(),
-                    r"C:\w\.intent\setup-wrapper-a.cmd".to_string(),
-                ]
-            );
-            assert_eq!(
-                extra_env,
-                vec![(
-                    "INTENT_SETUP_SCRIPT".to_string(),
-                    r"C:\w\.intent\setup-a.cmd".to_string(),
-                )]
-            );
-        }
-
-        /// Regression for the spaced-workspace-path bug: only the wrapper
-        /// path is a quoted argv token even when both the wrapper and script
-        /// live under a directory containing spaces, keeping the command
-        /// line at exactly two quote characters.
-        #[test]
-        fn windows_cmd_wrapper_command_line_has_one_quoted_token_with_spaced_paths() {
-            let runner = select(true, None);
-            let (_, args, extra_env) = runner.command(
-                Path::new(r"C:\a b\.intent\setup-x.cmd"),
-                Some(Path::new(r"C:\a b\.intent\setup-wrapper-x.cmd")),
-            );
-            assert_eq!(args.len(), 3);
-            assert_eq!(args[2], r"C:\a b\.intent\setup-wrapper-x.cmd");
-            assert_eq!(
-                extra_env,
-                vec![(
-                    "INTENT_SETUP_SCRIPT".to_string(),
-                    r"C:\a b\.intent\setup-x.cmd".to_string(),
-                )]
-            );
-        }
-
-        /// Drift guard: the templated wrapper for `/bin/sh` matches the POSIX
-        /// const except for the double quotes around the interpreter.
-        #[test]
-        fn wrapper_for_sh_matches_posix_const() {
-            assert_eq!(
-                wrapper_for_sh("/bin/sh").replacen("\"/bin/sh\"", "/bin/sh", 1),
-                crate::SETUP_SCRIPT_WRAPPER
-            );
-        }
-
-        #[test]
-        fn cmd_wrapper_preserves_summary_format_and_exit_code_contract() {
-            let w = SETUP_SCRIPT_WRAPPER_CMD;
-            assert!(w.starts_with("@echo off\r\n"));
-            assert!(w.contains("call \"%INTENT_SETUP_SCRIPT%\"\r\n"));
-            assert!(
-                w.contains("echo.\r\necho Setup script %verb% in %elapsed%s (exit code %code%)")
-            );
-            assert!(w.contains("(set \"verb=completed\")"));
-            assert!(w.contains("(set \"verb=failed\")"));
-            assert!(w.ends_with("exit /b %code%\r\n"));
-        }
-
-        #[test]
-        fn git_sh_candidates_probe_order_and_roots() {
-            let got = git_sh_candidates(
-                Some(r"C:\Program Files"),
-                Some(r"C:\Program Files (x86)"),
-                Some(r"C:\Users\u\AppData\Local"),
-            );
-            let expected: Vec<PathBuf> = [
-                Path::new(r"C:\Program Files").join("Git"),
-                Path::new(r"C:\Program Files (x86)").join("Git"),
-                Path::new(r"C:\Users\u\AppData\Local")
-                    .join("Programs")
-                    .join("Git"),
-            ]
-            .iter()
-            .flat_map(|root| {
-                [
-                    root.join("bin").join("sh.exe"),
-                    root.join("usr").join("bin").join("sh.exe"),
-                ]
-            })
-            .collect();
-            assert_eq!(got, expected);
-            assert!(git_sh_candidates(None, None, None).is_empty());
-        }
-
-        #[test]
-        fn find_sh_in_path_scans_entries_and_skips_empties() {
-            let dir = std::env::temp_dir().join(format!(
-                "setup-runner-path-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let sh = dir.join("sh.exe");
-            std::fs::write(&sh, "").unwrap();
-            let path_var = format!(";/nonexistent;{};", dir.to_string_lossy());
-            assert_eq!(find_sh_in_path(&path_var, ';'), Some(sh));
-            assert_eq!(find_sh_in_path("/nonexistent;/also-missing", ';'), None);
-            std::fs::remove_dir_all(&dir).ok();
-        }
-    }
 }
 
 // Retained by the settings supervisor before any effect; caller cancellation

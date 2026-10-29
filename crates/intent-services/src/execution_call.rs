@@ -55,6 +55,14 @@ impl Services {
     }
 }
 
+/// Test seam: [`forge_error`] for feature-crate tests.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[must_use]
+pub fn forge_error_for_test(error: intent_sourcecontrol::Error) -> Error {
+    forge_error(error)
+}
+
 /// Called at the provider's typed error boundary, before its response text is
 /// flattened into the legacy Internal error. Bodies never enter diagnostics.
 pub(crate) fn forge_error(error: intent_sourcecontrol::Error) -> Error {

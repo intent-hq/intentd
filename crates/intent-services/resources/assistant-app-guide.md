@@ -19,19 +19,15 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, and personal device pairing are currently experimental.
-Do not introduce them in routine answers about settings, devices, or mobile pairing.
+Multiplayer is always on: there is no switch to enable or disable it, and opening an
+invitation link joins directly without an enable step. Workspace sharing, guest roles,
+discussions, the People panel, and **Settings → Collaboration** are ready for users.
+Personal device pairing is still experimental; do not introduce it in routine answers
+about settings, devices, or mobile pairing.
 
-Only when explicitly asked about the experimental People sidebar tab: it follows
-**Agents**, immediately to its right in the expanded row and below it in the
-collapsed rail.
+<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/multi-select-sidebar-tabs.ts; src/lib/components/workspace/sidebar/SidebarSectionTabs.svelte. -->
-
-<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
-
-Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
-Labs feature labels the default collaborator role Participant. The workspace owner
+Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
 create agents, choose models/providers and reasoning effort, and run, start, stop,
 restart or inspect existing
@@ -39,15 +35,54 @@ saved scripts. They cannot edit script commands, control raw terminals, run host
 commands, change credentials, or manage sharing. Host membership retains its existing
 authority. Role downgrades apply to subsequent operations on open connections.
 
-Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+Workspaces support multiple workspace-wide discussions. Start a discussion by
+sending its first message; everyone with workspace access can read and participate.
+Workspace owners and managers can rename discussions; only workspace owners can
+delete them, including the default discussion. Open the discussion, then use the
+discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
+These controls require discussion-management support from the connected daemon.
+Archived workspaces whose folder was purged keep discussions read-only; unarchive the
+workspace before renaming or deleting a discussion.
+Existing private history remains
+visible only to its original participants and is read-only; new private discussions
+are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
 hover or focus an existing reaction to see who reacted, and click to toggle yours.
 Legacy 🙂 can be removed. Agents can react only
 after explicit addressing in the workspace-wide discussion; reactions never wake
-agents. Private discussions remain human-only. Imported reaction names are historical
+agents. Imported reaction names are historical
 snapshots, not local access.
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+An agent author's name or avatar opens that agent beside the discussion. If the
+agent is unavailable, the app reports that it cannot open the reference. Sending
+in an existing discussion preserves its message row while confirmation arrives; failed messages can be
+retried without consuming a newer draft. Discussion composers currently support
+text and references, not image pasting or file attachments. The discussion and
+agent-chat @ menus have different recipient and delivery rules. Sending a message
+with a selected agent in a workspace-wide discussion explicitly addresses that agent.
+
+With person-mention support from the connected daemon, selecting a person in the
+discussion's @ menu records who is mentioned. Sending can alert that person when
+the discussion is off screen and notifications are enabled. Plain text that looks
+like an @ mention does not identify a recipient. Notification actions open the
+relevant discussion subject to current access. Unread counts appear in discussion
+navigation and inactive tabs. They reflect messages observed by this client and
+clear as focused discussion content is read; they are not durable cross-device
+read receipts.
+
+In the People panel, invitations to specific accounts appear as **Invited** for people who can manage sharing. A share
+link without a named recipient does not add a person. Accepted members remain in
+People when they stop viewing the workspace and appear greyed out. Being connected
+to the host elsewhere does not mean they are active here.
+
+In the People panel's Activity list, nearby consecutive actions by the same person
+share an avatar. Each action remains individually selectable. **Load more** looks
+for older activity from people, even when automated events fill the recent feed.
+In agent chat, other people's typing appears as a compact status above the prompt
+without moving the messages or monitor cards.
+
+<!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleRoster,WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/store/renderer/slices/{presence/presence-selectors,workspace-share/workspace-share-selectors}.ts; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
@@ -59,7 +94,7 @@ pairing, use **Settings → Mobile → Intent Mobile → Show QR Code** on the i
 connection. Older instructions may call it **Pair another device as me**; that is
 not the current button label. Personal pairing requires a current signed-in identity
 and the connection's personal-pairing capability. The restricted-access panel also
-requires Multiplayer and a refreshed identity; the remote-owner panel needs Remote
+requires a refreshed identity; the remote-owner panel needs Remote
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
@@ -305,7 +340,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -322,9 +357,10 @@ terminal tab, alone does not count. **Waiting** covers workspaces watching somet
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
 the merge queue. The **Waiting** filter shows the same workspaces.
 
-The PR badge in list and board views prioritizes draft PRs, then open PRs
-(including conflicted or queued PRs), then merged and closed PRs. Within the same
-state, it shows the most recently updated available PR. Home's shortened PR list
+The PR badge in list and board views shows a PR in the merge queue first, then
+draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
+Within the same state, it shows the most recently updated PR (for a PR an agent only
+watches, its last update on GitHub as of the watch's latest check). Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
@@ -410,7 +446,7 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-services/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
@@ -516,7 +552,7 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
@@ -533,35 +569,54 @@ groups. In list view, **Status** groups workspace statuses in this order:
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
 
-Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
-**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
-activity first within the pinned and unpinned groups.
+Right-click a workspace and choose **Pin** or **Unpin**, or open **Label** to give
+it a label. The **Label** submenu lists the labels already in use (A–Z), **New
+label…** to name a new one (1–64 characters, not a duplicate and not "Pinned"), and
+**Remove label** when the workspace has one. Each workspace has one label; Pinned is
+the built-in label, so labeling a pinned workspace unpins it and pinning a labeled
+workspace removes its label. A label disappears once no workspace holds it. Labels
+are saved by the daemon, so they sync to every client connected to it. Only the
+workspace owner sees **Pin**, **Unpin** and **Label**; shared members cannot change them.
+
+In the list, pinned workspaces come first with a pin icon, then one collapsible
+group per label (A–Z), then the usual groups without those workspaces. Grouped by
+**None**, and on the board, pinned workspaces show a pin icon and stay ahead of the
+rest without label groups; **Done & idle** shows newest activity first within the
+pinned and unpinned groups.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
-## Retire and restore workspaces
+## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/workspace/RetiredWorkspaceBanner.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.retire, packages/intentd/crates/intent-services/src/{retire,auto_retire}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire}.rs. -->
 
-Retiring frees disk space: it deletes the workspace's folder, including uncommitted
-changes and untracked files, but keeps its conversations, notes, tasks, and git
-branch. In **Home → Workspaces**, right-click a workspace and choose **Retire**, then
-confirm. An active workspace is archived first. Workspaces whose folder is the
-repository itself (not a separate checkout) and remote workspaces cannot be retired.
+Archive is the one way to put a workspace away. In **Home → Workspaces**,
+right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
+and PR monitors and keeps its folder. Archived workspaces appear under the
+**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
 
-Retired workspaces appear only under the **Retired** filter in Home. Opening one
-shows its history read-only. To keep working, choose **Restore as blank workspace**
-from its menu or banner, or send it a message: Intent recreates it from a fresh
-checkout of the default branch on a new branch. The old branch still holds the
-earlier work.
+Intent archives idle workspaces automatically: a workspace with no messages, note
+edits or agent activity for 7 days is archived, unless an agent, script, hook or PR
+monitor is still running or it is shared with guests. Change or turn this off in
+**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`),
+or set `autoArchiveIdleAfterDays` (`0` = off) under `[workspace]` in `config.toml`.
 
-To retire archived workspaces automatically, turn on **Workspace setup →
-Automatically retire archived workspaces** (`/settings?tab=setup#git-workspace`) and
-set **Retire after (days)** (7 when first turned on). Intent checks about once an
-hour. It is off by default, and it skips remote, shared, and non-retirable
-workspaces.
+To free disk space, right-click an archived workspace and choose **Purge workspace
+folder**, then confirm. This deletes the folder, including uncommitted changes and
+untracked files, but keeps conversations, notes, tasks and the git branch. The
+workspace card's status then reads "Workspace folder purged to free disk space."
+Workspaces whose folder is the repository itself and remote workspaces cannot be
+purged. To purge automatically, turn on **Workspace setup → Free disk space for
+archived workspaces** and set the number of days (7 when first turned on), or set
+`purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
+hour, and skips workspaces with uncommitted changes.
+
+A purged workspace still shows as archived and its history stays readable.
+Unarchiving it, or sending a message, recreates it from a fresh checkout of the
+default branch on a new branch; the old branch still holds the earlier work, and
+the agents are told the folder was purged.
 
 ## Home workspace status icons
 
@@ -713,25 +768,36 @@ where available or reconnect, and check the app and daemon versions.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
-The workspace sidebar warns when its primary browser client is offline, even if
-the workspace has no browser tabs yet. Hover over the warning for recovery help:
-agent browser tabs and tunnels fail until that client reconnects or another
-connected, browser-capable client is set as primary.
+The workspace sidebar's menu shows **Primary client**: the client that runs this
+workspace's agent browser tabs and tunnels. When that client is offline, the menu
+button shows a red dot and **Primary client** reads **Offline**, even if the
+workspace has no browser tabs yet: agent browser tabs and tunnels fail until that
+client reconnects or another connected, browser-capable client is set as primary.
 
 To switch, open the workspace in the client you want to use, open the workspace
-sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
+sidebar's menu, choose **Primary client** → **This app**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
-state; tabs you opened yourself stay where they are. The action depends on the
-current client's connection, browser capability and your access. A checkmark
-means the saved primary selection matches the confirmed current client; it does
-not guarantee browser availability. The selection updates when the primary
-changes; after reconnecting, wait for the current client and workspace browser
-state to refresh. When the saved selection is known and this client is not
-selected, the action is available once its connection, browser capability and
-your access are ready. Do not promise automatic failover or change the primary
-client without the user's instruction.
+state; tabs you opened yourself stay where they are. **This app** depends on the
+current client's connection, browser capability and your access; when a guest role or
+missing browser support blocks it, a line below it says why. A checkmark marks
+the current primary client; it does not guarantee browser availability. The
+selection updates when the primary changes; after reconnecting, wait for the
+current client and workspace browser state to refresh. Do not promise automatic
+failover or change the primary client without the user's instruction.
+
+## iOS workspace browser
+
+<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist. -->
+
+In the iOS workspace browser, enter an explicit `http://` or `https://` address
+to open a server reachable from the device, including LAN and Tailscale hosts.
+Allow Intent's local network access if prompted; if previously denied, enable
+it in iOS Settings under **Privacy & Security → Local Network**. Tailscale
+addresses require a working route from the device. `daemon.localhost` and
+loopback addresses instead open servers on the connected daemon through its
+authenticated tunnel.
 
 ## Add context, run a task, and find results
 
@@ -743,6 +809,7 @@ Hover over an icon for its section name; scroll the row horizontally when space
 is tight. Faded edges show where more tabs are hidden and clear when you reach
 that end. **Agents** opens by default; your selected section is remembered. Its
 tab shows the main agent's avatar, or a robot while no main agent is available.
+**People** follows **Agents** in both the expanded row and collapsed rail.
 A token-usage total appears beside **Agents** once tokens have been used.
 The workspace status image appears as a compact thumbnail in **Context**; click
 it to view the full image.
@@ -830,6 +897,12 @@ A missing-file or access error is different: check the path and access rather th
 assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+Agents mention another workspace as a link showing its title rather than its internal ID.
+Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant
+chat it opens beside the conversation.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. Test-build behavior pending its frontend release. -->
 
 <!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 

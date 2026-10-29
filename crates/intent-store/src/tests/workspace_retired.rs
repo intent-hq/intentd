@@ -193,3 +193,85 @@ async fn revive_flip_is_scoped_and_conditional() {
         Err(Error::NotFound(_))
     ));
 }
+
+/// Review regression (intentd#2756): the revive flip and the pending
+/// folder-purged notices commit in ONE transaction. Every session except the
+/// excluded (triggering) one carries the notice as soon as the row reads
+/// Active; a declined flip (row not retired) writes no notice at all, so a
+/// notice can never exist without the flip or the flip without the notice.
+#[tokio::test]
+async fn revive_with_notice_writes_pending_notices_atomically_with_the_flip() {
+    let (_tmp, store, active, _archived, retired) = seeded().await;
+    let (a, b, c) = (AgentId::new(), AgentId::new(), AgentId::new());
+    for agent in [&a, &b] {
+        store
+            .insert_agent_session(&sample_agent_session(agent, &retired))
+            .await
+            .expect("session");
+    }
+    store
+        .insert_agent_session(&sample_agent_session(&c, &active))
+        .await
+        .expect("session in another workspace");
+    let key = "pendingWorkspacePurgeNotice";
+    let notice = |id: &AgentId| {
+        let store = store.clone();
+        let id = id.clone();
+        async move {
+            store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .metadata
+                .and_then(|m| m.get(key).and_then(|v| v.as_str()).map(str::to_string))
+        }
+    };
+
+    // A declined flip (the row is Active) writes nothing.
+    assert!(!store
+        .revive_workspace_if_retired_with_notice(
+            &active,
+            "x",
+            None,
+            &now_iso(),
+            Some((key, "N", None))
+        )
+        .await
+        .expect("declines"));
+    assert_eq!(notice(&c).await, None);
+
+    assert!(store
+        .revive_workspace_if_retired_with_notice(
+            &retired,
+            "feature/revived",
+            Some("abc123"),
+            &now_iso(),
+            Some((key, "folder purged", Some(&a))),
+        )
+        .await
+        .expect("revive"));
+    assert_eq!(
+        store.get_workspace(&retired).await.unwrap().status,
+        WorkspaceStatus::Active
+    );
+    assert_eq!(notice(&a).await, None, "the triggering session is excluded");
+    assert_eq!(notice(&b).await.as_deref(), Some("folder purged"));
+    assert_eq!(notice(&c).await, None, "other workspaces are untouched");
+
+    assert_eq!(
+        store
+            .take_agent_session_metadata_key(&retired, &b, key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("folder purged")
+    );
+    assert_eq!(
+        store
+            .take_agent_session_metadata_key(&retired, &b, key)
+            .await
+            .unwrap(),
+        None,
+        "taken exactly once"
+    );
+}

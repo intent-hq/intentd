@@ -1074,14 +1074,11 @@ async fn execution_presence_uses_full_configured_root_and_original_source() {
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
     let calls = server.control.requests.lock().unwrap().len();
-    let context = f.service.execution_context_snapshot().await.unwrap();
-    let connection = context
-        .repository_connections
-        .iter()
-        .find(|c| c.provider == "gitlab")
-        .unwrap();
-    assert!(connection.configured);
-    assert_eq!(connection.host, "gitlab.test");
+    // The runtime's execution context reports the GitLab connection from
+    // exactly these two reads (host, and configured = own token present).
+    let host = f.service.bound_gitlab_host().unwrap();
+    assert!(f.service.own_gitlab_token(&host).await.is_some());
+    assert_eq!(host.host(), "gitlab.test");
     assert_eq!(
         f.registry
             .snapshot()

@@ -1,9 +1,6 @@
 //! Correlated controls; human discussion access never grants general agent control.
 use crate::{agent_manager::TurnOptions, Services};
-use intent_core::{
-    discussion::{DiscussionAgentControl, DEFAULT_CONVERSATION},
-    Error, EventActor, Result,
-};
+use intent_core::{discussion::DiscussionAgentControl, Error, EventActor, Result};
 use intent_store::{DiscussionActivityReceipt, NewEvent};
 use serde_json::{json, Value};
 
@@ -76,7 +73,16 @@ impl Services {
                         let principal = services
                             .discussion_access(&request.workspace_id, &request.conversation_id)
                             .await?;
-                        if request.conversation_id != DEFAULT_CONVERSATION {
+                        if services
+                            .store
+                            .discussion_conversation(
+                                &request.workspace_id,
+                                &request.conversation_id,
+                            )
+                            .await?
+                            .kind
+                            != "workspace"
+                        {
                             return Err(Error::Forbidden(
                                 "private discussion agent control is unavailable".into(),
                             ));

@@ -1,5 +1,6 @@
 //! Member execution through a disposable real daemon and mock ACP provider.
 use super::*;
+use intent_app::RuntimeServicesExt as _;
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId};
 use intent_store::Store;
 use std::fmt::Write as _;
@@ -1230,14 +1231,14 @@ async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legac
     let github =
         intent_sourcecontrol::GitHubSourceControl::new("fake-repository-token", Some(&fake.url))
             .unwrap();
-    let services = Arc::new(
+    let services = Arc::new(intent_app::compose(
         Services::new(store)
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_settings_registry(registry)
             .with_secret_store(secrets)
             .with_event_bus(bus.clone())
             .with_source_control(Arc::new(github)),
-    );
+    ));
     let worker = services.spawn_execution_context_loop();
     let tls = intent_transport::ensure_tls_certificate(dir.path()).unwrap();
     let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));

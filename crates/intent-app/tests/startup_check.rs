@@ -28,7 +28,7 @@ async fn compose_registers_every_feature_port() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "intent_app::compose: feature ports not registered: transfer")]
+#[should_panic(expected = "intent_app::compose: feature ports not registered: transfer, runtime")]
 async fn an_unregistered_production_port_fails_the_startup_check() {
     let dir = tempfile::tempdir().expect("tempdir");
     let services = bare_services(&dir).await;

@@ -1,0 +1,51 @@
+# Re-runs a failed Release-plz planning run on intentd main's head, or fails
+# loudly when that is unsafe or attempts are used up. Without this, one
+# crates.io blip in release-pr (run 40430078531) left the frontend alpha cut
+# deferring "intentd-skew" for six hours: cloudlands-fe only exempts
+# test/ci-only intentd commits once a Release-plz run on main's head
+# succeeds with its no-op marker, and nothing retries a failed run until the
+# next intentd push. scripts/release-plz-rerun.py holds the policy (planning
+# job only, never tag publication; at most three attempts).
+#
+# workflow_run reacts as soon as a run finishes. A rerun started with the
+# GITHUB_TOKEN may not raise workflow_run again on completion, so the
+# schedule is the backstop that sees the rerun's outcome.
+name: Release-plz rerun
+
+on:
+  workflow_run:
+    workflows: [Release-plz]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# One assessment at a time, so two triggers cannot both re-run the same run.
+concurrency:
+  group: release-plz-rerun
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    name: Re-run failed Release-plz planning on main's head
+    if: ${{ github.repository_owner == 'intent-hq' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'success') }}
+    # A free hosted label: this control job must work while the self-hosted
+    # fleet that runs Release-plz is the thing that is struggling.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/release-plz-rerun.py
+          sparse-checkout-cone-mode: false
+      - name: Re-run or report the Release-plz run on main's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/release-plz-rerun.py

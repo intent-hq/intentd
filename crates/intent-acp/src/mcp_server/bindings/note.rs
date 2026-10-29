@@ -211,7 +211,7 @@ async fn create(
         .map_err(map_err)?;
     let note = result.note;
     let link = format!("intent://local/{}/note/{}", ws.as_str(), note.id.as_str());
-    let markdown_link = format!("[{}]({})", note.title, link);
+    let markdown_link = super::markdown_link(&note.title, &link);
     Ok(json!({
         "id": note.id.as_str(),
         "title": note.title,

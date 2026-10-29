@@ -49,6 +49,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // Historical human identity is immutable attribution, not a grant or a
     // principal FK. Import clears the private retry principal to avoid rebinding.
     ("discussion_conversation", "workspace_id = ?1"),
+    ("workspace_discussion_conversation", "workspace_id = ?1"),
     ("discussion_participant", "workspace_id = ?1"),
     ("workspace_discussion_message", "workspace_id = ?1"),
     ("discussion_reaction", "workspace_id = ?1"),
@@ -700,7 +701,11 @@ impl Store {
                         query,
                         table,
                         key,
-                        if *table == "workspace_discussion_message" && key == "agent_activity_json"
+                        if *table == "workspace_discussion_message"
+                            && matches!(
+                                key.as_str(),
+                                "agent_activity_json" | "principal_mentions_json"
+                            )
                         {
                             &empty_activity
                         } else if history_metadata.is_some() && key == "metadata" {
@@ -1467,6 +1472,7 @@ mod tests {
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES ('conversation-{ws}','{ws}','direct','[]','{t}')"),
+            format!("INSERT INTO workspace_discussion_conversation(workspace_id,id,name,created_at) VALUES ('{ws}','shared-{ws}','Plans','{t}')"),
             format!("INSERT INTO discussion_participant(conversation_id,workspace_id,source_principal_id,principal_id) VALUES ('conversation-{ws}','{ws}','human-{ws}','human-{ws}')"),
             format!(r#"INSERT INTO workspace_discussion_message (id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES ('discussion-{ws}','{ws}',1,'human-{ws}','retry','hello','{{"principalId":"human-{ws}","login":"human","displayName":null,"avatarUrl":null}}','{t}')"#),
             format!("INSERT INTO discussion_reaction(id,workspace_id,message_id,principal_id,reaction) VALUES ('reaction-{ws}','{ws}','discussion-{ws}','human-{ws}','👍')"),
@@ -1644,6 +1650,54 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn discussion_import_clears_principal_notification_identities_and_keeps_text() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        seed(&source, "ws-mention-import").await;
+        let ws = WorkspaceId::from("ws-mention-import");
+        let mentions =
+            serde_json::json!([{"principalId":"collision","name":"Bob","start":0,"end":4}])
+                .to_string();
+        sqlx::query("UPDATE workspace_discussion_message SET body='@Bob',principal_mentions_json=? WHERE workspace_id=?")
+            .bind(&mentions).bind(ws.as_str()).execute(source.write_pool()).await.unwrap();
+        let exported = source.transfer_export_rows(&ws).await.unwrap();
+        let messages = exported
+            .iter()
+            .find(|(t, _)| t == "workspace_discussion_message")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(messages[0]["principal_mentions_json"], mentions);
+        for legacy in [false, true] {
+            let destination_db = TempDb::new();
+            let destination = Store::open(&destination_db.path).await.unwrap();
+            seed(&destination, "ws-mention-import").await;
+            sqlx::query("DELETE FROM workspace_discussion_message WHERE workspace_id=?")
+                .bind(ws.as_str())
+                .execute(destination.write_pool())
+                .await
+                .unwrap();
+            let mut rows = messages.clone();
+            if legacy {
+                rows[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("principal_mentions_json");
+            }
+            destination
+                .transfer_import_rows(&[("workspace_discussion_message".into(), rows)])
+                .await
+                .unwrap();
+            let history = destination
+                .list_discussion_messages(&ws, None, None, 50)
+                .await
+                .unwrap();
+            assert_eq!(history.messages[0].body, "@Bob");
+            assert!(history.messages[0].principal_mentions.is_empty());
+        }
     }
 
     /// Regression for intent-hq/intent#4876: the export reads every table
@@ -2025,14 +2079,15 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized, retired_at
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized, retired_at, label
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 discussion_conversation: id, workspace_id, kind, participants_json, created_at
+workspace_discussion_conversation: workspace_id, id, name, first_message_id, first_principal_id, first_client_message_id, created_at, deleted_at
 discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
-workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json
+workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json, principal_mentions_json
 discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto
