@@ -1129,3 +1129,93 @@ async fn retirement_shutdown_joins_finalizer_past_supervisor_grace() {
         "store barrier returned while a known script result was still unpersisted"
     );
 }
+
+/// Regression for the out-of-band-kill e2e race: a one-off whose process is
+/// killed outside the supervisor reaches a readable `exited` *before* its
+/// separately enqueued settlement archives it (scripts.md, "Completion,
+/// failure and cancellation": final state precedes the archive change, and a
+/// run is never hidden before its final state can be read). Parking
+/// settlement holds that window open deterministically: `exited` is visible,
+/// the one-off is still listed and no archive change has been published.
+/// Only the settlement `script:changed` (carrying `archivedAt`) signals that
+/// `script.list` excludes it.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn retirement_out_of_band_kill_exits_before_settlement_archives() {
+    let h = harness().await;
+    let id = one_off(&h, "sleep 30").await;
+    let mut sub = subscribe(&h);
+    let park = Arc::new(SupervisePark::default());
+    let mut mgr = h.services.script_manager();
+    mgr.parks.settlement_ready = Some(park.clone());
+    mgr.start(&h.ws, &id).await.unwrap();
+    let running = await_state(&mut sub, LIVENESS, |v| {
+        v["data"]["scriptId"] == id && v["data"]["status"] == "running"
+    })
+    .await;
+    let pid = i32::try_from(running["data"]["pid"].as_u64().expect("running pid")).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("SIGKILL the one-off out of band");
+
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("settlement reaches its park");
+    let status = h
+        .services
+        .script_status(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "exited", "final state readable: {status}");
+    assert!(status["exitCode"].is_i64(), "exited carries exitCode: {status}");
+    let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+    assert!(
+        listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == id),
+        "an exited one-off stays listed until settlement: {listed}"
+    );
+
+    park.release.notify_one();
+    let mut exited_seen = false;
+    let archived = tokio::time::timeout(LIVENESS, async {
+        loop {
+            for event in sub.recv().await.expect("subscription open") {
+                let event = serde_json::to_value(event).unwrap();
+                if event["data"]["scriptId"] != id {
+                    continue;
+                }
+                if event["type"] == "script:state" && event["data"]["status"] == "exited" {
+                    exited_seen = true;
+                }
+                if event["type"] == "script:changed" {
+                    assert!(
+                        exited_seen,
+                        "exited script:state precedes the archive change: {event}"
+                    );
+                    assert_eq!(event["data"]["action"], "updated", "{event}");
+                    return event;
+                }
+            }
+        }
+    })
+    .await
+    .expect("settlement publishes the archive change");
+    assert!(
+        archived["data"]["script"]["archivedAt"].is_string(),
+        "settlement change carries archivedAt: {archived}"
+    );
+    let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+    assert!(
+        listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != id),
+        "a settled one-off is absent from the active list: {listed}"
+    );
+}
