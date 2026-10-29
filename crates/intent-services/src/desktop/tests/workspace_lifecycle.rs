@@ -194,13 +194,16 @@ async fn watchdog_ends_control_once_the_workspace_is_archived_or_retired() {
                 .await
                 .unwrap());
         }
-        // One 5s watchdog tick, scaled for loaded hosts.
+        // One 5s watchdog tick, scaled for loaded hosts. Wait for the native
+        // end call, the last teardown step: control reads Inactive as soon as
+        // the watchdog drops it, before the terminal record, ended event and
+        // native call land, so polling the state races `assert_ended`.
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(7));
-        while h.services.desktop.state(&h.agent) != DesktopState::Inactive {
+        while end_calls(&h, &session_id) == 0 {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "watchdog left control active (retired={retired})"
+                "watchdog never sent the native end call (retired={retired})"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
