@@ -110,6 +110,7 @@ fn refused_launch(id: &str) -> LinkFrame {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        profile_env: None,
     })
 }
 
@@ -333,6 +334,7 @@ async fn node_shutdown_settles_launches_arriving_on_a_live_link() {
             model: None,
             base_commit: "base".into(),
             repo_key: "repo".into(),
+            profile_env: None,
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();

@@ -2,14 +2,19 @@
 //! placing a created agent on it (its `base` ref and its record on the
 //! lease), and the runtime that starts it there on its first turn.
 //!
-//! Auth in this version is the node's own provider login: head sends no
-//! credentials, and a create that selects a saved provider profile is
-//! refused before admission (never silently run on the node's account).
+//! Auth is the selected provider profile's environment overlay, resolved
+//! on head under the local selection rules and sent with the launch; the
+//! node expands `~` against its own home and applies it like a local launch.
+//! With no profile selected (and no Default-configuration overrides) head
+//! sends nothing and the node uses its own provider login. A selected
+//! profile that cannot be resolved fails the launch; it never falls back to
+//! another account. Only environment values are sent: login files stay on
+//! the node.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use intent_core::node_link::LaunchCommand;
+use intent_core::node_link::{LaunchCommand, LaunchProfileEnv};
 use intent_core::placement::{
     AgentPlacement, PlacementCheckout, PlacementTarget, PlatformAvailability,
 };
@@ -88,7 +93,7 @@ fn help_text(node: &crate::RemoteNode) -> String {
     format!(
         "Remote placement (experimental): execution node \"{name}\" (nodeId `{id}`) is {state}; platforms: {supported}; available now: {available} ({running} of {max} agents running).\n\
          To run an agent there, pass `placement: {{ target: \"remote\" }}` (optionally `os`, `arch`, `nodeId`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, {{ create: {{ placement }} }})`. A placement that no node can take fails with `placement-unavailable`, listing what is available.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), signs in with the node's own provider login (saved provider profiles are not supported), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). It has no workspace tools yet.",
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (account folders such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` must exist on the node, `~` meaning the node's home), or with the node's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). It has no workspace tools yet.",
         name = status.node_name,
         id = status.node_id,
         state = if status.connected { "connected" } else { "offline" },
@@ -224,16 +229,24 @@ impl RemoteLaunchPort for RemoteLaunch {
                         "node-agent-unplaced: agent {agent_id} has no remote placement"
                     ))
                 })?;
+            let provider = session.provider.unwrap_or_default();
+            // Resolved at every start, so the node runs with the profile's
+            // current values; an unresolvable profile fails the start.
+            let profile_env = svc
+                .resolve_remote_profile_env(&provider)
+                .await?
+                .map(|profile| LaunchProfileEnv(profile.to_node_wire()));
             let checkout = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout)).await?;
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
                     workspace_id: record.workspace_id,
-                    provider: session.provider.unwrap_or_default(),
+                    provider: intent_providers::base_provider_id(&provider).to_owned(),
                     model: session.model,
                     base_commit: view.base_commit,
                     repo_key,
+                    profile_env,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

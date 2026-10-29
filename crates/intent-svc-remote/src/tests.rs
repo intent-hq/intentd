@@ -1120,11 +1120,17 @@ mod launch {
 
         /// A created agent, placed on the node with `view`.
         async fn agent(&self, view: &RemotePlacementView) -> AgentId {
+            self.agent_with(view, "mock").await
+        }
+
+        /// A created agent of `provider`, placed on the node with `view`.
+        async fn agent_with(&self, view: &RemotePlacementView, provider: &str) -> AgentId {
             let agent = AgentId::new();
             let now = intent_core::now_iso();
-            sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+            sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', ?, ?, ?)")
                 .bind(agent.as_str())
                 .bind(workspace().as_str())
+                .bind(provider)
                 .bind(&now)
                 .bind(&now)
                 .execute(self.services.store().write_pool())
@@ -1295,6 +1301,9 @@ mod launch {
             .await;
         assert_eq!(launch.agent_id, agent);
         assert_eq!(launch.provider, "mock");
+        // No profile selected: nothing is sent and the node uses its own
+        // provider login.
+        assert_eq!(launch.profile_env, None);
         assert_eq!(launch.base_commit, f.base);
         assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
         assert!(runtime.is_alive());
@@ -1314,6 +1323,106 @@ mod launch {
         let placed = f.view(&agent).await;
         assert_eq!(placed.effective_isolation, EffectiveIsolation::Isolated);
         assert_eq!(placed.placement_error, None);
+        f.node.shutdown();
+    }
+
+    /// An agent of a saved provider profile starts on the node with the
+    /// profile's environment: the base provider id, and the overlay with
+    /// account directories as typed (the node expands `~`).
+    #[tokio::test]
+    async fn a_profile_agent_launches_with_the_profiles_environment() {
+        let mut fake = FakeNode::start().await;
+        let (f, mut link) = Fixture::start(&mut fake).await;
+        use intent_core::WorkspaceApi as _;
+        let created = intent_core::caller::with_caller(
+            intent_core::caller::Caller::Daemon,
+            f.services.provider_profiles_create(json!({
+                "baseProviderId": "codex",
+                "name": "Work",
+                "env": [
+                    { "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" },
+                    { "key": "CODEX_ACCESS_TOKEN", "kind": "set", "value": "canary-head-secret" },
+                    { "key": "OPENAI_BASE_URL", "kind": "unset" },
+                ],
+            })),
+        )
+        .await
+        .expect("create profile");
+        let reference = created["profile"]["providerRef"].as_str().unwrap();
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let agent = f.agent_with(&view, reference).await;
+        f.port()
+            .launch(
+                &f.services,
+                RemoteLaunchRequest {
+                    workspace_id: workspace(),
+                    agent_id: agent.clone(),
+                    view,
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+        let launch = link
+            .expect(|frame| match frame {
+                LinkFrame::Launch(command) => Some(command),
+                _ => None,
+            })
+            .await;
+        assert_eq!(launch.provider, "codex");
+        let wire = launch.profile_env.expect("the profile's overlay").0;
+        assert_eq!(wire["providerRef"], reference);
+        assert_eq!(
+            wire["env"],
+            json!([
+                { "key": "CODEX_HOME", "value": "~/.codex-work" },
+                { "key": "CODEX_ACCESS_TOKEN", "value": "canary-head-secret" },
+                { "key": "OPENAI_BASE_URL", "value": null },
+            ])
+        );
+        assert!(runtime.is_alive());
+        f.node.shutdown();
+    }
+
+    /// A selected profile that no longer resolves fails the start: nothing
+    /// is sent, so the node never runs it on its own login.
+    #[tokio::test]
+    async fn an_unresolved_profile_fails_the_start_without_launching() {
+        let mut fake = FakeNode::start().await;
+        let (f, mut link) = Fixture::start(&mut fake).await;
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let agent = f.agent_with(&view, "codex@gone").await;
+        f.port()
+            .launch(
+                &f.services,
+                RemoteLaunchRequest {
+                    workspace_id: workspace(),
+                    agent_id: agent.clone(),
+                    view,
+                },
+            )
+            .await
+            .unwrap();
+        let Err(error) = f.port().runtime(&f.services, &agent).await else {
+            panic!("an unresolved profile must fail the start");
+        };
+        assert!(
+            matches!(&error, Error::ProviderProfile(failure)
+                if failure.data["code"] == "provider-profile-replacement-required"),
+            "{error:?}"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                link.expect(|frame| match frame {
+                    LinkFrame::Launch(command) => Some(command),
+                    _ => None,
+                })
+            )
+            .await
+            .is_err(),
+            "no launch is sent for an unresolved profile"
+        );
         f.node.shutdown();
     }
 

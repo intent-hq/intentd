@@ -135,6 +135,11 @@ fn every_frame() -> Vec<LinkFrame> {
             model: Some("opus".into()),
             base_commit: "base".into(),
             repo_key: "repo".into(),
+            profile_env: Some(LaunchProfileEnv(json!({
+                "providerRef": "claude-code@work",
+                "fingerprint": "f1",
+                "env": [{ "key": "CLAUDE_CONFIG_DIR", "value": "~/.claude-work" }],
+            }))),
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -294,4 +299,44 @@ fn journal_ingest_order_is_contiguous_and_dedupes_replays() {
     assert_eq!(classify(42, 7), JournalOrder::Duplicate);
     assert_eq!(classify(42, 44), JournalOrder::Gap);
     assert_eq!(classify(u64::MAX, u64::MAX), JournalOrder::Duplicate);
+}
+
+#[test]
+fn launch_profile_env_never_debug_renders_its_values() {
+    let command = LaunchCommand {
+        agent_id: AgentId::from("a1"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        profile_env: Some(LaunchProfileEnv(json!({
+            "providerRef": "codex@work",
+            "fingerprint": "f1",
+            "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": "canary-secret-7f3a" }],
+        }))),
+    };
+    let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
+    assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    let wire = serde_json::to_value(LinkFrame::Launch(command)).unwrap();
+    assert_eq!(
+        wire["profileEnv"]["env"][0]["value"], "canary-secret-7f3a",
+        "the overlay itself crosses the authenticated link"
+    );
+}
+
+#[test]
+fn launch_without_a_profile_omits_profile_env() {
+    let command = LaunchCommand {
+        agent_id: AgentId::from("a1"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        profile_env: None,
+    };
+    let wire = serde_json::to_value(&command).unwrap();
+    assert!(wire.get("profileEnv").is_none(), "{wire}");
 }

@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use intent_acp::session::ActivityTracker;
 use intent_acp::{
     ClientRequestHandler, Connection, ConnectionHooks, EventSink, FileService,
-    IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, SinkEvent,
-    SpawnOptions,
+    IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, ProfileEnv,
+    SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{JournalBody, JournalRecord, LaunchCommand, LeaseBinding};
 use intent_core::nodes::NodeCounter;
@@ -38,6 +38,10 @@ pub(super) mod codes {
     pub const PROVIDER: &str = "node-provider-unavailable";
     /// The provider process could not be started or set up.
     pub const START: &str = "node-agent-start-failed";
+    /// The selected provider profile cannot be used on this node (a missing
+    /// account folder, or an overlay the node cannot read). Nothing falls
+    /// back to the node's own login.
+    pub const PROFILE: &str = "node-profile-unavailable";
     /// The agent's checkout of its base commit could not be prepared.
     pub const CHECKOUT: &str = "node-checkout-failed";
     /// The agent is not running on this node.
@@ -79,6 +83,9 @@ pub(super) struct RunnerConfig {
     pub providers: BTreeMap<String, ProviderLaunch>,
     pub checkouts: Arc<dyn Checkouts>,
     pub journal: Journal,
+    /// The node user's home: a leading `~` in a profile's account directory
+    /// expands against it.
+    pub home: Option<PathBuf>,
 }
 
 /// The node's agents. Cloning shares them.
@@ -92,6 +99,7 @@ struct Inner {
     policy: PermissionPolicy,
     providers: BTreeMap<String, ProviderLaunch>,
     checkouts: Arc<dyn Checkouts>,
+    home: Option<PathBuf>,
     journal: Arc<Mutex<Journal>>,
     appended: watch::Sender<NodeCounter>,
     state: Mutex<State>,
@@ -191,6 +199,7 @@ impl Runner {
                 policy: config.policy,
                 providers: config.providers,
                 checkouts: config.checkouts,
+                home: config.home,
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
                 state: Mutex::new(State::default()),
@@ -273,6 +282,7 @@ impl Runner {
             model,
             base_commit,
             repo_key,
+            profile_env,
         } = command;
         let exited = |error: String| JournalEntry {
             agent_id: agent_id.clone(),
@@ -316,6 +326,16 @@ impl Runner {
                 configured.join(", ")
             )));
         };
+        let profile = match profile_env
+            .map(|wire| self.node_profile(&wire.0))
+            .transpose()
+        {
+            Ok(profile) => profile,
+            Err(error) => {
+                drop(state);
+                return Some(exited(format!("{}: {error}", codes::PROFILE)));
+            }
+        };
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
@@ -351,10 +371,14 @@ impl Runner {
             pumps.push(pump);
         }
         // caller-binding: allow — node-local provider process; the node has no service layer
-        tokio::spawn(
-            self.clone()
-                .run_agent(agent, launch, model, notes_tx, ready_tx, stop_rx),
-        );
+        tokio::spawn(self.clone().run_agent(
+            agent,
+            (launch, profile),
+            model,
+            notes_tx,
+            ready_tx,
+            stop_rx,
+        ));
         None
     }
 
@@ -420,7 +444,7 @@ impl Runner {
     async fn run_agent(
         self,
         agent: Arc<Agent>,
-        launch: ProviderLaunch,
+        (launch, profile): (ProviderLaunch, Option<ProfileEnv>),
         model: Option<String>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
         ready: watch::Sender<Option<Arc<Ready>>>,
@@ -440,8 +464,14 @@ impl Runner {
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
             Some(Ok(cwd)) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                self.start(&agent, &launch, model.as_deref(), notes, cwd)
-                    .map_err(|error| Some(format!("{}: {error}", codes::START)))
+                self.start(
+                    &agent,
+                    (&launch, profile.as_ref()),
+                    model.as_deref(),
+                    notes,
+                    cwd,
+                )
+                .map_err(|error| Some(format!("{}: {error}", codes::START)))
             }
         };
         let (exit_code, error) = match started {
@@ -516,7 +546,7 @@ impl Runner {
     fn start(
         &self,
         agent: &Agent,
-        launch: &ProviderLaunch,
+        (launch, profile): (&ProviderLaunch, Option<&ProfileEnv>),
         model: Option<&str>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
         cwd: PathBuf,
@@ -532,6 +562,7 @@ impl Runner {
         options.cwd = Some(&cwd);
         options.provider_binary = Some(&launch.binary);
         options.model = model;
+        options.profile_env = profile;
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
@@ -606,6 +637,20 @@ impl Runner {
             status = child.wait() => Outcome::Exited(status.ok().and_then(|s| s.code())),
             _ = &mut *stop => Outcome::Stopped,
         }
+    }
+
+    /// The overlay a launch's profile runs with on this node: parsed
+    /// strictly, then each account directory's leading `~` expanded against
+    /// the node's home and required to exist. The error never renders a
+    /// value.
+    fn node_profile(&self, wire: &Value) -> Result<ProfileEnv, String> {
+        let profile = ProfileEnv::from_node_wire(wire).ok_or_else(|| {
+            "the selected provider profile's environment could not be read; no other account was used"
+                .to_owned()
+        })?;
+        profile
+            .for_node(self.inner.home.as_deref())
+            .map_err(|missing| missing.to_string())
     }
 
     /// Run a turn. Its output streams as notifications; its end (or why it

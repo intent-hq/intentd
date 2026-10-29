@@ -241,29 +241,6 @@ impl ProfileEnv {
         ))
     }
 
-    /// Compose a launch environment with the local-launch precedence:
-    /// `inherited`, then this profile (`set` replaces, `unset` removes),
-    /// then Intent's own `wiring`, which a profile can never override.
-    #[must_use]
-    pub fn compose_launch_env(
-        &self,
-        mut inherited: BTreeMap<String, String>,
-        wiring: impl IntoIterator<Item = (String, String)>,
-    ) -> BTreeMap<String, String> {
-        for (key, value) in &self.entries {
-            match value {
-                Some(value) => {
-                    inherited.insert(key.clone(), value.clone());
-                }
-                None => {
-                    inherited.remove(key);
-                }
-            }
-        }
-        inherited.extend(wiring);
-        inherited
-    }
-
     /// Apply the overlay to a command as explicit overrides.
     pub fn apply_to_command(&self, command: &mut tokio::process::Command) {
         for (key, value) in &self.entries {
@@ -472,42 +449,6 @@ mod tests {
         assert!(node_profile("CODEX_HOME", file.to_str().unwrap())
             .for_node(Some(node.path()))
             .is_err());
-    }
-
-    #[test]
-    fn launch_env_precedence_is_inherited_then_profile_then_intent_wiring() {
-        let profile = ProfileEnv::new(
-            "codex@work",
-            "f",
-            vec![
-                ("CODEX_ACCESS_TOKEN".into(), Some("profile-token".into())),
-                ("OPENAI_BASE_URL".into(), None),
-                ("PATH".into(), Some("/profile/bin".into())),
-                ("CODEX_HOME".into(), Some("/node/.codex-work".into())),
-            ],
-        );
-        let inherited = BTreeMap::from([
-            ("CODEX_HOME".to_string(), "/node/.codex".to_string()),
-            (
-                "OPENAI_BASE_URL".to_string(),
-                "https://inherited".to_string(),
-            ),
-            ("LANG".to_string(), "C.UTF-8".to_string()),
-        ]);
-        let wiring = [("PATH".to_string(), "/intent/bin".to_string())];
-        let env = profile.compose_launch_env(inherited, wiring);
-        assert_eq!(
-            env,
-            BTreeMap::from([
-                (
-                    "CODEX_ACCESS_TOKEN".to_string(),
-                    "profile-token".to_string()
-                ),
-                ("CODEX_HOME".to_string(), "/node/.codex-work".to_string()),
-                ("LANG".to_string(), "C.UTF-8".to_string()),
-                ("PATH".to_string(), "/intent/bin".to_string()),
-            ])
-        );
     }
 
     #[test]

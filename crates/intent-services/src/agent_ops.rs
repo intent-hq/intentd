@@ -5363,10 +5363,11 @@ impl Services {
     }
 
     /// Admission of a create with a `placement`, before anything is
-    /// written: the documented subset only, the node's own provider login
-    /// (a selected provider profile cannot be sent to a node yet, and is
-    /// never silently replaced by the node's account), then the node's
-    /// platform and capacity.
+    /// written: the documented subset only, a provider selection whose
+    /// profile environment resolves (a missing or unselectable profile fails
+    /// here, never falling back to the node's own login; the overlay itself
+    /// is resolved again when the agent starts), then the node's platform
+    /// and capacity.
     async fn admit_remote_agent(
         &self,
         workspace_id: &WorkspaceId,
@@ -5374,11 +5375,7 @@ impl Services {
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
         placement.check_remote_supported()?;
-        if crate::provider_profiles::is_qualified_ref(provider) {
-            return Err(Error::InvalidParams(
-                "remote-auth-unsupported: a remote agent signs in with the execution node's own provider login; choose the provider itself, not a saved profile".into(),
-            ));
-        }
+        self.resolve_remote_profile_env(provider).await?;
         self.ports
             .remote_launch()
             .admit(self, workspace_id, placement)
