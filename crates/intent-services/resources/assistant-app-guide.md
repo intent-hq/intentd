@@ -417,9 +417,11 @@ or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
 
 Selecting a workspace opens its preview on the top-level agent (not a background or
-delegated agent) with the most recent activity. The preview keeps that agent while it
-stays open; choose another from the agent menu above the chat, and Home keeps that
-choice for the workspace until the app restarts.
+delegated agent) with the most recent activity; a workspace with no top-level agent
+left opens on its most recently active remaining agent. The preview keeps that agent
+while it stays open unless the agent is retired or deleted. Choose another from the
+agent menu above the chat; Home remembers that choice for the workspace until the app
+restarts, the account or connection changes, or Home is reset.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
