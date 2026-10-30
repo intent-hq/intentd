@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.82] - 2026-10-30
+
+### 🧪 Testing
+
+- Prove no secret value survives any agent-facing egress ([#2827](https://github.com/intent-hq/intentd/pull/2827))
+
+
 ## [0.11.81] - 2026-10-30
 
 ### 🐛 Bug Fixes
