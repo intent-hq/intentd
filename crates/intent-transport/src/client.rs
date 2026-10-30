@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
-use crate::reverse::ReverseClientIdentity;
+use crate::reverse::{ClaimedHello, HelloClaim};
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
@@ -165,10 +165,11 @@ fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
 
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
-/// task binds onto its reverse-registry entry (REV-2).
+/// task binds onto its reverse-registry entry (REV-2). It comes from the
+/// hello's [`HelloClaim`], so it names the id the claim reserved.
 pub(crate) struct HelloOutcome {
     pub frame: Option<String>,
-    pub bound: Option<ReverseClientIdentity>,
+    pub bound: Option<ClaimedHello>,
 }
 
 pub(crate) fn reject_role(req: &ClientRequest) -> Option<String> {
@@ -236,12 +237,20 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// host identification and re-returns the same `server` block (PROTOCOL
 /// §5.17). `version` is the daemon binary's version
 /// ([`crate::SystemControl::daemon_version`]), never this crate's own.
+///
+/// `claim` claims the resolved id for the connection
+/// ([`crate::reverse::PrimaryReverseGuard::claim_hello`]) before the client
+/// row is persisted, so the id is active for the superseded-id rehome
+/// throughout (intent-hq/intent#8045) — a server-generated id too, before the
+/// response reveals it. The claim alone supplies the id this hello persists,
+/// replies with and binds; a failed hello drops it, releasing the reservation.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
     version: &str,
+    claim: impl FnOnce(ClientId) -> HelloClaim,
 ) -> HelloOutcome {
     if req.connection_role != ConnectionRole::Ordinary {
         return HelloOutcome {
@@ -266,7 +275,10 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
-    let resolved = scope_to_caller(req.client_id.map(ClientId::from_string).unwrap_or_default());
+    let claim = claim(scope_to_caller(
+        req.client_id.map(ClientId::from_string).unwrap_or_default(),
+    ));
+    let resolved = claim.client_id().clone();
     if let Err(e) = api
         .upsert_client(
             resolved.clone(),
@@ -309,12 +321,11 @@ pub(crate) async fn handle(
                 "server": server,
             })),
         ),
-        bound: Some(ReverseClientIdentity {
-            client_id: resolved,
-            name: req.name,
-            capabilities: req.capabilities.unwrap_or_else(|| json!({})),
-            host: req.host,
-        }),
+        bound: Some(claim.complete(
+            req.name,
+            req.capabilities.unwrap_or_else(|| json!({})),
+            req.host,
+        )),
     }
 }
 

@@ -967,14 +967,6 @@ async fn process_captured_frame(
                     == Some(1);
             // A new hello revokes the previous connection-local operation.
             subs.setup = crate::provider_setup::Connection::default();
-            // Mark the presented id active before the hello persists its client
-            // row (intent-hq/intent#8045), and for the connection's life once
-            // it succeeds: a concurrent superseded-id rehome then never moves
-            // this host, whether it binds now or after a later role change.
-            let binding = req.client_id.as_ref().and_then(|id| {
-                reverse_guard
-                    .reserve_binding(client::scope_to_caller(ClientId::from_string(id.clone())))
-            });
             let mut bound = None;
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
                 let outcome = client::handle(
@@ -983,6 +975,12 @@ async fn process_captured_frame(
                     client_id,
                     is_local,
                     hello_version(control),
+                    // Mark the resolved id active before the hello persists
+                    // its client row (intent-hq/intent#8045), and for the
+                    // connection's life once it succeeds: a concurrent
+                    // superseded-id rehome then never moves this host,
+                    // whether it binds now or after a later role change.
+                    |id| reverse_guard.claim_hello(id),
                 )
                 .await;
                 bound = outcome.bound;
@@ -1003,49 +1001,29 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
-            // A server-generated id (no `clientId` presented) is reserved as
-            // soon as it is resolved — before the response reveals it, so no
-            // client can present a namespaced form of it earlier.
-            let binding = match (binding, &bound) {
-                (None, Some(identity)) => reverse_guard.reserve_binding(identity.client_id.clone()),
-                (binding, _) => binding,
-            };
-            let ordinary_source = bound.as_ref().and_then(|identity| {
+            let ordinary_source = bound.as_ref().and_then(|claimed| {
                 let principal = crate::context::current_caller()?.principal_id()?.clone();
-                reverse_guard.prepare_ordinary_monitor_source(identity.client_id.clone(), principal)
+                reverse_guard.prepare_ordinary_monitor_source(
+                    claimed.identity().client_id.clone(),
+                    principal,
+                )
             });
-            if let Some(identity) = bound {
+            if let Some(claimed) = bound {
                 reverse
                     .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
                 if let Some(principal) = crate::context::current_caller()
                     .and_then(|caller| caller.principal_id().cloned())
                 {
-                    reverse_guard.bind_device(identity.clone(), principal);
+                    reverse_guard.bind_device(claimed.identity().clone(), principal);
                 }
                 // A successful hello keeps its reservation, paired with the
                 // identity, until the connection closes or hellos again; the
                 // previous hello's binding is released only after this bind.
-                match binding.map(|reservation| reservation.into_hello_binding(identity)) {
-                    Some(Ok(hello)) => {
-                        reverse_guard.bind(&hello);
-                        subs.hello = Some(hello);
-                    }
-                    // Fail closed: never bind an unreserved id, and never
-                    // keep the previous hello's identity bound or rebindable.
-                    Some(Err(reservation)) => {
-                        tracing::warn!(
-                            client_id = %reservation.client_id().as_str(),
-                            "client.hello: bound identity differs from its reservation; unbinding"
-                        );
-                        reverse_guard.unbind();
-                        subs.hello = None;
-                    }
-                    // A detached guard (registry shutting down) reserves nothing.
-                    None => {}
+                // A detached guard (registry shutting down) reserves nothing.
+                if let crate::reverse::ClaimedHello::Reserved(hello) = claimed {
+                    reverse_guard.bind(&hello);
+                    subs.hello = Some(hello);
                 }
-            } else {
-                // A failed hello releases its reservation.
-                drop(binding);
             }
             // Multiplayer w5: a hello'd connection is online for its
             // principal. Best-effort — a refusal (no wire caller) only

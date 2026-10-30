@@ -1064,25 +1064,101 @@ impl BindingReservation {
         &self.client_id
     }
 
-    /// Pair this reservation with the identity a successful `client.hello`
-    /// resolved, producing the only value [`PrimaryReverseGuard::bind`]
-    /// accepts. Refused — the reservation is handed back — when `identity`
-    /// names a different `clientId` than the one reserved, so a bound host is
-    /// always one [`PrimaryReverseRegistry::client_active`] already reports
-    /// (intent-hq/intent#8045).
-    ///
-    /// # Errors
-    ///
-    /// Returns the reservation unchanged when `identity.client_id` differs
-    /// from [`Self::client_id`].
-    pub fn into_hello_binding(self, identity: ReverseClientIdentity) -> Result<HelloBinding, Self> {
-        if identity.client_id != self.client_id {
-            return Err(self);
-        }
-        Ok(HelloBinding {
+    /// Pair this reservation with the profile a successful `client.hello`
+    /// presented, producing the only value [`PrimaryReverseGuard::bind`]
+    /// accepts. The bound identity takes its `clientId` from the reservation
+    /// itself, so a bound host is always one
+    /// [`PrimaryReverseRegistry::client_active`] already reports
+    /// (intent-hq/intent#8045) — there is no identity to mismatch.
+    #[must_use]
+    pub fn into_hello_binding(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> HelloBinding {
+        let identity = ReverseClientIdentity {
+            client_id: self.client_id.clone(),
+            name,
+            capabilities,
+            host,
+        };
+        HelloBinding {
             reservation: self,
             identity,
-        })
+        }
+    }
+}
+
+/// The `clientId` a `client.hello` resolved, claimed for this connection
+/// ([`PrimaryReverseGuard::claim_hello`]) before the hello persists its client
+/// row. Holds the id's [`BindingReservation`] — none for a detached guard —
+/// and is the only source of the identity the hello binds
+/// ([`Self::complete`]), so the bound, reserved and persisted ids are one
+/// value by construction. Dropping it releases the reservation.
+pub struct HelloClaim {
+    client_id: ClientId,
+    reservation: Option<BindingReservation>,
+}
+
+impl HelloClaim {
+    /// A claim that reserves nothing, as a detached guard's claim does.
+    /// Its hello completes without a [`HelloBinding`], so it can never bind.
+    #[must_use]
+    pub fn unreserved(client_id: ClientId) -> Self {
+        Self {
+            client_id,
+            reservation: None,
+        }
+    }
+
+    /// The claimed `clientId`.
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    /// Finish a successful hello with the profile it presented: the claimed
+    /// id plus that profile, paired with the claim's reservation when it has
+    /// one.
+    #[must_use]
+    pub fn complete(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> ClaimedHello {
+        match self.reservation {
+            Some(reservation) => {
+                ClaimedHello::Reserved(reservation.into_hello_binding(name, capabilities, host))
+            }
+            None => ClaimedHello::Unreserved(ReverseClientIdentity {
+                client_id: self.client_id,
+                name,
+                capabilities,
+                host,
+            }),
+        }
+    }
+}
+
+/// A successful `client.hello`'s identity ([`HelloClaim::complete`]):
+/// bindable when its claim held a reservation.
+pub enum ClaimedHello {
+    /// Reserved: the connection may bind it ([`PrimaryReverseGuard::bind`]).
+    Reserved(HelloBinding),
+    /// Unreserved (a detached guard): never bound as a browser host.
+    Unreserved(ReverseClientIdentity),
+}
+
+impl ClaimedHello {
+    /// The hello'd identity.
+    #[must_use]
+    pub fn identity(&self) -> &ReverseClientIdentity {
+        match self {
+            Self::Reserved(hello) => hello.identity(),
+            Self::Unreserved(identity) => identity,
+        }
     }
 }
 
@@ -1092,8 +1168,8 @@ impl BindingReservation {
 /// takes one, so every bind path — the hello itself and a later role change —
 /// necessarily holds the reservation the superseded-id tab rehome relies on
 /// (intent-hq/intent#8045): a bind path without one does not compile.
-/// Built only by [`BindingReservation::into_hello_binding`]; dropping it
-/// releases the reservation.
+/// Built only by [`BindingReservation::into_hello_binding`], which takes its
+/// `clientId` from the reservation; dropping it releases the reservation.
 pub struct HelloBinding {
     reservation: BindingReservation,
     identity: ReverseClientIdentity,
@@ -1143,6 +1219,19 @@ impl PrimaryReverseGuard {
             connection: self.id,
             client_id,
         })
+    }
+
+    /// Claim `client_id` for this connection's `client.hello`
+    /// ([`HelloClaim`]): reserve it ([`Self::reserve_binding`]) and carry it
+    /// as the id the hello persists and binds. A detached guard's claim is
+    /// unreserved.
+    #[must_use]
+    pub fn claim_hello(&self, client_id: ClientId) -> HelloClaim {
+        let reservation = self.reserve_binding(client_id.clone());
+        HelloClaim {
+            client_id,
+            reservation,
+        }
     }
 
     pub(crate) fn desktop_connection(&self) -> Option<intent_core::desktop::DesktopConnection> {
@@ -1265,10 +1354,9 @@ impl PrimaryReverseGuard {
     /// Panics on a detached guard, which has no registry to reserve in.
     pub(crate) fn bind_hello(&self, identity: ReverseClientIdentity) -> HelloBinding {
         let hello = self
-            .reserve_binding(identity.client_id.clone())
+            .reserve_binding(identity.client_id)
             .expect("registered guard")
-            .into_hello_binding(identity)
-            .unwrap_or_else(|_| unreachable!("reserved the identity's own id"));
+            .into_hello_binding(identity.name, identity.capabilities, identity.host);
         self.bind(&hello);
         hello
     }
