@@ -241,6 +241,15 @@ impl SecretVault {
         })
     }
 
+    /// Whether the agent has any pending (unanswered) request. Memory only,
+    /// so a restart ends the pending state with the requests themselves.
+    pub(crate) fn has_pending(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> bool {
+        self.lock()
+            .agents
+            .get(&(workspace_id.clone(), agent_id.clone()))
+            .is_some_and(|entry| !entry.pending.is_empty())
+    }
+
     /// The owner of a pending request in `workspace_id`, without answering it.
     pub(crate) fn pending_owner(
         &self,
@@ -372,6 +381,29 @@ impl SecretVault {
         state.agents.retain(|key, _| &key.0 != workspace_id);
         state.requests.retain(|_, key| &key.0 != workspace_id);
     }
+}
+
+/// The `requestId`s of the secret-request resource blocks in a message's
+/// content-block array, in block order. Malformed blocks are skipped.
+pub(crate) fn secret_request_ids(content: &Value) -> Vec<String> {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("resource")
+                && block.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE)
+        })
+        .filter_map(|block| {
+            let text = block.pointer("/resource/text").and_then(Value::as_str)?;
+            let payload: Value = serde_json::from_str(text).ok()?;
+            payload
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Replace every exact occurrence of a secret value with `[secret:NAME]` in
@@ -611,6 +643,8 @@ impl Services {
             "requestId": request_id,
             "name": answer.name,
         });
+        // Answering may end the workspace's needs-attention state (§5.56).
+        self.maybe_emit_display_status_changed(&workspace_id).await;
         if let Err(error) = WorkspaceApi::agent_send_message(
             self,
             workspace_id,
@@ -636,6 +670,45 @@ impl Services {
             );
         }
         Ok(json!({ "ok": true, "requestId": request_id, "name": answer.name }))
+    }
+
+    /// `agent.dismissQuestions` on a message also declines that message's
+    /// pending secret requests (PROTOCOL §5.56 "Attention"), one declined
+    /// notice each. One bounded single-message read; requests already
+    /// answered, lost or owned by another agent are skipped.
+    pub(crate) async fn decline_secret_requests_on_message(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) {
+        let message = match self
+            .store
+            .get_agent_message_by_id(agent_id, message_id)
+            .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, error = %error, "secret request decline: message read failed");
+                return;
+            }
+        };
+        for request_id in secret_request_ids(&message.content) {
+            let owned = self
+                .secret_vault
+                .pending_owner(workspace_id, &request_id)
+                .is_some_and(|owner| &owner.agent_id == agent_id);
+            if !owned {
+                continue;
+            }
+            if let Err(error) = self
+                .secret_answer_op(workspace_id.clone(), request_id, Outcome::Declined, None)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %error, "secret request decline failed");
+            }
+        }
     }
 
     /// `ws.host.exec` from an agent's own turn: resolve `secretEnv` from the
@@ -981,6 +1054,37 @@ mod tests {
         assert_eq!(on["secretRequests"], json!(true));
         let decoded: AgentFeaturesSettings = serde_json::from_value(on).unwrap();
         assert!(decoded.secret_requests);
+    }
+
+    #[test]
+    fn has_pending_tracks_open_requests_only() {
+        let vault = SecretVault::default();
+        let (w, a) = (ws("w"), agent("a"));
+        assert!(!vault.has_pending(&w, &a));
+        let ticket = vault.request(&w, &a, "KEY").unwrap();
+        assert!(vault.has_pending(&w, &a));
+        assert!(!vault.has_pending(&ws("other"), &a));
+        vault
+            .answer(&w, &ticket.request_id, Outcome::Provided, Some(secret("v")))
+            .unwrap();
+        assert!(!vault.has_pending(&w, &a));
+    }
+
+    #[test]
+    fn secret_request_ids_reads_only_well_formed_cards() {
+        let mime = intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE;
+        let content = json!([
+            { "type": "text", "text": "hi" },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "{\"requestId\":\"sec-1\"}" } },
+            { "type": "resource", "resource": { "mimeType": "application/vnd.intent.question+json", "text": "{\"requestId\":\"q\"}" } },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "not json" } },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "{\"requestId\":\"sec-2\"}" } },
+        ]);
+        assert_eq!(
+            secret_request_ids(&content),
+            vec!["sec-1".to_string(), "sec-2".to_string()]
+        );
+        assert!(secret_request_ids(&json!("text")).is_empty());
     }
 
     #[test]
