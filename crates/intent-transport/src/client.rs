@@ -281,6 +281,22 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
+    let superseded = superseded_client_ids(&resolved);
+    // Rehoming tabs is browser management: it needs the same current host
+    // execution authority as the browser RPCs, not just namespace ownership
+    // (a member demoted to guest keeps its namespace but loses the browser).
+    if !superseded.is_empty() && crate::context::may_manage_workspaces(api).await {
+        if let Err(e) = api
+            .rehome_superseded_browser_tabs(resolved.clone(), superseded)
+            .await
+        {
+            tracing::warn!(
+                client_id = %resolved.as_str(),
+                error = %e,
+                "client.hello: rehoming browser tabs from superseded client ids failed"
+            );
+        }
+    }
     *client_id = Some(resolved.clone());
     let server = connection_server_json(is_local, version);
     HelloOutcome {
@@ -300,6 +316,24 @@ pub(crate) async fn handle(
             host: req.host,
         }),
     }
+}
+
+/// Earlier ids of the device that hello'd as `resolved` (intent-hq/intent#8045):
+/// every proper `:`-suffix of `resolved` (for `a:b:c`, `b:c` then `c`) — the
+/// ids it presented before a backend namespaced it ([`scope_to_caller`]) —
+/// kept only when the caller may already act as that id
+/// (`scope_to_caller(id) == id`). The administrator may act as any id; a
+/// collaborator only inside its own `{principalId}:` namespace, so presenting
+/// another member's raw id (resolved to `{principalId}:{raw}`) never reaches
+/// that member's tabs.
+pub(crate) fn superseded_client_ids(resolved: &ClientId) -> Vec<ClientId> {
+    let raw = resolved.as_str();
+    raw.match_indices(':')
+        .map(|(i, _)| &raw[i + 1..])
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| ClientId::from_string(tail.to_string()))
+        .filter(|id| scope_to_caller(id.clone()) == *id)
+        .collect()
 }
 
 /// Build the response frame for a `client.hello` result, or `None` for a

@@ -8026,6 +8026,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `client.hello` follow-up (intent-hq/intent#8045): move the open
+    /// browser tabs still hosted by `superseded` — earlier ids of the same
+    /// device that a backend later prefixed into `client_id`, already limited
+    /// by the transport to ids the caller may act as — onto `client_id`,
+    /// skipping any superseded id with a live connection, and publish
+    /// `browser:tab-updated` per moved tab. Returns how many tabs moved. The
+    /// default moves nothing.
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        let _ = (client_id, superseded);
+        Box::pin(async { Ok(0) })
+    }
+
     /// Anonymous-connection draft placeholder: ensure a `client` row exists for
     /// a connection-scoped `client_id` minted on its first draft write, so the
     /// draft FK is satisfied. Unlike [`Self::upsert_client`] this records no
@@ -9516,6 +9532,16 @@ pub trait AgentReverseDispatch: Send + Sync {
     /// projection). The default reports no clients.
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         Vec::new()
+    }
+
+    /// Whether `client_id` is live or about to be: a hello'd connection, or a
+    /// `client.hello` in flight that has not bound yet. The superseded-id tab
+    /// rehome (intent-hq/intent#8045) never moves such a host. The default
+    /// consults [`Self::live_clients`] only.
+    fn client_active(&self, client_id: &ClientId) -> bool {
+        self.live_clients()
+            .iter()
+            .any(|client| &client.client_id == client_id)
     }
 
     /// Every live hello'd connection grouped by client, plus where each of

@@ -1695,3 +1695,26 @@ fn connection_snapshot_route_uses_the_listed_client_name() {
     assert_eq!(snapshot.routes[0].connection_id, Some(0));
     assert_eq!(snapshot.routes[0].name.as_deref(), Some("New"));
 }
+
+/// intent-hq/intent#8045: an id with a `client.hello` in flight counts as
+/// active from its reservation until it is released, and stays active once
+/// bound — so the superseded-id rehome never moves a host about to bind.
+#[test]
+fn client_active_covers_in_flight_hellos_and_bound_clients() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desktop, _rx) = idle_channel();
+    let guard = reg.register(desktop, ReverseTransport::Wss);
+    let id = ClientId::from_string("dev-1");
+    assert!(!reg.client_active(&id));
+
+    let first = guard.reserve_binding(id.clone()).expect("registered guard");
+    let second = guard.reserve_binding(id.clone()).expect("registered guard");
+    assert!(reg.client_active(&id), "reserved before the hello persists");
+    drop(first);
+    assert!(reg.client_active(&id), "reservations are counted");
+    guard.bind(identity("dev-1", true));
+    drop(second);
+    assert!(reg.client_active(&id), "bound after the reservation");
+    drop(guard);
+    assert!(!reg.client_active(&id), "gone with its last connection");
+}
