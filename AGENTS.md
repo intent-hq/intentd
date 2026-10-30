@@ -243,7 +243,7 @@ standalone clone they exit 2 and name the monorepo command):
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
-make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes; an intent-core change also selects every crate depending on it; also runs the end-to-end and library unit-test modules .config/e2e-test-map.txt maps changed source to — add an entry when an end-to-end test or another crate's unit test exercises a crate's source (`<crate>::lib <module>` names unit tests) (scripts/changed-tests.sh --check-map validates it)
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes; an intent-core change also selects every crate depending on it, and an intent-js change the library unit tests of the crates depending on it directly; also runs the end-to-end and library unit-test modules .config/e2e-test-map.txt maps changed source to — add an entry when an end-to-end test or another crate's unit test exercises a crate's source (`<crate>::lib <module>` names unit tests) (scripts/changed-tests.sh --check-map validates it)
 make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
