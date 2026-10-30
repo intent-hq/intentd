@@ -17,11 +17,20 @@
 //! scaffolding; its module doc spells out those semantics. The rule itself is
 //! deliberately small:
 //!
-//! - A statement is flagged when it contains a fold call (`to_lowercase`,
+//! - A statement is flagged when one of its fold calls (`to_lowercase`,
 //!   `to_ascii_lowercase`, `eq_ignore_ascii_case`, `make_ascii_lowercase`)
-//!   AND a slug identifier: an identifier token with an underscore-delimited
-//!   component equal to `owner`, `repo`, `repository`, or `slug`, or the bare
-//!   token `name` when the same statement also carries an `owner` component.
+//!   has a slug identifier among its operands: an identifier token with an
+//!   underscore-delimited component equal to `owner`, `repo`, `repository`,
+//!   or `slug`, or the bare token `name` when the same statement also carries
+//!   an `owner` component.
+//! - A fold's operands are its receiver chain and argument group, the
+//!   receiver of the enclosing method call when the fold is passed as a value
+//!   (`.map(str::to_lowercase)`) or runs on a closure parameter
+//!   (`.map(|n| n.to_lowercase())`), and the left-hand side of an `=` whose
+//!   whole right-hand side is the fold's chain (`let repo = x.to_lowercase()`).
+//!   A slug identifier elsewhere in the statement does not count: a git
+//!   handle named `repo` next to a fold of a commit id is not slug identity
+//!   (intent-hq/intentd#2810). See `fold_operand_words` for the exact walk.
 //! - Skipped: `crates/intent-core/src/repo_ref.rs`, on top of the test code
 //!   the shared walker and `#[cfg(test)]` blanking leave out.
 //! - Opt-out: `// repo-slug-fold: allow — <reason>` on the line immediately
@@ -58,42 +67,295 @@ struct Hit {
     marker_malformed: bool,
 }
 
-/// ASCII identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`) in `text`.
-fn identifiers(text: &str) -> Vec<&str> {
+/// One token of a blanked statement: a word (identifier, keyword, or number)
+/// or a punctuation token (multi-character operators kept whole).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok<'a> {
+    Word(&'a str),
+    Punct(&'a str),
+}
+
+/// Multi-character operators, longest first, so `==` never reads as an
+/// assignment `=` and `::` never as two `:`.
+const MULTI_PUNCT: &[&str] = &[
+    "..=", "...", "<<=", ">>=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
+    "*=", "/=", "%=", "^=", "|=", "&=", "<<", ">>", "..",
+];
+/// Punctuation the backward receiver walk steps over: method and field
+/// access, paths, `?`, and the leftovers of type ascription / lifetimes /
+/// attributes. Every other punctuation token ends the receiver.
+const CHAIN_PUNCT: &[&str] = &[".", "::", "?", ":", "'", "#"];
+/// Keywords that end the receiver walk (`for c in <receiver>`, `return x`).
+const STOP_WORDS: &[&str] = &["in", "return", "break", "yield"];
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn tokens(text: &str) -> Vec<Tok<'_>> {
     let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    for (idx, c) in text.char_indices() {
-        let word_char = c.is_ascii_alphanumeric() || c == '_';
-        match (start, word_char) {
-            (None, true) => start = Some(idx),
-            (Some(s), false) => {
-                out.push(&text[s..idx]);
-                start = None;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let word = is_word_char(c);
+        let len = if word {
+            rest.find(|ch: char| !is_word_char(ch))
+                .unwrap_or(rest.len())
+        } else {
+            MULTI_PUNCT
+                .iter()
+                .find(|p| rest.starts_with(**p))
+                .map_or(c.len_utf8(), |p| p.len())
+        };
+        let (tok, tail) = rest.split_at(len);
+        out.push(if word {
+            Tok::Word(tok)
+        } else {
+            Tok::Punct(tok)
+        });
+        rest = tail;
+    }
+    out
+}
+
+/// For every `(` / `[` / `)` / `]`, the index of its matching bracket; `None`
+/// when unbalanced (a statement cut at a `{` can leave an opener unclosed).
+fn partners(toks: &[Tok]) -> Vec<Option<usize>> {
+    let mut out = vec![None; toks.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match *t {
+            Tok::Punct("(" | "[") => stack.push(i),
+            Tok::Punct(close @ (")" | "]")) => {
+                let want = if close == ")" { "(" } else { "[" };
+                if let Some(&open) = stack.last() {
+                    if toks[open] == Tok::Punct(want) {
+                        stack.pop();
+                        out[open] = Some(i);
+                        out[i] = Some(open);
+                    }
+                }
             }
             _ => {}
         }
     }
-    if let Some(s) = start {
-        out.push(&text[s..]);
-    }
-    out.retain(|id| id.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
     out
+}
+
+/// Start of the expression chain that ends just before `end`: walks back
+/// over words, chain punctuation, and balanced `(…)` / `[…]` groups until a
+/// statement boundary, an unmatched opener, an operator, `,`, `|`, or a stop
+/// keyword. Keywords left over from a chained operand block (`if c else`,
+/// `match x`, `unsafe`) are stepped over like any other word.
+fn chain_start(toks: &[Tok], partner: &[Option<usize>], end: usize) -> usize {
+    let mut j = end;
+    while j > 0 {
+        match toks[j - 1] {
+            Tok::Punct(")" | "]") => match partner[j - 1] {
+                Some(open) => j = open,
+                None => break,
+            },
+            Tok::Punct(p) if !CHAIN_PUNCT.contains(&p) => break,
+            Tok::Word(w) if STOP_WORDS.contains(&w) => break,
+            _ => j -= 1,
+        }
+    }
+    j
+}
+
+/// Innermost `(` / `[` before `pos` whose group contains `pos`.
+fn enclosing_open(toks: &[Tok], partner: &[Option<usize>], pos: usize) -> Option<usize> {
+    let mut j = pos;
+    while j > 0 {
+        j -= 1;
+        match toks[j] {
+            Tok::Punct(")" | "]") => {
+                if let Some(open) = partner[j] {
+                    j = open;
+                }
+            }
+            Tok::Punct("(" | "[") => return Some(j),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the `.` when the `(` at `open` is a method call `.m(`.
+fn method_dot(toks: &[Tok], open: usize) -> Option<usize> {
+    (toks[open] == Tok::Punct("(")
+        && open >= 2
+        && matches!(toks[open - 1], Tok::Word(_))
+        && toks[open - 2] == Tok::Punct("."))
+    .then(|| open - 2)
+}
+
+/// Parameter words of the last closure argument (`|a, (b, c)|` right after
+/// the `(`, a `,`, or `move`) that opens at the top level of the group at
+/// `open` before `pos` — the closure whose body holds `pos`.
+fn closure_params<'a>(
+    toks: &[Tok<'a>],
+    partner: &[Option<usize>],
+    open: usize,
+    pos: usize,
+) -> Vec<&'a str> {
+    let mut params = Vec::new();
+    let mut k = open + 1;
+    while k < pos {
+        match toks[k] {
+            Tok::Punct("(" | "[") => k = partner[k].map_or(pos, |c| c + 1),
+            Tok::Punct("|")
+                if k == open + 1 || matches!(toks[k - 1], Tok::Punct(",") | Tok::Word("move")) =>
+            {
+                let close = (k + 1..pos).find(|&m| toks[m] == Tok::Punct("|"));
+                let Some(close) = close else { break };
+                params = slug_candidates(&toks[k + 1..close]);
+                k = close + 1;
+            }
+            _ => k += 1,
+        }
+    }
+    params
+}
+
+/// Whether the tokens from `j` on are only a method/field chain and `?` — the
+/// value of the expression ending at `j` is what the statement binds.
+fn tail_is_chain(toks: &[Tok], partner: &[Option<usize>], mut j: usize) -> bool {
+    while j < toks.len() {
+        match toks[j] {
+            Tok::Punct("?") => j += 1,
+            Tok::Punct(".") => {
+                if !matches!(toks.get(j + 1), Some(Tok::Word(_))) {
+                    return false;
+                }
+                j += 2;
+                if toks.get(j) == Some(&Tok::Punct("::")) {
+                    match toks[j..].iter().position(|t| *t == Tok::Punct("(")) {
+                        Some(k) => j += k,
+                        None => return false,
+                    }
+                }
+                if toks.get(j) == Some(&Tok::Punct("(")) {
+                    match partner[j] {
+                        Some(close) => j = close + 1,
+                        None => return false,
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Identifier words (not numbers or punctuation) among `toks`.
+fn slug_candidates<'a>(toks: &[Tok<'a>]) -> Vec<&'a str> {
+    toks.iter()
+        .filter_map(|t| match *t {
+            Tok::Word(w) if w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') => Some(w),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Identifier words of the operands of the fold call at token `i`:
+///
+/// 1. its receiver chain (`<recv>.fold(…)`) and its own argument group
+///    (`o.eq_ignore_ascii_case(owner)`, UFCS `str::to_lowercase(&owner)`);
+/// 2. for a fold used as a value (`.map(str::to_lowercase)`), the receiver of
+///    the enclosing method call (or the enclosing call's arguments);
+/// 3. when an operand is a parameter of a closure passed to an enclosing
+///    `.m(|n| …)`, the receiver of `.m` — repeated outward;
+/// 4. when the fold's chain (as widened by 2/3, never across an enclosing
+///    group that was not widened) is the whole right-hand side of an `=`
+///    (only `.method()` / `?` follow), the assignment's left-hand side.
+fn fold_operand_words<'a>(toks: &[Tok<'a>], partner: &[Option<usize>], i: usize) -> Vec<&'a str> {
+    let mut words = Vec::new();
+    let call_close = match toks.get(i + 1) {
+        Some(Tok::Punct("(")) => partner[i + 1],
+        _ => None,
+    };
+    if let Some(close) = call_close {
+        words.extend(slug_candidates(&toks[i + 2..close]));
+    }
+    let (mut start, mut end) = if i > 0 && toks[i - 1] == Tok::Punct(".") {
+        let s = chain_start(toks, partner, i - 1);
+        words.extend(slug_candidates(&toks[s..i - 1]));
+        (s, call_close.map_or(i + 1, |c| c + 1))
+    } else if let Some(close) = call_close {
+        (chain_start(toks, partner, i), close + 1)
+    } else if let Some(open) = enclosing_open(toks, partner, i) {
+        let inner_end = partner[open].unwrap_or(toks.len());
+        let end = partner[open].map_or(toks.len(), |c| c + 1);
+        if let Some(dot) = method_dot(toks, open) {
+            let s = chain_start(toks, partner, dot);
+            words.extend(slug_candidates(&toks[s..dot]));
+            (s, end)
+        } else {
+            words.extend(slug_candidates(&toks[open + 1..inner_end]));
+            (chain_start(toks, partner, open), end)
+        }
+    } else {
+        (chain_start(toks, partner, i), i + 1)
+    };
+
+    let mut direct = true;
+    let mut pos = start;
+    while let Some(open) = enclosing_open(toks, partner, pos) {
+        pos = open;
+        let widened = method_dot(toks, open).filter(|_| {
+            closure_params(toks, partner, open, start)
+                .iter()
+                .any(|p| words.contains(p))
+        });
+        match widened {
+            Some(dot) => {
+                let s = chain_start(toks, partner, dot);
+                words.extend(slug_candidates(&toks[s..dot]));
+                start = s;
+                end = partner[open].map_or(toks.len(), |c| c + 1);
+                pos = s;
+            }
+            None => direct = false,
+        }
+    }
+
+    if direct
+        && start > 0
+        && toks[start - 1] == Tok::Punct("=")
+        && tail_is_chain(toks, partner, end)
+    {
+        let eq = start - 1;
+        let lhs = chain_start(toks, partner, eq);
+        words.extend(slug_candidates(&toks[lhs..eq]));
+    }
+    words
 }
 
 fn has_component(ident: &str, component: &str) -> bool {
     ident.split('_').any(|part| part == component)
 }
 
-/// Whether one statement folds a slug identifier.
+/// Whether one statement folds a slug identifier: some fold call has a slug
+/// identifier among its operands ([`fold_operand_words`]). A slug identifier
+/// elsewhere in the statement does not count.
 fn is_flagged(statement: &str) -> bool {
-    let idents = identifiers(statement);
-    if !idents.iter().any(|id| FOLD_CALLS.contains(id)) {
-        return false;
-    }
-    let has_owner = idents.iter().any(|id| has_component(id, "owner"));
-    idents.iter().any(|id| {
-        SLUG_COMPONENTS.iter().any(|c| has_component(id, c)) || (*id == "name" && has_owner)
-    })
+    let toks = tokens(statement);
+    let partner = partners(&toks);
+    let has_owner = slug_candidates(&toks)
+        .iter()
+        .any(|id| has_component(id, "owner"));
+    toks.iter()
+        .enumerate()
+        .filter(|(_, t)| matches!(t, Tok::Word(w) if FOLD_CALLS.contains(w)))
+        .any(|(i, _)| {
+            fold_operand_words(&toks, &partner, i).iter().any(|id| {
+                SLUG_COMPONENTS.iter().any(|c| has_component(id, c)) || (*id == "name" && has_owner)
+            })
+        })
 }
 
 fn excerpt(text: &str) -> String {
@@ -332,6 +594,39 @@ fn parse_github_owner_repo(github_url: &str) -> Option<(String, String)> {
 }
 "#;
 
+/// `head_reached_by` as it stood before intentd commit 8ce3c3dd
+/// (`crates/intent-git/src/local_changes.rs`, intent-hq/intentd#2810): the
+/// fold is on a commit id, and `repo` is a git handle in another operand.
+const HEAD_REACHED_BY_PRE_8CE3C3DD: &str = r"
+pub fn head_reached_by(worktree_path: &Path, heads: &[String]) -> Result<bool> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let Some(head) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .map(|c| c.id())
+    else {
+        return Ok(false);
+    };
+    for candidate in heads {
+        let Ok(oid) = Oid::from_str(candidate.trim()) else {
+            continue;
+        };
+        // `Oid::from_str` zero-pads a short prefix; only an exact id of a
+        // commit present locally can vouch for `HEAD`.
+        if oid.to_string() != candidate.trim().to_ascii_lowercase()
+            || repo.find_commit(oid).is_err()
+        {
+            continue;
+        }
+        if oid == head || repo.graph_descendant_of(oid, head).map_err(map_git_err)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+";
+
 #[test]
 fn flags_pre_31dc6cc7_lookup_known_repo_local_path() {
     let src = LOOKUP_KNOWN_REPO_LOCAL_PATH_PRE_31DC6CC7;
@@ -560,4 +855,49 @@ fn only_repo_ref_is_exempt() {
         .collect();
     assert!(!is_exempt(&elsewhere));
     assert_eq!(display_rel(&exempt), "crates/intent-core/src/repo_ref.rs");
+}
+
+#[test]
+fn ignores_pre_8ce3c3dd_head_reached_by_commit_id_fold() {
+    assert_eq!(hit_lines(HEAD_REACHED_BY_PRE_8CE3C3DD), Vec::<usize>::new());
+}
+
+/// Hit count of `statement` scanned as the only statement of a function body.
+fn statement_hits(statement: &str) -> usize {
+    scan_source(&format!("fn f() {{\n    {statement};\n}}\n")).len()
+}
+
+#[test]
+fn folds_of_a_slug_operand_are_flagged() {
+    for statement in [
+        "repo.to_lowercase()",
+        "owner.to_lowercase()",
+        "self.repo_slug.make_ascii_lowercase()",
+        "o.eq_ignore_ascii_case(owner) || repo.find_commit(x).is_err()",
+        "repo.find_commit(x).is_err() || o.eq_ignore_ascii_case(&owner)",
+        "let k = str::to_lowercase(&owner)",
+        "let owner = segs.next()?.to_lowercase()",
+        "let owner: String = segs.next()?.to_lowercase().trim().to_string()",
+        "let v: Vec<String> = repo_slugs.iter().map(|r| r.to_lowercase()).collect()",
+        "let v = repo_names.iter().map(str::to_lowercase).collect::<Vec<_>>()",
+        "let v = repo_list.iter().flat_map(|g| g.iter().map(|r| r.to_lowercase())).count()",
+        "let v = repo_names.iter().map_or(0, |r| r.to_lowercase().len())",
+    ] {
+        assert_eq!(statement_hits(statement), 1, "{statement:?}");
+    }
+}
+
+#[test]
+fn folds_of_other_values_next_to_a_slug_identifier_pass() {
+    for statement in [
+        "repo.find_commit(oid.to_string().to_lowercase())",
+        "repo.find_branch(&branch.to_lowercase(), BranchType::Local)",
+        "let repo = Repository::open(path.to_lowercase())?",
+        "let ok = repo.is_bare() && kind.eq_ignore_ascii_case(\"bare\")",
+        "let lowered = names.iter().map(|n| n.to_lowercase()).collect::<Vec<_>>()",
+        "let repo_dir = base.join(tag.to_lowercase())",
+        "if oid.to_string() != candidate.trim().to_ascii_lowercase() || repo.find_commit(oid).is_err() {}",
+    ] {
+        assert_eq!(statement_hits(statement), 0, "{statement:?}");
+    }
 }
