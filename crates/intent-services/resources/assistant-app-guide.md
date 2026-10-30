@@ -906,22 +906,29 @@ a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
 available space. Moving the pointer between tabs smoothly switches the preview
 without changing your remembered section. In the expanded sidebar, selecting a
-different section leaves your open content in place. Click the already-selected
+different section leaves your open content in place. **Shift-click** a section
+tab to add or remove its pane; selected panes stack in sidebar order, and at least
+one stays open. Your selection is remembered per workspace. **Shift+Enter** or
+**Shift+Space** does the same from the keyboard. A normal click returns to one pane.
+The collapsed rail still previews one section at a time; expanding restores the
+selected panes. Click the sole selected
 tab to open its default
 content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
 changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
 opens the first terminal, creating one when none exists. A click in the collapsed
-rail opens the section's default content immediately. Moving keyboard focus
-across the expanded row only selects the sidebar section; its focus ring stays
-inside the tab when the row scrolls. Enter or Space acts
-like a click in either layout. The rail's toggle stays visible as its tabs scroll
+rail opens the section's default content immediately. With one pane selected,
+arrow keys select a section without opening main content. With multiple panes
+selected, arrow keys move focus without changing the selection. The focus ring
+stays inside the tab as the row scrolls. Enter or Space acts like a click in either
+layout. The rail's toggle stays visible as its tabs scroll
 and pins the sidebar open;
 the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
 Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
-When collapsed, this opens the matching floating section beside the rail.
+This keeps other selected panes open. When collapsed, it opens the matching
+floating section beside the rail.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
