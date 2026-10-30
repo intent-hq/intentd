@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.78] - 2026-10-30
+
+### 🚀 Features
+
+- Let agents request memory-held secrets for ws.host.exec ([#2804](https://github.com/intent-hq/intentd/pull/2804))
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Auto-archive merged-PR workspaces after the branch is pruned ([#2810](https://github.com/intent-hq/intentd/pull/2810))
+- *(browser)* Rehome tabs stranded under a device's superseded client id ([#2799](https://github.com/intent-hq/intentd/pull/2799))
+- Enforce disabled providers for quick actions ([#2806](https://github.com/intent-hq/intentd/pull/2806))
+
+
 ## [0.11.77] - 2026-10-30
 
 ### 🧪 Testing

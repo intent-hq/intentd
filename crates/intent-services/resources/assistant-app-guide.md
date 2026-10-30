@@ -708,7 +708,7 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs; packages/intentd/crates/intent-git/src/local_changes.rs. -->
 
 In **Home → Workspaces**, right-click a workspace and choose **Archive** to put
 it away while keeping its folder. Archiving stops its agents, hooks and PR
@@ -724,8 +724,10 @@ show this setting.
 Automatic archiving skips ongoing agent, script, hook and PR-monitor work,
 workspaces shared with guests, and uncommitted changes in the workspace folder,
 including nested repositories. For repositories with remote refs, unpushed
-commits also block it. Unreadable local-change state blocks the sweep; linked
-repositories outside the folder do not.
+commits also block it. On newer daemons, commits covered by the recorded head of a
+pull request Intent saw merged no longer block archiving, even after its remote
+branch is deleted. Commits made after that head still block it. Unreadable
+local-change state blocks the sweep; linked repositories outside the folder do not.
 
 In app and daemon versions offering folder cleanup, choose **Purge workspace
 folder** on an archived workspace, then confirm. This deletes the folder,
