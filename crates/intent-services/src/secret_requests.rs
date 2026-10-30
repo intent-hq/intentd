@@ -89,7 +89,7 @@ pub(crate) fn unavailable(name: &str) -> Error {
     Error::SecretRequest {
         code: CODE_UNAVAILABLE,
         message: format!(
-            "{CODE_UNAVAILABLE}: secret {name} is not available to this agent. Secrets are held in memory and are lost when Intent restarts. Call ws.secret.request({{ name: \"{name}\", reason }}) and end your turn; from a background hook, return {{ dispatch: true, message }} so the agent asks instead."
+            "{CODE_UNAVAILABLE}: secret {name} is not available to this agent. Secrets are held in memory and are lost when Intent restarts. Call ws.secret.request({{ name: \"{name}\", reason }}) and end your turn."
         ),
     }
 }
@@ -479,21 +479,6 @@ fn declined_notice(name: &str) -> String {
 }
 
 impl Services {
-    /// Whether `agent_id`'s session captured secret requests as available
-    /// (`secretRequests` with `hostExec`, from its creation-time feature
-    /// snapshot). Background hooks use this instead of the live settings so
-    /// a toggle change applies to new sessions only (PROTOCOL §5.56). A
-    /// missing session is `false`.
-    pub async fn agent_captured_secret_requests(&self, agent_id: &AgentId) -> bool {
-        match self.store.get_agent_session_summary(agent_id).await {
-            Ok(session) => {
-                let features = self.session_agent_features(&session);
-                features.secret_requests && features.host_exec
-            }
-            Err(_) => false,
-        }
-    }
-
     /// Resolve `agent_id`'s session and require it to live in `workspace_id`.
     async fn secret_agent_session(
         &self,
@@ -653,7 +638,7 @@ impl Services {
         Ok(json!({ "ok": true, "requestId": request_id, "name": answer.name }))
     }
 
-    /// `ws.host.exec` from an agent or its hook: resolve `secretEnv` from the
+    /// `ws.host.exec` from an agent's own turn: resolve `secretEnv` from the
     /// caller's own secrets, overlay them last on `env`, run, and redact the
     /// resolved values from `stdout` / `stderr`. Without `secretEnv` (or with
     /// `secretEnv: null`) this is the plain workspace `host.exec`. Wiping is

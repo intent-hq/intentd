@@ -855,6 +855,15 @@ fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     v
 }
 
+/// The `[agentFeatures]` a hook run sees: the live settings, with agent
+/// secret requests (PROTOCOL §5.56) always off. Secrets are transient,
+/// held for the agent's own interactive work, so a background hook can
+/// neither request nor use one (`ws.secret` and `secretEnv` are absent).
+fn hook_agent_features(mut live: AgentFeaturesSettings) -> AgentFeaturesSettings {
+    live.secret_requests = false;
+    live
+}
+
 /// The background hook service (`hook.*`), on [`Services`].
 pub(crate) trait HookServicesExt {
     async fn hook_owner_is_sub_agent(&self, agent_id: &AgentId) -> bool;
@@ -965,9 +974,7 @@ impl HookServicesExt for Services {
                     .into(),
             ));
         }
-        let mut agent_features = self.effective_settings().agent_features;
-        // Secret requests follow the owner's creation-time snapshot (§5.56).
-        agent_features.secret_requests = self.agent_captured_secret_requests(agent_id).await;
+        let agent_features = hook_agent_features(self.effective_settings().agent_features);
         if !agent_features.background_hooks {
             return Err(Error::InvalidParams(
                 "hook.schedule: disabled in settings (agentFeatures.backgroundHooks = false)"
@@ -1836,11 +1843,7 @@ impl HookServicesExt for Services {
         // daemon restarts, so the current effective `[agentFeatures]` gate is
         // the same one a newly created session's bridge would capture. The
         // owner's sub-agent status is likewise re-derived per run.
-        let mut agent_features = self.effective_settings().agent_features;
-        // Except secret requests (§5.56): they follow the owner's
-        // creation-time snapshot, so a later toggle change never takes
-        // secrets away from (or grants them to) an existing agent's hooks.
-        agent_features.secret_requests = self.agent_captured_secret_requests(&hook.agent_id).await;
+        let agent_features = hook_agent_features(self.effective_settings().agent_features);
         let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
         let evaluation = async {
             #[cfg(test)]
@@ -2487,6 +2490,35 @@ mod tests {
 
     use super::*;
     use intent_services::feature_api::events::EventBus;
+
+    /// Hook runs never get agent secret requests (PROTOCOL §5.56), whatever
+    /// the live setting: no `ws.secret` in the prelude, every other toggle
+    /// passed through unchanged.
+    #[test]
+    fn hook_runs_never_get_secret_requests() {
+        let live = AgentFeaturesSettings {
+            secret_requests: true,
+            ..AgentFeaturesSettings::default()
+        };
+        let hook = hook_agent_features(live.clone());
+        assert!(!hook.secret_requests);
+        assert_eq!(
+            hook,
+            AgentFeaturesSettings {
+                secret_requests: false,
+                ..live.clone()
+            }
+        );
+        let workspace = WorkspaceId::from_string("ws-hook");
+        assert!(
+            intent_acp::bindings_prelude_for_workspace(&live, false, &workspace)
+                .contains("ws.secret = {")
+        );
+        assert!(
+            !intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace)
+                .contains("ws.secret = {")
+        );
+    }
 
     struct TempDb {
         path: PathBuf,

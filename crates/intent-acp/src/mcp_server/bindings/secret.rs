@@ -37,7 +37,7 @@ pub const SECRET_REQUEST_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.secr
 
 /// The error a frame gets when the feature is not effective for this caller.
 pub(crate) const SECRET_REQUESTS_UNAVAILABLE: &str =
-    "ws.secret is not available to this agent (agentFeatures.secretRequests and agentFeatures.hostExec must be on, for a top-level agent outside the Assistant workspace)";
+    "ws.secret is not available here (agentFeatures.secretRequests and agentFeatures.hostExec must be on, for a top-level agent's own turn outside the Assistant workspace; background hooks never get secrets)";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -90,10 +90,7 @@ async fn request(
     args: &Value,
 ) -> Result<Value, String> {
     let Some(registry) = registry else {
-        return Err(
-            "ws.secret.request is only available from a live agent turn, not from a background hook; return { dispatch: true, message } from the hook so the agent asks the user instead"
-                .to_string(),
-        );
+        return Err("ws.secret.request is only available from a live agent turn".to_string());
     };
     let name = args
         .get("name")
@@ -248,7 +245,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("background hook"), "{err}");
+        assert!(err.contains("live agent turn"), "{err}");
         let err = dispatch(
             &api(),
             &WorkspaceId::from_string("w"),
