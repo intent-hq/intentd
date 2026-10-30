@@ -399,12 +399,10 @@ pub(crate) fn proposal_title_in(blocks: &[Value], proposal_id: &str) -> Option<S
 /// ([`proposal_block_id`]) equals `proposal_id` (last match wins, like
 /// [`proposal_title_in`]). `None` when no block carries the id.
 pub(crate) fn proposal_in(blocks: &[Value], proposal_id: &str) -> Option<Value> {
-    blocks
+    let block = blocks
         .iter()
-        .filter(|block| proposal_block_id(block).as_deref() == Some(proposal_id))
-        .filter_map(|block| block.get("resource")?.get("text")?.as_str())
-        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .next_back()
+        .rfind(|block| proposal_block_id(block).as_deref() == Some(proposal_id))?;
+    serde_json::from_str(block.get("resource")?.get("text")?.as_str()?).ok()
 }
 
 /// Proposal ids carried by a message's content blocks, in block order,

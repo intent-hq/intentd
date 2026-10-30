@@ -1498,8 +1498,9 @@ pub struct WorkspaceCreate {
     /// intent-hq/intent#8086): the proposal card a client's create applies.
     /// The service validates it, derives the source workspace from the
     /// agent, records it as [`Self::origin`] and resolves the proposal
-    /// `applied` after a successful create. Ignored when an in-process
-    /// caller already set [`Self::origin`].
+    /// `applied` after a successful create. Its shape is always validated;
+    /// it is otherwise ignored when an in-process caller already set
+    /// [`Self::origin`] (such callers clear it to be safe).
     #[serde(rename = "origin")]
     pub origin_request: Option<WorkspaceCreateOriginRequest>,
 }

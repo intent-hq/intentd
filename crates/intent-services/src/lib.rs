@@ -21633,6 +21633,10 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
+            // Set when the create op actually runs, so an idempotent replay
+            // (stored result, op skipped) is distinguishable afterwards.
+            let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let executed_op = executed.clone();
             let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
                 &inflight,
@@ -21644,6 +21648,7 @@ impl WorkspaceApi for Services {
                 // replay and execution scopes. Its initial-message persistence
                 // path otherwise exhausts the default stack in debug builds.
                 move || Box::pin(async move {
+                    executed_op.store(true, std::sync::atomic::Ordering::Relaxed);
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -23744,9 +23749,13 @@ impl WorkspaceApi for Services {
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             if let Some(origin) = proposal_origin {
-                result.proposal_origin =
-                    Box::pin(self.resolve_create_proposal_origin(origin, &result.workspace.id))
-                        .await;
+                let replayed = !executed.load(std::sync::atomic::Ordering::Relaxed);
+                result.proposal_origin = Box::pin(self.resolve_create_proposal_origin(
+                    origin,
+                    &result.workspace.id,
+                    replayed,
+                ))
+                .await;
             }
             Ok(result)
         })

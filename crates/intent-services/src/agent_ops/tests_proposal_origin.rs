@@ -620,3 +620,119 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     assert_eq!(pending, vec!["tc-2".to_string()], "card 2 is untouched");
     assert_eq!(notices_for(&svc, &agent).await.len(), 1);
 }
+
+/// A replay returns a workspace an earlier request created, so it can only
+/// prove which card it applies when that card is bound to the replayed key.
+/// Naming a key-less pending card on a replay is declined.
+#[tokio::test]
+async fn replay_naming_a_keyless_card_is_declined() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = create_agent(&svc, &ws, "Proposer").await;
+    seed(
+        &svc,
+        &ws,
+        &agent,
+        "tc-a",
+        &create_proposal_blocks("tc-a", None),
+    )
+    .await;
+    seed(
+        &svc,
+        &ws,
+        &agent,
+        "tc-b",
+        &create_proposal_blocks("tc-b", None),
+    )
+    .await;
+
+    let first = create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "A", "skipIsolation": true, "origin": origin(&agent, "tc-a") }),
+        ),
+        Some("key-a"),
+    )
+    .await
+    .expect("create card A");
+    let replay = create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "A", "skipIsolation": true, "origin": origin(&agent, "tc-b") }),
+        ),
+        Some("key-a"),
+    )
+    .await
+    .expect("replay of key-a naming card B");
+
+    assert_eq!(first.workspace.id, replay.workspace.id);
+    assert_eq!(reported(&first), Some(outcome("tc-a", "applied")));
+    assert_eq!(reported(&replay), Some(outcome("tc-b", "notResolved")));
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    let pending: Vec<String> = session
+        .pending_proposals()
+        .into_iter()
+        .map(|p| p.proposal_id)
+        .collect();
+    assert_eq!(pending, vec!["tc-b".to_string()], "card B is untouched");
+    assert_eq!(notices_for(&svc, &agent).await.len(), 1);
+}
+
+/// Store errors while validating the origin are not "declined": a failed
+/// read of the card's carrying message fails the create before any side
+/// effect (no workspace, card still pending), and a retry once the read
+/// recovers creates the workspace and resolves the card.
+#[tokio::test]
+async fn origin_lookup_store_error_fails_the_create_and_a_retry_recovers() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let workspaces = |svc: &Services| {
+        let store = svc.store().clone();
+        async move {
+            store
+                .list_workspaces(intent_core::WorkspaceListFilter::default())
+                .await
+                .expect("list")
+                .len()
+        }
+    };
+    let before = workspaces(&svc).await;
+    let params =
+        json!({ "title": "Follow-up", "skipIsolation": true, "origin": origin(&agent, "tc-1") });
+
+    // Inject a read failure on the message lookup only (the session row
+    // stays readable): hide the transcript table.
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_hidden")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("hide agent_message");
+    let err = create_as_owner(&svc, wire_create(params.clone()), Some("key-1"))
+        .await
+        .expect_err("a store error during origin validation fails the create");
+    assert!(
+        !matches!(err, intent_core::Error::InvalidParams(_)),
+        "a store failure is not a request-shape error: {err:?}"
+    );
+    sqlx::query("ALTER TABLE agent_message_hidden RENAME TO agent_message")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("restore agent_message");
+
+    assert_eq!(workspaces(&svc).await, before, "nothing was created");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(session.pending_proposals().len(), 1, "card still pending");
+
+    let created = create_as_owner(&svc, wire_create(params), Some("key-1"))
+        .await
+        .expect("retry after the read recovers");
+    assert_eq!(reported(&created), Some(outcome("tc-1", "applied")));
+    assert_eq!(workspaces(&svc).await, before + 1);
+    assert_eq!(notices_for(&svc, &agent).await.len(), 1);
+}
