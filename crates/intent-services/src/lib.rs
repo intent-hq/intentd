@@ -39272,10 +39272,18 @@ impl Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
-            this.ports
-                .runtime()
-                .cancel_script_monitors(&this, &id, None, "workspace-archived")
-                .await?;
+            // A manual archive cancels script monitors before the commit, so a
+            // cancel failure leaves the row active. The automatic archive can
+            // still be refused inside its transaction (opt-out), and a refusal
+            // must have no side effects, so it cancels only after the flip
+            // committed (still under the fence; an archived workspace accepts
+            // no new monitors and its wakes are already terminal).
+            if !automatic {
+                this.ports
+                    .runtime()
+                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .await?;
+            }
             let guest_sweep = if automatic {
                 match store
                     .archive_workspace_detaching_guests_unless_auto_archive_disabled(&id, &now)
@@ -39287,6 +39295,20 @@ impl Services {
             } else {
                 store.archive_workspace_detaching_guests(&id, &now).await?
             };
+            if automatic {
+                if let Err(error) = this
+                    .ports
+                    .runtime()
+                    .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                    .await
+                {
+                    tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %error,
+                        "auto-archive: script monitor cleanup failed after archiving"
+                    );
+                }
+            }
             ws.status = WorkspaceStatus::Archived;
             ws.archived = true;
             ws.archived_at = Some(now.clone());

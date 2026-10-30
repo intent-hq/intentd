@@ -312,6 +312,49 @@ async fn opt_out_after_the_last_due_read_beats_the_automatic_archive() {
     assert!(manual.archived, "a manual archive ignores the opt-out");
 }
 
+/// A refused automatic archive has no side effects: script-monitor cleanup
+/// (which deletes pending completion notifications and queued wakes) runs
+/// only once the automatic flip committed, and still runs on success.
+#[intent_test_macros::daemon_test]
+async fn refused_automatic_archive_does_not_cancel_script_monitors() {
+    let f = retire::fixture().await;
+    let ws = retire::create_workspace(&f).await;
+    let svc = crate::test_support::fake_runtime::FakeRuntime::install(f.svc.clone());
+    let cancels = |svc: &Services| {
+        crate::test_support::fake_runtime::FakeRuntime::of(svc)
+            .calls()
+            .into_iter()
+            .filter(|c| *c == "cancel_script_monitors")
+            .count()
+    };
+
+    f.store
+        .set_workspace_auto_archive_disabled(&ws.id, true)
+        .await
+        .expect("opt out");
+    let refused = svc
+        .archive_workspace_with_mode(ws.id.clone(), None, true)
+        .await
+        .expect("automatic archive");
+    assert!(refused.is_none());
+    assert_eq!(cancels(&svc), 0, "a refused archive cancels no monitors");
+
+    f.store
+        .set_workspace_auto_archive_disabled(&ws.id, false)
+        .await
+        .expect("opt back in");
+    let archived = svc
+        .archive_workspace_with_mode(ws.id.clone(), None, true)
+        .await
+        .expect("automatic archive");
+    assert!(archived.is_some_and(|w| w.archived));
+    assert_eq!(
+        cancels(&svc),
+        1,
+        "a successful automatic archive cleans up monitors"
+    );
+}
+
 fn retire_updates(f: &retire::Fixture, id: &WorkspaceId) -> Subscription {
     super::retire_workspace::subscribe_updates(f, id)
 }
