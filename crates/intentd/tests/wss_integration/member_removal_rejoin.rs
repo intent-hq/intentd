@@ -125,7 +125,7 @@ async fn postcommit_rejoin(self_revoke: bool) {
         let registry = Arc::new(
             intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry.clone())
             .with_gitlab_secret_store(intent_core::FileSecretStore::with_path(

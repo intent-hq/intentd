@@ -74,7 +74,7 @@ async fn discussion_management_roles_deletion_and_reopen() {
         .await,
         Err(Error::Forbidden(_))
     ));
-    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    let reopened = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     let history = with_caller(
         human(&p[3].id),
         reopened.discussion_history_op(&ws, id, None, None, 50),

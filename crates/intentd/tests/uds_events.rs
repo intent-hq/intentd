@@ -112,7 +112,7 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
     let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");
@@ -327,7 +327,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     // The services surface must publish onto the SAME bus the transport reads.
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
@@ -620,7 +620,7 @@ async fn workspace_create_emits_workspace_created() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
@@ -706,7 +706,7 @@ async fn workspace_update_emits_workspace_updated_with_delta() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
@@ -799,7 +799,7 @@ async fn workspace_delete_emits_workspace_deleted() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );

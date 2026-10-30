@@ -267,7 +267,7 @@ async fn test_clean_merge_propagates_completion_and_emits_event() {
 
     // Wire up Services with EventBus
     let bus = EventBus::new(store.clone());
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
@@ -437,7 +437,7 @@ async fn test_conflict_suppresses_completion_and_bounces_agent() {
 
     // Wire up Services with EventBus
     let bus = EventBus::new(store.clone());
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
@@ -616,7 +616,7 @@ async fn test_retry_cap_exhausted_propagates_with_merge_pending() {
 
     // Wire up Services
     let bus = EventBus::new(store.clone());
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
@@ -757,7 +757,7 @@ async fn test_bounce_refreshes_sandbox_without_reprovisioning() {
 
     // Wire up Services
     let bus = EventBus::new(store.clone());
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
@@ -859,7 +859,7 @@ async fn setup_merge_pending_sandbox(
         .unwrap();
 
     let bus = EventBus::new(store.clone());
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root);
 

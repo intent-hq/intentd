@@ -38,7 +38,7 @@ fn lifetime(
 async fn no_observer_or_missing_physical_origin_never_enters_the_source() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = Arc::new(RepositoryLifecycleRegistry::default());
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -74,7 +74,7 @@ async fn real_workspace_aba_from_clone_or_independent_store_retires_checked_stag
     for mode in 0..4 {
         let fixture = Fixture::new().await;
         let f = &fixture;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = registry(f).await;
         let independent = Store::open(&f.dir.path().join("store.db")).await.unwrap();
         let original = owner(f, false).await;
@@ -167,7 +167,7 @@ async fn real_agent_aba_never_allows_an_old_physical_origin_to_recapture() {
         let fixture = Fixture::new().await;
         let f = &fixture;
         let id = agent(f).await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = registry(f).await;
         let caller = Caller::Agent {
             agent_id: id.clone(),
@@ -285,7 +285,7 @@ async fn registered_root_delete_recreate_retires_old_request() {
         updated_at: "2026-09-27T00:00:00Z".into(),
     };
     f.store.upsert_workspace_git_root(&root).await.unwrap();
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -322,7 +322,7 @@ async fn registered_root_delete_recreate_retires_old_request() {
 async fn subscriptions_exist_before_the_real_worktree_wait() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -373,7 +373,7 @@ async fn subscriptions_exist_before_the_real_worktree_wait() {
 async fn no_op_metadata_and_failed_precondition_preserve_current_request() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -418,7 +418,7 @@ async fn no_op_metadata_and_failed_precondition_preserve_current_request() {
 async fn failed_write_after_barrier_blocks_fresh_capture_without_reviving_old_request() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -465,7 +465,7 @@ async fn known_commit_and_uncertain_started_stage_survive_actual_writer_retireme
     for completed in [false, true] {
         let fixture = Fixture::new().await;
         let f = &fixture;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = registry(f).await;
         let original = owner(f, false).await;
         let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -542,7 +542,7 @@ async fn known_commit_and_uncertain_started_stage_survive_actual_writer_retireme
 async fn cancelling_lock_wait_and_unknown_owner_ticket_cannot_leak_authority() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -601,7 +601,7 @@ async fn cancelling_lock_wait_and_unknown_owner_ticket_cannot_leak_authority() {
 async fn managed_reopen_retires_checked_request_before_followup_write() {
     let fixture = Fixture::new().await;
     let f = &fixture;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let registry = registry(f).await;
     let original = owner(f, false).await;
     let physical = FixtureOriginOwner::new(&registry, original.caller().clone()).unwrap();
@@ -767,7 +767,7 @@ mod precise_registered_tests {
                 "createdAt":"same-time","updatedAt":"same-time"
             })).unwrap();
             f.store.insert_agent_session(&session).await.unwrap();
-            let services = Arc::new(Services::new(f.store.clone()));
+            let services = Arc::new(Services::new_isolated(f.store.clone()));
             let registry = services.repository_lifecycle_registry().await.unwrap();
             // Real Store one-use confirmation and physical owner; ACP completion
             // is explicitly scripted. No production NativeRead route is added.

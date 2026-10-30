@@ -683,7 +683,7 @@ mod tests {
         let store = intent_store::Store::open(&tmp.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store.clone());
+        let services = crate::Services::new_isolated(store.clone());
         let bus = EventBus::new(store.clone());
         let args = parse_args(&map(&json!({"command":"cat"}))).unwrap();
         let id = start_stream(&services, bus.clone(), args).await.unwrap();

@@ -172,7 +172,7 @@ async fn services(provider: &str) -> Services {
             )])
             .unwrap();
     }
-    Services::new(Store::open(&root().join("store.db")).await.unwrap())
+    Services::new_isolated(Store::open(&root().join("store.db")).await.unwrap())
         .with_settings_registry(registry)
 }
 

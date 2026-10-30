@@ -83,7 +83,7 @@ async fn original_guest_gates_preserve_git_rights_but_cannot_borrow_ambient_owne
         .await
         .unwrap();
     let captured = original(&guest.id, HostRole::Guest).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let primary = f.store.get_primary_principal().await.unwrap();
     with_caller(
         Caller::Wire {
@@ -133,7 +133,7 @@ async fn actual_host_member_gate_rechecks_removal_and_excludes_chief() {
     let f = fixtures::Fixture::new().await;
     let person = member(&f.store).await;
     let captured = original(&person.id, HostRole::Member).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     assert!(check_stage_gates(
         &services,
         &captured,
@@ -171,7 +171,7 @@ async fn unrelated_workspace_and_closed_store_do_not_become_a_gate_success() {
     let guest = person(903);
     f.store.upsert_principal(&guest).await.unwrap();
     let captured = original(&guest.id, HostRole::Guest).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     assert_eq!(
         check_stage_gates(
             &services,

@@ -44,7 +44,7 @@ pub async fn fixture() -> Fixture {
         .unwrap();
     let root_dir = test_tempdir("intentd-retire-root-");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store.clone())
+    let svc = Services::new_isolated(store.clone())
         .with_workspaces_root(root_dir.path().to_path_buf())
         .with_event_bus(bus.clone());
     Fixture {

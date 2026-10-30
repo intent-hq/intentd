@@ -31,7 +31,7 @@ async fn task_push_has_complete_rows_and_changed_only_statistics() {
     task.metadata.task = Some(TaskMetadata::default());
     store.insert_note(&task).await.unwrap();
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     services
         .task_update_note_status(
             ws.clone(),
@@ -132,7 +132,7 @@ async fn task_push_initial_notification_does_not_invent_statistics_change() {
         }
         if has_task {
             // The initialized baseline still detects the next real change.
-            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
             services
                 .task_update_note_status(
                     ws.clone(),
@@ -221,7 +221,7 @@ async fn task_push_spec_links_dependents_deletion_and_duplicate_notifications() 
         store.insert_note(&task).await.unwrap();
     }
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     services
         .task_update_note_status(ws.clone(), NoteId::from("a"), "complete".into(), None, None)
         .await
@@ -293,7 +293,7 @@ async fn task_push_rejected_write_emits_nothing_and_generic_metadata_is_current(
     task.metadata.task = Some(TaskMetadata::default());
     store.insert_note(&task).await.unwrap();
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     assert!(services
         .update_note_metadata(
             ws.clone(),
@@ -357,7 +357,7 @@ async fn task_push_ordinary_parent_deletion_detaches_children() {
         store.insert_note(&child).await.unwrap();
     }
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     services
         .delete_note(ws.clone(), parent.id, None)
         .await

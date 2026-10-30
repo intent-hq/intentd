@@ -448,7 +448,7 @@ mod tests {
                 serde_json::json!("auggie"),
             )])
             .expect("set model.defaultProvider");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
         (tmp, services)
@@ -487,8 +487,8 @@ mod tests {
         // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services =
-            Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+        let services = Services::new_isolated(store)
+            .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, None)
             .await

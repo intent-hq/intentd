@@ -46,7 +46,7 @@ pub async fn setup() -> (TempDb, Services, WorkspaceId) {
             ("agents.reportToParentDebounceSeconds".into(), json!(0)),
         ])
         .expect("seed default provider");
-    let services = Services::new(store).with_settings_registry(registry);
+    let services = Services::new_isolated(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 

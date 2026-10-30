@@ -54,6 +54,11 @@ ctor = "1.0.10"
 # dev-only edge introduces no cycle; the normal-build dependency direction
 # (transport → services only) is unchanged.
 intent-store = { path = "../intent-store", version = "0.11.76" }
+# Test `Services` are built with `Services::new_isolated` (per-instance scratch
+# secrets, never the developer's ~/intent), which exists only with this
+# test-only feature; a per-crate `cargo test -p intent-transport` must not
+# depend on workspace feature unification to see it.
+intent-services = { path = "../intent-services", version = "0.11.76", features = ["repository-test-fixtures"] }
 
 [lints]
 workspace = true

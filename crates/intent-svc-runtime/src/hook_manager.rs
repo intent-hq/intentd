@@ -2601,7 +2601,7 @@ mod tests {
             .expect("agent");
         let bus = EventBus::new(store.clone());
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = crate::test_runtime::with_runtime(Services::new(store))
+        let services = crate::test_runtime::with_runtime(Services::new_isolated(store))
             .with_event_bus(bus)
             .with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws, owner)
@@ -4224,7 +4224,8 @@ mod tests {
             .unwrap()
             .unwrap();
         mgr.shutdown().await;
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
@@ -4347,7 +4348,8 @@ mod tests {
             .unwrap();
         mgr.shutdown().await;
         drop(draining);
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
@@ -4437,7 +4439,8 @@ mod tests {
             timely,
             "shutdown must cancel evaluation before waiting out the hook budget"
         );
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         assert_eq!(
             restarted.queue_snapshot_for_test(&owner)[0]["id"],
@@ -6740,7 +6743,7 @@ mod tests {
         store.insert_agent_session(&session).await.expect("agent");
         let bus = EventBus::new(store.clone());
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let svc = crate::test_runtime::with_runtime(Services::new(store))
+        let svc = crate::test_runtime::with_runtime(Services::new_isolated(store))
             .with_event_bus(bus.clone())
             .with_workspaces_root(root.path().to_path_buf());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));

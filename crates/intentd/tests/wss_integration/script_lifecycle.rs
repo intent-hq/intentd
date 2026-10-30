@@ -560,7 +560,7 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
             legacy.cwd = Some("/outside-workspace".into());
             srv.store.upsert_script(&legacy).await.unwrap();
             let services = intent_app::compose(
-                Services::new(srv.store.clone())
+                Services::new_isolated(srv.store.clone())
                     .with_event_bus(srv.bus.clone())
                     .with_settings_registry(srv.registry.clone()),
             );

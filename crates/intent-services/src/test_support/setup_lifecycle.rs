@@ -50,7 +50,7 @@ pub async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_workspaces_root(root)
         .with_event_bus(bus.clone());
     (svc, bus, tmp)

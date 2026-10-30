@@ -177,7 +177,7 @@ impl Host {
                 .unwrap();
         let bus = EventBus::new(store.clone());
         let services = Arc::new(intent_app::compose(
-            Services::new(store.clone())
+            Services::new_isolated(store.clone())
                 .with_workspaces_root(dir.path().join("workspaces"))
                 .with_settings_registry(registry)
                 .with_secret_store(secrets)

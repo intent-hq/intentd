@@ -131,7 +131,7 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, tempfile::TempDir)
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);

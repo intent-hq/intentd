@@ -135,7 +135,7 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
@@ -351,7 +351,7 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
@@ -521,7 +521,7 @@ async fn mcp_servers_workspace_scoped_toggle_and_list() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),

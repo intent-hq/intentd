@@ -4161,7 +4161,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
         let bus = crate::EventBus::new(store.clone());
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let mut events = bus.subscribe(SubscriptionFilter {
@@ -4234,7 +4234,7 @@ mod tests {
             std::fs::write(&path, seed).unwrap();
             let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
             let bus = crate::EventBus::new(store.clone());
-            let services = crate::Services::new(store)
+            let services = crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus.clone());
             let mut events = bus.subscribe(SubscriptionFilter {
@@ -5153,7 +5153,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         ));
-        let mut services = crate::Services::new(store).with_settings_registry(registry);
+        let mut services = crate::Services::new_isolated(store).with_settings_registry(registry);
         services.secrets = secrets.clone();
         let writer = services.clone();
         let update = intent_core::spawn_daemon(async move {
@@ -5318,7 +5318,7 @@ mod tests {
             release: Mutex::new(rx),
             once: std::sync::atomic::AtomicBool::new(true),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(secrets)
             .with_settings_registry(registry)
             .with_event_bus(bus);
@@ -5702,7 +5702,7 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let (tx, rx) = std::sync::mpsc::channel();
         let mut release = ReleaseWrite(Some(tx));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_secret_store(Arc::new(RejectThenParkRollback {
                 inner: raw.clone(),
@@ -5782,7 +5782,7 @@ mod tests {
             .pin("notifications.volume", json!(0.5), "TEST_PIN")
             .unwrap();
         let raw = Arc::new(CountWrites(std::sync::atomic::AtomicUsize::new(0)));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(raw.clone())
             .with_settings_registry(registry);
         for entry in [
@@ -9432,7 +9432,7 @@ mod rollback_order_tests {
             newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
             write_order: Mutex::new(Vec::new()),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry)
             .with_secret_store(secrets.clone())
             .with_event_bus(bus);
@@ -9582,7 +9582,7 @@ mod rollback_order_tests {
         ] {
             raw.store(account, value).unwrap();
         }
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(RejectSecondSecret {
                 raw: raw.clone(),
                 reject_rollback: true,
@@ -9666,7 +9666,7 @@ mod rollback_order_tests {
         .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(ParkFailure {
                 raw: raw.clone(),
                 entered: entered.clone(),
@@ -9971,7 +9971,7 @@ mod rollback_order_tests {
         )
         .unwrap();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(raw.clone()))
                 .with_event_bus(bus)
@@ -10136,7 +10136,7 @@ mod rollback_order_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(PausedRollbackStore {
                     raw,
@@ -10259,7 +10259,7 @@ mod port_assignment_publication_tests {
                     event_types: vec!["settings:changed".into()],
                     ..Default::default()
                 });
-                let services = crate::Services::new(store)
+                let services = crate::Services::new_isolated(store)
                     .with_settings_registry(registry.clone())
                     .with_event_bus(bus);
                 let control = Arc::new(AssignPort {
@@ -10328,7 +10328,7 @@ mod port_assignment_publication_tests {
             event_types: vec!["settings:changed".into()],
             ..Default::default()
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus);
         let control = Arc::new(AssignPort {
@@ -10391,7 +10391,7 @@ mod port_assignment_publication_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus)
                 .with_secret_store(Arc::new(PausedRollbackStore {

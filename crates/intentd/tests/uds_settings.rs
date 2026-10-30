@@ -137,7 +137,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     // store so sensitive settings never touch the real keychain.
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),

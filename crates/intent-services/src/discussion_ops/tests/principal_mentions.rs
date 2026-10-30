@@ -74,7 +74,7 @@ async fn discussion_principal_mentions_persist_retry_and_never_infer_from_text()
     .await
     .unwrap();
     assert!(plain.principal_mentions.is_empty());
-    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    let reopened = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     let history = with_caller(
         human(&people[1].id),
         reopened.discussion_history_op(&ws, "default", None, None, 50),

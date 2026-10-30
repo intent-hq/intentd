@@ -123,9 +123,21 @@ impl FileSecretStore {
     /// Store backed by the default path ([`default_secrets_path`]), running
     /// the one-time legacy `secrets.json` → `.secrets.json` migration when
     /// the path is the true default (no env override; see the module docs).
+    ///
+    /// Under the test harness, a default that lands in the real home's Intent
+    /// state is redirected to an empty per-process scratch file and never
+    /// migrated (see [`crate::test_isolation::redirect_default_secrets`]); an
+    /// explicit `INTENTD_SECRETS_FILE` into the real home aborts instead.
     #[must_use]
     pub fn new() -> Self {
         let path = default_secrets_path();
+        if env_override_active() {
+            // An explicit `INTENTD_SECRETS_FILE` into the real home is a
+            // test's deliberate choice: fail loudly rather than redirect it.
+            crate::test_isolation::assert_outside_forbidden_home(&path, "INTENTD_SECRETS_FILE");
+        } else if let Some(scratch) = crate::test_isolation::redirect_default_secrets(&path) {
+            return Self::with_path(scratch);
+        }
         if !env_override_active() {
             migrate_legacy_default(&path);
         }
@@ -134,8 +146,13 @@ impl FileSecretStore {
 
     /// Store backed by an explicit path (tests use this so they never touch
     /// the real `~/intent/.secrets.json`). Never migrates the legacy file.
+    ///
+    /// Under the test harness, aborts when `path` lands in the real home's
+    /// Intent state (see [`crate::test_isolation`]).
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        crate::test_isolation::assert_outside_forbidden_home(&path, "FileSecretStore::with_path");
+        Self { path }
     }
 
     /// The backing file path.
@@ -531,6 +548,16 @@ mod imp {
     }
 }
 
+/// Process-env lock shared by intent-core tests that mutate `HOME` or the
+/// secrets/forbidden-home variables (plain `cargo test` runs them on threads).
+#[cfg(test)]
+pub(crate) fn tests_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +692,7 @@ mod tests {
 
     #[test]
     fn env_override_takes_precedence() {
+        let _env = EnvScope::new();
         let override_path = std::env::temp_dir().join("intent-core-secrets-env-override.json");
         std::env::set_var(SECRETS_FILE_ENV, &override_path);
         let resolved = default_secrets_path();
@@ -720,6 +748,282 @@ mod tests {
         let store = FileSecretStore::with_path(tmp.0.join(".secrets.json"));
         assert_eq!(store.load("a").unwrap(), None);
         assert!(legacy.exists(), "explicit-path stores must not migrate");
+    }
+
+    /// Environment variable names the home-isolation tests drive. Spelled as
+    /// literals so the tests stay independent of the guard's implementation.
+    const FORBIDDEN_HOME: &str = "INTENTD_TEST_FORBIDDEN_HOME";
+
+    /// Serializes the tests that mutate process env (`HOME`, the secrets
+    /// override, the forbidden-home marker) and restores every touched
+    /// variable on drop, so plain `cargo test` threads cannot observe them.
+    struct EnvScope {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        touched: usize,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvScope {
+        fn new() -> Self {
+            let lock = super::tests_env_lock();
+            let saved = ["HOME", "USERPROFILE", SECRETS_FILE_ENV, FORBIDDEN_HOME]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+            Self {
+                saved,
+                touched: 0,
+                _lock: lock,
+            }
+        }
+
+        /// Set `key` for the lifetime of this scope (restored on drop).
+        fn set(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            self.touched += 1;
+            std::env::set_var(key, value);
+        }
+
+        /// Remove `key` for the lifetime of this scope (restored on drop).
+        fn remove(&mut self, key: &str) {
+            self.touched += 1;
+            std::env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Recursive `(relative path, bytes, mtime)` listing of `root`, used to
+    /// prove a sentinel home is byte-for-byte untouched.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>, std::time::SystemTime)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let meta = std::fs::metadata(&path).unwrap();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if meta.is_dir() {
+                    out.push((rel, Vec::new(), meta.modified().unwrap()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, std::fs::read(&path).unwrap(), meta.modified().unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A sentinel "real home" holding a legacy `intent/secrets.json` that
+    /// `FileSecretStore::new` would otherwise migrate.
+    fn sentinel_home() -> TempDir {
+        let home = TempDir::new();
+        std::fs::create_dir_all(home.0.join("intent")).unwrap();
+        std::fs::write(
+            home.0.join("intent").join(LEGACY_SECRETS_FILE_NAME),
+            r#"{"real":"user-secret"}"#,
+        )
+        .unwrap();
+        home
+    }
+
+    /// Child-process marker and sentinel for the abort tests below.
+    const CHILD_ENV: &str = "INTENT_CORE_HOME_ISOLATION_CHILD";
+    const SENTINEL_ENV: &str = "INTENT_CORE_HOME_ISOLATION_SENTINEL";
+
+    /// Re-run this test binary on exactly `test` with the guard pointed at
+    /// `home` (also `HOME`), and return its output. The violation aborts the
+    /// child, so the parent observes it without dying itself.
+    fn run_child(test: &str, mode: &str, home: &Path) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, mode)
+            .env(SENTINEL_ENV, home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env(FORBIDDEN_HOME, home)
+            .env_remove(SECRETS_FILE_ENV)
+            .output()
+            .unwrap()
+    }
+
+    /// Child body (a no-op in normal runs): touch the forbidden home through
+    /// the requested constructor. Reaching the end means the guard failed.
+    #[test]
+    fn home_isolation_child() {
+        let Some(mode) = std::env::var_os(CHILD_ENV) else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os(SENTINEL_ENV).unwrap());
+        let target = home.join("intent").join(".secrets.json");
+        let store = if mode == "override" {
+            std::env::set_var(SECRETS_FILE_ENV, &target);
+            FileSecretStore::new()
+        } else {
+            assert_eq!(mode, "explicit");
+            FileSecretStore::with_path(target)
+        };
+        store.store("test-only", "leak").unwrap();
+        println!("home-isolation-child: reached the forbidden home");
+    }
+
+    fn assert_child_aborted(mode: &str) {
+        let home = sentinel_home();
+        let before = snapshot(&home.0);
+        let out = run_child("secrets::tests::home_isolation_child", mode, &home.0);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("hermetic-tests:"),
+            "the {mode} constructor must abort inside the forbidden home\n{stdout}\n{stderr}"
+        );
+        assert!(!stdout.contains("reached the forbidden home"));
+        assert_eq!(
+            snapshot(&home.0),
+            before,
+            "sentinel home must stay untouched"
+        );
+    }
+
+    /// The default constructor resolves to an empty scratch store instead of
+    /// the forbidden home: no read of the real secrets, no legacy migration,
+    /// and writes land outside the home.
+    #[test]
+    fn home_isolation_default_store_redirects_away_from_forbidden_home() {
+        let mut env = EnvScope::new();
+        let home = sentinel_home();
+        let before = snapshot(&home.0);
+        env.set("HOME", &home.0);
+        env.set("USERPROFILE", &home.0);
+        env.remove(SECRETS_FILE_ENV);
+        env.set(FORBIDDEN_HOME, &home.0);
+
+        // A stale file at the old PID-only scratch location must not leak in.
+        let stale = std::env::temp_dir().join(format!(
+            "intentd-test-default-secrets-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(".secrets.json"), r#"{"test-only":"stale"}"#).unwrap();
+
+        let store = FileSecretStore::new();
+        let _ = std::fs::remove_dir_all(&stale);
+        assert_eq!(
+            store.load("test-only").unwrap(),
+            None,
+            "the scratch store must start empty, never reopen a stale PID-keyed file"
+        );
+        assert!(
+            !store.path().starts_with(&home.0),
+            "default store must be redirected, got {}",
+            store.path().display()
+        );
+        assert_eq!(
+            store.load("real").unwrap(),
+            None,
+            "the real secrets must not be readable through the default store"
+        );
+        store.store("test-only", "redirected").unwrap();
+        assert_eq!(
+            FileSecretStore::new().load("test-only").unwrap(),
+            Some("redirected".to_string()),
+            "every default store in the process shares the scratch file"
+        );
+        let _ = std::fs::remove_dir_all(store.path().parent().unwrap());
+
+        assert_eq!(
+            snapshot(&home.0),
+            before,
+            "sentinel home must stay untouched"
+        );
+    }
+
+    #[test]
+    fn home_isolation_explicit_path_refuses_forbidden_home() {
+        assert_child_aborted("explicit");
+    }
+
+    /// An explicit `INTENTD_SECRETS_FILE` into the forbidden home is a test's
+    /// deliberate choice, so it aborts instead of being redirected.
+    #[test]
+    fn home_isolation_env_override_into_forbidden_home_aborts() {
+        assert_child_aborted("override");
+    }
+
+    #[test]
+    fn home_isolation_allows_redirected_home_and_override() {
+        let mut env = EnvScope::new();
+        let forbidden = sentinel_home();
+        let before = snapshot(&forbidden.0);
+        env.set(FORBIDDEN_HOME, &forbidden.0);
+        env.remove(SECRETS_FILE_ENV);
+
+        let other = sentinel_home();
+        env.set("HOME", &other.0);
+        env.set("USERPROFILE", &other.0);
+        let store = FileSecretStore::new();
+        assert_eq!(store.path(), other.0.join("intent").join(".secrets.json"));
+        assert_eq!(
+            store.load("real").unwrap(),
+            Some("user-secret".to_string()),
+            "a tempdir HOME keeps the default resolution and legacy migration"
+        );
+
+        env.set("HOME", &forbidden.0);
+        env.set("USERPROFILE", &forbidden.0);
+        let override_path = other.0.join("override.json");
+        env.set(SECRETS_FILE_ENV, &override_path);
+        let store = FileSecretStore::new();
+        assert_eq!(store.path(), override_path);
+        store.store("a", "1").unwrap();
+
+        assert_eq!(
+            snapshot(&forbidden.0),
+            before,
+            "forbidden home must stay untouched"
+        );
+    }
+
+    /// Every nextest test process has the guard active with no harness
+    /// configuration: the forbidden home is the user-database home, not a
+    /// possibly redirected `$HOME`.
+    #[cfg(unix)]
+    #[test]
+    fn home_isolation_active_under_nextest_without_configuration() {
+        if std::env::var_os("NEXTEST_RUN_ID").is_none() {
+            return;
+        }
+        let mut env = EnvScope::new();
+        env.remove(FORBIDDEN_HOME);
+        let redirected = TempDir::new();
+        env.set("HOME", &redirected.0);
+        let real = crate::path_utils::user_db_home().expect("user-database home");
+        let forbidden =
+            crate::test_isolation::forbidden_intent_dir().expect("guard active under nextest");
+        assert_eq!(
+            forbidden,
+            std::fs::canonicalize(&real)
+                .unwrap_or(real.clone())
+                .join("intent")
+        );
+        assert!(crate::test_isolation::is_in_forbidden_home(
+            &real.join("intent").join(".secrets.json")
+        ));
+        assert!(!crate::test_isolation::is_in_forbidden_home(
+            &redirected.0.join("intent").join(".secrets.json")
+        ));
     }
 
     #[cfg(unix)]

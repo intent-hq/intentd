@@ -78,7 +78,7 @@ async fn wss_linked_skills_external_edits_additions_deletions_and_root_retarget_
     .await
     .expect("subscription reply");
     assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
-    let cache = Services::new(srv.store.clone()).git_status_cache();
+    let cache = Services::new_isolated(srv.store.clone()).git_status_cache();
     let refresher = Arc::new(GitStatusRefresher::start(
         srv.bus.clone(),
         srv.api.clone(),

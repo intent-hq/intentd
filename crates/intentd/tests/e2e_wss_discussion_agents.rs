@@ -924,7 +924,7 @@ async fn seed_recovery_delivery(
     };
     let sent = if admitted {
         let services =
-            Services::new(store.clone()).with_workspaces_root(data_dir.join("workspaces"));
+            Services::new_isolated(store.clone()).with_workspaces_root(data_dir.join("workspaces"));
         with_caller(
             Caller::Wire {
                 principal_id: principal.id.clone(),
