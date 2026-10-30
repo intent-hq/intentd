@@ -186,6 +186,21 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          and an imported agent does not run on the source head's node",
     ),
     (
+        "executor_credential",
+        "credentials this machine minted for backends are daemon-wide execution authority \
+         bound to this installation's owner, not workspace state; a target must mint its own",
+    ),
+    (
+        "executor_binding",
+        "per-credential link bindings and generations of this machine's executor credentials; \
+         they follow the credentials, which never transfer",
+    ),
+    (
+        "exposed_machine",
+        "machines exposed to this backend: routes, pins and credentials minted for this \
+         backend's head id; the target is a different backend and holds no such credential",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",

@@ -7,7 +7,8 @@ use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 
-use crate::node_link::{ProtocolRange, ProviderStatus};
+use crate::ids::ExecutorCredentialId;
+use crate::node_link::{MachineCapabilities, ProtocolRange, ProviderStatus};
 use crate::placement::AgentPlatform;
 
 /// `error.data.code` of [`ModelUnavailable`].
@@ -210,6 +211,93 @@ impl fmt::Display for MachineUpdateRequired {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.message(), self.data())
     }
+}
+
+/// A machine-side executor credential: what the machine keeps about a
+/// credential it minted for one backend. The token itself is never stored,
+/// only its SHA-256 hash, which this record does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorCredential {
+    pub id: ExecutorCredentialId,
+    /// The backend's persisted head id; a bind must name it as `headId`.
+    pub backend_id: String,
+    pub backend_name: String,
+    pub backend_fingerprint: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+impl ExecutorCredential {
+    /// Whether the credential still admits its backend.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+/// `RemoteMachine.state` on the backend. `connected` describes a live link
+/// and is never persisted; the backend keeps the other, resting states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteMachineState {
+    Connected,
+    Disconnected,
+    Unreachable,
+    Revoked,
+    UpdateRequired,
+}
+
+impl RemoteMachineState {
+    /// The wire name, also the persisted value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Disconnected => "disconnected",
+            Self::Unreachable => "unreachable",
+            Self::Revoked => "revoked",
+            Self::UpdateRequired => "update-required",
+        }
+    }
+
+    /// Parse a wire name.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "connected" => Self::Connected,
+            "disconnected" => Self::Disconnected,
+            "unreachable" => Self::Unreachable,
+            "revoked" => Self::Revoked,
+            "update-required" => Self::UpdateRequired,
+            _ => return None,
+        })
+    }
+}
+
+/// A machine exposed to this backend: its routes, certificate pin, the
+/// executor credential it minted for this backend (the token is in the
+/// secret store) and its last capabilities report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposedMachine {
+    /// The machine's daemon id (`nodeId` in placement and the binding).
+    pub id: String,
+    pub name: String,
+    pub hosts: Vec<String>,
+    pub port: u16,
+    pub tc_address: Option<String>,
+    /// The machine's WSS certificate fingerprint, pinned on every connect.
+    pub fingerprint: String,
+    pub credential_id: ExecutorCredentialId,
+    pub platform: Option<AgentPlatform>,
+    /// The last capabilities report, kept while disconnected.
+    pub capabilities: Option<MachineCapabilities>,
+    /// When `capabilities` was reported.
+    pub observed_at: Option<String>,
+    /// The persisted resting state, never [`RemoteMachineState::Connected`].
+    pub state: RemoteMachineState,
+    pub added_at: String,
+    pub last_connected_at: Option<String>,
 }
 
 #[cfg(test)]

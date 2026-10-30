@@ -164,3 +164,18 @@ fn both_errors_are_invalid_params_with_typed_text_for_mcp() {
     assert!(text.starts_with("Update Intent on m (it runs 1;"));
     assert!(text.contains("\"code\":\"machine-update-required\""));
 }
+
+#[test]
+fn remote_machine_state_names_match_the_wire() {
+    for state in [
+        RemoteMachineState::Connected,
+        RemoteMachineState::Disconnected,
+        RemoteMachineState::Unreachable,
+        RemoteMachineState::Revoked,
+        RemoteMachineState::UpdateRequired,
+    ] {
+        assert_eq!(serde_json::to_value(state).unwrap(), json!(state.as_str()));
+        assert_eq!(RemoteMachineState::parse(state.as_str()), Some(state));
+    }
+    assert_eq!(RemoteMachineState::parse("online"), None);
+}
