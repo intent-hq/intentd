@@ -447,7 +447,7 @@ anything. A dismissed reminder shows **Running** if work is running, otherwise
 
 <!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/{home-model,home-preview-agent}.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -455,6 +455,14 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+In newer/test app builds with the updated Home preview, selecting a workspace
+opens its most recently active top-level agent, falling back to the most recently
+active remaining agent when no top-level agent remains. The preview keeps that
+agent until it is retired or deleted, or you choose another from the menu above
+chat. These versions remember the Home choice until the app restarts, the account
+or connection changes, or Home resets. Older apps use the workspace's selected
+agent or their default selection; use the agent menu to choose.
 
 In Home versions with a **Waiting** filter, status grouping separates running work
 from external waits. **Running** covers an agent at work or a running command script
@@ -742,7 +750,9 @@ for archived workspaces** and a day count (7 when first enabled). Supporting
 daemons use `purgeArchivedAfterDays` in `config.toml`; this is off by default,
 checks about once an hour, and skips shared or non-retirable workspaces,
 uncommitted changes, unpushed commits in nested repositories inside the folder,
-and unreadable local-change state.
+and unreadable local-change state. On newer daemons, a recorded merged PR head
+covering a nested repository's commits can lift that unpushed-commit block; later
+commits and uncommitted changes still block automatic cleanup.
 
 Older apps may instead offer **Retire**, the **Retired** filter, **Restore as blank
 workspace**, and **Automatically retire archived workspaces** with **Retire after

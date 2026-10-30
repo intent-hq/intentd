@@ -18,7 +18,8 @@
 //!   no remote ref, yet the work is done. Uncommitted changes always count.
 //! - [`LocalWorkRule::Purge`] — only work the purge would destroy counts:
 //!   uncommitted changes in any of those roots, and unpushed commits in a
-//!   nested secondary root (the primary branch is kept).
+//!   nested secondary root (the primary branch is kept) unless a merged PR
+//!   covers that root's `HEAD` — those commits survive on the forge.
 //!
 //! Under either rule a relevant root that could not be evaluated, or a row
 //! missing a field the rule needs, blocks, so the sweep retries on its next
@@ -39,17 +40,30 @@ pub(crate) enum LocalWorkRule {
     Purge,
 }
 
-/// The blocker reported for unpushed commits under [`LocalWorkRule::Archive`]
-/// — the one verdict a merged PR can lift.
+/// The blocker reported for unpushed commits under [`LocalWorkRule::Archive`].
 const UNPUSHED_COMMITS: &str = "unpushed commits";
+
+/// The blocker reported for a nested root's unpushed commits under
+/// [`LocalWorkRule::Purge`].
+const NESTED_UNPUSHED_COMMITS: &str = "unpushed commits in a nested repository";
+
+impl LocalWorkRule {
+    /// The unpushed-commits verdict a merged PR can lift under this rule.
+    fn liftable_verdict(self) -> &'static str {
+        match self {
+            Self::Archive => UNPUSHED_COMMITS,
+            Self::Purge => NESTED_UNPUSHED_COMMITS,
+        }
+    }
+}
 
 /// Why the sweep governed by `rule` must leave `folder`'s workspace alone,
 /// given its `workspace.localChanges` evaluation. `None` = no blocking work.
 ///
-/// `merged_covers(path)` answers, for a root under [`LocalWorkRule::Archive`]
-/// whose only blocking work is unpushed commits, whether a merged PR covers
-/// its `HEAD` (see [`intent_git::head_reached_by`]); `true` lifts the block.
-/// It is never asked under [`LocalWorkRule::Purge`].
+/// `merged_covers(path)` answers, for a root whose only blocking work under
+/// `rule` is unpushed commits, whether a merged PR covers its `HEAD` (see
+/// [`intent_git::head_reached_by`]); `true` lifts the block. Under
+/// [`LocalWorkRule::Purge`] it is asked only about nested roots.
 pub(crate) fn local_work_blocker(
     local_changes: &serde_json::Value,
     folder: Option<&Path>,
@@ -109,7 +123,13 @@ pub(crate) fn local_work_blocker(
             }
             LocalWorkRule::Purge => {
                 if !primary {
-                    return Some("unpushed commits in a nested repository");
+                    let covered = root
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(&mut *merged_covers);
+                    if !covered {
+                        return Some(NESTED_UNPUSHED_COMMITS);
+                    }
                 }
             }
         }
@@ -120,8 +140,9 @@ pub(crate) fn local_work_blocker(
 impl Services {
     /// The [`local_work_blocker`] verdict for `ws` under `rule`; a failed
     /// evaluation blocks (retried next sweep). Only when the first verdict is
-    /// unpushed commits under [`LocalWorkRule::Archive`] does it read the
-    /// workspace's merged PRs ([`Services::merged_pr_heads`]) and re-evaluate
+    /// the rule's unpushed-commits blocker
+    /// ([`LocalWorkRule::liftable_verdict`]) does it read the workspace's
+    /// merged PRs ([`Services::merged_pr_heads`]) and re-evaluate
     /// with the per-root coverage check, which runs git on the blocking pool.
     pub(crate) async fn blocked_by_local_work(
         &self,
@@ -137,7 +158,7 @@ impl Services {
             }
         };
         let verdict = local_work_blocker(&changes, folder.as_deref(), rule, &mut |_| false);
-        if rule != LocalWorkRule::Archive || verdict != Some(UNPUSHED_COMMITS) {
+        if verdict != Some(rule.liftable_verdict()) {
             return verdict;
         }
         let heads = self.merged_pr_heads(ws).await;
@@ -210,9 +231,7 @@ mod tests {
     }
 
     fn purge_blocker(changes: &serde_json::Value, folder: Option<&Path>) -> Option<&'static str> {
-        local_work_blocker(changes, folder, LocalWorkRule::Purge, &mut |_| {
-            panic!("purge never asks about merged PRs")
-        })
+        local_work_blocker(changes, folder, LocalWorkRule::Purge, &mut |_| false)
     }
 
     fn archive_blocker(changes: &serde_json::Value, folder: Option<&Path>) -> Option<&'static str> {
@@ -231,6 +250,51 @@ mod tests {
             asked.push(path.to_string());
             merged.contains(&path)
         })
+    }
+
+    /// Under purge a merged PR lifts only a nested root's unpushed-commits
+    /// block; uncommitted changes still block, an uncovered nested root
+    /// still blocks, and the primary root (kept by the purge) is never asked.
+    #[test]
+    fn purge_merged_pr_lifts_only_the_nested_unpushed_block_it_covers() {
+        let folder = Some(Path::new("/ws/one"));
+        let mut asked = Vec::new();
+        let purge_merged =
+            |changes: &serde_json::Value, merged: &[&str], asked: &mut Vec<String>| {
+                local_work_blocker(changes, folder, LocalWorkRule::Purge, &mut |path| {
+                    asked.push(path.to_string());
+                    merged.contains(&path)
+                })
+            };
+
+        let nested = json!({ "roots": [row("primary", "/ws/one", 0, 4), row("secondary", "/ws/one/packages/sub", 0, 2)] });
+        assert_eq!(
+            purge_merged(&nested, &["/ws/one/packages/sub"], &mut asked),
+            None,
+            "submodule PR merged"
+        );
+        assert_eq!(
+            asked,
+            vec!["/ws/one/packages/sub".to_string()],
+            "primary never asked"
+        );
+        assert_eq!(
+            purge_merged(&nested, &[], &mut asked),
+            Some("unpushed commits in a nested repository")
+        );
+
+        let nested_dirty = json!({ "roots": [row("secondary", "/ws/one/packages/sub", 1, 2)] });
+        assert_eq!(
+            purge_merged(&nested_dirty, &["/ws/one/packages/sub"], &mut asked),
+            Some("uncommitted changes")
+        );
+
+        let two = json!({ "roots": [row("secondary", "/ws/one/packages/a", 0, 1), row("secondary", "/ws/one/packages/b", 0, 1)] });
+        assert_eq!(
+            purge_merged(&two, &["/ws/one/packages/a"], &mut asked),
+            Some("unpushed commits in a nested repository"),
+            "another nested root is not covered"
+        );
     }
 
     /// A merged PR covering a root lifts only that root's unpushed-commits
