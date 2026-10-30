@@ -681,11 +681,12 @@ grouping choices keep their behavior.
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
 
 **Set aside** is unreleased until the companion frontend change ships. In a
-supporting frontend, use **Set aside** on a Home workspace row, card or menu to
-move it into the collapsed **Set aside** section. Expand that section and choose
-**Bring back**, or use the immediate **Undo** action. Searching includes set-aside
-workspaces. With a Home row or card focused, **Cmd/Ctrl+Shift+S** toggles its state;
-customize the shortcut in **Settings → Input**.
+supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
+view moves it into a collapsed **Set aside** section; board view shows it in the
+**Set aside** column on the right. Choose **Bring back** on its row or card, or use
+the immediate **Undo** action. Searching includes set-aside workspaces. With a Home
+row or card focused, **Cmd/Ctrl+Shift+S** toggles its state; customize the shortcut
+in **Settings → Input**.
 
 Setting aside keeps agents, scripts, hooks and PR monitors running. Reading its
 history keeps it aside; a new instruction or a new question, blocker, failure or
