@@ -3865,6 +3865,12 @@ mod tests {
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Admission is after the final pre-run TTL check; Running persists before it.
+        let started = hook_event_types(&svc, &ws, &[HOOK_RUN_STARTED]).await;
+        assert!(
+            started.contains(&HOOK_RUN_STARTED.to_string()),
+            "{started:?}"
+        );
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7579,6 +7585,12 @@ mod tests {
         // starts; the note gate keeps it there). Now pass the deadline, then
         // release the script — the continue lands strictly after expiry.
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Admission is after the final pre-run TTL check; Running persists before it.
+        let started = hook_event_types(&svc, &ws, &[HOOK_RUN_STARTED]).await;
+        assert!(
+            started.contains(&HOOK_RUN_STARTED.to_string()),
+            "{started:?}"
+        );
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7647,10 +7659,15 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        // Running persisted ⇒ the pre-run expiry guard already passed. Pass
-        // the deadline, then release the script — its dispatch lands
-        // strictly after expiry and must still win.
+        // Wait for admitted execution before passing the deadline and releasing
+        // the script; its dispatch then lands after expiry and must still win.
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Admission is after the final pre-run TTL check; Running persists before it.
+        let started = hook_event_types(&svc, &ws, &[HOOK_RUN_STARTED]).await;
+        assert!(
+            started.contains(&HOOK_RUN_STARTED.to_string()),
+            "{started:?}"
+        );
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
