@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.85] - 2026-10-30
+
+### 📚 Documentation
+
+- Explain sidebar multi-pane selection ([#2839](https://github.com/intent-hq/intentd/pull/2839))
+
+
+## [0.11.84] - 2026-10-30
+
+### 📚 Documentation
+
+- *(app-guide)* Explain how to turn on secret requests ([#2833](https://github.com/intent-hq/intentd/pull/2833))
+
+
 ## [0.11.83] - 2026-10-30
 
 ### 🚀 Features
