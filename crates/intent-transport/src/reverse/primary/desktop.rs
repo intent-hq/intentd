@@ -150,9 +150,9 @@ mod tests {
             host: ClientHostInfo::default(),
         };
         first.bind_device(identity("first", 0), principal.clone());
-        first.bind(identity("first", 0));
+        first.bind_hello(identity("first", 0));
         second.bind_device(identity("second", 1), principal.clone());
-        second.bind(identity("second", 1));
+        second.bind_hello(identity("second", 1));
         assert_eq!(
             registry
                 .desktop_resolve(&ReverseTarget::Default, &principal)
@@ -202,7 +202,7 @@ mod tests {
                 ReverseTransport::Uds,
             );
             guard.bind_device(identity(id), principal.clone());
-            guard.bind(identity(id));
+            guard.bind_hello(identity(id));
             guards.push(guard);
         }
         let default = registry
@@ -228,12 +228,12 @@ mod tests {
             host: ClientHostInfo::default(),
         };
         guard.bind_device(identity.clone(), principal.clone());
-        guard.bind(identity.clone());
+        guard.bind_hello(identity.clone());
         let old = registry
             .desktop_resolve(&ReverseTarget::Default, &principal)
             .unwrap();
         guard.bind_device(identity.clone(), principal.clone());
-        guard.bind(identity);
+        guard.bind_hello(identity);
         let new = registry
             .desktop_resolve(&ReverseTarget::Default, &principal)
             .unwrap();

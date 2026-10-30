@@ -240,7 +240,7 @@ mod tests {
             host: ClientHostInfo::default(),
         };
         source.bind_device(identity.clone(), principal.clone());
-        source.bind(identity);
+        source.bind_hello(identity);
         let before = registry.authenticated_clients();
         let live_before = registry.live_clients();
         let desktop_before = registry.desktop_candidates(&principal);
