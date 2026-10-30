@@ -166,7 +166,9 @@ fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
 /// task binds onto its reverse-registry entry (REV-2). It comes from the
-/// hello's [`HelloClaim`], so it names the id the claim reserved.
+/// hello's [`HelloClaim`], so it names the claimed id: reserved, and so
+/// bindable, only as [`ClaimedHello::Reserved`] — a detached guard's claim
+/// reserves nothing.
 pub(crate) struct HelloOutcome {
     pub frame: Option<String>,
     pub bound: Option<ClaimedHello>,
@@ -243,7 +245,7 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// row is persisted, so the id is active for the superseded-id rehome
 /// throughout (intent-hq/intent#8045) — a server-generated id too, before the
 /// response reveals it. The claim alone supplies the id this hello persists,
-/// replies with and binds; a failed hello drops it, releasing the reservation.
+/// replies with and binds; a failed hello drops it, releasing any reservation.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
