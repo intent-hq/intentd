@@ -1578,7 +1578,32 @@ pub struct WorkspaceCreateResult {
     pub workspace: Workspace,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_agent: Option<serde_json::Value>,
+    /// What this request's wire `origin` did (PROTOCOL §5.1 "Proposal
+    /// origin"): present whenever the request carried a well-formed
+    /// `origin`, so a client knows the daemon handled the card and must not
+    /// fall back to its own `agent.resolveProposal`. Computed per request
+    /// (an idempotent replay reports its own `origin`), never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_origin: Option<WorkspaceCreateProposalOutcome>,
 }
+
+/// `workspace.create` result `proposalOrigin` (PROTOCOL §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCreateProposalOutcome {
+    /// The request's `origin.proposalId`.
+    pub proposal_id: String,
+    /// The proposal's persisted outcome after this create: `"applied"` or
+    /// `"dismissed"` (an earlier resolution is kept), or `"notResolved"`
+    /// when the daemon declined the origin (unknown agent, no access, not a
+    /// pending `workspace-create` card, another card's idempotency key, or a
+    /// failed resolution write).
+    pub outcome: String,
+}
+
+/// [`WorkspaceCreateProposalOutcome::outcome`] when the daemon declined the
+/// origin and left the proposal as it was.
+pub const PROPOSAL_ORIGIN_NOT_RESOLVED: &str = "notResolved";
 
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
 /// an absent field leaves the stored value unchanged (`workspaceId` is supplied

@@ -14491,6 +14491,7 @@ mod workspace_apply_proposal_tests {
                         "name": "Coordinator",
                         "notificationsMuted": false,
                     })),
+                    proposal_origin: None,
                 })
             })
         }

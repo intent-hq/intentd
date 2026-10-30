@@ -23681,6 +23681,7 @@ impl WorkspaceApi for Services {
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
                         initial_agent,
+                        proposal_origin: None,
                     })
                 }),
             )
@@ -23740,8 +23741,10 @@ impl WorkspaceApi for Services {
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             if let Some(origin) = proposal_origin {
-                self.resolve_create_proposal_origin(origin, &result.workspace.id)
-                    .await;
+                result.proposal_origin = Some(
+                    self.resolve_create_proposal_origin(origin, &result.workspace.id)
+                        .await,
+                );
             }
             Ok(result)
         })

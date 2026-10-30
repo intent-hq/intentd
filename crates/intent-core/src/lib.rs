@@ -166,10 +166,11 @@ pub use model::{
     TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin,
-    WorkspaceCreateOriginRequest, WorkspaceCreateResult, WorkspaceDiskUsage,
-    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
-    WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceCreateOriginRequest, WorkspaceCreateProposalOutcome, WorkspaceCreateResult,
+    WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
+    WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

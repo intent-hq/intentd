@@ -3220,13 +3220,19 @@ pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed"
 /// [`QUESTIONS_DISMISSED_METADATA_TYPE`] conventions.
 pub(crate) const PROPOSAL_RESOLVED_METADATA_TYPE: &str = "proposal_resolved";
 
-/// A validated `workspace.create` proposal origin awaiting resolution once
-/// the create succeeds ([`Services::prepare_create_proposal_origin`]).
+/// What a well-formed `workspace.create` origin will do once the create
+/// succeeds ([`Services::prepare_create_proposal_origin`]).
 #[derive(Debug, Clone)]
-pub(crate) struct CreateProposalOrigin {
-    source_workspace_id: WorkspaceId,
-    agent_id: AgentId,
-    proposal_id: String,
+pub(crate) enum CreateProposalOrigin {
+    /// Accepted: resolve the proposal `applied`.
+    Resolve {
+        source_workspace: WorkspaceId,
+        agent: AgentId,
+        proposal: String,
+    },
+    /// Declined: report `outcome` (the persisted resolution, or
+    /// `notResolved`) and leave the proposal untouched.
+    Report { proposal: String, outcome: String },
 }
 
 /// Cap on the caller-supplied `agent.resolveProposal` `detail` string — it is
@@ -10160,7 +10166,10 @@ impl Services {
                 reason,
                 "workspace.create origin not resolved"
             );
-            Ok(None)
+            Ok(Some(CreateProposalOrigin::Report {
+                proposal: proposal_id.clone(),
+                outcome: intent_core::PROPOSAL_ORIGIN_NOT_RESOLVED.to_string(),
+            }))
         };
         let session = match self.store.get_agent_session_summary(&agent_id).await {
             Ok(session) => session,
@@ -10179,6 +10188,18 @@ impl Services {
             .into_iter()
             .find(|p| p.proposal_id == proposal_id)
         else {
+            // Already resolved (e.g. a replay after the first create resolved
+            // it, or a dismissal): report the persisted outcome.
+            if let Some(outcome) = session
+                .proposal_resolutions()
+                .get(&proposal_id)
+                .and_then(Value::as_str)
+            {
+                return Ok(Some(CreateProposalOrigin::Report {
+                    outcome: outcome.to_string(),
+                    proposal: proposal_id.clone(),
+                }));
+            }
             return skip("proposal is not pending");
         };
         let Some(proposal) = self
@@ -10210,33 +10231,42 @@ impl Services {
             agent_id: agent_id.clone(),
             source_workspace_id: session.workspace_id.clone(),
         });
-        Ok(Some(CreateProposalOrigin {
-            source_workspace_id: session.workspace_id,
-            agent_id,
-            proposal_id,
+        Ok(Some(CreateProposalOrigin::Resolve {
+            source_workspace: session.workspace_id,
+            agent: agent_id,
+            proposal: proposal_id,
         }))
     }
 
     /// `workspace.create { origin }`, second half — runs after the create
-    /// succeeded, on first execution AND on an idempotent replay (so a replay
-    /// retries a resolution that failed the first time). Resolves the
-    /// proposal `applied` through [`Services::agent_resolve_proposal_op`]
-    /// with the `"Created workspace <id>."` detail, delivering the same
-    /// notice and `agent:updated` a client-side `agent.resolveProposal`
-    /// would. An already-resolved proposal keeps its outcome and gets no
-    /// second notice. Fail-soft: the workspace exists either way.
+    /// succeeded, on first execution AND on an idempotent replay. An accepted
+    /// origin is resolved `applied` through
+    /// [`Services::agent_resolve_proposal_op`] with the `"Created workspace
+    /// <id>."` detail, delivering the same notice and `agent:updated` a
+    /// client-side `agent.resolveProposal` would; a declined one is only
+    /// reported. Returns the result's `proposalOrigin`, telling the client
+    /// the daemon handled the card. Fail-soft: the workspace exists either
+    /// way, and a failed resolution write reports `notResolved`.
     pub(crate) async fn resolve_create_proposal_origin(
         &self,
         origin: CreateProposalOrigin,
         created: &WorkspaceId,
-    ) {
-        let CreateProposalOrigin {
-            source_workspace_id,
-            agent_id,
-            proposal_id,
-        } = origin;
+    ) -> intent_core::WorkspaceCreateProposalOutcome {
+        let (source_workspace_id, agent_id, proposal_id) = match origin {
+            CreateProposalOrigin::Report { proposal, outcome } => {
+                return intent_core::WorkspaceCreateProposalOutcome {
+                    proposal_id: proposal,
+                    outcome,
+                };
+            }
+            CreateProposalOrigin::Resolve {
+                source_workspace,
+                agent,
+                proposal,
+            } => (source_workspace, agent, proposal),
+        };
         let detail = format!("Created workspace {}.", created.as_str());
-        if let Err(e) = self
+        let outcome = match self
             .agent_resolve_proposal_op(
                 source_workspace_id,
                 agent_id.clone(),
@@ -10246,13 +10276,24 @@ impl Services {
             )
             .await
         {
-            tracing::warn!(
-                agent = %agent_id,
-                proposal = %proposal_id,
-                workspace = %created.as_str(),
-                error = %e,
-                "workspace.create could not resolve its origin proposal"
-            );
+            Ok(resolved) => resolved["outcome"]
+                .as_str()
+                .unwrap_or(PROPOSAL_OUTCOME_APPLIED)
+                .to_string(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    proposal = %proposal_id,
+                    workspace = %created.as_str(),
+                    error = %e,
+                    "workspace.create could not resolve its origin proposal"
+                );
+                intent_core::PROPOSAL_ORIGIN_NOT_RESOLVED.to_string()
+            }
+        };
+        intent_core::WorkspaceCreateProposalOutcome {
+            proposal_id,
+            outcome,
         }
     }
 

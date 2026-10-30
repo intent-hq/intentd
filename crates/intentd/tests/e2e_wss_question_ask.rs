@@ -1567,6 +1567,13 @@ async fn workspace_create_with_proposal_origin_resolves_over_wss() {
         result["workspace"].get("origin").is_none(),
         "origin is never a workspace field: {result}"
     );
+    // The result tells the client the daemon handled the card, so it must
+    // not fall back to its own agent.resolveProposal.
+    assert_eq!(
+        result["proposalOrigin"],
+        json!({ "proposalId": proposal_id, "outcome": "applied" }),
+        "{result}"
+    );
 
     // `workspace:created` echoes the provenance; the source is derived.
     let created_event = loop {

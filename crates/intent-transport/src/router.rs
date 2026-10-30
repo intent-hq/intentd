@@ -983,6 +983,9 @@ async fn dispatch(
             if let Some(agent) = res.initial_agent {
                 result["initialAgent"] = agent;
             }
+            if let Some(origin) = res.proposal_origin {
+                result["proposalOrigin"] = json!(origin);
+            }
             Ok(result)
         }
         "workspace.update" => {

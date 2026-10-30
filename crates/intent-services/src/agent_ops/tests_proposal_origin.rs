@@ -146,6 +146,7 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
     .await
     .expect("workspace.create");
     let new_id = created.workspace.id.0.clone();
+    assert_eq!(reported(&created), outcome("tc-1", "applied"));
 
     let session = svc
         .store()
@@ -171,6 +172,17 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
             "User applied the proposal 'Create workspace: Follow-up'. Created workspace {new_id}."
         )],
     );
+}
+
+fn reported(result: &WorkspaceCreateResult) -> Option<(String, String)> {
+    result
+        .proposal_origin
+        .as_ref()
+        .map(|o| (o.proposal_id.clone(), o.outcome.clone()))
+}
+
+fn outcome(proposal_id: &str, outcome: &str) -> Option<(String, String)> {
+    Some((proposal_id.to_string(), outcome.to_string()))
 }
 
 fn origin(agent: &AgentId, proposal_id: &str) -> Value {
@@ -205,6 +217,12 @@ async fn replay_and_client_fallback_never_duplicate_the_notice() {
     assert_eq!(
         first.workspace.id, replay.workspace.id,
         "same key, same workspace"
+    );
+    assert_eq!(reported(&first), outcome("tc-1", "applied"));
+    assert_eq!(
+        reported(&replay),
+        outcome("tc-1", "applied"),
+        "a replay reports the persisted outcome"
     );
 
     let fallback = svc
@@ -241,7 +259,7 @@ async fn already_resolved_proposal_keeps_its_outcome() {
     .await
     .expect("dismiss");
 
-    create_as_owner(
+    let created = create_as_owner(
         &svc,
         wire_create(
             json!({ "title": "Late", "skipIsolation": true, "origin": origin(&agent, "tc-1") }),
@@ -250,6 +268,7 @@ async fn already_resolved_proposal_keeps_its_outcome() {
     )
     .await
     .expect("create still succeeds");
+    assert_eq!(reported(&created), outcome("tc-1", "dismissed"));
 
     let session = svc
         .store()
@@ -274,7 +293,7 @@ async fn unknown_agent_or_proposal_still_creates() {
     let (_t, svc, ws, _bus) = setup().await;
     let agent = pending_proposal(&svc, &ws, "tc-1").await;
 
-    create_as_owner(
+    let ghost = create_as_owner(
         &svc,
         wire_create(json!({
             "title": "Ghost agent",
@@ -285,13 +304,15 @@ async fn unknown_agent_or_proposal_still_creates() {
     )
     .await
     .expect("unknown agent is fail-soft");
-    create_as_owner(
+    let other = create_as_owner(
         &svc,
         wire_create(json!({ "title": "Other card", "skipIsolation": true, "origin": origin(&agent, "tc-other") })),
         None,
     )
     .await
     .expect("unknown proposal is fail-soft");
+    assert_eq!(reported(&ghost), outcome("tc-1", "notResolved"));
+    assert_eq!(reported(&other), outcome("tc-other", "notResolved"));
 
     let session = svc
         .store()
@@ -463,7 +484,12 @@ async fn in_process_origin_takes_precedence_over_the_wire_param() {
         source_workspace_id: ws.clone(),
     });
 
-    create_as_owner(&svc, input, None).await.expect("create");
+    let created = create_as_owner(&svc, input, None).await.expect("create");
+    assert_eq!(
+        reported(&created),
+        None,
+        "no proposalOrigin for an in-process origin"
+    );
 
     let session = svc
         .store()
@@ -494,13 +520,14 @@ async fn non_workspace_create_proposal_is_not_resolved() {
     )
     .await;
 
-    create_as_owner(
+    let created = create_as_owner(
         &svc,
         wire_create(json!({ "title": "Wrong card", "skipIsolation": true, "origin": origin(&agent, "tc-settings") })),
         None,
     )
     .await
     .expect("create still succeeds");
+    assert_eq!(reported(&created), outcome("tc-settings", "notResolved"));
 
     let session = svc
         .store()
@@ -539,7 +566,7 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     .await;
 
     // Card 1 applied under its own key.
-    create_as_owner(
+    let one = create_as_owner(
         &svc,
         wire_create(
             json!({ "title": "One", "skipIsolation": true, "origin": origin(&agent, "tc-1") }),
@@ -548,8 +575,11 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     )
     .await
     .expect("create card 1");
-    // A replay of key-1 naming card 2, and a key-less create naming card 2.
-    create_as_owner(
+    assert_eq!(reported(&one), outcome("tc-1", "applied"));
+    // A replay of key-1 naming card 2, and a key-less create naming card 2:
+    // both report `notResolved`, so a client never falls back to resolving
+    // card 2 itself.
+    let replay = create_as_owner(
         &svc,
         wire_create(
             json!({ "title": "One", "skipIsolation": true, "origin": origin(&agent, "tc-2") }),
@@ -558,7 +588,7 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     )
     .await
     .expect("replay of key-1");
-    create_as_owner(
+    let keyless = create_as_owner(
         &svc,
         wire_create(
             json!({ "title": "Two", "skipIsolation": true, "origin": origin(&agent, "tc-2") }),
@@ -567,6 +597,8 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     )
     .await
     .expect("key-less create");
+    assert_eq!(reported(&replay), outcome("tc-2", "notResolved"));
+    assert_eq!(reported(&keyless), outcome("tc-2", "notResolved"));
 
     let session = svc
         .store()
