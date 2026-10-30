@@ -443,9 +443,11 @@ includes the other linked PRs, even when their details are not loaded.
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. The settings beside the prompt (below it on narrow
 windows) are **Repository**, **Branch**, **Setup**, **Agent**, and **Model**; each
-opens a panel, and your prompt draft stays as you choose. In
-**Setup**, pick the repository's config, the last-used setup, or a template, and
-edit its commands inline. **Apply** keeps the changes; **Cancel** or clicking
+opens a panel, and your prompt draft stays as you choose. **Repository** lists
+your repositories once each, most recently used first, with search at the top;
+**Add repository** adds a local folder, links a GitHub repository, or creates a
+new one. In **Setup**, pick the repository's config, the last-used setup, or a
+template, and edit its commands inline. **Apply** keeps the changes; **Cancel** or clicking
 outside discards them. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
