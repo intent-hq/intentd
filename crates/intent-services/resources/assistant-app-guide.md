@@ -1180,13 +1180,14 @@ workspace has no browser tabs yet: agent browser tabs and tunnels fail until tha
 client reconnects or another connected, browser-capable client is set as primary.
 It also reads **Offline** when no primary is set but the workspace's agent browser
 tabs or desktop session are on a client that is not connected or cannot run agent
-browser tabs; choosing **This app** moves the agent-owned tabs here.
+browser tabs; choosing **This app** moves desktop agent-owned tabs here. Native iOS tabs stay
+on their original device.
 With no primary set and no agent tabs yet, a new agent browser tab opens in the
 connected app where you last viewed the workspace, else in the app that connected first.
 
 To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Primary client** → **This app**, and confirm **Set as
-Primary**. This moves agent-owned tabs to that client without preserving page
+Primary**. This moves desktop agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. **This app** depends on the
 current client's connection, browser capability and your access; when a guest role or
 missing browser support blocks it, a line below it says why. A checkmark marks
@@ -1203,7 +1204,7 @@ the agent sees, and its address can change on its own.
 
 ## iOS workspace browser
 
-<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist. -->
+<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist; packages/intentd/crates/intent-svc-runtime/src/{runtime,browser_tabs}.rs. -->
 
 In the iOS workspace browser, enter an explicit `http://` or `https://` address
 to open a server reachable from the device, including LAN and Tailscale hosts.
@@ -1212,6 +1213,15 @@ it in iOS Settings under **Privacy & Security → Local Network**. Tailscale
 addresses require a working route from the device. `daemon.localhost` and
 loopback addresses instead open servers on the connected daemon through its
 authenticated tunnel.
+
+Agent-requested native previews require the companion iOS implementation and are
+not yet a generally released option. On supporting builds, a new preview opens
+on connected iOS when no eligible desktop is connected and no other client is
+explicitly pinned. Native tabs stay on that device when a desktop reconnects or
+the primary client changes. Agents can open, show, focus, navigate and close
+their native tabs; page inspection, clicking, screenshots, viewport emulation
+and other browser automation require a separate desktop tab. Request acceptance
+does not confirm the preview is on screen; check the reported display state.
 
 ## Add context, run a task, and find results
 

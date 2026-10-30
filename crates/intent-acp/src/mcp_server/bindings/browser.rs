@@ -1,5 +1,7 @@
 //! `ws.browser.*` bindings (WSAPI-6).
 //!
+//! `browser.exec` also carries native navigation on capable iOS clients.
+//! Native tabs are marked `navigationOnly`; automation never moves them to desktop.
 //! `browser.exec` is a **client-callable trigger** — the actual CDP work happens
 //! on the connected frontend. The binding validates the actions envelope,
 //! forwards it via the [`WorkspaceApi::browser_exec`] seam (the concrete impl

@@ -923,3 +923,110 @@ async fn hello_rehomes_tabs_from_a_superseded_client_id_over_wss() {
         .unwrap_or_else(|| panic!("live tab listed: {listed}"));
     assert_eq!(live_tab["hostClientId"], "dev-2");
 }
+
+#[tokio::test]
+async fn native_navigation_reports_and_routes_over_secure_wss() {
+    let fx = boot().await;
+    let mut viewer = connect(&fx).await;
+    let created = wss_rpc(
+        &mut viewer,
+        1,
+        "workspace.create",
+        json!({"title":"Native navigation","branch":"main","skipWorktree":true}),
+    )
+    .await;
+    let workspace = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut native = connect(&fx).await;
+    let greeted = wss_rpc(
+        &mut native,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true,"browserExec":false}}),
+    )
+    .await;
+    assert!(greeted.get("error").is_none(), "{greeted}");
+    let mut report = tab("native-preview", "https://preview.test");
+    report["workspaceId"] = workspace.clone().into();
+    report["navigationOnly"] = true.into();
+    report["ownerAgentId"] = "agent-1".into();
+    let synced = wss_rpc(
+        &mut native,
+        2,
+        "browser.syncTabs",
+        json!({"tabs":[report.clone()]}),
+    )
+    .await;
+    assert!(synced.get("error").is_none(), "{synced}");
+    let _ = wss_rpc(&mut viewer, 2, "client.hello", hello("desktop")).await;
+    let pin = wss_rpc(
+        &mut viewer,
+        3,
+        "workspace.setBrowserClient",
+        json!({"workspaceId":workspace,"clientId":"desktop"}),
+    )
+    .await;
+    assert!(pin.get("error").is_none(), "{pin}");
+    report["navigationOnly"] = false.into();
+    let _ = wss_rpc(&mut native, 3, "browser.syncTabs", json!({"tabs":[report]})).await;
+    let listed = wss_rpc(
+        &mut viewer,
+        4,
+        "browser.listTabs",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["tabs"][0]["navigationOnly"], true,
+        "{listed}"
+    );
+    assert_eq!(listed["result"]["tabs"][0]["hostClientId"], "phone");
+    for (id, method, action) in [
+        (5, "browser.navigateTab", "navigate"),
+        (6, "browser.closeTab", "closeTab"),
+    ] {
+        let call = wss_rpc(
+            &mut viewer,
+            id,
+            method,
+            json!({"tabId":"native-preview","url":"https://updated.test"}),
+        );
+        let answer = async {
+            timeout(common::rpc_read_timeout(), async {
+                loop {
+                    match native.next().await.unwrap().unwrap() {
+                        Message::Text(text) => {
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            if request["method"] != "browser.exec" { continue; }
+                            assert_eq!(request["params"]["actions"][0]["action"], action);
+                            assert_eq!(request["params"]["workspaceId"], workspace);
+                            native.send(Message::Text(json!({"jsonrpc":"2.0","id":request["id"],"result":{"success":true,"results":[{"action":action,"success":true,"result":{"tabId":"native-preview","accepted":true,"displayed":false}}]}}).to_string().into())).await.unwrap();
+                            break;
+                        }
+                        Message::Ping(payload) => native.send(Message::Pong(payload)).await.unwrap(),
+                        _ => {}
+                    }
+                }
+            }).await.expect("native reverse request");
+        };
+        let (result, ()) = tokio::join!(call, answer);
+        assert!(result.get("error").is_none(), "{result}");
+    }
+    close_ws(native).await;
+    let listed = await_host_offline(&mut viewer, 10, &workspace).await;
+    assert_eq!(listed["result"]["tabs"][0]["navigationOnly"], true);
+    let offline = wss_rpc(
+        &mut viewer,
+        100,
+        "browser.navigateTab",
+        json!({"tabId":"native-preview","url":"https://updated.test"}),
+    )
+    .await;
+    assert_eq!(offline["error"]["code"], -32603, "{offline}");
+    assert!(offline["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("phone"));
+}

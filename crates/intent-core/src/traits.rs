@@ -9851,12 +9851,26 @@ pub trait ContextEngine: Send + Sync {
     ) -> std::result::Result<RetrieveResult, ContextError>;
 }
 
+/// Whether every action can run on a navigation-only native browser.
+/// Unknown actions and empty batches never gain navigation eligibility.
+#[must_use]
+pub fn browser_navigation_actions(actions: &[serde_json::Value]) -> bool {
+    !actions.is_empty()
+        && actions.iter().all(|action| {
+            matches!(
+                action["action"].as_str(),
+                Some("openTab" | "showTab" | "focusTab" | "closeTab" | "navigate")
+            )
+        })
+}
+
 /// Which client an agent-initiated reverse RPC should be delivered to (REV-2).
 ///
 /// Resolution is performed by the [`AgentReverseDispatch`] implementation
 /// against its live, capability-eligible connections (a connection is
-/// eligible for `browser.exec` only when its `client.hello` advertised
-/// `capabilities.browserExec === true`, PROTOCOL §5.17):
+/// eligible for automation when its `client.hello` advertised
+/// `capabilities.browserExec === true`. Navigation-only batches can additionally
+/// use `browserNavigation === true` (PROTOCOL §5.17):
 ///
 /// - [`Client`](Self::Client) / [`Pinned`](Self::Pinned): the named logical
 ///   client's **newest** eligible connection; no such connection ⇒
@@ -10159,6 +10173,19 @@ pub trait AgentReverseDispatch: Send + Sync {
                 })
             }
         }
+    }
+
+    /// Resolve native navigation without widening automation eligibility.
+    /// Defaults prefer automation-capable clients; pins never fall back.
+    ///
+    /// # Errors
+    /// Returns the same offline errors as `resolve`.
+    fn resolve_navigation(
+        &self,
+        target: &ReverseTarget,
+        _workspace_id: &WorkspaceId,
+    ) -> std::result::Result<ResolvedClient, ReverseDispatchError> {
+        self.resolve(target)
     }
 
     /// Live hello'd connections grouped by `clientId` (the `client.list`

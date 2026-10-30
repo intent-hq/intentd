@@ -1,7 +1,36 @@
 # Browser API Overview
 
-The browser API gives you programmatic access to embedded browser tabs via Chrome DevTools Protocol.
+The browser API supports desktop page automation via Chrome DevTools Protocol and,
+on supporting iOS builds, native tab navigation. Native preview support requires
+the companion iOS implementation; do not infer availability from the tool alone.
 Actions are executed as a sequence of declarative operations.
+
+## Native navigation
+
+A client advertising `browserNavigation: true` can receive `openTab`, `showTab`,
+`focusTab`, `closeTab`, and `navigate`. `browserExec: true` separately enables
+page automation. New `openTab` requests prefer an eligible desktop; without one,
+they can open on connected iOS. An explicit workspace client pin never falls back.
+An offline desktop tab or desktop session does not block opening a new native
+preview when no client is pinned. `listTabs` is answered by the daemon.
+
+Native tabs carry `navigationOnly: true` in `listTabs` and stay on their physical
+`hostClientId`, even after a desktop connects or the primary client changes.
+Named navigation requests never migrate tabs. A batch addressing different hosts
+fails with `browser-mixed-hosts` before executing anything. Native tabs cannot be
+claimed, resized, inspected, evaluated, screenshotted, or used for capture/trace;
+these requests fail with `browser-automation-unavailable`, including mixed
+navigation/automation batches. Create a separate desktop tab for automation.
+`ws.browser.clients()` describes automation routes; a null automation route does
+not rule out native navigation. `client.list` distinguishes the two capabilities.
+
+Native `openTab` defaults to visible (desktop tabs remain hidden by default).
+`accepted: true` confirms acceptance, not presentation: check `displayed` in the
+result or the later registry update to confirm the native browser appeared.
+Native previews use the device's viewport, not desktop viewport emulation.
+Native user tabs may be focused/shown without claiming them, but agents cannot
+navigate or close them. Another agent's tabs remain protected by `not-owner`.
+The desktop ownership, sizing and capture rules below apply to desktop tabs.
 
 ## Reuse Tabs by URL
 

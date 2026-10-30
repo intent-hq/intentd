@@ -6,7 +6,9 @@
 //! daemon resolves a [`ReverseTarget`] against the live connections:
 //!
 //! - A connection is **eligible** only once its `client.hello` (§5.17)
-//!   advertised `capabilities.browserExec === true`. Un-hello'd sockets (iOS,
+//!   advertised `capabilities.browserExec === true` for automation. Native
+//!   navigation batches also accept `browserNavigation === true`, preferring
+//!   automation-capable clients for default routing. Un-hello'd sockets (
 //!   CLIs, dev tooling) and connections without the capability (FE auxiliary
 //!   `JsonRpcClient`s) are never candidates — this is what fixes the REV-1
 //!   misrouting where the first arrival won regardless of what it could do.
@@ -106,6 +108,12 @@ impl ReverseClientIdentity {
             .get("browserExec")
             .and_then(Value::as_bool)
             == Some(true)
+    }
+
+    /// Whether this identity explicitly supports native tab navigation.
+    #[must_use]
+    pub fn browser_navigation(&self) -> bool {
+        self.capabilities["browserNavigation"] == true
     }
 
     /// `{ clientId, name?, capabilities }` — the `client:connected` /
@@ -370,6 +378,14 @@ impl Entry {
                 .is_some_and(ReverseClientIdentity::browser_exec)
     }
 
+    fn navigation_eligible(&self) -> bool {
+        self.channel.may_host_browser()
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.browser_exec() || i.browser_navigation())
+    }
+
     fn has_client(&self, client_id: &ClientId) -> bool {
         self.identity
             .as_ref()
@@ -422,6 +438,14 @@ fn resolve_entry_matching<'a>(
     target: &ReverseTarget,
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
+    resolve_entry_capability(entries, target, |e| e.is_eligible() && allowed(e))
+}
+
+fn resolve_entry_capability<'a>(
+    entries: &'a VecDeque<Entry>,
+    target: &ReverseTarget,
+    allowed: impl Fn(&Entry) -> bool,
+) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
         // REV-2 rule 5 focus preference (intent-hq/intent#7855): the first
         // listed client that still has an eligible connection, resolved
@@ -444,7 +468,7 @@ fn resolve_entry_matching<'a>(
         ReverseTarget::Default => {
             let first = entries
                 .iter()
-                .find(|e| e.is_eligible() && allowed(e))
+                .find(|e| allowed(e))
                 .ok_or(ReverseDispatchError::NoClient)?;
             let client_id = &first
                 .identity
@@ -452,34 +476,26 @@ fn resolve_entry_matching<'a>(
                 .expect("an eligible entry always carries an identity")
                 .client_id;
             // `first` itself matches, so the newest match always exists.
-            Ok(newest_eligible_of(entries, client_id, &allowed).unwrap_or(first))
+            Ok(entries
+                .iter()
+                .rev()
+                .find(|e| e.has_client(client_id) && allowed(e))
+                .unwrap_or(first))
         }
-        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
-            newest_eligible_of(entries, client_id, &allowed).ok_or_else(|| {
-                ReverseDispatchError::ClientOffline {
-                    client_id: client_id.clone(),
-                    name: entries
-                        .iter()
-                        .rev()
-                        .filter(|e| e.has_client(client_id))
-                        .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
-                    pinned: matches!(target, ReverseTarget::Pinned(_)),
-                }
-            })
-        }
+        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
+            .iter()
+            .rev()
+            .find(|e| e.has_client(client_id) && allowed(e))
+            .ok_or_else(|| ReverseDispatchError::ClientOffline {
+                client_id: client_id.clone(),
+                name: entries
+                    .iter()
+                    .rev()
+                    .filter(|e| e.has_client(client_id))
+                    .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
+                pinned: matches!(target, ReverseTarget::Pinned(_)),
+            }),
     }
-}
-
-/// The newest eligible, `allowed` connection of logical client `client_id`.
-fn newest_eligible_of<'a>(
-    entries: &'a VecDeque<Entry>,
-    client_id: &ClientId,
-    allowed: &impl Fn(&Entry) -> bool,
-) -> Option<&'a Entry> {
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
 }
 
 /// One logical client's live hello'd connections, oldest first, and the
@@ -521,6 +537,21 @@ fn group_by_client(entries: &VecDeque<Entry>) -> Vec<ClientGroup<'_>> {
         }
     }
     groups
+}
+
+/// Desktop preference applies only to default selection, never to a pin.
+fn resolve_navigation_entry<'a>(
+    entries: &'a VecDeque<Entry>,
+    target: &ReverseTarget,
+    workspace_id: &WorkspaceId,
+) -> Result<&'a Entry, ReverseDispatchError> {
+    let in_scope = |e: &Entry| member_scoped(workspace_id.as_str()) || e.channel.is_administrator();
+    if matches!(target, ReverseTarget::Default) {
+        if let Ok(desktop) = resolve_entry_matching(entries, target, in_scope) {
+            return Ok(desktop);
+        }
+    }
+    resolve_entry_capability(entries, target, |e| e.navigation_eligible() && in_scope(e))
 }
 
 /// Whether a `browser.exec` scoped to `workspace_id` may go to member
@@ -686,6 +717,13 @@ impl PrimaryReverseRegistry {
                     _ => serde_json::Map::new(),
                 };
                 capabilities.insert("browserExec".into(), Value::Bool(browser_exec));
+                if group.entries.iter().any(|e| {
+                    e.identity
+                        .as_ref()
+                        .is_some_and(ReverseClientIdentity::browser_navigation)
+                }) {
+                    capabilities.insert("browserNavigation".into(), Value::Bool(true));
+                }
                 LiveClient {
                     client_id: group.newest.client_id.clone(),
                     name: group.newest.name.clone(),
@@ -949,6 +987,20 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         PrimaryReverseRegistry::resolve(self, target)
     }
 
+    fn resolve_navigation(
+        &self,
+        target: &ReverseTarget,
+        workspace_id: &WorkspaceId,
+    ) -> Result<ResolvedClient, ReverseDispatchError> {
+        let state = self.inner.lock();
+        let entry = resolve_navigation_entry(&state.entries, target, workspace_id)?;
+        let identity = entry.identity.as_ref().expect("eligible identity");
+        Ok(ResolvedClient {
+            client_id: identity.client_id.clone(),
+            name: identity.name.clone(),
+        })
+    }
+
     fn client_active(&self, client_id: &ClientId) -> bool {
         PrimaryReverseRegistry::client_active(self, client_id)
     }
@@ -1009,10 +1061,25 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
         let member_scope =
             method == "browser.exec" && params["workspaceId"].as_str().is_some_and(member_scoped);
-        let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
-            member_scope || entry.channel.is_administrator()
-        })
-        .map(|e| (e.channel.clone(), ConnectionLabel::of(e)));
+        let navigation = method == "browser.exec"
+            && params["actions"]
+                .as_array()
+                .is_some_and(|a| intent_core::browser_navigation_actions(a));
+        let resolved = {
+            let state = self.inner.lock();
+            let entry = if navigation {
+                resolve_navigation_entry(
+                    &state.entries,
+                    &target,
+                    &WorkspaceId::from(params["workspaceId"].as_str().unwrap_or("")),
+                )
+            } else {
+                resolve_entry_matching(&state.entries, &target, |entry| {
+                    member_scope || entry.channel.is_administrator()
+                })
+            };
+            entry.map(|e| (e.channel.clone(), ConnectionLabel::of(e)))
+        };
         Box::pin(async move {
             let (channel, connection) = resolved?;
             let timeout = request_timeout(method, &params);
