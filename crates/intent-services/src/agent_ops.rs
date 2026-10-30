@@ -9688,15 +9688,16 @@ impl Services {
         // Deliver the questions-dismissed system notice (first dismissal of
         // this messageId only) BEFORE the drain kick, so an idle agent's next
         // turn is the notice rather than a previously queued entry.
+        // Dismissing a message also declines its pending secret requests
+        // (§5.56) — BEFORE the questions-dismissed notice starts a turn, so
+        // that turn never sees them still pending. Requests already answered
+        // or lost are skipped, so a repeat dismissal sends no duplicate notices.
+        self.decline_secret_requests_on_message(&workspace_id, &agent_id, &message_id)
+            .await;
         if !already_dismissed {
             self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
                 .await;
         }
-        // Dismissing a message also declines its pending secret requests
-        // (§5.56); requests already answered or lost are skipped, so a
-        // repeat dismissal sends no duplicate notices.
-        self.decline_secret_requests_on_message(&workspace_id, &agent_id, &message_id)
-            .await;
         // Kick the drain so entries parked for other reasons (busy race,
         // notice enqueued above) resume without waiting for the next
         // end-of-turn drain.

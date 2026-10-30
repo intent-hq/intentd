@@ -4359,6 +4359,7 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Proposal ids carried by this turn's lifted proposal-resource blocks
         // (both the registry/array path and the wrapped-echo path in
         // `record_tool` land as persisted blocks) — computed BEFORE the
@@ -4591,6 +4592,12 @@ impl Services {
         // instead of relying on the dedup cache to stay silent.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Persisted secret-request cards (§5.56) put their requests in front
+        // of the user: surface them for the needs_attention derivation.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
         }
         // Stored-on-write pending-proposals recording (PROTOCOL §5.5): a
         // proposal-bearing tail merges its `{ proposalId, messageId }`
@@ -5569,6 +5576,7 @@ impl Services {
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Same pre-append proposal-id scan as the prompt-turn persist
         // (PROTOCOL §5.5, pending proposals).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
@@ -5647,6 +5655,11 @@ impl Services {
         // question-bearing tail moves the pending-questions derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Same §5.56 surfacing as the prompt-turn persist.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
         }
         // Same stored-on-write pending-proposals recording as the prompt-turn
         // persist (PROTOCOL §5.5).

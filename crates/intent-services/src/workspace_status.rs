@@ -952,17 +952,20 @@ impl Services {
                 }
             }
         }
-        // An idle agent waiting on a secret request (PROTOCOL §5.56) needs the
-        // user too. Derived from the daemon's in-memory pending requests, so
-        // it ends when the request is answered, forgotten or lost on restart;
-        // a still-running turn reads `in_progress` until it ends, like a
-        // question whose card has not been drained yet.
+        // An agent waiting on a secret request (PROTOCOL §5.56) needs the user
+        // too, once the request's card has been persisted (the turn-end drain
+        // — the same point a question raises it). Derived from the daemon's
+        // in-memory pending requests, so it ends when the request is answered
+        // or lost on restart, and a card dropped with a cancelled turn never
+        // strands the workspace.
         if !signals.needs_attention {
-            signals.needs_attention = top_level.iter().any(|session| {
-                self.secret_vault
-                    .has_pending(&session.workspace_id, &session.id)
-                    && !intent_core::WorkspaceApi::agent_is_busy(self, session.id.clone())
-            });
+            if let Some(first) = top_level.first() {
+                let awaiting = self.secret_vault.agents_awaiting_user(&first.workspace_id);
+                signals.needs_attention = !awaiting.is_empty()
+                    && top_level
+                        .iter()
+                        .any(|session| awaiting.contains(&session.id));
+            }
         }
         signals
     }
@@ -4020,6 +4023,12 @@ mod workspace_needs_attention {
             .await
             .unwrap();
         let request_id = ticket["requestId"].as_str().unwrap().to_string();
+        assert!(
+            !signals(&svc, &ws).await.needs_attention,
+            "an unsurfaced card (still in the turn, or dropped) does not need the user"
+        );
+        svc.secret_vault
+            .mark_surfaced(&ws, &session.id, std::slice::from_ref(&request_id));
         assert!(signals(&svc, &ws).await.needs_attention);
 
         svc.secret_answer_op(
@@ -4061,6 +4070,12 @@ mod workspace_needs_attention {
             .append_agent_message(&session.id, "assistant", &content, &now_iso())
             .await
             .unwrap();
+        svc.surface_secret_requests(
+            &ws,
+            &session.id,
+            &crate::secret_requests::secret_request_ids(&content),
+        )
+        .await;
         assert!(signals(&svc, &ws).await.needs_attention);
 
         svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id.clone())
@@ -4156,16 +4171,24 @@ mod workspace_needs_attention {
                 .any(|read| read.contains("The user provided secret KEY")),
             "the provided notice reached the owner's transcript"
         );
-        let dir = tmp.path.parent().unwrap();
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            let bytes = std::fs::read(entry.path()).unwrap_or_default();
-            assert!(
-                !bytes
-                    .windows(SENTINEL.len())
-                    .any(|w| w == SENTINEL.as_bytes()),
-                "secret value leaked into {}",
-                entry.path().display()
-            );
+        let mut dirs = vec![tmp.path.parent().unwrap().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes =
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                assert!(
+                    !bytes
+                        .windows(SENTINEL.len())
+                        .any(|w| w == SENTINEL.as_bytes()),
+                    "secret value leaked into {}",
+                    path.display()
+                );
+            }
         }
     }
 
