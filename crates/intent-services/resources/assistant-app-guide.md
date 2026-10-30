@@ -415,6 +415,13 @@ checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
+When a new workspace uses a remote-tracking base branch from a local repository,
+Intent fetches that branch before creating the checkout. If the fetch fails,
+creation stops; restore access to the remote and retry. Explicit commits, tags,
+and local-only branches still use their local state.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/lib.rs; packages/intentd/crates/intent-git/src/fetch.rs. -->
+
 Legacy workspace import has been retired. Settings no longer offers the Data import
 section, and a fresh daemon does not discover or import old Electron workspace
 directories. Workspaces already stored in the daemon remain available.
