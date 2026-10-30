@@ -3829,7 +3829,9 @@ mod tests {
         // the dispatch wins (owner woken, dispatch counted), but a perpetual
         // fire at/after `expiresAt` expires instead of rescheduling.
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "perp-exp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -3864,7 +3866,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -3876,6 +3882,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
@@ -7542,7 +7549,9 @@ mod tests {
         // the skew is stored before the note flips to "go", so the script's
         // continue always lands after the deadline "passed".
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "exp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -7575,10 +7584,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        // The run is in flight (state persists to `running` before the script
-        // starts; the note gate keeps it there). Now pass the deadline, then
-        // release the script — the continue lands strictly after expiry.
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7590,6 +7600,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
@@ -7612,7 +7623,9 @@ mod tests {
         // Same clock choreography as the continue variant above, but the
         // released run returns a dispatch — which wins over the passed TTL.
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "disp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -7647,10 +7660,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        // Running persisted ⇒ the pre-run expiry guard already passed. Pass
-        // the deadline, then release the script — its dispatch lands
-        // strictly after expiry and must still win.
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7662,6 +7676,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;
