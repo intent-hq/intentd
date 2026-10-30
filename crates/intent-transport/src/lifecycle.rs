@@ -210,6 +210,9 @@ impl WsInner {
             if !handles.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            if let Some(links) = &self.executor_links {
+                links.close_all().await;
+            }
             // (4)+(6) remove the upgrade handlers / close every listener.
             for tx in running.shutdown_txs.drain(..) {
                 let _ = tx.send(());

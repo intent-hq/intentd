@@ -1,6 +1,10 @@
 //! The node's persisted [`LeaseBinding`]: one JSON file, replaced
 //! atomically and fsynced before a bind is acknowledged, so a node restart
 //! can never accept an older generation again.
+//!
+//! Deprecated: kept only for `intentd node`; remove with it once the runner
+//! moves into the daemon's executor service, which serves the link on the
+//! daemon listener with per-credential bindings ([`super::ExecutorLinks`]).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

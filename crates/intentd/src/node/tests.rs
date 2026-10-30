@@ -67,6 +67,7 @@ impl Running {
             url: format!("wss://{}", node.listener.local_addr()),
             pin: CertificatePin::parse(&node.certificate_sha256).unwrap(),
             token: LeaseToken::new(token()).unwrap(),
+            tailcat: None,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(node.serve(async move {

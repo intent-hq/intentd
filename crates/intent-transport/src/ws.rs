@@ -15,6 +15,7 @@
 //! serves plain `ws://` with no TLS acceptor and no bearer-token enforcement;
 //! it is the only path in this module that ever bypasses those checks.
 
+mod executor;
 mod startup;
 
 use std::collections::HashMap;
@@ -423,6 +424,9 @@ pub(crate) struct WsInner {
     /// Guest connection admission ([`GuestConnectionLimits`]): seats are
     /// taken before the `101` and travel with the connection task.
     pub guests: Arc<GuestRegistry>,
+    /// The executor link served on `/node/link` and `/node/git`; `None`
+    /// answers those paths with `404`.
+    pub executor_links: Option<Arc<crate::node_link::ExecutorLinks>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -482,6 +486,7 @@ impl WsApiServer {
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -529,6 +534,7 @@ impl WsApiServer {
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
         };
         Self {
             inner: Arc::new(inner),
@@ -570,6 +576,7 @@ impl WsApiServer {
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -638,6 +645,20 @@ impl WsApiServer {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("WsApiServer inner not yet shared before install_pairing_info");
         inner.dispatch.services_mut().server_pairing_info = Some(server_pairing_info);
+    }
+
+    /// Serve the daemon-to-daemon executor link on `/node/link` and
+    /// `/node/git`. Uses the same `Arc::get_mut` pattern as
+    /// `install_registry`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (called after `start`
+    /// published clones).
+    pub fn install_executor_links(&mut self, links: Arc<crate::node_link::ExecutorLinks>) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("WsApiServer inner not yet shared before install_executor_links");
+        inner.executor_links = Some(links);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -848,9 +869,20 @@ impl WsInner {
         let target = req.path.unwrap_or("");
         let path = target.split('?').next().unwrap_or(target);
         let (mut origin, mut authorization, mut ws_key) = (None, None, None);
+        let mut has_origin = false;
+        let mut binding_headers: Vec<(String, String)> = Vec::new();
         let mut ws_extensions: Vec<String> = Vec::new();
         for h in req.headers.iter() {
+            if h.name
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-intent-"))
+            {
+                if let Some(v) = header_str(h.value) {
+                    binding_headers.push((h.name.to_owned(), v));
+                }
+            }
             if h.name.eq_ignore_ascii_case("origin") {
+                has_origin = true;
                 origin = header_str(h.value);
             } else if h.name.eq_ignore_ascii_case("authorization") {
                 authorization = header_str(h.value);
@@ -866,6 +898,18 @@ impl WsInner {
         }
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
+        }
+        if path == crate::node_link::LINK_PATH || path == crate::node_link::GIT_PATH {
+            return self
+                .executor_upgrade(
+                    stream,
+                    path,
+                    authorization.as_deref(),
+                    has_origin,
+                    ws_key,
+                    &binding_headers,
+                )
+                .await;
         }
         if path != "/ws" && path != "/tunnel" && path != INVITE_PATH {
             return reject(&mut stream, 404, "Not Found").await;

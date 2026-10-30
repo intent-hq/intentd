@@ -32,11 +32,55 @@ pub(super) const HEADER_GENERATION: &str = "x-intent-generation";
 
 /// How head reaches one node: its `wss://host:port` base URL, the pinned
 /// certificate and the lease token. `Debug` never shows the token.
+///
+/// With `tailcat` set the TCP hop is replaced by a tailcat pipe client
+/// (`tailcat <address> <port>`, the port taken from `url`); the TLS pin and
+/// the token work exactly as on a direct route.
 #[derive(Debug, Clone)]
 pub struct NodeEndpoint {
     pub url: String,
     pub pin: CertificatePin,
     pub token: LeaseToken,
+    pub tailcat: Option<TailcatRoute>,
+}
+
+/// A tailcat route to a machine: the sitter-shipped tailcat binary run in
+/// pipe-client mode, one child per connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailcatRoute {
+    /// The tailcat binary.
+    pub bin: std::path::PathBuf,
+    /// The machine's `tc...` address.
+    pub address: String,
+}
+
+impl NodeEndpoint {
+    /// A direct route to `wss://host:port`.
+    #[must_use]
+    pub fn direct(url: impl Into<String>, pin: CertificatePin, token: LeaseToken) -> Self {
+        Self {
+            url: url.into(),
+            pin,
+            token,
+            tailcat: None,
+        }
+    }
+
+    /// A tailcat route to the machine's listener `port` at `address`.
+    #[must_use]
+    pub fn via_tailcat(
+        route: TailcatRoute,
+        port: u16,
+        pin: CertificatePin,
+        token: LeaseToken,
+    ) -> Self {
+        Self {
+            url: format!("wss://localhost:{port}"),
+            pin,
+            token,
+            tailcat: Some(route),
+        }
+    }
 }
 
 /// A link head dialed, with the node's welcome.
@@ -47,7 +91,7 @@ pub struct DialedLink {
     pub welcome: LinkWelcome,
 }
 
-type Socket = WebSocketStream<TlsStream<TcpStream>>;
+type Socket = WebSocketStream<TlsStream<DialStream>>;
 
 /// Dial the control/journal/RPC connection and bind with `hello`. Head must
 /// have durably advanced `hello.binding.generation` before calling, and
@@ -158,6 +202,10 @@ pub(super) fn decode_rejection(reason: &str) -> Error {
             "{}: the node is bound to another head; reset its binding to move it",
             codes::OTHER_HEAD
         )),
+        codes::UNAUTHORIZED => Error::Forbidden(format!(
+            "{}: the machine no longer accepts this credential",
+            codes::UNAUTHORIZED
+        )),
         codes::WRONG_NODE => Error::InvalidParams(format!(
             "{}: the endpoint serves a different node",
             codes::WRONG_NODE
@@ -207,14 +255,20 @@ async fn connect(
         .map_err(|_| super::config("node endpoint host is invalid"))?;
     let tls = TlsConnector::from(Arc::new(pin::client_config(endpoint.pin)?));
 
-    let tcp = TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(|_| super::unavailable())?;
-    let _ = tcp.set_nodelay(true);
+    let transport = match &endpoint.tailcat {
+        None => {
+            let tcp = TcpStream::connect((host.as_str(), port))
+                .await
+                .map_err(|_| super::unavailable())?;
+            let _ = tcp.set_nodelay(true);
+            DialStream::Tcp(tcp)
+        }
+        Some(route) => DialStream::tailcat(route, port)?,
+    };
     // The pin is checked here, before any HTTP byte (and so the token) is
     // written.
     let stream = tls
-        .connect(server_name, tcp)
+        .connect(server_name, transport)
         .await
         .map_err(|e| tls_error(&e))?;
 
@@ -238,7 +292,7 @@ async fn connect(
     Ok(socket)
 }
 
-pub(super) fn socket_config() -> tungstenite::protocol::WebSocketConfig {
+pub(crate) fn socket_config() -> tungstenite::protocol::WebSocketConfig {
     tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(intent_core::node_link::MAX_FRAME_BYTES))
         .max_frame_size(Some(intent_core::node_link::MAX_FRAME_BYTES))
@@ -273,5 +327,87 @@ fn upgrade_error(error: &tungstenite::Error) -> Error {
             _ => super::protocol("unexpected upgrade response"),
         },
         _ => super::unavailable(),
+    }
+}
+
+/// The byte stream under TLS: a direct TCP connection or a tailcat pipe
+/// client's stdio. The child is killed when the stream is dropped.
+pub(super) enum DialStream {
+    Tcp(TcpStream),
+    Tailcat {
+        _child: tokio::process::Child,
+        stdout: tokio::process::ChildStdout,
+        stdin: tokio::process::ChildStdin,
+    },
+}
+
+impl DialStream {
+    fn tailcat(route: &TailcatRoute, port: u16) -> Result<Self> {
+        if route.address.is_empty() || route.address.starts_with('-') {
+            return Err(super::config("tailcat address is invalid"));
+        }
+        let mut child = tokio::process::Command::new(&route.bin)
+            .arg(&route.address)
+            .arg(port.to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| super::unavailable())?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            return Err(super::unavailable());
+        };
+        Ok(Self::Tailcat {
+            _child: child,
+            stdout,
+            stdin,
+        })
+    }
+}
+
+impl tokio::io::AsyncRead for DialStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Tailcat { stdout, .. } => std::pin::Pin::new(stdout).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for DialStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Tailcat { stdin, .. } => std::pin::Pin::new(stdin).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Tailcat { stdin, .. } => std::pin::Pin::new(stdin).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Tailcat { stdin, .. } => std::pin::Pin::new(stdin).poll_shutdown(cx),
+        }
     }
 }

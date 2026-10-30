@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -72,6 +73,11 @@ struct Inner {
     pending: Mutex<HashMap<LinkId, oneshot::Sender<LinkOutcome>>>,
     inbound: Mutex<HashMap<LinkId, watch::Sender<bool>>>,
     close: watch::Sender<bool>,
+    /// The close frame to send when the link shuts, if not a plain close.
+    close_frame: Mutex<Option<CloseFrame>>,
+    /// The peer holds an executor credential: it may send only
+    /// [`LinkFrame::admitted_from_executor`] frames.
+    executor_peer: bool,
 }
 
 impl Inner {
@@ -287,6 +293,21 @@ impl NodeLink {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Self::start_with(socket, binding, tuning, false)
+    }
+
+    /// [`Self::start`] for a link whose peer is an executor credential: any
+    /// frame outside [`intent_core::node_link::EXECUTOR_LINK_REQUESTS`]
+    /// closes the link.
+    pub(super) fn start_with<S>(
+        socket: WebSocketStream<S>,
+        binding: LeaseBinding,
+        tuning: Tuning,
+        executor_peer: bool,
+    ) -> (Self, LinkEvents)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (out, out_rx) = mpsc::channel(tuning.outbound_queue);
         let (urgent, urgent_rx) = mpsc::channel(URGENT_QUEUE);
         let (events_tx, events_rx) = mpsc::channel(tuning.event_queue);
@@ -298,6 +319,8 @@ impl NodeLink {
             pending: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             close,
+            close_frame: Mutex::new(None),
+            executor_peer,
         });
         let (sink, stream) = socket.split();
         let last_seen = Arc::new(Mutex::new(Instant::now()));
@@ -325,6 +348,18 @@ impl NodeLink {
     /// Close the link. Pending calls fail with `node-link-closed` and
     /// incoming requests observe cancellation.
     pub fn close(&self) {
+        self.inner.shut();
+    }
+
+    /// Close the link with a WebSocket close `code` and `reason` (for
+    /// example `1008` when the peer's credential was revoked).
+    pub fn close_with(&self, code: u16, reason: &'static str) {
+        if !self.is_closed() {
+            *lock(&self.inner.close_frame) = Some(CloseFrame {
+                code: code.into(),
+                reason: reason.into(),
+            });
+        }
         self.inner.shut();
     }
 
@@ -478,9 +513,10 @@ async fn write_loop<S>(
         }
     }
     inner.shut();
+    let frame = lock(&inner.close_frame).take();
     // A peer that stopped reading must not hold this task open.
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = sink.send(Message::Close(None)).await;
+        let _ = sink.send(Message::Close(frame)).await;
         let _ = sink.close().await;
     })
     .await;
@@ -531,6 +567,13 @@ async fn read_loop<S>(
 
 /// Handle one received frame; `false` closes the link.
 async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<Inner>) -> bool {
+    if inner.executor_peer && !frame.admitted_from_executor() {
+        tracing::warn!(
+            code = codes::PROTOCOL,
+            "node link: frame not admitted from an executor credential; closing"
+        );
+        return false;
+    }
     match frame {
         LinkFrame::Hello(_) | LinkFrame::Welcome(_) => {
             tracing::warn!(
