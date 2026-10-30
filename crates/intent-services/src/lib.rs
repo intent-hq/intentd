@@ -21584,6 +21584,8 @@ impl WorkspaceApi for Services {
             .as_deref()
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
+        // Runs close to the debug stack limit: its size is budgeted by
+        // `tests/workspace_create_future_size.rs` (intent-hq/intent#6741).
         self.execution_call(async move {
             let native_checkout = native_checkout.await?;
             // The caller's key, before any native-checkout derivation: a
