@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.76] - 2026-10-29
+
+### 🚀 Features
+
+- Guide visual authoring with screenshot feedback ([#2611](https://github.com/intent-hq/intentd/pull/2611))
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Scope PR discovery to the repository owner's heads ([#2801](https://github.com/intent-hq/intentd/pull/2801))
+- *(acp)* Add a line-bounded ws.note.read so large notes can be read without OOM ([#2800](https://github.com/intent-hq/intentd/pull/2800))
+
+### 📚 Documentation
+
+- Explain workspace sidebar tabs and previews ([#2783](https://github.com/intent-hq/intentd/pull/2783))
+
+### 🧪 Testing
+
+- *(store)* Await cancelled renewal release before opening the doctor observer ([#2803](https://github.com/intent-hq/intentd/pull/2803))
+
+
+## [0.11.75] - 2026-10-29
+
+### 🧪 Testing
+
+- Drain orphan fixture stderr before the cleanup report ([#2796](https://github.com/intent-hq/intentd/pull/2796))
+
+
+## [0.11.74] - 2026-10-29
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Default auto-archive to off and skip workspaces with local git work ([#2795](https://github.com/intent-hq/intentd/pull/2795))
+
+### 🧪 Testing
+
+- *(desktop)* Wait for the native end call in the watchdog lifecycle test ([#2794](https://github.com/intent-hq/intentd/pull/2794))
+
+
 ## [0.11.73] - 2026-10-29
 
 ### 🔧 Refactor

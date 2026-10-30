@@ -1843,11 +1843,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             false,
         ),
-        // Whole days; 0 turns the idle auto-archive sweep off.
+        // Whole days; 0 (the default) turns the idle auto-archive sweep off.
         number(
             AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
             "Auto-archive idle workspaces (days)",
-            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders (0 = off)",
+            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders, and workspaces with uncommitted changes or unpushed commits are skipped (0 = off, the default)",
             "workspace",
             Some(0.0),
             None,
@@ -2782,8 +2782,8 @@ const WHOLE_DAY_PATHS: [&str; 2] = [
 ];
 
 /// The effective `workspace.autoArchiveIdleAfterDays` setting: `Some(days)`
-/// when the idle auto-archive sweep is on (the default, 7), `None` when it
-/// is `0` — read live from the settings snapshot at each sweep.
+/// when the idle auto-archive sweep is on, `None` when it is `0` (the
+/// default, off) — read live from the settings snapshot at each sweep.
 #[must_use]
 pub fn auto_archive_idle_after_days(settings: &SettingsFile) -> Option<u32> {
     Some(settings.workspace.auto_archive_idle_after_days).filter(|days| *days > 0)
@@ -7043,16 +7043,16 @@ mod tests {
     }
 
     /// `workspace.autoArchiveIdleAfterDays` (PROTOCOL §5.12) is a whole
-    /// number of days with default 7; `0` turns the sweep off.
+    /// number of days with default `0` (off).
     #[test]
-    fn auto_archive_catalog_entry_defaults_to_seven_and_allows_zero() {
+    fn auto_archive_catalog_entry_defaults_to_off_and_allows_zero() {
         let def = find_definition(AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH)
             .expect("workspace.autoArchiveIdleAfterDays missing from catalog");
         assert!(!def.sensitive);
         assert!(!def.read_only);
         assert_eq!(def.category, "workspace");
         assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
-        assert_eq!(def.default_value, Some(json!(7.0)));
+        assert_eq!(def.default_value, Some(json!(0.0)));
         assert!(KNOWN_PATHS.contains(&AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH));
         for ok in [json!(0), json!(1), json!(7), json!(30.0)] {
             def.validate(&ok)
@@ -7063,6 +7063,12 @@ mod tests {
         }
 
         let mut settings = SettingsFile::default();
+        assert_eq!(
+            auto_archive_idle_after_days(&settings),
+            None,
+            "off by default"
+        );
+        settings.workspace.auto_archive_idle_after_days = 7;
         assert_eq!(auto_archive_idle_after_days(&settings), Some(7));
         settings.workspace.auto_archive_idle_after_days = 0;
         assert_eq!(auto_archive_idle_after_days(&settings), None);
@@ -7172,9 +7178,10 @@ mod tests {
         remove_temp_settings_files(&tmp, &config_path);
     }
 
-    /// The auto-archive setting round-trips: absent reads 7 with `default`
-    /// origin, `0` persists and turns it off, negatives and fractions
-    /// reject, and `settings.reset` returns to 7.
+    /// The auto-archive setting round-trips: absent reads `0` (off) with
+    /// `default` origin, a positive window persists and turns it on, `0`
+    /// persists and turns it off, negatives and fractions reject, and
+    /// `settings.reset` returns to off.
     #[tokio::test]
     async fn auto_archive_setting_round_trips_via_registry() {
         let (tmp, config_path) = temp_settings_service_paths("autoarchive");
@@ -7187,13 +7194,21 @@ mod tests {
         let path = AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH;
 
         let got = svc.get(path).await.expect("get");
-        assert_eq!(got["value"], json!(7.0));
+        assert_eq!(got["value"], json!(0.0));
         assert_eq!(got["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None,
+            "off by default"
+        );
+
+        svc.update(&json!([{ "path": path, "value": 7 }]))
+            .await
+            .expect("7 turns auto-archive on");
         assert_eq!(
             auto_archive_idle_after_days(&registry.snapshot().effective),
             Some(7)
         );
-
         svc.update(&json!([{ "path": path, "value": 0 }]))
             .await
             .expect("0 turns auto-archive off");
@@ -7226,7 +7241,7 @@ mod tests {
         assert_eq!(reset["origin"], json!("default"));
         assert_eq!(
             auto_archive_idle_after_days(&registry.snapshot().effective),
-            Some(7)
+            None
         );
 
         remove_temp_settings_files(&tmp, &config_path);

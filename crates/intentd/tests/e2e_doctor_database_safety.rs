@@ -1207,6 +1207,21 @@ async fn renewal_initialization_ownership(read: bool) {
         worker_running && exclusive,
         "cancelled initialization must retain exclusive ownership, read={read}"
     );
+    // The blocker left the file in rollback mode, so the released worker now
+    // finishes initialization with `PRAGMA journal_mode = WAL`. An observer
+    // opening concurrently runs the same upgrade, and SQLite fails one of two
+    // racing DELETE->WAL upgrades with SQLITE_BUSY without invoking the busy
+    // handler. Wait for the worker to finish and release ownership first.
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !database_lock_available(&db) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("cancelled initialization must release ownership once unblocked");
     let observer = Store::open(&db).await.unwrap();
     assert_eq!(payloads(&observer, STAGED).await, before);
     finalize(&observer, STAGED, slim).await;

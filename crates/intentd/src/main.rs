@@ -2582,7 +2582,7 @@ async fn cmd_serve_owned(
     let auto_retire_loop = startup_work.spawn(|| services.spawn_auto_retire_loop());
     // Automatic archive (PROTOCOL §5.1): shortly after startup and then
     // hourly, archive workspaces idle longer than
-    // `workspace.autoArchiveIdleAfterDays` (read live; default 7, 0 = off).
+    // `workspace.autoArchiveIdleAfterDays` (read live; default 0 = off).
     // Aborted on clean shutdown.
     let auto_archive_loop = startup_work.spawn(|| services.spawn_auto_archive_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
