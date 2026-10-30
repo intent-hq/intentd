@@ -201,3 +201,104 @@ async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data
         "expected structured error.data, got: {resp}"
     );
 }
+
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_create_refreshes_stale_base_and_preserves_source_changes() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+    let upstream = common::test_tempdir("wt-refresh-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = common::test_tempdir("wt-refresh-source-");
+    git(
+        source.path(),
+        &["clone", upstream.path().to_str().unwrap(), "."],
+    );
+    let old = git(source.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(upstream.path().join("README.md"), "updated remote\n").unwrap();
+    git(upstream.path(), &["commit", "-am", "remote update"]);
+    let tip = git(upstream.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(source.path().join("README.md"), "source draft\n").unwrap();
+
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"repositoryPath": source.path(), "branch": "fresh-workspace", "baseRef": base}),
+    )
+    .await;
+    let workspace = &resp["result"]["workspace"];
+    assert_eq!(workspace["baseCommitSha"], tip, "{resp}");
+    let checkout = workspace["worktreePath"].as_str().unwrap();
+    assert_eq!(
+        intent_git::refs::rev_parse(Path::new(checkout), "HEAD").unwrap(),
+        tip
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(checkout).join("README.md")).unwrap(),
+        "updated remote\n"
+    );
+    assert_eq!(git(source.path(), &["rev-parse", "HEAD"]), old);
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("README.md")).unwrap(),
+        "source draft\n"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_create_rejects_stale_remote_base_when_fetch_fails() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+    let upstream = common::test_tempdir("wt-refresh-missing-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = common::test_tempdir("wt-refresh-failed-source-");
+    git(
+        source.path(),
+        &["clone", upstream.path().to_str().unwrap(), "."],
+    );
+    git(
+        source.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            source.path().join("missing").to_str().unwrap(),
+        ],
+    );
+
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"repositoryPath": source.path(), "branch": "failed-refresh", "baseRef": base}),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32603, "{resp}");
+    assert!(
+        resp["error"]["data"]
+            .as_str()
+            .unwrap()
+            .contains("git fetch failed"),
+        "{resp}"
+    );
+    assert!(git(source.path(), &["branch", "--list", "failed-refresh"]).is_empty());
+    assert_eq!(
+        std::fs::read_dir(fx._dir.path().join("workspaces"))
+            .unwrap()
+            .count(),
+        0
+    );
+}

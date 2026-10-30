@@ -23021,11 +23021,8 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                let pr_token = if pr_checkout.is_some() {
-                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
-                                } else {
-                                    None
-                                };
+                                let pr_token =
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await;
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -23158,6 +23155,13 @@ impl WorkspaceApi for Services {
                                                                 *number,
                                                                 &branch,
                                                                 sha.as_deref(),
+                                                                pr_token.as_deref(),
+                                                            )?;
+                                                        } else {
+                                                            intent_git::fetch::refresh_workspace_base(
+                                                                &repo,
+                                                                base_ref.as_deref(),
+                                                                &remote,
                                                                 pr_token.as_deref(),
                                                             )?;
                                                         }
