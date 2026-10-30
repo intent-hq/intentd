@@ -136,6 +136,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.desktopControl",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
+    "agentFeatures.secretRequests",
     "agentFeatures.attentionRequests",
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",

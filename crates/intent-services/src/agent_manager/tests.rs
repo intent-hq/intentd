@@ -1969,7 +1969,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = AgentManager::new(services, sink, 2); // cap=2 to test eviction and queueing
 
@@ -4705,7 +4705,7 @@ async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -6012,7 +6012,7 @@ async fn suspend_enrollment_kills_child_so_resume_issues_session_load() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -6105,7 +6105,7 @@ async fn suspend_enrollment_flushes_deferred_attention() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -6210,7 +6210,7 @@ async fn suspend_enrollment_drains_continuation_parked_behind_held_slot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -6519,7 +6519,7 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             // Reopen the durable store with a new manager, not merely a new child.
             let store = Store::open(&tmp.path).await.unwrap();
             let bus = EventBus::new(store.clone());
-            let services = Services::new(store).with_event_bus(bus.clone());
+            let services = Services::new_isolated(store).with_event_bus(bus.clone());
             let mgr = AgentManager::new(services, Arc::new(BusEventSink::new(bus)), 8);
             let (agent, calls) = track_antigravity_setup(&mgr, &id, None);
             assert_eq!(
@@ -6570,7 +6570,7 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             let store = Store::open(&tmp.path).await.unwrap();
             let bus = EventBus::new(store.clone());
             let mgr = AgentManager::new(
-                Services::new(store).with_event_bus(bus.clone()),
+                Services::new_isolated(store).with_event_bus(bus.clone()),
                 Arc::new(BusEventSink::new(bus)),
                 8,
             );
@@ -11512,7 +11512,7 @@ async fn stop_fallback_kill_path_arms_redelivery_for_next_turn() {
 fn restarted_manager(mgr: &AgentManager) -> AgentManager {
     let store = mgr.services.store.clone();
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
     AgentManager::new(services, sink, 8)
 }
@@ -12938,7 +12938,7 @@ impl TempSpecialistsDir {
 async fn services_with_specialists(dir: &TempSpecialistsDir) -> (TempDb, Services) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store).with_specialist_dirs(Some(dir.0.clone()), None);
+    let services = Services::new_isolated(store).with_specialist_dirs(Some(dir.0.clone()), None);
     (tmp, services)
 }
 
@@ -12955,7 +12955,7 @@ async fn services_with_specialists_and_registry(
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(Some(dir.0.clone()), None);
     (tmp, services, config_dir)
@@ -13367,7 +13367,7 @@ async fn services_pending_and_respond_rpcs_drive_the_registry() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let manager = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&manager);
@@ -13428,7 +13428,7 @@ async fn services_permission_rpcs_are_inert_without_a_manager() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     // No AgentManager attached → no registry to consult.
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
 
     let pending = services
         .agent_pending_permissions(None)
@@ -13521,7 +13521,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_workspaces_root(tmp.path.with_extension("workspaces"));
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -13588,7 +13588,7 @@ async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_tear
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_workspaces_root(tmp.path.with_extension("workspaces"));
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
@@ -13653,7 +13653,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -13749,7 +13749,7 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -13834,7 +13834,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -13900,7 +13900,7 @@ async fn archive_workspace_parks_wake_deliveries() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -13956,7 +13956,7 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let park = Arc::new(crate::runtime_config::SupervisePark::default());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_wake_archived_park(park.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -14031,7 +14031,7 @@ async fn retired_session_parks_wake_deliveries_until_restore() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14095,7 +14095,7 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14178,7 +14178,7 @@ async fn archived_workspace_parks_internal_parent_wake() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14222,7 +14222,7 @@ async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14287,7 +14287,7 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14347,7 +14347,7 @@ async fn cross_workspace_parent_wake_unaffected_by_archived_child_workspace() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14524,7 +14524,7 @@ async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14566,7 +14566,7 @@ async fn list_active_skips_busy_agent_with_missing_session_row() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
     services.attach_agent_manager(&mgr);
@@ -14608,7 +14608,7 @@ async fn list_active_statement_count_is_constant_in_busy_agents() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store).with_event_bus(bus.clone());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
     let mgr = Arc::new(AgentManager::new(services.clone(), sink, 64));
     services.attach_agent_manager(&mgr);
@@ -19476,7 +19476,7 @@ fn user_message_blocks_persists_image_reference() {
 async fn validate_image_block_refs_checks_registry() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
     let ws_id = WorkspaceId::from("ws-imgref");
 
     let unknown = json!([{ "type": "image", "attachmentId": "att-missing" }]);
@@ -19539,7 +19539,7 @@ async fn validate_image_block_refs_checks_registry() {
 async fn validate_image_block_refs_enforces_aggregate_cap() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
     let ws_id = WorkspaceId::from("ws-imgagg");
     let over_half =
         i64::try_from(crate::agent_ops::IMAGE_REF_MAX_BYTES / 2 + 1).expect("fits in i64");
@@ -19634,7 +19634,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         .await
         .unwrap();
 
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
     let input = json!([
         { "type": "image", "attachmentId": "att-r" },
         { "type": "image", "data": "inline", "mimeType": "image/jpeg" },
@@ -20226,7 +20226,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
     let store = Store::open(&tmp.path).await.expect("open store");
     // No global specialists dirs — the only way to find `worker` is via the
     // workspace's project tier.
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
 
     let session = session_with_specialist(Some("worker"));
     let workspace = intent_core::Workspace {
@@ -20397,7 +20397,7 @@ async fn build_turn_prompt_note_ids_render_reference_notice() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let assets_dir = crate::tests::test_tempdir("intentd-note-img-");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_assets_root(assets_dir.path().to_path_buf());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -20584,7 +20584,7 @@ async fn note_ids_attach_large_image_notes_by_reference() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let assets_dir = crate::tests::test_tempdir("intentd-note-ref-");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_assets_root(assets_dir.path().to_path_buf());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -20737,7 +20737,7 @@ mod merge_user_mcp_servers_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_secret_store(secrets.clone() as Arc<dyn SecretStore>)
             .with_settings_registry(registry);
@@ -22960,7 +22960,7 @@ mod unblocked_hints_tests {
         let cfg_path = cfg.path().join("config.toml");
         std::fs::write(&cfg_path, "[agentFeatures]\ntaskGraph = true\n").expect("write config");
         let registry = Arc::new(crate::SettingsRegistry::load(&cfg_path).expect("load registry"));
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
@@ -25625,7 +25625,7 @@ mod archived_flush_gates {
         registry
             .reload("[agents]\nflushQueuedMessages = \"off\"\n")
             .expect("load legacy preference");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -26509,7 +26509,7 @@ mod flush_queued_messages_tests {
         registry
             .reload("[agents]\nflushQueuedMessages = \"off\"\n")
             .expect("load legacy preference");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -26587,7 +26587,7 @@ mod flush_queued_messages_tests {
         registry
             .reload("[agents]\nflushQueuedMessages = \"systemOnly\"\n")
             .expect("load legacy preference");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -26681,7 +26681,7 @@ mod flush_queued_messages_tests {
         registry
             .reload("[agents]\nflushQueuedMessages = \"systemOnly\"\n")
             .expect("load legacy preference");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
@@ -28147,7 +28147,7 @@ async fn shutdown_admission_parks_late_send_durably_without_provider_failure() {
             .unwrap(),
         AgentStatus::Error
     );
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let queue = restarted.queue_snapshot(&id);
     assert_eq!(queue.len(), 1);
@@ -28243,7 +28243,7 @@ async fn shutdown_admission_requeues_flush_popped_before_closure() {
     // An unrelated queue mutation must not durably overwrite the popped entry.
     mgr.services.persist_queue_snapshot(&id).await;
     mgr.shutdown().await;
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let queue = restarted.queue_snapshot(&id);
     assert_eq!(queue.len(), 1);
@@ -28283,7 +28283,7 @@ async fn shutdown_durable_failed_persist_handback_keeps_original_entry() {
     .await;
     drop(draining);
     mgr.shutdown().await;
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let recovered = restarted
         .dequeue_message(&id)
@@ -28387,7 +28387,7 @@ async fn shutdown_durable_cancelled_drain(count: usize, persisted_head: bool) {
     );
     mgr.services.persist_queue_snapshot(&id).await;
     mgr.shutdown().await;
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     for (n, original) in entries.iter().enumerate() {
         let recovered = restarted
@@ -28508,7 +28508,7 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
         AgentStatus::Error,
         "shutdown batch handback must not manufacture terminal failure"
     );
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let queue = restarted.queue_snapshot(&id);
     assert_eq!(
@@ -28547,7 +28547,7 @@ async fn shutdown_durable_duplicate_draining_guards_preserve_one_entry() {
     drop(first);
     drop(second);
     mgr.shutdown().await;
-    let restarted = Services::new(mgr.services.store.clone());
+    let restarted = Services::new_isolated(mgr.services.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let queue = restarted.queue_snapshot(&id);
     assert_eq!(
@@ -30060,7 +30060,7 @@ mod profile_routing_tests {
         let root = crate::test_support::test_tempdir("profile-switch-notice-");
         let store = Store::open(&root.path().join("a.db")).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
         let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
@@ -30187,7 +30187,7 @@ mod profile_routing_tests {
             let root = crate::test_support::test_tempdir("profile-activation-spawn-");
             let store = Store::open(&root.path().join("a.db")).await.unwrap();
             let bus = EventBus::new(store.clone());
-            let services = Services::new(store)
+            let services = Services::new_isolated(store)
                 .with_event_bus(bus.clone())
                 .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
             let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);

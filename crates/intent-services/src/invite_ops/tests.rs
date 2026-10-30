@@ -68,9 +68,9 @@ pub(super) fn gitlab_guest(host: &str, login: &str, id: u64) -> ForgeUser {
 /// ([`Services::resolve_identity_forge`]) probes GitLab through that store,
 /// so it must never read the developer's real `~/intent/.secrets.json`.
 fn services(store: &Store, tmp: &TempDb) -> Services {
-    Services::new(store.clone()).with_gitlab_secret_store(intent_core::FileSecretStore::with_path(
-        tmp.path.with_extension("secrets.json"),
-    ))
+    Services::new_isolated(store.clone()).with_gitlab_secret_store(
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
 }
 
 pub(super) fn wire(principal_id: &PrincipalId) -> Caller {
@@ -304,7 +304,7 @@ async fn stale_snapshot_cannot_bypass_the_reconnect_guard() {
 async fn stale_refresh_keeps_a_concurrent_account_switch() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("first".into());

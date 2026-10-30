@@ -18780,7 +18780,7 @@ mod role_reminder_tests {
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_specialist_dirs(
                 specialists_dir,
@@ -19768,7 +19768,7 @@ mod role_reminder_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let workspace_id = WorkspaceId::from("ws-1");
@@ -20789,7 +20789,7 @@ mod disabled_provider_rehome_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         store
@@ -21257,7 +21257,7 @@ mod disabled_provider_rehome_tests {
             .expect_err("disabled provider without a default must not spawn");
         assert!(
             matches!(&err, Error::InvalidParams(m)
-                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Agents")),
+                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Providers")),
             "distinct not-enabled rejection: {err:?}"
         );
         assert!(!mgr.contains(&agent_id), "no child spawned");
@@ -21579,7 +21579,7 @@ mod legacy_feature_freeze_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         store
@@ -23438,7 +23438,7 @@ mod agent_retry_tests {
             .await
             .expect("insert session");
         let bus = EventBus::new(db.clone());
-        let services = Services::new(db).with_event_bus(bus.clone());
+        let services = Services::new_isolated(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
@@ -23461,7 +23461,7 @@ mod agent_retry_tests {
             .expect("insert session");
         let bus = EventBus::new(db.clone());
         let services = crate::test_support::fake_runtime::FakeRuntime::install(
-            Services::new(db).with_event_bus(bus.clone()),
+            Services::new_isolated(db).with_event_bus(bus.clone()),
         );
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
@@ -23579,7 +23579,7 @@ mod agent_retry_tests {
             }
             let bus = EventBus::new(store.clone());
             let services = crate::test_support::fake_runtime::FakeRuntime::install(
-                Services::new(store.clone()).with_event_bus(bus.clone()),
+                Services::new_isolated(store.clone()).with_event_bus(bus.clone()),
             );
             let mgr = Arc::new(AgentManager::new(
                 services,

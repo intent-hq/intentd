@@ -247,6 +247,14 @@ async fn create(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    // Saved scripts never receive secrets (PROTOCOL §5.56): say so instead of
+    // silently ignoring the key and letting the script run without them.
+    if args.get("secretEnv").is_some() {
+        return Err(
+            "secretEnv is not supported by ws.script: secrets work only with ws.host.exec"
+                .to_string(),
+        );
+    }
     let name =
         req_str(args, "name").map_err(|_| "name, command, and mode are required.".to_string())?;
     let command = req_str(args, "command")

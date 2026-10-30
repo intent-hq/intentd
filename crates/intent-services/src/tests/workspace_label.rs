@@ -28,7 +28,7 @@ async fn harness() -> Harness {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
     let ws_root = WorkspacesRoot::new();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
     Harness {

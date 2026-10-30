@@ -22,7 +22,7 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
     let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.clone())
         .with_settings_registry(common::registry_with_default_provider(&ws_root));
 
@@ -64,7 +64,7 @@ async fn workspace_create_survives_multibyte_char_after_at_in_prompt() {
     let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.clone())
         .with_settings_registry(common::registry_with_default_provider(&ws_root));
 
@@ -102,7 +102,7 @@ async fn workspace_id_random_slug_when_no_prompt() {
     let db = tmp.path().join("intentd.db");
     let ws_root = tmp.path().join("ws");
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
+    let services = Services::new_isolated(store.clone()).with_workspaces_root(ws_root.clone());
 
     // Workspace create with no prompt → should generate random slug
     let result = services

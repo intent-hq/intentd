@@ -256,6 +256,7 @@ mod runtime_config;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
+mod secret_requests;
 mod sentry_ops;
 mod settings;
 mod settings_registry;
@@ -851,6 +852,9 @@ pub struct Services {
     /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
     /// notice at worst.
     dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
+    /// Agent-owned secrets and pending secret requests (PROTOCOL §5.56).
+    /// Memory only: never persisted, so a restart drops every value.
+    secret_vault: Arc<secret_requests::SecretVault>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -1246,6 +1250,10 @@ pub struct Services {
     /// Production wiring uses the daemon default (`$INTENTD_SECRETS_FILE`);
     /// tests inject a scratch path.
     gitlab_secret_store: intent_core::FileSecretStore,
+    /// Owns the scratch secrets directory of a [`Services::new_isolated`]
+    /// instance (removed when the last clone drops); `None` otherwise.
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    isolated_secrets_dir: Option<Arc<tempfile::TempDir>>,
     /// Serialises refresh / persist / delete of the GitLab credential pair
     /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
     /// clones.
@@ -1620,6 +1628,32 @@ impl Services {
         Self::new_with_repository_sources(store, intent_core::FileSecretStore::new(), None)
     }
 
+    /// Test constructor: [`Services::new`] over a per-instance scratch
+    /// secrets file instead of the home default, so a test can never read,
+    /// write or migrate the developer's real `~/intent/.secrets.json` (or its
+    /// `.collaboration` sibling). The scratch dir lives until the last clone
+    /// drops. Use this in every test: under nextest the default constructor
+    /// only avoids the real home by falling back to one scratch store shared
+    /// by the whole test process (see [`intent_core::test_isolation`]), and
+    /// plain `cargo test` has no guard at all.
+    ///
+    /// # Panics
+    ///
+    /// When the scratch directory cannot be created.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn new_isolated(store: Store) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("intentd-test-secrets-")
+            .tempdir()
+            .expect("create isolated secrets dir");
+        let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
+        let mut services = Self::new_with_repository_sources(store, secrets, None);
+        services.isolated_secrets_dir = Some(Arc::new(dir));
+        services
+    }
+
     /// Select the backing file before constructing any secret wrapper.
     #[cfg(test)]
     pub(crate) fn new_with_file_secrets(
@@ -1710,6 +1744,7 @@ impl Services {
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
+            secret_vault: Arc::new(secret_requests::SecretVault::default()),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
@@ -1789,6 +1824,8 @@ impl Services {
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
             gitlab_secret_store,
+            #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+            isolated_secrets_dir: None,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
@@ -13230,17 +13267,20 @@ pub fn default_workspaces_root() -> PathBuf {
         return PathBuf::from(dir);
     }
     assert_hermetic_root_absent();
-    std::env::var_os("HOME")
+    let root = std::env::var_os("HOME")
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("intent")
-        .join("workspaces")
+        .join("workspaces");
+    intent_core::test_isolation::assert_outside_forbidden_home(&root, "default_workspaces_root");
+    root
 }
 
 /// Non-panicking [`default_workspaces_root`] for boot-time consumers that must
 /// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
-/// `$HOME` default would panic — else the same root the service layer uses.
+/// `$HOME` default would panic — or, under the test harness, when the default
+/// lands in the real home; else the same root the service layer uses.
 pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
@@ -13248,12 +13288,17 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
         return None;
     }
-    Some(
-        std::env::var_os("HOME")
-            .map_or_else(std::env::temp_dir, PathBuf::from)
-            .join("intent")
-            .join("workspaces"),
-    )
+    let root = std::env::var_os("HOME")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("intent")
+        .join("workspaces");
+    // Under the test harness the real home's root is unavailable, exactly
+    // like the hermetic posture above: the CoW probe would otherwise create
+    // `~/intent/workspaces` (see `intent_core::test_isolation`).
+    if intent_core::test_isolation::is_in_forbidden_home(&root) {
+        return None;
+    }
+    Some(root)
 }
 
 /// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
@@ -18609,6 +18654,9 @@ impl Services {
             // Producer admission is already closed: no new subscription can
             // register behind this sweep while the store cleanup yields.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Drop the workspace's memory-held secrets and pending secret
+            // requests (§5.56) before its rows go.
+            services.secret_vault.clear_workspace(&id);
             // Eagerly abort the workspace's live hook scheduler tasks BEFORE
             // the store cascade drops their rows — otherwise each task would
             // linger until its next tick before noticing the row is gone.
@@ -24241,6 +24289,9 @@ impl WorkspaceApi for Services {
                 // Desktop authority never survives archive, the caller's
                 // included: unarchive must not hand it back without consent.
                 this.desktop_terminate_workspace(&id).await;
+                // Archiving drops every memory-held secret and pending
+                // request in the workspace (§5.56); unarchive starts empty.
+                this.secret_vault.clear_workspace(&id);
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect
@@ -33912,10 +33963,14 @@ impl WorkspaceApi for Services {
                 // exits cooperatively once its generation is gone.
                 *slot = None;
             }
-            let (auth, flow) = intent_sourcecontrol::device_flow::start_at(
+            // Fix the flow's store to this instance's file store (the daemon
+            // default in production) instead of letting `start_at` resolve
+            // and migrate the home default behind an injected store.
+            let (auth, flow) = intent_sourcecontrol::device_flow::start_at_with_store(
                 &base_uri,
                 &client_id,
                 intent_sourcecontrol::device_flow::DEFAULT_SCOPES,
+                self.gitlab_secret_store.clone(),
             )
             .await
             .map_err(pr_ops::map_sc_err)?;
@@ -35796,6 +35851,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        Box::pin(async move {
+            self.ports
+                .runtime()
+                .rehome_superseded_browser_tabs(self, client_id, superseded)
+                .await
+        })
+    }
+
     fn draft_get(
         &self,
         workspace_id: WorkspaceId,
@@ -35854,6 +35922,78 @@ impl WorkspaceApi for Services {
                 .run_for_workspace(self, workspace_id, params)
                 .await
         })
+    }
+
+    fn agent_host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.agent_host_exec_op(workspace_id, agent_id, params))
+    }
+
+    fn secret_request(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+        reason: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.secret_request_op(workspace_id, agent_id, name, reason))
+    }
+
+    fn secret_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.secret_list_op(workspace_id, agent_id).await
+        })
+    }
+
+    fn secret_forget(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.secret_forget_op(workspace_id, agent_id, name).await
+        })
+    }
+
+    fn secret_provide(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+        value: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let value = zeroize::Zeroizing::new(value);
+        Box::pin(self.secret_answer_op(
+            workspace_id,
+            request_id,
+            secret_requests::Outcome::Provided,
+            Some(value),
+        ))
+    }
+
+    fn secret_dismiss(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.secret_answer_op(
+            workspace_id,
+            request_id,
+            secret_requests::Outcome::Declined,
+            None,
+        ))
     }
 
     fn pr_monitor_start_addressed(

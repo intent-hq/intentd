@@ -694,7 +694,8 @@ mod tests {
             let store = intent_store::Store::open(&dir.path().join("settings.db"))
                 .await
                 .unwrap();
-            let services = crate::Services::new(store).with_settings_registry(registry.clone());
+            let services =
+                crate::Services::new_isolated(store).with_settings_registry(registry.clone());
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Semaphore::new(0));
             let reload: PreparedReload = Arc::new({
@@ -930,7 +931,8 @@ mod tests {
         let store = intent_store::Store::open(&dir.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store).with_settings_registry(registry.clone());
+        let services =
+            crate::Services::new_isolated(store).with_settings_registry(registry.clone());
         let snapshot = registry.snapshot();
         let notice = registry.subscribe();
         let revision = services
@@ -1072,7 +1074,7 @@ mod tests {
             .await
             .unwrap();
         let bus = crate::events::bus::EventBus::new(store.clone());
-        let services = crate::Services::new(store.clone())
+        let services = crate::Services::new_isolated(store.clone())
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let control = Arc::new(PreparedRuntimeHook {

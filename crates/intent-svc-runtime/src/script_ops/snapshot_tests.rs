@@ -89,7 +89,7 @@ async fn script_snapshot_recovery_installs_matching_runtime_before_publication()
         workspace_id: Some(h.ws.to_string()),
         ..Default::default()
     });
-    let fresh = crate::test_runtime::with_runtime(Services::new(store)).with_event_bus(bus);
+    let fresh = crate::test_runtime::with_runtime(Services::new_isolated(store)).with_event_bus(bus);
     assert_eq!(fresh.hydrate_scripts().await.unwrap(), 1);
     let event = await_script_change(&mut sub, "updated").await;
     let row = &event["data"]["script"];

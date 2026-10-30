@@ -651,6 +651,17 @@ pub trait RuntimePort: Send + Sync + 'static {
         new_host: &'a ClientId,
     ) -> BoxFuture<'a, Result<()>>;
 
+    /// `client.hello` follow-up (intent-hq/intent#8045): move the open browser
+    /// tabs still hosted by `superseded` (earlier ids of the hello'd device,
+    /// already limited by the transport to ids the caller may act as) onto
+    /// `client_id`. Returns how many tabs moved.
+    fn rehome_superseded_browser_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'a, Result<usize>>;
+
     /// Provision a `CoW` sandbox for `agent_id` under `workspaces_root`.
     fn provision_sandbox<'a>(
         &'a self,
@@ -1595,6 +1606,17 @@ impl RuntimePort for UnavailableRuntime {
         Box::pin(async { Err(runtime_unavailable()) })
     }
 
+    /// Without the runtime there is no tab registry to repair; the hello it
+    /// follows must not fail or warn, so nothing moves.
+    fn rehome_superseded_browser_tabs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _client_id: ClientId,
+        _superseded: Vec<ClientId>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
     fn provision_sandbox<'a>(
         &'a self,
         _svc: &'a Services,
@@ -2104,7 +2126,7 @@ mod tests {
     #[tokio::test]
     async fn unregistered_transfer_port_fails_like_the_workspace_api_default() {
         let tmp = TempDb::new();
-        let svc = Services::new(intent_store::Store::open(&tmp.path).await.unwrap());
+        let svc = Services::new_isolated(intent_store::Store::open(&tmp.path).await.unwrap());
         let ws = WorkspaceId::new();
         let expect = |result: intent_core::Result<serde_json::Value>, method: &str| {
             assert!(
@@ -2154,7 +2176,7 @@ mod tests {
     }
 
     async fn bare_services(tmp: &TempDb) -> Services {
-        Services::new(intent_store::Store::open(&tmp.path).await.unwrap())
+        Services::new_isolated(intent_store::Store::open(&tmp.path).await.unwrap())
     }
 
     #[tokio::test]

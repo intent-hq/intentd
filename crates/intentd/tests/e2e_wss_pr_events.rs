@@ -373,7 +373,7 @@ async fn boot_seeded(
     store.insert_workspace(&ws).await.expect("seed workspace");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_source_control(Arc::new(forge)),

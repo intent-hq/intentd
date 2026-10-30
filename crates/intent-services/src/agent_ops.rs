@@ -1130,7 +1130,7 @@ pub(crate) fn ensure_provider_enabled(
         let display = intent_providers::provider_config(provider_id).display_name;
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
-             Settings > Agents."
+             Settings > Providers, or choose an enabled provider or model."
         )));
     }
     Ok(())
@@ -4013,7 +4013,7 @@ impl Services {
     /// is NULL; best-effort — an encode failure yields `None` and the wire
     /// field stays omitted.
     fn current_agent_features_snapshot(&self) -> Option<serde_json::Value> {
-        serde_json::to_value(&self.effective_settings().agent_features).ok()
+        agent_features_snapshot(&self.effective_settings().agent_features).ok()
     }
 
     /// The `agentFeatures` values governing `session`'s runtime surface: the
@@ -4073,7 +4073,7 @@ impl Services {
                 return;
             }
         }
-        let Ok(snapshot) = serde_json::to_value(&features) else {
+        let Ok(snapshot) = agent_features_snapshot(&features) else {
             tracing::warn!(agent_id = %session.id,
                 "legacy feature freeze: agentFeatures snapshot encode failed; skipping");
             return;
@@ -5719,7 +5719,7 @@ impl Services {
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
         let settings = self.effective_settings();
-        let harness_features = serde_json::to_value(&settings.agent_features).map_err(|e| {
+        let harness_features = agent_features_snapshot(&settings.agent_features).map_err(|e| {
             AgentPersistError::Internal(format!(
                 "{method}: encode agentFeatures snapshot failed: {e}"
             ))
@@ -6123,6 +6123,10 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        #[cfg(all(test, unix))]
+        self.pending_delete_test_gate
+            .pause("agent-secret-window", &agent_id.0)
+            .await;
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -6140,6 +6144,11 @@ impl Services {
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
+        // Memory-held secrets and pending requests die with their agent
+        // (§5.56). Swept only AFTER the row is gone: a concurrent
+        // `ws.secret.request` either inserted before this sweep (removed
+        // here) or re-reads the session after the DELETE and drops itself.
+        self.secret_vault.clear_agent(&agent_id);
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
@@ -6507,6 +6516,8 @@ impl Services {
             return Ok(None);
         }
         self.desktop_terminate_agent(&session.id).await;
+        // A retired agent is inert: drop its secrets and pending requests (§5.56).
+        self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire
         // caller retires another agent, whose current worker must be aborted;
         // MCP self-retirement instead lets its own response unwind normally.
@@ -19617,4 +19628,21 @@ pub(crate) fn stamp_direct_correlation(metadata: &mut Option<Value>, id: &str) {
         object.remove("recoverySources");
         object.insert("submissionIds".into(), json!([id]));
     }
+}
+
+/// The per-session `agentFeatures` snapshot JSON (intent-hq/monorepo#2459).
+/// The off-by-default `secretRequests` toggle (PROTOCOL §5.56) is written
+/// only when on: an absent key decodes as `false`, so default sessions keep
+/// the exact snapshot shape older daemons and the shared transfer-selection
+/// fixtures expect.
+pub(crate) fn agent_features_snapshot(
+    features: &intent_core::settings_file::AgentFeaturesSettings,
+) -> serde_json::Result<serde_json::Value> {
+    let mut snapshot = serde_json::to_value(features)?;
+    if !features.secret_requests {
+        if let Some(fields) = snapshot.as_object_mut() {
+            fields.remove("secretRequests");
+        }
+    }
+    Ok(snapshot)
 }

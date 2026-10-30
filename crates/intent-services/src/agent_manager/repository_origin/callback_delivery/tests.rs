@@ -4976,7 +4976,7 @@ mod live_context {
     }
 
     #[intent_test_macros::daemon_test]
-    async fn confirmed_context_actual_created_3_2_reaches_original_guidance_boundary() {
+    async fn confirmed_context_actual_created_current_reaches_original_guidance_boundary() {
         let h = NativeHarness::observed("<created>", true, false, None, None).await;
         let created = h.f.stored().await;
         assert_eq!(
@@ -8909,7 +8909,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 let s = started.unwrap();
                 let prompt_only = matches!(mode, "absent" | "wrong" | "malformed");
                 if prompt_only {
-                    let prompt = s.turn.prompt.as_ref().expect("original 3.2 prompt capture");
+                    let prompt = s
+                        .turn
+                        .prompt
+                        .as_ref()
+                        .expect("original current prompt capture");
                     assert!(!prompt.binding.requires_callback_ack);
                     assert!(!prompt.binding.acknowledged.load(Ordering::SeqCst));
                 } else {
@@ -9595,7 +9599,7 @@ mod genuine_native_startup {
                 .unwrap();
             let bus = crate::events::EventBus::new(store.clone());
             let services = Arc::new(
-                Services::new(store)
+                Services::new_isolated(store)
                     .with_settings_registry(registry)
                     .with_event_bus(bus.clone())
                     .with_workspaces_root(scratch.path().join("workspaces")),

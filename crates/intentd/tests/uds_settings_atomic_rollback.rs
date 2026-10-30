@@ -124,7 +124,7 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -260,7 +260,7 @@ async fn successful_mixed_batch_persists_all() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -331,7 +331,7 @@ async fn single_key_failure_reverts() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -392,7 +392,7 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -526,7 +526,7 @@ async fn gitlab_token_rollback_restores_device_grant_siblings() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let secrets = Arc::new(InMemorySecretStore::default());
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(secrets.clone())
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -605,7 +605,7 @@ async fn db_read_error_during_capture_fails_batch() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());

@@ -103,6 +103,56 @@ a refreshed identity; older apps also require Multiplayer Labs. The remote-owner
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
+## Inline visuals (unreleased)
+
+Inline HTML visuals are under development; do not recommend them in ordinary app
+help. Discuss or test them only when explicitly asked, and confirm the frontend
+supports them. A newer daemon or agent instruction version does not prove support
+in the installed client.
+
+For development testing, run both component branches and create a new agent with
+harness 3.5. Existing agents retain their creation-time prompts. If controls do
+not respond in a scaled embedded-browser preview, choose **Fit panel** in its size
+menu and retry.
+
+In a supporting development frontend, an agent can put raw, self-contained
+HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
+in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
+The preview shows a skeleton while its content streams or the sandbox starts.
+Scrolling continues through chat when the visual has no more content to scroll.
+Use this for exploring comparisons or changing inputs. Keep simple explanations
+in text and shareable charts in saved files. Visuals use app semantic CSS variables
+for both themes and cannot use external libraries, network access, arbitrary app APIs,
+navigation, forms, popups, or embedded frames. **Source** shows the code;
+**Reload** starts it again with its last published configuration restored.
+
+With the persistent-visual development extension, authored code publishes bounded
+JSON state plus named inputs and derived results through `window.intentVisual`.
+The host toolbar can **Save scenario** (up to six), compare, restore or remove
+scenarios. **Use this configuration** appends selected inputs/results to the
+editable composer draft without sending it. **Export** saves JSON and editable
+source to fixed workspace paths; the visual cannot choose paths or send messages.
+This extension does not promise arbitrary SVG/PNG export. A labeled file input
+can read an explicitly user-picked local CSV, JSON or image with the browser File
+API; it cannot read arbitrary paths or fetch data automatically.
+
+The development preview supplies app typography, compact controls and optional
+drawing styles from the diagrams: neutral surfaces and thin lines that stay thin
+as the drawing resizes, plus six theme chart colors for data and depicted
+things. Use HTML labels for readable text in narrow chat columns.
+Playback buttons, sliders and their values share a compact row. Authored styles
+can override the defaults. Figures share the surrounding content gutter; keep
+headings, chart labels, controls and results on common edges, with row values
+aligned at the right.
+
+Before showing a visual, an agent in a supporting development frontend checks it
+with the browser `previewHtml` action: a screenshot at a chosen width and light or
+dark appearance, its content height and console messages. A frontend without that
+action reports it as unsupported; the agent then says preview is unavailable.
+Asked for an image to share elsewhere, the agent saves a PNG file instead.
+
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.5/common.md; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
+
 ## Finding things
 
 Answer location questions with the destination and action first. Read settings only
@@ -206,7 +256,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -219,6 +269,31 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+**Disable a provider.** In **Settings → Providers**, choose **Disable** from its
+⋯ menu when offered. Older apps hide this action for the default provider and
+block it while saved models or specialists use that provider; change those
+selections first.
+
+Newer or test app builds with matching daemon support also allow disabling the
+default provider or one used by saved selections. Check released-app availability
+before offering those controls as normal options. Saved selections remain intact;
+a turn already running can finish. On the next turn, a conversation using the
+provider's Default configuration moves to the configured app default if it is
+enabled and usable, with a notice in chat. Named profiles require an explicit
+replacement. If no usable default exists, re-enable the provider or choose another
+enabled provider/model. With the newer daemon enforcement, new agents and quick
+actions cannot run on a disabled provider; update their saved selections or
+re-enable it. Intent does not choose an arbitrary replacement for a disabled app
+default.
+
+<!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
+In app versions with installed-or-enabled provider visibility, Auggie appears in
+provider lists, including onboarding, only when its CLI is installed or it is
+already enabled. An enabled but missing installation stays visible so you can
+disable it; it disappears afterward. Sign-in is not required for an installed
+Auggie to appear. Older apps may list it differently; do not promise this behavior
+without matching app support.
 
 **Provider profiles (Codex and Claude Code only).** Availability depends on the app
 version. In apps where profiles remain in Labs, discuss them only when asked and
@@ -878,7 +953,48 @@ authenticated tunnel.
 
 ## Add context, run a task, and find results
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; sidebar/{AddContextSection,ContextPanel,NotesPanel}.svelte; NoteMetadataBar.svelte (sidebar/ and NoteMetadataBar paths relative to the same workspace component directory); messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+
+Sidebar tabs and previews depend on the app version. The layout below applies to
+apps with the newer section tabs and hover previews. Older apps may use different
+controls or return to the overview when the selected tab is clicked; use their
+existing **Context** actions to find the Spec and other notes.
+
+Use the icon tabs above the expanded sidebar's content panel to switch sections.
+They share available width up to a compact limit, then stay grouped at the left.
+Hover over an icon for its section name; scroll the row horizontally when space
+is tight. Faded edges show where more tabs are hidden and clear when you reach
+that end. **Agents** opens by default; your selected section is remembered. Its
+tab shows the main agent's avatar, or a robot while no main agent is available.
+**People** follows **Agents** in both the expanded row and collapsed rail.
+A token-usage total appears beside **Agents** once tokens have been used.
+The workspace status image appears as a compact thumbnail in **Context**; click
+it to view the full image.
+When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
+a section tab to reveal just its content panel beside it, aligned with the tab
+when space allows. The panel fits its contents; longer sections scroll within the
+available space. Moving the pointer between tabs smoothly switches the preview
+without changing your remembered section. In the expanded sidebar, selecting a
+different section leaves your open content in place. Click the already-selected
+tab to open its default
+content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
+changes list, and **Files** a root README (otherwise the first root file, then a
+file inside a folder). **Browsers** opens the first browser in its list; **Shells**
+opens the first terminal, creating one when none exists. A click in the collapsed
+rail opens the section's default content immediately. Moving keyboard focus
+across the expanded row only selects the sidebar section; its focus ring stays
+inside the tab when the row scrolls. Enter or Space acts
+like a click in either layout. The rail's toggle stays visible as its tabs scroll
+and pins the sidebar open;
+the expanded sidebar's toggle collapses it.
+**Toggle Sidebar** still uses
+**⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
+Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
+When collapsed, this opens the matching floating section beside the rail.
+
+In **Files**, search and file actions sit beside the section title. Open search to
+find a file; use the arrow keys to choose a result and Enter to open it. Escape
+clears search and returns focus to its button.
 
 In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel

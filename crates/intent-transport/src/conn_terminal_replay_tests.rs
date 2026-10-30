@@ -49,7 +49,7 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
     let (priority, _priority_rx) = mpsc::channel(1);
     let (bulk, mut rx) = mpsc::channel(1);
     let forwarder = recovery::forward(
-        Arc::new(intent_services::Services::new(store)),
+        Arc::new(intent_services::Services::new_isolated(store)),
         sub,
         None,
         None,

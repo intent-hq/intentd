@@ -540,3 +540,261 @@ fn monitor_test_host_support_requires_explicit_opt_in() {
         "test support changes no other host claims"
     );
 }
+
+/// Records `rehome_superseded_browser_tabs` calls (intent-hq/intent#8045) and
+/// optionally fails them.
+#[derive(Default)]
+struct RehomeApi {
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+    fail: bool,
+    /// The durable host role `principal_host_role` reports (`None` ⇒ error).
+    role: Option<intent_core::HostRole>,
+}
+
+impl WorkspaceApi for RehomeApi {
+    fn upsert_client(
+        &self,
+        _client_id: ClientId,
+        _name: Option<String>,
+        _capabilities: Option<Value>,
+        _host: ClientHostInfo,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn principal_host_role(
+        &self,
+        _principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<intent_core::HostRole>> {
+        let role = self.role;
+        Box::pin(
+            async move { role.ok_or_else(|| intent_core::Error::NotFound("principal".into())) },
+        )
+    }
+
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((client_id.0, superseded.into_iter().map(|c| c.0).collect()));
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(intent_core::Error::Internal("rehome exploded".into()))
+            } else {
+                Ok(1)
+            }
+        })
+    }
+}
+
+fn wire_caller(principal: &str, is_administrator: bool) -> Caller {
+    Caller::Wire {
+        principal_id: PrincipalId::from_string(principal),
+        host_role: if is_administrator {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        },
+    }
+}
+
+fn hello_as(client_id: &str) -> ClientRequest {
+    classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "client.hello",
+        "params": { "clientId": client_id, "capabilities": { "browserExec": true } }
+    }))
+    .unwrap()
+}
+
+/// A device whose id other backends prefixed twice re-hellos as the
+/// administrator: the tabs of both earlier ids are offered for rehome, most
+/// recent first, so they move to the current id.
+#[tokio::test]
+async fn administrator_hello_rehomes_tabs_from_every_superseded_suffix() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(wire_caller("p-owner", true)),
+            handle(
+                hello_as("aaccc21a:4d61d017:60420340"),
+                &api,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        out["result"]["clientId"],
+        json!("aaccc21a:4d61d017:60420340")
+    );
+    assert_eq!(
+        *api.calls.lock().unwrap(),
+        vec![(
+            "aaccc21a:4d61d017:60420340".to_string(),
+            vec!["4d61d017:60420340".to_string(), "60420340".to_string()],
+        )]
+    );
+}
+
+/// A plain (unprefixed) id has no earlier ids, so no rehome is attempted.
+#[tokio::test]
+async fn unprefixed_hello_attempts_no_rehome() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let _ = handle(
+        hello_as("60420340"),
+        &api,
+        &mut binding,
+        true,
+        TEST_DAEMON_VERSION,
+    )
+    .await;
+    assert!(api.calls.lock().unwrap().is_empty());
+}
+
+/// Multiplayer safety: a collaborator presenting another member's raw id
+/// resolves to `{principal}:{raw}`, but may not act as `{raw}`, so the other
+/// member's tabs are never offered for rehome. Its own namespaced earlier id
+/// (`{principal}:{raw}` under a further `{principal}:` prefix) is.
+#[tokio::test]
+async fn collaborator_hello_never_rehomes_ids_outside_its_namespace() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(wire_caller("p-guest", false)),
+            handle(
+                hello_as("cli-owner"),
+                &api,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(out["result"]["clientId"], json!("p-guest:cli-owner"));
+    assert!(
+        api.calls.lock().unwrap().is_empty(),
+        "the owner's raw id is not the guest's to rehome"
+    );
+
+    let mut binding = None;
+    let _ = with_request_context(
+        true,
+        Some(wire_caller("p-other", false)),
+        handle(
+            hello_as("p-guest:cli-owner"),
+            &api,
+            &mut binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
+    )
+    .await;
+    assert!(
+        api.calls.lock().unwrap().is_empty(),
+        "another guest's namespaced id is not p-other's to rehome"
+    );
+
+    assert_eq!(
+        with_request_context(true, Some(wire_caller("p-guest", false)), async {
+            superseded_client_ids(&ClientId::from_string("p-guest:x:p-guest:dev"))
+        })
+        .await,
+        vec![ClientId::from_string("p-guest:dev")],
+        "only ids inside the caller's own namespace qualify"
+    );
+}
+
+/// A failed rehome is logged and never fails the hello.
+#[tokio::test]
+async fn failed_rehome_does_not_fail_the_hello() {
+    let api = RehomeApi {
+        fail: true,
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let out = handle(
+        hello_as("4d61d017:60420340"),
+        &api,
+        &mut binding,
+        true,
+        TEST_DAEMON_VERSION,
+    )
+    .await;
+    assert!(out.bound.is_some());
+    let out = parsed(out);
+    assert_eq!(out["result"]["clientId"], json!("4d61d017:60420340"));
+    assert_eq!(binding.unwrap().as_str(), "4d61d017:60420340");
+    assert_eq!(api.calls.lock().unwrap().len(), 1);
+}
+
+/// Rehoming is browser management: a collaborator whose connection still
+/// carries a member snapshot but who has since been demoted to guest keeps
+/// its namespace, yet its hello offers nothing for rehome (and still
+/// succeeds); with current member authority its own namespaced earlier id
+/// is offered.
+#[tokio::test]
+async fn demoted_collaborator_hello_rehomes_nothing_but_still_succeeds() {
+    let member_snapshot = Caller::Wire {
+        principal_id: PrincipalId::from_string("p-mem"),
+        host_role: intent_core::HostRole::Member,
+    };
+    let demoted = RehomeApi {
+        role: Some(intent_core::HostRole::Guest),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(member_snapshot.clone()),
+            handle(
+                hello_as("p-mem:x:p-mem:dev"),
+                &demoted,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(out["result"]["clientId"], json!("p-mem:x:p-mem:dev"));
+    assert!(demoted.calls.lock().unwrap().is_empty());
+
+    let member = RehomeApi {
+        role: Some(intent_core::HostRole::Member),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let _ = with_request_context(
+        true,
+        Some(member_snapshot),
+        handle(
+            hello_as("p-mem:x:p-mem:dev"),
+            &member,
+            &mut binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
+    )
+    .await;
+    assert_eq!(
+        *member.calls.lock().unwrap(),
+        vec![(
+            "p-mem:x:p-mem:dev".to_string(),
+            vec!["p-mem:dev".to_string()]
+        )]
+    );
+}

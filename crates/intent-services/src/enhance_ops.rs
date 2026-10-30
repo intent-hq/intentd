@@ -291,13 +291,21 @@ impl Services {
         // settings, which resolve the gate closed rather than falling through to
         // the first registered provider — return a typed unavailable response so
         // the FE can hide the affordance gracefully without an error crash.
-        let effective_provider =
-            crate::agent_session::derived_default_provider(&self.effective_settings());
+        let settings = self.effective_settings();
+        let effective_provider = crate::agent_session::derived_default_provider(&settings);
         if effective_provider.as_deref() != Some("auggie") {
             return Ok(json!({
                 "available": false,
                 "reason": "enhance-prompt requires auggie as the effective default provider"
             }));
+        }
+
+        if let Err(error) = crate::agent_ops::ensure_provider_enabled(
+            "agent.enhancePrompt",
+            "auggie",
+            settings.providers.enabled.as_ref(),
+        ) {
+            return Ok(json!({ "available": false, "reason": error.to_string() }));
         }
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
@@ -448,7 +456,7 @@ mod tests {
                 serde_json::json!("auggie"),
             )])
             .expect("set model.defaultProvider");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
         (tmp, services)
@@ -487,8 +495,8 @@ mod tests {
         // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services =
-            Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+        let services = Services::new_isolated(store)
+            .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, None)
             .await

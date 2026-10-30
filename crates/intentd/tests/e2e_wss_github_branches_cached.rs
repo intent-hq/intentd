@@ -206,7 +206,7 @@ async fn boot() -> Fixture {
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root.clone())
             .with_branches_ls_remote_base(file_url(&dir.join("remotes")))
             .with_event_bus(bus.clone()),

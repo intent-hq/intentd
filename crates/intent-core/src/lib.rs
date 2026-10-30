@@ -60,6 +60,7 @@ pub mod server_control;
 pub mod settings_file;
 pub mod slug;
 pub mod startup;
+pub mod test_isolation;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;

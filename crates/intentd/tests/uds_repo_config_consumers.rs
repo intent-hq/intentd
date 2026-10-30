@@ -150,7 +150,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path())),
@@ -214,7 +214,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
@@ -347,7 +347,7 @@ async fn test_script_list_bootstrap_from_repo() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
     ));
@@ -441,7 +441,7 @@ async fn test_repo_instructions_in_system_prompt() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
@@ -496,7 +496,7 @@ async fn concurrent_script_list_no_duplicates() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
-        Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()),
+        Services::new_isolated(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()),
     ));
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.

@@ -5,7 +5,7 @@ use intent_services::Services;
 use intent_store::Store;
 
 async fn bare_services(dir: &tempfile::TempDir) -> Services {
-    Services::new(
+    Services::new_isolated(
         Store::open(&dir.path().join("svc.db"))
             .await
             .expect("open store"),

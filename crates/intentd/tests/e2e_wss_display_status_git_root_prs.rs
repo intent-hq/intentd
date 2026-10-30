@@ -236,7 +236,7 @@ async fn boot() -> Fixture {
         .expect("ws_open root");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone()),
     );

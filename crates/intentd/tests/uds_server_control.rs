@@ -125,7 +125,7 @@ async fn settings_rollback_on_failed_listener_start() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());

@@ -2891,7 +2891,8 @@ mod tests {
             .await
             .expect("child");
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws)
     }
 
