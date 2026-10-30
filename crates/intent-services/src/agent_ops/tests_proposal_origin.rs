@@ -146,7 +146,7 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
     .await
     .expect("workspace.create");
     let new_id = created.workspace.id.0.clone();
-    assert_eq!(reported(&created), outcome("tc-1", "applied"));
+    assert_eq!(reported(&created), Some(outcome("tc-1", "applied")));
 
     let session = svc
         .store()
@@ -181,8 +181,8 @@ fn reported(result: &WorkspaceCreateResult) -> Option<(String, String)> {
         .map(|o| (o.proposal_id.clone(), o.outcome.clone()))
 }
 
-fn outcome(proposal_id: &str, outcome: &str) -> Option<(String, String)> {
-    Some((proposal_id.to_string(), outcome.to_string()))
+fn outcome(proposal_id: &str, outcome: &str) -> (String, String) {
+    (proposal_id.to_string(), outcome.to_string())
 }
 
 fn origin(agent: &AgentId, proposal_id: &str) -> Value {
@@ -218,10 +218,10 @@ async fn replay_and_client_fallback_never_duplicate_the_notice() {
         first.workspace.id, replay.workspace.id,
         "same key, same workspace"
     );
-    assert_eq!(reported(&first), outcome("tc-1", "applied"));
+    assert_eq!(reported(&first), Some(outcome("tc-1", "applied")));
     assert_eq!(
         reported(&replay),
-        outcome("tc-1", "applied"),
+        Some(outcome("tc-1", "applied")),
         "a replay reports the persisted outcome"
     );
 
@@ -268,7 +268,7 @@ async fn already_resolved_proposal_keeps_its_outcome() {
     )
     .await
     .expect("create still succeeds");
-    assert_eq!(reported(&created), outcome("tc-1", "dismissed"));
+    assert_eq!(reported(&created), Some(outcome("tc-1", "dismissed")));
 
     let session = svc
         .store()
@@ -311,8 +311,8 @@ async fn unknown_agent_or_proposal_still_creates() {
     )
     .await
     .expect("unknown proposal is fail-soft");
-    assert_eq!(reported(&ghost), outcome("tc-1", "notResolved"));
-    assert_eq!(reported(&other), outcome("tc-other", "notResolved"));
+    assert_eq!(reported(&ghost), Some(outcome("tc-1", "notResolved")));
+    assert_eq!(reported(&other), Some(outcome("tc-other", "notResolved")));
 
     let session = svc
         .store()
@@ -527,7 +527,10 @@ async fn non_workspace_create_proposal_is_not_resolved() {
     )
     .await
     .expect("create still succeeds");
-    assert_eq!(reported(&created), outcome("tc-settings", "notResolved"));
+    assert_eq!(
+        reported(&created),
+        Some(outcome("tc-settings", "notResolved"))
+    );
 
     let session = svc
         .store()
@@ -575,7 +578,7 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     )
     .await
     .expect("create card 1");
-    assert_eq!(reported(&one), outcome("tc-1", "applied"));
+    assert_eq!(reported(&one), Some(outcome("tc-1", "applied")));
     // A replay of key-1 naming card 2, and a key-less create naming card 2:
     // both report `notResolved`, so a client never falls back to resolving
     // card 2 itself.
@@ -597,8 +600,8 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
     )
     .await
     .expect("key-less create");
-    assert_eq!(reported(&replay), outcome("tc-2", "notResolved"));
-    assert_eq!(reported(&keyless), outcome("tc-2", "notResolved"));
+    assert_eq!(reported(&replay), Some(outcome("tc-2", "notResolved")));
+    assert_eq!(reported(&keyless), Some(outcome("tc-2", "notResolved")));
 
     let session = svc
         .store()
