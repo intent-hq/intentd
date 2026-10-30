@@ -243,17 +243,16 @@ pub(crate) const EMBEDDED_BUNDLED_V3_6: &[(&str, &str)] = &[
         "implementor",
         include_str!("../resources/specialists/v3.6/implementor.md"),
     ),
-    EMBEDDED_BUNDLED_V3_1[3],
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v3.6/pr-reviewer.md"),
+    ),
     EMBEDDED_BUNDLED_V3_1[4],
     (
         "spec-writer",
         include_str!("../resources/specialists/v3.6/spec-writer.md"),
     ),
     EMBEDDED_BUNDLED_V3_1[6],
-    (
-        "verifier",
-        include_str!("../resources/specialists/v3.6/verifier.md"),
-    ),
     EMBEDDED_BUNDLED_V3_1[8],
     (
         "developer-legacy",
@@ -2389,6 +2388,8 @@ mod tests {
         assert!(old.resolve_is_orchestrator("spec-writer", None));
         assert!(old.resolve_is_orchestrator("coordinator", None));
         assert!(old.canonical_id("lead", None).is_none());
+        assert!(svc.resolve("verifier", None).is_none());
+        assert!(old.resolve("verifier", None).is_some());
         for id in [
             "developer-legacy",
             "coordinator-legacy",
@@ -2913,10 +2914,9 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    const LATEST_EMBEDDED_IDS: [&str; 13] = [
+    const LATEST_EMBEDDED_IDS: [&str; 12] = [
         "spec-writer",
         "implementor",
-        "verifier",
         "developer",
         "chief-of-staff",
         "ralph",
@@ -3090,13 +3090,13 @@ mod tests {
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         bundled.write(
-            "verifier",
-            "---\nname: \"Patched Verifier\"\ndescription: \"d\"\n---\n\nPatched body",
+            "implementor",
+            "---\nname: \"Patched Implementor\"\ndescription: \"d\"\n---\n\nPatched body",
         );
         let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
-        let got = svc.get("verifier", None).unwrap();
+        let got = svc.get("implementor", None).unwrap();
         assert_eq!(got["specialist"]["source"], "bundled");
-        assert_eq!(got["specialist"]["name"], "Patched Verifier");
+        assert_eq!(got["specialist"]["name"], "Patched Implementor");
         assert_eq!(got["specialist"]["prompt"], "Patched body");
     }
 
@@ -4296,21 +4296,16 @@ mod tests {
     fn embedded_bundle_carries_picker_metadata() {
         // The latest embedded bundle resolves the picker-metadata fields:
         // spec-writer is the lead with its advisory roster,
-        // implementor/verifier are internal, and every def carries an icon.
+        // implementor is internal, and every def carries an icon.
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
         let sw = svc.get("spec-writer", None).unwrap();
         assert_eq!(sw["specialist"]["role"], "lead");
-        assert_eq!(
-            sw["specialist"]["teamAgents"],
-            json!(["implementor", "verifier"])
-        );
+        assert_eq!(sw["specialist"]["teamAgents"], json!(["implementor"]));
         assert_eq!(sw["specialist"]["icon"], "coordinator");
-        for id in ["implementor", "verifier"] {
-            let got = svc.get(id, None).unwrap();
-            assert_eq!(got["specialist"]["role"], "internal", "{id}");
-            assert_eq!(got["specialist"]["icon"], id, "{id}");
-        }
+        let implementor = svc.get("implementor", None).unwrap();
+        assert_eq!(implementor["specialist"]["role"], "internal");
+        assert_eq!(implementor["specialist"]["icon"], "implementor");
         for id in LATEST_EMBEDDED_IDS {
             let got = svc.get(id, None).unwrap();
             assert!(

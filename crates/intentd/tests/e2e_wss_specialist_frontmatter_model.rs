@@ -545,15 +545,14 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         );
     }
 
-    // An UNKNOWN specialist id is rejected with `-32602` naming the id and
-    // the known catalog ids (monorepo#3497) — no session is created.
+    // The removed current Verifier cannot create new sessions.
     let rejected = wss_rpc_raw(
         &mut ws,
         5,
         "agent.create",
         json!({
             "workspaceId": ws_id,
-            "specialistId": "no-such-specialist",
+            "specialistId": "verifier",
             "model": "opus",
             "provider": "auggie"
         }),
@@ -567,7 +566,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         .as_str()
         .expect("error message");
     assert!(
-        msg.contains("unknown specialist: no-such-specialist"),
+        msg.contains("unknown specialist: verifier"),
         "error names the id: {msg}"
     );
     assert!(
@@ -702,7 +701,6 @@ async fn embedded_bundled_catalog_over_wss() {
             "pr-reviewer",
             "spec-writer",
             "ui-designer",
-            "verifier",
             "verifier-legacy",
             "vulnerability-scanner",
         ],

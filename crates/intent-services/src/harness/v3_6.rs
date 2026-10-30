@@ -26,7 +26,7 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "da2e7af947cfab164c7195a2a1dce2eb338781051bd2667564b3586e41477ffb",
+                "e4a6893b783b12e57f6fbdb14709fa71be79258cbb602766242d447c9bfee6b2",
             ),
             (
                 "implementor",
@@ -34,11 +34,11 @@ mod tests {
             ),
             (
                 "spec-writer",
-                "23519f72689f58af8f88174b11886662278f8fd844c63f1f0f6db0b51dbe3d93",
+                "c76d2a6c6ee315586a9c4d1e29e0d40b6674b335bf3d2b73cc7b1450563866c6",
             ),
             (
-                "verifier",
-                "f1e7caa77c837942b2e0643cd017417ea8958d163a94f4a9c991b11e56f6aaa9",
+                "pr-reviewer",
+                "0ca55d5b0bd14f942cea27f96b6f5e5a3a3115e86c25229b65845a55045729a7",
             ),
             (
                 "developer-legacy",
@@ -74,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_6_versions_four_workflows_and_adds_legacy_choices() {
+    fn v3_6_versions_workflows_and_preserves_legacy_choices() {
         let current = super::super::resolve_entry("3.6");
         let previous = super::super::resolve_entry("3.5");
         assert_eq!(current.version, "3.6");
@@ -87,24 +87,28 @@ mod tests {
         assert_eq!(current.feature_labels, previous.feature_labels);
         assert_eq!(
             current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len() + 4
+            previous.doctrine.specialists.len() + 3
         );
-        for ((old_id, old), (new_id, new)) in previous
-            .doctrine
-            .specialists
-            .iter()
-            .zip(current.doctrine.specialists)
-        {
-            assert_eq!(old_id, new_id);
+        for (old_id, old) in previous.doctrine.specialists {
+            let replacement = current
+                .doctrine
+                .specialists
+                .iter()
+                .find(|(id, _)| id == old_id);
+            if *old_id == "verifier" {
+                assert!(replacement.is_none());
+                continue;
+            }
+            let (new_id, new) = replacement.expect("retained specialist");
             if matches!(
                 *new_id,
-                "developer" | "spec-writer" | "implementor" | "verifier"
+                "developer" | "spec-writer" | "implementor" | "pr-reviewer"
             ) {
                 assert_ne!(old, new, "{new_id}");
                 let (old_meta, _) = crate::specialists::parse_frontmatter(old);
                 let (new_meta, _) = crate::specialists::parse_frontmatter(new);
                 let keys = if *new_id == "spec-writer" {
-                    &["teamAgents", "icon", "model"][..]
+                    &["icon", "model"][..]
                 } else {
                     &["name", "role", "teamAgents", "icon", "aliases", "model"][..]
                 };

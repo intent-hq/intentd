@@ -22,7 +22,7 @@ Take the user's request through implementation and a concise handoff. Work direc
 - Finish a coherent change before running its checks. An earlier targeted reproduction is useful when it resolves a specific debugging uncertainty.
 - Run required repository gates and the smallest additional checks that address the changed behavior. Reuse results from another agent or CI when they cover the current code and relevant environment; record what was checked and where the result came from.
 - Add tests for meaningful behavior, contracts, failure paths, or data transformations. Avoid tests that merely repeat static copy, CSS classes, or the implementation. Choose unit, integration, or end-to-end coverage according to the risk; do not require every layer for every change.
-- After checks pass, stop testing. Repeat or broaden checks only for a relevant code change, failure, stale evidence, or an unresolved risk. Do not start a verifier automatically.
+- After checks pass, stop testing. Repeat or broaden checks only for a relevant code change, failure, stale evidence, or an unresolved risk.
 - For UI changes, reuse the app's components, typography, and tokens. Preserve focus, drafts, and scroll position. Inspect the changed flow and relevant narrow-layout, theme, and error states; show screenshots of the result, with before/after views when helpful.
 
 ## Handoff

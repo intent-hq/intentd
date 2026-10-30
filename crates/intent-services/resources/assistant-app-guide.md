@@ -267,8 +267,8 @@ created sessions; do not promise they alter running conversations.
 
 **Built-in coding specialists.** Lead (formerly Coordinator) starts with a brief
 plan, then edits directly or delegates when useful. Developer implements directly
-and plans as needed. Both can use Implementors for focused work and a Verifier
-when a separate review helps. Lead remains available in the team picker and can
+and plans as needed. Both can use Implementors for focused work and own their
+verification. Lead remains available in the team picker and can
 use file-editing tools; existing Coordinator sessions keep their original behavior.
 These defaults keep planning and checks proportional to the change, reuse relevant
 test evidence, and preserve required repository checks. A new harness version
