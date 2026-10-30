@@ -144,6 +144,7 @@ fn launch_with_handshake(dir: &Path, gate: &Path, advertised: bool) -> (GuardedC
     (GuardedChild::spawn(&mut command).unwrap(), port)
 }
 
+#[track_caller]
 fn startup_client_config(dir: &Path) -> Arc<ClientConfig> {
     let intent_transport::CertStatus::Valid { fingerprint } = intent_transport::inspect_cert(dir)
     else {

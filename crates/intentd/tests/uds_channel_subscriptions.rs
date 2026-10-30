@@ -493,6 +493,7 @@ async fn workspace_channel_snapshot_then_updated_delta() {
 }
 
 /// Reduce the actual channel envelopes, keyed by the contract's thread ID.
+#[track_caller]
 fn reduce_comments(state: &mut Vec<Value>, push: &Value, sub_id: &str, seq: u64) {
     assert_eq!(push["method"], "subscription.push");
     assert_eq!(push["params"]["subscriptionId"], sub_id);

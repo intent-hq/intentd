@@ -375,6 +375,7 @@ async fn note_set_content_stale_expected_version_merges_over_wss() {
 /// not write (docs/protocol/09-error-codes.md §9): `id` echoed, `jsonrpc`
 /// `"2.0"`, no `result`, `error.message` `"Conflict"`, `error.data.code`
 /// `"conflict"`, and `error.data.current` carrying the untouched entity.
+#[track_caller]
 fn assert_conflict_envelope(v: &Value, id: i64, content: &str, rev: i64) {
     assert_eq!(v["id"], json!(id), "{v}");
     assert_eq!(v["jsonrpc"], json!("2.0"), "{v}");

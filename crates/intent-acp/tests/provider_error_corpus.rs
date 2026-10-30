@@ -42,6 +42,7 @@ fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("provider-error-corpus.json is valid JSON")
 }
 
+#[track_caller]
 fn expect_quota(entry: &Value, what: &str) -> bool {
     match entry["expect"].as_str() {
         Some("quota") => true,
@@ -50,6 +51,7 @@ fn expect_quota(entry: &Value, what: &str) -> bool {
     }
 }
 
+#[track_caller]
 fn object<'a>(value: &'a Value, what: &str) -> &'a Map<String, Value> {
     value
         .as_object()
@@ -66,6 +68,7 @@ fn internal_error(data: Value) -> JsonRpcError {
 
 /// One rendering per structured kind: the kind alone, with no wording, so the
 /// structured signal is tested on its own.
+#[track_caller]
 fn kind_cases(corpus: &Value) -> Vec<Case> {
     let mut cases = Vec::new();
     for (adapter, table) in object(&corpus["kinds"], "kinds") {
@@ -114,6 +117,7 @@ fn kind_cases(corpus: &Value) -> Vec<Case> {
     cases
 }
 
+#[track_caller]
 fn rendering_cases(corpus: &Value) -> Vec<Case> {
     let renderings = corpus["renderings"]
         .as_array()

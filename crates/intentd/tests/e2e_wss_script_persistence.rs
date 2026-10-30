@@ -263,6 +263,7 @@ fn stop(mut child: GuardedChild) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
+#[track_caller]
 fn create_test_repo() -> tempfile::TempDir {
     let repo = common::test_tempdir("scr-persist-repo-");
     let repo_path = repo.path().to_path_buf();
@@ -724,6 +725,7 @@ const LOST_AT_DAEMON_STOP_ERROR: &str = "lost: the daemon stopped while the scri
 
 /// Serialized `ScriptRuntimeState` omits cleared fields (`skip_serializing_if`);
 /// a `null` anywhere in a runtime payload is a contract break.
+#[track_caller]
 fn assert_no_nulls(value: &Value, ctx: &str) {
     match value {
         Value::Null => panic!("{ctx}: null field (cleared fields must be omitted)"),
@@ -736,6 +738,7 @@ fn assert_no_nulls(value: &Value, ctx: &str) {
 /// The hydrated reading of a command script that was running when the daemon
 /// stopped: `exited` / `-1` / the lost error, with no run fields and no
 /// service-only `previouslyRunning`.
+#[track_caller]
 fn assert_lost_command_state(st: &Value, ctx: &str) {
     assert_eq!(st["status"], "exited", "{ctx}: {st}");
     assert_eq!(st["exitCode"], EXIT_CODE_UNOBSERVABLE, "{ctx}: {st}");

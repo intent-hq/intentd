@@ -98,6 +98,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
     .expect("response timeout")
 }
 
+#[track_caller]
 fn run_git(args: &[&str], dir: &Path) {
     let out = std::process::Command::new("git")
         .args(args)
@@ -183,6 +184,7 @@ async fn subscribe_clone_events(ws: &mut PlainWs, id: i64) {
 /// Shared assertions on a successful create's frame stream: every frame
 /// echoes `progressId`, percent is non-decreasing and ends at `complete 100`,
 /// and exactly one `git:clone:done { ok:true }` terminates the stream.
+#[track_caller]
 fn assert_progress_stream(events: &[Value], progress_id: &str) {
     assert!(!events.is_empty(), "create emitted progress frames");
     for e in events {

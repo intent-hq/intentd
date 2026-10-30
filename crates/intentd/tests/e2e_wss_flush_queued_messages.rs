@@ -69,6 +69,7 @@ struct Daemon {
 }
 
 impl Drop for Daemon {
+    #[track_caller]
     fn drop(&mut self) {
         // Providers own separate process groups. Let normal daemon shutdown
         // stop them before reaping the daemon; the guard remains the fallback.
@@ -500,6 +501,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// Seed `agents.flushQueuedMessages = <mode>` into the data dir's
 /// `config.toml` BEFORE boot (must run before `enable_ws_api` appends the
 /// `[server.wsApi]` table, and the two tables must not collide).
+#[track_caller]
 fn seed_flush_mode(data_dir: &Path, mode: &str) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
@@ -725,6 +727,7 @@ async fn await_prompts(prompt_log: &Path, min_lines: usize) -> Vec<String> {
 
 /// The `agent.getConversation` user row whose first text block starts with
 /// `needle` (metadata assertions need the full row, not just its text).
+#[track_caller]
 fn user_row<'a>(conv: &'a Value, needle: &str) -> &'a Value {
     conv["messages"]
         .as_array()
@@ -846,6 +849,7 @@ async fn observe_drain(
 /// Queue snapshot lengths from the DRAIN phase: everything after the last
 /// length-2 snapshot (the enqueue phase publishes 1 → 2 before the busy turn
 /// ends; the subscription sees those buffered events too).
+#[track_caller]
 fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
     let last_two = queue_lengths
         .iter()

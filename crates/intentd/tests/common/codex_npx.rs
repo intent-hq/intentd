@@ -39,6 +39,7 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
 /// Run an in-process WSS server test in its own test process before
 /// installing the fake toolchain environment. Parallel tests keep their
 /// original PATH and provider discovery caches.
+#[track_caller]
 pub fn in_subprocess(test_name: &str) -> bool {
     use intentd_test_support::GuardedChild;
     use std::process::{Command, Stdio};

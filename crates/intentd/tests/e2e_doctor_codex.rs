@@ -42,6 +42,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    #[track_caller]
     fn new(selection: &'static str, config: &Value) -> Self {
         let root = common::test_tempdir("doctor-codex");
         let bin = root.path().join("bin");
@@ -232,6 +233,7 @@ impl Fixture {
         command
     }
 
+    #[track_caller]
     fn run_command(&self, mut command: Command) -> (bool, String) {
         let stdout_path = self.root.path().join("stdout.log");
         let stderr_path = self.root.path().join("stderr.log");
@@ -261,6 +263,7 @@ impl Fixture {
         (status.success(), stdout)
     }
 
+    #[track_caller]
     fn doctor_command(&self, live: bool) -> Command {
         // Check production discovery before any adapter could execute. If a host
         // install outranks a fixture, fail rather than touching that installation.
@@ -284,6 +287,7 @@ impl Fixture {
         command
     }
 
+    #[track_caller]
     fn run(&self, live: bool) -> String {
         let (success, stdout) = self.run_command(self.doctor_command(live));
         assert!(
@@ -303,6 +307,7 @@ impl Fixture {
             .collect()
     }
 
+    #[track_caller]
     fn assert_version_only(&self) {
         let events = self.events();
         assert!(!events.is_empty(), "installed CLI version must be measured");
@@ -314,6 +319,7 @@ impl Fixture {
         );
     }
 
+    #[track_caller]
     fn assert_clean(&self) {
         assert!(!self.root.path().join("bundled-runtime-ran").exists());
         assert!(!self.root.path().join("mcp-launched").exists());
@@ -403,6 +409,7 @@ fn ordinary_warning_fixture() -> Fixture {
     fixture
 }
 
+#[track_caller]
 fn assert_ordinary_warning(stderr: &str) {
     assert!(stderr.contains("WARN"));
     assert!(stderr.contains("must be absolute and executable"));
@@ -420,6 +427,7 @@ fn redirected_stderr_keeps_ordinary_warnings_plain() {
     fixture.assert_version_only();
 }
 
+#[track_caller]
 fn run_with_terminal_stderr(fixture: &Fixture, no_color: Option<&str>) -> (String, String) {
     use std::io::{self, Read};
     use std::os::fd::FromRawFd;

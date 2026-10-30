@@ -199,6 +199,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 }
 
 /// Init a small git repo with one commit using the git CLI; returns its path.
+#[track_caller]
 fn seed_repo(dir: &PathBuf) {
     std::fs::create_dir_all(dir).unwrap();
     let git = |args: &[&str]| {

@@ -52,6 +52,7 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Canonical `src_path` of every cargo test target of the workspace at `root`.
+#[track_caller]
 fn test_target_sources(root: &Path) -> BTreeSet<PathBuf> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -81,6 +82,7 @@ fn test_target_sources(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 /// One crate's top-level `tests/*.rs` files: (file stem, canonical path, text).
+#[track_caller]
 fn top_level_test_files(tests: &Path) -> Vec<(String, PathBuf, String)> {
     let Ok(entries) = fs::read_dir(tests) else {
         return Vec::new();

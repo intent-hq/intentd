@@ -394,6 +394,7 @@ fn status_code(response: &str) -> u16 {
 
 /// Assert `response` is the guest-cap refusal: `503` carrying
 /// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+#[track_caller]
 fn assert_guest_cap_refused(response: &str, ctx: &str) {
     assert_eq!(status_code(response), 503, "{ctx}: {response}");
     let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
@@ -3110,6 +3111,7 @@ async fn next_subscription_push(
 /// `harnessFeatures` rides along), every render preview is capped to
 /// `AGENT_LIST_PREVIEW_BUDGET_BYTES`, and the serialized row fits
 /// `AGENT_LIST_ROW_BUDGET_BYTES`.
+#[track_caller]
 fn assert_agent_list_projected_row(label: &str, row: &Value) {
     use intent_core::{
         format_key_bytes_table, serialized_key_bytes, AGENT_LIST_PREVIEW_BUDGET_BYTES,
@@ -4483,6 +4485,7 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
 
+    #[track_caller]
     fn assert_not_found(v: &Value, what: &str) {
         assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
         assert_eq!(v["error"]["data"]["code"], "not-found", "{what}: {v}");
@@ -5210,6 +5213,7 @@ impl Guest {
 
 /// A tiny real repository (one commit on `main`, repo-local identity) for
 /// direct-checkout workspaces in the in-process harness.
+#[track_caller]
 fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     let dir = test_tempdir(prefix);
     let repo = dir.path().to_path_buf();
@@ -5238,6 +5242,7 @@ fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
+#[track_caller]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -9259,6 +9264,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 #[intent_test_macros::daemon_test]
 async fn wss_agent_set_model_provider_id_param() {
     /// Assert the JSON-RPC response envelope: version and id correlation.
+    #[track_caller]
     fn assert_envelope(resp: &Value, id: i64) {
         assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
         assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
@@ -11492,6 +11498,7 @@ async fn multi_bind_serves_every_configured_address() {
 /// Reservation of the pair is retried on a fresh ephemeral port when
 /// `::1:port` happens to be taken already; the server bind itself is never
 /// retried.
+#[track_caller]
 fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::TcpSocket, u16) {
     for _ in 0..16 {
         let blocker = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("blocker bind");
@@ -21903,6 +21910,7 @@ async fn wss_transfer_preserves_remote_state() {
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
 
+    #[track_caller]
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
@@ -21980,6 +21988,7 @@ async fn wss_transfer_preserves_remote_state() {
 
     /// The archive with only `git/refs.json` replaced; the bundle bytes are
     /// untouched, so a rejection is purely metadata validation.
+    #[track_caller]
     fn relabel(archive: &[u8], tampered_refs: &Value) -> Vec<u8> {
         let mut original = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

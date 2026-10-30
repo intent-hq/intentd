@@ -321,6 +321,7 @@ async fn await_daemon_log_contains(data_dir: &Path, needle: &str) {
 /// Read the mock's session-establishment log — one `{ method, sessionId, pid }`
 /// JSON line per `session/new` / `session/load` — collapsed to `"new"` /
 /// `"load"` markers for sequence assertions.
+#[track_caller]
 fn session_log_lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .unwrap_or_default()

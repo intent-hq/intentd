@@ -419,6 +419,7 @@ fn all_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The decoded payload of the final assistant message's trailing secret card.
+#[track_caller]
 fn trailing_secret_card(conv: &Value) -> Value {
     let messages = conv["messages"].as_array().expect("messages array");
     let assistant = messages

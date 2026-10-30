@@ -88,6 +88,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-identity-")
 }
 
+#[track_caller]
 fn mock_identity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -335,6 +336,7 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
 }
 
 /// The owner row of a `workspace.members.list` result.
+#[track_caller]
 fn owner_row(result: &Value) -> &Value {
     result["members"]
         .as_array()
@@ -345,6 +347,7 @@ fn owner_row(result: &Value) -> &Value {
 /// The documented owner row keys, including the additive `hostRole`.
 /// The `identity` triple is present exactly when the owner is linked
 /// (`login` is a string) and absent otherwise.
+#[track_caller]
 fn assert_member_row_shape(row: &Value) {
     let mut keys: Vec<&str> = row
         .as_object()

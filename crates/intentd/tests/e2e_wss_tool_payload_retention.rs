@@ -396,6 +396,7 @@ fn prompt_texts(path: &Path) -> Vec<String> {
 
 /// The rendered `<tool_result tool_use_id="{tool_use_id}" …>…</tool_result>`
 /// element of a replayed `<supervisor>` history.
+#[track_caller]
 fn tool_result_element(history: &str, tool_use_id: &str) -> String {
     let open = format!("<tool_result tool_use_id=\"{tool_use_id}\"");
     let start = history
@@ -410,6 +411,7 @@ fn tool_result_element(history: &str, tool_use_id: &str) -> String {
 }
 
 /// Same for `<tool_use name="bash" tool_use_id="{tool_use_id}" …>…</tool_use>`.
+#[track_caller]
 fn tool_use_element(history: &str, tool_use_id: &str) -> String {
     let open = format!("<tool_use name=\"bash\" tool_use_id=\"{tool_use_id}\"");
     let start = history

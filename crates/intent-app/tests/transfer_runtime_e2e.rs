@@ -202,6 +202,7 @@ fn rows(ws: &str) -> Vec<(&'static str, Vec<Value>)> {
     ]
 }
 
+#[track_caller]
 fn script<'a>(list: &'a Value, id: &str) -> &'a Value {
     list["scripts"]
         .as_array()

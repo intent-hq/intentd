@@ -346,6 +346,7 @@ impl Harness {
         )
     }
 
+    #[track_caller]
     fn fail(&self, msg: &str, procs: &[ProcStat]) -> ! {
         panic!("{msg}\n{}", self.diag(procs));
     }
@@ -489,6 +490,7 @@ fn reap_adopted(keep: &[i32], sessions: &HashSet<i32>, since: u64, deadline: Ins
 /// real terminal gives a backgrounded daemon, even when the harness itself
 /// inherited `SIG_IGN` for them (nextest ignores `SIGTTIN` for test
 /// binaries); the harness's own dispositions are restored right after.
+#[track_caller]
 fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     let data_dir = dir.path().to_path_buf();
     let workspaces_dir = data_dir.join("workspaces");
@@ -825,6 +827,7 @@ mod helper_tests {
             .contains("controlling tty"));
     }
 
+    #[track_caller]
     fn poll_until(what: &str, mut ok: impl FnMut() -> bool) {
         let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !ok() {
@@ -891,6 +894,7 @@ mod helper_tests {
         );
     }
 
+    #[track_caller]
     fn orphan_scenario() {
         become_child_subreaper();
         let dir = tempfile::tempdir().expect("tempdir");

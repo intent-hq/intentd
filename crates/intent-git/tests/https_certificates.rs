@@ -34,6 +34,7 @@ unsafe extern "C" {
     fn git_libgit2_feature_backend(feature: c_int) -> *const c_char;
 }
 
+#[track_caller]
 fn require_openssl() {
     let version = git2::Version::get();
     assert!(version.https(), "Git HTTPS is required: {version:?}");
@@ -60,6 +61,7 @@ enum Expected {
     UntrustedChain,
 }
 
+#[track_caller]
 fn connect(expected: Expected) {
     require_openssl();
     let url = std::env::var(CHILD_URL).unwrap();
@@ -135,6 +137,7 @@ impl Drop for Server {
 }
 
 impl Server {
+    #[track_caller]
     fn start(listener: TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
         Self(tokio::spawn(async move {
             timeout(tls_limit(), async move {

@@ -258,6 +258,7 @@ where
 
 /// Create a git repo with one commit so `workspace.create` can provision a
 /// worktree from it.
+#[track_caller]
 fn create_test_repo() -> tempfile::TempDir {
     let repo_dir = scratch_dir("repo");
     let repo_path = repo_dir.path().to_path_buf();
@@ -494,6 +495,7 @@ where
 /// call as a `tool_use` + `tool_result` pair whose `output[0].text` carries
 /// the JSON the agent-side JS returned, so with one `workspace_api` call per
 /// turn this is the most recent turn's `ws.workspace.details()` result.
+#[track_caller]
 fn last_tool_result(transcript: &Value) -> Value {
     transcript["messages"]
         .as_array()
@@ -840,6 +842,7 @@ const SETUP_NOTICE_MARKER: &str = "[System: workspace setup ";
 /// The original text block of each outbound prompt, in arrival order. Optional
 /// repository guidance is a separate final block; it does not alter the setup
 /// notice or user content in the original block.
+#[track_caller]
 fn read_prompt_texts(path: &Path) -> Vec<String> {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     raw.lines()
@@ -871,6 +874,7 @@ fn read_prompt_texts(path: &Path) -> Vec<String> {
 /// with the outermost fire-once `<system>` block (the mock provider's
 /// `FirstTurnPrepend` system prompt) stripped so the assertion sees the first
 /// per-turn decoration.
+#[track_caller]
 fn prompt_after_system_block(log: &[String], user_content: &str) -> String {
     let text = log
         .iter()

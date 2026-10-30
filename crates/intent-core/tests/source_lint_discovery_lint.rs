@@ -111,6 +111,7 @@ fn collect_lint_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Every `crates/*/tests/**/*_lint.rs` under `root`, sorted, as paths
 /// relative to `root`.
+#[track_caller]
 fn lint_files(root: &Path) -> Vec<PathBuf> {
     let crates_dir = root.join("crates");
     let crates = fs::read_dir(&crates_dir)
@@ -133,6 +134,7 @@ fn lint_files(root: &Path) -> Vec<PathBuf> {
 /// Canonical `src_path` of every cargo test target under `root` whose name
 /// ends in `_lint`, read from `cargo metadata --no-deps` (manifests only, no
 /// build, no dependency resolution).
+#[track_caller]
 fn lint_target_sources(root: &Path) -> BTreeSet<PathBuf> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -250,6 +252,7 @@ fn token_reader_definitions(blanked: &str) -> Vec<(usize, String)> {
 /// `// source-lint-scaffolding: allow` marker on the line above the `fn`
 /// keyword with a reason suppresses the hit, one without a reason is
 /// reported instead.
+#[track_caller]
 fn scaffolding_copies(root: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     for rel in lint_files(root) {
@@ -385,6 +388,7 @@ mod fixture {
         fs::write(ci, content).unwrap();
     }
 
+    #[track_caller]
     fn assert_single_failure_at(failures: &[String], prefix: &str) {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].starts_with(prefix), "{failures:?}");

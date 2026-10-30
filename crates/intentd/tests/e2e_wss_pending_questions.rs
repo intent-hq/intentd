@@ -670,6 +670,7 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
 /// immediately: not queued, a turn was driven, the binding classified it
 /// `delivered`, and no hold flag rides the result (`heldForQuestions` is gone
 /// from the wire — pending questions never park automatic deliveries).
+#[track_caller]
 fn assert_delivered_now(result: &Value, ctx: &str) {
     assert_eq!(result["success"], true, "{ctx}: send ok: {result}");
     assert_ne!(
@@ -1135,6 +1136,7 @@ where
 /// (PROTOCOL §1 / §9): `jsonrpc: "2.0"`, a non-null `id` (matched to the
 /// request by `wss_rpc_envelope`), an `error` with code `-32602` and a
 /// string `message`, and NO `result` member.
+#[track_caller]
 fn assert_invalid_params_envelope(envelope: &Value, ctx: &str) {
     assert_eq!(
         envelope["jsonrpc"], "2.0",

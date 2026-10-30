@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream as BlockingUnixStream;
 use tokio::net::UnixListener;
 
+#[track_caller]
 fn open() -> File {
     // SAFETY: geteuid has no preconditions and does not mutate process state.
     let uid = unsafe { libc::geteuid() };
@@ -36,6 +37,7 @@ pub(super) fn acquire() -> Flock<File> {
     acquire_bounded(open())
 }
 
+#[track_caller]
 fn acquire_bounded(mut file: File) -> Flock<File> {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {

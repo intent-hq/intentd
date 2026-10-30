@@ -140,6 +140,7 @@ async fn connect(port: u16) -> PlainWs {
 /// request `id` echoed, and exactly one of `result` / `error` with no other
 /// top-level keys. An `error` member carries an integer `code` and a string
 /// `message` (plus optional `data`).
+#[track_caller]
 fn assert_envelope(v: &Value, id: i64, method: &str) {
     let obj = v
         .as_object()

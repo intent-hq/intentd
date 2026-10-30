@@ -399,6 +399,7 @@ fn running_turn_rule_is_only_spelled_in_agent_status() {
 }
 
 /// Sorted non-test sources of the SQL rule's scope, `crates/intent-store/src`.
+#[track_caller]
 fn sql_literal_sources(root: &Path) -> Vec<PathBuf> {
     let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
     let files: Vec<PathBuf> = crate_src_files(root)
@@ -458,6 +459,7 @@ fn running_turn_sql_list_is_generated_not_spelled_in_store() {
 // ---- scanner fixtures -------------------------------------------------------
 
 /// 1-based line of the first line containing `needle`.
+#[track_caller]
 fn line_of(src: &str, needle: &str) -> usize {
     src.lines()
         .position(|l| l.contains(needle))

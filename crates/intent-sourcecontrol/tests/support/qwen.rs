@@ -55,6 +55,7 @@ pub struct State {
 }
 
 impl State {
+    #[track_caller]
     pub fn captured(number: u64) -> Self {
         let capture: Value =
             serde_json::from_str(include_str!("../fixtures/qwen_checks_5881.json")).unwrap();
@@ -187,6 +188,7 @@ impl State {
         })
     }
 
+    #[track_caller]
     fn respond(&self, target: &str, body: &Value) -> (u16, Value) {
         if target.contains("/compare/") {
             return (self.compare_status, self.compare.clone());
@@ -301,6 +303,7 @@ impl State {
 // A next page is served ONLY when a declared variable is actually bound to
 // contexts(after:...). An unrelated variable or inline cursor token is not
 // enough to make a broken paginator pass these tests.
+#[track_caller]
 fn bound_check_cursor(query: &str, vars: &Value) -> usize {
     let args = query
         .split("contexts(")
@@ -390,6 +393,7 @@ impl MockQwen {
         f(&mut self.state.lock().unwrap());
     }
 
+    #[track_caller]
     pub fn assert_check_queries(&self) {
         for request in self
             .requests

@@ -203,6 +203,7 @@ where
 
 /// `git init` the checkout (plus local user config) so the daemon's watcher
 /// sees a real repo.
+#[track_caller]
 fn git_init(root: &Path) {
     let run = |args: &[&str]| {
         let out = Command::new("git")

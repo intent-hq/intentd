@@ -50,6 +50,7 @@ use intentd_test_support::source_lint::workspace_root;
 
 const WORKFLOWS_DIR: &str = ".github/workflows";
 
+#[track_caller]
 fn workflow_files(root: &Path) -> Vec<PathBuf> {
     let dir = root.join(WORKFLOWS_DIR);
     let entries = fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));

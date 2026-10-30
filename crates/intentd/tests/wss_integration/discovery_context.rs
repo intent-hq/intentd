@@ -23,10 +23,24 @@ async fn equivalent(client: &mut Guest, method: &str, params: Value) -> Value {
     direct
 }
 
-async fn success(client: &mut Guest, method: &str, params: Value) -> Value {
-    let reply = equivalent(client, method, params).await;
-    assert!(reply.get("error").is_none(), "{method}: {reply}");
-    reply["result"].clone()
+/// A sync `#[track_caller]` fn returning the future, not an `async fn`, so a
+/// failure names the calling test line: the attribute is a no-op on an
+/// `async fn` (rust-lang/rust#110011).
+#[track_caller]
+fn success<'a>(
+    client: &'a mut Guest,
+    method: &'a str,
+    params: Value,
+) -> impl std::future::Future<Output = Value> + 'a {
+    let caller = std::panic::Location::caller();
+    async move {
+        let reply = equivalent(client, method, params).await;
+        assert!(
+            reply.get("error").is_none(),
+            "{method} (called at {caller}): {reply}"
+        );
+        reply["result"].clone()
+    }
 }
 
 #[intent_test_macros::daemon_test]

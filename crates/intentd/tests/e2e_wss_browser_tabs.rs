@@ -195,6 +195,7 @@ async fn connect(fx: &Fixture) -> TlsWs {
 /// is exactly `"2.0"`, `id` echoes the request, and exactly one of `result` /
 /// `error` is present — an error carrying an integer `code` and a string
 /// `message` (§9), never both members and never neither.
+#[track_caller]
 fn assert_envelope(res: &Value, id: i64, method: &str) {
     let obj = res
         .as_object()

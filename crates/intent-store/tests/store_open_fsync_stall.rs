@@ -138,6 +138,7 @@ unsafe extern "C" fn shim_open(
 }
 
 /// Make the stalling shim the default VFS for every connection in this process.
+#[track_caller]
 fn install_shim() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| unsafe {

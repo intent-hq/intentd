@@ -343,6 +343,7 @@ fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String
 }
 
 /// Every `*.rs` under `dir`, recursively.
+#[track_caller]
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for entry in entries {
@@ -357,6 +358,7 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `*.rs` under `crates/*/tests/`, sorted.
+#[track_caller]
 fn collect_test_sources(root: &Path) -> Vec<PathBuf> {
     let crates_dir = root.join("crates");
     let crates = fs::read_dir(&crates_dir)

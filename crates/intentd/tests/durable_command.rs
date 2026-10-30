@@ -32,6 +32,7 @@ fn run(root: &Path, id: &str, shell: &str, timeout: &str) -> GuardedChild {
     .unwrap()
 }
 
+#[track_caller]
 fn result(root: &Path, id: &str) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .args(["command-result", "--record-dir"])
@@ -43,6 +44,7 @@ fn result(root: &Path, id: &str) -> Value {
         .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)))
 }
 
+#[track_caller]
 fn wait_file(path: &Path) {
     let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     while !path.exists() {

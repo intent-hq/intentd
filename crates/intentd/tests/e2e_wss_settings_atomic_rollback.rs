@@ -1187,6 +1187,7 @@ async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
 
 /// Assert the JSON-RPC 2.0 success envelope (PROTOCOL §1): `jsonrpc: "2.0"`,
 /// the echoed `id`, a `result` object and no `error` member.
+#[track_caller]
 fn assert_success_envelope(resp: &Value, id: i64) {
     assert_eq!(resp["jsonrpc"], json!("2.0"), "{resp}");
     assert_eq!(resp["id"], json!(id), "{resp}");
@@ -1662,6 +1663,7 @@ async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
 
 /// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,
 /// the echoed `id`, the expected `error.code` with a message, and no `result`.
+#[track_caller]
 fn assert_error_envelope(resp: &Value, id: i64, code: i64) {
     assert_eq!(resp["jsonrpc"], json!("2.0"), "{resp}");
     assert_eq!(resp["id"], json!(id), "{resp}");

@@ -385,6 +385,7 @@ async fn get_status(rpc: &mut TlsWs, id: i64, ws: &WorkspaceId) -> Value {
 
 /// `displayStatus` of one row in a list-shaped row set (`workspace.list`
 /// rows or the seq-0 snapshot entries).
+#[track_caller]
 fn row_status<'a>(rows: &'a [Value], ws: &WorkspaceId, path: &str) -> &'a Value {
     let row = rows
         .iter()

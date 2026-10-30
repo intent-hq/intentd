@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[track_caller]
 pub fn in_subprocess(test_name: &str) -> bool {
     use intentd_test_support::GuardedChild;
     use std::os::unix::fs::PermissionsExt;

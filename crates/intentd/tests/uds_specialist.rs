@@ -654,6 +654,7 @@ fn write_specialist_frontmatter(dir: &Path, id: &str, extra_frontmatter: &str) {
 }
 
 /// Find one specialist def by id in a `specialist.list` result.
+#[track_caller]
 fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
     list["specialists"]
         .as_array()

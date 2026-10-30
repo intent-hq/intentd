@@ -11,6 +11,7 @@ mod sharing;
 #[path = "presence.rs"]
 mod presence;
 
+#[track_caller]
 fn result(frame: &Value, id: i64) -> Value {
     assert_eq!(frame["jsonrpc"], "2.0");
     assert_eq!(frame["id"], id);

@@ -29,6 +29,7 @@ use std::process::{Command, Output, Stdio};
 
 use intentd_test_support::GuardedChild;
 
+#[track_caller]
 fn install_ps1() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -37,6 +38,7 @@ fn install_ps1() -> String {
 /// Extract one marked region of install.ps1 — the lines between its
 /// `>>> BEGIN <name>` and `<<< END <name>` markers — so a driver runs the
 /// shipped code rather than a copy of it.
+#[track_caller]
 fn ps_region(name: &str) -> String {
     let script = install_ps1();
     let begin = format!(">>> BEGIN {name}");
@@ -68,6 +70,7 @@ fn ps_region(name: &str) -> String {
 /// that marker a missing PowerShell panics instead of skipping, so a broken
 /// provisioning step fails the suite loudly. Local runs without the marker
 /// keep today's skip.
+#[track_caller]
 fn pwsh() -> Option<PathBuf> {
     for name in ["pwsh", "powershell"] {
         let Ok(output) = Command::new("sh")
@@ -126,6 +129,7 @@ fn run_owner_check(pwsh: &Path, cwd: &Path, data_dir: &str) -> Verdict {
 /// here among them) racing on its rewrite, though the writer was never
 /// pinned down. A per-run cache dir keeps this suite's pwsh from ever
 /// reading or writing the shared PowerShell cache.
+#[track_caller]
 fn run_owner_check_with(
     pwsh: &Path,
     cwd: &Path,

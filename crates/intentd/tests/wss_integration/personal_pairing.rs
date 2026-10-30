@@ -177,6 +177,7 @@ async fn reconnect(srv: &Server, principal: &intent_core::Principal, token: &str
     }
 }
 
+#[track_caller]
 fn assert_pairing(response: &Value, token: &str, person: &intent_core::Principal, role: &str) {
     assert!(
         response.get("error").is_none(),
@@ -1185,6 +1186,7 @@ async fn removal_observed_event(client: &mut PresenceClient, kind: &str) -> Valu
     client.event(kind).await
 }
 
+#[track_caller]
 fn assert_shared_capabilities(hello: &Value) {
     assert!(hello.get("error").is_none());
     let capabilities = &hello["result"]["server"]["capabilities"];

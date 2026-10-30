@@ -108,6 +108,7 @@ esac
     path
 }
 
+#[track_caller]
 fn mock_identity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -467,6 +468,7 @@ impl MockGithub {
     /// Authorise device flow `n` as the account behind `token`. The flow
     /// must already have been started (a `/login/device/code` call minted
     /// it), so a stale index is a test bug rather than a silent no-op.
+    #[track_caller]
     fn authorize(&self, n: usize, token: &'static str) {
         let started = self.flows.load(Ordering::SeqCst);
         assert!(

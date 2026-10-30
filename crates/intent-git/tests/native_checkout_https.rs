@@ -54,6 +54,7 @@ impl NativeCheckoutCredentials for Credential {
         }
         Ok(())
     }
+    #[track_caller]
     fn credential(&mut self, url: &str) -> Result<git2::Cred, git2::Error> {
         assert_eq!(url, self.url);
         if self.retired {
@@ -71,6 +72,7 @@ impl NativeCheckoutCredentials for Credential {
     fn rejected(&self) {
         REJECTED.with(|v| v.set(true));
     }
+    #[track_caller]
     fn observe(&self, status: u16, _: Option<std::time::Instant>) {
         self.responses.set(self.responses.get() + 1);
         if self.responses.get() == 2 {
@@ -83,6 +85,7 @@ impl NativeCheckoutCredentials for Credential {
             self.rejected();
         }
     }
+    #[track_caller]
     fn with_basic_auth(
         &mut self,
         url: &str,
@@ -111,6 +114,7 @@ impl NativeCheckoutCredentials for Credential {
 }
 thread_local! { static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+#[track_caller]
 fn child(mode: &str) {
     let url = std::env::var("INTENT_NATIVE_URL").unwrap();
     let directory = PathBuf::from(std::env::var_os("INTENT_NATIVE_DEST").unwrap());
@@ -393,6 +397,7 @@ fn child(mode: &str) {
     }
 }
 
+#[track_caller]
 fn assert_pushed(path: &Path, branch: &str, acknowledged: git2::Oid) {
     let repo = git2::Repository::open(path).unwrap();
     assert_eq!(
@@ -507,6 +512,7 @@ fn tls() -> (String, Arc<rustls::ServerConfig>) {
     (ca, Arc::new(config))
 }
 
+#[track_caller]
 fn backend(root: &Path, method: &str, target: &str, body: &[u8]) -> Vec<u8> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let mut command = Command::new("git");
