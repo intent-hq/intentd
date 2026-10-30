@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.86] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- Refresh remote base before creating local workspaces ([#2841](https://github.com/intent-hq/intentd/pull/2841))
+
+### 📚 Documentation
+
+- Describe personal workspace Set aside controls ([#2845](https://github.com/intent-hq/intentd/pull/2845))
+
+
 ## [0.11.85] - 2026-10-30
 
 ### 📚 Documentation
