@@ -407,7 +407,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/{home-model,home-preview-agent}.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -415,6 +415,11 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+Selecting a workspace opens its preview on the top-level agent (not a background or
+delegated agent) with the most recent activity. The preview keeps that agent while it
+stays open; choose another from the agent menu above the chat, and Home keeps that
+choice for the workspace until the app restarts.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
