@@ -682,7 +682,9 @@ Workspaces whose folder is the repository itself and remote workspaces cannot be
 purged. To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
 `purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
-hour, and skips workspaces with uncommitted changes.
+hour, and skips workspaces with uncommitted changes or with unpushed commits in a
+nested repository (such as a submodule), unless Intent saw those commits merged in a
+pull request.
 
 A purged workspace still shows as archived and its history stays readable.
 Unarchiving it, or sending a message, recreates it from a fresh checkout of the
