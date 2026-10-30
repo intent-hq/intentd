@@ -18,8 +18,9 @@
 //!
 //! The budget is the debug-profile size (the test profile, where the overflow
 //! happened) measured on `x86_64` Linux, plus headroom smaller than one
-//! `WorkspaceCreate`; release builds lay futures out differently, so the test
-//! only builds with debug assertions (gated in `tests.rs`). Re-measure: run
+//! rebinding (`2 * size_of::<WorkspaceCreate>()`). Release builds and other
+//! targets lay futures out differently, so the module only builds for debug
+//! `x86_64` Linux (gated in `tests.rs`), the platform CI runs. Re-measure: run
 //! `make test-select E='test(/future_size/)'` with the budget lowered to 0;
 //! the failure message prints the size.
 
@@ -30,8 +31,8 @@ use super::{TempDb, WorkspacesRoot};
 use crate::Services;
 
 /// `Services::create_workspace` (measured `38_032` bytes; `WorkspaceCreate`
-/// is `1_200`). Headroom stays below one copy of the input so a stray
-/// rebinding or clone of the request trips it.
+/// is `1_200`, so a stray rebinding adds `2_400`). Headroom stays below one
+/// rebinding so it trips the budget.
 const CREATE_WORKSPACE_BUDGET: usize = 38 * 1024;
 
 #[tokio::test]
@@ -58,14 +59,17 @@ async fn workspace_create_future_size_stays_within_budget() {
          clone or rebind the `WorkspaceCreate` request ({input} bytes) inside the future — \
          mutate `input` in place. If the growth is intentional and bounded (new locals, larger \
          types, a toolchain bump), re-measure and raise CREATE_WORKSPACE_BUDGET in \
-         tests/workspace_create_future_size.rs, keeping the headroom below one request."
+         src/tests/workspace_create_future_size.rs, keeping the headroom below one rebinding \
+         (2 x the request)."
     );
-    // Keeps the budget meaningful: headroom must stay below one copy of the
-    // request, or a stray rebinding would slip under it.
+    // Keeps the budget meaningful: a rebinding of the request inside the
+    // create block adds about `2 * input` here (the wrapper holds the inner
+    // future twice), so headroom must stay below that or it would slip under.
     assert!(
-        CREATE_WORKSPACE_BUDGET - size < input,
-        "Services::create_workspace future shrank to {size} bytes, leaving more than one \
-         WorkspaceCreate ({input} bytes) of headroom under CREATE_WORKSPACE_BUDGET \
-         ({CREATE_WORKSPACE_BUDGET}). Re-measure and tighten the budget"
+        CREATE_WORKSPACE_BUDGET - size < 2 * input,
+        "Services::create_workspace future shrank to {size} bytes, leaving at least one \
+         rebinding of WorkspaceCreate (2 x {input} bytes) of headroom under \
+         CREATE_WORKSPACE_BUDGET ({CREATE_WORKSPACE_BUDGET}), so a stray rebinding would no \
+         longer trip it. Re-measure and tighten the budget"
     );
 }
