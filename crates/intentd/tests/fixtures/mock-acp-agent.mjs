@@ -626,7 +626,13 @@ async function handlePrompt(id, params) {
       }).catch(() => {});
     }
     log(`resolving prompt as cancelled (attempt ${attempt}/${cancelGate})`);
-    return result(id, { stopReason: 'cancelled' });
+    // `cancelledPromptMeta` is echoed as the cancelled response's `_meta`
+    // (e.g. a grok `_meta.usage` bill for the cancelled attempt).
+    const cancelled = { stopReason: 'cancelled' };
+    if (behavior.cancelledPromptMeta && typeof behavior.cancelledPromptMeta === 'object') {
+      cancelled._meta = behavior.cancelledPromptMeta;
+    }
+    return result(id, cancelled);
   }
   // Provider prompt failure (monorepo#479): optionally stream one
   // agent_message_chunk (the provider's pre-failure warning) and then answer

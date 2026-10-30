@@ -4679,9 +4679,11 @@ impl Services {
         // turn N can neither skew turn N+1's stats delta nor overwrite its
         // newer cumulative snapshot.
         // A stale-cancel attempt is not a completed run (the redrive is), but
-        // any usage the provider reported for it is still recorded.
+        // any usage the provider reported for it is still recorded —
+        // including a `_meta`-only bill (grok), which the task below resolves
+        // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
         let run_completed = result.is_ok() && !spurious_cancel;
-        if turn_usage.is_some() || turn_cost.is_some() || run_completed {
+        if turn_usage.is_some() || turn_cost.is_some() || turn_meta.is_some() || run_completed {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();

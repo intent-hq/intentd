@@ -18244,6 +18244,99 @@ async fn spurious_cancel_after_client_request_is_not_redriven() {
     assert_eq!(finish_reason(&run.assistant[0]), Some("cancelled"));
 }
 
+/// A stale-cancel attempt whose only usage report is a `_meta` bill (grok)
+/// still records that bill: both the cancelled attempt's and the redrive's
+/// bills are summed, while only the redrive counts as a completed run.
+#[tokio::test]
+async fn spurious_cancel_keeps_meta_only_usage_bill() {
+    fn grok_bill(input: u64, output: u64) -> Value {
+        json!({
+            "usage": {
+                "inputTokens": input,
+                "outputTokens": output,
+                "totalTokens": input + output,
+                "cachedReadTokens": 0,
+                "reasoningTokens": 0,
+                "costUsdTicks": 0,
+                "numTurns": 1
+            }
+        })
+    }
+    let script = mock_agent_script();
+    let scratch = test_tempdir("itd-spurious-cancel-meta-");
+    let attempt_file = scratch.path().join("attempts");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "cancelledBeforeOutputAttempts": 1,
+        "cancelledPromptMeta": grok_bill(700, 0),
+        "promptMeta": grok_bill(300, 50),
+        "response": "answered after the spurious cancel",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+        ("MOCK_AGENT_STANDS_IN_FOR", "grok"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-spurious-cancel-meta"),
+        AgentId::from("a-spurious-cancel-meta"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "grok").await;
+    mgr.arm_stale_cancel(&id);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "write up a note".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    let store = mgr.services.store.clone();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let rows = store.list_usage_stats_hourly().await.unwrap_or_default();
+                let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+                if input >= 1000 && !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("both attempts' bills are recorded and the agent settles");
+
+    let rows = store.list_usage_stats_hourly().await.expect("stats rows");
+    let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+    let runs: u64 = rows.iter().map(|r| r.runs).sum();
+    assert_eq!(input, 1000, "cancelled bill (700) + redrive bill (300)");
+    assert_eq!(runs, 1, "only the redrive counts as a completed run");
+
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
+        stream_ends += batch
+            .iter()
+            .filter(|ev| ev.event_type == "agent:stream:end")
+            .count();
+    }
+    assert_eq!(stream_ends, 1, "only the redrive emits the terminal event");
+}
+
 /// The stale-cancel mark is one-shot and time-bounded.
 #[tokio::test]
 async fn stale_cancel_mark_is_one_shot_and_bounded() {
