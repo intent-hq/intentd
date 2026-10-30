@@ -268,7 +268,7 @@ async fn boot() -> Fixture {
 
     let engine = Arc::new(RecordingEngine::default());
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_sentry_engine(engine.clone()),

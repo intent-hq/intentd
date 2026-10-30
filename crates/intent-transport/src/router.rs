@@ -314,6 +314,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "host-membership-required" })),
         },
+        ref e @ Error::SecretRequest { code, .. } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": code })),
+        },
         ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
             code: e.code(),
             message: e.to_string(),
@@ -977,6 +982,9 @@ async fn dispatch(
             let mut result = json!({ "workspace": res.workspace });
             if let Some(agent) = res.initial_agent {
                 result["initialAgent"] = agent;
+            }
+            if let Some(origin) = res.proposal_origin {
+                result["proposalOrigin"] = json!(origin);
             }
             Ok(result)
         }
@@ -2608,6 +2616,40 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
+        }
+        // Secret requests (PROTOCOL §5.56). `secret.provide` carries a secret
+        // value: it is handed to the service call and never logged, echoed or
+        // copied into an error (the request params own the original string).
+        "secret.provide" => {
+            let ws = require_ws_note(params)?;
+            let request_id = require_str_param(params, "requestId")?;
+            let value = match params.get("value") {
+                Some(Value::String(value)) => value.clone(),
+                _ => return Err(invalid_params("Missing required parameter: value")),
+            };
+            api.secret_provide(ws, request_id, value)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "secret.dismiss" => {
+            let ws = require_ws_note(params)?;
+            let request_id = require_str_param(params, "requestId")?;
+            api.secret_dismiss(ws, request_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "secret.list" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            api.secret_list(ws, agent_id).await.map_err(domain_to_rpc)
+        }
+        "secret.forget" => {
+            let ws = require_ws_note(params)?;
+            let agent_id = require_agent_id(params)?;
+            let name = require_str_param(params, "name")?;
+            api.secret_forget(ws, agent_id, name)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.resolveProposal" => {
             let agent_id = require_agent_id(params)?;

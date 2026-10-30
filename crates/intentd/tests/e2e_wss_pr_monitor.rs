@@ -629,7 +629,7 @@ async fn boot_with_source_control(sc: Option<Arc<dyn SourceControl>>) -> Fixture
 
     let forge = StubForge::default();
     let services = Arc::new(intent_app::compose(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_source_control(sc.unwrap_or_else(|| Arc::new(forge.clone())))

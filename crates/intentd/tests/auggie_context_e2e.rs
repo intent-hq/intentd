@@ -95,7 +95,7 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         .await
         .expect("insert workspace");
     let ws_root = common::hermetic_workspaces_root();
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_context_engine(std::sync::Arc::new(engine));
 

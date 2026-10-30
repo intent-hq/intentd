@@ -929,7 +929,7 @@ impl Services {
             }
         }
         if !signals.needs_attention {
-            for session in top_level {
+            for session in &top_level {
                 // The summaries already carry the session `metadata`, so a
                 // written pending-questions marker is decided right here with
                 // no extra store read (monorepo#3058) — same derivation as
@@ -950,6 +950,21 @@ impl Services {
                     signals.needs_attention = true;
                     break;
                 }
+            }
+        }
+        // An agent waiting on a secret request (PROTOCOL §5.56) needs the user
+        // too, once the request's card has been persisted (the turn-end drain
+        // — the same point a question raises it). Derived from the daemon's
+        // in-memory pending requests, so it ends when the request is answered
+        // or lost on restart, and a card dropped with a cancelled turn never
+        // strands the workspace.
+        if !signals.needs_attention {
+            if let Some(first) = top_level.first() {
+                let awaiting = self.secret_vault.agents_awaiting_user(&first.workspace_id);
+                signals.needs_attention = !awaiting.is_empty()
+                    && top_level
+                        .iter()
+                        .any(|session| awaiting.contains(&session.id));
             }
         }
         signals
@@ -3956,7 +3971,7 @@ mod workspace_needs_attention {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (Services::new(store), ws, tmp)
+        (Services::new_isolated(store), ws, tmp)
     }
 
     #[tokio::test]
@@ -3994,6 +4009,187 @@ mod workspace_needs_attention {
         assert!(s.needs_attention);
         assert!(s.blocked);
         assert!(!s.failed);
+    }
+
+    /// An idle top-level agent with a pending secret request needs the user
+    /// (PROTOCOL §5.56); answering it, or a sub-agent, does not count.
+    #[intent_test_macros::daemon_test]
+    async fn pending_secret_request_drives_needs_attention() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-secret");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), session.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        let request_id = ticket["requestId"].as_str().unwrap().to_string();
+        assert!(
+            !signals(&svc, &ws).await.needs_attention,
+            "an unsurfaced card (still in the turn, or dropped) does not need the user"
+        );
+        svc.secret_vault
+            .mark_surfaced(&ws, &session.id, std::slice::from_ref(&request_id));
+        assert!(signals(&svc, &ws).await.needs_attention);
+
+        svc.secret_answer_op(
+            ws.clone(),
+            request_id,
+            crate::secret_requests::Outcome::Declined,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!signals(&svc, &ws).await.needs_attention);
+    }
+
+    /// `agent.dismissQuestions` on the carrying message declines its pending
+    /// secret requests (PROTOCOL §5.56), so the workspace stops needing the
+    /// user; a second dismissal finds nothing left to decline.
+    #[intent_test_macros::daemon_test]
+    async fn dismissing_a_message_declines_its_secret_requests() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-secret-dismiss");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), session.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        let request_id = ticket["requestId"].as_str().unwrap().to_string();
+        let card = json!({ "requestId": request_id, "agentId": session.id.0, "name": "KEY", "reason": "tests" });
+        let content = json!([
+            { "type": "text", "text": "I need a key." },
+            { "type": "resource", "resource": {
+                "uri": format!("intent-secret-request://{request_id}"),
+                "name": "KEY",
+                "mimeType": intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE,
+                "text": card.to_string(),
+            } },
+        ]);
+        let asked = svc
+            .store
+            .append_agent_message(&session.id, "assistant", &content, &now_iso())
+            .await
+            .unwrap();
+        svc.surface_secret_requests(
+            &ws,
+            &session.id,
+            &crate::secret_requests::secret_request_ids(&content),
+        )
+        .await;
+        assert!(signals(&svc, &ws).await.needs_attention);
+
+        svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id.clone())
+            .await
+            .unwrap();
+        assert!(!signals(&svc, &ws).await.needs_attention);
+        let listing = svc.secret_vault.list(&ws, &session.id);
+        assert!(listing.pending.is_empty());
+        assert_eq!(
+            listing.answered,
+            vec![(
+                request_id,
+                "KEY".to_string(),
+                crate::secret_requests::Outcome::Declined
+            )]
+        );
+        svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id)
+            .await
+            .unwrap();
+        assert_eq!(svc.secret_vault.list(&ws, &session.id).answered.len(), 1);
+    }
+
+    /// A planted secret value (PROTOCOL §5.56) reaches no agent-facing read
+    /// for the owning agent or a second agent in the same workspace, and no
+    /// file of the store; the provided notice (name only) does.
+    #[intent_test_macros::daemon_test]
+    async fn secret_value_never_reaches_agent_facing_reads() {
+        const SENTINEL: &str = "sentinel-sv-9Qk2-never-egress";
+        let (svc, ws, tmp) = setup().await;
+        let owner = mk_session(&ws, "agent-secret-owner");
+        let other = mk_session(&ws, "agent-secret-other");
+        svc.store.insert_agent_session(&owner).await.unwrap();
+        svc.store.insert_agent_session(&other).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), owner.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        svc.secret_answer_op(
+            ws.clone(),
+            ticket["requestId"].as_str().unwrap().to_string(),
+            crate::secret_requests::Outcome::Provided,
+            Some(zeroize::Zeroizing::new(SENTINEL.to_string())),
+        )
+        .await
+        .unwrap();
+
+        let mut reads =
+            vec![serde_json::to_string(&svc.agent_list(ws.clone()).await.unwrap()).unwrap()];
+        for agent in [&owner.id, &other.id] {
+            reads.push(
+                svc.agent_get_conversation(
+                    agent.clone(),
+                    None,
+                    Some(ws.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+                .to_string(),
+            );
+            reads.push(
+                svc.secret_list_op(ws.clone(), agent.clone())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            );
+            reads.push(
+                serde_json::to_string(&svc.store.get_agent_session(agent).await.unwrap()).unwrap(),
+            );
+        }
+        reads.push(
+            svc.event_query(
+                ws.clone(),
+                intent_core::EventQueryParams {
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .to_string(),
+        );
+        for read in &reads {
+            assert!(!read.contains(SENTINEL), "secret value leaked into: {read}");
+        }
+        assert!(
+            reads
+                .iter()
+                .any(|read| read.contains("The user provided secret KEY")),
+            "the provided notice reached the owner's transcript"
+        );
+        let mut dirs = vec![tmp.path.parent().unwrap().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes =
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                assert!(
+                    !bytes
+                        .windows(SENTINEL.len())
+                        .any(|w| w == SENTINEL.as_bytes()),
+                    "secret value leaked into {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4193,7 +4389,7 @@ mod workspace_needs_attention {
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store.clone());
+        let svc = Services::new_isolated(store.clone());
         let cases = [
             ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
             (
@@ -4477,7 +4673,7 @@ mod display_status_events {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
             store,
@@ -5955,7 +6151,7 @@ mod background_tasks_running_events {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus);
+        let services = Services::new_isolated(store).with_event_bus(bus);
         Harness {
             _tmp: tmp,
             services,

@@ -433,6 +433,9 @@ mod tests_unknown_model;
 #[cfg(test)]
 mod tests_suggested_prompts_contract;
 
+#[cfg(test)]
+mod tests_proposal_origin;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -1130,7 +1133,7 @@ pub(crate) fn ensure_provider_enabled(
         let display = intent_providers::provider_config(provider_id).display_name;
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
-             Settings > Agents."
+             Settings > Providers, or choose an enabled provider or model."
         )));
     }
     Ok(())
@@ -3217,6 +3220,23 @@ pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed"
 /// [`QUESTIONS_DISMISSED_METADATA_TYPE`] conventions.
 pub(crate) const PROPOSAL_RESOLVED_METADATA_TYPE: &str = "proposal_resolved";
 
+/// What a well-formed `workspace.create` origin will do once the create
+/// succeeds ([`Services::prepare_create_proposal_origin`]).
+#[derive(Debug, Clone)]
+pub(crate) enum CreateProposalOrigin {
+    /// Accepted: resolve the proposal `applied`. `key_bound` records that
+    /// the card carries its own `idempotencyKey` (which this create uses).
+    Resolve {
+        source_workspace: WorkspaceId,
+        agent: AgentId,
+        proposal: String,
+        key_bound: bool,
+    },
+    /// Declined: report `outcome` (the persisted resolution, or
+    /// `notResolved`) and leave the proposal untouched.
+    Report { proposal: String, outcome: String },
+}
+
 /// Cap on the caller-supplied `agent.resolveProposal` `detail` string — it is
 /// appended verbatim to the applied notice, so bound it against oversized
 /// payloads riding into the transcript.
@@ -4013,7 +4033,7 @@ impl Services {
     /// is NULL; best-effort — an encode failure yields `None` and the wire
     /// field stays omitted.
     fn current_agent_features_snapshot(&self) -> Option<serde_json::Value> {
-        serde_json::to_value(&self.effective_settings().agent_features).ok()
+        agent_features_snapshot(&self.effective_settings().agent_features).ok()
     }
 
     /// The `agentFeatures` values governing `session`'s runtime surface: the
@@ -4073,7 +4093,7 @@ impl Services {
                 return;
             }
         }
-        let Ok(snapshot) = serde_json::to_value(&features) else {
+        let Ok(snapshot) = agent_features_snapshot(&features) else {
             tracing::warn!(agent_id = %session.id,
                 "legacy feature freeze: agentFeatures snapshot encode failed; skipping");
             return;
@@ -5719,7 +5739,7 @@ impl Services {
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
         let settings = self.effective_settings();
-        let harness_features = serde_json::to_value(&settings.agent_features).map_err(|e| {
+        let harness_features = agent_features_snapshot(&settings.agent_features).map_err(|e| {
             AgentPersistError::Internal(format!(
                 "{method}: encode agentFeatures snapshot failed: {e}"
             ))
@@ -6123,6 +6143,10 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        #[cfg(all(test, unix))]
+        self.pending_delete_test_gate
+            .pause("agent-secret-window", &agent_id.0)
+            .await;
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -6140,6 +6164,11 @@ impl Services {
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
+        // Memory-held secrets and pending requests die with their agent
+        // (§5.56). Swept only AFTER the row is gone: a concurrent
+        // `ws.secret.request` either inserted before this sweep (removed
+        // here) or re-reads the session after the DELETE and drops itself.
+        self.secret_vault.clear_agent(&agent_id);
         self.agent_queues
             .lock()
             .expect("agent queue registry poisoned")
@@ -6507,6 +6536,8 @@ impl Services {
             return Ok(None);
         }
         self.desktop_terminate_agent(&session.id).await;
+        // A retired agent is inert: drop its secrets and pending requests (§5.56).
+        self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire
         // caller retires another agent, whose current worker must be aborted;
         // MCP self-retirement instead lets its own response unwind normally.
@@ -9677,6 +9708,12 @@ impl Services {
         // Deliver the questions-dismissed system notice (first dismissal of
         // this messageId only) BEFORE the drain kick, so an idle agent's next
         // turn is the notice rather than a previously queued entry.
+        // Dismissing a message also declines its pending secret requests
+        // (§5.56) — BEFORE the questions-dismissed notice starts a turn, so
+        // that turn never sees them still pending. Requests already answered
+        // or lost are skipped, so a repeat dismissal sends no duplicate notices.
+        self.decline_secret_requests_on_message(&workspace_id, &agent_id, &message_id)
+            .await;
         if !already_dismissed {
             self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
                 .await;
@@ -10078,6 +10115,218 @@ impl Services {
         }))
     }
 
+    /// `workspace.create { origin }` (PROTOCOL §5.1 "Proposal origin",
+    /// intent-hq/intent#8086), first half — runs BEFORE any side effect.
+    /// Takes the wire `origin` off `input` and rejects a malformed shape with
+    /// `-32602` (blank `agentId` / `proposalId`, either over the id length
+    /// cap). Unless an in-process caller already set `input.origin`
+    /// (`ws.workspace.applyProposal` keeps its own provenance and
+    /// resolution), it then accepts the origin only when the named proposal
+    /// is still pending on the agent, is a `workspace-create` proposal, and —
+    /// when its params carry an `idempotencyKey` — this create uses that same
+    /// key (so neither another kind of card nor a replay naming a different
+    /// card can be marked applied). An accepted origin is recorded as
+    /// `input.origin` for the `workspace:created` echo. A rejected one is
+    /// fail-soft — an unknown agent, a caller without access to the agent's
+    /// workspace, or a proposal failing those checks logs a warning and the
+    /// create proceeds with nothing to resolve. Any other store error fails
+    /// the create before it starts, so the client can retry.
+    pub(crate) async fn prepare_create_proposal_origin(
+        &self,
+        input: &mut intent_core::WorkspaceCreate,
+        idempotency_key: Option<&str>,
+    ) -> Result<Option<CreateProposalOrigin>> {
+        let Some(request) = input.origin_request.take() else {
+            return Ok(None);
+        };
+        let intent_core::WorkspaceCreateOriginRequest::Proposal {
+            agent_id,
+            proposal_id,
+        } = request;
+        let agent_id = agent_id.trim();
+        // Matched verbatim against the pending entry (see
+        // `agent_resolve_proposal_op`), so only blankness is checked.
+        for (field, value, blank) in [
+            ("agentId", agent_id, agent_id.is_empty()),
+            (
+                "proposalId",
+                proposal_id.as_str(),
+                proposal_id.trim().is_empty(),
+            ),
+        ] {
+            if blank {
+                return Err(Error::InvalidParams(format!("origin.{field} is required")));
+            }
+            if value.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "origin.{field} exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+                )));
+            }
+        }
+        if input.origin.is_some() {
+            return Ok(None);
+        }
+        let agent_id = AgentId::from(agent_id);
+        let skip = |reason: &str| {
+            tracing::warn!(
+                agent = %agent_id,
+                proposal = %proposal_id,
+                reason,
+                "workspace.create origin not resolved"
+            );
+            Ok(Some(CreateProposalOrigin::Report {
+                proposal: proposal_id.clone(),
+                outcome: intent_core::PROPOSAL_ORIGIN_NOT_RESOLVED.to_string(),
+            }))
+        };
+        let session = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(session) => session,
+            Err(Error::NotFound(_)) => return skip("unknown agent"),
+            Err(e) => return Err(e),
+        };
+        match self.require_member(&session.workspace_id).await {
+            Ok(()) => {}
+            Err(Error::NotFound(_)) => {
+                return skip("caller is not a member of the agent's workspace")
+            }
+            Err(e) => return Err(e),
+        }
+        let Some(entry) = session
+            .pending_proposals()
+            .into_iter()
+            .find(|p| p.proposal_id == proposal_id)
+        else {
+            // Already resolved (e.g. a replay after the first create resolved
+            // it, or a dismissal): report the persisted outcome.
+            if let Some(outcome) = session
+                .proposal_resolutions()
+                .get(&proposal_id)
+                .and_then(Value::as_str)
+            {
+                return Ok(Some(CreateProposalOrigin::Report {
+                    outcome: outcome.to_string(),
+                    proposal: proposal_id.clone(),
+                }));
+            }
+            return skip("proposal is not pending");
+        };
+        let Some(proposal) = self
+            .message_blocks_checked(&agent_id, &entry.message_id)
+            .await?
+            .and_then(|blocks| crate::tool_block::proposal_in(&blocks, &proposal_id))
+        else {
+            return skip("proposal block could not be loaded");
+        };
+        let kind = proposal.get("kind").and_then(Value::as_str);
+        let operation = proposal
+            .get("payload")
+            .and_then(|p| p.get("operation"))
+            .and_then(Value::as_str);
+        if kind != Some("workspace-create") || operation != Some("workspace.create") {
+            return skip("proposal is not a workspace-create proposal");
+        }
+        let bound_key = proposal
+            .get("payload")
+            .and_then(|p| p.get("params"))
+            .and_then(|p| p.get("idempotencyKey"))
+            .and_then(Value::as_str);
+        if bound_key.is_some_and(|bound| idempotency_key != Some(bound)) {
+            return skip("create does not use the proposal's idempotencyKey");
+        }
+        input.origin = Some(intent_core::WorkspaceCreateOrigin::Proposal {
+            proposal_id: proposal_id.clone(),
+            agent_id: agent_id.clone(),
+            source_workspace_id: session.workspace_id.clone(),
+        });
+        Ok(Some(CreateProposalOrigin::Resolve {
+            source_workspace: session.workspace_id,
+            agent: agent_id,
+            proposal: proposal_id,
+            key_bound: bound_key.is_some(),
+        }))
+    }
+
+    /// `workspace.create { origin }`, second half — runs after the create
+    /// succeeded, on first execution AND on an idempotent replay. An accepted
+    /// origin is resolved `applied` through
+    /// [`Services::agent_resolve_proposal_op`] with the `"Created workspace
+    /// <id>."` detail, delivering the same notice and `agent:updated` a
+    /// client-side `agent.resolveProposal` would; a declined one is only
+    /// reported. Returns the result's `proposalOrigin`, telling the client
+    /// the daemon handled the card. Fail-soft: the workspace exists either
+    /// way. A failed resolution write of an ACCEPTED origin returns `None`
+    /// (no `proposalOrigin`), so the client's own `agent.resolveProposal`
+    /// retries it — safe, because the daemon already validated the card.
+    pub(crate) async fn resolve_create_proposal_origin(
+        &self,
+        origin: CreateProposalOrigin,
+        created: &WorkspaceId,
+        replayed: bool,
+    ) -> Option<intent_core::WorkspaceCreateProposalOutcome> {
+        let (source_workspace_id, agent_id, proposal_id) = match origin {
+            CreateProposalOrigin::Report { proposal, outcome } => {
+                return Some(intent_core::WorkspaceCreateProposalOutcome {
+                    proposal_id: proposal,
+                    outcome,
+                });
+            }
+            // A replay returns a workspace an EARLIER request created. Only a
+            // card bound to this very key is provably that request's card; a
+            // key-less card named on a replay is declined.
+            CreateProposalOrigin::Resolve {
+                proposal,
+                key_bound: false,
+                ..
+            } if replayed => {
+                tracing::warn!(
+                    proposal = %proposal,
+                    workspace = %created.as_str(),
+                    "workspace.create replay names a key-less card; origin not resolved"
+                );
+                return Some(intent_core::WorkspaceCreateProposalOutcome {
+                    proposal_id: proposal,
+                    outcome: intent_core::PROPOSAL_ORIGIN_NOT_RESOLVED.to_string(),
+                });
+            }
+            CreateProposalOrigin::Resolve {
+                source_workspace,
+                agent,
+                proposal,
+                ..
+            } => (source_workspace, agent, proposal),
+        };
+        let detail = format!("Created workspace {}.", created.as_str());
+        let outcome = match self
+            .agent_resolve_proposal_op(
+                source_workspace_id,
+                agent_id.clone(),
+                proposal_id.clone(),
+                PROPOSAL_OUTCOME_APPLIED.to_string(),
+                Some(detail),
+            )
+            .await
+        {
+            Ok(resolved) => resolved["outcome"]
+                .as_str()
+                .unwrap_or(PROPOSAL_OUTCOME_APPLIED)
+                .to_string(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    proposal = %proposal_id,
+                    workspace = %created.as_str(),
+                    error = %e,
+                    "workspace.create could not resolve its origin proposal"
+                );
+                return None;
+            }
+        };
+        Some(intent_core::WorkspaceCreateProposalOutcome {
+            proposal_id,
+            outcome,
+        })
+    }
+
     /// The `preview.title` of the proposal `proposal_id` as carried by the
     /// persisted message `message_id`'s lifted proposal-resource block.
     /// Bounded: one index lookup + one single-message page, mirroring
@@ -10089,19 +10338,44 @@ impl Services {
         message_id: &str,
         proposal_id: &str,
     ) -> Option<String> {
-        let idx = self
+        let blocks = self.message_blocks(agent_id, message_id).await?;
+        crate::tool_block::proposal_title_in(&blocks, proposal_id)
+    }
+
+    /// Content blocks of persisted message `message_id`: one index lookup +
+    /// one single-message page, never a transcript hydration. `None` when
+    /// the message is gone or carries no block array (best-effort: store
+    /// errors read as `None` too).
+    async fn message_blocks(&self, agent_id: &AgentId, message_id: &str) -> Option<Vec<Value>> {
+        self.message_blocks_checked(agent_id, message_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`Services::message_blocks`] that surfaces store errors instead of
+    /// folding them into `None`.
+    async fn message_blocks_checked(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(idx) = self
             .store
             .get_agent_message_index(agent_id, message_id)
-            .await
-            .ok()??;
-        let page = self
-            .store
-            .get_agent_messages_page(agent_id, idx, 1)
-            .await
-            .ok()?;
-        let msg = page.first().filter(|m| m.id == message_id)?;
-        let blocks = msg.content.as_array()?;
-        crate::tool_block::proposal_title_in(blocks, proposal_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let page = self.store.get_agent_messages_page(agent_id, idx, 1).await?;
+        Ok(page
+            .into_iter()
+            .next()
+            .filter(|m| m.id == message_id)
+            .and_then(|msg| match msg.content {
+                Value::Array(blocks) => Some(blocks),
+                _ => None,
+            }))
     }
 
     /// Deliver the proposal-resolved system notice (`agent.resolveProposal`,
@@ -12805,6 +13079,9 @@ impl Services {
             || self.agent_is_waiting_on_agents(agent_id)
             || !self.list_event_subscriptions_for_agent(agent_id).is_empty()
             || self.pending_question_count(agent_id).await > 0
+            || self
+                .secret_vault
+                .has_pending(&session.workspace_id, agent_id)
         {
             return Ok(true);
         }
@@ -19609,4 +19886,21 @@ pub(crate) fn stamp_direct_correlation(metadata: &mut Option<Value>, id: &str) {
         object.remove("recoverySources");
         object.insert("submissionIds".into(), json!([id]));
     }
+}
+
+/// The per-session `agentFeatures` snapshot JSON (intent-hq/monorepo#2459).
+/// The off-by-default `secretRequests` toggle (PROTOCOL §5.56) is written
+/// only when on: an absent key decodes as `false`, so default sessions keep
+/// the exact snapshot shape older daemons and the shared transfer-selection
+/// fixtures expect.
+pub(crate) fn agent_features_snapshot(
+    features: &intent_core::settings_file::AgentFeaturesSettings,
+) -> serde_json::Result<serde_json::Value> {
+    let mut snapshot = serde_json::to_value(features)?;
+    if !features.secret_requests {
+        if let Some(fields) = snapshot.as_object_mut() {
+            fields.remove("secretRequests");
+        }
+    }
+    Ok(snapshot)
 }

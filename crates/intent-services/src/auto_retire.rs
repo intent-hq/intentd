@@ -10,8 +10,9 @@
 //! workspace with a pending grace-window delete, and one whose folder holds
 //! work the purge would destroy
 //! ([`crate::local_work::LocalWorkRule::Purge`]): uncommitted changes in
-//! any root, unpushed commits in a secondary root inside the folder, or a
-//! root that could not be evaluated. Each workspace is retired
+//! any root, unpushed commits in a secondary root inside the folder (unless
+//! a merged PR covers that root's `HEAD`), or a root that could not be
+//! evaluated. Each workspace is retired
 //! independently: a failure is logged and counted, never aborts the sweep.
 //! Retired rows are not archived-and-due any more, so a sweep is idempotent.
 

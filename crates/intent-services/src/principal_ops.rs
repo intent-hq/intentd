@@ -1645,7 +1645,7 @@ mod tests {
             .revoke_all_principal_credentials(&revoked.id)
             .await
             .expect("revoke");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let listed = services.principal_list_op().await.expect("daemon lists");
         assert_eq!(
@@ -1699,7 +1699,7 @@ mod tests {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let primary = store.get_primary_principal().await.expect("primary");
         assert!(primary.login.is_none(), "fixture precondition: {primary:?}");
-        let services = Services::new(store).with_source_control(sc);
+        let services = Services::new_isolated(store).with_source_control(sc);
         (tmp, services, ws)
     }
 
@@ -2179,7 +2179,7 @@ mod tests {
         let primary = store.get_primary_principal().await.expect("primary");
         let guest = principal("guest");
         store.upsert_principal(&guest).await.expect("guest");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let stamped = json!({ "fromPrincipalId": guest.id.0 });
         let mut resolver = MessageAuthorResolver::new(&services, &ws);
@@ -2264,7 +2264,7 @@ mod tests {
         for g in &guests {
             store.upsert_principal(g).await.expect("guest");
         }
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let row = |role: &str, metadata: Option<Value>| intent_core::AgentMessage {
             id: "m".to_string(),
@@ -2345,7 +2345,7 @@ mod tests {
         let primary = store.get_primary_principal().await.expect("primary");
         let guest = principal("guest");
         store.upsert_principal(&guest).await.expect("guest");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let mut queue = vec![
             json!({ "id": "q1", "content": "hi", "queuedAt": now_iso(), "position": 0,

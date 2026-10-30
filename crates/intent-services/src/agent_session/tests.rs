@@ -734,7 +734,7 @@ async fn setup() -> (TempDb, Services, EventBus, AgentId, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     let workspace_id = WorkspaceId::from("ws-1");
     let agent_id = AgentId::from("agent-1");
     store
@@ -8312,7 +8312,7 @@ async fn daemon_stall_blocker_clears_after_restart_on_next_successful_turn() {
     raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
     let store = services.store.clone();
     drop(services);
-    let restarted = Services::new(store).with_event_bus(bus.clone());
+    let restarted = Services::new_isolated(store).with_event_bus(bus.clone());
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     run_follow_up_turn(&restarted, &agent_id, &workspace_id, connect())

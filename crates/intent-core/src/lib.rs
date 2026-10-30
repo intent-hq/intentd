@@ -60,6 +60,7 @@ pub mod server_control;
 pub mod settings_file;
 pub mod slug;
 pub mod startup;
+pub mod test_isolation;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
@@ -164,11 +165,12 @@ pub use model::{
     TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin, WorkspaceCreateResult,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin,
+    WorkspaceCreateOriginRequest, WorkspaceCreateProposalOutcome, WorkspaceCreateResult,
     WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
     WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
-    SUPPORTED_ASSET_MIME_TYPES,
+    PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

@@ -267,6 +267,7 @@ impl WorkspaceApi for FakeApi {
             Ok(intent_core::WorkspaceCreateResult {
                 workspace: ws,
                 initial_agent: None,
+                proposal_origin: None,
             })
         })
     }

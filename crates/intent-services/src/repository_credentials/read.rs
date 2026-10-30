@@ -780,6 +780,22 @@ impl RepositoryConnectionDirectory {
         inspect(self.connection_metadata(&state))
     }
 
+    /// Non-blocking status projection for background observation: `Ok(None)`
+    /// while another holder has the state lock. Poison remains an error.
+    pub(crate) fn try_with_connection_metadata<T>(
+        &self,
+        inspect: impl FnOnce(RepositoryConnectionMetadata<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RepositoryCredentialError::Indeterminate)
+            }
+        };
+        inspect(self.connection_metadata(&state)).map(Some)
+    }
+
     fn connection_metadata<'a>(&self, state: &'a State) -> RepositoryConnectionMetadata<'a> {
         let ready = state.ready().and_then(|published| {
             if published.binding.daemon_id != self.daemon_id

@@ -251,7 +251,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -276,6 +276,23 @@ applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
 <!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.6/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_6.rs}. -->
+
+**Disable a provider.** In **Settings → Providers**, choose **Disable** from its
+⋯ menu, including for the default provider or one used by saved models or
+specialists. Saved selections remain intact. A turn already running can finish;
+disabling does not stop it. On their next turn, conversations using the provider's
+Default configuration move to the configured app default if it is enabled and
+usable, with a notice in chat. Named profiles require an explicit replacement
+instead. If no usable default exists, re-enable the provider or choose another
+enabled provider/model. New agents and quick actions cannot run on a disabled
+provider; update their saved selections or re-enable it. Intent does not choose an
+arbitrary replacement for a disabled app default.
+
+<!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
+Auggie appears in provider lists, including onboarding, only when its CLI is
+installed or it is already enabled. An enabled but missing installation stays
+visible so you can disable it; it disappears afterward. Sign-in is not required
+for an installed Auggie to appear.
 
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
@@ -373,7 +390,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -402,7 +419,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/{home-model,home-preview-agent}.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -410,6 +427,13 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+Selecting a workspace opens its preview on the top-level agent (not a background or
+delegated agent) with the most recent activity; a workspace with no top-level agent
+left opens on its most recently active remaining agent. The preview keeps that agent
+while it stays open unless the agent is retired or deleted. Choose another from the
+agent menu above the chat; Home remembers that choice for the workspace until the app
+restarts, the account or connection changes, or Home is reset.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
@@ -652,7 +676,7 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
 Archive is the one way to put a workspace away. In **Home → Workspaces**,
 right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
@@ -665,7 +689,14 @@ and set the number of days (7 when first turned on), or set `autoArchiveIdleAfte
 (`0` = off) under `[workspace]` in `config.toml`. A workspace with no messages, note
 edits or agent activity for that long is archived, unless an agent, script, hook or
 PR monitor is still running, it is shared with guests, or it has uncommitted changes
-or unpushed commits.
+or unpushed commits. Commits from a pull request that Intent saw merged no longer
+count as unpushed, even after the merged branch is deleted on the remote; commits
+made after the merge still do.
+
+To keep one workspace from being archived automatically, right-click it in **Home →
+Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
+off for every workspace by default, only the workspace owner sees it, and it does not
+stop you archiving the workspace yourself.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
@@ -675,7 +706,9 @@ Workspaces whose folder is the repository itself and remote workspaces cannot be
 purged. To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
 `purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
-hour, and skips workspaces with uncommitted changes.
+hour, and skips workspaces with uncommitted changes or with unpushed commits in a
+nested repository (such as a submodule), unless Intent saw those commits merged in a
+pull request.
 
 A purged workspace still shows as archived and its history stays readable.
 Unarchiving it, or sending a message, recreates it from a fresh checkout of the

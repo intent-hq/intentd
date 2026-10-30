@@ -73,8 +73,8 @@ async fn workspace_change_is_rejected_without_events_or_row_changes() {
         .await
         .expect("client");
     let bus = EventBus::new(store.clone());
-    let services =
-        crate::test_runtime::with_runtime(Services::new(store.clone())).with_event_bus(bus.clone());
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
+        .with_event_bus(bus.clone());
     let subscribe = |ws: &WorkspaceId| {
         bus.subscribe(SubscriptionFilter {
             workspace_id: Some(ws.0.clone()),
@@ -180,8 +180,8 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
         .await
         .expect("client");
     let bus = EventBus::new(store.clone());
-    let services =
-        crate::test_runtime::with_runtime(Services::new(store.clone())).with_event_bus(bus.clone());
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
+        .with_event_bus(bus.clone());
     let mut sub = bus.subscribe(SubscriptionFilter {
         workspace_id: Some(ws.0.clone()),
         event_types: vec!["browser:*".to_string()],
@@ -273,8 +273,12 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
     }
 }
 
-/// Identity changes do not migrate persistent pins, tab hosts or old drafts.
-/// Safe recovery has to be explicit: a common suffix is not ownership proof.
+/// Identity changes do not migrate persistent pins, tab hosts or old drafts on
+/// their own: routing, pins and drafts never resolve an id by a common suffix,
+/// which is not ownership proof. The one implicit move is the guarded
+/// `client.hello` rehome of open tabs from superseded ids
+/// (`hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts`), which
+/// leaves pins and drafts alone.
 #[tokio::test]
 async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts() {
     use intent_core::{AgentId, ReverseTarget};
@@ -284,7 +288,7 @@ async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
     let agent = AgentId::from_string("draft-agent");
-    let services = crate::test_runtime::with_runtime(Services::new(store.clone()));
+    let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
     for (index, old) in ["desktop", "alice:desktop"].into_iter().enumerate() {
         let old = ClientId::from_string(old);
         let drifted = ClientId::from_string(format!("bob:{}", old.as_str()));
@@ -359,4 +363,476 @@ async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts
         );
         services.browser_tab_remove(old, tab.tab_id).await.unwrap();
     }
+}
+
+/// Superseded-id rehome on `client.hello` (intent-hq/intent#8045): a tab
+/// stranded under an earlier id of the hello'd device moves to its current
+/// id with one `browser:tab-updated { changes: { hostClientId } }`; a
+/// superseded id that is live right now keeps its tabs; and an
+/// administrator-only id never moves under an id whose head is a principal of
+/// this daemon (a collaborator could hello as it).
+#[tokio::test]
+async fn hello_rehome_moves_stranded_tabs_but_not_live_or_widened_hosts() {
+    use intent_core::{AgentId, Principal, PrincipalId, WorkspaceApi};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let collaborator = Principal {
+        id: PrincipalId::from_string("p-bob"),
+        identity: None,
+        github_user_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: intent_core::now_iso(),
+        updated_at: intent_core::now_iso(),
+    };
+    store
+        .upsert_principal(&collaborator)
+        .await
+        .expect("principal");
+    for id in [
+        "60420340",
+        "4d61d017:60420340",
+        "aaccc21a:4d61d017:60420340",
+        "live-old",
+        "x:live-old",
+        "desktop",
+        "p-bob:desktop",
+        "p-bob:bobs-device",
+        "zzz:p-bob:bobs-device",
+        "user-old",
+        "x:user-old",
+    ] {
+        store
+            .upsert_client(
+                &ClientId::from_string(id),
+                Some("Desktop"),
+                Some(&json!({ "browserExec": true })),
+                &ClientHostInfo::default(),
+            )
+            .await
+            .expect("client");
+    }
+    let bus = EventBus::new(store.clone());
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        .with_event_bus(bus.clone())
+        .with_reverse_dispatch(super::browser_client_pin_tests::FakeRegistry::new(&[(
+            "live-old",
+            Some("Still here"),
+            true,
+        )]));
+    let mut stranded = input(&ws, "stranded");
+    stranded.owner_agent_id = Some(AgentId::from_string("agent-1"));
+    stranded.visibility = BrowserTabVisibility::Hidden;
+    store
+        .set_workspace_browser_client(&ws, Some(&ClientId::from_string("60420340")))
+        .await
+        .expect("pin");
+    for (host, tab) in [
+        ("60420340", stranded),
+        ("live-old", input(&ws, "live-tab")),
+        ("desktop", input(&ws, "admin-tab")),
+        ("p-bob:bobs-device", input(&ws, "bob-tab")),
+        ("user-old", input(&ws, "user-tab")),
+    ] {
+        services
+            .browser_tab_upsert(ClientId::from_string(host), tab)
+            .await
+            .expect("seed tab");
+    }
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec!["browser:*".to_string()],
+        ..Default::default()
+    });
+
+    let current = ClientId::from_string("aaccc21a:4d61d017:60420340");
+    let moved = services
+        .rehome_superseded_browser_tabs(
+            current.clone(),
+            vec![
+                ClientId::from_string("4d61d017:60420340"),
+                ClientId::from_string("60420340"),
+            ],
+        )
+        .await
+        .expect("rehome");
+    assert_eq!(moved, 1);
+    let events = recv_one(&mut sub).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, BROWSER_TAB_UPDATED);
+    assert_eq!(tab_id_of(&events[0]), "stranded");
+    assert_eq!(
+        events[0].data["changes"],
+        json!({ "hostClientId": "aaccc21a:4d61d017:60420340" })
+    );
+    let row = store.get_browser_tab("stranded").await.unwrap().unwrap();
+    assert_eq!(row.host_client_id, current);
+    assert_eq!(row.owner_agent_id, Some(AgentId::from_string("agent-1")));
+    assert_eq!(
+        store.workspace_browser_client(&ws).await.unwrap(),
+        Some(ClientId::from_string("60420340")),
+        "pins are never migrated implicitly"
+    );
+
+    let live = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:live-old"),
+            vec![ClientId::from_string("live-old")],
+        )
+        .await
+        .expect("live rehome");
+    assert_eq!(live, 0, "a live superseded host keeps its tabs");
+    assert_eq!(
+        store
+            .get_browser_tab("live-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "live-old"
+    );
+
+    let widened = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("p-bob:desktop"),
+            vec![ClientId::from_string("desktop")],
+        )
+        .await
+        .expect("widened rehome");
+    assert_eq!(widened, 0, "p-bob could hello as the new id");
+    assert_eq!(
+        store
+            .get_browser_tab("admin-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "desktop"
+    );
+
+    let narrowed = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("zzz:p-bob:bobs-device"),
+            vec![ClientId::from_string("p-bob:bobs-device")],
+        )
+        .await
+        .expect("narrowed rehome");
+    assert_eq!(narrowed, 0, "p-bob could not hello as the new id");
+    assert_eq!(
+        store
+            .get_browser_tab("bob-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "p-bob:bobs-device"
+    );
+
+    let unclaimed = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:user-old"),
+            vec![ClientId::from_string("user-old")],
+        )
+        .await
+        .expect("unclaimed rehome");
+    assert_eq!(unclaimed, 1, "unclaimed tabs move too");
+
+    let blind = crate::test_runtime::with_runtime(Services::new(store.clone()));
+    let mut seed = input(&ws, "blind-tab");
+    seed.owner_agent_id = None;
+    services
+        .browser_tab_upsert(ClientId::from_string("user-old"), seed)
+        .await
+        .expect("seed blind tab");
+    assert_eq!(
+        blind
+            .rehome_superseded_browser_tabs(
+                ClientId::from_string("x:user-old"),
+                vec![ClientId::from_string("user-old")],
+            )
+            .await
+            .expect("blind rehome"),
+        0,
+        "without a reverse registry liveness is unknown: nothing moves"
+    );
+}
+
+/// A reverse registry whose live set the test flips at will; `bind_on_read`
+/// joins the live set right after the first `live_clients` read, as a host
+/// binding between a rehome's liveness snapshot and its commit would.
+#[derive(Default)]
+struct LiveSet(
+    std::sync::Mutex<Vec<ClientId>>,
+    std::sync::Mutex<Option<ClientId>>,
+);
+
+impl intent_core::AgentReverseDispatch for LiveSet {
+    fn is_connected(&self) -> bool {
+        !self.0.lock().unwrap().is_empty()
+    }
+    fn live_clients(&self) -> Vec<intent_core::ReverseLiveClient> {
+        let snapshot = self.0.lock().unwrap().clone();
+        if let Some(late) = self.1.lock().unwrap().take() {
+            self.0.lock().unwrap().push(late);
+        }
+        snapshot
+            .iter()
+            .map(|id| intent_core::ReverseLiveClient {
+                principal_id: None,
+                host_role: None,
+                login: None,
+                display_name: None,
+                avatar_url: None,
+                identity: None,
+                client_id: id.clone(),
+                name: None,
+                capabilities: json!({ "browserExec": true }),
+                host: ClientHostInfo::default(),
+                connections: 1,
+                transports: vec!["wss".to_string()],
+                connected_at: "2026-10-29T00:00:00Z".to_string(),
+            })
+            .collect()
+    }
+    fn dispatch<'a>(
+        &'a self,
+        _method: &'a str,
+        _params: serde_json::Value,
+        _target: intent_core::ReverseTarget,
+    ) -> intent_core::BoxFuture<
+        'a,
+        std::result::Result<serde_json::Value, intent_core::ReverseDispatchError>,
+    > {
+        Box::pin(async { Err(intent_core::ReverseDispatchError::NoClient) })
+    }
+}
+
+async fn rehome_fixture(
+    hosts: &[&str],
+) -> (
+    TempDb,
+    Store,
+    Services,
+    std::sync::Arc<LiveSet>,
+    WorkspaceId,
+) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    for id in hosts {
+        store
+            .upsert_client(
+                &ClientId::from_string(*id),
+                Some("Desktop"),
+                Some(&json!({ "browserExec": true })),
+                &ClientHostInfo::default(),
+            )
+            .await
+            .expect("client");
+    }
+    let live = std::sync::Arc::new(LiveSet::default());
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        .with_reverse_dispatch(live.clone());
+    (tmp, store, services, live, ws)
+}
+
+/// The liveness decision is made under the tab gate: an old host that binds
+/// while a rehome waits on the gate keeps its tabs, and nothing is published.
+#[tokio::test]
+async fn hello_rehome_rechecks_liveness_after_waiting_on_the_tab_gate() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, store, services, live, ws) = rehome_fixture(&["dev-1", "x:dev-1"]).await;
+    let bus = EventBus::new(store.clone());
+    let services = services.with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec!["browser:*".to_string()],
+        ..Default::default()
+    });
+    services
+        .browser_tab_upsert(ClientId::from_string("dev-1"), input(&ws, "racy"))
+        .await
+        .expect("seed");
+    let opened = recv_one(&mut sub).await;
+    assert_eq!(opened[0].event_type, BROWSER_TAB_OPENED);
+
+    let gate = services.feature_browser_tab_gate().lock().await;
+    let rehome = {
+        let services = services.clone();
+        tokio::spawn(async move {
+            services
+                .rehome_superseded_browser_tabs(
+                    ClientId::from_string("x:dev-1"),
+                    vec![ClientId::from_string("dev-1")],
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    live.0.lock().unwrap().push(ClientId::from_string("dev-1"));
+    drop(gate);
+    let moved = rehome.await.expect("join").expect("rehome");
+    assert_eq!(moved, 0, "the reconnected old host keeps its tabs");
+    assert_eq!(
+        store
+            .get_browser_tab("racy")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "dev-1"
+    );
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
+        "no rehome event"
+    );
+}
+
+/// A collaborator moves a superseded host only when it may manage the browser
+/// in every workspace that host has open tabs in: a host member manages every
+/// workspace but Chief, so a host with a Chief tab stays put.
+#[tokio::test]
+async fn collaborator_rehome_skips_hosts_with_tabs_in_unmanaged_workspaces() {
+    use intent_core::{Caller, Principal, PrincipalId, WorkspaceApi};
+
+    let (_tmp, store, services, _live, ws) =
+        rehome_fixture(&["p-mem:dev", "p-mem:x:p-mem:dev"]).await;
+    let member = Principal {
+        id: PrincipalId::from_string("p-mem"),
+        identity: None,
+        github_user_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: intent_core::now_iso(),
+        updated_at: intent_core::now_iso(),
+    };
+    store.upsert_principal(&member).await.expect("principal");
+    sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+        .bind(&member.id.0)
+        .bind(intent_core::now_iso())
+        .execute(store.write_pool())
+        .await
+        .expect("host member");
+    let chief = WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID);
+    if store.get_workspace(&chief).await.is_err() {
+        store
+            .insert_workspace(&workspace(&chief))
+            .await
+            .expect("chief");
+    }
+    services
+        .browser_tab_upsert(ClientId::from_string("p-mem:dev"), input(&ws, "managed"))
+        .await
+        .expect("seed managed");
+    services
+        .browser_tab_upsert(
+            ClientId::from_string("p-mem:dev"),
+            input(&chief, "chief-tab"),
+        )
+        .await
+        .expect("seed chief");
+
+    let moved = intent_core::with_caller(
+        Caller::Wire {
+            principal_id: member.id.clone(),
+            host_role: intent_core::HostRole::Member,
+        },
+        services.rehome_superseded_browser_tabs(
+            ClientId::from_string("p-mem:x:p-mem:dev"),
+            vec![ClientId::from_string("p-mem:dev")],
+        ),
+    )
+    .await
+    .expect("rehome");
+    assert_eq!(moved, 0, "a host member does not manage Chief");
+    assert_eq!(
+        store
+            .get_browser_tab("managed")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "p-mem:dev",
+        "the whole host stays put, managed workspaces included"
+    );
+    assert_eq!(
+        store
+            .get_browser_tab("chief-tab")
+            .await
+            .unwrap()
+            .unwrap()
+            .host_client_id
+            .as_str(),
+        "p-mem:dev"
+    );
+}
+
+/// An old host that binds after the rehome's first liveness snapshot is
+/// rejected by the final in-transaction check: its row is never written
+/// (host, `displayed` and `updatedAt` unchanged) and no event goes out.
+#[tokio::test]
+async fn hello_rehome_never_writes_rows_of_an_old_host_that_binds_mid_rehome() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, store, services, live, ws) = rehome_fixture(&["dev-1", "x:dev-1"]).await;
+    let bus = EventBus::new(store.clone());
+    let services = services.with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec!["browser:*".to_string()],
+        ..Default::default()
+    });
+    let mut seeded = input(&ws, "bound-late");
+    seeded.displayed = Some(true);
+    services
+        .browser_tab_upsert(ClientId::from_string("dev-1"), seeded)
+        .await
+        .expect("seed");
+    let opened = recv_one(&mut sub).await;
+    assert_eq!(opened[0].event_type, BROWSER_TAB_OPENED);
+    let before = store.get_browser_tab("bound-late").await.unwrap().unwrap();
+    assert_eq!(before.displayed, Some(true));
+
+    *live.1.lock().unwrap() = Some(ClientId::from_string("dev-1"));
+    let moved = services
+        .rehome_superseded_browser_tabs(
+            ClientId::from_string("x:dev-1"),
+            vec![ClientId::from_string("dev-1")],
+        )
+        .await
+        .expect("rehome");
+    assert_eq!(moved, 0, "the late-bound old host keeps its tabs");
+    let after = store.get_browser_tab("bound-late").await.unwrap().unwrap();
+    assert_eq!(
+        after, before,
+        "the row is never written: host, displayed, updatedAt kept"
+    );
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
+        "no rehome event"
+    );
 }

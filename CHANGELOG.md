@@ -2,6 +2,109 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.83] - 2026-10-30
+
+### 🚀 Features
+
+- Per-workspace auto-archive opt-out ([#2825](https://github.com/intent-hq/intentd/pull/2825))
+
+### 🐛 Bug Fixes
+
+- *(selection)* Free the operation lane before a public reply is sent ([#2824](https://github.com/intent-hq/intentd/pull/2824))
+
+### 🔧 Refactor
+
+- *(transport)* Require a binding reservation to bind a browser host ([#2823](https://github.com/intent-hq/intentd/pull/2823))
+
+### 📚 Documentation
+
+- Point the startup-progress guide sources at the connection-layer files ([#2831](https://github.com/intent-hq/intentd/pull/2831))
+- *(browser)* State full frame rate during agent use ([#2830](https://github.com/intent-hq/intentd/pull/2830))
+
+### 🧪 Testing
+
+- *(core)* Split repo-slug fold lint at top-level && / || operands ([#2822](https://github.com/intent-hq/intentd/pull/2822))
+
+
+## [0.11.82] - 2026-10-30
+
+### 🧪 Testing
+
+- Prove no secret value survives any agent-facing egress ([#2827](https://github.com/intent-hq/intentd/pull/2827))
+
+
+## [0.11.81] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(agent)* Redrive a prompt the provider cancelled before any output ([#2817](https://github.com/intent-hq/intentd/pull/2817))
+- Resolve card-applied proposals inside workspace.create ([#2819](https://github.com/intent-hq/intentd/pull/2819))
+
+
+## [0.11.80] - 2026-10-30
+
+### 🚀 Features
+
+- Surface pending secret requests and advertise secretRequests ([#2813](https://github.com/intent-hq/intentd/pull/2813))
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop the native review monitor from refusing stage checks ([#2815](https://github.com/intent-hq/intentd/pull/2815))
+- Bump Codex ACP fallback to v2.5.0 ([#2818](https://github.com/intent-hq/intentd/pull/2818))
+
+
+## [0.11.79] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Auto-purge lets merged PRs cover nested unpushed commits ([#2814](https://github.com/intent-hq/intentd/pull/2814))
+- *(js)* Refuse values JSON cannot represent at the host() bridge ([#2811](https://github.com/intent-hq/intentd/pull/2811))
+
+### 📚 Documentation
+
+- *(app-guide)* Describe which agent the Home preview opens ([#2812](https://github.com/intent-hq/intentd/pull/2812))
+
+
+## [0.11.78] - 2026-10-30
+
+### 🚀 Features
+
+- Let agents request memory-held secrets for ws.host.exec ([#2804](https://github.com/intent-hq/intentd/pull/2804))
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Auto-archive merged-PR workspaces after the branch is pruned ([#2810](https://github.com/intent-hq/intentd/pull/2810))
+- *(browser)* Rehome tabs stranded under a device's superseded client id ([#2799](https://github.com/intent-hq/intentd/pull/2799))
+- Enforce disabled providers for quick actions ([#2806](https://github.com/intent-hq/intentd/pull/2806))
+
+
+## [0.11.77] - 2026-10-30
+
+### 🧪 Testing
+
+- *(services)* Isolate tests from the user's ~/intent ([#2790](https://github.com/intent-hq/intentd/pull/2790))
+
+
+## [0.11.76] - 2026-10-29
+
+### 🚀 Features
+
+- Guide visual authoring with screenshot feedback ([#2611](https://github.com/intent-hq/intentd/pull/2611))
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Scope PR discovery to the repository owner's heads ([#2801](https://github.com/intent-hq/intentd/pull/2801))
+- *(acp)* Add a line-bounded ws.note.read so large notes can be read without OOM ([#2800](https://github.com/intent-hq/intentd/pull/2800))
+
+### 📚 Documentation
+
+- Explain workspace sidebar tabs and previews ([#2783](https://github.com/intent-hq/intentd/pull/2783))
+
+### 🧪 Testing
+
+- *(store)* Await cancelled renewal release before opening the doctor observer ([#2803](https://github.com/intent-hq/intentd/pull/2803))
+
+
 ## [0.11.75] - 2026-10-29
 
 ### 🧪 Testing

@@ -56,6 +56,9 @@
 #   crates/intent-core/ (src/** or   also every crate depending on intent-core,
 #     <anything else>)               directly or transitively, as for src/**
 #                                    (dependencies read from crates/*/Cargo.toml)
+#   crates/intent-js/ (src/** or     also --lib of every crate depending on
+#     <anything else>)               intent-js directly that has a src/lib.rs
+#                                    (its library unit tests only)
 #   a glob in .config/e2e-test-map.txt
 #                                    also the end-to-end modules it maps to:
 #                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
@@ -78,7 +81,8 @@
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are
-# propagated in full only from intent-core (intentd#2698); otherwise only from
+# propagated in full only from intent-core (intentd#2698), and as library unit
+# tests only from intent-js to its direct dependents; otherwise only from
 # intent-services to its feature crates and intent-app, from a feature crate
 # to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
 # own tests plus any mapped end-to-end or library unit-test modules; the full
@@ -205,6 +209,20 @@ cd "$repo_root"
 # them would run the full suite for most changes.
 rdeps_roots="intent-core"
 
+# intent-js is the host() bridge every ws.* call from a workspace_api or hook
+# script crosses, and the crates that call it test their bindings and hooks
+# in their library unit tests (intent-acp's tests_wsapi*, intent-svc-runtime's
+# hook_manager). A change to it (as for intent-core, src or any other
+# non-test file) also selects the library unit tests (--lib) of each crate
+# depending on it directly that has a testable src/lib.rs, but not their
+# integration tests, binaries or own dependents: those reach intentd's
+# end-to-end suites, and the bridge's end-to-end modules are named in the
+# end-to-end map instead. intentd#2811 changed only intent-js/src, passed PR
+# CI and failed in the merge queue. A crate that starts calling the bridge
+# must depend on intent-js, so it is covered without a map entry. The direct
+# edges are the ones check-rdeps-parity.py compares with cargo metadata.
+lib_rdeps_roots="intent-js"
+
 # Prints "<dependent>\t<dependency>" for each dependency between workspace
 # crates declared in crates/*/Cargo.toml: any [dependencies],
 # [dev-dependencies] or [build-dependencies] table, target-specific ones
@@ -277,6 +295,16 @@ workspace_edges() {
         printf '%s\t%s\n' "$crate" "$dep"
     done <"$manifest"
   done
+}
+
+# Prints the workspace crates depending on crate $1 directly, one per line,
+# from the workspace_edges records in $2.
+direct_dependents() {
+  local root=$1 edges=$2 dependent dependency
+  while IFS=$'\t' read -r dependent dependency; do
+    [[ -z "$dependent" || "$dependency" != "$root" || "$dependent" == "$root" ]] ||
+      printf '%s\n' "$dependent"
+  done <<<"$edges"
 }
 
 # Prints the workspace crates depending on crate $1, directly or
@@ -735,19 +763,26 @@ while IFS= read -r note; do
   [[ -z "$note" ]] || log "$note"
 done <<<"$e2e_notes"
 
+# Succeeds when the $mapped records select crate $1's src or every target (a
+# src or other non-test file of the crate changed): a propagation root then
+# selects its dependents.
+root_changed() {
+  local rec_crate rec_kind
+  while IFS=$'\t' read -r rec_crate rec_kind _; do
+    [[ "$rec_crate" != "$1" || ("$rec_kind" != src && "$rec_kind" != all) ]] || return 0
+  done <<<"$mapped"
+  return 1
+}
+
+# Propagated roots (full and lib-only): their dependents are selected, so no
+# "downstream crates are not selected" note is printed for them.
 rdeps_propagated=""
 # Dependents of a propagated root: their own dependents are selected too, so
 # no "downstream crates are not selected" note is printed for them.
 rdeps_selected=""
 rdeps_edges=""
 for root in $rdeps_roots; do
-  root_changed=""
-  while IFS=$'\t' read -r rec_crate rec_kind _; do
-    if [[ "$rec_crate" == "$root" && ("$rec_kind" == src || "$rec_kind" == all) ]]; then
-      root_changed=1
-    fi
-  done <<<"$mapped"
-  [[ -n "$root_changed" ]] || continue
+  root_changed "$root" || continue
   [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
   dependents=""
   while IFS= read -r dependent; do
@@ -761,6 +796,41 @@ for root in $rdeps_roots; do
     log "note: crates/$root changed; its reverse dependencies run too ($dependents)"
   else
     log "note: crates/$root changed; no workspace crate depends on it"
+  fi
+done
+
+# Library unit tests of a lib root's direct dependents ("lib": --lib, the
+# record a module-less <crate>::lib map entry makes). A broader selection of
+# the same crate (src, dependent, all) subsumes it, and it never selects the
+# feature crates or intent-app below. A dependent a full propagation root
+# already selects is left out of the note, since every target of it runs.
+for root in $lib_rdeps_roots; do
+  root_changed "$root" || continue
+  [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
+  dependents=""
+  covered=""
+  while IFS= read -r dependent; do
+    [[ -n "$dependent" ]] || continue
+    if [[ "$rdeps_selected" == *" $dependent "* ]]; then
+      covered=1
+      continue
+    fi
+    # Before the src/lib.rs check, so a lib moved off it gets the note.
+    if ! lib_is_testable "$dependent"; then
+      log "note: crates/$dependent depends on $root but its library unit tests cannot run ($lib_problem)"
+      continue
+    fi
+    [[ -f "crates/$dependent/src/lib.rs" ]] || continue
+    mapped+="$dependent"$'\t'"lib"$'\n'
+    dependents+="${dependents:+, }$dependent"
+  done <<<"$(direct_dependents "$root" "$rdeps_edges" | sort -u)"
+  rdeps_propagated+=" $root "
+  if [[ -n "$dependents" ]]; then
+    log "note: crates/$root changed; the library unit tests of the crates depending on it directly run too ($dependents)"
+  elif [[ -n "$covered" ]]; then
+    :
+  else
+    log "note: crates/$root changed; no workspace crate depending on it directly has library unit tests"
   fi
 done
 

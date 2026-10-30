@@ -207,7 +207,7 @@ async fn boot_with_engine(
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
     let services = Arc::new(
-        Services::new(store.clone())
+        Services::new_isolated(store.clone())
             .with_workspaces_root(workspaces_root.clone())
             .with_event_bus(bus.clone())
             .with_voice_engine(engine),

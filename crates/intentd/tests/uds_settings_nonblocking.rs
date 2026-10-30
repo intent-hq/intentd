@@ -111,7 +111,7 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let secrets_dyn: Arc<dyn SecretStore> = secrets.clone();
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_secret_store(secrets_dyn)
             .with_workspaces_root(ws_root.path().to_path_buf()),

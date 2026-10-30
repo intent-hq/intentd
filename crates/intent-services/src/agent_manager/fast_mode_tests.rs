@@ -50,7 +50,7 @@ async fn fixture_with(
     registry
         .apply(&[("providers.paths".into(), json!({provider:script}))])
         .unwrap();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_settings_registry(registry)
         .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));

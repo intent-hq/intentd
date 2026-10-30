@@ -111,7 +111,7 @@ async fn uds_slice_end_to_end() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             // Keep the (y) github.* section hermetic: `github.connect` must
             // deterministically fail fast (port 0 is never a valid

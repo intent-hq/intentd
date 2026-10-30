@@ -387,25 +387,22 @@ pub(crate) fn proposal_block_id(block: &Value) -> Option<String> {
 /// `None` when no block carries the id or the matching proposal has no
 /// title — callers fall back to the id itself.
 pub(crate) fn proposal_title_in(blocks: &[Value], proposal_id: &str) -> Option<String> {
-    let mut title = None;
-    for block in blocks {
-        if proposal_block_id(block).as_deref() == Some(proposal_id) {
-            title = block
-                .get("resource")
-                .and_then(|r| r.get("text"))
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .and_then(|proposal| {
-                    proposal
-                        .get("preview")
-                        .and_then(|p| p.get("title"))
-                        .and_then(Value::as_str)
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                });
-        }
-    }
-    title
+    proposal_in(blocks, proposal_id)?
+        .get("preview")
+        .and_then(|p| p.get("title"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// The parsed proposal JSON of the proposal-resource block whose identity
+/// ([`proposal_block_id`]) equals `proposal_id` (last match wins, like
+/// [`proposal_title_in`]). `None` when no block carries the id.
+pub(crate) fn proposal_in(blocks: &[Value], proposal_id: &str) -> Option<Value> {
+    let block = blocks
+        .iter()
+        .rfind(|block| proposal_block_id(block).as_deref() == Some(proposal_id))?;
+    serde_json::from_str(block.get("resource")?.get("text")?.as_str()?).ok()
 }
 
 /// Proposal ids carried by a message's content blocks, in block order,

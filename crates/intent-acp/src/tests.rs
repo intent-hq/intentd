@@ -7916,8 +7916,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Every gate is open by default.
-        let all_on_srv = server("amber-forest", None);
+        // Every gate open: the defaults plus the off-by-default
+        // `secretRequests` toggle (PROTOCOL §5.56).
+        let all_on_srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            },
+        );
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -8314,8 +8320,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A default top-level bridge stays byte-identical to the static const.
-        let top = server("amber-forest", None).with_sub_agent(false);
+        // A top-level bridge with every gate open stays byte-identical to
+        // the static const.
+        let top = server("amber-forest", None)
+            .with_sub_agent(false)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            });
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -10821,6 +10833,17 @@ mod wsapi6_bindings_tests {
         assert!(doc.contains("## Troubleshooting Timeouts"));
         assert!(doc.contains("ws.browser.clients()"));
         assert!(doc.contains("reverse request timed out"));
+    }
+
+    #[tokio::test]
+    async fn browser_docs_overview_states_full_frame_rate_during_agent_use() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('overview');").await;
+        let v = body(&resp);
+        let doc = v.as_str().expect("docs return string");
+        assert!(doc.contains("**Frame rate during agent use.**"));
+        assert!(doc.contains("draws at full\nframe rate"));
+        assert!(doc.contains("30 s\nafter your last action"));
     }
 
     #[tokio::test]
@@ -14479,6 +14502,7 @@ mod workspace_apply_proposal_tests {
                         "name": "Coordinator",
                         "notificationsMuted": false,
                     })),
+                    proposal_origin: None,
                 })
             })
         }

@@ -349,3 +349,161 @@ async fn auto_archive_rechecks_the_idle_clock_after_the_git_scan() {
     );
     assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
 }
+
+/// Commit `name` on top of `HEAD` in `wt` and return the new commit.
+fn commit_on_head(wt: &std::path::Path, name: &str) -> git2::Oid {
+    let repo = git2::Repository::open(wt).expect("open worktree");
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    std::fs::write(wt.join(name), "work\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(name)).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, name, &tree, &[&parent])
+        .unwrap()
+}
+
+/// A workspace whose branch was pushed, squash-merged, then deleted and
+/// pruned on the remote: only `origin/main` (the base) remains, so its two
+/// commits are on no remote ref. Returns the workspace and its `HEAD`.
+async fn squash_merged_and_pruned(
+    f: &crate::test_support::retire_workspace::Fixture,
+) -> (intent_core::Workspace, git2::Oid) {
+    let ws = create_workspace(f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    let repo = git2::Repository::open(&wt).expect("open worktree");
+    let base = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.reference("refs/remotes/origin/main", base, true, "base")
+        .expect("remote ref");
+    commit_on_head(&wt, "one.txt");
+    let head = commit_on_head(&wt, "two.txt");
+    (ws, head)
+}
+
+/// Record a completed PR monitor whose final snapshot shows the PR merged at
+/// `head_sha`.
+async fn insert_merged_monitor(
+    f: &crate::test_support::retire_workspace::Fixture,
+    ws: &intent_core::Workspace,
+    head_sha: &str,
+) {
+    let mut snapshot = crate::v1_goldens::pr_snapshot("merged");
+    snapshot.requirements.state = "merged".to_string();
+    snapshot.head_sha = Some(head_sha.to_string());
+    let snapshot = serde_json::to_string(&snapshot).unwrap();
+    f.store
+        .insert_pr_monitor(&intent_core::PrMonitor {
+            monitor_id: intent_core::PrMonitorId::new(),
+            workspace_id: ws.id.clone(),
+            agent_id: intent_core::AgentId::from(format!("agent-{}", ws.id.0)),
+            repo_owner: "o".to_string(),
+            repo_name: "r".to_string(),
+            pr_number: 42,
+            state: intent_core::PrMonitorState::Completed,
+            last_snapshot: Some(snapshot.clone()),
+            baseline_snapshot: Some(snapshot),
+            pending_changes: vec![],
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: intent_core::now_iso(),
+            updated_at: intent_core::now_iso(),
+        })
+        .await
+        .expect("monitor");
+}
+
+async fn sweep(f: &crate::test_support::retire_workspace::Fixture) -> crate::AutoArchiveReport {
+    f.svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await
+}
+
+/// A squash-merged workspace whose branch was pruned is skipped while no
+/// merged PR is known (indistinguishable from a never-pushed branch), and
+/// archived once a completed PR monitor shows the PR merged at its `HEAD`.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_archives_a_merged_pr_workspace_after_the_branch_is_pruned() {
+    let f = fixture().await;
+    let (ws, head) = squash_merged_and_pruned(&f).await;
+
+    let report = sweep(&f).await;
+    assert_eq!((report.archived, report.skipped), (0, 1), "{report:?}");
+
+    insert_merged_monitor(&f, &ws, &head.to_string()).await;
+    let report = sweep(&f).await;
+    assert_eq!(report.archived, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
+}
+
+/// The workspace's stored PR record (no monitor) is enough when it says
+/// merged and carries the head SHA; an open record is not.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_uses_the_stored_merged_pr_record() {
+    let f = fixture().await;
+    let (ws, head) = squash_merged_and_pruned(&f).await;
+    let pr = |status: &str| {
+        serde_json::from_value::<intent_core::PullRequestInfo>(serde_json::json!({
+            "id": "PR_1",
+            "number": 42,
+            "url": "https://github.com/o/r/pull/42",
+            "title": "feat: work",
+            "status": status,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "headSha": head.to_string(),
+        }))
+        .expect("pr record")
+    };
+
+    let mut row = f.store.get_workspace(&ws.id).await.unwrap();
+    row.pull_requests = Some(vec![pr("Open")]);
+    f.store.update_workspace(&row).await.expect("update");
+    let report = sweep(&f).await;
+    assert_eq!((report.archived, report.skipped), (0, 1), "{report:?}");
+
+    let mut row = f.store.get_workspace(&ws.id).await.unwrap();
+    row.pull_requests = Some(vec![pr("Merged")]);
+    f.store.update_workspace(&row).await.expect("update");
+    let report = sweep(&f).await;
+    assert_eq!(report.archived, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
+}
+
+/// A merged PR never lifts other work: a commit made after the merge, a
+/// merged PR for some other commit, and uncommitted changes all keep the
+/// workspace Active.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_merged_pr_does_not_cover_new_or_uncommitted_work() {
+    let f = fixture().await;
+
+    let (after_merge, merged_head) = squash_merged_and_pruned(&f).await;
+    insert_merged_monitor(&f, &after_merge, &merged_head.to_string()).await;
+    commit_on_head(
+        std::path::Path::new(after_merge.worktree_path.as_deref().unwrap()),
+        "follow-up.txt",
+    );
+
+    let (other_pr, _) = squash_merged_and_pruned(&f).await;
+    insert_merged_monitor(&f, &other_pr, "0123456789abcdef0123456789abcdef01234567").await;
+
+    let (dirty, head) = squash_merged_and_pruned(&f).await;
+    insert_merged_monitor(&f, &dirty, &head.to_string()).await;
+    std::fs::write(
+        std::path::Path::new(dirty.worktree_path.as_deref().unwrap()).join("draft.txt"),
+        "unsaved",
+    )
+    .unwrap();
+
+    let report = sweep(&f).await;
+    assert_eq!((report.archived, report.skipped), (0, 3), "{report:?}");
+    for kept in [&after_merge, &other_pr, &dirty] {
+        assert!(
+            !f.store.get_workspace(&kept.id).await.unwrap().archived,
+            "{}",
+            kept.id
+        );
+    }
+}

@@ -33,7 +33,8 @@ impl Harness {
             .insert_agent_session(&session(&ws, &agent.0))
             .await
             .unwrap();
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&services.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, Caller::Daemon).unwrap();
@@ -613,7 +614,8 @@ async fn no_observer_schedule_blocks_first_install_and_cancellation_confirms_onl
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let services =
+        Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
     services
         .schedule_workspace_delete(ws.clone(), 60_000)
         .await
@@ -781,7 +783,7 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let services = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let (pause, resume) = services.pending_delete_test_gate.arm("background", &ws.0);
     services.delete_workspace(ws.clone()).await.unwrap();
     reached(&pause).await;
@@ -793,5 +795,61 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     assert!(
         registry.install(&reopened).await.is_err(),
         "unconfirmed pre-observer owner survives all handles"
+    );
+}
+
+/// A `ws.secret.request` that lands while an agent delete is between its
+/// first steps and the row DELETE must not survive the deleted agent: the
+/// post-DELETE sweep removes it, and a later provide is refused (§5.56).
+#[intent_test_macros::daemon_test]
+async fn secret_request_racing_agent_delete_does_not_survive() {
+    let h = Harness::new().await;
+    let (pause, resume) = h
+        .services
+        .pending_delete_test_gate
+        .arm("agent-secret-window", &h.agent.0);
+    let finished = h.services.pending_delete_test_gate.completion(&h.agent.0);
+    h.services
+        .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
+        .await
+        .unwrap();
+    reached(&pause).await;
+    let ticket = h
+        .services
+        .secret_request_op(h.ws.clone(), h.agent.clone(), "KEY".into(), "race".into())
+        .await
+        .expect("the row still exists while deletion is paused");
+    let request_id = ticket["requestId"].as_str().unwrap().to_string();
+    resume.notify_one();
+    reached(&finished).await;
+    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .secret_vault
+        .pending_owner(&h.ws, &request_id)
+        .is_none());
+    assert!(h
+        .services
+        .secret_vault
+        .resolve(&h.ws, &h.agent, &["KEY"])
+        .is_err());
+    let provided = h
+        .services
+        .secret_answer_op(
+            h.ws.clone(),
+            request_id,
+            crate::secret_requests::Outcome::Provided,
+            Some(zeroize::Zeroizing::new("v".to_string())),
+        )
+        .await;
+    assert!(
+        matches!(
+            provided,
+            Err(intent_core::Error::SecretRequest {
+                code: "secret-request-unknown",
+                ..
+            })
+        ),
+        "{provided:?}"
     );
 }

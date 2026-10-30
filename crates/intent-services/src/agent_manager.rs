@@ -484,6 +484,13 @@ fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
 /// abandon: a timed-out `mpsc` send enqueues nothing.
 const SESSION_CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long after the daemon writes `session/cancel` an output-free provider
+/// `cancelled` still counts as that cancel arriving late (see
+/// [`AgentManager::stale_cancels`]). Adapters apply a cancel within
+/// milliseconds to seconds; the bound only stops a stale mark from excusing
+/// an unrelated cancel much later.
+const STALE_CANCEL_WINDOW: Duration = Duration::from_secs(60);
+
 /// Settle a hung `session/prompt` after the idle timeout WITHOUT killing the
 /// child: send `session/cancel` so the agent resolves/abandons the hung turn
 /// server-side (its in-flight prompt already had its client-side pending-map
@@ -2945,6 +2952,16 @@ pub struct AgentManager {
     /// prompt). Consumed by [`AgentManager::build_turn_prompt`] so the block
     /// fires exactly once per fresh session and re-fires after a recreate.
     prepend_pending: Arc<Mutex<HashSet<AgentId>>>,
+    /// When the daemon last wrote `session/cancel` for each agent (the
+    /// keep-alive interrupt and the idle-timeout settle). ACP cancels are
+    /// notifications the adapter may apply late, after the NEXT prompt has
+    /// started. The turn worker takes the mark before each attempt: an
+    /// output-free `cancelled` on an attempt that took a fresh mark is that
+    /// stale cancel, and the worker redrives the prompt once (see
+    /// [`crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX`]). Taking it on
+    /// every attempt keeps the redrive one-shot and stops an old mark from
+    /// excusing a later, provider-initiated cancel.
+    stale_cancels: Arc<Mutex<HashMap<AgentId, Instant>>>,
     /// Most recent interrupt-priority `messageId` delivered per agent
     /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
     /// client-supplied id under this lock BEFORE preempting, so the SAME
@@ -3175,6 +3192,7 @@ impl AgentManager {
             recreated: Arc::new(Mutex::new(HashSet::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
+            stale_cancels: Arc::new(Mutex::new(HashMap::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             active_delivery_groups: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
@@ -6383,6 +6401,34 @@ impl AgentManager {
         turn_id: Option<&str>,
         original: OriginalTurn,
     ) -> Result<StopReason> {
+        self.run_turn_owned_with(
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            original,
+            false,
+        )
+        .await
+    }
+
+    /// [`AgentManager::run_turn_owned`] for the turn worker, the only caller
+    /// that can redrive: with `redrive_spurious_cancel` a prompt ended by a
+    /// stale daemon cancel returns a [`spurious_cancel_error`] instead of
+    /// settling the turn (see
+    /// [`crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+    #[expect(clippy::too_many_arguments)]
+    async fn run_turn_owned_with(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: crate::provider_images::PreparedPrompt,
+        turn_id: Option<&str>,
+        original: OriginalTurn,
+        redrive_spurious_cancel: bool,
+    ) -> Result<StopReason> {
         let OriginalTurn {
             runtime,
             connection: conn,
@@ -6408,6 +6454,7 @@ impl AgentManager {
                         captured,
                         required: None,
                     }),
+                redrive_spurious_cancel,
             )
             .await;
         self.active_delivery_groups.lock().unwrap().remove(agent_id);
@@ -6656,6 +6703,25 @@ impl AgentManager {
     /// no live session is available to interrupt (no handle / no `acpSessionId`),
     /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
     /// whether an agent was found.
+    /// Record that the daemon just wrote `session/cancel` for `agent_id`
+    /// (see [`AgentManager::stale_cancels`]).
+    pub(crate) fn arm_stale_cancel(&self, agent_id: &AgentId) {
+        self.stale_cancels
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), Instant::now());
+    }
+
+    /// Take the agent's stale-cancel mark: `true` when the daemon wrote a
+    /// `session/cancel` within [`STALE_CANCEL_WINDOW`]. Always clears it.
+    pub(crate) fn take_stale_cancel(&self, agent_id: &AgentId) -> bool {
+        self.stale_cancels
+            .lock()
+            .unwrap()
+            .remove(agent_id)
+            .is_some_and(|at| at.elapsed() <= STALE_CANCEL_WINDOW)
+    }
+
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
         self.interrupt_inner(agent_id, InterruptReason::UserStop, None)
             .await
@@ -6873,7 +6939,7 @@ impl AgentManager {
         // the idle sweep to hold.
         match tokio::time::timeout(SESSION_CANCEL_WRITE_TIMEOUT, conn.cancel(&acp_session_id)).await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => self.arm_stale_cancel(agent_id),
             Ok(Err(e)) if is_cancel_transport_closed(&e) => {
                 // Child already dead — expected race when cancelling a dead
                 // turn; the run_turn branch surfaces the real failure.
@@ -14584,14 +14650,21 @@ async fn run_message_worker(
                         .await;
                     return;
                 }
+                // A fresh stale-cancel mark (the daemon wrote `session/cancel`
+                // just before this attempt) lets an output-free `cancelled`
+                // be redriven. Taken before EVERY attempt, so the redrive is
+                // one-shot and an old mark cannot excuse a later
+                // provider-initiated cancel.
+                let stale_cancel = mgr.take_stale_cancel(&agent_id);
                 match boxed_await(|| {
-                    mgr.run_turn_owned(
+                    mgr.run_turn_owned_with(
                         &agent_id,
                         &workspace_id,
                         &acp_session_id,
                         prompt,
                         options.turn_id.as_deref(),
                         turn,
+                        stale_cancel,
                     )
                 })
                 .await
@@ -14705,6 +14778,27 @@ async fn run_message_worker(
                         }
                     }
                     Err(e) => {
+                        if spurious_cancel_error(&e) {
+                            // Stale daemon cancel (see
+                            // `PROMPT_SPURIOUS_CANCEL_PREFIX`): the daemon
+                            // wrote `session/cancel` moments ago (typically for
+                            // the turn this message preempted) and the adapter
+                            // applied it to THIS prompt before any output or
+                            // client request. `run_prompt_turn` persisted
+                            // nothing and emitted no terminal event, so re-send
+                            // the SAME content/options on the live child. The
+                            // user row is already durable and is not re-
+                            // persisted. One-shot: this attempt consumed the
+                            // stale-cancel mark, so a second empty cancel
+                            // settles normally. The provider received the
+                            // prompt, so its one-shot context is NOT restored.
+                            keep_failover_chain = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                "prompt cancelled before output by a stale daemon cancel — redriving it once on the live child"
+                            );
+                            continue 'outer;
+                        }
                         if is_benign_turn_error(&e) {
                             mgr.clear_discussion_turn(&agent_id, &options);
                             boxed_await(|| {
@@ -14782,6 +14876,9 @@ async fn run_message_worker(
                                     }
                                     None => false,
                                 };
+                                if settled {
+                                    mgr.arm_stale_cancel(&agent_id);
+                                }
                                 // STAB-124 for the idle-timeout path:
                                 // attribution on the turn-less
                                 // `session/update` channel is positional,
@@ -17723,6 +17820,18 @@ fn pre_output_transport_failure(err: &Error) -> bool {
     )
 }
 
+/// Whether a `run_turn` error carries the spurious-cancel marker from
+/// `run_prompt_turn` ([`crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX`]):
+/// a stale daemon cancel ended the prompt before any output, and the worker
+/// should redrive it once.
+fn spurious_cancel_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX)
+    )
+}
+
 /// Whether a `run_turn` error carries the sleep-induced interrupt marker from
 /// `run_prompt_turn` (Task C): the turn died with a transient upstream
 /// disconnect whose active window overlapped a detected host suspend.
@@ -18780,7 +18889,7 @@ mod role_reminder_tests {
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_specialist_dirs(
                 specialists_dir,
@@ -19768,7 +19877,7 @@ mod role_reminder_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         let workspace_id = WorkspaceId::from("ws-1");
@@ -20789,7 +20898,7 @@ mod disabled_provider_rehome_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         store
@@ -21257,7 +21366,7 @@ mod disabled_provider_rehome_tests {
             .expect_err("disabled provider without a default must not spawn");
         assert!(
             matches!(&err, Error::InvalidParams(m)
-                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Agents")),
+                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Providers")),
             "distinct not-enabled rejection: {err:?}"
         );
         assert!(!mgr.contains(&agent_id), "no child spawned");
@@ -21579,7 +21688,7 @@ mod legacy_feature_freeze_tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
         store
@@ -23438,7 +23547,7 @@ mod agent_retry_tests {
             .await
             .expect("insert session");
         let bus = EventBus::new(db.clone());
-        let services = Services::new(db).with_event_bus(bus.clone());
+        let services = Services::new_isolated(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
@@ -23461,7 +23570,7 @@ mod agent_retry_tests {
             .expect("insert session");
         let bus = EventBus::new(db.clone());
         let services = crate::test_support::fake_runtime::FakeRuntime::install(
-            Services::new(db).with_event_bus(bus.clone()),
+            Services::new_isolated(db).with_event_bus(bus.clone()),
         );
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
@@ -23579,7 +23688,7 @@ mod agent_retry_tests {
             }
             let bus = EventBus::new(store.clone());
             let services = crate::test_support::fake_runtime::FakeRuntime::install(
-                Services::new(store.clone()).with_event_bus(bus.clone()),
+                Services::new_isolated(store.clone()).with_event_bus(bus.clone()),
             );
             let mgr = Arc::new(AgentManager::new(
                 services,

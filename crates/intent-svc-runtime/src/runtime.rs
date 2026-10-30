@@ -1198,6 +1198,18 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(svc.browser_tabs_migrate_claimed(workspace_id, new_host))
     }
 
+    fn rehome_superseded_browser_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            svc.browser_tabs_rehome_superseded(&client_id, superseded)
+                .await
+        })
+    }
+
     fn provision_sandbox<'a>(
         &'a self,
         svc: &'a Services,

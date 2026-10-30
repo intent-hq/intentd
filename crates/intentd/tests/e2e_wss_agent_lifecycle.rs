@@ -7010,7 +7010,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+    let services =
+        Services::new_isolated(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
@@ -14569,7 +14570,7 @@ async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
             .await
             .expect("store");
         let ws_root = common::hermetic_workspaces_root();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
         let ws = WorkspaceId::new();
@@ -14776,7 +14777,7 @@ async fn legacy_inline_file_blocks_served_as_text_over_wss() {
             .await
             .expect("open store");
         let ws_root = common::hermetic_workspaces_root();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
         let ws = WorkspaceId::new();

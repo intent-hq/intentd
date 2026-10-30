@@ -1461,6 +1461,45 @@ async fn terminal_read_output_forwards_max_lines() {
     assert_eq!(calls[0].1, Some(200));
 }
 
+/// A computed bad option used to reach the binding as "absent" (here: no
+/// line limit). The shared `host()` bridge now refuses it with its path.
+#[tokio::test]
+async fn terminal_read_output_refuses_unrepresentable_max_lines() {
+    for bad in ["NaN", "Infinity", "new Number(5)", "() => 5"] {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            &format!("return await ws.terminal.readOutput('t-1', {bad});"),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{bad}");
+        let message = text(&resp);
+        assert!(
+            message.contains("terminal.readOutput: args.maxLines is")
+                && message.contains("JSON cannot represent"),
+            "{bad}: {message}"
+        );
+        assert!(
+            api.terminal_read_calls.lock().unwrap().is_empty(),
+            "{bad}: the daemon must not be reached"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_read_output_still_treats_undefined_max_lines_as_absent() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.terminal.readOutput('t-1', undefined);",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let calls = api.terminal_read_calls.lock().unwrap();
+    assert_eq!(calls[0].0, "t-1");
+    assert_eq!(calls[0].1, None);
+}
+
 // ============================================================================
 // file.*
 // ============================================================================

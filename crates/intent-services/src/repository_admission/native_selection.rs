@@ -508,6 +508,15 @@ impl Request {
             operation.active.store(false, Ordering::Release);
         }
     }
+    /// Release this frame's own lane, if it still holds one. A frame never
+    /// releases a lane it does not own, so late cleanup cannot free a successor.
+    fn release_own_lane(&self) {
+        if self.owns_lane.load(Ordering::Acquire) {
+            if let Ok(op) = self.operation() {
+                self.release_lane(&op);
+            }
+        }
+    }
     fn finish(&self) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
@@ -515,8 +524,8 @@ impl Request {
         if let Some(life) = &self.lifetime {
             life.retirement().end_scope();
         }
+        self.release_own_lane();
         if let Ok(op) = self.operation() {
-            self.release_lane(&op);
             if self.initiator.load(Ordering::Acquire) {
                 op.retire_write();
                 op.no_start(Failure::AdmissionRetired);
@@ -762,12 +771,25 @@ impl RepositoryReadRequestScope for Request {
         _kind: RepositoryReadReplyKind,
         transfer: &'a mut (dyn FnMut() -> Result<()> + Send),
     ) -> BoxFuture<'a, Result<()>> {
+        /// The transport sends a refusal as soon as `deliver` returns (or panics),
+        /// before it retires the frame; release the lane on every exit first.
+        struct LaneRelease<'a>(&'a Request);
+        impl Drop for LaneRelease<'_> {
+            fn drop(&mut self) {
+                self.0.release_own_lane();
+            }
+        }
         let entered = self.check();
         Box::pin(async move {
+            let _lane = LaneRelease(self);
             if self.public.load(Ordering::Acquire) || self.entry_error.is_some() {
                 if self.consumed.swap(true, Ordering::AcqRel) {
                     return Err(unavailable());
                 }
+                // As on the admitted path, release this frame's own lane before its
+                // reply becomes observable: the client's next request on the same
+                // operation must not race the transport's later frame cleanup.
+                self.release_own_lane();
                 return transfer();
             }
             entered?;
@@ -800,10 +822,16 @@ impl RepositoryReadRequestScope for Request {
                                     // Release this frame before its reply becomes observable.
                                     // Later cleanup must not release a successor frame's lane.
                                     self.release_lane(&op);
+                                    // Likewise publish a capture before its selection ID
+                                    // becomes observable; an untransferred one stays private.
+                                    let capture = matches!(self.frame, Frame::Capture(_));
+                                    if capture {
+                                        op.published.store(true, Ordering::Release);
+                                    }
                                     let result =
                                         transfer().map_err(|_| AdmissionError::Unavailable);
-                                    if result.is_ok() && matches!(self.frame, Frame::Capture(_)) {
-                                        op.published.store(true, Ordering::Release);
+                                    if result.is_err() && capture {
+                                        op.published.store(false, Ordering::Release);
                                     }
                                     result
                                 })
