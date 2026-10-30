@@ -309,6 +309,12 @@ pub(crate) struct ConnSubs {
     setup: crate::provider_setup::Connection,
     /// The server-bound hello used to refresh browser hosting on a live upgrade.
     pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
+    /// Keeps the hello'd `clientId` reported active
+    /// ([`crate::reverse::PrimaryReverseRegistry::client_active`]) for the
+    /// connection's whole life, bound or not (intent-hq/intent#8045): a
+    /// guest connection a role change later binds (`ws.rs` `RoleChanged`)
+    /// is never treated as an absent host by the superseded-id tab rehome.
+    pub(crate) hello_reservation: Option<crate::reverse::BindingReservation>,
     /// The connection's presence identity (multiplayer w5); dropping it with
     /// the registry publishes the offline transition and releases every
     /// `note.presence` lease — declared after `subs` so the forwarders'
@@ -937,9 +943,10 @@ async fn process_captured_frame(
                     == Some(1);
             // A new hello revokes the previous connection-local operation.
             subs.setup = crate::provider_setup::Connection::default();
-            // Mark the presented id as binding before the hello persists its
-            // client row, until the bind below (intent-hq/intent#8045): a
-            // concurrent superseded-id rehome then never moves this host.
+            // Mark the presented id active before the hello persists its client
+            // row (intent-hq/intent#8045), and for the connection's life once
+            // it succeeds: a concurrent superseded-id rehome then never moves
+            // this host, whether it binds now or after a later role change.
             let binding = req.client_id.as_ref().and_then(|id| {
                 reverse_guard
                     .reserve_binding(client::scope_to_caller(ClientId::from_string(id.clone())))
@@ -987,7 +994,13 @@ async fn process_captured_frame(
                 subs.hello_identity = Some(identity.clone());
                 reverse_guard.bind(identity);
             }
-            drop(binding);
+            // A successful hello keeps its reservation until the connection
+            // closes or hellos again; a failed one releases it.
+            if hello_ok {
+                subs.hello_reservation = binding;
+            } else {
+                drop(binding);
+            }
             // Multiplayer w5: a hello'd connection is online for its
             // principal. Best-effort — a refusal (no wire caller) only
             // means this connection never counts as present.
