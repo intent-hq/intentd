@@ -603,7 +603,9 @@ and set the number of days (7 when first turned on), or set `autoArchiveIdleAfte
 (`0` = off) under `[workspace]` in `config.toml`. A workspace with no messages, note
 edits or agent activity for that long is archived, unless an agent, script, hook or
 PR monitor is still running, it is shared with guests, or it has uncommitted changes
-or unpushed commits.
+or unpushed commits. Commits from a pull request that Intent saw merged no longer
+count as unpushed, even after the merged branch is deleted on the remote; commits
+made after the merge still do.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
