@@ -624,13 +624,14 @@ links a PR to a workspace when it discovers the PR on that workspace's branch or
 one of its submodules; PRs seen only before this feature shipped are not linked
 until Intent sees them again.
 
-The **Changes** sidebar lists linked workspace PRs at the top, including PRs from
-submodules and agent monitors. Each row shows its title, number, and state, with
-repository context for PRs from other repositories. Select a row to open that PR.
+The sidebar shows **Pull Requests** as its own section above **Changes**, including
+linked PRs from submodules and agent monitors. Each row shows its title, number,
+and state, with repository context for PRs from other repositories. Select a row
+to open that PR.
 The list stays the same when you switch the repository used to browse file changes;
 merged and closed PRs remain visible.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,WorkspacePullRequests,SidebarPrList}.svelte; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; src/lib/components/workspace/sidebar/{SidebarChangesPanel,WorkspacePullRequests,SidebarPrList}.svelte; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 ## Home Workspaces
 
