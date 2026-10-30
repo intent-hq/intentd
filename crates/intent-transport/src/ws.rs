@@ -1540,14 +1540,7 @@ impl WsInner {
                         )
                         .await;
                         reverse.set_browser_member(allowed);
-                        if allowed {
-                            if let Some(identity) = subs.hello_identity.clone() {
-                                reverse_guard.bind(identity);
-                            }
-                        } else {
-                            reverse_guard.unbind();
-                        }
-                        reverse_guard.refresh_devices();
+                        subs.apply_browser_authority(&reverse_guard, allowed);
                     }
                     Input::Incoming(incoming) => match incoming {
                         Some(Err(e)) => {

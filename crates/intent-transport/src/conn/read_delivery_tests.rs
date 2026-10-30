@@ -1906,6 +1906,69 @@ async fn hello_frame(
     .await
 }
 
+/// A live role upgrade rebinds only through the connection's own successful
+/// hello ([`ConnSubs::hello`]): a demoted then re-promoted member hosts again
+/// under its reserved scoped id, while a connection whose only hello failed
+/// stays unbound through the same promotion (intent-hq/intent#8045).
+#[tokio::test]
+async fn role_upgrade_rebinds_only_a_successful_hello() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    let api: Arc<dyn WorkspaceApi> = h.api.clone();
+    let registry = PrimaryReverseRegistry::new();
+    let member = || {
+        ReverseChannel::new(h.tx.priority_sender())
+            .with_member_authority(api.clone(), Some(&h.caller))
+    };
+    let scoped = ClientId::from_string(format!("{}:dev-1", h.api.principal.as_str()));
+
+    let reverse = member();
+    let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+    let mut subs = ConnSubs::default();
+    let good = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":"dev-1","capabilities":{"browserExec":true}}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
+    reverse.set_browser_member(false);
+    subs.apply_browser_authority(&guard, false);
+    assert_eq!(guard.bound_client_id(), None, "demoted");
+    assert!(
+        registry.client_active(&scoped),
+        "still reserved while demoted"
+    );
+    reverse.set_browser_member(true);
+    subs.apply_browser_authority(&guard, true);
+    assert_eq!(guard.bound_client_id(), Some(scoped.clone()), "re-promoted");
+
+    let other = member();
+    let other_guard = registry.register(other.clone(), ReverseTransport::Wss);
+    let mut other_subs = ConnSubs::default();
+    let bad = json!({"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":42}});
+    assert!(
+        hello_frame(
+            &h,
+            &api,
+            &other,
+            &other_guard,
+            &mut other_subs,
+            &bad.to_string()
+        )
+        .await
+    );
+    other.set_browser_member(true);
+    other_subs.apply_browser_authority(&other_guard, true);
+    assert_eq!(
+        other_guard.bound_client_id(),
+        None,
+        "no successful hello, nothing to bind"
+    );
+    assert_eq!(
+        registry
+            .live_clients()
+            .iter()
+            .map(|client| client.client_id.clone())
+            .collect::<Vec<_>>(),
+        vec![scoped],
+    );
+}
+
 /// intent-hq/intent#8045: a successful `client.hello` keeps its scoped
 /// `clientId` active in the reverse registry for the connection's life,
 /// bound or not — a connection unbound by a demotion (and later rebound by a
@@ -1922,14 +1985,17 @@ async fn successful_hello_keeps_its_client_id_active_for_the_connection_life() {
     let scoped = ClientId::from_string(format!("{}:dev-1", h.api.principal.as_str()));
     let bad = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":42}});
     assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &bad.to_string()).await);
-    assert!(
-        subs.hello_reservation.is_none(),
-        "a failed hello reserves nothing"
-    );
+    assert!(subs.hello.is_none(), "a failed hello reserves nothing");
+    assert_eq!(guard.bound_client_id(), None, "a failed hello cannot bind");
 
     let good =
         json!({"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"dev-1"}});
     assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
+    assert_eq!(
+        subs.hello.as_ref().map(|hello| hello.client_id().clone()),
+        Some(scoped.clone()),
+        "the scoped id is reserved and paired"
+    );
     assert!(registry.client_active(&scoped), "hello'd and bound");
     guard.unbind();
     assert!(
@@ -1961,6 +2027,11 @@ async fn successful_hello_keeps_its_client_id_active_for_the_connection_life() {
             .as_str()
             .starts_with(&format!("{}:", h.api.principal.as_str())),
         "{generated:?}"
+    );
+    assert_eq!(
+        subs.hello.as_ref().map(|hello| hello.client_id().clone()),
+        Some(generated.clone()),
+        "the generated id is reserved and paired"
     );
     guard.unbind();
     assert!(

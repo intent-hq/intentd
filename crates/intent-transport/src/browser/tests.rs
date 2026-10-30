@@ -386,7 +386,7 @@ fn registry_with_live(
     let registry = PrimaryReverseRegistry::new();
     let (out_tx, _out_rx) = mpsc::channel(8);
     let guard = registry.register(ReverseChannel::new(out_tx), ReverseTransport::Wss);
-    guard.bind(ReverseClientIdentity {
+    guard.bind_hello(ReverseClientIdentity {
         client_id: client(client_id),
         name: Some(name.to_string()),
         capabilities: json!({ "browserExec": true }),
