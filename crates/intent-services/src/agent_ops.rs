@@ -10246,18 +10246,20 @@ impl Services {
     /// client-side `agent.resolveProposal` would; a declined one is only
     /// reported. Returns the result's `proposalOrigin`, telling the client
     /// the daemon handled the card. Fail-soft: the workspace exists either
-    /// way, and a failed resolution write reports `notResolved`.
+    /// way. A failed resolution write of an ACCEPTED origin returns `None`
+    /// (no `proposalOrigin`), so the client's own `agent.resolveProposal`
+    /// retries it — safe, because the daemon already validated the card.
     pub(crate) async fn resolve_create_proposal_origin(
         &self,
         origin: CreateProposalOrigin,
         created: &WorkspaceId,
-    ) -> intent_core::WorkspaceCreateProposalOutcome {
+    ) -> Option<intent_core::WorkspaceCreateProposalOutcome> {
         let (source_workspace_id, agent_id, proposal_id) = match origin {
             CreateProposalOrigin::Report { proposal, outcome } => {
-                return intent_core::WorkspaceCreateProposalOutcome {
+                return Some(intent_core::WorkspaceCreateProposalOutcome {
                     proposal_id: proposal,
                     outcome,
-                };
+                });
             }
             CreateProposalOrigin::Resolve {
                 source_workspace,
@@ -10288,13 +10290,13 @@ impl Services {
                     error = %e,
                     "workspace.create could not resolve its origin proposal"
                 );
-                intent_core::PROPOSAL_ORIGIN_NOT_RESOLVED.to_string()
+                return None;
             }
         };
-        intent_core::WorkspaceCreateProposalOutcome {
+        Some(intent_core::WorkspaceCreateProposalOutcome {
             proposal_id,
             outcome,
-        }
+        })
     }
 
     /// The `preview.title` of the proposal `proposal_id` as carried by the

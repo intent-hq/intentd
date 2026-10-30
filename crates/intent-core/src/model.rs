@@ -1581,8 +1581,10 @@ pub struct WorkspaceCreateResult {
     /// What this request's wire `origin` did (PROTOCOL §5.1 "Proposal
     /// origin"): present whenever the request carried a well-formed
     /// `origin`, so a client knows the daemon handled the card and must not
-    /// fall back to its own `agent.resolveProposal`. Computed per request
-    /// (an idempotent replay reports its own `origin`), never persisted.
+    /// fall back to its own `agent.resolveProposal` — except after a failed
+    /// resolution write of an accepted origin, where it is omitted so that
+    /// fallback retries. Computed per request (an idempotent replay reports
+    /// its own `origin`), never persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_origin: Option<WorkspaceCreateProposalOutcome>,
 }
@@ -1596,8 +1598,7 @@ pub struct WorkspaceCreateProposalOutcome {
     /// The proposal's persisted outcome after this create: `"applied"` or
     /// `"dismissed"` (an earlier resolution is kept), or `"notResolved"`
     /// when the daemon declined the origin (unknown agent, no access, not a
-    /// pending `workspace-create` card, another card's idempotency key, or a
-    /// failed resolution write).
+    /// pending `workspace-create` card, or another card's idempotency key).
     pub outcome: String,
 }
 
