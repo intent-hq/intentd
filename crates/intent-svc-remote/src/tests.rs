@@ -58,14 +58,17 @@ fn welcome() -> WelcomeFn {
 fn welcome_running(running: Vec<AgentId>) -> WelcomeFn {
     Arc::new(move |_| LinkWelcome {
         protocol: 0,
-        intentd_version: "node-test".into(),
         node_id: String::new(),
-        platform: AgentPlatform {
-            os: NodeOs::Macos,
-            arch: NodeArch::Aarch64,
-        },
-        max_agents: 2,
         running_agents: running.clone(),
+        capabilities: intent_core::node_link::MachineCapabilities::new(
+            AgentPlatform {
+                os: NodeOs::Macos,
+                arch: NodeArch::Aarch64,
+            },
+            "node-test",
+            2,
+            "2026-10-30T00:00:00Z",
+        ),
     })
 }
 

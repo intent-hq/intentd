@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use intent_core::node_link::{
     JournalBody, JournalRecord, LaunchCommand, LeaseBinding, LinkFrame, LinkHello,
-    NODE_LINK_PROTOCOL,
+    NODE_LINK_PROTOCOLS,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::{AgentId, WorkspaceId};
@@ -88,7 +88,7 @@ impl Running {
 
 fn hello(generation: u64, lease: &str, acked: u64) -> LinkHello {
     LinkHello {
-        protocol: NODE_LINK_PROTOCOL,
+        protocol: NODE_LINK_PROTOCOLS,
         intentd_version: "test".into(),
         binding: LeaseBinding {
             head_id: "head-1".into(),
@@ -151,8 +151,11 @@ async fn node_binds_reports_capacity_and_streams_launch_outcomes() {
         .await
         .unwrap();
     assert_eq!(dialed.welcome.node_id, NODE_ID);
-    assert_eq!(dialed.welcome.max_agents, 3);
-    assert_eq!(dialed.welcome.platform, host_platform().unwrap());
+    assert_eq!(dialed.welcome.capabilities.max_agents, 3);
+    assert_eq!(
+        dialed.welcome.capabilities.platform,
+        host_platform().unwrap()
+    );
     assert!(dialed.welcome.running_agents.is_empty());
     assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
 

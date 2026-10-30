@@ -298,6 +298,26 @@ impl PlatformAvailability {
             requested,
             reason,
             availability: self,
+            capacity: None,
+            machine: None,
+        }
+    }
+
+    /// The `placement-unavailable` failure for a machine that cannot be
+    /// used: `machine-unreachable`, `machine-unknown` or `machine-revoked`.
+    #[must_use]
+    pub fn machine_unavailable(
+        self,
+        requested: AgentPlacement,
+        reason: PlacementUnavailableReason,
+        machine: MachineRef,
+    ) -> PlacementUnavailable {
+        PlacementUnavailable {
+            requested,
+            reason,
+            availability: self,
+            capacity: None,
+            machine: Some(machine),
         }
     }
 }
@@ -315,14 +335,70 @@ fn sorted_platforms(platforms: impl IntoIterator<Item = AgentPlatform>) -> Vec<A
 pub enum PlacementUnavailableReason {
     UnsupportedPlatform,
     NoCapacity,
+    /// No route to the machine answered (it may be asleep or offline).
+    MachineUnreachable,
+    /// `placement.nodeId` names no machine exposed to this backend.
+    MachineUnknown,
+    /// The machine revoked this backend's executor credential.
+    MachineRevoked,
 }
 
 impl PlacementUnavailableReason {
-    /// `no-capacity` may succeed later; `unsupported-platform` cannot.
+    /// `no-capacity` and `machine-unreachable` may succeed later; the
+    /// others cannot without a change on either side.
     #[must_use]
     pub fn retryable(self) -> bool {
-        matches!(self, Self::NoCapacity)
+        matches!(self, Self::NoCapacity | Self::MachineUnreachable)
     }
+}
+
+/// Which shared limit a `no-capacity` refusal hit, with the numbers: the
+/// machine's agent process cap (`count`) or its aggregate agent memory
+/// budget (`memory`). Flattened into the error data as `limit` plus the
+/// counts or bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "limit", rename_all = "lowercase")]
+pub enum CapacityLimit {
+    #[serde(rename_all = "camelCase")]
+    Count {
+        running_agents: u32,
+        max_agents: u32,
+    },
+    #[serde(rename_all = "camelCase")]
+    Memory {
+        charged_bytes: u64,
+        budget_bytes: u64,
+    },
+}
+
+impl fmt::Display for CapacityLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MIB: u64 = 1024 * 1024;
+        match *self {
+            Self::Count {
+                running_agents,
+                max_agents,
+            } => write!(f, "{running_agents} of {max_agents} agents running"),
+            Self::Memory {
+                charged_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "{} of {} MiB agent memory in use",
+                charged_bytes / MIB,
+                budget_bytes / MIB
+            ),
+        }
+    }
+}
+
+/// The machine a `machine-*` refusal is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRef {
+    pub node_id: String,
+    /// Its display name; the id again when the machine is unknown.
+    pub name: String,
 }
 
 /// No node can run the requested placement. Surfaces as JSON-RPC `-32602`
@@ -333,12 +409,23 @@ pub struct PlacementUnavailable {
     pub requested: AgentPlacement,
     pub reason: PlacementUnavailableReason,
     pub availability: PlatformAvailability,
+    /// The limit a `no-capacity` refusal hit, when known.
+    pub capacity: Option<CapacityLimit>,
+    /// The machine a `machine-*` refusal is about.
+    pub machine: Option<MachineRef>,
 }
 
 /// `error.data.code` of [`PlacementUnavailable`].
 pub const PLACEMENT_UNAVAILABLE_CODE: &str = "placement-unavailable";
 
 impl PlacementUnavailable {
+    /// Record the limit a `no-capacity` refusal hit.
+    #[must_use]
+    pub fn with_capacity(mut self, limit: CapacityLimit) -> Self {
+        self.capacity = Some(limit);
+        self
+    }
+
     /// The human message, for example
     /// `No capacity for x86_64; available: none; supported: linux/x86_64`.
     #[must_use]
@@ -349,12 +436,28 @@ impl PlacementUnavailable {
             (None, Some(arch)) => arch_name(arch).to_string(),
             (None, None) => "any platform".to_string(),
         };
+        let machine = self.machine.as_ref().map_or_else(
+            || self.requested.node_id.clone().unwrap_or_default(),
+            |machine| machine.name.clone(),
+        );
         let lead = match self.reason {
-            PlacementUnavailableReason::NoCapacity => "No capacity for",
-            PlacementUnavailableReason::UnsupportedPlatform => "Unsupported",
+            PlacementUnavailableReason::NoCapacity => match self.capacity {
+                Some(limit) => format!("No capacity for {requested} ({limit})"),
+                None => format!("No capacity for {requested}"),
+            },
+            PlacementUnavailableReason::UnsupportedPlatform => format!("Unsupported {requested}"),
+            PlacementUnavailableReason::MachineUnreachable => {
+                format!("Machine \"{machine}\" is unreachable")
+            }
+            PlacementUnavailableReason::MachineUnknown => {
+                format!("No machine \"{machine}\" is exposed to this backend")
+            }
+            PlacementUnavailableReason::MachineRevoked => {
+                format!("Machine \"{machine}\" revoked this backend's access")
+            }
         };
         format!(
-            "{lead} {requested}; available: {}; supported: {}",
+            "{lead}; available: {}; supported: {}",
             platform_list(&self.availability.available_platforms),
             platform_list(&self.availability.supported_platforms),
         )
@@ -374,6 +477,15 @@ impl PlacementUnavailable {
             serde_json::to_value(&self.availability),
         ) {
             data.extend(availability);
+        }
+        if let (Some(data), Some(Ok(serde_json::Value::Object(limit)))) = (
+            data.as_object_mut(),
+            self.capacity.map(serde_json::to_value),
+        ) {
+            data.extend(limit);
+        }
+        if let Some(machine) = &self.machine {
+            data["machine"] = serde_json::json!(machine);
         }
         data
     }

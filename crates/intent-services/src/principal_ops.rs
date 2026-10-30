@@ -188,6 +188,12 @@ pub(crate) fn no_caller() -> Error {
     Error::Internal("forbidden: request is not bound to a principal".to_string())
 }
 
+/// The refusal for an executor credential reaching a principal-scoped
+/// operation: it may only send executor link frames.
+pub(crate) fn executor_forbidden() -> Error {
+    Error::Forbidden("executor credentials may only run remote agents".into())
+}
+
 /// Resolve the current request's caller to a principal id. `None` when no
 /// caller is bound.
 pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<PrincipalId>> {
@@ -197,6 +203,8 @@ pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<Principa
         Some(Caller::Agent { .. } | Caller::Daemon) => {
             Ok(Some(store.get_primary_principal().await?.id))
         }
+        // An executor credential is not a person and acts for no principal.
+        Some(Caller::Executor { .. }) => Ok(None),
     }
 }
 
@@ -206,7 +214,7 @@ pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<Principa
 fn stamping_principal_id() -> Option<PrincipalId> {
     match current_caller() {
         Some(Caller::Wire { principal_id, .. }) => Some(principal_id),
-        Some(Caller::Agent { .. } | Caller::Daemon) | None => None,
+        Some(Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. }) | None => None,
     }
 }
 
@@ -838,6 +846,7 @@ impl Services {
         let principal = match &caller {
             Caller::Wire { principal_id, .. } => self.store.get_principal(principal_id).await?,
             Caller::Agent { .. } | Caller::Daemon => self.store.get_primary_principal().await?,
+            Caller::Executor { .. } => return Err(executor_forbidden()),
         };
         if principal.is_primary {
             self.spawn_primary_identity_refresh(principal.clone()).await;
@@ -910,7 +919,7 @@ impl Services {
         let caller_is_primary = match current_caller() {
             Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
             Some(Caller::Agent { .. } | Caller::Daemon) => true,
-            None => false,
+            Some(Caller::Executor { .. }) | None => false,
         };
         if caller_is_primary {
             self.spawn_primary_identity_refresh(primary.clone()).await;

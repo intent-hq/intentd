@@ -303,3 +303,118 @@ fn the_error_text_keeps_the_typed_data_for_mcp() {
         assert!(text.contains(expected), "{expected} missing from {text}");
     }
 }
+
+#[test]
+fn no_capacity_names_the_shared_limit_it_hit() {
+    let mac = platform(NodeOs::Macos, NodeArch::Aarch64);
+    let availability = || PlatformAvailability::new([mac], [], "t".into());
+    let count = availability()
+        .unavailable(AgentPlacement::default())
+        .with_capacity(CapacityLimit::Count {
+            running_agents: 3,
+            max_agents: 3,
+        });
+    assert_eq!(
+        count.message(),
+        "No capacity for any platform (3 of 3 agents running); available: none; supported: macos/aarch64"
+    );
+    let data = count.data();
+    assert_eq!(data["reason"], "no-capacity");
+    assert_eq!(data["limit"], "count");
+    assert_eq!(data["runningAgents"], 3);
+    assert_eq!(data["maxAgents"], 3);
+    assert_eq!(data["retryable"], true);
+
+    let memory = availability()
+        .unavailable(AgentPlacement::default())
+        .with_capacity(CapacityLimit::Memory {
+            charged_bytes: 7 << 30,
+            budget_bytes: 8 << 30,
+        });
+    assert!(memory
+        .message()
+        .starts_with("No capacity for any platform (7168 of 8192 MiB agent memory in use);"));
+    let data = memory.data();
+    assert_eq!(data["limit"], "memory");
+    assert_eq!(data["chargedBytes"], 7_u64 << 30);
+    assert_eq!(data["budgetBytes"], 8_u64 << 30);
+    assert_eq!(data["retryable"], true);
+    assert!(data.get("machine").is_none());
+}
+
+#[test]
+fn capacity_limits_round_trip_tagged_by_limit() {
+    for (limit, wire) in [
+        (
+            CapacityLimit::Count {
+                running_agents: 1,
+                max_agents: 2,
+            },
+            json!({ "limit": "count", "runningAgents": 1, "maxAgents": 2 }),
+        ),
+        (
+            CapacityLimit::Memory {
+                charged_bytes: 5,
+                budget_bytes: 9,
+            },
+            json!({ "limit": "memory", "chargedBytes": 5, "budgetBytes": 9 }),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(limit).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<CapacityLimit>(wire).unwrap(),
+            limit
+        );
+    }
+}
+
+#[test]
+fn machine_refusals_name_the_machine_and_say_whether_to_retry() {
+    let requested: AgentPlacement =
+        serde_json::from_str(r#"{"target":"remote","nodeId":"m-1"}"#).unwrap();
+    let machine = MachineRef {
+        node_id: "m-1".into(),
+        name: "mac-mini".into(),
+    };
+    for (reason, wire, lead, retryable) in [
+        (
+            PlacementUnavailableReason::MachineUnreachable,
+            "machine-unreachable",
+            "Machine \"mac-mini\" is unreachable",
+            true,
+        ),
+        (
+            PlacementUnavailableReason::MachineUnknown,
+            "machine-unknown",
+            "No machine \"mac-mini\" is exposed to this backend",
+            false,
+        ),
+        (
+            PlacementUnavailableReason::MachineRevoked,
+            "machine-revoked",
+            "Machine \"mac-mini\" revoked this backend's access",
+            false,
+        ),
+    ] {
+        let failure = PlatformAvailability::none("t".into()).machine_unavailable(
+            requested.clone(),
+            reason,
+            machine.clone(),
+        );
+        assert_eq!(reason.retryable(), retryable);
+        assert_eq!(
+            failure.message(),
+            format!("{lead}; available: none; supported: none")
+        );
+        let data = failure.data();
+        assert_eq!(data["code"], "placement-unavailable");
+        assert_eq!(data["reason"], wire);
+        assert_eq!(data["retryable"], retryable);
+        assert_eq!(
+            data["machine"],
+            json!({ "nodeId": "m-1", "name": "mac-mini" })
+        );
+        assert_eq!(data["requested"]["nodeId"], "m-1");
+        assert!(data.get("limit").is_none());
+    }
+}

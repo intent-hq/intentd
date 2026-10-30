@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::watch;
 
+use intent_core::node_link::{MachineCapabilities, ProtocolRange, NODE_LINK_PROTOCOLS};
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_core::AgentId;
@@ -40,7 +41,7 @@ fn binding(generation: u64) -> LeaseBinding {
 
 fn hello(binding: LeaseBinding) -> LinkHello {
     LinkHello {
-        protocol: NODE_LINK_PROTOCOL,
+        protocol: NODE_LINK_PROTOCOLS,
         intentd_version: "test".into(),
         binding,
         acked_seq: NodeCounter(0),
@@ -50,14 +51,17 @@ fn hello(binding: LeaseBinding) -> LinkHello {
 fn welcome() -> WelcomeFn {
     Arc::new(|_| LinkWelcome {
         protocol: 0,
-        intentd_version: "test".into(),
         node_id: String::new(),
-        platform: AgentPlatform {
-            os: NodeOs::Linux,
-            arch: NodeArch::X86_64,
-        },
-        max_agents: 2,
         running_agents: vec![],
+        capabilities: MachineCapabilities::new(
+            AgentPlatform {
+                os: NodeOs::Linux,
+                arch: NodeArch::X86_64,
+            },
+            "test",
+            2,
+            "2026-10-30T00:00:00Z",
+        ),
     })
 }
 
@@ -156,8 +160,8 @@ async fn binds_and_exchanges_frames() {
     let mut node = Node::start(token("t")).await;
     let dialed = dial(&node, 1).await;
     assert_eq!(dialed.welcome.node_id, NODE);
-    assert_eq!(dialed.welcome.protocol, NODE_LINK_PROTOCOL);
-    assert_eq!(dialed.welcome.max_agents, 2);
+    assert_eq!(dialed.welcome.protocol, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(dialed.welcome.capabilities.max_agents, 2);
     let (node_link, mut node_events, node_hello) = node.accept_link().await;
     assert_eq!(node_hello.binding, binding(1));
     assert_eq!(node_link.binding(), &binding(1));
@@ -319,14 +323,30 @@ async fn another_head_or_node_is_rejected() {
 async fn protocol_mismatch_is_rejected() {
     let mut node = Node::start(token("t")).await;
     let mut offer = hello(binding(1));
-    offer.protocol = NODE_LINK_PROTOCOL + 1;
+    let newer = NODE_LINK_PROTOCOLS.max + 1;
+    offer.protocol = ProtocolRange {
+        min: newer,
+        max: newer,
+    };
     let error = dial_link(&node.endpoint(), offer).await.unwrap_err();
     assert_eq!(code(&error), codes::VERSION_MISMATCH);
     assert!(error
         .to_string()
-        .contains(&format!("node speaks {NODE_LINK_PROTOCOL}")));
+        .contains(&format!("node speaks {}", NODE_LINK_PROTOCOLS.max)));
     node.nothing_admitted().await;
     assert_eq!(node.listener.binding(), None);
+}
+
+#[tokio::test]
+async fn the_node_picks_the_highest_common_protocol_version() {
+    let node = Node::start(token("t")).await;
+    let mut offer = hello(binding(1));
+    offer.protocol = ProtocolRange {
+        min: NODE_LINK_PROTOCOLS.min,
+        max: NODE_LINK_PROTOCOLS.max + 3,
+    };
+    let dialed = dial_link(&node.endpoint(), offer).await.unwrap();
+    assert_eq!(dialed.welcome.protocol, NODE_LINK_PROTOCOLS.max);
 }
 
 #[tokio::test]

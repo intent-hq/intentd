@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::bail;
 
-use intent_core::node_link::LinkWelcome;
+use intent_core::node_link::{LinkWelcome, MachineCapabilities};
 use intent_core::nodes::{NodeArch, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_git::node_git::{CheckoutCache, NodeGit};
@@ -132,13 +132,22 @@ impl Node {
         });
         let welcome: WelcomeFn = {
             let runner = runner.clone();
-            Arc::new(move |_hello| LinkWelcome {
-                protocol: 0,
-                intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
-                node_id: String::new(),
-                platform,
-                max_agents: runner.max_agents(),
-                running_agents: runner.running(),
+            Arc::new(move |_hello| {
+                let running_agents = runner.running();
+                let mut capabilities = MachineCapabilities::new(
+                    platform,
+                    env!("CARGO_PKG_VERSION"),
+                    runner.max_agents(),
+                    intent_core::now_iso(),
+                );
+                capabilities.running_agents =
+                    u32::try_from(running_agents.len()).unwrap_or(u32::MAX);
+                LinkWelcome {
+                    protocol: 0,
+                    node_id: String::new(),
+                    running_agents,
+                    capabilities,
+                }
             })
         };
         let listener = NodeListener::bind(
