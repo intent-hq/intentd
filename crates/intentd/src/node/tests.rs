@@ -151,7 +151,7 @@ async fn node_binds_reports_capacity_and_streams_launch_outcomes() {
         .await
         .unwrap();
     assert_eq!(dialed.welcome.node_id, NODE_ID);
-    assert_eq!(dialed.welcome.capabilities.max_agents, 3);
+    assert_eq!(dialed.welcome.capabilities.capacity.agent_cap, 3);
     assert_eq!(
         dialed.welcome.capabilities.platform,
         host_platform().unwrap()

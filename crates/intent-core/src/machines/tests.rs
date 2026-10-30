@@ -4,7 +4,7 @@ use super::*;
 use crate::nodes::{NodeArch, NodeOs};
 use crate::Error;
 
-fn machine(name: &str, status: Option<ProviderStatus>, models: usize) -> MachineModels {
+fn machine(name: &str, status: ProviderStatus, models: usize) -> MachineModels {
     MachineModels {
         node_id: format!("{name}-id"),
         name: name.into(),
@@ -19,23 +19,22 @@ fn machine(name: &str, status: Option<ProviderStatus>, models: usize) -> Machine
 }
 
 #[test]
-fn model_unavailable_lists_what_each_machine_has() {
+fn model_unavailable_lists_what_each_machine_has_and_its_status() {
     let failure = ModelUnavailable::new(
         "claude",
         "opus",
         [
-            machine("mac-mini", Some(ProviderStatus::SignedIn), 2),
-            machine("studio", Some(ProviderStatus::SignedOut), 1),
-            machine("pi", None, 0),
+            machine("mac-mini", ProviderStatus::SignedIn, 2),
+            machine("studio", ProviderStatus::SignedOut, 1),
+            machine("pi", ProviderStatus::CliMissing, 0),
         ],
         false,
     );
     assert_eq!(
         failure.message(),
-        "Model \"opus\" (claude) isn't available on mac-mini, studio, pi. \
-         mac-mini (macos/aarch64) has: m0, m1; \
-         studio (macos/aarch64) [claude: signed-out] has: m0; \
-         pi (macos/aarch64) doesn't have claude."
+        "Model \"opus\" isn't available on mac-mini (macos/aarch64, claude: signed-in); it has: m0, m1. \
+         Model \"opus\" isn't available on studio (macos/aarch64, claude: signed-out); it has: m0. \
+         Model \"opus\" isn't available on pi (macos/aarch64, claude: cli-missing); it has: no models listed."
     );
     assert_eq!(
         failure.data(),
@@ -54,7 +53,8 @@ fn model_unavailable_lists_what_each_machine_has() {
                   "observedAt": "2026-10-30T00:00:00Z" },
                 { "nodeId": "pi-id", "name": "pi",
                   "platform": { "os": "macos", "arch": "aarch64" },
-                  "models": [], "observedAt": "2026-10-30T00:00:00Z" },
+                  "status": "cli-missing", "models": [],
+                  "observedAt": "2026-10-30T00:00:00Z" },
             ],
             "retryable": false,
         })
@@ -66,19 +66,16 @@ fn model_unavailable_caps_models_in_data_and_message() {
     let failure = ModelUnavailable::new(
         "codex",
         "gpt-x",
-        [machine("box", Some(ProviderStatus::Unknown), 80)],
+        [machine("box", ProviderStatus::Unknown, 80)],
         true,
     );
     assert_eq!(
         failure.machines[0].models.len(),
         MODEL_UNAVAILABLE_MAX_MODELS
     );
-    let message = failure.message();
-    assert!(message.contains("has: m0, m1, m2, m3, m4, m5, m6, m7, m8, m9 (+40 more)."));
-    assert!(
-        !message.contains("[codex"),
-        "unknown status is not called out"
-    );
+    assert!(failure
+        .message()
+        .ends_with("(macos/aarch64, codex: unknown); it has: m0, m1, m2, m3, m4, m5, m6, m7, m8, m9 (+40 more)."));
     assert_eq!(failure.data()["retryable"], true);
 }
 
@@ -94,7 +91,7 @@ fn model_unavailable_without_machines_says_none_is_exposed() {
 
 #[test]
 fn machine_models_round_trip() {
-    let entry = machine("mac", Some(ProviderStatus::AuthFailed), 1);
+    let entry = machine("mac", ProviderStatus::AuthFailed, 1);
     let wire = serde_json::to_value(&entry).unwrap();
     assert_eq!(wire["status"], "auth-failed");
     assert_eq!(

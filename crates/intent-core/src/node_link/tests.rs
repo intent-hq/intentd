@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::*;
 use crate::nodes::{NodeArch, NodeOs};
+use crate::placement::CapacityRefusal;
 
 fn binding(head: &str, generation: u64) -> LeaseBinding {
     LeaseBinding {
@@ -122,10 +123,12 @@ fn capabilities() -> MachineCapabilities {
             arch: NodeArch::Aarch64,
         },
         intentd_version: "0.12.0".into(),
-        max_agents: 4,
-        running_agents: 1,
-        memory_budget_bytes: Some(8 << 30),
-        memory_charged_bytes: Some(1 << 30),
+        capacity: MachineCapacity {
+            running_agents: 1,
+            agent_cap: 4,
+            charged_memory_bytes: 1 << 30,
+            memory_budget_bytes: Some(8 << 30),
+        },
         providers: vec![
             ProviderCapability {
                 id: "claude".into(),
@@ -146,32 +149,43 @@ fn capabilities() -> MachineCapabilities {
     }
 }
 
+/// The report as `docs/protocol/node-link.md` "Capabilities report" spells
+/// it.
 #[test]
-fn the_capabilities_report_wire_shape() {
-    assert_eq!(
-        serde_json::to_value(capabilities()).unwrap(),
-        json!({
-            "platform": { "os": "macos", "arch": "aarch64" },
-            "intentdVersion": "0.12.0",
-            "maxAgents": 4,
+fn the_capabilities_report_matches_the_documented_shape() {
+    let canonical = json!({
+        "platform": { "os": "macos", "arch": "aarch64" },
+        "intentdVersion": "0.12.0",
+        "capacity": {
             "runningAgents": 1,
+            "agentCap": 4,
+            "chargedMemoryBytes": 1_073_741_824_u64,
             "memoryBudgetBytes": 8_589_934_592_u64,
-            "memoryChargedBytes": 1_073_741_824_u64,
-            "providers": [
-                { "id": "claude", "visible": true, "status": "signed-in",
-                  "models": ["opus", "sonnet"], "modelsStale": false },
-                { "id": "codex", "visible": true, "status": "cli-missing",
-                  "models": [], "modelsStale": true },
-            ],
-            "observedAt": "2026-10-30T00:00:00Z",
-        })
+        },
+        "providers": [
+            { "id": "claude", "visible": true, "status": "signed-in",
+              "models": ["opus", "sonnet"], "modelsStale": false },
+            { "id": "codex", "visible": true, "status": "cli-missing",
+              "models": [], "modelsStale": true },
+        ],
+        "observedAt": "2026-10-30T00:00:00Z",
+    });
+    assert_eq!(serde_json::to_value(capabilities()).unwrap(), canonical);
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(canonical).unwrap(),
+        capabilities()
     );
-    let mut lean = capabilities();
-    lean.memory_budget_bytes = None;
-    lean.memory_charged_bytes = None;
-    let value = serde_json::to_value(&lean).unwrap();
-    assert!(value.get("memoryBudgetBytes").is_none());
-    assert!(value.get("memoryChargedBytes").is_none());
+    let mut unlimited = capabilities();
+    unlimited.capacity.memory_budget_bytes = None;
+    let value = serde_json::to_value(&unlimited).unwrap();
+    assert!(
+        value["capacity"].get("memoryBudgetBytes").is_none(),
+        "absent when unlimited"
+    );
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(value).unwrap(),
+        unlimited
+    );
 }
 
 #[test]
@@ -216,19 +230,17 @@ fn later_additions_within_a_version_decode_on_an_older_peer() {
 
     let mut report = serde_json::to_value(capabilities()).unwrap();
     report["gpu"] = json!("m3");
+    report["capacity"]["gpuSlots"] = json!(2);
     report["providers"][0]["quota"] = json!(3);
-    report["providers"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("modelsStale");
-    let decoded: MachineCapabilities = serde_json::from_value(report.clone()).unwrap();
-    assert!(
-        !decoded.providers[0].models_stale,
-        "modelsStale defaults to false"
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(report.clone()).unwrap(),
+        capabilities()
     );
-    report.as_object_mut().unwrap().remove("providers");
-    let decoded: MachineCapabilities = serde_json::from_value(report).unwrap();
-    assert!(decoded.providers.is_empty(), "providers default to none");
+    let reply = json!({ "type": "capabilitiesReply", "capabilities": report, "extra": 1 });
+    assert!(matches!(
+        LinkFrame::decode(reply.to_string().as_bytes()).unwrap(),
+        LinkFrame::CapabilitiesReply { .. }
+    ));
 
     let mut launch = serde_json::to_value(match &every_frame()[4] {
         frame @ LinkFrame::Launch(_) => frame.clone(),
@@ -278,7 +290,7 @@ fn executor_link_requests_golden() {
         [
             "ack",
             "cancel",
-            "capabilitiesQuery",
+            "capabilities",
             "heartbeat",
             "heartbeatReply",
             "hello",
@@ -323,7 +335,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
         refused,
         [
             "cancelRequest",
-            "capabilities",
+            "capabilitiesReply",
             "journal",
             "replayComplete",
             "request",
@@ -358,6 +370,8 @@ fn every_frame() -> Vec<LinkFrame> {
             node_id: "node-1".into(),
             running_agents: vec![agent_id.clone()],
             capabilities: capabilities(),
+            hosts: vec!["192.168.1.20".into()],
+            tc_address: Some("mac-mini.tc".into()),
         }),
         LinkFrame::Heartbeat { nonce: 1 },
         LinkFrame::HeartbeatReply { nonce: 1 },
@@ -405,6 +419,7 @@ fn every_frame() -> Vec<LinkFrame> {
             JournalBody::Exited {
                 exit_code: Some(1),
                 error: Some("crashed".into()),
+                failure: None,
             },
         )),
         LinkFrame::Ack {
@@ -433,9 +448,8 @@ fn every_frame() -> Vec<LinkFrame> {
             }),
         },
         LinkFrame::CancelRequest { request_id },
-        LinkFrame::CapabilitiesQuery { nonce: 7 },
-        LinkFrame::Capabilities {
-            nonce: 7,
+        LinkFrame::Capabilities,
+        LinkFrame::CapabilitiesReply {
             capabilities: capabilities(),
         },
     ]
@@ -583,4 +597,81 @@ fn launch_without_a_profile_omits_profile_env() {
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
+}
+
+/// The executor frames of `docs/protocol/node-link.md`: an empty
+/// `capabilities` request, a `capabilitiesReply`, and the welcome's routes.
+#[test]
+fn executor_frames_match_the_documented_wire_shapes() {
+    let request = json!({ "type": "capabilities" });
+    assert_eq!(
+        serde_json::to_value(LinkFrame::Capabilities).unwrap(),
+        request
+    );
+    assert_eq!(
+        LinkFrame::decode(request.to_string().as_bytes()).unwrap(),
+        LinkFrame::Capabilities
+    );
+    let reply = serde_json::to_value(LinkFrame::CapabilitiesReply {
+        capabilities: capabilities(),
+    })
+    .unwrap();
+    assert_eq!(reply["type"], "capabilitiesReply");
+    assert_eq!(reply["capabilities"]["capacity"]["agentCap"], 4);
+
+    let welcome = serde_json::to_value(&every_frame()[1]).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["protocol"], 6);
+    assert_eq!(welcome["hosts"], json!(["192.168.1.20"]));
+    assert_eq!(welcome["tcAddress"], "mac-mini.tc");
+    let mut no_tailcat = welcome.clone();
+    no_tailcat.as_object_mut().unwrap().remove("tcAddress");
+    match serde_json::from_value::<LinkFrame>(no_tailcat).unwrap() {
+        LinkFrame::Welcome(welcome) => assert_eq!(welcome.tc_address, None),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+}
+
+/// `exited.failure` as `docs/protocol/node-link.md` "Capacity refusal on
+/// the wire" spells it: an optional structured failure whose `data` is the
+/// closed capacity refusal.
+#[test]
+fn exited_carries_the_documented_capacity_failure() {
+    let canonical = json!({
+        "kind": "exited",
+        "error": "node-capacity: this machine is running 4 of 4 agents",
+        "failure": {
+            "code": "node-capacity",
+            "data": { "limit": "count", "runningAgents": 4, "agentCap": 4 },
+        },
+    });
+    let body: JournalBody = serde_json::from_value(canonical.clone()).unwrap();
+    assert_eq!(
+        body,
+        JournalBody::Exited {
+            exit_code: None,
+            error: Some("node-capacity: this machine is running 4 of 4 agents".into()),
+            failure: Some(ExitFailure {
+                code: "node-capacity".into(),
+                data: Some(CapacityRefusal::Count {
+                    running_agents: 4,
+                    agent_cap: 4,
+                }),
+            }),
+        }
+    );
+    assert_eq!(serde_json::to_value(&body).unwrap(), canonical);
+
+    let mut open_data = canonical.clone();
+    open_data["failure"]["data"]["note"] = json!("x");
+    assert!(
+        serde_json::from_value::<JournalBody>(open_data).is_err(),
+        "the capacity refusal is closed"
+    );
+
+    let plain = json!({ "kind": "exited", "exitCode": 1 });
+    assert!(matches!(
+        serde_json::from_value::<JournalBody>(plain).unwrap(),
+        JournalBody::Exited { failure: None, .. }
+    ));
 }

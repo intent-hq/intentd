@@ -507,6 +507,7 @@ impl Runner {
             body: JournalBody::Exited {
                 exit_code: None,
                 error: Some(error),
+                failure: None,
             },
         };
         let mut state = lock(&self.inner.state);
@@ -646,7 +647,11 @@ impl Runner {
                     }
                     Mark::Exited { exit_code, error } => {
                         let error = error.map(|error| redactor.text(error));
-                        (None, JournalBody::Exited { exit_code, error })
+                        (None, JournalBody::Exited {
+                            exit_code,
+                            error,
+                            failure: None,
+                        })
                     }
                 },
                 else => break,

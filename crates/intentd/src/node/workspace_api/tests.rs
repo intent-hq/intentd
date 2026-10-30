@@ -296,6 +296,8 @@ async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
                 1,
                 "2026-10-30T00:00:00Z",
             ),
+            hosts: Vec::new(),
+            tc_address: None,
         }),
     )
     .await

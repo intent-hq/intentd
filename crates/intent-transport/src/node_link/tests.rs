@@ -62,6 +62,8 @@ fn welcome() -> WelcomeFn {
             2,
             "2026-10-30T00:00:00Z",
         ),
+        hosts: Vec::new(),
+        tc_address: None,
     })
 }
 
@@ -161,7 +163,7 @@ async fn binds_and_exchanges_frames() {
     let dialed = dial(&node, 1).await;
     assert_eq!(dialed.welcome.node_id, NODE);
     assert_eq!(dialed.welcome.protocol, NODE_LINK_PROTOCOLS.max);
-    assert_eq!(dialed.welcome.capabilities.max_agents, 2);
+    assert_eq!(dialed.welcome.capabilities.capacity.agent_cap, 2);
     let (node_link, mut node_events, node_hello) = node.accept_link().await;
     assert_eq!(node_hello.binding, binding(1));
     assert_eq!(node_link.binding(), &binding(1));

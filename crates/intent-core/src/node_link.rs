@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::nodes::NodeCounter;
-use crate::placement::AgentPlatform;
+use crate::placement::{AgentPlatform, CapacityRefusal};
 use crate::{AgentId, Error, Result, WorkspaceId};
 
 /// Identifies one RPC request on the link.
@@ -62,17 +62,17 @@ impl std::fmt::Display for ProtocolRange {
 
 /// The link frame types a backend holding an executor credential may send
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
-/// liveness, agent control, journal acks, the capabilities query and
+/// liveness, agent control, journal acks, the capabilities request and
 /// responses to the machine's forwarded `workspace.call` requests. Nothing
 /// else is admitted from an executor credential; the machine-to-backend
 /// frames (`welcome`, `journal`, `replayComplete`, `request`,
-/// `capabilities`) and `cancelRequest` are refused. Git sessions use the
+/// `capabilitiesReply`) and `cancelRequest` are refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
 /// [`LinkFrame::admitted_from_executor`] is the typed form.
 pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "ack",
     "cancel",
-    "capabilitiesQuery",
+    "capabilities",
     "heartbeat",
     "heartbeatReply",
     "hello",
@@ -161,7 +161,8 @@ pub struct LinkHello {
 
 /// The node's reply to an accepted [`LinkHello`]: the negotiated protocol
 /// version, the agents it is running for this binding (so head can stop
-/// agents it does not claim) and its capabilities report.
+/// agents it does not claim), its capabilities report and its current
+/// routes, which the backend stores so a changed address repairs itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkWelcome {
@@ -170,47 +171,63 @@ pub struct LinkWelcome {
     pub node_id: String,
     pub running_agents: Vec<AgentId>,
     pub capabilities: MachineCapabilities,
+    /// Direct hosts the machine can be dialed on.
+    pub hosts: Vec<String>,
+    /// The machine's tailcat address, when tailcat is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tc_address: Option<String>,
 }
 
 /// What a machine can run, reported in the welcome and on request: its
 /// platform and intentd version, its shared agent limits, and each
 /// provider's sign-in status and models. A snapshot taken at `observed_at`.
+/// The report is advisory, never a reservation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineCapabilities {
     pub platform: AgentPlatform,
     pub intentd_version: String,
-    /// The machine's agent process cap, shared by local and remote agents.
-    pub max_agents: u32,
-    /// Agents (local and remote) running when observed.
-    pub running_agents: u32,
-    /// The aggregate agent memory budget, when one applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_budget_bytes: Option<u64>,
-    /// Memory charged against the budget when observed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_charged_bytes: Option<u64>,
-    #[serde(default)]
+    pub capacity: MachineCapacity,
     pub providers: Vec<ProviderCapability>,
     pub observed_at: String,
 }
 
+/// A machine's shared agent limits and their use, counting local and
+/// remote agents together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCapacity {
+    /// Agents counted against the cap, local and remote.
+    pub running_agents: u32,
+    /// The effective `agents.maxConcurrent`.
+    pub agent_cap: u32,
+    /// Aggregate memory charged to running agents.
+    pub charged_memory_bytes: u64,
+    /// The effective `agents.memoryBudgetMb` in bytes; absent when
+    /// unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
+}
+
 impl MachineCapabilities {
-    /// A report with no agents running, no memory budget and no providers.
+    /// A report with no agents running, no memory charged or budgeted and
+    /// no providers.
     #[must_use]
     pub fn new(
         platform: AgentPlatform,
         intentd_version: impl Into<String>,
-        max_agents: u32,
+        agent_cap: u32,
         observed_at: impl Into<String>,
     ) -> Self {
         Self {
             platform,
             intentd_version: intentd_version.into(),
-            max_agents,
-            running_agents: 0,
-            memory_budget_bytes: None,
-            memory_charged_bytes: None,
+            capacity: MachineCapacity {
+                running_agents: 0,
+                agent_cap,
+                charged_memory_bytes: 0,
+                memory_budget_bytes: None,
+            },
             providers: Vec::new(),
             observed_at: observed_at.into(),
         }
@@ -227,14 +244,14 @@ pub struct ProviderCapability {
     pub status: ProviderStatus,
     pub models: Vec<String>,
     /// The model list is a cached one the machine could not refresh.
-    #[serde(default)]
     pub models_stale: bool,
 }
 
-/// A provider's readiness on a machine. `signed-in` / `signed-out` come
-/// from the provider's sign-in probe, `auth-failed` from a launch that
-/// failed to authenticate, `cli-missing` / `prerequisite-missing` from the
-/// machine's model listing. `unknown` when no probe result is available,
+/// A provider's readiness on a machine, for its default account only.
+/// `signed-in` / `signed-out` come from the provider's sign-in probe,
+/// `auth-failed` from a launch without a profile that failed to
+/// authenticate, `cli-missing` / `prerequisite-missing` from the machine's
+/// model listing. `unknown` when the provider has no probe or it failed,
 /// and for any status this build does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -400,16 +417,11 @@ pub enum LinkFrame {
     CancelRequest {
         request_id: LinkId,
     },
-    /// Head asks for a fresh capabilities report.
+    /// Head asks for a fresh capabilities report (empty body).
+    Capabilities,
+    /// The node's answer to [`LinkFrame::Capabilities`].
     #[serde(rename_all = "camelCase")]
-    CapabilitiesQuery {
-        nonce: u64,
-    },
-    /// The node's answer to the [`LinkFrame::CapabilitiesQuery`] with the
-    /// same `nonce`.
-    #[serde(rename_all = "camelCase")]
-    Capabilities {
-        nonce: u64,
+    CapabilitiesReply {
         capabilities: MachineCapabilities,
     },
 }
@@ -427,8 +439,8 @@ impl LinkFrame {
             | Self::Prompt { .. }
             | Self::Cancel { .. }
             | Self::Stop { .. }
-            | Self::CapabilitiesQuery { .. }
-            | Self::Capabilities { .. } => LinkChannel::Control,
+            | Self::Capabilities
+            | Self::CapabilitiesReply { .. } => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -452,13 +464,13 @@ impl LinkFrame {
             | Self::Stop { .. }
             | Self::Ack { .. }
             | Self::Response { .. }
-            | Self::CapabilitiesQuery { .. } => true,
+            | Self::Capabilities => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
             | Self::Request(_)
             | Self::CancelRequest { .. }
-            | Self::Capabilities { .. } => false,
+            | Self::CapabilitiesReply { .. } => false,
         }
     }
 
@@ -528,14 +540,27 @@ pub enum JournalBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// The agent's provider process exited.
+    /// The agent's provider process exited. `error` stays
+    /// `"<code>: <detail>"`; protocol 6 adds the structured `failure`.
     #[serde(rename_all = "camelCase")]
     Exited {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<ExitFailure>,
     },
+}
+
+/// `exited.failure`: the structured form of an exit error. `data` is
+/// present only for `node-capacity` and is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitFailure {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CapacityRefusal>,
 }
 
 /// How head treats an incoming record given its highest ingested sequence.

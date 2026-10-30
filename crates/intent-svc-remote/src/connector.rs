@@ -171,7 +171,7 @@ impl Shared {
         let mut status = lock(&self.status);
         status.connected = true;
         status.platform = Some(welcome.capabilities.platform);
-        status.max_agents = welcome.capabilities.max_agents;
+        status.max_agents = welcome.capabilities.capacity.agent_cap;
         status.running_agents.clone_from(&welcome.running_agents);
         status.intentd_version = Some(welcome.capabilities.intentd_version.clone());
     }

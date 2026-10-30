@@ -27,10 +27,8 @@ pub struct MachineModels {
     pub node_id: String,
     pub name: String,
     pub platform: AgentPlatform,
-    /// The provider's status there; absent when the machine does not have
-    /// the provider at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<ProviderStatus>,
+    /// The provider's status there (`cli-missing` when it isn't installed).
+    pub status: ProviderStatus,
     /// The provider's models there, at most
     /// [`MODEL_UNAVAILABLE_MAX_MODELS`].
     pub models: Vec<String>,
@@ -73,47 +71,42 @@ impl ModelUnavailable {
         }
     }
 
-    /// The message, for example `Model "opus" (claude) isn't available on
-    /// mac-mini (macos/aarch64); it has: sonnet, haiku.`
+    /// The message, written for the delegating model, for example
+    /// `Model "opus" isn't available on mac-mini (macos/aarch64, claude:
+    /// signed-in); it has: sonnet, haiku.` with one sentence per machine.
     #[must_use]
     pub fn message(&self) -> String {
-        let lead = format!("Model \"{}\" ({})", self.model, self.provider);
         if self.machines.is_empty() {
-            return format!("{lead} isn't available: no machine is exposed to this backend.");
+            return format!(
+                "Model \"{}\" ({}) isn't available: no machine is exposed to this backend.",
+                self.model, self.provider
+            );
         }
-        let names = self
-            .machines
+        self.machines
             .iter()
-            .map(|machine| machine.name.as_str())
+            .map(|machine| self.sentence(machine))
             .collect::<Vec<_>>()
-            .join(", ");
-        let offers = self
-            .machines
-            .iter()
-            .map(|machine| self.offer(machine))
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!("{lead} isn't available on {names}. {offers}.")
+            .join(" ")
     }
 
-    fn offer(&self, machine: &MachineModels) -> String {
-        let at = format!("{} ({})", machine.name, machine.platform);
-        let Some(status) = machine.status else {
-            return format!("{at} doesn't have {}", self.provider);
-        };
-        let status = match status {
-            ProviderStatus::SignedIn | ProviderStatus::Unknown => String::new(),
-            other => format!(" [{}: {}]", self.provider, status_name(other)),
-        };
-        if machine.models.is_empty() {
-            return format!("{at}{status} has no models listed");
-        }
+    fn sentence(&self, machine: &MachineModels) -> String {
         let shown = machine.models.len().min(MESSAGE_MAX_MODELS);
-        let mut list = machine.models[..shown].join(", ");
+        let mut has = if shown == 0 {
+            "no models listed".to_string()
+        } else {
+            machine.models[..shown].join(", ")
+        };
         if machine.models.len() > shown {
-            let _ = write!(list, " (+{} more)", machine.models.len() - shown);
+            let _ = write!(has, " (+{} more)", machine.models.len() - shown);
         }
-        format!("{at}{status} has: {list}")
+        format!(
+            "Model \"{}\" isn't available on {} ({}, {}: {}); it has: {has}.",
+            self.model,
+            machine.name,
+            machine.platform,
+            self.provider,
+            status_name(machine.status),
+        )
     }
 
     /// The `error.data` object.

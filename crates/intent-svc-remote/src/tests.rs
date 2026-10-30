@@ -69,6 +69,8 @@ fn welcome_running(running: Vec<AgentId>) -> WelcomeFn {
             2,
             "2026-10-30T00:00:00Z",
         ),
+        hosts: Vec::new(),
+        tc_address: None,
     })
 }
 
@@ -283,6 +285,7 @@ fn exited(seq: u64, agent: &AgentId) -> JournalRecord {
         body: JournalBody::Exited {
             exit_code: Some(3),
             error: None,
+            failure: None,
         },
     }
 }
@@ -1458,6 +1461,7 @@ mod launch {
             body: JournalBody::Exited {
                 exit_code: None,
                 error: Some("node-provider-unavailable: provider \"mock\" is not configured on this node (configured: codex)".into()),
+                failure: None,
             },
         })
         .await;

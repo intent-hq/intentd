@@ -158,7 +158,7 @@ impl HeadLease {
                 &self.owner,
                 welcome.capabilities.platform.os,
                 welcome.capabilities.platform.arch,
-                welcome.capabilities.max_agents,
+                welcome.capabilities.capacity.agent_cap,
                 &welcome.capabilities.intentd_version,
             )
             .await

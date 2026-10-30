@@ -140,13 +140,15 @@ impl Node {
                     runner.max_agents(),
                     intent_core::now_iso(),
                 );
-                capabilities.running_agents =
+                capabilities.capacity.running_agents =
                     u32::try_from(running_agents.len()).unwrap_or(u32::MAX);
                 LinkWelcome {
                     protocol: 0,
                     node_id: String::new(),
                     running_agents,
                     capabilities,
+                    hosts: Vec::new(),
+                    tc_address: None,
                 }
             })
         };

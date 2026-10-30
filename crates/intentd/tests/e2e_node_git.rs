@@ -154,6 +154,8 @@ impl Fixture {
                     2,
                     "2026-10-30T00:00:00Z",
                 ),
+                hosts: Vec::new(),
+                tc_address: None,
             }),
         )
         .await

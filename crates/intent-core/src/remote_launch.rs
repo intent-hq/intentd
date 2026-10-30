@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::placement::AgentPlacement;
+use crate::placement::{AgentPlacement, CapacityRefusal};
 use crate::{AgentId, WorkspaceId};
 
 pub mod workspace_api;
@@ -51,11 +51,16 @@ pub enum EffectiveIsolation {
 
 /// `placementError`: why a remote agent could not be started on its node.
 /// `code` is the node's error code (for example `node-capacity`), `detail`
-/// its message.
+/// its message. A `node-capacity` refusal also carries the limit it hit
+/// (`data`) and `retryable: true`; both are absent otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementError {
     pub code: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CapacityRefusal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 /// Longest `placementError.detail` kept, in UTF-8 bytes: the field rides
@@ -84,6 +89,19 @@ impl PlacementError {
         Self {
             code: cap(code, PLACEMENT_ERROR_CODE_MAX_BYTES),
             detail: cap(detail, PLACEMENT_ERROR_DETAIL_MAX_BYTES),
+            data: None,
+            retryable: None,
+        }
+    }
+
+    /// A machine's capacity refusal: `node-capacity` with the limit it hit,
+    /// retryable.
+    #[must_use]
+    pub fn capacity(detail: &str, refusal: CapacityRefusal) -> Self {
+        Self {
+            data: Some(refusal),
+            retryable: Some(true),
+            ..Self::new("node-capacity", detail)
         }
     }
 
@@ -158,5 +176,38 @@ mod tests {
             PlacementError::from_node_error(&format!("node-checkout-failed: {}", "é".repeat(1000)));
         assert!(long.detail.len() <= PLACEMENT_ERROR_DETAIL_MAX_BYTES);
         assert!(long.detail.ends_with('…'));
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({ "code": "node-agent-start-failed", "detail": "Something: broke" }),
+            "data and retryable stay absent outside node-capacity"
+        );
+    }
+
+    #[test]
+    fn capacity_placement_errors_carry_the_limit_and_retry() {
+        let error = PlacementError::capacity(
+            "this machine is running 4 of 4 agents",
+            CapacityRefusal::Count {
+                running_agents: 4,
+                agent_cap: 4,
+            },
+        );
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "code": "node-capacity",
+                "detail": "this machine is running 4 of 4 agents",
+                "data": { "limit": "count", "runningAgents": 4, "agentCap": 4 },
+                "retryable": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PlacementError>(wire).unwrap(),
+            error
+        );
+        let legacy: PlacementError =
+            serde_json::from_value(serde_json::json!({ "code": "x", "detail": "y" })).unwrap();
+        assert_eq!(legacy, PlacementError::new("x", "y"));
     }
 }

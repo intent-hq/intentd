@@ -304,66 +304,139 @@ fn the_error_text_keeps_the_typed_data_for_mcp() {
     }
 }
 
-#[test]
-fn no_capacity_names_the_shared_limit_it_hit() {
-    let mac = platform(NodeOs::Macos, NodeArch::Aarch64);
-    let availability = || PlatformAvailability::new([mac], [], "t".into());
-    let count = availability()
-        .unavailable(AgentPlacement::default())
-        .with_capacity(CapacityLimit::Count {
-            running_agents: 3,
-            max_agents: 3,
-        });
-    assert_eq!(
-        count.message(),
-        "No capacity for any platform (3 of 3 agents running); available: none; supported: macos/aarch64"
-    );
-    let data = count.data();
-    assert_eq!(data["reason"], "no-capacity");
-    assert_eq!(data["limit"], "count");
-    assert_eq!(data["runningAgents"], 3);
-    assert_eq!(data["maxAgents"], 3);
-    assert_eq!(data["retryable"], true);
+fn build_box() -> MachineRef {
+    MachineRef {
+        node_id: "d-build-box".into(),
+        name: "Build box".into(),
+    }
+}
 
-    let memory = availability()
-        .unavailable(AgentPlacement::default())
-        .with_capacity(CapacityLimit::Memory {
-            charged_bytes: 7 << 30,
-            budget_bytes: 8 << 30,
-        });
-    assert!(memory
-        .message()
-        .starts_with("No capacity for any platform (7168 of 8192 MiB agent memory in use);"));
-    let data = memory.data();
-    assert_eq!(data["limit"], "memory");
-    assert_eq!(data["chargedBytes"], 7_u64 << 30);
-    assert_eq!(data["budgetBytes"], 8_u64 << 30);
-    assert_eq!(data["retryable"], true);
-    assert!(data.get("machine").is_none());
+/// The `no-capacity` example of `docs/protocol/methods/nodes.md` "Remote
+/// machine errors", rebuilt from typed data.
+#[test]
+fn no_capacity_on_a_machine_matches_the_documented_example() {
+    let requested: AgentPlacement =
+        serde_json::from_str(r#"{"target":"remote","nodeId":"d-build-box"}"#).unwrap();
+    let failure = PlatformAvailability::none("2026-10-30T00:00:00Z".into()).machine_unavailable(
+        requested,
+        PlacementUnavailableReason::NoCapacity,
+        build_box(),
+        Some(CapacityRefusal::Count {
+            running_agents: 4,
+            agent_cap: 4,
+        }),
+    );
+    assert_eq!(
+        failure.message(),
+        "No capacity on Build box: 4 of 4 agents running"
+    );
+    let data = failure.data();
+    let documented = json!({
+        "code": "placement-unavailable", "reason": "no-capacity", "nodeId": "d-build-box",
+        "limit": "count", "runningAgents": 4, "agentCap": 4, "retryable": true,
+        "observedAt": "2026-10-30T00:00:00Z"
+    });
+    for (key, value) in documented.as_object().unwrap() {
+        assert_eq!(&data[key], value, "{key}");
+    }
+    assert_eq!(data["requested"]["nodeId"], "d-build-box");
 }
 
 #[test]
-fn capacity_limits_round_trip_tagged_by_limit() {
-    for (limit, wire) in [
+fn memory_refusals_use_the_documented_member_names() {
+    let failure = PlatformAvailability::none("t".into()).machine_unavailable(
+        AgentPlacement::default(),
+        PlacementUnavailableReason::NoCapacity,
+        build_box(),
+        Some(CapacityRefusal::Memory {
+            charged_memory_bytes: 7 << 30,
+            memory_budget_bytes: 8 << 30,
+        }),
+    );
+    assert_eq!(
+        failure.message(),
+        "No capacity on Build box: 7168 of 8192 MiB agent memory in use"
+    );
+    let data = failure.data();
+    assert_eq!(data["limit"], "memory");
+    assert_eq!(data["chargedMemoryBytes"], 7_u64 << 30);
+    assert_eq!(data["memoryBudgetBytes"], 8_u64 << 30);
+    assert_eq!(data["retryable"], true);
+}
+
+#[test]
+fn several_full_candidates_list_their_limits_in_machines() {
+    let failure =
+        PlatformAvailability::new([platform(NodeOs::Linux, NodeArch::X86_64)], [], "t".into())
+            .unavailable(AgentPlacement::default())
+            .with_machines(vec![
+                MachineCapacityRefusal {
+                    node_id: "a".into(),
+                    refusal: CapacityRefusal::Count {
+                        running_agents: 2,
+                        agent_cap: 2,
+                    },
+                },
+                MachineCapacityRefusal {
+                    node_id: "b".into(),
+                    refusal: CapacityRefusal::Memory {
+                        charged_memory_bytes: 9,
+                        memory_budget_bytes: 9,
+                    },
+                },
+            ]);
+    let data = failure.data();
+    assert_eq!(data["reason"], "no-capacity");
+    assert!(data.get("nodeId").is_none());
+    assert_eq!(
+        data["machines"],
+        json!([
+            { "nodeId": "a", "limit": "count", "runningAgents": 2, "agentCap": 2 },
+            { "nodeId": "b", "limit": "memory", "chargedMemoryBytes": 9, "memoryBudgetBytes": 9 },
+        ])
+    );
+    let plain = PlatformAvailability::none("t".into()).unavailable(AgentPlacement::default());
+    assert!(plain.data().get("machines").is_none());
+}
+
+/// `CapacityRefusal` is closed: `docs/protocol/node-link.md` lists it with
+/// the payloads that reject unknown or mistyped members.
+#[test]
+fn capacity_refusals_round_trip_and_stay_closed() {
+    for (refusal, wire) in [
         (
-            CapacityLimit::Count {
+            CapacityRefusal::Count {
                 running_agents: 1,
-                max_agents: 2,
+                agent_cap: 2,
             },
-            json!({ "limit": "count", "runningAgents": 1, "maxAgents": 2 }),
+            json!({ "limit": "count", "runningAgents": 1, "agentCap": 2 }),
         ),
         (
-            CapacityLimit::Memory {
-                charged_bytes: 5,
-                budget_bytes: 9,
+            CapacityRefusal::Memory {
+                charged_memory_bytes: 5,
+                memory_budget_bytes: 9,
             },
-            json!({ "limit": "memory", "chargedBytes": 5, "budgetBytes": 9 }),
+            json!({ "limit": "memory", "chargedMemoryBytes": 5, "memoryBudgetBytes": 9 }),
         ),
     ] {
-        assert_eq!(serde_json::to_value(limit).unwrap(), wire);
+        assert_eq!(serde_json::to_value(refusal).unwrap(), wire);
         assert_eq!(
-            serde_json::from_value::<CapacityLimit>(wire).unwrap(),
-            limit
+            serde_json::from_value::<CapacityRefusal>(wire.clone()).unwrap(),
+            refusal
+        );
+        let mut extra = wire.clone();
+        extra["note"] = json!(1);
+        assert!(serde_json::from_value::<CapacityRefusal>(extra).is_err());
+    }
+    for bad in [
+        json!({ "limit": "count", "runningAgents": "1", "agentCap": 2 }),
+        json!({ "limit": "count", "runningAgents": -1, "agentCap": 2 }),
+        json!({ "limit": "disk", "usedBytes": 1 }),
+        json!({ "limit": "memory", "chargedMemoryBytes": 5 }),
+    ] {
+        assert!(
+            serde_json::from_value::<CapacityRefusal>(bad.clone()).is_err(),
+            "{bad}"
         );
     }
 }
@@ -371,50 +444,40 @@ fn capacity_limits_round_trip_tagged_by_limit() {
 #[test]
 fn machine_refusals_name_the_machine_and_say_whether_to_retry() {
     let requested: AgentPlacement =
-        serde_json::from_str(r#"{"target":"remote","nodeId":"m-1"}"#).unwrap();
-    let machine = MachineRef {
-        node_id: "m-1".into(),
-        name: "mac-mini".into(),
-    };
-    for (reason, wire, lead, retryable) in [
+        serde_json::from_str(r#"{"target":"remote","nodeId":"d-build-box"}"#).unwrap();
+    for (reason, wire, message, retryable) in [
         (
             PlacementUnavailableReason::MachineUnreachable,
             "machine-unreachable",
-            "Machine \"mac-mini\" is unreachable",
+            "Build box is unreachable",
             true,
         ),
         (
             PlacementUnavailableReason::MachineUnknown,
             "machine-unknown",
-            "No machine \"mac-mini\" is exposed to this backend",
+            "No machine d-build-box is exposed to this backend",
             false,
         ),
         (
             PlacementUnavailableReason::MachineRevoked,
             "machine-revoked",
-            "Machine \"mac-mini\" revoked this backend's access",
+            "Build box revoked this backend's access",
             false,
         ),
     ] {
         let failure = PlatformAvailability::none("t".into()).machine_unavailable(
             requested.clone(),
             reason,
-            machine.clone(),
+            build_box(),
+            None,
         );
         assert_eq!(reason.retryable(), retryable);
-        assert_eq!(
-            failure.message(),
-            format!("{lead}; available: none; supported: none")
-        );
+        assert_eq!(failure.message(), message);
         let data = failure.data();
         assert_eq!(data["code"], "placement-unavailable");
         assert_eq!(data["reason"], wire);
         assert_eq!(data["retryable"], retryable);
-        assert_eq!(
-            data["machine"],
-            json!({ "nodeId": "m-1", "name": "mac-mini" })
-        );
-        assert_eq!(data["requested"]["nodeId"], "m-1");
+        assert_eq!(data["nodeId"], "d-build-box");
         assert!(data.get("limit").is_none());
     }
 }
