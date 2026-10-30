@@ -433,6 +433,9 @@ mod tests_unknown_model;
 #[cfg(test)]
 mod tests_suggested_prompts_contract;
 
+#[cfg(test)]
+mod tests_proposal_origin;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -3216,6 +3219,15 @@ pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed"
 /// naming the proposal instead of a plain user message. Follows the
 /// [`QUESTIONS_DISMISSED_METADATA_TYPE`] conventions.
 pub(crate) const PROPOSAL_RESOLVED_METADATA_TYPE: &str = "proposal_resolved";
+
+/// A validated `workspace.create` proposal origin awaiting resolution once
+/// the create succeeds ([`Services::prepare_create_proposal_origin`]).
+#[derive(Debug, Clone)]
+pub(crate) struct CreateProposalOrigin {
+    source_workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    proposal_id: String,
+}
 
 /// Cap on the caller-supplied `agent.resolveProposal` `detail` string — it is
 /// appended verbatim to the applied notice, so bound it against oversized
@@ -10087,6 +10099,123 @@ impl Services {
             "proposalId": proposal_id,
             "outcome": outcome,
         }))
+    }
+
+    /// `workspace.create { origin }` (PROTOCOL §5.1 "Proposal origin",
+    /// intent-hq/intent#8086), first half — runs BEFORE any side effect.
+    /// Takes the wire `origin` off `input`, rejects a malformed shape with
+    /// `-32602` (blank `agentId` / `proposalId`, either over the id length
+    /// cap), and — unless an in-process caller already set `input.origin`
+    /// (`ws.workspace.applyProposal` keeps its own provenance and resolution)
+    /// — derives the source workspace from the agent's session and records it
+    /// as `input.origin` for the `workspace:created` echo. Lookup problems are
+    /// fail-soft: an unknown agent, or a caller who is not a member of the
+    /// source workspace, logs a warning and the create proceeds without a
+    /// proposal to resolve.
+    pub(crate) async fn prepare_create_proposal_origin(
+        &self,
+        input: &mut intent_core::WorkspaceCreate,
+    ) -> Result<Option<CreateProposalOrigin>> {
+        let Some(request) = input.origin_request.take() else {
+            return Ok(None);
+        };
+        let intent_core::WorkspaceCreateOriginRequest::Proposal {
+            agent_id,
+            proposal_id,
+        } = request;
+        if agent_id.trim().is_empty() {
+            return Err(Error::InvalidParams(
+                "origin.agentId is required".to_string(),
+            ));
+        }
+        // Matched verbatim against the pending entry (see
+        // `agent_resolve_proposal_op`), so only blankness is checked.
+        if proposal_id.trim().is_empty() {
+            return Err(Error::InvalidParams(
+                "origin.proposalId is required".to_string(),
+            ));
+        }
+        for (field, value) in [("agentId", &agent_id), ("proposalId", &proposal_id)] {
+            if value.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "origin.{field} exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+                )));
+            }
+        }
+        if input.origin.is_some() {
+            return Ok(None);
+        }
+        let agent_id = AgentId::from(agent_id.trim());
+        let source_workspace_id = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(session) => session.workspace_id,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    proposal = %proposal_id,
+                    error = %e,
+                    "workspace.create origin names an unknown agent; the proposal is not resolved"
+                );
+                return Ok(None);
+            }
+        };
+        if let Err(e) = self.require_member(&source_workspace_id).await {
+            tracing::warn!(
+                agent = %agent_id,
+                workspace = %source_workspace_id.as_str(),
+                error = %e,
+                "workspace.create caller cannot act on the origin's workspace; the proposal is not resolved"
+            );
+            return Ok(None);
+        }
+        input.origin = Some(intent_core::WorkspaceCreateOrigin::Proposal {
+            proposal_id: proposal_id.clone(),
+            agent_id: agent_id.clone(),
+            source_workspace_id: source_workspace_id.clone(),
+        });
+        Ok(Some(CreateProposalOrigin {
+            source_workspace_id,
+            agent_id,
+            proposal_id,
+        }))
+    }
+
+    /// `workspace.create { origin }`, second half — runs after the create
+    /// succeeded, on first execution AND on an idempotent replay (so a replay
+    /// retries a resolution that failed the first time). Resolves the
+    /// proposal `applied` through [`Services::agent_resolve_proposal_op`]
+    /// with the `"Created workspace <id>."` detail, delivering the same
+    /// notice and `agent:updated` a client-side `agent.resolveProposal`
+    /// would. An already-resolved proposal keeps its outcome and gets no
+    /// second notice. Fail-soft: the workspace exists either way.
+    pub(crate) async fn resolve_create_proposal_origin(
+        &self,
+        origin: CreateProposalOrigin,
+        created: &WorkspaceId,
+    ) {
+        let CreateProposalOrigin {
+            source_workspace_id,
+            agent_id,
+            proposal_id,
+        } = origin;
+        let detail = format!("Created workspace {}.", created.as_str());
+        if let Err(e) = self
+            .agent_resolve_proposal_op(
+                source_workspace_id,
+                agent_id.clone(),
+                proposal_id.clone(),
+                PROPOSAL_OUTCOME_APPLIED.to_string(),
+                Some(detail),
+            )
+            .await
+        {
+            tracing::warn!(
+                agent = %agent_id,
+                proposal = %proposal_id,
+                workspace = %created.as_str(),
+                error = %e,
+                "workspace.create could not resolve its origin proposal"
+            );
+        }
     }
 
     /// The `preview.title` of the proposal `proposal_id` as carried by the

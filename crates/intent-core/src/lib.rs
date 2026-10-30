@@ -165,11 +165,11 @@ pub use model::{
     TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin, WorkspaceCreateResult,
-    WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
-    SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin,
+    WorkspaceCreateOriginRequest, WorkspaceCreateResult, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
+    WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

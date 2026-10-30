@@ -1494,6 +1494,14 @@ pub struct WorkspaceCreate {
     /// set it, so clients can surface the new workspace next to its source.
     #[serde(skip)]
     pub origin: Option<WorkspaceCreateOrigin>,
+    /// Wire `origin` param (PROTOCOL §5.1 "Proposal origin",
+    /// intent-hq/intent#8086): the proposal card a client's create applies.
+    /// The service validates it, derives the source workspace from the
+    /// agent, records it as [`Self::origin`] and resolves the proposal
+    /// `applied` after a successful create. Ignored when an in-process
+    /// caller already set [`Self::origin`].
+    #[serde(rename = "origin")]
+    pub origin_request: Option<WorkspaceCreateOriginRequest>,
 }
 
 /// Provenance of a `workspace.create` (see [`WorkspaceCreate::origin`]),
@@ -1508,6 +1516,22 @@ pub enum WorkspaceCreateOrigin {
         proposal_id: String,
         agent_id: AgentId,
         source_workspace_id: WorkspaceId,
+    },
+}
+
+/// Wire shape of `workspace.create`'s `origin` param (PROTOCOL §5.1). Only
+/// `kind: "proposal"` exists; any other `kind` fails deserialization
+/// (`-32602`). A client-sent `sourceWorkspaceId` is ignored: the daemon
+/// derives it from the agent's session.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkspaceCreateOriginRequest {
+    /// The `workspace-create` proposal `proposalId` (its `pendingProposals`
+    /// key) that agent `agentId` emitted.
+    #[serde(rename_all = "camelCase")]
+    Proposal {
+        agent_id: String,
+        proposal_id: String,
     },
 }
 

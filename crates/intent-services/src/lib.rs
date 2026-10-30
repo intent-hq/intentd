@@ -21591,6 +21591,10 @@ impl WorkspaceApi for Services {
             services
                 .require_workspace_creator("workspace.create")
                 .await?;
+            // Proposal origin (PROTOCOL §5.1, intent-hq/intent#8086): shape
+            // `-32602`s here, before any side effect; resolved after success.
+            let mut input = input;
+            let proposal_origin = services.prepare_create_proposal_origin(&mut input).await?;
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
@@ -23730,6 +23734,10 @@ impl WorkspaceApi for Services {
             let mut result = result.map_err(|e| execution_call::git_error(e, execution_origin.as_deref()))?;
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
+            if let Some(origin) = proposal_origin {
+                self.resolve_create_proposal_origin(origin, &result.workspace.id)
+                    .await;
+            }
             Ok(result)
         })
     }

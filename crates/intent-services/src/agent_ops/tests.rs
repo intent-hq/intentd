@@ -147,7 +147,7 @@ async fn setup_with_task_graph(
     (tmp, services, ws, registry, config_dir)
 }
 
-async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
+pub(super) async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -39980,7 +39980,7 @@ fn question_blocks() -> serde_json::Value {
 /// proposal-resource block whose embedded proposal identifies as
 /// `proposal_id` (the shape the §7.1 turn-end drain appends for
 /// `ws.app.proposal.show` / `proposeSibling`).
-fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
+pub(super) fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
     let proposal = json!({
         "kind": "settings-change",
         "applyToolCallId": proposal_id,

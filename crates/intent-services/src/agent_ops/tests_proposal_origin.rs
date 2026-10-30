@@ -1,0 +1,430 @@
+//! `workspace.create { origin: { kind: "proposal", agentId, proposalId } }`
+//! (intent-hq/intent#8086): a card Apply's create resolves the proposing
+//! agent's pending proposal daemon-side, so the `proposal_resolved` notice
+//! never waits for the proposing conversation to be open in a client.
+
+use intent_core::{
+    now_iso, with_caller, AgentId, Caller, HostRole, PrincipalId, WorkspaceApi, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceId,
+};
+use serde_json::{json, Value};
+
+use super::tests::{create_agent, proposal_blocks, setup_with_bus, TempDb};
+use crate::Services;
+
+/// The shared agent-ops harness plus a scratch workspaces root, so a
+/// `workspace.create` never provisions under the real `$HOME` default.
+async fn setup() -> (TempDb, Services, WorkspaceId, crate::EventBus) {
+    let (tmp, svc, ws, bus) = setup_with_bus().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
+    (tmp, svc, ws, bus)
+}
+
+/// Seed `proposal_id` as a pending proposal on a fresh agent in `ws`.
+async fn pending_proposal(svc: &Services, ws: &WorkspaceId, proposal_id: &str) -> AgentId {
+    let id = create_agent(svc, ws, "Proposer").await;
+    let msg = svc
+        .store()
+        .append_agent_message(&id, "assistant", &proposal_blocks(proposal_id), &now_iso())
+        .await
+        .expect("append proposal");
+    assert!(
+        svc.record_pending_proposals(ws, &id, &msg.id, &[proposal_id.to_string()])
+            .await
+    );
+    id
+}
+
+/// Parse a `workspace.create` request exactly as the router does: from the
+/// wire JSON object.
+fn wire_create(params: Value) -> WorkspaceCreate {
+    serde_json::from_value(params).expect("wire workspace.create params")
+}
+
+/// `workspace.create` as the host owner's wire connection (the method is
+/// creator-gated and every capability gate needs a bound caller).
+async fn create_as_owner(
+    svc: &Services,
+    input: WorkspaceCreate,
+    idempotency_key: Option<&str>,
+) -> intent_core::Result<WorkspaceCreateResult> {
+    with_caller(
+        Caller::Wire {
+            principal_id: PrincipalId::new(),
+            host_role: HostRole::Owner,
+        },
+        WorkspaceApi::create_workspace(svc, input, idempotency_key.map(str::to_string)),
+    )
+    .await
+}
+
+fn proposal_resolved_notices(messages: &[intent_core::AgentMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|md| md.get("type"))
+                .and_then(Value::as_str)
+                == Some("proposal_resolved")
+        })
+        .map(|m| {
+            m.content[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Regression (intent-hq/intent#8086): a create carrying a proposal `origin`
+/// resolves the pending proposal `applied` and delivers exactly one notice
+/// naming the created workspace — with no client-side `agent.resolveProposal`.
+#[tokio::test]
+async fn create_with_proposal_origin_resolves_and_notifies() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+
+    let created = create_as_owner(
+        &svc,
+        wire_create(json!({
+            "title": "Follow-up",
+            "skipIsolation": true,
+            "origin": { "kind": "proposal", "agentId": agent.0, "proposalId": "tc-1" },
+        })),
+        None,
+    )
+    .await
+    .expect("workspace.create");
+    let new_id = created.workspace.id.0.clone();
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert!(
+        session.pending_proposals().is_empty(),
+        "the create must resolve the pending proposal"
+    );
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("applied"))
+    );
+    let messages = svc
+        .store()
+        .get_agent_messages(&agent, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        proposal_resolved_notices(&messages),
+        vec![format!(
+            "User applied the proposal 'Update Setting'. Created workspace {new_id}."
+        )],
+    );
+}
+
+fn origin(agent: &AgentId, proposal_id: &str) -> Value {
+    json!({ "kind": "proposal", "agentId": agent.0, "proposalId": proposal_id })
+}
+
+async fn notices_for(svc: &Services, agent: &AgentId) -> Vec<String> {
+    let messages = svc
+        .store()
+        .get_agent_messages(agent, None)
+        .await
+        .expect("messages");
+    proposal_resolved_notices(&messages)
+}
+
+/// A same-key replay returns the stored workspace and re-runs the resolve
+/// step idempotently: still exactly one notice. A later client-side
+/// `agent.resolveProposal` (the older-daemon fallback) is a no-op too.
+#[tokio::test]
+async fn replay_and_client_fallback_never_duplicate_the_notice() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let params =
+        json!({ "title": "Follow-up", "skipIsolation": true, "origin": origin(&agent, "tc-1") });
+
+    let first = create_as_owner(&svc, wire_create(params.clone()), Some("key-1"))
+        .await
+        .expect("first create");
+    let replay = create_as_owner(&svc, wire_create(params), Some("key-1"))
+        .await
+        .expect("replayed create");
+    assert_eq!(
+        first.workspace.id, replay.workspace.id,
+        "same key, same workspace"
+    );
+
+    let fallback = svc
+        .agent_resolve_proposal_op(
+            ws.clone(),
+            agent.clone(),
+            "tc-1".to_string(),
+            "applied".to_string(),
+            Some("Created workspace x.".to_string()),
+        )
+        .await
+        .expect("client fallback resolve");
+    assert_eq!(fallback["outcome"], json!("applied"));
+    assert_eq!(
+        notices_for(&svc, &agent).await.len(),
+        1,
+        "exactly one notice"
+    );
+}
+
+/// A proposal the user already dismissed keeps that outcome: the create
+/// still succeeds and the agent hears nothing more.
+#[tokio::test]
+async fn already_resolved_proposal_keeps_its_outcome() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "dismissed".to_string(),
+        None,
+    )
+    .await
+    .expect("dismiss");
+
+    create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "Late", "skipIsolation": true, "origin": origin(&agent, "tc-1") }),
+        ),
+        None,
+    )
+    .await
+    .expect("create still succeeds");
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("dismissed"))
+    );
+    assert_eq!(
+        notices_for(&svc, &agent).await.len(),
+        1,
+        "only the dismissal notice"
+    );
+}
+
+/// Fail-soft lookups: an unknown agent, or a proposal id that was never
+/// pending, never blocks the create and never errors.
+#[tokio::test]
+async fn unknown_agent_or_proposal_still_creates() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+
+    create_as_owner(
+        &svc,
+        wire_create(json!({
+            "title": "Ghost agent",
+            "skipIsolation": true,
+            "origin": origin(&AgentId::from("agent-missing"), "tc-1"),
+        })),
+        None,
+    )
+    .await
+    .expect("unknown agent is fail-soft");
+    create_as_owner(
+        &svc,
+        wire_create(json!({ "title": "Other card", "skipIsolation": true, "origin": origin(&agent, "tc-other") })),
+        None,
+    )
+    .await
+    .expect("unknown proposal is fail-soft");
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(session.pending_proposals().len(), 1, "tc-1 is untouched");
+    assert!(notices_for(&svc, &agent).await.is_empty());
+}
+
+/// A malformed origin is rejected `-32602` before anything is created; an
+/// unknown `kind` already fails deserialization (the router's `-32602`).
+#[tokio::test]
+async fn malformed_origin_is_rejected_before_any_side_effect() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let before = svc
+        .store()
+        .list_workspaces(intent_core::WorkspaceListFilter::default())
+        .await
+        .expect("list")
+        .len();
+
+    let too_long = "x".repeat(super::MAX_MESSAGE_ID_LEN + 1);
+    for bad in [
+        json!({ "kind": "proposal", "agentId": "  ", "proposalId": "tc-1" }),
+        json!({ "kind": "proposal", "agentId": agent.0, "proposalId": "" }),
+        json!({ "kind": "proposal", "agentId": agent.0, "proposalId": too_long }),
+    ] {
+        let err = create_as_owner(
+            &svc,
+            wire_create(json!({ "title": "Bad", "skipIsolation": true, "origin": bad })),
+            None,
+        )
+        .await
+        .expect_err("malformed origin must reject");
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "-32602 for {bad}: {err:?}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<WorkspaceCreate>(json!({
+            "origin": { "kind": "discussion", "agentId": agent.0, "proposalId": "tc-1" }
+        }))
+        .is_err(),
+        "unknown origin kind must not parse"
+    );
+    assert_eq!(
+        svc.store()
+            .list_workspaces(intent_core::WorkspaceListFilter::default())
+            .await
+            .expect("list")
+            .len(),
+        before,
+        "nothing was created"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(session.pending_proposals().len(), 1);
+}
+
+/// A failed create resolves nothing, so the card stays pending for Retry.
+/// The failure here is raised inside the create op (a `contextLinks` entry
+/// with number 0), after the origin was validated and recorded.
+#[tokio::test]
+async fn failed_create_leaves_the_proposal_pending() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+
+    let err = create_as_owner(
+        &svc,
+        wire_create(json!({
+            "title": "Broken",
+            "skipIsolation": true,
+            "contextLinks": [{
+                "kind": "issue",
+                "url": "https://github.com/intent-hq/intent/issues/1",
+                "owner": "intent-hq",
+                "repo": "intent",
+                "number": 0,
+            }],
+            "origin": origin(&agent, "tc-1"),
+        })),
+        None,
+    )
+    .await
+    .expect_err("an invalid context link fails the create");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(ref m) if m.contains("contextLinks")),
+        "{err:?}"
+    );
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(session.pending_proposals().len(), 1, "still pending");
+    assert!(notices_for(&svc, &agent).await.is_empty());
+}
+
+/// `workspace:created` echoes the provenance with the daemon-derived source
+/// workspace, ignoring a client-sent `sourceWorkspaceId`.
+#[tokio::test]
+async fn workspace_created_event_carries_the_derived_origin() {
+    let (_t, svc, ws, bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+        ..Default::default()
+    });
+
+    let created = create_as_owner(
+        &svc,
+        wire_create(json!({
+            "title": "Echo",
+            "skipIsolation": true,
+            "origin": {
+                "kind": "proposal",
+                "agentId": agent.0,
+                "proposalId": "tc-1",
+                "sourceWorkspaceId": "ws-forged",
+            },
+        })),
+        None,
+    )
+    .await
+    .expect("create");
+
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
+    let event = batch
+        .iter()
+        .find(|e| e.data["workspaceId"] == json!(created.workspace.id.0))
+        .expect("workspace:created for the new workspace");
+    assert_eq!(
+        event.data["origin"],
+        json!({
+            "kind": "proposal",
+            "proposalId": "tc-1",
+            "agentId": agent.0,
+            "sourceWorkspaceId": ws.0,
+        })
+    );
+}
+
+/// An in-process caller that already set `origin` (`ws.workspace.applyProposal`)
+/// owns the resolution: a wire `origin` alongside it is ignored, so the
+/// create itself resolves nothing.
+#[tokio::test]
+async fn in_process_origin_takes_precedence_over_the_wire_param() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let mut input = wire_create(
+        json!({ "title": "Binding", "skipIsolation": true, "origin": origin(&agent, "tc-1") }),
+    );
+    input.origin = Some(intent_core::WorkspaceCreateOrigin::Proposal {
+        proposal_id: "tc-1".to_string(),
+        agent_id: agent.clone(),
+        source_workspace_id: ws.clone(),
+    });
+
+    create_as_owner(&svc, input, None).await.expect("create");
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_proposals().len(),
+        1,
+        "the binding resolves its own proposal"
+    );
+    assert!(notices_for(&svc, &agent).await.is_empty());
+}
