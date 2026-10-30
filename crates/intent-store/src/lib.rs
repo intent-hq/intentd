@@ -38,6 +38,7 @@ mod discussion_repo;
 mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
+mod executor_repo;
 mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
@@ -113,6 +114,7 @@ pub use discussion_activity_repo::DiscussionActivityReceipt;
 pub use discussion_agent_repo::DiscussionDelivery;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use executor_repo::ExecutorRevocation;
 pub use hook_repo::ActiveHookMetadata;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
