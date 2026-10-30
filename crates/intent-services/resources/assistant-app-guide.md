@@ -908,8 +908,9 @@ available space. Moving the pointer between tabs smoothly switches the preview
 without changing your remembered section. In the expanded sidebar, selecting a
 different section leaves your open content in place. **Shift-click** a section
 tab to add or remove its pane; selected panes stack in sidebar order, and at least
-one stays open. Your selection is remembered per workspace. **Shift+Enter** or
-**Shift+Space** does the same from the keyboard. A normal click returns to one pane.
+one stays open. Your selection is remembered per workspace. Hold **Shift** while
+using arrow keys to move focus without changing the selection, then use
+**Shift+Enter** or **Shift+Space** to add or remove that pane. A normal click returns to one pane.
 The collapsed rail still previews one section at a time; expanding restores the
 selected panes. Click the sole selected
 tab to open its default
