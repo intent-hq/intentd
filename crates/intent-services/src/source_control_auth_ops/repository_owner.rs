@@ -21,8 +21,8 @@ pub(super) use secret_reader::GitlabSourceRead;
 pub(crate) use secret_reader::RepositoryReadEligibility;
 pub(crate) use secret_reader::RepositorySettledConnection;
 pub(crate) use secret_reader::{
-    RepositoryAttachmentState, RepositoryChildPolicyState, RepositoryConnectionFacts,
-    RepositoryDescriptorState,
+    NativeReviewObservation, RepositoryAttachmentState, RepositoryChildPolicyState,
+    RepositoryConnectionFacts, RepositoryDescriptorState,
 };
 
 use intent_sourcecontrol::gitlab_auth::{
@@ -45,6 +45,11 @@ use crate::repository_credentials::{
 pub(crate) struct GitlabCredentialGate {
     mutex: Arc<tokio::sync::Mutex<()>>,
     repository: Arc<OnceLock<Arc<RepositoryOwner>>>,
+    /// Serializes native review's own optional-metadata readers: the consuming
+    /// currency check and the background monitor observation. Every holder only
+    /// try-locks the ranked metadata locks, so a waiter is never queued behind
+    /// another lock or I/O and no wait cycle can form through this gate.
+    native_review: Arc<Mutex<()>>,
 }
 
 pub(crate) struct GitlabCredentialGuard {
@@ -73,6 +78,25 @@ impl GitlabCredentialGate {
         Self {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             repository: Arc::new(OnceLock::new()),
+            native_review: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Wait for any in-progress native-review metadata reader. Holders never
+    /// wait on another lock, so this wait is bounded. The gate guards no data;
+    /// a poisoned holder is ignored.
+    pub(crate) fn native_review_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.native_review
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Background readers skip instead of queueing behind a consuming check.
+    pub(crate) fn try_native_review_gate(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.native_review.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         }
     }
 

@@ -842,10 +842,21 @@ impl RepositoryConnectionFacts {
         release.recv().unwrap();
         drop(release);
     }
+
+    // Test-only stand-in for a monitor observation in progress: the shared
+    // native-review gate first, then the same optional config lock.
+    pub(crate) fn hold_native_review_monitor_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _gate = self.gate.native_review_gate();
+        self.hold_native_review_metadata_for_test(entered, release);
+    }
 }
 
 #[intent_test_macros::daemon_test]
-async fn native_review_background_observation_waits_for_contention_and_detects_revision() {
+async fn native_review_monitor_observation_skips_contention_and_detects_revision() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
     let facts = Arc::new(f.service.gitlab_repository_connection_facts().unwrap());
@@ -855,6 +866,7 @@ async fn native_review_background_observation_waits_for_contention_and_detects_r
     let holder =
         std::thread::spawn(move || held.hold_native_review_metadata_for_test(entered, released));
     waiting.await.unwrap();
+    // A non-native-review holder still makes the consuming check refuse.
     let mut effects = 0;
     RepositoryConnectionFacts::with_native_review_current(&facts, |current| {
         assert!(!current);
@@ -865,24 +877,30 @@ async fn native_review_background_observation_waits_for_contention_and_detects_r
     })
     .unwrap();
     assert_eq!(effects, 0);
-    let observed = facts.clone();
-    let (entered, waiting) = tokio::sync::oneshot::channel();
-    let observe = tokio::task::spawn_blocking(move || {
-        entered.send(()).unwrap();
-        observed.native_review_metadata_current()
-    });
-    waiting.await.unwrap();
-    assert!(!observe.is_finished());
+    // The background observation neither waits nor reports a change while busy.
+    assert_eq!(
+        facts.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Busy
+    );
     release.send(()).unwrap();
     holder.join().unwrap();
-    assert!(observe.await.unwrap().unwrap());
+    assert_eq!(
+        facts.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Current
+    );
     f.service
         .gitlab_connect_pat(server.host.clone(), "pat-second".into())
         .await
         .unwrap();
-    assert!(!facts.native_review_metadata_current().unwrap());
+    assert_eq!(
+        facts.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Changed
+    );
     let fresh = f.service.gitlab_repository_connection_facts().unwrap();
-    assert!(fresh.native_review_metadata_current().unwrap());
+    assert_eq!(
+        fresh.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Current
+    );
     let owner = fresh.retained_owner().unwrap().clone();
     let poison = std::thread::spawn(move || {
         let _guard = owner.descriptor.lock().unwrap();
@@ -890,7 +908,7 @@ async fn native_review_background_observation_waits_for_contention_and_detects_r
     });
     assert!(poison.join().is_err());
     assert_eq!(
-        fresh.native_review_metadata_current().unwrap_err(),
+        fresh.native_review_monitor_observation().unwrap_err(),
         Error::Indeterminate
     );
     RepositoryConnectionFacts::with_native_review_current(&fresh, |current| {
@@ -900,6 +918,47 @@ async fn native_review_background_observation_waits_for_contention_and_detects_r
     .unwrap();
 }
 
+// Regression for the merge-queue flake in e2e_native_review_wire: an
+// operation's own background monitor held the optional metadata locks while
+// its stage check ran, and the non-waiting check refused a valid review.
+#[intent_test_macros::daemon_test]
+async fn native_review_stage_check_waits_for_monitor_observation_instead_of_refusing() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let facts = Arc::new(f.service.gitlab_repository_connection_facts().unwrap());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let held = facts.clone();
+    let holder =
+        std::thread::spawn(move || held.hold_native_review_monitor_for_test(entered, released));
+    waiting.await.unwrap();
+    // A second monitor tick skips instead of queueing behind the first.
+    assert_eq!(
+        facts.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Busy
+    );
+    let checked = facts.clone();
+    let mut check = tokio::task::spawn_blocking(move || {
+        let mut observed = None;
+        RepositoryConnectionFacts::with_native_review_current(&checked, |current| {
+            observed = Some(current);
+            Ok(())
+        })
+        .map(|()| observed)
+    });
+    // timing-guard: proves the check is still waiting for the in-progress
+    // observation; the unfixed check returns `false` within microseconds.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut check)
+            .await
+            .is_err(),
+        "stage check must wait for the monitor observation, not refuse"
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(check.await.unwrap().unwrap(), Some(true));
+}
+
 #[intent_test_macros::daemon_test]
 async fn native_review_background_absence_never_adopts_a_later_attachment() {
     let gate = GitlabCredentialGate::new();
@@ -907,10 +966,13 @@ async fn native_review_background_absence_never_adopts_a_later_attachment() {
         crate::repository_credentials::RepositoryConnectionDirectory::new("absence-native".into()),
     );
     let absent = RepositoryConnectionFacts::observe(&gate, &directory).unwrap();
-    assert!(absent.native_review_metadata_current().unwrap());
+    assert_eq!(
+        absent.native_review_monitor_observation().unwrap(),
+        NativeReviewObservation::Current
+    );
     gate.attach_repository(directory, None).unwrap();
     assert_eq!(
-        absent.native_review_metadata_current().unwrap_err(),
+        absent.native_review_monitor_observation().unwrap_err(),
         Error::Unverified
     );
 }
