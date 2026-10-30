@@ -19321,6 +19321,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
             caps.insert("discussionManagement".into(), serde_json::json!(1));
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
+            caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -23889,6 +23890,10 @@ impl WorkspaceApi for Services {
             if let Some(v) = normalised.label.clone() {
                 ws.label = v;
             }
+            // Auto-archive opt-out (§5.1): missing leaves it untouched.
+            if let Some(v) = update.auto_archive_disabled {
+                ws.auto_archive_disabled = v;
+            }
             if let Some(v) = update.branch {
                 ws.branch = v;
             }
@@ -23991,6 +23996,12 @@ impl WorkspaceApi for Services {
                 // elsewhere cannot revert it; persist an explicit change here.
                 if let Some(label) = normalised.label.as_ref() {
                     store.set_workspace_label(&ws.id, label.as_deref()).await?;
+                }
+                // Same scoped-write rule for the auto-archive opt-out.
+                if let Some(disabled) = update.auto_archive_disabled {
+                    store
+                        .set_workspace_auto_archive_disabled(&ws.id, disabled)
+                        .await?;
                 }
                 if let Some(archived) = want_archived {
                     // Delegate the lifecycle flip to the fenced path: it

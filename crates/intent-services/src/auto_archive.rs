@@ -7,7 +7,8 @@
 //! workspace is idle when the newest of `lastContentActivity`,
 //! `lastActivity` and `createdAt` is older than the cutoff. Skipped: the
 //! Chief workspace, remote workspaces, workspaces that are already archived,
-//! retired or deleted, a pending grace-window delete, guest-shared
+//! retired or deleted, workspaces opted out with `autoArchiveDisabled`
+//! (never due, so not counted as skipped), a pending grace-window delete, guest-shared
 //! workspaces (archiving would remove the guests), and any workspace with
 //! work in flight — a running agent turn, a running script or background
 //! worker, an active hook or an active PR monitor — and any workspace whose
@@ -70,11 +71,13 @@ fn last_activity_at(ws: &Workspace) -> Option<OffsetDateTime> {
     .max()
 }
 
-/// Whether `ws` is an archivable lifecycle state and has been idle since
-/// before `cutoff`. A workspace with no parseable timestamp is never due.
+/// Whether `ws` is an archivable lifecycle state, has not opted out of
+/// auto-archive, and has been idle since before `cutoff`. A workspace with no
+/// parseable timestamp is never due.
 pub(crate) fn auto_archive_due(ws: &Workspace, cutoff: OffsetDateTime) -> bool {
     if ws.id.is_chief()
         || ws.is_remote
+        || ws.auto_archive_disabled
         || ws.archived
         || matches!(
             ws.status,
@@ -351,5 +354,18 @@ mod tests {
         let mut chief = old();
         chief.id = WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID);
         assert!(!auto_archive_due(&chief, cutoff));
+    }
+
+    /// A workspace that opted out of auto-archive is never due, however long
+    /// it has been idle; clearing the flag makes it due again.
+    #[test]
+    fn opted_out_workspace_is_never_due() {
+        let cutoff = ts("2026-10-20T00:00:00Z");
+        let mut idle = ws("2026-01-01T00:00:00Z", None, None);
+        assert!(auto_archive_due(&idle, cutoff));
+        idle.auto_archive_disabled = true;
+        assert!(!auto_archive_due(&idle, cutoff));
+        idle.auto_archive_disabled = false;
+        assert!(auto_archive_due(&idle, cutoff));
     }
 }

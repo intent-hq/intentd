@@ -344,6 +344,12 @@ pub struct Workspace {
     /// workspaces hold. Omitted (not `null`) when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Per-workspace auto-archive opt-out (§5.1 "Auto-archive opt-out"):
+    /// while `true` the automatic archive sweep never archives this
+    /// workspace. Off by default. Set via `workspace.update
+    /// { autoArchiveDisabled }` (owner-only). Omitted (not `false`) while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_archive_disabled: bool,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -654,6 +660,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "statusMessage",
     "statusImageAssetId",
     "label",
+    "autoArchiveDisabled",
     "activity",
     "attention",
     "createdAt",
@@ -1647,6 +1654,12 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_optional_field"
     )]
     pub label: Option<Option<String>>,
+    /// Auto-archive opt-out (§5.1 `Workspace.autoArchiveDisabled`): `true`
+    /// exempts the workspace from the automatic archive sweep, `false`
+    /// re-enables it, missing leaves it untouched. Owner-only — not in the
+    /// collaborator-editable allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_archive_disabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
