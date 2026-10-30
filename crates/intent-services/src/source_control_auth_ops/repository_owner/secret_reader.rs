@@ -744,35 +744,36 @@ impl RepositoryConnectionFacts {
             },
             None => None,
         };
-        let inspect = |metadata: crate::repository_credentials::read::RepositoryConnectionMetadata<'_>| {
-            let proof = match owner {
-                Some(o) => match observation_lock(&o.evidence.published, blocking)? {
-                    Some(guard) => Some(guard),
-                    None => return Ok(None),
-                },
-                None => None,
+        let inspect =
+            |metadata: crate::repository_credentials::read::RepositoryConnectionMetadata<'_>| {
+                let proof = match owner {
+                    Some(o) => match observation_lock(&o.evidence.published, blocking)? {
+                        Some(guard) => Some(guard),
+                        None => return Ok(None),
+                    },
+                    None => None,
+                };
+                // A one-time attachment may have appeared while waiting for these
+                // metadata locks. Never combine a captured absence with its later state.
+                if gate.repository.get().map(Arc::as_ptr) != owner.map(Arc::as_ptr)
+                    || owner.and_then(|o| o.settings.get()).map(std::ptr::from_ref)
+                        != settings.map(std::ptr::from_ref)
+                {
+                    return Err(Error::Unverified);
+                }
+                Ok(Some(Self::from_held(
+                    gate,
+                    directory,
+                    owner,
+                    settings,
+                    ConnectionFactsView {
+                        config: config.as_deref(),
+                        descriptor: descriptor.as_deref().and_then(Option::as_ref),
+                        proof: proof.as_deref().and_then(Option::as_deref),
+                        metadata,
+                    },
+                )))
             };
-            // A one-time attachment may have appeared while waiting for these
-            // metadata locks. Never combine a captured absence with its later state.
-            if gate.repository.get().map(Arc::as_ptr) != owner.map(Arc::as_ptr)
-                || owner.and_then(|o| o.settings.get()).map(std::ptr::from_ref)
-                    != settings.map(std::ptr::from_ref)
-            {
-                return Err(Error::Unverified);
-            }
-            Ok(Some(Self::from_held(
-                gate,
-                directory,
-                owner,
-                settings,
-                ConnectionFactsView {
-                    config: config.as_deref(),
-                    descriptor: descriptor.as_deref().and_then(Option::as_ref),
-                    proof: proof.as_deref().and_then(Option::as_deref),
-                    metadata,
-                },
-            )))
-        };
         if blocking {
             directory.with_connection_metadata(inspect)
         } else {

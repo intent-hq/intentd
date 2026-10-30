@@ -3329,8 +3329,7 @@ async fn companion_advance_and_join_monitor(op: &Operation, duration: Duration, 
     tokio::time::advance(duration).await;
     // Every monitor sharing this metadata has observed (and deferred on) the
     // contended state after the advance.
-    wait_until(|| op.metadata.monitor_ticks.load(Ordering::Acquire) >= baseline + observers)
-        .await;
+    wait_until(|| op.metadata.monitor_ticks.load(Ordering::Acquire) >= baseline + observers).await;
     release.send(()).unwrap();
     holder.join().unwrap();
 }

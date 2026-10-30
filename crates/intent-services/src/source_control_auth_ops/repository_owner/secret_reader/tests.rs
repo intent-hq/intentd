@@ -946,12 +946,16 @@ async fn native_review_stage_check_waits_for_monitor_observation_instead_of_refu
         })
         .map(|()| observed)
     });
-    // timing-guard: proves the check is still waiting for the in-progress
-    // observation; the unfixed check returns `false` within microseconds.
+    // Nothing may arrive while the observation is in progress: the unfixed
+    // check returns `false` within microseconds. No production timer bounds
+    // this window, so stretching it only makes the check stricter.
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut check)
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            &mut check
+        )
+        .await
+        .is_err(),
         "stage check must wait for the monitor observation, not refuse"
     );
     release.send(()).unwrap();
