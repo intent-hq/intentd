@@ -299,14 +299,23 @@ for an installed Auggie to appear.
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
-Claude Code and choose **Add profile**: enter a name and environment variables
-(literal values, **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
-the provider host user's home folder (`~user` stays literal). The user signs in or
-prepares that account outside Intent. Credentials inherited from the environment can still
-apply: for a Claude Code profile that should use another account (or none), set
-inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
-**Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
+Claude Code and choose **Add profile**, then a kind: **Different login**, **API key**
+(Claude Code only), **Token**, or **Advanced**. **Different login** creates a new
+sign-in folder under `~/intent/profiles/` and opens the bottom terminal to sign in
+there; the folder starts without the user's usual Claude Code or Codex settings, and
+stays on disk when the profile is removed. Later, ⋯ → **Log In** on that profile
+signs in again to the same folder. **API key** saves an Anthropic key (optionally a
+custom endpoint); **Token** saves a `claude setup-token` token, or a Codex access
+token (ChatGPT Business or Enterprise); Intent then runs a test prompt and shows
+**Key works** or **Key was rejected**. These kinds also unset inherited credentials
+that would otherwise win. **Advanced** is the raw editor: a name and environment
+variables (literal values, **Empty value**, or **Unset**; no shell expansion). Use
+`CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there only, a leading
+`~` or `~/` means the provider host user's home folder (`~user` stays literal), and the
+saved folder path is shown as typed while other saved values stay hidden. Credentials
+inherited from the environment can still apply to an Advanced profile: for a Claude
+Code profile that should use another account (or none), set inherited variables such
+as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
 custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
