@@ -344,6 +344,12 @@ impl WorkspaceMcpServer {
         let mut features = self.agent_features.clone();
         if self.is_sub_agent {
             features.structured_questions = false;
+            features.secret_requests = false;
+        }
+        // Secret requests (PROTOCOL §5.56) are usable only through
+        // `ws.host.exec`, which the chief description never advertises.
+        if !features.host_exec || self.is_chief {
+            features.secret_requests = false;
         }
         features
     }

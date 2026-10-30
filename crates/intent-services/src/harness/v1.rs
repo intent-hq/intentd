@@ -51,6 +51,7 @@ pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
         "structuredQuestions",
         "Structured questions (ws.app.question.ask)",
     ),
+    ("secretRequests", "Secret requests (ws.secret.*)"),
     (
         "attentionRequests",
         "Attention requests (reportBlocker / requestDiscussion)",

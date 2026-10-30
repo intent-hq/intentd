@@ -8793,6 +8793,103 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.host.exec` from an agent or one of its hooks (PROTOCOL §5.56):
+    /// like [`WorkspaceApi::host_exec`], plus the agent-only `secretEnv`
+    /// option, resolved from `agent_id`'s own memory-held secrets and
+    /// redacted from the output. A missing secret fails before spawning with
+    /// `secret-unavailable`.
+    fn agent_host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        self.host_exec(workspace_id, params)
+    }
+
+    /// `ws.secret.request` (MCP-only, PROTOCOL §5.56): record a pending
+    /// secret request for the calling top-level agent. Returns
+    /// `{ requestId, agentId, name, reason, created }`; `created` is false
+    /// when a pending request for the same name was reused.
+    fn secret_request(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+        reason: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, name, reason);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.list` / `ws.secret.list` (PROTOCOL §5.56): names only —
+    /// `{ secrets, pendingRequests, answeredRequests }` for one agent.
+    fn secret_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.forget` / `ws.secret.forget` (PROTOCOL §5.56): drop one of an
+    /// agent's held secrets → `{ ok, forgotten }`.
+    fn secret_forget(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, name);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.provide` (PROTOCOL §5.56): answer a pending request with its
+    /// value, held in memory for the requesting agent only, and deliver the
+    /// provided notice. The value is never logged, echoed or persisted.
+    fn secret_provide(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+        value: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, request_id, value);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.dismiss` (PROTOCOL §5.56): decline a pending request and
+    /// deliver the declined notice.
+    fn secret_dismiss(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, request_id);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
     /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
     /// (an agent-owned scheduled script) after one immediate real run.
     /// `params` carries `{ name, code }` plus exactly one schedule kind —

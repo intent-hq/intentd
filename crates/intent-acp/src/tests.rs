@@ -7916,8 +7916,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Every gate is open by default.
-        let all_on_srv = server("amber-forest", None);
+        // Every gate open: the defaults plus the off-by-default
+        // `secretRequests` toggle (PROTOCOL §5.56).
+        let all_on_srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            },
+        );
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -8314,8 +8320,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A default top-level bridge stays byte-identical to the static const.
-        let top = server("amber-forest", None).with_sub_agent(false);
+        // A top-level bridge with every gate open stays byte-identical to
+        // the static const.
+        let top = server("amber-forest", None)
+            .with_sub_agent(false)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            });
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await

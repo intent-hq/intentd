@@ -256,6 +256,7 @@ mod runtime_config;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
+mod secret_requests;
 mod sentry_ops;
 mod settings;
 mod settings_registry;
@@ -848,6 +849,9 @@ pub struct Services {
     /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
     /// notice at worst.
     dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
+    /// Agent-owned secrets and pending secret requests (PROTOCOL §5.56).
+    /// Memory only: never persisted, so a restart drops every value.
+    secret_vault: Arc<secret_requests::SecretVault>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -1735,6 +1739,7 @@ impl Services {
             advisory_pending_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
+            secret_vault: Arc::new(secret_requests::SecretVault::default()),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
@@ -18602,6 +18607,9 @@ impl Services {
             // Producer admission is already closed: no new subscription can
             // register behind this sweep while the store cleanup yields.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Drop the workspace's memory-held secrets and pending secret
+            // requests (§5.56) before its rows go.
+            services.secret_vault.clear_workspace(&id);
             // Eagerly abort the workspace's live hook scheduler tasks BEFORE
             // the store cascade drops their rows — otherwise each task would
             // linger until its next tick before noticing the row is gone.
@@ -24217,6 +24225,9 @@ impl WorkspaceApi for Services {
                 // Desktop authority never survives archive, the caller's
                 // included: unarchive must not hand it back without consent.
                 this.desktop_terminate_workspace(&id).await;
+                // Archiving drops every memory-held secret and pending
+                // request in the workspace (§5.56); unarchive starts empty.
+                this.secret_vault.clear_workspace(&id);
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect
@@ -35803,6 +35814,78 @@ impl WorkspaceApi for Services {
                 .run_for_workspace(self, workspace_id, params)
                 .await
         })
+    }
+
+    fn agent_host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.agent_host_exec_op(workspace_id, agent_id, params))
+    }
+
+    fn secret_request(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+        reason: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.secret_request_op(workspace_id, agent_id, name, reason))
+    }
+
+    fn secret_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.secret_list_op(workspace_id, agent_id).await
+        })
+    }
+
+    fn secret_forget(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            self.secret_forget_op(workspace_id, agent_id, name).await
+        })
+    }
+
+    fn secret_provide(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+        value: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let value = zeroize::Zeroizing::new(value);
+        Box::pin(self.secret_answer_op(
+            workspace_id,
+            request_id,
+            secret_requests::Outcome::Provided,
+            Some(value),
+        ))
+    }
+
+    fn secret_dismiss(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.secret_answer_op(
+            workspace_id,
+            request_id,
+            secret_requests::Outcome::Declined,
+            None,
+        ))
     }
 
     fn pr_monitor_start_addressed(

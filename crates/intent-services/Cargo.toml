@@ -53,6 +53,8 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 sha2 = "0.11"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+zeroize = "1.9"
+aho-corasick = "1.1"
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
