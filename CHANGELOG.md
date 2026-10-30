@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.77] - 2026-10-30
+
+### 🧪 Testing
+
+- *(services)* Isolate tests from the user's ~/intent ([#2790](https://github.com/intent-hq/intentd/pull/2790))
+
+
 ## [0.11.76] - 2026-10-29
 
 ### 🚀 Features
