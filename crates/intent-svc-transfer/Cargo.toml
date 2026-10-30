@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-transfer"
-version = "0.11.84"
+version = "0.11.85"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,12 +8,12 @@ license.workspace = true
 description = "Workspace transfer (plan, export, import) for intentd, built on intent-services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.84" }
-intent-core = { path = "../intent-core", version = "0.11.84" }
-intent-store = { path = "../intent-store", version = "0.11.84" }
-intent-git = { path = "../intent-git", version = "0.11.84" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.84" }
-intent-providers = { path = "../intent-providers", version = "0.11.84" }
+intent-services = { path = "../intent-services", version = "0.11.85" }
+intent-core = { path = "../intent-core", version = "0.11.85" }
+intent-store = { path = "../intent-store", version = "0.11.85" }
+intent-git = { path = "../intent-git", version = "0.11.85" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.85" }
+intent-providers = { path = "../intent-providers", version = "0.11.85" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 reqwest = { workspace = true }
@@ -27,8 +27,8 @@ uuid = { workspace = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.84", features = ["test-hooks"] }
-intent-providers = { path = "../intent-providers", version = "0.11.84", features = ["test-support"] }
+intent-services = { path = "../intent-services", version = "0.11.85", features = ["test-hooks"] }
+intent-providers = { path = "../intent-providers", version = "0.11.85", features = ["test-support"] }
 intent-test-macros = { path = "../intent-test-macros" }
 intentd-test-support = { path = "../intentd-test-support" }
 sqlx.workspace = true
