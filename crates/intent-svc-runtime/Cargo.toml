@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-runtime"
-version = "0.11.81"
+version = "0.11.82"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,15 +8,15 @@ license.workspace = true
 description = "Scripts, hooks, terminals, browser tabs and sandboxes for intentd, built on intent-services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.81" }
-intent-core = { path = "../intent-core", version = "0.11.81" }
-intent-store = { path = "../intent-store", version = "0.11.81" }
-intent-git = { path = "../intent-git", version = "0.11.81" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.81" }
-intent-providers = { path = "../intent-providers", version = "0.11.81" }
-intent-acp = { path = "../intent-acp", version = "0.11.81" }
-intent-js = { path = "../intent-js", version = "0.11.81" }
-intent-pty = { path = "../intent-pty", version = "0.11.81" }
+intent-services = { path = "../intent-services", version = "0.11.82" }
+intent-core = { path = "../intent-core", version = "0.11.82" }
+intent-store = { path = "../intent-store", version = "0.11.82" }
+intent-git = { path = "../intent-git", version = "0.11.82" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.82" }
+intent-providers = { path = "../intent-providers", version = "0.11.82" }
+intent-acp = { path = "../intent-acp", version = "0.11.82" }
+intent-js = { path = "../intent-js", version = "0.11.82" }
+intent-pty = { path = "../intent-pty", version = "0.11.82" }
 base64 = { workspace = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 croner = "4.0.0"
@@ -35,10 +35,10 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.81", features = ["test-hooks", "repository-test-fixtures"] }
-intent-providers = { path = "../intent-providers", version = "0.11.81", features = ["test-support"] }
-intent-store = { path = "../intent-store", version = "0.11.81", features = ["test-support"] }
-intent-acp = { path = "../intent-acp", version = "0.11.81", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.82", features = ["test-hooks", "repository-test-fixtures"] }
+intent-providers = { path = "../intent-providers", version = "0.11.82", features = ["test-support"] }
+intent-store = { path = "../intent-store", version = "0.11.82", features = ["test-support"] }
+intent-acp = { path = "../intent-acp", version = "0.11.82", features = ["test-hooks"] }
 intent-test-macros = { path = "../intent-test-macros" }
 intentd-test-support = { path = "../intentd-test-support" }
 sqlx.workspace = true
