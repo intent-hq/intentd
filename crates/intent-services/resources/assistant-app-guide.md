@@ -442,8 +442,8 @@ includes the other linked PRs, even when their details are not loaded.
 
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. The settings beside the prompt (below it on narrow
-windows) set the repository, branch, and setup first, then the **Model** and the
-**Agent** behavior. The workspace groups working files, notes, and agent
+windows) set the repository, branch, and setup first, then the **Agent** behavior
+and **Model**. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
 the form's retry instruction instead of creating a second workspace.
