@@ -1062,6 +1062,18 @@ chat it opens beside the conversation.
 
 <!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 
+
+## Review and commit workspace changes
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline}.svelte. -->
+
+In the workspace sidebar, open **Changes** to review files and commit history.
+Owners can toggle **Auto-commit** beside the file summary. **Unstaged** and
+**Staged** appear when they contain files; **Stage all** and **Unstage all** sit
+in their section headers. After staging files, open **Commit** to enter a message.
+An open commit draft stays available if the staged list changes.
+**Workspace start** marks the boundary; select it to show or hide earlier commits.
+
 ## Daemon lifecycle from the terminal
 
 For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
