@@ -6,12 +6,14 @@
 //! - `tests_hidden_field_egress` (this crate) runs each call against a stub
 //!   whose payloads carry every `AGENT_HIDDEN_FIELDS` key and fails if a
 //!   key survives;
-//! - `secret_egress` (intent-services) runs each call against the real
+//! - `tests_secret_egress` (intent-services) runs each call against the real
 //!   services with a planted secret value (PROTOCOL §5.56) and fails if the
 //!   value comes back.
 //!
 //! A new agent-facing egress that serves session or event data must be
-//! appended here, so both contracts cover it.
+//! appended here, so both contracts cover it; the
+//! `agent_hidden_field_egress_lint` test cross-checks binding files against
+//! these names.
 
 /// Which `workspace_api` server a call runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,11 +22,16 @@ pub enum EgressServer {
     Workspace,
     /// The Chief-of-Staff workspace (`ws.app.*`).
     Chief,
+    /// Not a `workspace_api` call: the services wake-metadata builder
+    /// (`build_event_notification_metadata`), which each test drives with its
+    /// own events. `code` is empty.
+    WakeMetadata,
 }
 
 /// One registered egress: a name for failure messages, the server it runs
 /// on, and the JS body. `{target}` is replaced by the agent whose data is
-/// read and `{workspace}` by that agent's workspace id.
+/// read, `{workspace}` by that agent's workspace id, and `{message}` /
+/// `{block}` by a message and block of that agent's conversation.
 #[derive(Debug, Clone, Copy)]
 pub struct EgressCall {
     pub name: &'static str,
@@ -33,21 +40,31 @@ pub struct EgressCall {
 }
 
 impl EgressCall {
-    /// The JS body with `{target}` and `{workspace}` filled in.
+    /// The JS body with the placeholders filled in.
     #[must_use]
-    pub fn render(&self, target: &str, workspace: &str) -> String {
+    pub fn render(&self, ids: &EgressIds<'_>) -> String {
         self.code
-            .replace("{target}", target)
-            .replace("{workspace}", workspace)
+            .replace("{target}", ids.target)
+            .replace("{workspace}", ids.workspace)
+            .replace("{message}", ids.message)
+            .replace("{block}", ids.block)
     }
+}
+
+/// The ids a test fills into [`EgressCall::code`].
+#[derive(Debug, Clone, Copy)]
+pub struct EgressIds<'a> {
+    pub target: &'a str,
+    pub workspace: &'a str,
+    pub message: &'a str,
+    pub block: &'a str,
 }
 
 const fn call(name: &'static str, server: EgressServer, code: &'static str) -> EgressCall {
     EgressCall { name, server, code }
 }
 
-/// Every agent-facing `workspace_api` egress that serves session or event
-/// data (the wake-metadata builder is driven separately by each test).
+/// Every agent-facing egress that serves session or event data.
 pub const AGENT_EGRESS_CALLS: &[EgressCall] = &[
     call(
         "ws.agent.status",
@@ -80,6 +97,16 @@ pub const AGENT_EGRESS_CALLS: &[EgressCall] = &[
         "return await ws.agent.readConversation('{target}', { lastN: 10 });",
     ),
     call(
+        "ws.agent.readConversation (tool calls)",
+        EgressServer::Workspace,
+        "return await ws.agent.readConversation('{target}', { lastN: 10, includeToolCalls: true });",
+    ),
+    call(
+        "ws.agent.getMessageBlock",
+        EgressServer::Workspace,
+        "return await ws.agent.getMessageBlock('{target}', '{message}', '{block}');",
+    ),
+    call(
         "ws.agent.summary",
         EgressServer::Workspace,
         "return await ws.agent.summary('{target}');",
@@ -88,6 +115,11 @@ pub const AGENT_EGRESS_CALLS: &[EgressCall] = &[
         "ws.event.query",
         EgressServer::Workspace,
         "return await ws.event.query({ eventType: 'agent:*' });",
+    ),
+    call(
+        "ws.event.query (all types)",
+        EgressServer::Workspace,
+        "return await ws.event.query({ limit: 200 });",
     ),
     call(
         "ws.event.query (paginated)",
@@ -120,6 +152,16 @@ pub const AGENT_EGRESS_CALLS: &[EgressCall] = &[
         "return await ws.app.agents.readConversation('{workspace}', '{target}', { lastN: 10 });",
     ),
     call(
+        "ws.app.agents.getMessageBlock",
+        EgressServer::Chief,
+        "return await ws.app.agents.getMessageBlock('{workspace}', '{target}', '{message}', '{block}');",
+    ),
+    call(
+        "ws.app.agents.readConversation (tool calls)",
+        EgressServer::Chief,
+        "return await ws.app.agents.readConversation('{workspace}', '{target}', { lastN: 10, includeToolCalls: true });",
+    ),
+    call(
         "ws.app.chats.list",
         EgressServer::Chief,
         "return await ws.app.chats.list();",
@@ -132,11 +174,18 @@ pub const AGENT_EGRESS_CALLS: &[EgressCall] = &[
     call(
         "ws.app.chats.getMessageBlock",
         EgressServer::Chief,
-        "return await ws.app.chats.getMessageBlock('{target}', 'm-1', 'b-1');",
+        "return await ws.app.chats.getMessageBlock('{target}', '{message}', '{block}');",
     ),
     call(
         "ws.app.chats.rename",
         EgressServer::Chief,
         "return await ws.app.chats.rename('{target}', 'Renamed chat');",
+    ),
+    // The name stays a literal: the egress lint reads the first string
+    // literal of each entry.
+    call(
+        "wake metadata (build_event_notification_metadata)",
+        EgressServer::WakeMetadata,
+        "",
     ),
 ];

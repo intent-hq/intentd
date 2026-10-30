@@ -30,7 +30,7 @@ use intent_core::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::egress_registry::{EgressServer, AGENT_EGRESS_CALLS};
+use crate::egress_registry::{EgressIds, EgressServer, AGENT_EGRESS_CALLS};
 use crate::WorkspaceMcpServer;
 
 /// Marker value injected under every hidden key; the assertion looks for the
@@ -592,25 +592,30 @@ impl Harness {
     }
 }
 
-/// The registered egresses: every shared `workspace_api` call from
-/// [`crate::egress_registry::AGENT_EGRESS_CALLS`], read as `a-1` against
-/// target `a-2`, plus the services wake-metadata builder.
+/// The registered egresses from
+/// [`crate::egress_registry::AGENT_EGRESS_CALLS`]: each `workspace_api` call
+/// read as `a-1` against target `a-2`, and the wake-metadata builder.
+const IDS: EgressIds<'static> = EgressIds {
+    target: TARGET,
+    workspace: WS,
+    message: "m-1",
+    block: "b-1",
+};
+
 async fn run_registry(h: &Harness) -> Vec<(String, Value)> {
     let mut outputs = Vec::new();
     for call in AGENT_EGRESS_CALLS {
-        let srv = match call.server {
-            EgressServer::Workspace => &h.srv,
-            EgressServer::Chief => &h.chief,
+        let out = match call.server {
+            EgressServer::Workspace => Harness::mcp(&h.srv, call.name, &call.render(&IDS)).await,
+            EgressServer::Chief => Harness::mcp(&h.chief, call.name, &call.render(&IDS)).await,
+            EgressServer::WakeMetadata => {
+                let events = typed_events();
+                let refs: Vec<&Event> = events.iter().collect();
+                intent_services::build_event_notification_metadata(&refs)
+            }
         };
-        let out = Harness::mcp(srv, call.name, &call.render(TARGET, WS)).await;
         outputs.push((call.name.to_string(), out));
     }
-    let events = typed_events();
-    let refs: Vec<&Event> = events.iter().collect();
-    outputs.push((
-        "wake metadata (build_event_notification_metadata)".to_string(),
-        intent_services::build_event_notification_metadata(&refs),
-    ));
     outputs
 }
 

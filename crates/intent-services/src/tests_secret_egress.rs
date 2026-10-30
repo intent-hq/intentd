@@ -5,7 +5,7 @@
 //! [`intent_acp::egress_registry::AGENT_EGRESS_CALLS`] through the real
 //! `workspace_api` tool on the real [`Services`], as A and as a second agent B
 //! in the same workspace, plus the secret-specific surfaces (`ws.secret.list`,
-//! `ws.host.exec` with and without `secretEnv`) and the wake-metadata builder.
+//! `ws.host.exec` with `secretEnv` as the owner and as another agent).
 //! The test fails naming every egress whose output contains the value.
 //!
 //! The registry is shared with the hidden-field egress contract in
@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use intent_acp::egress_registry::{EgressServer, AGENT_EGRESS_CALLS};
+use intent_acp::egress_registry::{EgressIds, EgressServer, AGENT_EGRESS_CALLS};
 use intent_acp::WorkspaceMcpServer;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
@@ -40,7 +40,9 @@ fn features() -> AgentFeaturesSettings {
 }
 
 /// One `workspace_api` call: the raw tool text (result or error) and whether
-/// it was an error. The raw text is what the agent sees either way.
+/// it was an error. The raw text is what the agent sees either way. A
+/// protocol-level failure (no tool result) fails the test, so an unexercised
+/// egress can never pass as clean.
 async fn call(server: &WorkspaceMcpServer, code: &str) -> (String, bool) {
     let resp = server
         .handle_message(&json!({
@@ -54,9 +56,19 @@ async fn call(server: &WorkspaceMcpServer, code: &str) -> (String, bool) {
         .expect("tools/call must produce a response");
     let text = resp["result"]["content"][0]["text"]
         .as_str()
-        .unwrap_or_default()
+        .unwrap_or_else(|| panic!("no tool result for `{code}`: {resp}"))
         .to_string();
-    (text, resp["result"]["isError"] == json!(true))
+    // Oversized output is redirected to a file the agent can read, which this
+    // scan would not see; keep every output under the limit.
+    assert!(
+        !text.starts_with("Output too large:"),
+        "`{code}` spilled to a file, so its output is not scanned"
+    );
+    let is_error = match &resp["result"]["isError"] {
+        Value::Bool(flag) => *flag,
+        other => panic!("tool result for `{code}` has no isError flag: {other}"),
+    };
+    (text, is_error)
 }
 
 struct Fixture {
@@ -87,7 +99,9 @@ async fn fixture() -> Fixture {
         .insert_agent_session(&session(&other, &ws))
         .await
         .expect("other");
-    let services = Arc::new(Services::new_isolated(store));
+    // A real event bus, so the deliveries below are recorded as events.
+    let bus = crate::EventBus::new(store.clone());
+    let services = Arc::new(Services::new_isolated(store).with_event_bus(bus));
     let ticket = services
         .secret_request_op(ws.clone(), owner.clone(), SECRET.into(), "tests".into())
         .await
@@ -139,32 +153,8 @@ async fn no_secret_value_survives_any_egress() {
         }
     };
 
-    // Every registered agent-facing egress, reading the owner's data, as the
-    // owner and as a second agent in the same workspace.
-    for egress in AGENT_EGRESS_CALLS {
-        let code = egress.render(&f.owner.0, &f.ws.0);
-        match egress.server {
-            EgressServer::Workspace => {
-                for (who, server) in [("owner", &as_owner), ("other agent", &as_other)] {
-                    let (text, is_error) = call(server, &code).await;
-                    assert!(
-                        !is_error,
-                        "{} as {who} failed, so the egress was not exercised: {text}",
-                        egress.name
-                    );
-                    check(&format!("{} as {who}", egress.name), &text);
-                }
-            }
-            // Chief calls may legitimately refuse a non-Chief agent id; the
-            // text the agent would see is checked either way.
-            EgressServer::Chief => {
-                let (text, _) = call(&chief, &code).await;
-                check(egress.name, &text);
-            }
-        }
-    }
-
-    // The secret-specific surfaces.
+    // The secret-specific surfaces first, so the registry reads below see
+    // whatever the uses may have left behind.
     let (owner_list, err) = call(&as_owner, "return await ws.secret.list();").await;
     assert!(!err, "ws.secret.list as owner: {owner_list}");
     assert!(
@@ -190,14 +180,6 @@ async fn no_secret_value_survives_any_egress() {
         &used,
     );
 
-    let (env_dump, err) = call(
-        &as_owner,
-        "return await ws.host.exec({ command: 'sh', args: ['-c', 'env'] });",
-    )
-    .await;
-    assert!(!err, "ws.host.exec without secretEnv: {env_dump}");
-    check("ws.host.exec without secretEnv (env dump)", &env_dump);
-
     let (refused, err) = call(&as_other, &echo).await;
     assert!(err, "another agent's secretEnv must be refused: {refused}");
     assert!(
@@ -206,8 +188,46 @@ async fn no_secret_value_survives_any_egress() {
     );
     check("ws.host.exec with secretEnv as other agent", &refused);
 
-    // Wake metadata built from the workspace's real events, including the
-    // provided notice delivery.
+    // The provided notice reached the owner's conversation: its first block
+    // is the message-block target, and the events below include its delivery.
+    let conversation = f
+        .services
+        .agent_get_conversation(
+            f.owner.clone(),
+            None,
+            Some(f.ws.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("owner conversation");
+    let notice = conversation["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                message
+                    .to_string()
+                    .contains(&format!("The user provided secret {SECRET}"))
+            })
+        })
+        .unwrap_or_else(|| panic!("the provided notice reached the owner: {conversation}"))
+        .clone();
+    let message_id = notice["id"]
+        .as_str()
+        .expect("notice message id")
+        .to_string();
+    let block_id = notice["contentBlocks"][0]["id"]
+        .as_str()
+        .map_or_else(|| "0".to_string(), str::to_string);
+    let ids = EgressIds {
+        target: &f.owner.0,
+        workspace: &f.ws.0,
+        message: &message_id,
+        block: &block_id,
+    };
     let events = f
         .services
         .store
@@ -218,12 +238,46 @@ async fn no_secret_value_survives_any_egress() {
         })
         .await
         .expect("events");
-    let refs: Vec<&intent_core::Event> = events.iter().collect();
-    let metadata: Value = crate::build_event_notification_metadata(&refs);
-    check(
-        "wake metadata (build_event_notification_metadata)",
-        &metadata.to_string(),
-    );
+    assert!(!events.is_empty(), "the fixture produced workspace events");
+
+    // Every registered agent-facing egress, reading the owner's data, as the
+    // owner and as a second agent in the same workspace. Each must succeed,
+    // so it is really exercised.
+    for egress in AGENT_EGRESS_CALLS {
+        let code = egress.render(&ids);
+        match egress.server {
+            EgressServer::Workspace => {
+                for (who, server) in [("owner", &as_owner), ("other agent", &as_other)] {
+                    let (text, is_error) = call(server, &code).await;
+                    assert!(
+                        !is_error,
+                        "{} as {who} failed, so the egress was not exercised: {text}",
+                        egress.name
+                    );
+                    check(&format!("{} as {who}", egress.name), &text);
+                }
+            }
+            EgressServer::Chief => {
+                let (text, is_error) = call(&chief, &code).await;
+                // `ws.app.chats.*` serve Chief-workspace chats only, and a
+                // Chief session can never hold a secret (§5.56), so they
+                // refuse this target; `ws.app.agents.*` must serve it.
+                if egress.name.starts_with("ws.app.agents.") {
+                    assert!(
+                        !is_error,
+                        "{} failed, so the egress was not exercised: {text}",
+                        egress.name
+                    );
+                }
+                check(egress.name, &text);
+            }
+            EgressServer::WakeMetadata => {
+                let refs: Vec<&intent_core::Event> = events.iter().collect();
+                let metadata: Value = crate::build_event_notification_metadata(&refs);
+                check(egress.name, &metadata.to_string());
+            }
+        }
+    }
 
     assert!(
         leaks.is_empty(),

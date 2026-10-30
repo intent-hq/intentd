@@ -3,7 +3,8 @@
 //! `intent_core::model::AGENT_HIDDEN_FIELDS` names session fields that must
 //! never reach an agent's transcript, and the contract test in
 //! `crates/intent-acp/src/tests_hidden_field_egress.rs` proves the scrub on
-//! every egress its `EGRESS_REGISTRY` lists — but only on those. A new
+//! every egress `AGENT_EGRESS_CALLS` (`crates/intent-acp/src/egress_registry.rs`)
+//! lists — but only on those. A new
 //! `ws.<ns>.*` binding that serializes an `AgentLite` / `Event` row, or a new
 //! services helper that copies `Event.data` into message metadata, would ship
 //! unproven unless someone remembered the registry. This source-scanning test
@@ -13,13 +14,13 @@
 //!   or event data (a `READER_TYPES` identifier, or a `READER_METHODS` call)
 //!   and is neither a `SCRUBBED_BINDINGS` row nor a `HAND_PICKED_BINDINGS` row;
 //! - a `SCRUBBED_BINDINGS` file does not call `strip_agent_hidden_fields`, or
-//!   no `EGRESS_REGISTRY` entry starts with its registry-name prefix;
+//!   no `AGENT_EGRESS_CALLS` entry starts with its registry-name prefix;
 //! - a `fn` under `crates/intent-services/src/` copies a `.data` field
 //!   wholesale (`e.data.clone()`, `"data": e.data,` … on an unborrowed
 //!   receiver) into a `json!` value and is neither a `WAKE_METADATA_BUILDERS`
 //!   row (registered, scrubbed) nor a `SAFE_DATA_COPIES` row (function name or `file::function`, never reaches an
 //!   agent; reason required), or a listed builder has no registry entry;
-//! - an `EGRESS_REGISTRY` entry is claimed by no `SCRUBBED_BINDINGS` prefix
+//! - an `AGENT_EGRESS_CALLS` entry is claimed by no `SCRUBBED_BINDINGS` prefix
 //!   and no `WAKE_METADATA_BUILDERS` name, or an allowlist row is stale (its
 //!   file / fn is gone or no longer matches) — so the allowlists here and the
 //!   registry cannot drift apart silently.
@@ -30,7 +31,7 @@
 //! first outside parens, brackets, and generics; modules declared
 //! `#[cfg(test)] mod name;`, `tests.rs` / `*_tests.rs` files, and `tests/`
 //! directories are skipped. Registry entry names are the first string literal
-//! of each top-level `( … )` tuple in `EGRESS_REGISTRY`. The lint is
+//! of each top-level `( … )` tuple in `AGENT_EGRESS_CALLS`. The lint is
 //! file-granular: it proves every binding file that serves session/event data
 //! is scrubbed and has SOME registry coverage; the contract test remains the
 //! per-entry proof, so a new `ws.<ns>.*` method in an already-scrubbed file
@@ -43,8 +44,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const REGISTRY_FILE: &str = "crates/intent-acp/src/tests_hidden_field_egress.rs";
-const REGISTRY_CONST: &str = "EGRESS_REGISTRY";
+const REGISTRY_FILE: &str = "crates/intent-acp/src/egress_registry.rs";
+const REGISTRY_CONST: &str = "AGENT_EGRESS_CALLS";
 const BINDINGS_DIR: &str = "crates/intent-acp/src/mcp_server/bindings";
 const SERVICES_DIR: &str = "crates/intent-services/src";
 const SCRUB_FN: &str = "strip_agent_hidden_fields";
@@ -76,7 +77,7 @@ const READER_METHODS: &[&str] = &[
     "event_workspace_summary",
 ];
 
-/// The allowlist, cross-checked against `EGRESS_REGISTRY` names.
+/// The allowlist, cross-checked against `AGENT_EGRESS_CALLS` names.
 struct Allowlist<'a> {
     /// Binding files whose `dispatch` scrubs every result: `(file, prefix)`
     /// where at least one registry entry name starts with `prefix`.
@@ -527,8 +528,8 @@ fn copies_data_into_json(body: &[Token<'_>]) -> Option<usize> {
 
 // ---- registry ---------------------------------------------------------------
 
-/// Entry names of `const EGRESS_REGISTRY: &[(&str, Producer)] = &[ … ];` —
-/// the first string literal of each top-level `( … )` tuple in the array.
+/// Entry names of `const AGENT_EGRESS_CALLS: &[…] = &[ … ];` — the first
+/// string literal of each top-level `call( … )` / `( … )` entry in the array.
 /// Brackets are depth-tracked and `"…"` literals / `//` comments skipped, so
 /// the JS snippets inside producers never count as structure.
 fn registry_names(root: &Path) -> Result<Vec<String>, String> {
@@ -871,7 +872,7 @@ mod fixture {
             r#"
             type Producer = fn(&Harness) -> Value;
             // ("ws.commented.out", |h| h.nothing()),
-            const EGRESS_REGISTRY: &[(&str, Producer)] = &[
+            const AGENT_EGRESS_CALLS: &[(&str, Producer)] = &[
                 ("ws.agent.list", |h| {
                     Box::pin(Harness::mcp(&h.srv, "ws.agent.list", "return await ws.agent.list([{(\"x\")}]);"))
                 }),
@@ -1059,7 +1060,7 @@ mod fixture {
             dir.path(),
             REGISTRY_FILE,
             r#"
-            const EGRESS_REGISTRY: &[(&str, Producer)] = &[
+            const AGENT_EGRESS_CALLS: &[(&str, Producer)] = &[
                 ("ws.agent.list", |h| Box::pin(h.list())),
                 ("ws.scratch.get", |h| Box::pin(h.get())),
                 ("wake metadata (build_meta)", |_h| Box::pin(async { build_meta() })),
