@@ -441,16 +441,17 @@ includes the other linked PRs, even when their details are not loaded.
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,SetupScriptEditor}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
-choose **Create workspace**. **Codebase**, **Branch**, and **Setup script** sit to the
-left of the prompt (below it on narrow windows). Choose the initial agent and model
-using the footer buttons on the left. Use **+** on the right to add context.
+choose **Create workspace**. The settings beside the prompt (below it on narrow
+windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
+Use **+** below the prompt to add context.
 These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
 **Add codebase** adds a local folder, links a GitHub repository, or creates a
 new one. Open the agent picker to search by name and choose who starts the workspace.
 In **Setup script**, pick the repository's config, the last-used setup, or a
-template, and edit its commands in the setup modal. **Done** or **Save & Done**
-keeps the changes; **Cancel** discards them. The workspace groups working files, notes, and agent
+template, and edit its commands in the same dialog. **Done** or **Save & Done**
+keeps the changes; the back arrow returns to the workspace form without applying edits.
+Your prompt draft stays intact. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
 the form's retry instruction instead of creating a second workspace.
