@@ -45,11 +45,33 @@ use crate::repository_credentials::{
 pub(crate) struct GitlabCredentialGate {
     mutex: Arc<tokio::sync::Mutex<()>>,
     repository: Arc<OnceLock<Arc<RepositoryOwner>>>,
-    /// Serializes native review's own optional-metadata readers: the consuming
-    /// currency check and the background monitor observation. Every holder only
-    /// try-locks the ranked metadata locks, so a waiter is never queued behind
-    /// another lock or I/O and no wait cycle can form through this gate.
-    native_review: Arc<Mutex<()>>,
+    /// Turns between native review's own optional-metadata readers: the
+    /// consuming currency check and the background monitor observation.
+    native_review: Arc<NativeReviewGate>,
+}
+
+/// A turn is held only while its holder try-locks the ranked optional metadata
+/// locks (and, for the monitor, compares the snapshot). No holder blocks on a
+/// lock, awaits or runs a caller transfer while holding a turn, so waiting for
+/// one is bounded and cannot join a wait cycle. The gate guards no data.
+#[derive(Default)]
+pub(crate) struct NativeReviewGate {
+    busy: Mutex<bool>,
+    idle: std::sync::Condvar,
+}
+
+/// One held turn; `Send` so it can be released inside a metadata batch.
+pub(crate) struct NativeReviewTurn(Arc<NativeReviewGate>);
+
+impl Drop for NativeReviewTurn {
+    fn drop(&mut self) {
+        *self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.idle.notify_one();
+    }
 }
 
 pub(crate) struct GitlabCredentialGuard {
@@ -78,26 +100,41 @@ impl GitlabCredentialGate {
         Self {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             repository: Arc::new(OnceLock::new()),
-            native_review: Arc::new(Mutex::new(())),
+            native_review: Arc::default(),
         }
     }
 
-    /// Wait for any in-progress native-review metadata reader. Holders never
-    /// wait on another lock, so this wait is bounded. The gate guards no data;
-    /// a poisoned holder is ignored.
-    pub(crate) fn native_review_gate(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.native_review
+    /// Wait for the current native-review metadata reader's turn to end. Turns
+    /// are short and never wait on another lock, so this wait is bounded.
+    pub(crate) fn native_review_turn(&self) -> NativeReviewTurn {
+        let gate = &self.native_review;
+        let mut busy = gate
+            .busy
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *busy {
+            busy = gate
+                .idle
+                .wait(busy)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *busy = true;
+        NativeReviewTurn(gate.clone())
     }
 
     /// Background readers skip instead of queueing behind a consuming check.
-    pub(crate) fn try_native_review_gate(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.native_review.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+    pub(crate) fn try_native_review_turn(&self) -> Option<NativeReviewTurn> {
+        let gate = &self.native_review;
+        let mut busy = match gate.busy.try_lock() {
+            Ok(busy) => busy,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if *busy {
+            return None;
         }
+        *busy = true;
+        Some(NativeReviewTurn(gate.clone()))
     }
 
     pub(crate) async fn lock(&self) -> GitlabCredentialGuard {

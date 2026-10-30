@@ -1013,9 +1013,12 @@ struct CapturedMetadata {
     authority: RepositoryAuthoritySnapshot,
     provider: Arc<RepositoryConnectionFacts>,
     settings: Option<(Arc<crate::SettingsRegistry>, Arc<SettingsSnapshot>)>,
-    /// Completed background monitor observations, for test synchronization.
+    /// Completed and in-flight background monitor observations, for test
+    /// synchronization.
     #[cfg(test)]
     monitor_ticks: AtomicUsize,
+    #[cfg(test)]
+    monitor_inflight: AtomicUsize,
 }
 impl CapturedMetadata {
     async fn validate(&self, execution: bool) -> Result<Arc<Connection>> {
@@ -2263,6 +2266,8 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .map(|s| (s.clone(), s.snapshot())),
         #[cfg(test)]
         monitor_ticks: AtomicUsize::new(0),
+        #[cfg(test)]
+        monitor_inflight: AtomicUsize::new(0),
     });
     if let Some(parent) = &r.predecessor {
         companion_observe!(r.probe, Metadata, parent.metadata.validate(true).await)?;
@@ -2750,6 +2755,8 @@ fn monitor(op: &Arc<Operation>) {
                 op.retire();
             } else {
                 let metadata = op.metadata.clone();
+                #[cfg(test)]
+                op.metadata.monitor_inflight.fetch_add(1, Ordering::AcqRel);
                 // One observation per retained operation, awaited to real completion.
                 // The original record permits remain held by `op` throughout. No R
                 // fence or settings guard crosses into the P observation, which never
@@ -2774,7 +2781,10 @@ fn monitor(op: &Arc<Operation>) {
                     tracing::debug!(operation = %op.id, phase = "monitor-metadata", "native review admission refused");
                 }
                 #[cfg(test)]
-                op.metadata.monitor_ticks.fetch_add(1, Ordering::AcqRel);
+                {
+                    op.metadata.monitor_ticks.fetch_add(1, Ordering::AcqRel);
+                    op.metadata.monitor_inflight.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             let expired = op.disclosure_current().is_err();
             let busy = {

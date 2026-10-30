@@ -850,7 +850,7 @@ impl RepositoryConnectionFacts {
         entered: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     ) {
-        let _gate = self.gate.native_review_gate();
+        let _turn = self.gate.native_review_turn();
         self.hold_native_review_metadata_for_test(entered, release);
     }
 }

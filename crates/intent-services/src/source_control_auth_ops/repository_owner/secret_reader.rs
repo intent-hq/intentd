@@ -613,8 +613,8 @@ impl RepositoryConnectionFacts {
         facts: &Self,
         transfer: impl FnOnce(bool) -> Result<()> + Send,
     ) -> Result<()> {
-        let _gate = facts.gate.native_review_gate();
-        RepositoryReadEligibility::with_output(&[], Some(facts), transfer)
+        let turn = facts.gate.native_review_turn();
+        RepositoryReadEligibility::with_output_turn(&[], Some(facts), Some(turn), transfer)
     }
 
     /// Observe only the originally captured metadata for background retirement.
@@ -625,7 +625,7 @@ impl RepositoryConnectionFacts {
     /// the caller retries on its next tick. A captured missing attachment can
     /// never adopt a later installation; poison is an error.
     pub(crate) fn native_review_monitor_observation(&self) -> Result<NativeReviewObservation> {
-        let Some(_gate) = self.gate.try_native_review_gate() else {
+        let Some(_turn) = self.gate.try_native_review_turn() else {
             return Ok(NativeReviewObservation::Busy);
         };
         let settings = match self.attachment {
@@ -1240,6 +1240,19 @@ impl RepositoryReadEligibility {
         optional: Option<&RepositoryConnectionFacts>,
         transfer: impl FnOnce(bool) -> Result<()> + Send,
     ) -> Result<()> {
+        Self::with_output_turn(originals, optional, None, transfer)
+    }
+
+    /// `turn` is passed only with no required originals, so every lock taken
+    /// under it is a non-waiting optional try-lock. It ends once the metadata
+    /// guards are held, before any comparison or the caller's transfer runs.
+    fn with_output_turn(
+        originals: &[&Self],
+        optional: Option<&RepositoryConnectionFacts>,
+        turn: Option<super::NativeReviewTurn>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        debug_assert!(turn.is_none() || originals.is_empty());
         let optional = optional.filter(|facts| facts.retained_owner().is_some());
         let mut owners = originals
             .iter()
@@ -1287,6 +1300,7 @@ impl RepositoryReadEligibility {
                 .zip(&required)
                 .map(|(owner, required)| output_lock(&owner.evidence.published, *required))
                 .collect::<Result<Vec<_>>>()?;
+            drop(turn);
             for ((original, index), selected) in originals.iter().zip(indices).zip(selected) {
                 original.check_source(
                     settings[index],
@@ -1525,6 +1539,17 @@ impl RepositoryReadEligibility {
 
 /// Required locks retain their existing blocking/error semantics. Additional
 /// optional locks never block and never recover poisoned data.
+fn output_lock<T>(
+    mutex: &Mutex<T>,
+    required: bool,
+) -> Result<Option<std::sync::MutexGuard<'_, T>>> {
+    if required {
+        mutex.lock().map(Some).map_err(|_| Error::Indeterminate)
+    } else {
+        Ok(mutex.try_lock().ok())
+    }
+}
+
 /// Background observation lock: blocking, or `Ok(None)` while busy. Poison is
 /// an error either way, unlike the optional output path.
 fn observation_lock<T>(
@@ -1538,17 +1563,6 @@ fn observation_lock<T>(
         Ok(guard) => Ok(Some(guard)),
         Err(std::sync::TryLockError::WouldBlock) => Ok(None),
         Err(std::sync::TryLockError::Poisoned(_)) => Err(Error::Indeterminate),
-    }
-}
-
-fn output_lock<T>(
-    mutex: &Mutex<T>,
-    required: bool,
-) -> Result<Option<std::sync::MutexGuard<'_, T>>> {
-    if required {
-        mutex.lock().map(Some).map_err(|_| Error::Indeterminate)
-    } else {
-        Ok(mutex.try_lock().ok())
     }
 }
 
