@@ -10836,6 +10836,17 @@ mod wsapi6_bindings_tests {
     }
 
     #[tokio::test]
+    async fn browser_docs_overview_states_full_frame_rate_during_agent_use() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('overview');").await;
+        let v = body(&resp);
+        let doc = v.as_str().expect("docs return string");
+        assert!(doc.contains("**Frame rate during agent use.**"));
+        assert!(doc.contains("draws at full\nframe rate"));
+        assert!(doc.contains("30 s\nafter your last action"));
+    }
+
+    #[tokio::test]
     async fn browser_docs_rejects_unknown_topic() {
         let (srv, _api) = server();
         let resp = call(&srv, "return await ws.browser.docs('bogus');").await;
