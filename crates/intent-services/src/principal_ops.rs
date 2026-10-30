@@ -195,16 +195,15 @@ pub(crate) fn executor_forbidden() -> Error {
 }
 
 /// Resolve the current request's caller to a principal id. `None` when no
-/// caller is bound.
+/// caller is bound, or for an executor credential.
 pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<PrincipalId>> {
     match current_caller() {
-        None => Ok(None),
+        // An executor credential is not a person and acts for no principal.
+        None | Some(Caller::Executor { .. }) => Ok(None),
         Some(Caller::Wire { principal_id, .. }) => Ok(Some(principal_id)),
         Some(Caller::Agent { .. } | Caller::Daemon) => {
             Ok(Some(store.get_primary_principal().await?.id))
         }
-        // An executor credential is not a person and acts for no principal.
-        Some(Caller::Executor { .. }) => Ok(None),
     }
 }
 
