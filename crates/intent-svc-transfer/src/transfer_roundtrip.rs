@@ -627,6 +627,7 @@ async fn seed_source(
     ws.repository_path = Some(repo.to_string_lossy().into_owned());
     ws.repository_name = Some("test-repo".to_string());
     ws.label = Some("For Later".to_string());
+    ws.auto_archive_disabled = true;
     svc.store().insert_workspace(&ws).await.expect("workspace");
 
     svc.store()
@@ -1312,6 +1313,10 @@ async fn transfer_round_trip_between_two_stacks() {
         imported.label.as_deref(),
         Some("For Later"),
         "the workspace label rides the transfer"
+    );
+    assert!(
+        imported.auto_archive_disabled,
+        "the auto-archive opt-out rides the transfer"
     );
     // Worktree: right tip, dirty state restored (WIP snapshot unwound).
     assert_eq!(repo_head(&checkout), seeded.main_tip);

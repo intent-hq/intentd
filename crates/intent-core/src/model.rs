@@ -344,6 +344,12 @@ pub struct Workspace {
     /// workspaces hold. Omitted (not `null`) when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Per-workspace auto-archive opt-out (§5.1 "Auto-archive opt-out"):
+    /// while `true` the automatic archive sweep never archives this
+    /// workspace. Off by default. Set via `workspace.update
+    /// { autoArchiveDisabled }` (owner-only). Omitted (not `false`) while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_archive_disabled: bool,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -654,6 +660,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "statusMessage",
     "statusImageAssetId",
     "label",
+    "autoArchiveDisabled",
     "activity",
     "attention",
     "createdAt",
@@ -1647,6 +1654,17 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_optional_field"
     )]
     pub label: Option<Option<String>>,
+    /// Auto-archive opt-out (§5.1 `Workspace.autoArchiveDisabled`): `true`
+    /// exempts the workspace from the automatic archive sweep, `false`
+    /// re-enables it, missing leaves it untouched; an explicit `null` (or any
+    /// other non-boolean) is a deserialize error (`-32602`). Owner-only — not
+    /// in the collaborator-editable allowlist.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_field"
+    )]
+    pub auto_archive_disabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1719,6 +1737,17 @@ pub struct WorkspaceUpdate {
     pub attention: Option<WorkspaceAttention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+/// A field that is optional but, when present, must hold a non-null `T`:
+/// missing (via `#[serde(default)]`) is `None`, a present value is
+/// `Some(value)`, and a wire `null` fails like any other wrong type.
+fn deserialize_present_field<'de, T, D>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
