@@ -254,22 +254,6 @@ pub(crate) const EMBEDDED_BUNDLED_V3_6: &[(&str, &str)] = &[
     ),
     EMBEDDED_BUNDLED_V3_1[6],
     EMBEDDED_BUNDLED_V3_1[8],
-    (
-        "developer-legacy",
-        include_str!("../resources/specialists/v3.6/developer-legacy.md"),
-    ),
-    (
-        "coordinator-legacy",
-        include_str!("../resources/specialists/v3.6/coordinator-legacy.md"),
-    ),
-    (
-        "implementor-legacy",
-        include_str!("../resources/specialists/v3.6/implementor-legacy.md"),
-    ),
-    (
-        "verifier-legacy",
-        include_str!("../resources/specialists/v3.6/verifier-legacy.md"),
-    ),
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
@@ -2390,27 +2374,6 @@ mod tests {
         assert!(old.canonical_id("lead", None).is_none());
         assert!(svc.resolve("verifier", None).is_none());
         assert!(old.resolve("verifier", None).is_some());
-        for id in [
-            "developer-legacy",
-            "coordinator-legacy",
-            "implementor-legacy",
-            "verifier-legacy",
-        ] {
-            assert_eq!(svc.canonical_id(id, None).as_deref(), Some(id));
-            assert!(old.resolve(id, None).is_none());
-            assert_eq!(
-                svc.resolve_is_orchestrator(id, None),
-                id == "coordinator-legacy"
-            );
-        }
-        let coordinator = svc.resolve("coordinator-legacy", None).unwrap();
-        assert_eq!(
-            coordinator["teamAgents"],
-            json!(["implementor-legacy", "verifier-legacy"])
-        );
-        for id in ["implementor-legacy", "verifier-legacy"] {
-            assert_eq!(svc.resolve_role(id, None).as_deref(), Some("internal"));
-        }
     }
 
     /// Name-based fallback: sessions can carry an orchestrator id without a
@@ -2914,7 +2877,7 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    const LATEST_EMBEDDED_IDS: [&str; 12] = [
+    const LATEST_EMBEDDED_IDS: [&str; 8] = [
         "spec-writer",
         "implementor",
         "developer",
@@ -2923,10 +2886,6 @@ mod tests {
         "ui-designer",
         "pr-reviewer",
         "vulnerability-scanner",
-        "developer-legacy",
-        "coordinator-legacy",
-        "implementor-legacy",
-        "verifier-legacy",
     ];
 
     #[test]

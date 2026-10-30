@@ -40,22 +40,6 @@ mod tests {
                 "pr-reviewer",
                 "0ca55d5b0bd14f942cea27f96b6f5e5a3a3115e86c25229b65845a55045729a7",
             ),
-            (
-                "developer-legacy",
-                "14b08458a96ebdb53c8ad1244c3181b8013cdea99185d30e46a1ebce69db870f",
-            ),
-            (
-                "coordinator-legacy",
-                "9c37755b2464c55537c5666b6468f1b5827c5e46fe70e62babb13de498a8efaf",
-            ),
-            (
-                "implementor-legacy",
-                "4a00641fee14572683c7264233499de3fd4c11ed18515e5a5520d45b99c46bf4",
-            ),
-            (
-                "verifier-legacy",
-                "42ebe6fee95eef659ceeac955dd91a985eeba154dc5ad68fe5e48152882d5396",
-            ),
         ] {
             let content = super::ENTRY
                 .doctrine
@@ -74,7 +58,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_6_versions_workflows_and_preserves_legacy_choices() {
+    fn v3_6_versions_workflows_and_removes_verifier() {
         let current = super::super::resolve_entry("3.6");
         let previous = super::super::resolve_entry("3.5");
         assert_eq!(current.version, "3.6");
@@ -87,7 +71,7 @@ mod tests {
         assert_eq!(current.feature_labels, previous.feature_labels);
         assert_eq!(
             current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len() + 3
+            previous.doctrine.specialists.len() - 1
         );
         for (old_id, old) in previous.doctrine.specialists {
             let replacement = current

@@ -506,73 +506,42 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "persisted session carries the canonical id"
     );
 
-    let listed = wss_rpc(&mut ws, 10, "specialist.list", json!({})).await;
-    let catalog = listed["specialists"]
-        .as_array()
-        .expect("specialist catalog");
-    for (id, name, restricted) in [
-        ("developer-legacy", "Developer (Legacy)", false),
-        ("coordinator-legacy", "Coordinator (Legacy)", true),
-        ("implementor-legacy", "Implementor (Legacy)", false),
-        ("verifier-legacy", "Verifier (Legacy)", false),
+    // Removed bundled choices cannot create new sessions.
+    for removed in [
+        "verifier",
+        "developer-legacy",
+        "coordinator-legacy",
+        "implementor-legacy",
+        "verifier-legacy",
     ] {
-        assert!(catalog.iter().any(|def| def["id"] == id));
-        let legacy = wss_rpc(
+        let rejected = wss_rpc_raw(
             &mut ws,
-            11,
+            5,
             "agent.create",
             json!({
                 "workspaceId": ws_id,
-                "specialistId": id,
+                "specialistId": removed,
                 "model": "opus",
                 "provider": "auggie"
             }),
         )
         .await;
-        assert_eq!(legacy["agent"]["name"], name);
-        let legacy_id = legacy["agent"]["id"].as_str().expect("legacy agent id");
-        let stored = wss_rpc(
-            &mut ws,
-            12,
-            "agent.getSession",
-            json!({"agentId": legacy_id}),
-        )
-        .await;
-        assert_eq!(stored["session"]["specialist"], id);
         assert_eq!(
-            stored["session"]["metadata"]["specialistIsOrchestrator"],
-            restricted
+            rejected["error"]["code"], -32602,
+            "unknown specialist rejects with invalid-params: {rejected}"
+        );
+        let msg = rejected["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            msg.contains(&format!("unknown specialist: {removed}")),
+            "error names the id: {msg}"
+        );
+        assert!(
+            msg.contains("known specialists:") && msg.contains("spec-writer"),
+            "error lists the known ids: {msg}"
         );
     }
-
-    // The removed current Verifier cannot create new sessions.
-    let rejected = wss_rpc_raw(
-        &mut ws,
-        5,
-        "agent.create",
-        json!({
-            "workspaceId": ws_id,
-            "specialistId": "verifier",
-            "model": "opus",
-            "provider": "auggie"
-        }),
-    )
-    .await;
-    assert_eq!(
-        rejected["error"]["code"], -32602,
-        "unknown specialist rejects with invalid-params: {rejected}"
-    );
-    let msg = rejected["error"]["message"]
-        .as_str()
-        .expect("error message");
-    assert!(
-        msg.contains("unknown specialist: verifier"),
-        "error names the id: {msg}"
-    );
-    assert!(
-        msg.contains("known specialists:") && msg.contains("spec-writer"),
-        "error lists the known ids: {msg}"
-    );
 
     drop(daemon);
 }
@@ -693,18 +662,14 @@ async fn embedded_bundled_catalog_over_wss() {
         ids,
         [
             "chief-of-staff",
-            "coordinator-legacy",
             "developer",
-            "developer-legacy",
             "implementor",
-            "implementor-legacy",
             "pr-reviewer",
             "spec-writer",
             "ui-designer",
-            "verifier-legacy",
             "vulnerability-scanner",
         ],
-        "bundled catalog over WSS contains the current and opt-in legacy specialists"
+        "bundled catalog over WSS contains only the current specialists"
     );
     assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
