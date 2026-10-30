@@ -88,9 +88,29 @@ fn update_param_deserializes_as_optional_bool() {
         opt_out_update(&json!(false)).auto_archive_disabled,
         Some(false)
     );
-    assert!(
-        serde_json::from_value::<WorkspaceUpdate>(json!({ "autoArchiveDisabled": "yes" })).is_err()
-    );
+    for bad in [json!("yes"), Value::Null, json!(1)] {
+        assert!(
+            serde_json::from_value::<WorkspaceUpdate>(json!({ "autoArchiveDisabled": bad }))
+                .is_err(),
+            "{bad} must be rejected"
+        );
+    }
+}
+
+/// The virtual Chief workspace is never persisted or auto-archived, so the
+/// opt-out is refused there instead of being echoed and lost.
+#[intent_test_macros::daemon_test]
+async fn chief_rejects_opt_out() {
+    let h = harness().await;
+    let err = h
+        .services
+        .update_workspace(
+            WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID),
+            opt_out_update(&json!(true)),
+        )
+        .await
+        .expect_err("chief refused");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
 }
 
 /// Off by default and omitted from the payload; on/off persist, show on get

@@ -23811,6 +23811,14 @@ impl WorkspaceApi for Services {
             if let Some(e) = label_error {
                 return Err(e);
             }
+            // Chief is virtual (never persisted) and never auto-archived, so
+            // an opt-out there could only be echoed and then lost.
+            if id.is_chief() && update.auto_archive_disabled.is_some() {
+                return Err(Error::InvalidParams(
+                    "workspace.update: `autoArchiveDisabled` does not apply to the Chief workspace"
+                        .to_string(),
+                ));
+            }
             // `Retired` is entered only through `workspace.retire` / the
             // automatic sweep (ownership proof, teardown, folder removal):
             // a generic status write must never produce it.
