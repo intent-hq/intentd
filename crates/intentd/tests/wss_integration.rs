@@ -243,6 +243,20 @@ async fn make_services(
     Arc<intent_services::SettingsRegistry>,
     tempfile::TempDir,
 ) {
+    make_services_with_source_control(auggie_bin, models_cache_dir, None).await
+}
+
+async fn make_services_with_source_control(
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+    source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
+) -> (
+    Arc<dyn WorkspaceApi>,
+    EventBus,
+    Store,
+    Arc<intent_services::SettingsRegistry>,
+    tempfile::TempDir,
+) {
     let dir = test_tempdir("intentd-wss-");
     let store = Store::open(&dir.path().join("intentd.db"))
         .await
@@ -269,6 +283,9 @@ async fn make_services(
     }
     if let Some(cache_dir) = models_cache_dir {
         services = services.with_models_cache_dir(&cache_dir);
+    }
+    if let Some(source_control) = source_control {
+        services = services.with_source_control(source_control);
     }
     // Mirror the production composition root (main.rs): the AS-3
     // completion-delivery worker turns agent completion events
@@ -326,12 +343,23 @@ async fn start_with_auggie_and_models_cache(
 
 /// Build + start a WSS listener with an optional system control implementation.
 async fn start_with_control(
-    mut opts: WsOptions,
+    opts: WsOptions,
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
     system_control: Option<Arc<dyn SystemControl>>,
 ) -> Server {
-    let (api, bus, store, registry, dir) = make_services(auggie_bin, models_cache_dir).await;
+    start_with_source_control(opts, auggie_bin, models_cache_dir, system_control, None).await
+}
+
+async fn start_with_source_control(
+    mut opts: WsOptions,
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+    system_control: Option<Arc<dyn SystemControl>>,
+    source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
+) -> Server {
+    let (api, bus, store, registry, dir) =
+        make_services_with_source_control(auggie_bin, models_cache_dir, source_control).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -794,7 +822,44 @@ async fn wss_workspace_auto_commit_round_trip() {
 /// rejects `-32602` before any state change.
 #[intent_test_macros::daemon_test]
 async fn wss_workspace_create_context_links_round_trip_and_validation() {
-    let srv = start(WsOptions::default()).await;
+    // The wire contract does not depend on live forge metadata. Exercise the
+    // registry-only best-effort lookup through the real adapter on loopback.
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind forge fixture");
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let mut forge = tokio::task::JoinSet::new();
+    forge.spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("forge connection");
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(request.len() < 16 * 1024, "bounded fixture headers");
+            stream.read_exact(&mut byte).await.expect("forge headers");
+            request.push(byte[0]);
+        }
+        let request = String::from_utf8(request).expect("request text");
+        let line = request.lines().next().expect("request line").to_string();
+        let body = r#"{"message":"Not Found"}"#;
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.expect("forge reply");
+        stream.shutdown().await.expect("close forge reply");
+        line
+    });
+    let source_control =
+        intent_sourcecontrol::GitHubSourceControl::new("context-links-fixture", Some(&base))
+            .expect("loopback forge");
+    let srv = start_with_source_control(
+        WsOptions::default(),
+        None,
+        None,
+        None,
+        Some(Arc::new(source_control)),
+    )
+    .await;
     let links = serde_json::json!([
         {
             "kind": "issue",
@@ -823,6 +888,15 @@ async fn wss_workspace_create_context_links_round_trip_and_validation() {
         created["result"]["workspace"]["contextLinks"], links,
         "create result carries the persisted links: {created}"
     );
+    let lookup = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        forge.join_next(),
+    )
+    .await
+    .expect("forge fixture completed")
+    .expect("forge task")
+    .expect("forge task succeeded");
+    assert_eq!(lookup, "GET /repos/intent-hq/intentd/pulls/7 HTTP/1.1");
     let ws_id = created["result"]["workspace"]["id"]
         .as_str()
         .expect("created id")
