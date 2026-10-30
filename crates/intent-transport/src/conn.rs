@@ -307,14 +307,16 @@ pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
     fences: Vec<JoinHandle<()>>,
     setup: crate::provider_setup::Connection,
-    /// The server-bound hello used to refresh browser hosting on a live upgrade.
-    pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
-    /// Keeps the hello'd `clientId` reported active
+    /// The last successful hello's identity, paired with the reservation
+    /// that keeps its `clientId` reported active
     /// ([`crate::reverse::PrimaryReverseRegistry::client_active`]) for the
-    /// connection's whole life, bound or not (intent-hq/intent#8045): a
-    /// guest connection a role change later binds (`ws.rs` `RoleChanged`)
-    /// is never treated as an absent host by the superseded-id tab rehome.
-    pub(crate) hello_reservation: Option<crate::reverse::BindingReservation>,
+    /// connection's whole life, bound or not (intent-hq/intent#8045). Both
+    /// bind paths — the hello and a later live role upgrade (`ws.rs`
+    /// `RoleChanged`) — bind from it, so a guest connection a role change
+    /// binds is never treated as an absent host by the superseded-id tab
+    /// rehome, and a connection without a successful hello has nothing to
+    /// bind with.
+    pub(crate) hello: Option<crate::reverse::HelloBinding>,
     /// The connection's presence identity (multiplayer w5); dropping it with
     /// the registry publishes the offline transition and releases every
     /// `note.presence` lease — declared after `subs` so the forwarders'
@@ -335,6 +337,28 @@ impl Drop for ConnSubs {
 }
 
 impl ConnSubs {
+    /// Reconcile browser hosting after a live role change (`ws.rs`
+    /// `RoleChanged`): record the channel's member authority, then an allowed
+    /// connection rebinds the reserved identity of its last successful hello
+    /// ([`Self::hello`]) — a connection without one stays unbound — and a
+    /// disallowed one withdraws hosting.
+    pub(crate) fn apply_browser_authority(
+        &self,
+        reverse: &ReverseChannel,
+        guard: &PrimaryReverseGuard,
+        allowed: bool,
+    ) {
+        reverse.set_browser_member(allowed);
+        if allowed {
+            if let Some(hello) = &self.hello {
+                guard.bind(hello);
+            }
+        } else {
+            guard.unbind();
+        }
+        guard.refresh_devices();
+    }
+
     /// The real committed removal event bypasses bulk delivery only for raw
     /// subscriptions that requested it. Every other event producer is stopped.
     pub(crate) fn removal_control(&self, event: &intent_core::Event) -> Vec<String> {
@@ -998,14 +1022,29 @@ async fn process_captured_frame(
                 {
                     reverse_guard.bind_device(identity.clone(), principal);
                 }
-                subs.hello_identity = Some(identity.clone());
-                reverse_guard.bind(identity);
-            }
-            // A successful hello keeps its reservation until the connection
-            // closes or hellos again; a failed one releases it.
-            if hello_ok {
-                subs.hello_reservation = binding;
+                // A successful hello keeps its reservation, paired with the
+                // identity, until the connection closes or hellos again; the
+                // previous hello's binding is released only after this bind.
+                match binding.map(|reservation| reservation.into_hello_binding(identity)) {
+                    Some(Ok(hello)) => {
+                        reverse_guard.bind(&hello);
+                        subs.hello = Some(hello);
+                    }
+                    // Fail closed: never bind an unreserved id, and never
+                    // keep the previous hello's identity bound or rebindable.
+                    Some(Err(reservation)) => {
+                        tracing::warn!(
+                            client_id = %reservation.client_id().as_str(),
+                            "client.hello: bound identity differs from its reservation; unbinding"
+                        );
+                        reverse_guard.unbind();
+                        subs.hello = None;
+                    }
+                    // A detached guard (registry shutting down) reserves nothing.
+                    None => {}
+                }
             } else {
+                // A failed hello releases its reservation.
                 drop(binding);
             }
             // Multiplayer w5: a hello'd connection is online for its

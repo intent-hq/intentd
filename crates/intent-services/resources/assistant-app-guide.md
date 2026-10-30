@@ -392,7 +392,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -678,7 +678,7 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
 Archive is the one way to put a workspace away. In **Home → Workspaces**,
 right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
@@ -694,6 +694,11 @@ PR monitor is still running, it is shared with guests, or it has uncommitted cha
 or unpushed commits. Commits from a pull request that Intent saw merged no longer
 count as unpushed, even after the merged branch is deleted on the remote; commits
 made after the merge still do.
+
+To keep one workspace from being archived automatically, right-click it in **Home →
+Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
+off for every workspace by default, only the workspace owner sees it, and it does not
+stop you archiving the workspace yourself.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
