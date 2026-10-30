@@ -182,18 +182,6 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ConnectionsSettings,GitLabAuthConnection,GitLabChildGitSetting}.svelte; messages/en.json. -->
-
-When explicitly asked about experimental GitLab terminal access, open **Connections
-→ Accounts → GitLab → Use GitLab account for terminal Git**. Only the connected
-host's owner can change this choice, and the daemon must support it. It defaults
-off for a new account or instance. Wait for the saved acknowledgement; an unavailable
-status does not mean off. Use **Refresh** to check the current choice after an error.
-Intent's own authorized Git operations work with this off. Enabling it lets terminal
-and agent Git commands request credentials for that account and full instance; it
-does not sign in `glab`. The GitLab section can remain visible for a configured
-account even when Labs is off; do not infer permission or readiness from visibility.
-
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
 For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. Users can also ask the Assistant to set up or update a server. Use `ws.app.mcp` to read existing configurations, avoid duplicates, and apply the requested change app-wide. These configuration tools are available only in Assistant chat; ordinary workspace agents retain access to enabled servers' tools.
@@ -392,7 +380,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -459,7 +447,7 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
@@ -618,23 +606,7 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeIntegrations,HomeRepositorySummary,HomeReviewConversation}.svelte; src/features/home/{home-repository-discovery-saga,home-integrations-saga,home-review-threads}.ts; messages/en.json. -->
-
-For the experimental GitLab review flow, open **Home → Pull requests**. The inner
-list is labeled **Merge requests** for GitLab alone or **Pull and merge requests**
-with both forges. It reads selected, known repositories through the current
-connection. **Closed / merged** includes merged and unmerged-closed MRs. Use
-**Load more** when offered, including after an empty filtered page. **Summary**
-shows the qualified project, description, available checks and approvals, merge
-requirements, and discussions with replies. Restricted, unknown, partial or
-unsupported information does not establish merge readiness. **Review head** and
-**Note diff head** distinguish the current review from a note's code position.
-The GitLab preview has no **Code** tab. Use **Review on GitLab** for provider-side
-actions. **Start workspace** opens the existing creation form with the qualified
-item; it does not automatically check out the MR source head. The separate
-**Linear issues** section is unchanged.
-
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, packages/intentd/crates/intent-store/migrations/0161_pull_request_workspace.sql. -->
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
 behavior** is **Show choices**, the default). If another workspace worked on that
@@ -685,7 +657,7 @@ grouping choices keep their behavior.
 
 ## Set aside workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga}.ts. -->
 
 **Set aside** is unreleased until the companion frontend change ships. In a
 supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
@@ -877,20 +849,6 @@ fails (for example, offline or without npm), Codex launches report the
 installed version, the required minimum, and the download error; Claude Code
 keeps using the installed CLI.
 
-## Missed display updates
-
-<!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
-
-When the app and connected daemon support recovery, detected gaps in state
-updates trigger a refresh of affected visible data. Inactive cached views refresh
-when next used. Recovery respects current access; it does not repeat commands or
-replay notifications, chat transcripts, or terminal output. Temporary terminal
-directory, title, and command indicators may clear until live updates resume.
-
-Older daemons retain their existing reconnect and refresh behavior; do not promise
-recovery from a missed final update. If a view stays stale, use its refresh action
-where available or reconnect, and check the app and daemon versions.
-
 ## Restore workspace browser use
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
@@ -984,16 +942,6 @@ With a supporting daemon, the desktop app shows a note over 500 KB truncated and
 render-only, with a banner, so the user cannot edit it there. Agents still read
 and write the full content; make large-note edits with note tools rather than
 asking the user to edit them in the app.
-
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
-
-When testing experimental GitLab context suggestions, choose **GL Issues** or
-**GL MRs** in workspace creation or the workspace context picker. Search the
-selected projects; **Use link** accepts an explicit project URL where offered.
-**Refresh** and **Load more** operate on that selection. Unsupported filters and
-partial results remain explicit. Selecting an item attaches its qualified context;
-it does not automatically check out the MR's source branch. Availability depends
-on the current connection, repository access and supported daemon.
 
 In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
 in a note's **…** menu to edit Markdown directly; large notes otherwise stay
