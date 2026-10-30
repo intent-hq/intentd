@@ -24139,243 +24139,10 @@ impl WorkspaceApi for Services {
         id: WorkspaceId,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<Workspace>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let this = self.clone();
-        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
-        // reference; read-only/test wiring with no manager attached simply
-        // skips the sweep and still archives.
-        let manager = self.agent_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.archive")
-                .await?;
-            // Chief cannot be archived: it is a fixed virtual workspace, so
-            // return the synthesized shape unchanged rather than mutating the
-            // seeded row (TS virtual-workspace guard parity).
-            if id.is_chief() {
-                return Ok(chief_workspace());
-            }
-            let mut ws = store.get_workspace(&id).await?;
-            // A retired workspace is already past archived; re-archiving
-            // would flip its status back to Archived without a folder.
-            if ws.is_retired() {
-                return Err(retire::retired_error(&id));
-            }
-            // Archive ↔ unarchive fence (see `ArchiveFence`): held from
-            // before the commit until the detached guests' queued messages
-            // are dropped and their removal deltas are out (the guard moves
-            // into the detached tail below). Every unarchive flips under the
-            // same fence, and `workspace.members.add` refuses while the row
-            // is archived, so no unarchive + re-add + fresh enqueue of a
-            // detached principal can interleave with the tail's drop — the
-            // tail never drops a message a CURRENT member queued nor
-            // announces the removal of a member who is seated again.
-            let fence = this.archive_fence.acquire(&id).await;
-            let now = now_iso();
-            // Archiving removes guests: the Archived flip, every non-owner
-            // membership delete and every open-invite revoke commit in ONE
-            // `BEGIN IMMEDIATE` transaction (scoped column write — never a
-            // full-row replace of the `get_workspace` read above). A store
-            // failure fails the RPC with the row still active: access
-            // revocation is never best-effort. Unarchive does NOT restore
-            // either; a guest rejoins by a fresh invite.
-            this.ports
-                .runtime()
-                .cancel_script_monitors(&this, &id, None, "workspace-archived")
-                .await?;
-            let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
-            ws.status = WorkspaceStatus::Archived;
-            ws.archived = true;
-            ws.archived_at = Some(now.clone());
-            ws.updated_at = now;
-            // Everything below the persist runs on a DETACHED task
-            // (intent-hq/monorepo#1577): the sweeps can cancel this very
-            // caller. A background hook whose script calls
-            // `ws.workspace.archive()` is itself swept by
-            // `cancel_workspace_hooks` below, which aborts the hook's
-            // scheduler task — i.e. the task awaiting this future. Inline,
-            // that abort dropped the rest of the tail mid-flight and the
-            // §6.5 `workspace:updated` delta was never published, leaving
-            // clients stale on an archived workspace. Spawning detaches the
-            // tail's lifetime from the caller's: aborting the caller only
-            // drops the `JoinHandle` (never the task), so the sweeps, the
-            // derived fields, and the emit always complete. On the hook path
-            // the abort means `archive()` never returns to the script, which
-            // stops running for good — the hook is `cancelled` by the sweep
-            // like any other hook in the workspace.
-            let id_for_log = id.clone();
-            let tail = self.store_tasks.spawn_draining(async move {
-                let mut ws = ws;
-                // Announce the committed guest sweep first — one
-                // `{ members, removedPrincipalId, memberCount }` delta per
-                // detached collaborator (queued messages dropped), then one
-                // `{ invites: true }` when an invite was revoked — so the
-                // deltas describe the transaction that just committed and
-                // precede every other archive-tail event. Still under the
-                // fence taken before the commit: released right after, so
-                // a waiting unarchive proceeds only once the drops and the
-                // removal deltas are done.
-                if let Some(park) = &this.archive_predrop_park {
-                    park.entered.notify_one();
-                    park.release.notified().await;
-                }
-                this.publish_archived_guest_deltas(&id, &guest_sweep).await;
-                if let Some(park) = &this.archive_tail_park {
-                    park.entered.notify_one();
-                    park.release.notified().await;
-                }
-                drop(fence);
-                // Gracefully interrupt every in-flight turn in the workspace —
-                // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
-                // turn cancelled over the wire, draining worker aborted, terminal
-                // `agent:stream:end` emitted, provider child + ACP session kept
-                // alive. Unlike `delete_workspace` nothing is deleted: session
-                // rows, transcripts, completion watches, and pending message
-                // queues all survive so unarchive can resume work. Runs AFTER the
-                // archived row is persisted so any concurrent queue-drain kick
-                // observes the archived flag and parks instead of respawning a
-                // turn (see the archived gate in `try_drain_queue`).
-                //
-                // Residual race (deliberate trade-off): a drain that read the
-                // workspace row BEFORE the persist above can still claim the
-                // in-flight slot after the `list_busy` snapshot below, spawning
-                // one stray turn in the freshly archived workspace that this
-                // sweep misses. The window is a few statements wide and the
-                // failure is benign — that turn runs to completion once and every
-                // subsequent drain/wake parks behind the archived gates — so the
-                // sweep accepts it rather than adding a post-claim re-check to
-                // the hot drain path.
-                //
-                // The initiating agent (`caller_agent_id`, set on the agent-facing
-                // `ws.workspace.archive` host — the MCP front door and the
-                // background-hook runtime, which builds the same host for the
-                // hook owner; the JSON-RPC front door passes `None`) is excluded.
-                // On the MCP path the caller is necessarily mid-turn — blocked
-                // awaiting this very tool call — so interrupting it aborts the
-                // worker that owns the in-flight MCP dispatch: the tool result
-                // never reaches the child, the turn never settles, and the busy
-                // slot leaks (workspace activity stays `agent_running`). The
-                // caller's turn ends normally once the tool result is delivered.
-                // On the hook path the "caller" is the hook owner, which may have
-                // an independent in-flight turn that this sweep now skips; that
-                // turn runs to completion in the freshly archived workspace and
-                // every subsequent drain/wake parks behind the archived gates —
-                // the same benign-runaway trade-off as the residual race above.
-                if let Some(manager) = manager {
-                    for (agent_id, agent_ws) in manager.list_busy() {
-                        if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
-                            manager.interrupt(&agent_id).await;
-                        }
-                    }
-                }
-                // Desktop authority never survives archive, the caller's
-                // included: unarchive must not hand it back without consent.
-                this.desktop_terminate_workspace(&id).await;
-                // Archiving drops every memory-held secret and pending
-                // request in the workspace (§5.56); unarchive starts empty.
-                this.secret_vault.clear_workspace(&id);
-                // Cancel every active background hook in the workspace: task
-                // aborted, state persisted to `cancelled`, `hook:cancelled`
-                // emitted — silently per hook. Unarchive does NOT resurrect
-                // cancelled hooks; the consolidated notice below tells the
-                // owner to reschedule if the condition still matters.
-                let cancelled_hooks = this.ports.runtime().cancel_workspace_hooks(&this, &id).await;
-                // Cancel every ACTIVE PR monitor the same way
-                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
-                // `prMonitor:cancelled` emitted, silently per monitor.
-                // Unarchive does NOT resurrect cancelled monitors. Without
-                // this sweep an archived workspace's displayStatus rollup
-                // reads `in_progress` indefinitely off the active-monitor
-                // signal.
-                let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
-                // ONE consolidated wake per affected owner naming every hook
-                // and monitor the two sweeps cancelled, THEN the owner's
-                // deferral backstop (the per-item cancels above skipped it so
-                // a deferred completion watch stays armed behind the queued
-                // notice). Runs AFTER the archived row is persisted so the
-                // wake parks behind the archived gate in
-                // `deliver_wake_message` (queued at most, no turn spawned) —
-                // the same reason the interrupt sweep above runs post-persist
-                // — and is only ever read after unarchive, which is the
-                // moment its wording is written for.
-                this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
-                    .await;
-                // Derive `lastActivity` (§9.1) so archive callers get the
-                // authoritative wire shape without a follow-up `workspace.get`,
-                // and persist it through the scoped monotonic write
-                // (monorepo#1585).
-                this.derive_and_persist_last_activity(&mut ws, "workspace.archive")
-                    .await;
-                // Derive `activity` from live agent state (§9.9) so the mutation
-                // response carries `agent_running` when agents are in-flight,
-                // not the stale default `idle` from the persisted row.
-                ws.activity = this.workspace_activity(&ws.id);
-                // §6.5 has no `workspace:archived`; mirror the reference emitter and
-                // publish `workspace:updated` with the full applied delta
-                // (`archived`/`status`/`archivedAt`) so subscribers flip state
-                // without a re-read. `archivedAt` is the same timestamp persisted
-                // on the row above.
-                //
-                // Fenced on the archive still being current: the sweeps above
-                // ran outside the fence, so an unarchive may have flipped the
-                // row (and announced `archived: false`) meanwhile — its own
-                // delta is the latest word, and re-announcing THIS call's
-                // archive after it would leave clients on a stale archived
-                // state. Re-read under the fence and publish only when the
-                // row still carries this call's `archivedAt`; the flip and
-                // its delta happen under the same fence, so the two
-                // announcements can never cross.
-                let _fence = this.archive_fence.acquire(&ws.id).await;
-                let still_archived = match store.get_workspace(&ws.id).await {
-                    Ok(row) => row.archived && row.archived_at == ws.archived_at,
-                    Err(e) => {
-                        tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %e,
-                            "workspace.archive: row re-read failed before the archived delta; publishing"
-                        );
-                        true
-                    }
-                };
-                if still_archived {
-                    publish_event(
-                        bus.as_ref(),
-                        workspace_updated_event(
-                            &ws.id,
-                            &serde_json::json!({
-                                "archived": true,
-                                "status": ws.status,
-                                "archivedAt": ws.archived_at,
-                            }),
-                        ),
-                    )
-                    .await;
-                }
-                ws
-            });
-            // Awaiting the handle keeps the caller-visible contract intact
-            // (the archived workspace is returned only after the tail ran);
-            // a cancelled caller simply drops this await while the detached
-            // tail runs on. A `JoinError` means the tail itself panicked —
-            // the row is already archived, so surface it rather than
-            // reporting a bogus success shape.
-            let tail =
-                tail.ok_or_else(|| Error::Internal("daemon writer admission closed".into()))?;
-            let mut ws = tail.await.map_err(|e| {
-                // The `JoinError` text names no workspace, so log the id —
-                // otherwise a panicked tail is undiagnosable from daemon logs.
-                tracing::error!(
-                    workspace = %id_for_log.as_str(),
-                    error = %e,
-                    "workspace.archive: post-persist tail task failed; row is archived"
-                );
-                Error::Internal(format!("archive tail task failed: {e}"))
-            })?;
-            // Membership summary (multiplayer w1) read AFTER the guest
-            // sweep, so the mutation response carries the post-detach
-            // `memberCount` / `openInviteCount`.
-            self.attach_workspace_membership(&mut ws).await;
-            Ok(ws)
+            self.archive_workspace_with_mode(id, caller_agent_id, false)
+                .await?
+                .ok_or_else(|| Error::Internal("manual archive refused".into()))
         })
     }
 
@@ -39449,5 +39216,269 @@ impl Services {
         receiver.await.map_err(|_| {
             Error::Internal("settings completion owner failed; state may be unknown".into())
         })?
+    }
+}
+
+impl Services {
+    /// `workspace.archive`, optionally as the automatic sweep. With
+    /// `automatic`, the Archived flip commits only while the row has not
+    /// opted out of auto-archive (checked inside the archive transaction,
+    /// so an opt-out committed after the sweep's last read still wins) and
+    /// `Ok(None)` reports a refused flip; a manual archive always proceeds
+    /// and returns `Some`.
+    pub(crate) fn archive_workspace_with_mode(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        automatic: bool,
+    ) -> BoxFuture<'_, Result<Option<Workspace>>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let this = self.clone();
+        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the sweep and still archives.
+        let manager = self.agent_manager();
+        Box::pin(async move {
+            self.require_workspace_manager(&id, "workspace.archive")
+                .await?;
+            // Chief cannot be archived: it is a fixed virtual workspace, so
+            // return the synthesized shape unchanged rather than mutating the
+            // seeded row (TS virtual-workspace guard parity).
+            if id.is_chief() {
+                return Ok(Some(chief_workspace()));
+            }
+            let mut ws = store.get_workspace(&id).await?;
+            // A retired workspace is already past archived; re-archiving
+            // would flip its status back to Archived without a folder.
+            if ws.is_retired() {
+                return Err(retire::retired_error(&id));
+            }
+            // Archive ↔ unarchive fence (see `ArchiveFence`): held from
+            // before the commit until the detached guests' queued messages
+            // are dropped and their removal deltas are out (the guard moves
+            // into the detached tail below). Every unarchive flips under the
+            // same fence, and `workspace.members.add` refuses while the row
+            // is archived, so no unarchive + re-add + fresh enqueue of a
+            // detached principal can interleave with the tail's drop — the
+            // tail never drops a message a CURRENT member queued nor
+            // announces the removal of a member who is seated again.
+            let fence = this.archive_fence.acquire(&id).await;
+            let now = now_iso();
+            // Archiving removes guests: the Archived flip, every non-owner
+            // membership delete and every open-invite revoke commit in ONE
+            // `BEGIN IMMEDIATE` transaction (scoped column write — never a
+            // full-row replace of the `get_workspace` read above). A store
+            // failure fails the RPC with the row still active: access
+            // revocation is never best-effort. Unarchive does NOT restore
+            // either; a guest rejoins by a fresh invite.
+            this.ports
+                .runtime()
+                .cancel_script_monitors(&this, &id, None, "workspace-archived")
+                .await?;
+            let guest_sweep = if automatic {
+                match store
+                    .archive_workspace_detaching_guests_unless_auto_archive_disabled(&id, &now)
+                    .await?
+                {
+                    Some(sweep) => sweep,
+                    None => return Ok(None),
+                }
+            } else {
+                store.archive_workspace_detaching_guests(&id, &now).await?
+            };
+            ws.status = WorkspaceStatus::Archived;
+            ws.archived = true;
+            ws.archived_at = Some(now.clone());
+            ws.updated_at = now;
+            // Everything below the persist runs on a DETACHED task
+            // (intent-hq/monorepo#1577): the sweeps can cancel this very
+            // caller. A background hook whose script calls
+            // `ws.workspace.archive()` is itself swept by
+            // `cancel_workspace_hooks` below, which aborts the hook's
+            // scheduler task — i.e. the task awaiting this future. Inline,
+            // that abort dropped the rest of the tail mid-flight and the
+            // §6.5 `workspace:updated` delta was never published, leaving
+            // clients stale on an archived workspace. Spawning detaches the
+            // tail's lifetime from the caller's: aborting the caller only
+            // drops the `JoinHandle` (never the task), so the sweeps, the
+            // derived fields, and the emit always complete. On the hook path
+            // the abort means `archive()` never returns to the script, which
+            // stops running for good — the hook is `cancelled` by the sweep
+            // like any other hook in the workspace.
+            let id_for_log = id.clone();
+            let tail = self.store_tasks.spawn_draining(async move {
+                let mut ws = ws;
+                // Announce the committed guest sweep first — one
+                // `{ members, removedPrincipalId, memberCount }` delta per
+                // detached collaborator (queued messages dropped), then one
+                // `{ invites: true }` when an invite was revoked — so the
+                // deltas describe the transaction that just committed and
+                // precede every other archive-tail event. Still under the
+                // fence taken before the commit: released right after, so
+                // a waiting unarchive proceeds only once the drops and the
+                // removal deltas are done.
+                if let Some(park) = &this.archive_predrop_park {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+                this.publish_archived_guest_deltas(&id, &guest_sweep).await;
+                if let Some(park) = &this.archive_tail_park {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
+                drop(fence);
+                // Gracefully interrupt every in-flight turn in the workspace —
+                // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+                // turn cancelled over the wire, draining worker aborted, terminal
+                // `agent:stream:end` emitted, provider child + ACP session kept
+                // alive. Unlike `delete_workspace` nothing is deleted: session
+                // rows, transcripts, completion watches, and pending message
+                // queues all survive so unarchive can resume work. Runs AFTER the
+                // archived row is persisted so any concurrent queue-drain kick
+                // observes the archived flag and parks instead of respawning a
+                // turn (see the archived gate in `try_drain_queue`).
+                //
+                // Residual race (deliberate trade-off): a drain that read the
+                // workspace row BEFORE the persist above can still claim the
+                // in-flight slot after the `list_busy` snapshot below, spawning
+                // one stray turn in the freshly archived workspace that this
+                // sweep misses. The window is a few statements wide and the
+                // failure is benign — that turn runs to completion once and every
+                // subsequent drain/wake parks behind the archived gates — so the
+                // sweep accepts it rather than adding a post-claim re-check to
+                // the hot drain path.
+                //
+                // The initiating agent (`caller_agent_id`, set on the agent-facing
+                // `ws.workspace.archive` host — the MCP front door and the
+                // background-hook runtime, which builds the same host for the
+                // hook owner; the JSON-RPC front door passes `None`) is excluded.
+                // On the MCP path the caller is necessarily mid-turn — blocked
+                // awaiting this very tool call — so interrupting it aborts the
+                // worker that owns the in-flight MCP dispatch: the tool result
+                // never reaches the child, the turn never settles, and the busy
+                // slot leaks (workspace activity stays `agent_running`). The
+                // caller's turn ends normally once the tool result is delivered.
+                // On the hook path the "caller" is the hook owner, which may have
+                // an independent in-flight turn that this sweep now skips; that
+                // turn runs to completion in the freshly archived workspace and
+                // every subsequent drain/wake parks behind the archived gates —
+                // the same benign-runaway trade-off as the residual race above.
+                if let Some(manager) = manager {
+                    for (agent_id, agent_ws) in manager.list_busy() {
+                        if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
+                            manager.interrupt(&agent_id).await;
+                        }
+                    }
+                }
+                // Desktop authority never survives archive, the caller's
+                // included: unarchive must not hand it back without consent.
+                this.desktop_terminate_workspace(&id).await;
+                // Archiving drops every memory-held secret and pending
+                // request in the workspace (§5.56); unarchive starts empty.
+                this.secret_vault.clear_workspace(&id);
+                // Cancel every active background hook in the workspace: task
+                // aborted, state persisted to `cancelled`, `hook:cancelled`
+                // emitted — silently per hook. Unarchive does NOT resurrect
+                // cancelled hooks; the consolidated notice below tells the
+                // owner to reschedule if the condition still matters.
+                let cancelled_hooks = this.ports.runtime().cancel_workspace_hooks(&this, &id).await;
+                // Cancel every ACTIVE PR monitor the same way
+                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
+                // `prMonitor:cancelled` emitted, silently per monitor.
+                // Unarchive does NOT resurrect cancelled monitors. Without
+                // this sweep an archived workspace's displayStatus rollup
+                // reads `in_progress` indefinitely off the active-monitor
+                // signal.
+                let cancelled_monitors = this.cancel_workspace_pr_monitors(&id).await;
+                // ONE consolidated wake per affected owner naming every hook
+                // and monitor the two sweeps cancelled, THEN the owner's
+                // deferral backstop (the per-item cancels above skipped it so
+                // a deferred completion watch stays armed behind the queued
+                // notice). Runs AFTER the archived row is persisted so the
+                // wake parks behind the archived gate in
+                // `deliver_wake_message` (queued at most, no turn spawned) —
+                // the same reason the interrupt sweep above runs post-persist
+                // — and is only ever read after unarchive, which is the
+                // moment its wording is written for.
+                this.notify_owners_of_archived_watches(&id, cancelled_hooks, cancelled_monitors)
+                    .await;
+                // Derive `lastActivity` (§9.1) so archive callers get the
+                // authoritative wire shape without a follow-up `workspace.get`,
+                // and persist it through the scoped monotonic write
+                // (monorepo#1585).
+                this.derive_and_persist_last_activity(&mut ws, "workspace.archive")
+                    .await;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the persisted row.
+                ws.activity = this.workspace_activity(&ws.id);
+                // §6.5 has no `workspace:archived`; mirror the reference emitter and
+                // publish `workspace:updated` with the full applied delta
+                // (`archived`/`status`/`archivedAt`) so subscribers flip state
+                // without a re-read. `archivedAt` is the same timestamp persisted
+                // on the row above.
+                //
+                // Fenced on the archive still being current: the sweeps above
+                // ran outside the fence, so an unarchive may have flipped the
+                // row (and announced `archived: false`) meanwhile — its own
+                // delta is the latest word, and re-announcing THIS call's
+                // archive after it would leave clients on a stale archived
+                // state. Re-read under the fence and publish only when the
+                // row still carries this call's `archivedAt`; the flip and
+                // its delta happen under the same fence, so the two
+                // announcements can never cross.
+                let _fence = this.archive_fence.acquire(&ws.id).await;
+                let still_archived = match store.get_workspace(&ws.id).await {
+                    Ok(row) => row.archived && row.archived_at == ws.archived_at,
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.archive: row re-read failed before the archived delta; publishing"
+                        );
+                        true
+                    }
+                };
+                if still_archived {
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_updated_event(
+                            &ws.id,
+                            &serde_json::json!({
+                                "archived": true,
+                                "status": ws.status,
+                                "archivedAt": ws.archived_at,
+                            }),
+                        ),
+                    )
+                    .await;
+                }
+                ws
+            });
+            // Awaiting the handle keeps the caller-visible contract intact
+            // (the archived workspace is returned only after the tail ran);
+            // a cancelled caller simply drops this await while the detached
+            // tail runs on. A `JoinError` means the tail itself panicked —
+            // the row is already archived, so surface it rather than
+            // reporting a bogus success shape.
+            let tail =
+                tail.ok_or_else(|| Error::Internal("daemon writer admission closed".into()))?;
+            let mut ws = tail.await.map_err(|e| {
+                // The `JoinError` text names no workspace, so log the id —
+                // otherwise a panicked tail is undiagnosable from daemon logs.
+                tracing::error!(
+                    workspace = %id_for_log.as_str(),
+                    error = %e,
+                    "workspace.archive: post-persist tail task failed; row is archived"
+                );
+                Error::Internal(format!("archive tail task failed: {e}"))
+            })?;
+            // Membership summary (multiplayer w1) read AFTER the guest
+            // sweep, so the mutation response carries the post-detach
+            // `memberCount` / `openInviteCount`.
+            self.attach_workspace_membership(&mut ws).await;
+            Ok(Some(ws))
+        })
     }
 }

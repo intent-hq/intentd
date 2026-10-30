@@ -104,3 +104,57 @@ async fn auto_archive_disabled_round_trips_and_survives_stale_full_row_write() {
         "{missing:?}"
     );
 }
+
+/// The automatic-sweep archive reads the opt-out inside its transaction:
+/// an opted-out row is left untouched (`Ok(None)`), while the manual archive
+/// still archives it and an opted-in row is archived automatically.
+#[tokio::test]
+async fn automatic_archive_refuses_an_opted_out_row_inside_the_transaction() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "ws", false))
+        .await
+        .expect("insert");
+    store
+        .set_workspace_auto_archive_disabled(&id, true)
+        .await
+        .expect("opt out");
+
+    let refused = store
+        .archive_workspace_detaching_guests_unless_auto_archive_disabled(
+            &id,
+            "2026-10-30T00:00:00Z",
+        )
+        .await
+        .expect("automatic archive");
+    assert!(refused.is_none(), "opted-out row is not archived");
+    let row = store.get_workspace(&id).await.expect("get");
+    assert!(!row.archived);
+    assert_eq!(row.archived_at, None);
+
+    store
+        .set_workspace_auto_archive_disabled(&id, false)
+        .await
+        .expect("opt back in");
+    let swept = store
+        .archive_workspace_detaching_guests_unless_auto_archive_disabled(
+            &id,
+            "2026-10-30T00:00:01Z",
+        )
+        .await
+        .expect("automatic archive");
+    assert!(swept.is_some());
+    assert!(store.get_workspace(&id).await.expect("get").archived);
+
+    let manual = WorkspaceId::new();
+    let mut ws = sample_workspace(&manual, "manual", false);
+    ws.auto_archive_disabled = true;
+    store.insert_workspace(&ws).await.expect("insert");
+    store
+        .archive_workspace_detaching_guests(&manual, "2026-10-30T00:00:02Z")
+        .await
+        .expect("manual archive ignores the opt-out");
+    assert!(store.get_workspace(&manual).await.expect("get").archived);
+}

@@ -13,7 +13,9 @@
 //! work in flight — a running agent turn, a running script or background
 //! worker, an active hook or an active PR monitor — and any workspace whose
 //! folder's git roots hold uncommitted changes or unpushed commits
-//! ([`crate::local_work::LocalWorkRule::Archive`]). Each workspace is
+//! ([`crate::local_work::LocalWorkRule::Archive`]). The final archive runs in
+//! automatic mode, whose transaction re-reads the opt-out, so an opt-out that
+//! commits after the sweep's last read still wins. Each workspace is
 //! archived independently: a failure is logged and counted, never aborts the
 //! sweep. Archived rows are not due any more, so a sweep is idempotent.
 
@@ -189,8 +191,14 @@ impl Services {
         if self.workspace_activity(id) == WorkspaceActivity::AgentRunning {
             return IdleArchive::AgentRunning;
         }
-        match intent_core::WorkspaceApi::archive_workspace(self, id.clone(), None).await {
-            Ok(_) => IdleArchive::Archived,
+        // Automatic mode: the archive transaction itself refuses the flip if
+        // the owner opted out after the re-read above.
+        match self
+            .archive_workspace_with_mode(id.clone(), None, true)
+            .await
+        {
+            Ok(Some(_)) => IdleArchive::Archived,
+            Ok(None) => IdleArchive::NoLongerDue,
             Err(e) => {
                 tracing::warn!(workspace = %id, error = %e, "auto-archive: archive failed");
                 IdleArchive::Failed

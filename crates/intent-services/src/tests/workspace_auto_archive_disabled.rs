@@ -102,6 +102,11 @@ fn update_param_deserializes_as_optional_bool() {
 #[intent_test_macros::daemon_test]
 async fn chief_rejects_opt_out() {
     let h = harness().await;
+    let mut chief_sub = h.bus.subscribe(SubscriptionFilter {
+        event_types: vec!["workspace:updated".to_string()],
+        workspace_id: Some(intent_core::CHIEF_WORKSPACE_ID.to_string()),
+        ..Default::default()
+    });
     let err = h
         .services
         .update_workspace(
@@ -111,6 +116,15 @@ async fn chief_rejects_opt_out() {
         .await
         .expect_err("chief refused");
     assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    let got = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        chief_sub.recv(),
+    )
+    .await;
+    assert!(
+        got.is_err(),
+        "no workspace:updated for the refused write: {got:?}"
+    );
 }
 
 /// Off by default and omitted from the payload; on/off persist, show on get
@@ -253,4 +267,51 @@ async fn sweep_skips_opted_out_workspace_until_cleared() {
         .await;
     assert_eq!(report.archived, 1, "{report:?}");
     assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
+}
+
+/// Controlled interleaving: the sweep's last due read saw the workspace
+/// opted in, then the owner opted out before the archive committed. The
+/// automatic archive must refuse inside its transaction — row active, no
+/// archive delta — while a manual archive still proceeds.
+#[intent_test_macros::daemon_test]
+async fn opt_out_after_the_last_due_read_beats_the_automatic_archive() {
+    let f = retire::fixture().await;
+    let ws = retire::create_workspace(&f).await;
+    let cutoff = retire::days_from_now(30)
+        .checked_sub(time::Duration::days(7))
+        .expect("cutoff");
+    let due = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(
+        crate::auto_archive::auto_archive_due(&due, cutoff),
+        "due at the last read"
+    );
+
+    f.store
+        .set_workspace_auto_archive_disabled(&ws.id, true)
+        .await
+        .expect("opt out after the read");
+    let mut sub = retire_updates(&f, &ws.id);
+    let outcome = f
+        .svc
+        .archive_workspace_with_mode(ws.id.clone(), None, true)
+        .await
+        .expect("automatic archive");
+    assert!(outcome.is_none(), "automatic archive refused");
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
+    let changes = super::retire_workspace::drain_changes(&mut sub).await;
+    assert!(
+        !changes.iter().any(|c| c["archived"] == true),
+        "no archive delta: {changes:?}"
+    );
+
+    let manual = f
+        .svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("manual archive");
+    assert!(manual.archived, "a manual archive ignores the opt-out");
+}
+
+fn retire_updates(f: &retire::Fixture, id: &WorkspaceId) -> Subscription {
+    super::retire_workspace::subscribe_updates(f, id)
 }
