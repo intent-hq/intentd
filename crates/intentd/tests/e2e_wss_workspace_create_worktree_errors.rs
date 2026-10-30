@@ -27,7 +27,7 @@ type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
@@ -51,7 +51,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: dir_guard,
+        dir: dir_guard,
     }
 }
 
@@ -296,7 +296,7 @@ async fn workspace_create_rejects_stale_remote_base_when_fetch_fails() {
     );
     assert!(git(source.path(), &["branch", "--list", "failed-refresh"]).is_empty());
     assert_eq!(
-        std::fs::read_dir(fx._dir.path().join("workspaces"))
+        std::fs::read_dir(fx.dir.path().join("workspaces"))
             .unwrap()
             .count(),
         0
