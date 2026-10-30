@@ -128,6 +128,20 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
+**Frame rate during agent use.** While you act on a tab you own, it draws at full
+frame rate (requestAnimationFrame, CSS animations, timers) even when it is hidden or
+the app window is minimized or covered. Content actions on it (`evaluate`,
+`screenshot`, `snapshot`, `getAccessibilityTree`, `navigate`, `focusTab`,
+`startSession`, and the `startCapture` / `captureStep` / `startTrace` session steps)
+keep it at full rate for as long as they run and for 30 s
+after your last action; after that an idle hidden tab drops back to a throttled rate
+(about 1 frame per second) to save battery. So animation, flicker and timing measured
+inside one `evaluate`, or across calls a few seconds apart, are real. After a longer
+gap, the first frames of the next action can still be throttled: send a cheap action
+first (e.g. `evaluate` of `1`). A trace or capture whose steps are more than 30 s apart
+is throttled in between, so keep its start and stop close together. Tabs you do not
+own keep the browser's normal throttling.
+
 **Capture ops and workspace visibility.** Layout-only actions (`openTab` hidden or
 visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …) do not need
 the workspace to be open/visible in the app: they apply their effects to the
