@@ -6383,6 +6383,34 @@ impl AgentManager {
         turn_id: Option<&str>,
         original: OriginalTurn,
     ) -> Result<StopReason> {
+        self.run_turn_owned_with(
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            original,
+            false,
+        )
+        .await
+    }
+
+    /// [`AgentManager::run_turn_owned`] for the turn worker, which owns the
+    /// one-shot redrive budget: with `redrive_spurious_cancel` an output-free
+    /// provider `cancelled` returns a [`spurious_cancel_error`] for the worker
+    /// to redrive instead of settling the turn (see
+    /// [`crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+    #[expect(clippy::too_many_arguments)]
+    async fn run_turn_owned_with(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: crate::provider_images::PreparedPrompt,
+        turn_id: Option<&str>,
+        original: OriginalTurn,
+        redrive_spurious_cancel: bool,
+    ) -> Result<StopReason> {
         let OriginalTurn {
             runtime,
             connection: conn,
@@ -6408,6 +6436,7 @@ impl AgentManager {
                         captured,
                         required: None,
                     }),
+                redrive_spurious_cancel,
             )
             .await;
         self.active_delivery_groups.lock().unwrap().remove(agent_id);
@@ -14585,13 +14614,14 @@ async fn run_message_worker(
                     return;
                 }
                 match boxed_await(|| {
-                    mgr.run_turn_owned(
+                    mgr.run_turn_owned_with(
                         &agent_id,
                         &workspace_id,
                         &acp_session_id,
                         prompt,
                         options.turn_id.as_deref(),
                         turn,
+                        !silent_redrive_used,
                     )
                 })
                 .await
@@ -14705,6 +14735,31 @@ async fn run_message_worker(
                         }
                     }
                     Err(e) => {
+                        if spurious_cancel_error(&e) {
+                            // Stale provider cancel (see
+                            // `PROMPT_SPURIOUS_CANCEL_PREFIX`): the prompt was
+                            // cancelled before any output on a turn the daemon
+                            // never cancelled — typically the late
+                            // `session/cancel` of the turn this message
+                            // preempted. `run_prompt_turn` persisted nothing
+                            // and emitted no terminal event, so redrive the
+                            // SAME content/options once on the live child. The
+                            // user row is already durable and is not re-
+                            // persisted. One-shot: shares the silent-redrive
+                            // budget, so a second empty cancel settles the
+                            // turn normally instead of looping.
+                            silent_redrive_used = true;
+                            keep_failover_chain = true;
+                            // The provider never acted on the prompt, so the
+                            // one-shot context it carried (session-recreate
+                            // history, pending prepend) must ride the redrive.
+                            restore_undelivered_context();
+                            tracing::warn!(
+                                agent = %agent_id,
+                                "prompt cancelled before output without a daemon cancel — redriving it once on the live child"
+                            );
+                            continue 'outer;
+                        }
                         if is_benign_turn_error(&e) {
                             mgr.clear_discussion_turn(&agent_id, &options);
                             boxed_await(|| {
@@ -17720,6 +17775,18 @@ fn pre_output_transport_failure(err: &Error) -> bool {
         err,
         Error::Internal(msg)
             if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
+}
+
+/// Whether a `run_turn` error carries the spurious-cancel marker from
+/// `run_prompt_turn` ([`crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX`]):
+/// the provider resolved the prompt `cancelled` before any output on a turn
+/// the daemon never cancelled, and the worker should redrive it once.
+fn spurious_cancel_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_SPURIOUS_CANCEL_PREFIX)
     )
 }
 

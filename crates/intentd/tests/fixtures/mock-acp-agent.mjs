@@ -571,7 +571,32 @@ async function handlePrompt(id, params) {
     typeof behavior.exitDuringPromptOnAttempt === 'number' && behavior.exitDuringPromptOnAttempt > 0
       ? behavior.exitDuringPromptOnAttempt
       : 0;
-  const attempt = exitGate > 0 || rpcGate > 0 || exitOn > 0 ? getAndIncrementAttempt() : 0;
+  // `cancelledBeforeOutputAttempts` answers the first N prompt attempts with
+  // `stopReason: "cancelled"` and no session/update at all, modelling a late
+  // `session/cancel` from a preempted turn landing on the NEW prompt (the
+  // Claude adapter handles the cancel notification asynchronously). With
+  // `cancelledAfterChunk` the gated attempts stream one text
+  // chunk first, so the cancelled turn is NOT output-free.
+  const cancelGate =
+    typeof behavior.cancelledBeforeOutputAttempts === 'number' &&
+    behavior.cancelledBeforeOutputAttempts > 0
+      ? behavior.cancelledBeforeOutputAttempts
+      : 0;
+  const attempt =
+    exitGate > 0 || rpcGate > 0 || exitOn > 0 || cancelGate > 0 ? getAndIncrementAttempt() : 0;
+  if (cancelGate > 0 && attempt <= cancelGate) {
+    if (typeof behavior.cancelledAfterChunk === 'string') {
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: behavior.cancelledAfterChunk },
+        },
+      });
+    }
+    log(`resolving prompt as cancelled (attempt ${attempt}/${cancelGate})`);
+    return result(id, { stopReason: 'cancelled' });
+  }
   if (exitOn > 0 && attempt === exitOn) {
     log(`exiting during prompt (attempt ${attempt} = exitDuringPromptOnAttempt)`);
     process.exit(1);

@@ -167,6 +167,19 @@ mod tests_meta;
 pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
     "session/prompt transport closed before output:";
 
+/// Prefix marking a turn the provider resolved with `stopReason: "cancelled"`
+/// before streaming ANY output, on a turn the daemon never cancelled. Every
+/// daemon-initiated cancel aborts the turn worker (`interrupt_inner`) or
+/// drops the prompt future first (idle-timeout settle), so such a result can
+/// only be a stale cancel: the `session/cancel` notification of a just-
+/// preempted turn that the adapter applied late, to the NEW prompt (the
+/// Claude adapter processes cancels asynchronously). [`Services::run_prompt_turn`]
+/// returns it only when the worker still has its one-shot redrive budget,
+/// suppressing the empty marker row and every terminal event, so the worker
+/// redrives the same prompt invisibly instead of leaving a silent idle agent.
+pub(crate) const PROMPT_SPURIOUS_CANCEL_PREFIX: &str =
+    "session/prompt cancelled before output without a daemon cancel:";
+
 /// Suffix appended to the wrapped idle-timeout error when the timed-out turn
 /// DID receive `session/update` traffic before going silent (`session/prompt
 /// failed: session/prompt idle timeout (…) [turn streamed output]`). ANY
@@ -3847,6 +3860,7 @@ impl Services {
             prompt,
             turn_id,
             None,
+            false,
         )
         .await
     }
@@ -3865,6 +3879,7 @@ impl Services {
         prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
+        redrive_spurious_cancel: bool,
     ) -> Result<StopReason> {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
@@ -4400,6 +4415,35 @@ impl Services {
                     err,
                 )
                 .await;
+        }
+        // Spurious provider cancel (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]):
+        // the provider resolved this prompt `cancelled` before streaming a
+        // single update, and the daemon never cancelled it. Persisting the
+        // empty `finishReason: "cancelled"` row and emitting stream:end +
+        // agent:idle here would leave the user's message unanswered with no
+        // spinner and no notice. When the worker still holds its redrive
+        // budget, hand the turn back invisibly so it re-sends the same
+        // prompt; once the budget is spent the turn settles as before.
+        if redrive_spurious_cancel
+            && matches!(&result, Ok(StopReason::Cancelled))
+            && !any_update_received
+            && blocks.is_empty()
+        {
+            tracing::warn!(
+                agent = %agent_id,
+                "prompt resolved cancelled before any output without a daemon cancel — handing it back to the worker for one redrive"
+            );
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "spurious_cancel",
+                Some(turn_started.elapsed()),
+                block_count,
+                "redrive",
+            );
+            return Err(Error::Internal(format!(
+                "{PROMPT_SPURIOUS_CANCEL_PREFIX} stopReason cancelled"
+            )));
         }
         // Record the silent tail for `agent.diagnostics`
         // (intent-hq/monorepo#2669). A pre-output transport failure is
