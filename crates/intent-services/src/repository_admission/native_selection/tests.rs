@@ -1413,3 +1413,140 @@ async fn native_selection_reply_transfer_releases_only_its_original_lane() {
         revision
     );
 }
+
+/// Run one original frame up to and including its reply transfer, leaving the
+/// transport's later frame cleanup to the caller (as `RequestCompletion` does).
+async fn transferred<T: Send>(
+    s: &Socket,
+    frame: Frame,
+    body: impl Future<Output = Result<T>> + Send,
+) -> (RetireFrame, Result<T>) {
+    let scope = s.owner.capture_selection(&frame).unwrap();
+    let guard = RetireFrame(scope.clone());
+    let mut value = None;
+    scope
+        .scope(Box::pin(async {
+            value = Some(body.await);
+        }))
+        .await;
+    let value = value.unwrap();
+    let mut sent = 0;
+    scope
+        .deliver(
+            if value.is_ok() {
+                RepositoryReadReplyKind::Result
+            } else {
+                RepositoryReadReplyKind::ServiceError
+            },
+            &mut || {
+                sent += 1;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent, 1);
+    (guard, value)
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_public_reply_release_frees_lane_before_transfer() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    let q = bound(&capture);
+    s.entered(async {
+        let (first, released) = transferred(&s, Frame::Release(q.clone()), async {
+            f.services.repository_selection_release(q.clone()).await
+        })
+        .await;
+        assert!(released.unwrap().released);
+
+        // The client has the reply; its repeated release can arrive before the
+        // transport drops the first frame. It must not find the lane still held.
+        let second = s
+            .owner
+            .capture_selection(&Frame::Release(q.clone()))
+            .unwrap();
+        let second_guard = RetireFrame(second.clone());
+        drop(first);
+        // Late cleanup of the first frame must not release the second frame's lane.
+        let overlapping = s
+            .owner
+            .capture_selection(&Frame::Release(q.clone()))
+            .unwrap();
+        overlapping
+            .scope(Box::pin(async {
+                assert!(f
+                    .services
+                    .repository_selection_release(q.clone())
+                    .await
+                    .is_err());
+            }))
+            .await;
+        overlapping.retire();
+        let mut repeated = None;
+        second
+            .scope(Box::pin(async {
+                repeated = Some(f.services.repository_selection_release(q.clone()).await);
+            }))
+            .await;
+        assert!(
+            repeated
+                .unwrap()
+                .expect("a transferred release reply must permit a repeated release")
+                .released
+        );
+        drop(second_guard);
+    })
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_public_reply_refusal_frees_lane_before_transfer() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let edit = s.capture(&f).await.unwrap();
+    let original = s
+        .save(
+            &f,
+            &edit,
+            Choice::ExplicitRemote {
+                remote_name: "not-current-git".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let changed = save_query(&edit);
+    let q = bound(&edit);
+    s.entered(async {
+        let (first, refused) = transferred(&s, Frame::Save(changed.clone()), async {
+            f.services.repository_selection_save(changed.clone()).await
+        })
+        .await;
+        assert!(matches!(refused, Err(Error::InvalidParams(_))));
+
+        // The refusal reply is already observable; the next request on the same
+        // original operation must not race the transport's frame cleanup.
+        let second = s
+            .owner
+            .capture_selection(&Frame::Reconcile(q.clone()))
+            .unwrap();
+        let second_guard = RetireFrame(second.clone());
+        drop(first);
+        let mut reconciled = None;
+        second
+            .scope(Box::pin(async {
+                reconciled = Some(f.services.repository_selection_reconcile(q.clone()).await);
+            }))
+            .await;
+        assert_eq!(
+            reconciled
+                .unwrap()
+                .expect("a transferred refusal must permit the next original request"),
+            original
+        );
+        drop(second_guard);
+    })
+    .await;
+}

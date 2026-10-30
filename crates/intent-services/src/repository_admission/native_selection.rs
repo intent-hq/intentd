@@ -768,6 +768,12 @@ impl RepositoryReadRequestScope for Request {
                 if self.consumed.swap(true, Ordering::AcqRel) {
                     return Err(unavailable());
                 }
+                // As on the admitted path, release this frame's own lane before its
+                // reply becomes observable: the client's next request on the same
+                // operation must not race the transport's later frame cleanup.
+                if let Ok(op) = self.operation() {
+                    self.release_lane(&op);
+                }
                 return transfer();
             }
             entered?;
