@@ -291,6 +291,8 @@ mod test_tracing;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_secret_egress;
+#[cfg(test)]
 mod v1_1_goldens;
 #[cfg(test)]
 mod v1_goldens;
