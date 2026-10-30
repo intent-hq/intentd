@@ -446,7 +446,8 @@ windows) are **Repository**, **Branch**, **Setup**, **Agent**, and **Model**; ea
 opens a panel, and your prompt draft stays as you choose. **Repository** lists
 your repositories once each, most recently used first, with search at the top;
 **Add repository** adds a local folder, links a GitHub repository, or creates a
-new one. In **Setup**, pick the repository's config, the last-used setup, or a
+new one. In **Agent**, search by name and choose who starts the workspace.
+In **Setup**, pick the repository's config, the last-used setup, or a
 template, and edit its commands inline. **Apply** keeps the changes; **Cancel** or clicking
 outside discards them. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
