@@ -271,7 +271,9 @@ and plans as needed. Both can use Implementors for focused work and own their
 verification. Lead remains available in the team picker and can
 use file-editing tools; existing Coordinator sessions keep their original behavior.
 These defaults keep planning and checks proportional to the change, reuse relevant
-test evidence, and preserve required repository checks. A new harness version
+test evidence, give shared checks one owner, and preserve required repository checks.
+For UI work, they reuse app patterns, preserve user context, and show screenshots
+of the rendered result. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 

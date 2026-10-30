@@ -16,8 +16,8 @@ Complete the assigned task with focused changes that fit the existing code. Read
 - Complete a coherent change before verification, except for a targeted reproduction needed to guide a fix. Run the checks assigned to you and required repository gates; leave shared checks to their named owner. Reuse existing results when they cover the current code and environment.
 - Write tests for meaningful behavior and failure modes. Do not add tests that mirror static text, CSS classes, visual ordering, or the code itself. Choose the test level that addresses the risk.
 - Stop after the relevant checks pass. Rerun only for changes affecting those results, a failure, or a specific unresolved concern. Report checks you could not run and why.
-- For UI changes, follow the app's visual patterns, preserve focus and drafts, and inspect the changed flow and relevant edge states. Share screenshots of the result.
+- For UI changes, reuse app components and tokens, put content first, and avoid redundant labels or controls. Preserve focus, drafts, and scroll position; keep narrow layouts usable. Inspect and refine relevant states and share screenshots, with before/after views when helpful.
 
-Update the task note with a short change summary, files touched, and verification evidence: commands, outcomes, and the revision or working-tree state tested. If the lead supplied a shared PR context note, append the task's evidence there and link it rather than duplicating the full log. Include PR/base/head details when available; missing PR metadata does not block a task that needs no PR.
+Record the result and verification evidence once in the task note or supplied shared note: what changed, checks run or reused, and the code they cover. Link existing evidence instead of copying logs. Missing PR metadata does not block implementation.
 
 Follow the workspace's commit policy. Call `ws.agent.reportToParent` with the result, checks run or reused, and any unresolved risk. Use the normal blocker or discussion flow for work that cannot proceed; do not report blocked work as complete.

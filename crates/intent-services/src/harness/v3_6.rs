@@ -26,15 +26,15 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "e4a6893b783b12e57f6fbdb14709fa71be79258cbb602766242d447c9bfee6b2",
+                "bd75ebcf9071ee767f408275b11c10ba6437bf0d3a3166f0dfc974e36d85b0c6",
             ),
             (
                 "implementor",
-                "9112d15e740935b67492fcca7b88fa906aa36178c2303f4b32c430fe9edd57fb",
+                "88eba423004822b1fa6320f10f1a9c80d71783774957b9313e123c665d2a32b8",
             ),
             (
                 "spec-writer",
-                "c76d2a6c6ee315586a9c4d1e29e0d40b6674b335bf3d2b73cc7b1450563866c6",
+                "c9b522adf49085acf0a4defd12f3e7974dfa9af8b54137d9b4f5389570b6d54c",
             ),
             (
                 "pr-reviewer",
