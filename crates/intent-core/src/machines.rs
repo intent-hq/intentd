@@ -3,7 +3,7 @@
 //! `docs/protocol/methods/nodes.md`). Types only; the backend raises them
 //! when it places an agent or connects to a machine.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +111,7 @@ impl ModelUnavailable {
         let shown = machine.models.len().min(MESSAGE_MAX_MODELS);
         let mut list = machine.models[..shown].join(", ");
         if machine.models.len() > shown {
-            list.push_str(&format!(" (+{} more)", machine.models.len() - shown));
+            let _ = write!(list, " (+{} more)", machine.models.len() - shown);
         }
         format!("{at}{status} has: {list}")
     }
