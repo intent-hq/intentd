@@ -21558,7 +21558,7 @@ impl WorkspaceApi for Services {
 
     fn create_workspace(
         &self,
-        input: WorkspaceCreate,
+        mut input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
         let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
@@ -21596,10 +21596,13 @@ impl WorkspaceApi for Services {
                 .await?;
             // Proposal origin (PROTOCOL §5.1, intent-hq/intent#8086): shape
             // `-32602`s here, before any side effect; resolved after success.
-            let mut input = input;
-            let proposal_origin = services
-                .prepare_create_proposal_origin(&mut input, requested_key.as_deref())
-                .await?;
+            // Boxed like the create op below: inlining these futures grows
+            // the create future enough to overflow the default stack in
+            // debug builds.
+            let proposal_origin = Box::pin(
+                services.prepare_create_proposal_origin(&mut input, requested_key.as_deref()),
+            )
+            .await?;
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
@@ -23741,9 +23744,9 @@ impl WorkspaceApi for Services {
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             if let Some(origin) = proposal_origin {
-                result.proposal_origin = self
-                    .resolve_create_proposal_origin(origin, &result.workspace.id)
-                    .await;
+                result.proposal_origin =
+                    Box::pin(self.resolve_create_proposal_origin(origin, &result.workspace.id))
+                        .await;
             }
             Ok(result)
         })
