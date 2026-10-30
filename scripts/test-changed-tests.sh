@@ -633,6 +633,8 @@ expect_cargo "-p alpha -p intent-js --lib --bins --tests" "-p intent-services --
 [[ "$stdout" == *"note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no alpha note: $stdout"
 [[ "$stdout" != *"crates/intent-js/src changed"* ]] || fail "$case_name: misleading intent-js note: $stdout"
 
+# alpha and intent-services are intent-core reverse dependencies, so every
+# target of them runs: the intent-js note does not claim only --lib runs.
 case_name="intent-js and intent-core changes together keep intent-core's full propagation"
 reset_repo
 setup_intent_js
@@ -642,7 +644,23 @@ run_script
 g update-ref refs/remotes/origin/main "$base_sha"
 expect_ok
 expect_cargo "-p alpha -p delta -p gamma -p intent-app -p intent-core -p intent-js -p intent-services -p intent-svc-transfer --lib --bins --tests" "-p intentd --bins --tests"
-[[ "$stdout" == *"$js_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+[[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+[[ "$stdout" != *"crates/intent-js changed"* ]] || fail "$case_name: misleading lib-dependents note: $stdout"
+[[ "$stdout" == *"$js_epsilon_note"* ]] || fail "$case_name: no untestable-lib note: $stdout"
+
+case_name="intent-js dependent whose lib is not src/lib.rs gets a note"
+reset_repo
+setup_intent_js
+write crates/zeta/Cargo.toml $'[package]\nname = "zeta"\n\n[lib]\npath = "src/bridge.rs"\n\n[dependencies]\nintent-js = { path = "../intent-js" }'
+write crates/zeta/src/bridge.rs
+commit_all "zeta"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-js/src/engine.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *'[test-changed] note: crates/zeta depends on intent-js but its library unit tests cannot run (crates/zeta/Cargo.toml sets [lib] path = "src/bridge.rs", not src/lib.rs)'* ]] || fail "$case_name: no moved-lib note: $stdout"
 
 case_name="intent-js lib propagation merges with a <crate>::lib map entry"
 reset_repo

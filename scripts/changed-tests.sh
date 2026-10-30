@@ -763,19 +763,26 @@ while IFS= read -r note; do
   [[ -z "$note" ]] || log "$note"
 done <<<"$e2e_notes"
 
+# Succeeds when the $mapped records select crate $1's src or every target (a
+# src or other non-test file of the crate changed): a propagation root then
+# selects its dependents.
+root_changed() {
+  local rec_crate rec_kind
+  while IFS=$'\t' read -r rec_crate rec_kind _; do
+    [[ "$rec_crate" != "$1" || ("$rec_kind" != src && "$rec_kind" != all) ]] || return 0
+  done <<<"$mapped"
+  return 1
+}
+
+# Propagated roots (full and lib-only): their dependents are selected, so no
+# "downstream crates are not selected" note is printed for them.
 rdeps_propagated=""
 # Dependents of a propagated root: their own dependents are selected too, so
 # no "downstream crates are not selected" note is printed for them.
 rdeps_selected=""
 rdeps_edges=""
 for root in $rdeps_roots; do
-  root_changed=""
-  while IFS=$'\t' read -r rec_crate rec_kind _; do
-    if [[ "$rec_crate" == "$root" && ("$rec_kind" == src || "$rec_kind" == all) ]]; then
-      root_changed=1
-    fi
-  done <<<"$mapped"
-  [[ -n "$root_changed" ]] || continue
+  root_changed "$root" || continue
   [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
   dependents=""
   while IFS= read -r dependent; do
@@ -795,30 +802,33 @@ done
 # Library unit tests of a lib root's direct dependents ("lib": --lib, the
 # record a module-less <crate>::lib map entry makes). A broader selection of
 # the same crate (src, dependent, all) subsumes it, and it never selects the
-# feature crates or intent-app below.
-lib_rdeps_propagated=""
+# feature crates or intent-app below. A dependent a full propagation root
+# already selects is left out of the note, since every target of it runs.
 for root in $lib_rdeps_roots; do
-  root_changed=""
-  while IFS=$'\t' read -r rec_crate rec_kind _; do
-    if [[ "$rec_crate" == "$root" && ("$rec_kind" == src || "$rec_kind" == all) ]]; then
-      root_changed=1
-    fi
-  done <<<"$mapped"
-  [[ -n "$root_changed" ]] || continue
+  root_changed "$root" || continue
   [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
   dependents=""
+  covered=""
   while IFS= read -r dependent; do
-    [[ -n "$dependent" && -f "crates/$dependent/src/lib.rs" ]] || continue
+    [[ -n "$dependent" ]] || continue
+    if [[ "$rdeps_selected" == *" $dependent "* ]]; then
+      covered=1
+      continue
+    fi
+    # Before the src/lib.rs check, so a lib moved off it gets the note.
     if ! lib_is_testable "$dependent"; then
       log "note: crates/$dependent depends on $root but its library unit tests cannot run ($lib_problem)"
       continue
     fi
+    [[ -f "crates/$dependent/src/lib.rs" ]] || continue
     mapped+="$dependent"$'\t'"lib"$'\n'
     dependents+="${dependents:+, }$dependent"
   done <<<"$(direct_dependents "$root" "$rdeps_edges" | sort -u)"
-  lib_rdeps_propagated+=" $root "
+  rdeps_propagated+=" $root "
   if [[ -n "$dependents" ]]; then
     log "note: crates/$root changed; the library unit tests of the crates depending on it directly run too ($dependents)"
+  elif [[ -n "$covered" ]]; then
+    :
   else
     log "note: crates/$root changed; no workspace crate depending on it directly has library unit tests"
   fi
@@ -890,7 +900,7 @@ crate_selection() {
     src | dependent)
       crate_filter="--bins --tests"
       [[ -f "crates/$crate/src/lib.rs" ]] && crate_filter="--lib $crate_filter"
-      if [[ "$best" == dependent || "$rdeps_propagated$rdeps_selected$lib_rdeps_propagated" == *" $crate "* ]]; then
+      if [[ "$best" == dependent || "$rdeps_propagated$rdeps_selected" == *" $crate "* ]]; then
         :
       elif [[ "$crate" == intent-services && -n "$feature_crates" ]]; then
         log "note: crates/$crate/src changed; its feature crates and intent-app ($feature_crates) run too, other downstream crates are not selected"
