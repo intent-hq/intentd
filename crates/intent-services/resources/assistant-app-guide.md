@@ -265,6 +265,16 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
+
+**Secret requests.** Off by default. Open **Agent defaults**
+(`/settings?tab=agent-behavior#global-instructions`) and turn on **Secret requests**
+under **Agent features**; **Host command execution** must also be on. It applies to agents created
+afterwards. An agent can then ask for a secret such as an API key: a masked card
+appears above the message box, where the user can provide or dismiss it. Intent
+keeps the value in memory only, for that agent's own commands, and never shows it to
+the model. Values are lost when Intent restarts, so the agent asks again.
+
 **Disable a provider.** In **Settings → Providers**, choose **Disable** from its
 ⋯ menu, including for the default provider or one used by saved models or
 specialists. Saved selections remain intact. A turn already running can finish;
