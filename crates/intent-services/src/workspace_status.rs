@@ -3956,7 +3956,7 @@ mod workspace_needs_attention {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (Services::new(store), ws, tmp)
+        (Services::new_isolated(store), ws, tmp)
     }
 
     #[tokio::test]
@@ -4193,7 +4193,7 @@ mod workspace_needs_attention {
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store.clone());
+        let svc = Services::new_isolated(store.clone());
         let cases = [
             ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
             (
@@ -4477,7 +4477,7 @@ mod display_status_events {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
             store,
@@ -5955,7 +5955,7 @@ mod background_tasks_running_events {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus);
+        let services = Services::new_isolated(store).with_event_bus(bus);
         Harness {
             _tmp: tmp,
             services,

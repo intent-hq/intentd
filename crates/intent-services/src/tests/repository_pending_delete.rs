@@ -33,7 +33,8 @@ impl Harness {
             .insert_agent_session(&session(&ws, &agent.0))
             .await
             .unwrap();
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&services.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, Caller::Daemon).unwrap();
@@ -613,7 +614,8 @@ async fn no_observer_schedule_blocks_first_install_and_cancellation_confirms_onl
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let services =
+        Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
     services
         .schedule_workspace_delete(ws.clone(), 60_000)
         .await
@@ -781,7 +783,7 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let services = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let (pause, resume) = services.pending_delete_test_gate.arm("background", &ws.0);
     services.delete_workspace(ws.clone()).await.unwrap();
     reached(&pause).await;

@@ -31,7 +31,7 @@ fail() {
 # it.
 targets=$(grep -E '^FORWARDED_TARGETS[[:space:]]*:=' "$forwarder" | sed 's/^[^=]*:=[[:space:]]*//')
 [[ -n "$targets" ]] || fail "could not read FORWARDED_TARGETS from $forwarder"
-for required in check test test-changed test-select gate list-tests; do
+for required in check test test-changed test-select test-stress gate list-tests; do
   [[ " $targets " == *" $required "* ]] || fail "FORWARDED_TARGETS lacks '$required': $targets"
 done
 
@@ -132,6 +132,12 @@ filterset="test(/it's a \$/) | package(intent-acp)"
 run_make "$monorepo/packages/intentd" test-select "E=$filterset"
 expect_status 0
 expect_log "test-select RESUME= BASE= GATE_FORCE="
+[[ "$e_log" == "command line E=$filterset" ]] || fail "$case_name: root saw E as: $e_log"
+
+case_name="test-stress filterset passes through"
+run_make "$monorepo/packages/intentd" test-stress "E=$filterset" COUNT=200 LOAD=1
+expect_status 0
+expect_log "test-stress RESUME= BASE= GATE_FORCE="
 [[ "$e_log" == "command line E=$filterset" ]] || fail "$case_name: root saw E as: $e_log"
 
 # The root recipe's failure is the forwarder's failure.

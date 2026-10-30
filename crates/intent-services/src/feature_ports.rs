@@ -2126,7 +2126,7 @@ mod tests {
     #[tokio::test]
     async fn unregistered_transfer_port_fails_like_the_workspace_api_default() {
         let tmp = TempDb::new();
-        let svc = Services::new(intent_store::Store::open(&tmp.path).await.unwrap());
+        let svc = Services::new_isolated(intent_store::Store::open(&tmp.path).await.unwrap());
         let ws = WorkspaceId::new();
         let expect = |result: intent_core::Result<serde_json::Value>, method: &str| {
             assert!(
@@ -2176,7 +2176,7 @@ mod tests {
     }
 
     async fn bare_services(tmp: &TempDb) -> Services {
-        Services::new(intent_store::Store::open(&tmp.path).await.unwrap())
+        Services::new_isolated(intent_store::Store::open(&tmp.path).await.unwrap())
     }
 
     #[tokio::test]

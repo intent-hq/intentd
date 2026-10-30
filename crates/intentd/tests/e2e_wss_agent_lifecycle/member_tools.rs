@@ -1232,7 +1232,7 @@ async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legac
         intent_sourcecontrol::GitHubSourceControl::new("fake-repository-token", Some(&fake.url))
             .unwrap();
     let services = Arc::new(intent_app::compose(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_settings_registry(registry)
             .with_secret_store(secrets)

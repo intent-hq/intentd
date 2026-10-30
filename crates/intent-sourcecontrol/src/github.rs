@@ -217,6 +217,62 @@ impl GitHubSourceControl {
         result
     }
 
+    /// One raw `GET /repos/{o}/{r}/pulls` page for `query` (no search
+    /// routing, no author filter) and its validated continuation cursor.
+    async fn list_pulls_rest(
+        &self,
+        repo: &RepoRef,
+        query: &PrQuery,
+    ) -> Result<(Vec<Value>, Option<String>)> {
+        let per_page = rest_per_page(query.limit.unwrap_or(30));
+        let page_no = rest_page(query.cursor.as_deref());
+        let mut params: Vec<(&str, String)> = vec![(
+            "state",
+            match query.state {
+                Some(PrState::Open) => "open",
+                Some(PrState::Closed) => "closed",
+                _ => "all",
+            }
+            .to_string(),
+        )];
+        if let Some(base) = &query.base {
+            params.push(("base", base.clone()));
+        }
+        if let Some(head) = &query.head {
+            params.push(("head", head.clone()));
+        }
+        params.push(("per_page", per_page.to_string()));
+        params.push(("page", page_no.to_string()));
+        let route = Self::repo_path(repo, "/pulls");
+        let page: octocrab::Page<Value> = self.client().get(&route, Some(&params)).await?;
+        // Consume GitHub's continuation when supplied, but never follow its URL
+        // with credentials. Only a strictly advancing numeric page is accepted;
+        // the next request reconstructs this same repository route and filters.
+        let next_cursor = if let Some(next) = page.next.as_ref() {
+            let next = reqwest::Url::parse(&next.to_string())
+                .map_err(|_| Error::Decode("invalid PR pagination link".into()))?;
+            let pages: Vec<_> = next.query_pairs().filter(|(k, _)| k == "page").collect();
+            let number = if pages.len() == 1 {
+                pages[0].1.parse::<u64>().ok()
+            } else {
+                None
+            };
+            Some(
+                number
+                    .filter(|n| Some(*n) == page_no.checked_add(1))
+                    .ok_or_else(|| Error::Decode("non-advancing PR pagination link".into()))?
+                    .to_string(),
+            )
+        } else if page.prev.is_some() || page.first.is_some() || page.last.is_some() {
+            None
+        } else {
+            // Hosts/fixtures omitting Link need the empty sentinel page at an
+            // exact page-size boundary; a full page alone cannot prove absence.
+            rest_next_cursor(page_no, page.items.len(), per_page)
+        };
+        Ok((page.items, next_cursor))
+    }
+
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
         format!("/repos/{}/{}{}", repo.owner, repo.name, suffix)
     }
@@ -445,6 +501,22 @@ fn verdict_event(verdict: ReviewVerdict) -> &'static str {
         ReviewVerdict::Approve => "APPROVE",
         ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
         ReviewVerdict::Comment => "COMMENT",
+    }
+}
+
+/// Whether a REST pull's head repository belongs to `repo`'s owner (folded
+/// as [`RepoRef`] identity). `head.repo: null` (deleted fork) is not; an
+/// absent `head.repo` is unknown and kept.
+fn head_owned_by(pull: &Value, repo: &RepoRef) -> bool {
+    match pull.pointer("/head/repo") {
+        None => true,
+        Some(head) => head
+            .pointer("/owner/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| {
+                RepoRef::new(login, repo.name.as_str()).identity_parts().0
+                    == repo.identity_parts().0
+            }),
     }
 }
 
@@ -1291,35 +1363,6 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
 }
 ";
 
-/// Open PRs of one head branch from ANY head repository: the REST `head`
-/// filter needs `owner:branch` (a bare branch is ignored), so it cannot find
-/// a contributor's fork PR without knowing the fork owner.
-const OPEN_PRS_BY_HEAD_QUERY: &str = r"
-query OpenPrsByHead($owner: String!, $repo: String!, $head: String!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequests(headRefName: $head, states: OPEN, first: 100) {
-      pageInfo { hasNextPage }
-      nodes {
-        number
-        url
-        title
-        body
-        state
-        isDraft
-        headRefName
-        headRefOid
-        author { login }
-        mergeable
-        createdAt
-        updatedAt
-        mergeStateStatus
-        baseRefName
-      }
-    }
-  }
-}
-";
-
 /// Map the `pullRequest` node of [`PR_OBSERVATION_QUERY`] onto the same
 /// [`PullRequest`] `GET /pulls/{n}` yields: GraphQL's `mergeable`
 /// (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`) becomes the REST tri-state bool,
@@ -2075,55 +2118,8 @@ impl SourceControl for GitHubSourceControl {
                 next_cursor: rest_next_cursor(page_no, fetched, per_page),
             });
         }
-        let mut params: Vec<(&str, String)> = vec![(
-            "state",
-            match query.state {
-                Some(PrState::Open) => "open",
-                Some(PrState::Closed) => "closed",
-                _ => "all",
-            }
-            .to_string(),
-        )];
-        if let Some(base) = &query.base {
-            params.push(("base", base.clone()));
-        }
-        if let Some(head) = &query.head {
-            params.push(("head", head.clone()));
-        }
-        params.push(("per_page", per_page.to_string()));
-        params.push(("page", page_no.to_string()));
-        let route = Self::repo_path(repo, "/pulls");
-        let page: octocrab::Page<Value> = self.client().get(&route, Some(&params)).await?;
-        // Consume GitHub's continuation when supplied, but never follow its URL
-        // with credentials. Only a strictly advancing numeric page is accepted;
-        // the next request reconstructs this same repository route and filters.
-        let next_cursor = if let Some(next) = page.next.as_ref() {
-            let next = reqwest::Url::parse(&next.to_string())
-                .map_err(|_| Error::Decode("invalid PR pagination link".into()))?;
-            let pages: Vec<_> = next.query_pairs().filter(|(k, _)| k == "page").collect();
-            let number = if pages.len() == 1 {
-                pages[0].1.parse::<u64>().ok()
-            } else {
-                None
-            };
-            Some(
-                number
-                    .filter(|n| Some(*n) == page_no.checked_add(1))
-                    .ok_or_else(|| Error::Decode("non-advancing PR pagination link".into()))?
-                    .to_string(),
-            )
-        } else if page.prev.is_some() || page.first.is_some() || page.last.is_some() {
-            None
-        } else {
-            // Hosts/fixtures omitting Link need the empty sentinel page at an
-            // exact page-size boundary; a full page alone cannot prove absence.
-            rest_next_cursor(page_no, page.items.len(), per_page)
-        };
-        let prs = page
-            .items
-            .into_iter()
-            .map(map_pull)
-            .collect::<Result<Vec<_>>>()?;
+        let (raw, next_cursor) = self.list_pulls_rest(repo, &query).await?;
+        let prs = raw.into_iter().map(map_pull).collect::<Result<Vec<_>>>()?;
         let items = match &query.author {
             Some(author) => prs.into_iter().filter(|p| &p.author == author).collect(),
             None => prs,
@@ -2131,42 +2127,63 @@ impl SourceControl for GitHubSourceControl {
         Ok(Page { items, next_cursor })
     }
 
+    /// Open PRs whose head is `head_ref` in the workspace repository owner's
+    /// account (intent-hq/intent#8010). GitHub's REST `head=<owner>:<branch>`
+    /// filter is applied server-side on the head repository owner (not the PR
+    /// author), so other forks' same-name heads (`main`, `patch-1`) neither
+    /// fill the page nor match. A PR from another owner's fork is never this
+    /// workspace's: the workspace tracks no separate push identity.
     async fn list_open_prs_by_head(
         &self,
         repo: &RepoRef,
         head_ref: &str,
     ) -> Result<Vec<PullRequest>> {
-        let payload = json!({
-            "query": OPEN_PRS_BY_HEAD_QUERY,
-            "variables": { "owner": repo.owner, "repo": repo.name, "head": head_ref },
-        });
-        let data = graphql_data(
-            self.graphql_accounted_as(&payload, crate::traffic::Operation::Discovery)
-                .await?,
-        )?;
-        let prs = data
-            .pointer("/repository/pullRequests")
-            .ok_or_else(|| Error::Decode("repository pullRequests missing".into()))?;
-        if prs
-            .pointer("/pageInfo/hasNextPage")
-            .and_then(Value::as_bool)
-            != Some(false)
-        {
+        let page = self
+            .list_prs(
+                repo,
+                PrQuery {
+                    state: Some(PrState::Open),
+                    head: Some(format!("{}:{head_ref}", repo.owner)),
+                    limit: Some(100),
+                    ..PrQuery::default()
+                },
+            )
+            .await?;
+        if page.next_cursor.is_some() {
             return Err(Error::Api(
                 "more than one page of open PRs for one head".into(),
             ));
         }
-        prs.get("nodes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::Decode("pullRequests nodes missing".into()))?
-            .iter()
-            .map(map_graphql_pull)
-            .filter(|pr| {
-                pr.as_ref().map_or(true, |pr| {
-                    pr.state == PrState::Open && pr.source_branch == head_ref
-                })
-            })
-            .collect()
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|pr| pr.state == PrState::Open && pr.source_branch == head_ref)
+            .collect())
+    }
+
+    /// One page of open PRs whose head repository is owned by `repo.owner`
+    /// (intent-hq/intent#8010): another fork's same-name branch is never the
+    /// workspace's. A head whose repository was deleted (`head.repo: null`)
+    /// is excluded; a payload without `head.repo` at all carries no owner
+    /// evidence and is kept, as before.
+    async fn list_own_open_prs(
+        &self,
+        repo: &RepoRef,
+        cursor: Option<String>,
+    ) -> Result<Page<PullRequest>> {
+        let query = PrQuery {
+            state: Some(PrState::Open),
+            limit: Some(100),
+            cursor,
+            ..PrQuery::default()
+        };
+        let (raw, next_cursor) = self.list_pulls_rest(repo, &query).await?;
+        let items = raw
+            .into_iter()
+            .filter(|pr| head_owned_by(pr, repo))
+            .map(map_pull)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Page { items, next_cursor })
     }
 
     async fn list_org_prs(&self, org: &str, query: PrQuery) -> Result<Page<PullRequest>> {

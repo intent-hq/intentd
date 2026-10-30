@@ -627,7 +627,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: agent_id.clone(),
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         // The transport scope is real; physical creation remains an explicit
@@ -695,7 +695,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: tests::agent(f).await,
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
@@ -769,7 +769,7 @@ mod captured_scope_tests {
             let caller = Caller::Agent {
                 agent_id: tests::agent(f).await,
             };
-            let services = Services::new(f.store.clone());
+            let services = Services::new_isolated(f.store.clone());
             let service = &services;
             let registry = Arc::new(RepositoryLifecycleRegistry::default());
             registry.install(&f.store).await.unwrap();
@@ -892,7 +892,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: tests::agent(f).await,
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
@@ -953,7 +953,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: agent_id.clone(),
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let creator = RepositoryCreationOwner::allocate(

@@ -1596,6 +1596,12 @@ jobs:
           evidence_dir=$(mktemp -d "$RUNNER_TEMP/native-review-startup-failures.XXXXXX")
           evidence_dir=$(realpath "$evidence_dir")
           printf 'directory=%s\n' "$evidence_dir" >> "$GITHUB_OUTPUT"
+      # Backstop for intent_core::test_isolation (which aborts tests that
+      # resolve the real home's secrets store or workspaces root): fail if
+      # anything else in the run touched the runner's real ~/intent.
+      - name: Snapshot the real ~/intent
+        id: home-intent
+        run: python3 -I -B scripts/home-intent-guard.py snapshot "$RUNNER_TEMP/home-intent-e2e.json"
       - name: Run e2e coverage
         # Arm the bound-caller seam for the test processes themselves, not
         # only the daemons they spawn: a direct-call test that evaluates a
@@ -1611,6 +1617,9 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
+      - name: Verify tests left the real ~/intent untouched
+        if: ${{ !cancelled() && steps.home-intent.outcome == 'success' }}
+        run: python3 -I -B scripts/home-intent-guard.py verify "$RUNNER_TEMP/home-intent-e2e.json"
       - name: Validate native startup evidence
         id: native-evidence-check
         if: ${{ failure() && steps.native-evidence.outputs.directory != '' }}
@@ -1763,6 +1772,12 @@ jobs:
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Verify bounded coverage profile pooling
         run: python3 -I -B scripts/test-coverage-profile-pool.py
+      # Backstop for intent_core::test_isolation (which aborts tests that
+      # resolve the real home's secrets store or workspaces root): fail if
+      # anything else in the run touched the runner's real ~/intent.
+      - name: Snapshot the real ~/intent
+        id: home-intent
+        run: python3 -I -B scripts/home-intent-guard.py snapshot "$RUNNER_TEMP/home-intent-all.json"
       - name: Run combined coverage
         timeout-minutes: 53
         # Armed bound-caller seam — see coverage-e2e's run step.
@@ -1771,6 +1786,9 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-all.sh 80
+      - name: Verify tests left the real ~/intent untouched
+        if: ${{ !cancelled() && steps.home-intent.outcome == 'success' }}
+        run: python3 -I -B scripts/home-intent-guard.py verify "$RUNNER_TEMP/home-intent-all.json"
       - name: Generate coverage summary
         if: always()
         run: |
@@ -1825,7 +1843,7 @@ jobs:
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
-        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_2_reaches_original_guidance_boundary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_current_reaches_original_guidance_boundary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
@@ -1992,6 +2010,12 @@ jobs:
         run: |
           python3 -I -B scripts/coverage-storage.py init --output "$RUNNER_TEMP/coverage-storage"
           echo "COVERAGE_STORAGE_DIR=$RUNNER_TEMP/coverage-storage" >> "$GITHUB_ENV"
+      # Backstop for intent_core::test_isolation (which aborts tests that
+      # resolve the real home's secrets store or workspaces root): fail if
+      # anything else in the run touched the runner's real ~/intent.
+      - name: Snapshot the real ~/intent
+        id: home-intent
+        run: python3 -I -B scripts/home-intent-guard.py snapshot "$RUNNER_TEMP/home-intent-changed.json"
       - name: Run changed tests under llvm-cov
         timeout-minutes: 50
         if: steps.select.outputs.has_selection == 'true'
@@ -2001,6 +2025,9 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
+      - name: Verify tests left the real ~/intent untouched
+        if: ${{ !cancelled() && steps.home-intent.outcome == 'success' }}
+        run: python3 -I -B scripts/home-intent-guard.py verify "$RUNNER_TEMP/home-intent-changed.json"
       - name: Run callback fixture composition under llvm-cov
         timeout-minutes: 8
         if: steps.select.outputs.callback_fixture_changed == 'true'
@@ -2292,6 +2319,7 @@ jobs:
           python3 -B scripts/test-hosted-runners.py
           python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
+          python3 -I -B scripts/test-home-intent-guard.py
       - name: Test the local release-scripts runner (make test-release-scripts)
         run: python3 -I -B scripts/test-release-scripts-local.py
       - name: Test optional Intel cargo-dist network handling (offline)

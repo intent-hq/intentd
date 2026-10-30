@@ -181,7 +181,7 @@ async fn boot() -> Fixture {
     store.insert_workspace(&skip).await.expect("seed skip");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone()),
     );

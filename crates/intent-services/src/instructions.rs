@@ -205,6 +205,12 @@ pub(crate) static V3_4: InstructionSet = InstructionSet {
     ..V3_3
 };
 
+/// Harness v3.5 adds development-only persistent inline visual guidance.
+pub(crate) static V3_5: InstructionSet = InstructionSet {
+    common: instr!("v3.5", "common"),
+    ..V3_4
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -514,9 +520,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body: v2.10 app file-link guidance plus the v3.4
-    /// workspace-link guidance.
-    const COMMON_LATEST: &str = V3_4.common;
+    /// The current common body includes workspace links and development-only visuals.
+    const COMMON_LATEST: &str = V3_5.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

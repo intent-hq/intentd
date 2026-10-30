@@ -133,7 +133,7 @@ async fn imported_owner_case(change: Change, runtime: bool) {
     let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
     let bus = EventBus::new(store.clone());
     let services = Arc::new(
-        Services::new(store.clone())
+        Services::new_isolated(store.clone())
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_event_bus(bus.clone()),
     );

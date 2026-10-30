@@ -1241,6 +1241,10 @@ pub struct Services {
     /// Production wiring uses the daemon default (`$INTENTD_SECRETS_FILE`);
     /// tests inject a scratch path.
     gitlab_secret_store: intent_core::FileSecretStore,
+    /// Owns the scratch secrets directory of a [`Services::new_isolated`]
+    /// instance (removed when the last clone drops); `None` otherwise.
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    isolated_secrets_dir: Option<Arc<tempfile::TempDir>>,
     /// Serialises refresh / persist / delete of the GitLab credential pair
     /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
     /// clones.
@@ -1615,6 +1619,32 @@ impl Services {
         Self::new_with_repository_sources(store, intent_core::FileSecretStore::new(), None)
     }
 
+    /// Test constructor: [`Services::new`] over a per-instance scratch
+    /// secrets file instead of the home default, so a test can never read,
+    /// write or migrate the developer's real `~/intent/.secrets.json` (or its
+    /// `.collaboration` sibling). The scratch dir lives until the last clone
+    /// drops. Use this in every test: under nextest the default constructor
+    /// only avoids the real home by falling back to one scratch store shared
+    /// by the whole test process (see [`intent_core::test_isolation`]), and
+    /// plain `cargo test` has no guard at all.
+    ///
+    /// # Panics
+    ///
+    /// When the scratch directory cannot be created.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn new_isolated(store: Store) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("intentd-test-secrets-")
+            .tempdir()
+            .expect("create isolated secrets dir");
+        let secrets = intent_core::FileSecretStore::with_path(dir.path().join(".secrets.json"));
+        let mut services = Self::new_with_repository_sources(store, secrets, None);
+        services.isolated_secrets_dir = Some(Arc::new(dir));
+        services
+    }
+
     /// Select the backing file before constructing any secret wrapper.
     #[cfg(test)]
     pub(crate) fn new_with_file_secrets(
@@ -1783,6 +1813,8 @@ impl Services {
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
             gitlab_secret_store,
+            #[cfg(any(test, feature = "test-hooks", feature = "repository-test-fixtures"))]
+            isolated_secrets_dir: None,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
             repository_connection_directory,
             repository_lifecycle_registry: Arc::default(),
@@ -13183,17 +13215,20 @@ pub fn default_workspaces_root() -> PathBuf {
         return PathBuf::from(dir);
     }
     assert_hermetic_root_absent();
-    std::env::var_os("HOME")
+    let root = std::env::var_os("HOME")
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("intent")
-        .join("workspaces")
+        .join("workspaces");
+    intent_core::test_isolation::assert_outside_forbidden_home(&root, "default_workspaces_root");
+    root
 }
 
 /// Non-panicking [`default_workspaces_root`] for boot-time consumers that must
 /// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
-/// `$HOME` default would panic — else the same root the service layer uses.
+/// `$HOME` default would panic — or, under the test harness, when the default
+/// lands in the real home; else the same root the service layer uses.
 pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
@@ -13201,12 +13236,17 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
         return None;
     }
-    Some(
-        std::env::var_os("HOME")
-            .map_or_else(std::env::temp_dir, PathBuf::from)
-            .join("intent")
-            .join("workspaces"),
-    )
+    let root = std::env::var_os("HOME")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("intent")
+        .join("workspaces");
+    // Under the test harness the real home's root is unavailable, exactly
+    // like the hermetic posture above: the CoW probe would otherwise create
+    // `~/intent/workspaces` (see `intent_core::test_isolation`).
+    if intent_core::test_isolation::is_in_forbidden_home(&root) {
+        return None;
+    }
+    Some(root)
 }
 
 /// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
@@ -33817,10 +33857,14 @@ impl WorkspaceApi for Services {
                 // exits cooperatively once its generation is gone.
                 *slot = None;
             }
-            let (auth, flow) = intent_sourcecontrol::device_flow::start_at(
+            // Fix the flow's store to this instance's file store (the daemon
+            // default in production) instead of letting `start_at` resolve
+            // and migrate the home default behind an injected store.
+            let (auth, flow) = intent_sourcecontrol::device_flow::start_at_with_store(
                 &base_uri,
                 &client_id,
                 intent_sourcecontrol::device_flow::DEFAULT_SCOPES,
+                self.gitlab_secret_store.clone(),
             )
             .await
             .map_err(pr_ops::map_sc_err)?;

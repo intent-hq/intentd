@@ -252,7 +252,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = intent_app::compose(Services::new(store.clone()))
+    let mut services = intent_app::compose(Services::new_isolated(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -8628,7 +8628,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -8763,7 +8763,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -22722,7 +22722,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)

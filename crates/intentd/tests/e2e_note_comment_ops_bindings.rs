@@ -41,7 +41,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(tmp.path().to_path_buf())
         .with_event_bus(bus.clone());
 

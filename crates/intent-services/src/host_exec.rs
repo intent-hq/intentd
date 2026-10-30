@@ -700,7 +700,7 @@ mod tests {
         let store = intent_store::Store::open(&tmp.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store.clone());
+        let services = crate::Services::new_isolated(store.clone());
         let runtime = services.host_exec_runtime();
         let pid_file = tmp.path().join("pid");
         let fifo = tmp.path().join("gate");
