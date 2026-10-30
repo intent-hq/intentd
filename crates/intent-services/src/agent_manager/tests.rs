@@ -17984,14 +17984,23 @@ struct SpuriousCancelRun {
     assistant: Vec<intent_core::AgentMessage>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct SpuriousCancelOpts<'a> {
+    /// Whether the daemon wrote `session/cancel` just before the send (the
+    /// stale-cancel mark `interrupt_inner` sets).
+    daemon_cancel_armed: bool,
+    chunk_before_cancel: Option<&'a str>,
+    client_request_before_cancel: bool,
+}
+
 /// Drive one worker turn against a mock child that resolves the first
-/// `cancelled_attempts` prompts as `stopReason: "cancelled"` (optionally
-/// after one streamed chunk), then answers normally. Models a late
-/// `session/cancel` from a preempted turn landing on the NEW prompt.
+/// `cancelled_attempts` prompts as `stopReason: "cancelled"`, then answers
+/// normally. With `daemon_cancel_armed` this models a late `session/cancel`
+/// from a preempted turn landing on the NEW prompt.
 async fn spurious_cancel_scenario(
     tag: &str,
     cancelled_attempts: u32,
-    chunk_before_cancel: Option<&str>,
+    opts: SpuriousCancelOpts<'_>,
 ) -> SpuriousCancelRun {
     let script = mock_agent_script();
     let scratch = test_tempdir(&format!("itd-spurious-cancel-{tag}-"));
@@ -18003,8 +18012,11 @@ async fn spurious_cancel_scenario(
         "cancelledBeforeOutputAttempts": cancelled_attempts,
         "response": "answered after the spurious cancel",
     });
-    if let Some(chunk) = chunk_before_cancel {
+    if let Some(chunk) = opts.chunk_before_cancel {
         behavior["cancelledAfterChunk"] = json!(chunk);
+    }
+    if opts.client_request_before_cancel {
+        behavior["cancelledAfterClientRequest"] = json!(true);
     }
     let behavior = behavior.to_string();
     let _env = EnvGuard::set_all(&[
@@ -18022,6 +18034,9 @@ async fn spurious_cancel_scenario(
     seed_agent(&mgr, &ws, &id).await;
     set_session_provider(&mgr, &ws, &id, "mock").await;
 
+    if opts.daemon_cancel_armed {
+        mgr.arm_stale_cancel(&id);
+    }
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.send_message(
         id.clone(),
@@ -18103,13 +18118,21 @@ fn finish_reason(message: &intent_core::AgentMessage) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// A prompt the provider resolves as `cancelled` before streaming anything,
-/// with no daemon-requested cancel for that turn (a late `session/cancel`
-/// from the preempted turn), is redriven once on the live child: the user
-/// gets a real reply instead of a silent empty turn and an idle agent.
+/// A prompt resolved `cancelled` before streaming anything, right after the
+/// daemon wrote `session/cancel` (the late cancel of the preempted turn), is
+/// redriven once on the live child: the user gets a real reply instead of a
+/// silent empty turn and an idle agent.
 #[tokio::test]
 async fn spurious_cancel_before_output_redrives_once() {
-    let run = spurious_cancel_scenario("once", 1, None).await;
+    let run = spurious_cancel_scenario(
+        "once",
+        1,
+        SpuriousCancelOpts {
+            daemon_cancel_armed: true,
+            ..SpuriousCancelOpts::default()
+        },
+    )
+    .await;
     assert_eq!(run.prompts, 2, "cancelled attempt + one redrive");
     assert_eq!(run.failed, 0, "no agent:failed for the redriven attempt");
     assert_eq!(
@@ -18135,12 +18158,20 @@ async fn spurious_cancel_before_output_redrives_once() {
     );
 }
 
-/// The redrive budget is one per message: a second output-free `cancelled`
-/// settles the turn as today (empty `finishReason: "cancelled"` row, one
+/// The redrive is one-shot (the first resolution consumed the stale-cancel
+/// mark): a second output-free `cancelled` settles the turn as today (empty `finishReason: "cancelled"` row, one
 /// stream:end, one idle) instead of looping.
 #[tokio::test]
 async fn second_spurious_cancel_settles_without_looping() {
-    let run = spurious_cancel_scenario("twice", 2, None).await;
+    let run = spurious_cancel_scenario(
+        "twice",
+        2,
+        SpuriousCancelOpts {
+            daemon_cancel_armed: true,
+            ..SpuriousCancelOpts::default()
+        },
+    )
+    .await;
     assert_eq!(run.prompts, 2, "exactly one redrive");
     assert_eq!(run.failed, 0);
     assert_eq!(run.stream_ends, 1);
@@ -18159,7 +18190,16 @@ async fn second_spurious_cancel_settles_without_looping() {
 /// is never redriven: the partial reply is persisted as today.
 #[tokio::test]
 async fn spurious_cancel_after_output_is_not_redriven() {
-    let run = spurious_cancel_scenario("partial", 1, Some("partial reply")).await;
+    let run = spurious_cancel_scenario(
+        "partial",
+        1,
+        SpuriousCancelOpts {
+            daemon_cancel_armed: true,
+            chunk_before_cancel: Some("partial reply"),
+            ..SpuriousCancelOpts::default()
+        },
+    )
+    .await;
     assert_eq!(run.prompts, 1, "no redrive once output streamed");
     assert_eq!(run.stream_ends, 1);
     assert_eq!(run.idles, 1);
@@ -18169,6 +18209,102 @@ async fn spurious_cancel_after_output_is_not_redriven() {
         .content
         .to_string()
         .contains("partial reply"));
+}
+
+/// A provider-initiated `cancelled` with no recent daemon cancel is the
+/// provider's own decision, not a stale cancel: it settles as today.
+#[tokio::test]
+async fn provider_cancel_without_daemon_cancel_is_not_redriven() {
+    let run = spurious_cancel_scenario("unarmed", 1, SpuriousCancelOpts::default()).await;
+    assert_eq!(run.prompts, 1, "no redrive without a daemon cancel");
+    assert_eq!(run.stream_ends, 1);
+    assert_eq!(run.idles, 1);
+    assert_eq!(run.assistant.len(), 1, "{:?}", run.assistant);
+    assert_eq!(finish_reason(&run.assistant[0]), Some("cancelled"));
+}
+
+/// A cancelled turn that made a client request (permission, fs, terminal)
+/// may have had side effects or a user decision, so it is never redriven.
+#[tokio::test]
+async fn spurious_cancel_after_client_request_is_not_redriven() {
+    let run = spurious_cancel_scenario(
+        "client-request",
+        1,
+        SpuriousCancelOpts {
+            daemon_cancel_armed: true,
+            client_request_before_cancel: true,
+            ..SpuriousCancelOpts::default()
+        },
+    )
+    .await;
+    assert_eq!(run.prompts, 1, "no redrive after a client request");
+    assert_eq!(run.stream_ends, 1);
+    assert_eq!(run.idles, 1);
+    assert_eq!(run.assistant.len(), 1, "{:?}", run.assistant);
+    assert_eq!(finish_reason(&run.assistant[0]), Some("cancelled"));
+}
+
+/// The stale-cancel mark is one-shot and time-bounded.
+#[tokio::test]
+async fn stale_cancel_mark_is_one_shot_and_bounded() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-stale-cancel-mark");
+    assert!(!mgr.take_stale_cancel(&id), "unarmed");
+    mgr.arm_stale_cancel(&id);
+    assert!(mgr.take_stale_cancel(&id), "armed");
+    assert!(!mgr.take_stale_cancel(&id), "taking clears it");
+    mgr.stale_cancels.lock().unwrap().insert(
+        id.clone(),
+        std::time::Instant::now()
+            .checked_sub(super::STALE_CANCEL_WINDOW + Duration::from_secs(1))
+            .expect("monotonic clock is past the window"),
+    );
+    assert!(!mgr.take_stale_cancel(&id), "an old mark has expired");
+    assert!(mgr.stale_cancels.lock().unwrap().is_empty());
+}
+
+/// The keep-alive interrupt arms the stale-cancel mark when it writes
+/// `session/cancel`, so the preempting message's prompt can recognise a late
+/// cancel.
+#[tokio::test]
+async fn keep_alive_interrupt_arms_stale_cancel_mark() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-1"),
+        AgentId::from("a-stale-cancel-arm"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .align_with_mock_for_test();
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-stale-cancel-arm")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .set_live_turn(&id, "msg-stale-cancel-arm", Vec::new());
+    assert!(
+        mgr.interrupt(&id).await,
+        "keep-alive interrupt finds the agent"
+    );
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "keep-alive path (child kept)"
+    );
+    assert!(
+        mgr.take_stale_cancel(&id),
+        "writing session/cancel arms the stale-cancel mark"
+    );
 }
 
 /// End-to-end auth-required prompt failure (intent-hq/intent#3941): a real

@@ -167,16 +167,18 @@ mod tests_meta;
 pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
     "session/prompt transport closed before output:";
 
-/// Prefix marking a turn the provider resolved with `stopReason: "cancelled"`
-/// before streaming ANY output, on a turn the daemon never cancelled. Every
-/// daemon-initiated cancel aborts the turn worker (`interrupt_inner`) or
-/// drops the prompt future first (idle-timeout settle), so such a result can
-/// only be a stale cancel: the `session/cancel` notification of a just-
-/// preempted turn that the adapter applied late, to the NEW prompt (the
-/// Claude adapter processes cancels asynchronously). [`Services::run_prompt_turn`]
-/// returns it only when the worker still has its one-shot redrive budget,
-/// suppressing the empty marker row and every terminal event, so the worker
-/// redrives the same prompt invisibly instead of leaving a silent idle agent.
+/// Prefix marking a prompt ended by a stale daemon cancel: it resolved
+/// `stopReason: "cancelled"` before any `session/update` or client request,
+/// on a turn-worker attempt that started shortly after the daemon wrote
+/// `session/cancel` for this agent (`AgentManager::stale_cancels`). Every daemon-initiated cancel aborts the
+/// turn worker (`interrupt_inner`) or drops the prompt future first
+/// (idle-timeout settle), so the worker never sees the cancel it asked for —
+/// but ACP cancels are notifications, and an adapter that applies one late
+/// (the Claude adapter processes cancels asynchronously) ends the NEXT
+/// prompt instead. [`Services::run_prompt_turn`] returns this for
+/// turn-worker turns, without the empty marker row or any terminal event, so
+/// the worker redrives the prompt once instead of leaving a silent idle
+/// agent.
 pub(crate) const PROMPT_SPURIOUS_CANCEL_PREFIX: &str =
     "session/prompt cancelled before output without a daemon cancel:";
 
@@ -4355,6 +4357,17 @@ impl Services {
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
             && blocks.is_empty();
+        // Stale-cancel classification (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        // `redrive_spurious_cancel` is set only when the turn worker took a
+        // fresh stale-cancel mark for this attempt. A client request
+        // (permission prompt, fs write, terminal) means the turn may have had
+        // side effects or a user decision, so it settles instead.
+        let spurious_cancel = redrive_spurious_cancel
+            && matches!(&result, Ok(StopReason::Cancelled))
+            && !closed
+            && !any_update_received
+            && conn.client_request_seq() == client_request_watermark
+            && blocks.is_empty();
         // Idle-timeout classification (warn-and-continue): the turn went the
         // whole idle window with no `session/update` traffic. The partial
         // transcript (if any) is flushed and the normal `agent:stream:end`
@@ -4416,22 +4429,10 @@ impl Services {
                 )
                 .await;
         }
-        // Spurious provider cancel (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]):
-        // the provider resolved this prompt `cancelled` before streaming a
-        // single update, and the daemon never cancelled it. Persisting the
-        // empty `finishReason: "cancelled"` row and emitting stream:end +
-        // agent:idle here would leave the user's message unanswered with no
-        // spinner and no notice. When the worker still holds its redrive
-        // budget, hand the turn back invisibly so it re-sends the same
-        // prompt; once the budget is spent the turn settles as before.
-        if redrive_spurious_cancel
-            && matches!(&result, Ok(StopReason::Cancelled))
-            && !any_update_received
-            && blocks.is_empty()
-        {
+        if spurious_cancel {
             tracing::warn!(
                 agent = %agent_id,
-                "prompt resolved cancelled before any output without a daemon cancel — handing it back to the worker for one redrive"
+                "prompt resolved cancelled before any output right after a daemon cancel — handing it back to the worker for one redrive"
             );
             trace_stream_lifecycle(
                 Some(message_id.as_str()),
@@ -4441,9 +4442,6 @@ impl Services {
                 block_count,
                 "redrive",
             );
-            return Err(Error::Internal(format!(
-                "{PROMPT_SPURIOUS_CANCEL_PREFIX} stopReason cancelled"
-            )));
         }
         // Record the silent tail for `agent.diagnostics`
         // (intent-hq/monorepo#2669). A pre-output transport failure is
@@ -4457,6 +4455,7 @@ impl Services {
         // insert leaves one stale u64, which the diagnostics read (it
         // iterates live sessions) never serves.
         if !pre_output_transport_failure
+            && !spurious_cancel
             && self.store.get_agent_session_summary(agent_id).await.is_ok()
         {
             self.record_turn_silent_tail(agent_id, silent_tail_ms);
@@ -4554,7 +4553,7 @@ impl Services {
             .ok()
             .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
             .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
-        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
+        if !spurious_cancel && (!blocks.is_empty() || abnormal_finish_reason.is_some()) {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
@@ -4679,7 +4678,9 @@ impl Services {
         // its predecessor via [`TurnBookkeeping`]) so a delayed task from
         // turn N can neither skew turn N+1's stats delta nor overwrite its
         // newer cumulative snapshot.
-        let run_completed = result.is_ok();
+        // A stale-cancel attempt is not a completed run (the redrive is), but
+        // any usage the provider reported for it is still recorded.
+        let run_completed = result.is_ok() && !spurious_cancel;
         if turn_usage.is_some() || turn_cost.is_some() || run_completed {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
@@ -4752,6 +4753,14 @@ impl Services {
                     chain.insert(agent_id.clone(), handle);
                 }
             }
+        }
+        // Stale daemon cancel: nothing was persisted and no terminal event
+        // fires — the turn worker redrives the prompt and that attempt closes
+        // the turn (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        if spurious_cancel {
+            return Err(Error::Internal(format!(
+                "{PROMPT_SPURIOUS_CANCEL_PREFIX} stopReason cancelled"
+            )));
         }
         // Post-output transient fetch failure (intent-hq/intent#5419): the
         // turn is about to fail terminally exactly as today (Error status,

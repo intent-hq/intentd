@@ -576,7 +576,8 @@ async function handlePrompt(id, params) {
   // `session/cancel` from a preempted turn landing on the NEW prompt (the
   // Claude adapter handles the cancel notification asynchronously). With
   // `cancelledAfterChunk` the gated attempts stream one text
-  // chunk first, so the cancelled turn is NOT output-free.
+  // chunk first, so the cancelled turn is NOT output-free. The gate itself
+  // is applied after the exit gates below.
   const cancelGate =
     typeof behavior.cancelledBeforeOutputAttempts === 'number' &&
     behavior.cancelledBeforeOutputAttempts > 0
@@ -584,19 +585,6 @@ async function handlePrompt(id, params) {
       : 0;
   const attempt =
     exitGate > 0 || rpcGate > 0 || exitOn > 0 || cancelGate > 0 ? getAndIncrementAttempt() : 0;
-  if (cancelGate > 0 && attempt <= cancelGate) {
-    if (typeof behavior.cancelledAfterChunk === 'string') {
-      note('session/update', {
-        sessionId: SESSION_ID,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: behavior.cancelledAfterChunk },
-        },
-      });
-    }
-    log(`resolving prompt as cancelled (attempt ${attempt}/${cancelGate})`);
-    return result(id, { stopReason: 'cancelled' });
-  }
   if (exitOn > 0 && attempt === exitOn) {
     log(`exiting during prompt (attempt ${attempt} = exitDuringPromptOnAttempt)`);
     process.exit(1);
@@ -616,6 +604,29 @@ async function handlePrompt(id, params) {
     }
     log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
     process.exit(1);
+  }
+  // Checked after the exit gates above so combining them keeps their meaning.
+  if (cancelGate > 0 && attempt <= cancelGate) {
+    if (typeof behavior.cancelledAfterChunk === 'string') {
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: behavior.cancelledAfterChunk },
+        },
+      });
+    }
+    // `cancelledAfterClientRequest` makes one client request (an fs read)
+    // first, modelling a turn that may have had side effects before the
+    // cancel landed.
+    if (behavior.cancelledAfterClientRequest) {
+      await callClientService('fs/read_text_file', {
+        sessionId: SESSION_ID,
+        path: 'cancelled-after-client-request-probe',
+      }).catch(() => {});
+    }
+    log(`resolving prompt as cancelled (attempt ${attempt}/${cancelGate})`);
+    return result(id, { stopReason: 'cancelled' });
   }
   // Provider prompt failure (monorepo#479): optionally stream one
   // agent_message_chunk (the provider's pre-failure warning) and then answer
