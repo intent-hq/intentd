@@ -1568,3 +1568,90 @@ async fn native_selection_public_reply_capture_is_published_before_transfer() {
         Persistence::Committed { .. }
     ));
 }
+
+#[track_caller]
+fn invalid_params_message(result: Result<Attempt>) -> String {
+    match result {
+        Err(Error::InvalidParams(message)) => message,
+        other => panic!("expected invalid params, got {other:?}"),
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_invalid_remote_name_reports_its_own_refusal() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    for name in [
+        String::new(),
+        " origin".into(),
+        "origin ".into(),
+        "ori\ngin".into(),
+        "a".repeat(1025),
+    ] {
+        let refused = s
+            .save(
+                &f,
+                &capture,
+                Choice::ExplicitRemote {
+                    remote_name: name.clone(),
+                },
+            )
+            .await;
+        assert_eq!(
+            invalid_params_message(refused),
+            "Invalid repository remote name",
+            "remote name {name:?}"
+        );
+    }
+
+    // A rejected name claims nothing: the same original selection still saves.
+    let saved = s
+        .save(
+            &f,
+            &capture,
+            Choice::ExplicitRemote {
+                remote_name: "not-current-git".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt(&saved).persistence,
+        Persistence::Committed { .. }
+    ));
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_changed_command_keeps_claimed_refusal() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    s.save(
+        &f,
+        &capture,
+        Choice::ExplicitRemote {
+            remote_name: "not-current-git".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        invalid_params_message(s.save(&f, &capture, Choice::Automatic {}).await),
+        "Selection command already claimed"
+    );
+    // Malformed input is reported as such even after a command was claimed.
+    assert_eq!(
+        invalid_params_message(
+            s.save(
+                &f,
+                &capture,
+                Choice::ExplicitRemote {
+                    remote_name: " not-current-git".into(),
+                },
+            )
+            .await
+        ),
+        "Invalid repository remote name"
+    );
+}

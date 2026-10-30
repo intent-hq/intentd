@@ -60,6 +60,13 @@ fn denied(_: impl std::fmt::Debug) -> Error {
 fn changed_command() -> Error {
     Error::InvalidParams("Selection command already claimed".into())
 }
+/// Why a frame was refused at capture. Invalid input keeps its own message
+/// (a malformed remote name is not a changed command); every other entry
+/// failure stays the uniform unavailable refusal.
+enum EntryError {
+    Unavailable,
+    InvalidParams(String),
+}
 
 pub(crate) struct Capacity {
     records: Arc<Semaphore>,
@@ -464,7 +471,7 @@ struct Request {
     completed: AtomicBool,
     consumed: AtomicBool,
     public: AtomicBool,
-    entry_error: Option<bool>, // true: changed command; false: unavailable
+    entry_error: Option<EntryError>,
     created: Instant,
 }
 impl Request {
@@ -490,9 +497,9 @@ impl Request {
         {
             return Err(unavailable());
         }
-        match request.entry_error {
-            Some(true) => Err(changed_command()),
-            Some(false) => Err(unavailable()),
+        match &request.entry_error {
+            Some(EntryError::InvalidParams(message)) => Err(Error::InvalidParams(message.clone())),
+            Some(EntryError::Unavailable) => Err(unavailable()),
             None => Ok(request),
         }
     }
@@ -567,7 +574,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     let mut target = None;
     let mut initiator = false;
     let mut owns_lane = false;
-    let mut entry_error = life.is_none().then_some(false);
+    let mut entry_error = life.is_none().then_some(EntryError::Unavailable);
     if life.is_some() {
         if let Some((id, command)) = frame_target(&frame) {
             let record = c
@@ -608,11 +615,14 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                     Ok(())
                 })();
                 if let Err(e) = claim {
-                    entry_error = Some(matches!(e, Error::InvalidParams(_)));
+                    entry_error = Some(match e {
+                        Error::InvalidParams(message) => EntryError::InvalidParams(message),
+                        _ => EntryError::Unavailable,
+                    });
                 }
                 target = Some(op);
             } else if !matches!(frame, Frame::Release(_)) {
-                entry_error = Some(false);
+                entry_error = Some(EntryError::Unavailable);
             }
         }
     }
