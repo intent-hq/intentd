@@ -955,7 +955,7 @@ authenticated tunnel.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
@@ -996,6 +996,8 @@ the expanded sidebar's toggle collapses it.
 Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
 This keeps other selected panes open. When collapsed, it opens the matching
 floating section beside the rail.
+In every sidebar section, a chevron pointing right marks a closed group, row, or
+drawer; select it to open, and the chevron points down.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
