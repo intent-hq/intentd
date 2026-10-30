@@ -15,7 +15,7 @@ use crate::{publish_event, workspace_updated_event, Services};
 /// Private invalidation inputs. Secret requests are not acknowledgement
 /// reasons: while one needs the user, the personal projection is unavailable.
 /// Tracking that availability alongside reasons refreshes clients even when
-/// raw NeedsAttention and the public reason set stay unchanged.
+/// raw `NeedsAttention` and the public reason set stay unchanged.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AttentionReminderInputs {
     reasons: Vec<AttentionReminderReason>,
