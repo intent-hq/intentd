@@ -338,10 +338,17 @@ impl Drop for ConnSubs {
 
 impl ConnSubs {
     /// Reconcile browser hosting after a live role change (`ws.rs`
-    /// `RoleChanged`): an allowed connection rebinds the reserved identity of
-    /// its last successful hello ([`Self::hello`]) — a connection without one
-    /// stays unbound — and a disallowed one withdraws hosting.
-    pub(crate) fn apply_browser_authority(&self, guard: &PrimaryReverseGuard, allowed: bool) {
+    /// `RoleChanged`): record the channel's member authority, then an allowed
+    /// connection rebinds the reserved identity of its last successful hello
+    /// ([`Self::hello`]) — a connection without one stays unbound — and a
+    /// disallowed one withdraws hosting.
+    pub(crate) fn apply_browser_authority(
+        &self,
+        reverse: &ReverseChannel,
+        guard: &PrimaryReverseGuard,
+        allowed: bool,
+    ) {
+        reverse.set_browser_member(allowed);
         if allowed {
             if let Some(hello) = &self.hello {
                 guard.bind(hello);
@@ -1023,10 +1030,16 @@ async fn process_captured_frame(
                         reverse_guard.bind(&hello);
                         subs.hello = Some(hello);
                     }
-                    Some(Err(reservation)) => tracing::warn!(
-                        client_id = %reservation.client_id().as_str(),
-                        "client.hello: bound identity differs from its reservation; not binding"
-                    ),
+                    // Fail closed: never bind an unreserved id, and never
+                    // keep the previous hello's identity bound or rebindable.
+                    Some(Err(reservation)) => {
+                        tracing::warn!(
+                            client_id = %reservation.client_id().as_str(),
+                            "client.hello: bound identity differs from its reservation; unbinding"
+                        );
+                        reverse_guard.unbind();
+                        subs.hello = None;
+                    }
                     // A detached guard (registry shutting down) reserves nothing.
                     None => {}
                 }

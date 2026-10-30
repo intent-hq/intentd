@@ -1539,8 +1539,7 @@ impl WsInner {
                             crate::context::may_manage_workspaces(self.api.as_ref()),
                         )
                         .await;
-                        reverse.set_browser_member(allowed);
-                        subs.apply_browser_authority(&reverse_guard, allowed);
+                        subs.apply_browser_authority(&reverse, &reverse_guard, allowed);
                     }
                     Input::Incoming(incoming) => match incoming {
                         Some(Err(e)) => {

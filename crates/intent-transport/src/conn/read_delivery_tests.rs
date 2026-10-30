@@ -1926,15 +1926,13 @@ async fn role_upgrade_rebinds_only_a_successful_hello() {
     let mut subs = ConnSubs::default();
     let good = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":"dev-1","capabilities":{"browserExec":true}}});
     assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
-    reverse.set_browser_member(false);
-    subs.apply_browser_authority(&guard, false);
+    subs.apply_browser_authority(&reverse, &guard, false);
     assert_eq!(guard.bound_client_id(), None, "demoted");
     assert!(
         registry.client_active(&scoped),
         "still reserved while demoted"
     );
-    reverse.set_browser_member(true);
-    subs.apply_browser_authority(&guard, true);
+    subs.apply_browser_authority(&reverse, &guard, true);
     assert_eq!(guard.bound_client_id(), Some(scoped.clone()), "re-promoted");
 
     let other = member();
@@ -1952,8 +1950,7 @@ async fn role_upgrade_rebinds_only_a_successful_hello() {
         )
         .await
     );
-    other.set_browser_member(true);
-    other_subs.apply_browser_authority(&other_guard, true);
+    other_subs.apply_browser_authority(&other, &other_guard, true);
     assert_eq!(
         other_guard.bound_client_id(),
         None,
