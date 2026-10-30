@@ -32,6 +32,21 @@ crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_g_r    e
 crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_s_z    e2e_wss_script_monitors
 crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  script_lifecycle
 
+# Script bridge (intent-js): every ws.* call from an agent's workspace_api
+# script or a hook's script crosses its host() bridge. A change to its src
+# alone selects only intent-js's own tests; intentd#2811 (engine.rs plus an
+# intent-acp test) ran intent-acp and intent-js, then failed coverage-e2e in
+# the merge queue on desktop_control::cursor_move. desktop_control drives
+# ws.desktop.* through workspace_api, script_lifecycle runs workspace_api
+# scripts over MCP, and e2e_wss_hook_mcp_tools runs hook scripts (hook_manager
+# evaluates them through intent-js).
+crates/intent-js/src/*                               intentd::wss_integration  desktop_control
+crates/intent-js/src/*                               intentd::wss_integration  script_lifecycle
+crates/intent-js/src/*                               intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools
+
+# Desktop binding (ws.desktop.*): the workspace_api tests that drive it.
+crates/intent-acp/src/mcp_server/bindings/desktop.rs intentd::wss_integration  desktop_control
+
 # Script monitors: registration, completion wakes and the start-time monitor.
 crates/intent-core/src/script_monitor.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
 crates/intent-core/src/script_monitor.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
