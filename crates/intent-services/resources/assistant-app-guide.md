@@ -443,13 +443,13 @@ includes the other linked PRs, even when their details are not loaded.
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. The settings beside the prompt (below it on narrow
 windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**; each
-opens a panel, and your prompt draft stays as you choose. **Codebase** lists
+opens a picker or editor, and your prompt draft stays as you choose. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
 **Add codebase** adds a local folder, links a GitHub repository, or creates a
 new one. In **Initial agent**, search by name and choose who starts the workspace.
 In **Setup script**, pick the repository's config, the last-used setup, or a
-template, and edit its commands inline. **Apply** keeps the changes; **Cancel** or clicking
-outside discards them. The workspace groups working files, notes, and agent
+template, and edit its commands in the setup modal. **Done** or **Save & Done**
+keeps the changes; **Cancel** discards them. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
 the form's retry instruction instead of creating a second workspace.
