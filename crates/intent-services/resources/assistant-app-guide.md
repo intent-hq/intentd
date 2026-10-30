@@ -270,6 +270,24 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{AgentFeaturesSettings.svelte,agent-feature-definitions.ts}; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
+
+**Secret requests (supporting app and daemon versions).** Off by default.
+The setup workflow below requires an app exposing both the **Secret requests**
+control and matching request cards, together with daemon support. Older apps may
+lack the control, the cards, or both; if either is absent, this UI workflow is
+unavailable in that app version. In a supporting app, open **Agent defaults**
+(`/settings?tab=agent-behavior#global-instructions`) and turn on **Secret requests**
+under **Agent features**; **Host command execution** must also be on. It applies to
+top-level workspace agents created afterwards, not to sub-agents, background hooks
+or Assistant chat. When such an agent asks for a secret such as an API key, a masked
+card appears above the message box after its turn ends; **Hide** collapses it to a
+"Secret requested" chip, and the user can provide or dismiss it. The value is not
+put in the chat: Intent holds it in daemon memory and passes it only to that agent's
+`ws.host.exec` commands that name it, redacting exact copies from their output. It is
+dropped when the daemon restarts, the agent is deleted or retired, or its workspace
+is archived; the agent then has to ask again.
+
 **Disable a provider.** In **Settings → Providers**, choose **Disable** from its
 ⋯ menu when offered. Older apps hide this action for the default provider and
 block it while saved models or specialists use that provider; change those
