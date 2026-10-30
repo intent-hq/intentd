@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.79] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Auto-purge lets merged PRs cover nested unpushed commits ([#2814](https://github.com/intent-hq/intentd/pull/2814))
+- *(js)* Refuse values JSON cannot represent at the host() bridge ([#2811](https://github.com/intent-hq/intentd/pull/2811))
+
+### 📚 Documentation
+
+- *(app-guide)* Describe which agent the Home preview opens ([#2812](https://github.com/intent-hq/intentd/pull/2812))
+
+
 ## [0.11.78] - 2026-10-30
 
 ### 🚀 Features
