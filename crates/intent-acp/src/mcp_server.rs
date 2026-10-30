@@ -49,6 +49,7 @@ pub use bindings::app::proposal::{
 // `intent-services` reuses this so question detection cannot drift from what
 // `ws.app.question.ask` emits.
 pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
+pub use bindings::secret::SECRET_REQUEST_RESOURCE_MIME_TYPE;
 
 // Hook-scheduler seam: the background hook runner in `intent-services`
 // evaluates agent scripts with the same `ws.*` prelude + host dispatch the
