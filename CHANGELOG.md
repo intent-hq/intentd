@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.80] - 2026-10-30
+
+### 🚀 Features
+
+- Surface pending secret requests and advertise secretRequests ([#2813](https://github.com/intent-hq/intentd/pull/2813))
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop the native review monitor from refusing stage checks ([#2815](https://github.com/intent-hq/intentd/pull/2815))
+- Bump Codex ACP fallback to v2.5.0 ([#2818](https://github.com/intent-hq/intentd/pull/2818))
+
+
 ## [0.11.79] - 2026-10-30
 
 ### 🐛 Bug Fixes
