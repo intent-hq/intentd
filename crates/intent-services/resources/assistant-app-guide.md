@@ -683,6 +683,25 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
+## Set aside workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
+
+**Set aside** is unreleased until the companion frontend change ships. In a
+supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
+view moves it into a collapsed **Set aside** section; board view shows it in the
+**Set aside** column on the right, and dragging a card into that column also sets it
+aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
+action. Searching includes set-aside workspaces. With a Home
+row or card focused, **Cmd/Ctrl+Shift+S** toggles its state; customize the shortcut
+in **Settings → Input**.
+
+Setting aside keeps agents, scripts, hooks and PR monitors running. Reading its
+history keeps it aside; a new instruction or a new question, blocker, failure or
+review request brings it back. Ordinary background updates do not. This is personal
+Home organization, saved in this app for the current account and daemon; it does
+not hide the workspace for collaborators or mark its work complete.
+
 ## Archive, auto-archive and disk cleanup
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
