@@ -21558,7 +21558,7 @@ impl WorkspaceApi for Services {
 
     fn create_workspace(
         &self,
-        input: WorkspaceCreate,
+        mut input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
         let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
@@ -21583,6 +21583,9 @@ impl WorkspaceApi for Services {
             == Some(SettingOrigin::Flag);
         self.execution_call(async move {
             let native_checkout = native_checkout.await?;
+            // The caller's key, before any native-checkout derivation: a
+            // proposal origin is bound to the key its card carries.
+            let requested_key = idempotency_key.clone();
             let idempotency_key = match &native_checkout {
                 Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
                 None => idempotency_key,
@@ -21591,6 +21594,15 @@ impl WorkspaceApi for Services {
             services
                 .require_workspace_creator("workspace.create")
                 .await?;
+            // Proposal origin (PROTOCOL §5.1, intent-hq/intent#8086): shape
+            // `-32602`s here, before any side effect; resolved after success.
+            // Boxed like the create op below: inlining these futures grows
+            // the create future enough to overflow the default stack in
+            // debug builds.
+            let proposal_origin = Box::pin(
+                services.prepare_create_proposal_origin(&mut input, requested_key.as_deref()),
+            )
+            .await?;
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
@@ -21621,6 +21633,10 @@ impl WorkspaceApi for Services {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let wrapper_bus = bus.clone();
+            // Set when the create op actually runs, so an idempotent replay
+            // (stored result, op skipped) is distinguishable afterwards.
+            let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let executed_op = executed.clone();
             let inflight = services.idempotency_inflight.clone();
             let result = with_idempotency(
                 &inflight,
@@ -21632,6 +21648,7 @@ impl WorkspaceApi for Services {
                 // replay and execution scopes. Its initial-message persistence
                 // path otherwise exhausts the default stack in debug builds.
                 move || Box::pin(async move {
+                    executed_op.store(true, std::sync::atomic::Ordering::Relaxed);
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -23672,6 +23689,7 @@ impl WorkspaceApi for Services {
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
                         initial_agent,
+                        proposal_origin: None,
                     })
                 }),
             )
@@ -23730,6 +23748,15 @@ impl WorkspaceApi for Services {
             let mut result = result.map_err(|e| execution_call::git_error(e, execution_origin.as_deref()))?;
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
+            if let Some(origin) = proposal_origin {
+                let replayed = !executed.load(std::sync::atomic::Ordering::Relaxed);
+                result.proposal_origin = Box::pin(self.resolve_create_proposal_origin(
+                    origin,
+                    &result.workspace.id,
+                    replayed,
+                ))
+                .await;
+            }
             Ok(result)
         })
     }
