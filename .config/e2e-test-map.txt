@@ -39,10 +39,17 @@ crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  s
 # the merge queue on desktop_control::cursor_move. desktop_control drives
 # ws.desktop.* through workspace_api, script_lifecycle runs workspace_api
 # scripts over MCP, and e2e_wss_hook_mcp_tools runs hook scripts (hook_manager
-# evaluates them through intent-js).
+# evaluates them through intent-js). The workspace_api binding suites call
+# ws.* bindings through the bridge end to end, and e2e_hook_lifecycle runs
+# hook scripts. The library unit tests of intent-js's direct dependents
+# (intent-acp's tests_wsapi*, intent-svc-runtime's hook_manager) are selected
+# by changed-tests.sh's lib_rdeps_roots, not by entries here.
 crates/intent-js/src/*                               intentd::wss_integration  desktop_control
 crates/intent-js/src/*                               intentd::wss_integration  script_lifecycle
 crates/intent-js/src/*                               intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings2
+crates/intent-js/src/*                               intentd::suite_e2e        e2e_hook_lifecycle
 
 # Desktop binding (ws.desktop.*): the workspace_api tests that drive it.
 crates/intent-acp/src/mcp_server/bindings/desktop.rs intentd::wss_integration  desktop_control
