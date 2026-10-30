@@ -683,8 +683,9 @@ grouping choices keep their behavior.
 **Set aside** is unreleased until the companion frontend change ships. In a
 supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
 view moves it into a collapsed **Set aside** section; board view shows it in the
-**Set aside** column on the right. Choose **Bring back** on its row or card, or use
-the immediate **Undo** action. Searching includes set-aside workspaces. With a Home
+**Set aside** column on the right, and dragging a card into that column also sets it
+aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
+action. Searching includes set-aside workspaces. With a Home
 row or card focused, **Cmd/Ctrl+Shift+S** toggles its state; customize the shortcut
 in **Settings → Input**.
 
