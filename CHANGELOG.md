@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.81] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(agent)* Redrive a prompt the provider cancelled before any output ([#2817](https://github.com/intent-hq/intentd/pull/2817))
+- Resolve card-applied proposals inside workspace.create ([#2819](https://github.com/intent-hq/intentd/pull/2819))
+
+
 ## [0.11.80] - 2026-10-30
 
 ### 🚀 Features
