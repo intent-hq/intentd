@@ -95,14 +95,14 @@ pub fn head_reached_by(worktree_path: &Path, heads: &[String]) -> Result<bool> {
         return Ok(false);
     };
     for candidate in heads {
-        let Ok(oid) = Oid::from_str(candidate.trim()) else {
+        let candidate = candidate.trim();
+        let Ok(oid) = Oid::from_str(candidate) else {
             continue;
         };
-        // `Oid::from_str` zero-pads a short prefix; only an exact id of a
-        // commit present locally can vouch for `HEAD`.
-        if oid.to_string() != candidate.trim().to_ascii_lowercase()
-            || repo.find_commit(oid).is_err()
-        {
+        // `Oid::from_str` zero-pads a short prefix; only a full-length id
+        // (two hex digits per byte) of a commit present locally can vouch
+        // for `HEAD`.
+        if candidate.len() != oid.as_bytes().len() * 2 || repo.find_commit(oid).is_err() {
             continue;
         }
         if oid == head || repo.graph_descendant_of(oid, head).map_err(map_git_err)? {
