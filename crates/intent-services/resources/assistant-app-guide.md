@@ -624,7 +624,7 @@ links a PR to a workspace when it discovers the PR on that workspace's branch or
 one of its submodules; PRs seen only before this feature shipped are not linked
 until Intent sees them again.
 
-The sidebar shows **Pull Requests** as its own section above **Changes**, including
+The sidebar card contains a **Pull Requests** section above **Changes**, including
 linked PRs from submodules and agent monitors. Each row shows its title, number,
 and state, with repository context for PRs from other repositories. Select a row
 to open that PR.
