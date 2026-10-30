@@ -226,6 +226,7 @@ impl Fixture {
             .upsert_browser_tab(
                 &intent_core::ClientId::from("client"),
                 intent_core::BrowserTabInput {
+                    navigation_only: false,
                     tab_id: "tab".into(),
                     workspace_id: self.workspace.id.clone(),
                     url: "https://example.test/".into(),

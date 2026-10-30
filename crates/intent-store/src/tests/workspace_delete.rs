@@ -461,6 +461,7 @@ async fn seed_tab_and_draft(store: &Store, workspace: &WorkspaceId, host: &Clien
         .upsert_browser_tab(
             host,
             BrowserTabInput {
+                navigation_only: false,
                 tab_id: workspace.0.clone(),
                 workspace_id: workspace.clone(),
                 url: "https://example.test/".to_string(),
@@ -829,6 +830,7 @@ async fn workspace_delete_browser_batch_failure_evicts_only_committed_overlays()
             .upsert_browser_tab(
                 &host,
                 BrowserTabInput {
+                    navigation_only: false,
                     tab_id: format!("doomed-{n}"),
                     workspace_id: doomed.clone(),
                     url: "https://example.test/".to_string(),

@@ -14,6 +14,7 @@ use intent_services::feature_api::{EventBus, Services, Subscription, Subscriptio
 
 fn input(ws: &WorkspaceId, tab_id: &str) -> BrowserTabInput {
     BrowserTabInput {
+        navigation_only: false,
         tab_id: tab_id.to_string(),
         workspace_id: ws.clone(),
         url: format!("https://example.test/{tab_id}"),

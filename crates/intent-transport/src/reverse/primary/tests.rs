@@ -1859,3 +1859,114 @@ fn detached_guard_cannot_reserve_a_binding() {
         .is_none());
     assert_eq!(guard.bound_client_id(), None);
 }
+
+#[tokio::test]
+async fn native_navigation_prefers_desktop_and_never_widens_automation() {
+    use intent_core::WorkspaceId;
+    let reg = PrimaryReverseRegistry::new();
+    let (phone, mut phone_rx) = idle_channel();
+    let phone_guard = reg.register(phone.clone(), ReverseTransport::Wss);
+    let mut native = identity("phone", false);
+    native.capabilities["browserNavigation"] = true.into();
+    phone_guard.bind_hello(native.clone());
+    let ws = WorkspaceId::from("workspace");
+    assert!(reg.resolve(&ReverseTarget::Default).is_err());
+    assert_eq!(
+        reg.resolve_navigation(&ReverseTarget::Default, &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "phone"
+    );
+    let (desktop, _desktop_rx) = idle_channel();
+    let desktop_guard = reg.register(desktop, ReverseTransport::Wss);
+    desktop_guard.bind_hello(identity("desktop", true));
+    assert_eq!(
+        reg.resolve_navigation(&ReverseTarget::Default, &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "desktop"
+    );
+    assert_eq!(
+        reg.resolve_navigation(&pinned("phone"), &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "phone"
+    );
+    assert!(reg.resolve_navigation(&pinned("offline"), &ws).is_err());
+    let (aux, _aux_rx) = idle_channel();
+    let aux_guard = reg.register(aux, ReverseTransport::Wss);
+    aux_guard.bind_hello(identity("phone", false));
+    assert_eq!(
+        reg.live_clients()[0].capabilities["browserNavigation"],
+        true
+    );
+    let request = reg.dispatch("browser.exec", json!({"workspaceId":"workspace","actions":[{"action":"openTab","url":"https://example.test"}]}), pinned("phone"));
+    let reply = async {
+        let frame = phone_rx.recv().await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        phone.route_response(&json!({"jsonrpc":"2.0","id":frame["id"],"result":{"success":true}}));
+    };
+    let (result, ()) = tokio::join!(request, reply);
+    assert_eq!(result.unwrap()["success"], true);
+    for actions in [
+        json!([{"action":"evaluate"}]),
+        json!([{"action":"openTab"},{"action":"screenshot"}]),
+        json!([{"action":"unknown"}]),
+    ] {
+        assert!(reg
+            .dispatch(
+                "browser.exec",
+                json!({"workspaceId":"workspace","actions":actions}),
+                pinned("phone")
+            )
+            .await
+            .is_err());
+        assert!(phone_rx.try_recv().is_err());
+    }
+    drop(phone_guard);
+    assert!(
+        reg.resolve_navigation(&pinned("phone"), &ws).is_err(),
+        "auxiliary socket cannot navigate"
+    );
+}
+
+#[test]
+fn native_navigation_preserves_guest_and_chief_authority() {
+    let reg = PrimaryReverseRegistry::new();
+    let (guest_tx, _guest_rx) = mpsc::channel::<crate::OutboundFrame>(4);
+    let guest = reg.register(
+        ReverseChannel::new(guest_tx).with_administrator(false),
+        ReverseTransport::Wss,
+    );
+    let mut native = identity("phone", false);
+    native.capabilities["browserNavigation"] = true.into();
+    guest.bind_hello(native.clone());
+    assert!(reg
+        .resolve_navigation(&ReverseTarget::Default, &workspace("ws-1"))
+        .is_err());
+    assert!(guest.bound_client_id().is_none());
+    let (member_tx, _member_rx) = mpsc::channel::<crate::OutboundFrame>(4);
+    let channel = ReverseChannel::new(member_tx).with_member_authority(
+        std::sync::Arc::new(NoApi),
+        Some(&intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Member,
+        }),
+    );
+    channel.set_browser_member(true);
+    let member = reg.register(channel.clone(), ReverseTransport::Wss);
+    member.bind_hello(native);
+    assert!(reg
+        .resolve_navigation(&ReverseTarget::Default, &workspace("ws-1"))
+        .is_ok());
+    assert!(reg
+        .resolve_navigation(&ReverseTarget::Default, &intent_core::WorkspaceId::chief())
+        .is_err());
+    channel.set_browser_member(false);
+    assert!(reg
+        .resolve_navigation(&ReverseTarget::Default, &workspace("ws-1"))
+        .is_err());
+}
