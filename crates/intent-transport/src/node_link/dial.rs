@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::{self, http, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use intent_core::node_link::{
-    ensure_protocol, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOL,
+    ensure_protocol, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS,
 };
 use intent_core::{Error, Result};
 
@@ -164,11 +164,11 @@ pub(super) fn decode_rejection(reason: &str) -> Error {
         )),
         codes::VERSION_MISMATCH => match number() {
             Some(peer) => Error::InvalidParams(format!(
-                "{}: node speaks {peer}, this daemon {NODE_LINK_PROTOCOL}",
+                "{}: node speaks {peer}, this daemon {NODE_LINK_PROTOCOLS}",
                 codes::VERSION_MISMATCH
             )),
             None => Error::InvalidParams(format!(
-                "{}: this daemon speaks {NODE_LINK_PROTOCOL}",
+                "{}: this daemon speaks {NODE_LINK_PROTOCOLS}",
                 codes::VERSION_MISMATCH
             )),
         },

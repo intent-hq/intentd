@@ -122,7 +122,9 @@ impl AgentSink {
                 }
                 self.responses.send_modify(|count| *count += 1);
             }
-            JournalBody::Exited { exit_code, error } => {
+            JournalBody::Exited {
+                exit_code, error, ..
+            } => {
                 let mut state = lock(&self.state);
                 state.exit = Some(Exit { exit_code, error });
                 // Dropping the waiters fails every pending prompt.

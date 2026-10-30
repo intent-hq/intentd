@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::*;
 use crate::nodes::{NodeArch, NodeOs};
+use crate::placement::CapacityRefusal;
 
 fn binding(head: &str, generation: u64) -> LeaseBinding {
     LeaseBinding {
@@ -84,14 +85,263 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn protocol_versions_must_match_exactly() {
-    ensure_protocol(NODE_LINK_PROTOCOL).unwrap();
-    for peer in [0, 4, NODE_LINK_PROTOCOL + 1] {
+fn the_daemon_to_daemon_link_starts_at_protocol_6() {
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 6, max: 6 });
+    ensure_protocol(6).unwrap();
+    for peer in [0, 4, 5, NODE_LINK_PROTOCOLS.max + 1] {
         assert!(matches!(
             ensure_protocol(peer),
             Err(Error::InvalidParams(m)) if m.starts_with("node-link-version-mismatch")
         ));
     }
+}
+
+#[test]
+fn protocol_ranges_negotiate_the_highest_common_version() {
+    let range = |min, max| ProtocolRange { min, max };
+    assert_eq!(range(6, 8).highest_common(range(7, 9)), Some(8));
+    assert_eq!(range(7, 9).highest_common(range(6, 8)), Some(8));
+    assert_eq!(range(6, 6).highest_common(range(6, 9)), Some(6));
+    assert_eq!(range(6, 7).highest_common(range(8, 9)), None);
+    assert_eq!(range(8, 9).highest_common(range(6, 7)), None);
+    assert_eq!(range(7, 6).highest_common(range(6, 7)), None, "empty range");
+    assert!(range(6, 8).contains(7));
+    assert!(!range(6, 8).contains(9));
+    assert_eq!(range(6, 6).to_string(), "6");
+    assert_eq!(range(6, 8).to_string(), "6-8");
+    assert_eq!(
+        serde_json::to_value(range(6, 8)).unwrap(),
+        json!({ "min": 6, "max": 8 })
+    );
+    assert!(serde_json::from_value::<ProtocolRange>(json!({ "min": 6 })).is_err());
+}
+
+fn capabilities() -> MachineCapabilities {
+    MachineCapabilities {
+        platform: AgentPlatform {
+            os: NodeOs::Macos,
+            arch: NodeArch::Aarch64,
+        },
+        intentd_version: "0.12.0".into(),
+        capacity: MachineCapacity {
+            running_agents: 1,
+            agent_cap: 4,
+            charged_memory_bytes: 1 << 30,
+            memory_budget_bytes: Some(8 << 30),
+        },
+        providers: vec![
+            ProviderCapability {
+                id: "claude".into(),
+                visible: true,
+                status: ProviderStatus::SignedIn,
+                models: vec!["opus".into(), "sonnet".into()],
+                models_stale: false,
+            },
+            ProviderCapability {
+                id: "codex".into(),
+                visible: true,
+                status: ProviderStatus::CliMissing,
+                models: vec![],
+                models_stale: true,
+            },
+        ],
+        observed_at: "2026-10-30T00:00:00Z".into(),
+    }
+}
+
+/// The report as `docs/protocol/node-link.md` "Capabilities report" spells
+/// it.
+#[test]
+fn the_capabilities_report_matches_the_documented_shape() {
+    let canonical = json!({
+        "platform": { "os": "macos", "arch": "aarch64" },
+        "intentdVersion": "0.12.0",
+        "capacity": {
+            "runningAgents": 1,
+            "agentCap": 4,
+            "chargedMemoryBytes": 1_073_741_824_u64,
+            "memoryBudgetBytes": 8_589_934_592_u64,
+        },
+        "providers": [
+            { "id": "claude", "visible": true, "status": "signed-in",
+              "models": ["opus", "sonnet"], "modelsStale": false },
+            { "id": "codex", "visible": true, "status": "cli-missing",
+              "models": [], "modelsStale": true },
+        ],
+        "observedAt": "2026-10-30T00:00:00Z",
+    });
+    assert_eq!(serde_json::to_value(capabilities()).unwrap(), canonical);
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(canonical).unwrap(),
+        capabilities()
+    );
+    let mut unlimited = capabilities();
+    unlimited.capacity.memory_budget_bytes = None;
+    let value = serde_json::to_value(&unlimited).unwrap();
+    assert!(
+        value["capacity"].get("memoryBudgetBytes").is_none(),
+        "absent when unlimited"
+    );
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(value).unwrap(),
+        unlimited
+    );
+}
+
+#[test]
+fn every_provider_status_has_its_kebab_case_name() {
+    for (status, name) in [
+        (ProviderStatus::SignedIn, "signed-in"),
+        (ProviderStatus::SignedOut, "signed-out"),
+        (ProviderStatus::AuthFailed, "auth-failed"),
+        (ProviderStatus::CliMissing, "cli-missing"),
+        (ProviderStatus::PrerequisiteMissing, "prerequisite-missing"),
+        (ProviderStatus::Unknown, "unknown"),
+    ] {
+        assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
+        assert_eq!(
+            serde_json::from_value::<ProviderStatus>(json!(name)).unwrap(),
+            status
+        );
+    }
+}
+
+#[test]
+fn later_additions_within_a_version_decode_on_an_older_peer() {
+    let status: ProviderStatus = serde_json::from_value(json!("rate-limited")).unwrap();
+    assert_eq!(
+        status,
+        ProviderStatus::Unknown,
+        "a newer status reads as unknown"
+    );
+
+    let mut hello = serde_json::to_value(LinkFrame::Hello(LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "0.12.0".into(),
+        binding: binding("head", 1),
+        acked_seq: NodeCounter(0),
+    }))
+    .unwrap();
+    hello["futureOption"] = json!(true);
+    assert!(matches!(
+        serde_json::from_value::<LinkFrame>(hello).unwrap(),
+        LinkFrame::Hello(_)
+    ));
+
+    let mut report = serde_json::to_value(capabilities()).unwrap();
+    report["gpu"] = json!("m3");
+    report["capacity"]["gpuSlots"] = json!(2);
+    report["providers"][0]["quota"] = json!(3);
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(report.clone()).unwrap(),
+        capabilities()
+    );
+    let reply = json!({ "type": "capabilitiesReply", "capabilities": report, "extra": 1 });
+    assert!(matches!(
+        LinkFrame::decode(reply.to_string().as_bytes()).unwrap(),
+        LinkFrame::CapabilitiesReply { .. }
+    ));
+
+    let mut launch = serde_json::to_value(match &every_frame()[4] {
+        frame @ LinkFrame::Launch(_) => frame.clone(),
+        other => panic!("expected launch, got {other:?}"),
+    })
+    .unwrap();
+    launch["futureOption"] = json!("x");
+    assert!(matches!(
+        serde_json::from_value::<LinkFrame>(launch).unwrap(),
+        LinkFrame::Launch(_)
+    ));
+}
+
+#[test]
+fn protocol_6_launches_require_the_workspace_api_fields() {
+    let launch = serde_json::to_value(&every_frame()[4]).unwrap();
+    for field in ["agentFeatures", "isSubAgent", "baseCommit", "repoKey"] {
+        let mut missing = launch.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<LinkFrame>(missing).is_err(),
+            "{field} is required in protocol 6"
+        );
+    }
+}
+
+#[test]
+fn the_binding_stays_strict() {
+    let mut value = serde_json::to_value(binding("head", 1)).unwrap();
+    value["extra"] = json!(1);
+    assert!(serde_json::from_value::<LeaseBinding>(value).is_err());
+}
+
+fn frame_tag(frame: &LinkFrame) -> String {
+    serde_json::to_value(frame).unwrap()["type"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Golden: changing what an executor credential may send is a deliberate
+/// security decision, so the list is spelled out here.
+#[test]
+fn executor_link_requests_golden() {
+    assert_eq!(
+        EXECUTOR_LINK_REQUESTS,
+        [
+            "ack",
+            "cancel",
+            "capabilities",
+            "heartbeat",
+            "heartbeatReply",
+            "hello",
+            "launch",
+            "prompt",
+            "response",
+            "stop",
+        ]
+    );
+    let mut sorted = EXECUTOR_LINK_REQUESTS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted, EXECUTOR_LINK_REQUESTS, "sorted and unique");
+}
+
+#[test]
+fn every_frame_is_classified_for_executors_consistently_with_the_list() {
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for frame in every_frame() {
+        let tag = frame_tag(&frame);
+        assert_eq!(
+            frame.admitted_from_executor(),
+            EXECUTOR_LINK_REQUESTS.contains(&tag.as_str()),
+            "{tag}"
+        );
+        if frame.admitted_from_executor() {
+            admitted.push(tag);
+        } else {
+            refused.push(tag);
+        }
+    }
+    admitted.sort_unstable();
+    admitted.dedup();
+    assert_eq!(
+        admitted, EXECUTOR_LINK_REQUESTS,
+        "every listed frame exists"
+    );
+    refused.sort_unstable();
+    refused.dedup();
+    assert_eq!(
+        refused,
+        [
+            "cancelRequest",
+            "capabilitiesReply",
+            "journal",
+            "replayComplete",
+            "request",
+            "welcome"
+        ]
+    );
 }
 
 fn record(seq: u64, body: JournalBody) -> JournalRecord {
@@ -110,21 +360,18 @@ fn every_frame() -> Vec<LinkFrame> {
     let request_id = LinkId::new_v4();
     vec![
         LinkFrame::Hello(LinkHello {
-            protocol: NODE_LINK_PROTOCOL,
-            intentd_version: "0.11.62".into(),
+            protocol: NODE_LINK_PROTOCOLS,
+            intentd_version: "0.12.0".into(),
             binding: binding("head", 3),
             acked_seq: NodeCounter(10),
         }),
         LinkFrame::Welcome(LinkWelcome {
-            protocol: NODE_LINK_PROTOCOL,
-            intentd_version: "0.11.62".into(),
+            protocol: 6,
             node_id: "node-1".into(),
-            platform: AgentPlatform {
-                os: NodeOs::Macos,
-                arch: NodeArch::Aarch64,
-            },
-            max_agents: 4,
             running_agents: vec![agent_id.clone()],
+            capabilities: capabilities(),
+            hosts: vec!["192.168.1.20".into()],
+            tc_address: Some("mac-mini.tc".into()),
         }),
         LinkFrame::Heartbeat { nonce: 1 },
         LinkFrame::HeartbeatReply { nonce: 1 },
@@ -172,6 +419,7 @@ fn every_frame() -> Vec<LinkFrame> {
             JournalBody::Exited {
                 exit_code: Some(1),
                 error: Some("crashed".into()),
+                failure: None,
             },
         )),
         LinkFrame::Ack {
@@ -200,6 +448,10 @@ fn every_frame() -> Vec<LinkFrame> {
             }),
         },
         LinkFrame::CancelRequest { request_id },
+        LinkFrame::Capabilities,
+        LinkFrame::CapabilitiesReply {
+            capabilities: capabilities(),
+        },
     ]
 }
 
@@ -219,7 +471,7 @@ fn frames_are_routed_to_their_lane() {
         lanes,
         [
             Control, Control, Control, Control, Control, Control, Control, Control, Journal,
-            Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc
+            Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control, Control
         ]
     );
 }
@@ -345,4 +597,81 @@ fn launch_without_a_profile_omits_profile_env() {
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
+}
+
+/// The executor frames of `docs/protocol/node-link.md`: an empty
+/// `capabilities` request, a `capabilitiesReply`, and the welcome's routes.
+#[test]
+fn executor_frames_match_the_documented_wire_shapes() {
+    let request = json!({ "type": "capabilities" });
+    assert_eq!(
+        serde_json::to_value(LinkFrame::Capabilities).unwrap(),
+        request
+    );
+    assert_eq!(
+        LinkFrame::decode(request.to_string().as_bytes()).unwrap(),
+        LinkFrame::Capabilities
+    );
+    let reply = serde_json::to_value(LinkFrame::CapabilitiesReply {
+        capabilities: capabilities(),
+    })
+    .unwrap();
+    assert_eq!(reply["type"], "capabilitiesReply");
+    assert_eq!(reply["capabilities"]["capacity"]["agentCap"], 4);
+
+    let welcome = serde_json::to_value(&every_frame()[1]).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["protocol"], 6);
+    assert_eq!(welcome["hosts"], json!(["192.168.1.20"]));
+    assert_eq!(welcome["tcAddress"], "mac-mini.tc");
+    let mut no_tailcat = welcome.clone();
+    no_tailcat.as_object_mut().unwrap().remove("tcAddress");
+    match serde_json::from_value::<LinkFrame>(no_tailcat).unwrap() {
+        LinkFrame::Welcome(welcome) => assert_eq!(welcome.tc_address, None),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+}
+
+/// `exited.failure` as `docs/protocol/node-link.md` "Capacity refusal on
+/// the wire" spells it: an optional structured failure whose `data` is the
+/// closed capacity refusal.
+#[test]
+fn exited_carries_the_documented_capacity_failure() {
+    let canonical = json!({
+        "kind": "exited",
+        "error": "node-capacity: this machine is running 4 of 4 agents",
+        "failure": {
+            "code": "node-capacity",
+            "data": { "limit": "count", "runningAgents": 4, "agentCap": 4 },
+        },
+    });
+    let body: JournalBody = serde_json::from_value(canonical.clone()).unwrap();
+    assert_eq!(
+        body,
+        JournalBody::Exited {
+            exit_code: None,
+            error: Some("node-capacity: this machine is running 4 of 4 agents".into()),
+            failure: Some(ExitFailure {
+                code: "node-capacity".into(),
+                data: Some(CapacityRefusal::Count {
+                    running_agents: 4,
+                    agent_cap: 4,
+                }),
+            }),
+        }
+    );
+    assert_eq!(serde_json::to_value(&body).unwrap(), canonical);
+
+    let mut open_data = canonical.clone();
+    open_data["failure"]["data"]["note"] = json!("x");
+    assert!(
+        serde_json::from_value::<JournalBody>(open_data).is_err(),
+        "the capacity refusal is closed"
+    );
+
+    let plain = json!({ "kind": "exited", "exitCode": 1 });
+    assert!(matches!(
+        serde_json::from_value::<JournalBody>(plain).unwrap(),
+        JournalBody::Exited { failure: None, .. }
+    ));
 }

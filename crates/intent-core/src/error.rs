@@ -105,6 +105,20 @@ pub enum Error {
     #[error("{0}")]
     PlacementUnavailable(Box<crate::placement::PlacementUnavailable>),
 
+    /// No exposed machine offers the requested model. Surfaces as `-32602`
+    /// with [`crate::machines::ModelUnavailable::message`] and `error.data =
+    /// { code: "model-unavailable", provider, model, machines, retryable }`.
+    #[error("{0}")]
+    ModelUnavailable(Box<crate::machines::ModelUnavailable>),
+
+    /// A backend and a machine share no node-link protocol version.
+    /// Surfaces as `-32602` with
+    /// [`crate::machines::MachineUpdateRequired::message`] and `error.data =
+    /// { code: "machine-update-required", machineVersion, backendVersion,
+    /// update }`.
+    #[error("{0}")]
+    MachineUpdateRequired(Box<crate::machines::MachineUpdateRequired>),
+
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
     /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
@@ -602,6 +616,8 @@ impl Error {
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::PlacementUnavailable(_)
+            | Error::ModelUnavailable(_)
+            | Error::MachineUpdateRequired(_)
             | Error::ContentBaseMismatch { .. }
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {

@@ -2,7 +2,7 @@
 //! live lease, the link generation (advanced before every dial) and the
 //! journal ack (persisted before it is sent).
 
-use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOL};
+use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
 use intent_core::nodes::{
     LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
     NodeRecord, NodeState,
@@ -139,7 +139,7 @@ impl HeadLease {
         };
         let generation = self.store.next_node_link_generation(&self.owner).await?;
         Ok(LinkHello {
-            protocol: NODE_LINK_PROTOCOL,
+            protocol: NODE_LINK_PROTOCOLS,
             intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
             binding: LeaseBinding {
                 head_id: self.owner.head_id.clone(),
@@ -156,10 +156,10 @@ impl HeadLease {
         self.store
             .record_node_welcome(
                 &self.owner,
-                welcome.platform.os,
-                welcome.platform.arch,
-                welcome.max_agents,
-                &welcome.intentd_version,
+                welcome.capabilities.platform.os,
+                welcome.capabilities.platform.arch,
+                welcome.capabilities.capacity.agent_cap,
+                &welcome.capabilities.intentd_version,
             )
             .await
             .map(drop)

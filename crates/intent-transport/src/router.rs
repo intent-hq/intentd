@@ -213,6 +213,20 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: failure.message(),
             data: Some(failure.data()),
         },
+        // No exposed machine offers the requested model: -32602 with
+        // `data.code: "model-unavailable"` and what each machine has.
+        ref e @ Error::ModelUnavailable(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
+        // Backend and machine share no node-link version: -32602 with
+        // `data.code: "machine-update-required"` and the side to update.
+        ref e @ Error::MachineUpdateRequired(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
         ref e @ Error::ProviderProfile(ref failure) => RpcErr {
             code: e.code(),
             message: failure.message.clone(),

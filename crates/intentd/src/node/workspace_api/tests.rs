@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use intent_core::node_link::{
-    LeaseBinding, LinkHello, LinkOutcome, LinkRpcError, LinkWelcome, NODE_LINK_PROTOCOL,
+    LeaseBinding, LinkHello, LinkOutcome, LinkRpcError, LinkWelcome, NODE_LINK_PROTOCOLS,
 };
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
@@ -284,15 +284,20 @@ async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
             certificate: certificate.clone(),
         },
         Arc::new(|_| LinkWelcome {
-            protocol: NODE_LINK_PROTOCOL,
-            intentd_version: "test".into(),
+            protocol: NODE_LINK_PROTOCOLS.max,
             node_id: "node-1".into(),
-            platform: AgentPlatform {
-                os: NodeOs::Linux,
-                arch: NodeArch::X86_64,
-            },
-            max_agents: 1,
             running_agents: Vec::new(),
+            capabilities: intent_core::node_link::MachineCapabilities::new(
+                AgentPlatform {
+                    os: NodeOs::Linux,
+                    arch: NodeArch::X86_64,
+                },
+                "test",
+                1,
+                "2026-10-30T00:00:00Z",
+            ),
+            hosts: Vec::new(),
+            tc_address: None,
         }),
     )
     .await
@@ -303,7 +308,7 @@ async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
         token: token(),
     };
     let hello = LinkHello {
-        protocol: NODE_LINK_PROTOCOL,
+        protocol: NODE_LINK_PROTOCOLS,
         intentd_version: "test".into(),
         binding: LeaseBinding {
             head_id: "head-1".into(),

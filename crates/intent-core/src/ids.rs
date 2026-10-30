@@ -136,6 +136,11 @@ id_newtype!(
     WorkspaceGitRootId
 );
 id_newtype!(
+    /// Identifier for an executor credential: the scoped bearer credential a
+    /// machine mints for one backend so it can run remote agents there.
+    ExecutorCredentialId
+);
+id_newtype!(
     /// Identifier for a principal (a person, keyed locally; stable across
     /// GitHub identity linking). The daemon's primary user is minted by
     /// migration `0125_principals`.

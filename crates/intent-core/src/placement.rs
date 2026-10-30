@@ -298,6 +298,30 @@ impl PlatformAvailability {
             requested,
             reason,
             availability: self,
+            machine: None,
+            capacity: None,
+            machines: Vec::new(),
+        }
+    }
+
+    /// The `placement-unavailable` failure for one machine: `no-capacity`
+    /// with the limit it hit, or `machine-unreachable`, `machine-unknown`
+    /// or `machine-revoked` (pass `capacity: None`).
+    #[must_use]
+    pub fn machine_unavailable(
+        self,
+        requested: AgentPlacement,
+        reason: PlacementUnavailableReason,
+        machine: MachineRef,
+        capacity: Option<CapacityRefusal>,
+    ) -> PlacementUnavailable {
+        PlacementUnavailable {
+            requested,
+            reason,
+            availability: self,
+            machine: Some(machine),
+            capacity,
+            machines: Vec::new(),
         }
     }
 }
@@ -315,14 +339,79 @@ fn sorted_platforms(platforms: impl IntoIterator<Item = AgentPlatform>) -> Vec<A
 pub enum PlacementUnavailableReason {
     UnsupportedPlatform,
     NoCapacity,
+    /// No route to the machine answered (it may be asleep or offline).
+    MachineUnreachable,
+    /// `placement.nodeId` names no machine exposed to this backend.
+    MachineUnknown,
+    /// The machine revoked this backend's executor credential.
+    MachineRevoked,
 }
 
 impl PlacementUnavailableReason {
-    /// `no-capacity` may succeed later; `unsupported-platform` cannot.
+    /// `no-capacity` and `machine-unreachable` may succeed later; the
+    /// others cannot without a change on either side.
     #[must_use]
     pub fn retryable(self) -> bool {
-        matches!(self, Self::NoCapacity)
+        matches!(self, Self::NoCapacity | Self::MachineUnreachable)
     }
+}
+
+/// Which of a machine's shared limits refused a launch, with the numbers:
+/// its agent process cap (`count`) or its aggregate agent memory budget
+/// (`memory`). A closed payload (unknown members reject): it rides the
+/// `placement-unavailable` / `no-capacity` data (flattened), the executor
+/// link's `exited.failure.data`, and `placementError.data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "limit", rename_all = "lowercase", deny_unknown_fields)]
+pub enum CapacityRefusal {
+    #[serde(rename_all = "camelCase")]
+    Count { running_agents: u32, agent_cap: u32 },
+    #[serde(rename_all = "camelCase")]
+    Memory {
+        charged_memory_bytes: u64,
+        memory_budget_bytes: u64,
+    },
+}
+
+impl fmt::Display for CapacityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MIB: u64 = 1024 * 1024;
+        match *self {
+            Self::Count {
+                running_agents,
+                agent_cap,
+            } => write!(f, "{running_agents} of {agent_cap} agents running"),
+            Self::Memory {
+                charged_memory_bytes,
+                memory_budget_bytes,
+            } => write!(
+                f,
+                "{} of {} MiB agent memory in use",
+                charged_memory_bytes / MIB,
+                memory_budget_bytes / MIB
+            ),
+        }
+    }
+}
+
+/// The machine a machine-specific refusal is about. The data carries its
+/// `nodeId`; the message uses its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRef {
+    pub node_id: String,
+    /// Its display name; the id again when the machine is unknown.
+    pub name: String,
+}
+
+/// One candidate's capacity refusal in `placement-unavailable`
+/// `machines[]`, when several machines were full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCapacityRefusal {
+    pub node_id: String,
+    #[serde(flatten)]
+    pub refusal: CapacityRefusal,
 }
 
 /// No node can run the requested placement. Surfaces as JSON-RPC `-32602`
@@ -333,14 +422,28 @@ pub struct PlacementUnavailable {
     pub requested: AgentPlacement,
     pub reason: PlacementUnavailableReason,
     pub availability: PlatformAvailability,
+    /// The one machine the refusal is about (`nodeId` in the data).
+    pub machine: Option<MachineRef>,
+    /// The limit that machine's `no-capacity` refusal hit.
+    pub capacity: Option<CapacityRefusal>,
+    /// Per-candidate `no-capacity` limits when several machines were full.
+    pub machines: Vec<MachineCapacityRefusal>,
 }
 
 /// `error.data.code` of [`PlacementUnavailable`].
 pub const PLACEMENT_UNAVAILABLE_CODE: &str = "placement-unavailable";
 
 impl PlacementUnavailable {
+    /// Record each full candidate's limit (`machines[]` in the data).
+    #[must_use]
+    pub fn with_machines(mut self, machines: Vec<MachineCapacityRefusal>) -> Self {
+        self.machines = machines;
+        self
+    }
+
     /// The human message, for example
-    /// `No capacity for x86_64; available: none; supported: linux/x86_64`.
+    /// `No capacity for x86_64; available: none; supported: linux/x86_64`,
+    /// or for one machine `No capacity on Build box: 4 of 4 agents running`.
     #[must_use]
     pub fn message(&self) -> String {
         let requested = match (self.requested.os, self.requested.arch) {
@@ -349,9 +452,33 @@ impl PlacementUnavailable {
             (None, Some(arch)) => arch_name(arch).to_string(),
             (None, None) => "any platform".to_string(),
         };
+        if let Some(machine) = &self.machine {
+            let name = &machine.name;
+            return match self.reason {
+                PlacementUnavailableReason::NoCapacity => match self.capacity {
+                    Some(limit) => format!("No capacity on {name}: {limit}"),
+                    None => format!("No capacity on {name}"),
+                },
+                PlacementUnavailableReason::UnsupportedPlatform => {
+                    format!("{name} does not run {requested}")
+                }
+                PlacementUnavailableReason::MachineUnreachable => {
+                    format!("{name} is unreachable")
+                }
+                PlacementUnavailableReason::MachineUnknown => {
+                    format!("No machine {} is exposed to this backend", machine.node_id)
+                }
+                PlacementUnavailableReason::MachineRevoked => {
+                    format!("{name} revoked this backend's access")
+                }
+            };
+        }
         let lead = match self.reason {
             PlacementUnavailableReason::NoCapacity => "No capacity for",
             PlacementUnavailableReason::UnsupportedPlatform => "Unsupported",
+            PlacementUnavailableReason::MachineUnreachable => "No reachable machine for",
+            PlacementUnavailableReason::MachineUnknown => "No exposed machine for",
+            PlacementUnavailableReason::MachineRevoked => "No machine accepts this backend for",
         };
         format!(
             "{lead} {requested}; available: {}; supported: {}",
@@ -369,11 +496,23 @@ impl PlacementUnavailable {
             "reason": self.reason,
             "retryable": self.reason.retryable(),
         });
-        if let (Some(data), Ok(serde_json::Value::Object(availability))) = (
-            data.as_object_mut(),
-            serde_json::to_value(&self.availability),
-        ) {
-            data.extend(availability);
+        let Some(object) = data.as_object_mut() else {
+            return data;
+        };
+        if let Ok(serde_json::Value::Object(availability)) =
+            serde_json::to_value(&self.availability)
+        {
+            object.extend(availability);
+        }
+        if let Some(machine) = &self.machine {
+            object.insert("nodeId".into(), machine.node_id.clone().into());
+        }
+        if let Some(Ok(serde_json::Value::Object(limit))) = self.capacity.map(serde_json::to_value)
+        {
+            object.extend(limit);
+        }
+        if !self.machines.is_empty() {
+            object.insert("machines".into(), serde_json::json!(self.machines));
         }
         data
     }

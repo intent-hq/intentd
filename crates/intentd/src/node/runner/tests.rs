@@ -285,7 +285,9 @@ async fn node_runner_journals_a_provider_that_dies_at_start() {
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let record = find(&all, exited("a1"));
     match &record.body {
-        JournalBody::Exited { exit_code, error } => assert!(
+        JournalBody::Exited {
+            exit_code, error, ..
+        } => assert!(
             *exit_code == Some(3)
                 || error
                     .as_deref()
@@ -432,7 +434,9 @@ async fn node_runner_kills_leftover_children_when_the_provider_exits_by_itself()
         .await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     match &find(&all, exited("a1")).body {
-        JournalBody::Exited { exit_code, error } => {
+        JournalBody::Exited {
+            exit_code, error, ..
+        } => {
             assert_eq!((*exit_code, error.as_deref()), (Some(0), None));
         }
         other => panic!("{other:?}"),

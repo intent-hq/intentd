@@ -170,10 +170,10 @@ impl Shared {
     fn welcome(&self, welcome: &LinkWelcome) {
         let mut status = lock(&self.status);
         status.connected = true;
-        status.platform = Some(welcome.platform);
-        status.max_agents = welcome.max_agents;
+        status.platform = Some(welcome.capabilities.platform);
+        status.max_agents = welcome.capabilities.capacity.agent_cap;
         status.running_agents.clone_from(&welcome.running_agents);
-        status.intentd_version = Some(welcome.intentd_version.clone());
+        status.intentd_version = Some(welcome.capabilities.intentd_version.clone());
     }
 
     fn disconnected(&self) {

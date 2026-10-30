@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOL};
+use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_core::{BoxFuture, Error, Result};
@@ -143,14 +143,19 @@ impl Fixture {
             },
             Arc::new(|_| LinkWelcome {
                 protocol: 0,
-                intentd_version: "test".into(),
                 node_id: String::new(),
-                platform: AgentPlatform {
-                    os: NodeOs::Linux,
-                    arch: NodeArch::X86_64,
-                },
-                max_agents: 2,
                 running_agents: vec![],
+                capabilities: intent_core::node_link::MachineCapabilities::new(
+                    AgentPlatform {
+                        os: NodeOs::Linux,
+                        arch: NodeArch::X86_64,
+                    },
+                    "test",
+                    2,
+                    "2026-10-30T00:00:00Z",
+                ),
+                hosts: Vec::new(),
+                tc_address: None,
             }),
         )
         .await
@@ -169,7 +174,7 @@ impl Fixture {
         let link = dial_link(
             &endpoint,
             LinkHello {
-                protocol: NODE_LINK_PROTOCOL,
+                protocol: NODE_LINK_PROTOCOLS,
                 intentd_version: "test".into(),
                 binding: binding.clone(),
                 acked_seq: NodeCounter(0),

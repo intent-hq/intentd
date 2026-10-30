@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::{http, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use intent_core::node_link::{
-    BindDecision, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOL,
+    BindDecision, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::{Error, Result};
@@ -331,14 +331,14 @@ where
             _ => return Err(super::unavailable()),
         }
     };
-    if hello.protocol != NODE_LINK_PROTOCOL {
+    let Some(protocol) = NODE_LINK_PROTOCOLS.highest_common(hello.protocol) else {
         reject(
             socket,
-            &format!("{}: {NODE_LINK_PROTOCOL}", codes::VERSION_MISMATCH),
+            &format!("{}: {}", codes::VERSION_MISMATCH, NODE_LINK_PROTOCOLS.max),
         )
         .await;
         return Err(Error::InvalidParams(codes::VERSION_MISMATCH.into()));
-    }
+    };
     let accepted = {
         let mut current = lock(&shared.current);
         match LeaseBinding::decide(&shared.node_id, current.binding.as_ref(), &hello.binding) {
@@ -376,7 +376,7 @@ where
         older.close();
     }
     let mut welcome = (shared.welcome)(&hello);
-    welcome.protocol = NODE_LINK_PROTOCOL;
+    welcome.protocol = protocol;
     welcome.node_id.clone_from(&shared.node_id);
     let bytes = LinkFrame::Welcome(welcome).encode()?;
     socket
