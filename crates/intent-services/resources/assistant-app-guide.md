@@ -542,12 +542,14 @@ window finishes. Older clients may show the initial messages together.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; src/lib/components/chat/AssistantThreadTitle.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/{ChiefCard.svelte,chief-thread-starter.svelte.ts}; src/lib/components/chat/AssistantThreadTitle.svelte. -->
 
-In **Home → Assistant**, select a thread in the sidebar. To rename it, click its
-title in the conversation header. The title field uses the available header width.
-Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
-select conversations and cannot be edited there.
+In **Home → Assistant**, click **New chat** at the top of the sidebar to start a
+chat; a blank chat is reused rather than duplicated. Select a thread in the
+sidebar to open it. To rename it, click its title in the conversation header.
+The title field uses the available header width. Press **Enter** or click away
+to save; press **Escape** to cancel. Sidebar titles select conversations and
+cannot be edited there.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 
