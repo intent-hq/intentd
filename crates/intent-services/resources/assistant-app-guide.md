@@ -630,7 +630,7 @@ repository context for PRs from other repositories. Select a row to open that PR
 The list stays the same when you switch the repository used to browse file changes;
 merged and closed PRs remain visible.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,WorkspacePullRequests,SidebarPrList}.svelte; workspace-pr-presentation.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,WorkspacePullRequests,SidebarPrList}.svelte; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 ## Home Workspaces
 
