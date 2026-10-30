@@ -1884,3 +1884,89 @@ async fn native_private_output_binding_failure_never_falls_back_to_plain_payload
         );
     }
 }
+
+/// Run one frame through `process_frame` on caller-owned connection state.
+async fn hello_frame(
+    h: &Harness,
+    api: &Arc<dyn WorkspaceApi>,
+    reverse: &ReverseChannel,
+    guard: &crate::reverse::PrimaryReverseGuard,
+    subs: &mut ConnSubs,
+    raw: &str,
+) -> bool {
+    with_credential_context(
+        true,
+        Some(h.caller.clone()),
+        Some(h.credential.clone()),
+        None,
+        process_frame(
+            raw, api, &h.bus, &h.tx, subs, reverse, guard, None, None, &mut None, false, &h.limiter,
+        ),
+    )
+    .await
+}
+
+/// intent-hq/intent#8045: a successful `client.hello` keeps its scoped
+/// `clientId` active in the reverse registry for the connection's life,
+/// bound or not — a connection unbound by a demotion (and later rebound by a
+/// role change without another hello) is never an absent host to the
+/// superseded-id tab rehome. A failed hello reserves nothing.
+#[tokio::test]
+async fn successful_hello_keeps_its_client_id_active_for_the_connection_life() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    let api: Arc<dyn WorkspaceApi> = h.api.clone();
+    let registry = PrimaryReverseRegistry::new();
+    let reverse = ReverseChannel::new(h.tx.priority_sender());
+    let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+    let mut subs = ConnSubs::default();
+    let scoped = ClientId::from_string(format!("{}:dev-1", h.api.principal.as_str()));
+    let bad = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":42}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &bad.to_string()).await);
+    assert!(
+        subs.hello_reservation.is_none(),
+        "a failed hello reserves nothing"
+    );
+
+    let good =
+        json!({"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"dev-1"}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
+    assert!(registry.client_active(&scoped), "hello'd and bound");
+    guard.unbind();
+    assert!(
+        registry.client_active(&scoped),
+        "still active while the connection lives, though unbound"
+    );
+    drop(subs);
+    assert!(
+        !registry.client_active(&scoped),
+        "released with the connection's state"
+    );
+
+    // A hello without `clientId` reserves the server-generated scoped id.
+    let mut h = h;
+    let mut subs = ConnSubs::default();
+    let minted = json!({"jsonrpc":"2.0","id":3,"method":"client.hello","params":{}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &minted.to_string()).await);
+    let mut response = h.response().await;
+    while response["id"] != json!(3) {
+        response = h.response().await;
+    }
+    let generated = ClientId::from_string(
+        response["result"]["clientId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("generated client id: {response}")),
+    );
+    assert!(
+        generated
+            .as_str()
+            .starts_with(&format!("{}:", h.api.principal.as_str())),
+        "{generated:?}"
+    );
+    guard.unbind();
+    assert!(
+        registry.client_active(&generated),
+        "a generated id stays active while the connection lives, though unbound"
+    );
+    drop(subs);
+    assert!(!registry.client_active(&generated));
+}

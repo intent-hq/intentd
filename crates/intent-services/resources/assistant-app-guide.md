@@ -251,7 +251,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -264,6 +264,23 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+**Disable a provider.** In **Settings → Providers**, choose **Disable** from its
+⋯ menu, including for the default provider or one used by saved models or
+specialists. Saved selections remain intact. A turn already running can finish;
+disabling does not stop it. On their next turn, conversations using the provider's
+Default configuration move to the configured app default if it is enabled and
+usable, with a notice in chat. Named profiles require an explicit replacement
+instead. If no usable default exists, re-enable the provider or choose another
+enabled provider/model. New agents and quick actions cannot run on a disabled
+provider; update their saved selections or re-enable it. Intent does not choose an
+arbitrary replacement for a disabled app default.
+
+<!-- Auggie visibility: packages/cloudlands-fe/src/shared/provider-visibility.ts; packages/cloudlands-fe/src/features/onboarding/messages/AgentGrid.svelte; packages/cloudlands-fe/src/store/renderer/slices/provider-catalog/workspace-catalog-selectors.ts. -->
+Auggie appears in provider lists, including onboarding, only when its CLI is
+installed or it is already enabled. An enabled but missing installation stays
+visible so you can disable it; it disappears afterward. Sign-in is not required
+for an installed Auggie to appear.
 
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
@@ -653,7 +670,9 @@ and set the number of days (7 when first turned on), or set `autoArchiveIdleAfte
 (`0` = off) under `[workspace]` in `config.toml`. A workspace with no messages, note
 edits or agent activity for that long is archived, unless an agent, script, hook or
 PR monitor is still running, it is shared with guests, or it has uncommitted changes
-or unpushed commits.
+or unpushed commits. Commits from a pull request that Intent saw merged no longer
+count as unpushed, even after the merged branch is deleted on the remote; commits
+made after the merge still do.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
@@ -663,7 +682,9 @@ Workspaces whose folder is the repository itself and remote workspaces cannot be
 purged. To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
 `purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
-hour, and skips workspaces with uncommitted changes.
+hour, and skips workspaces with uncommitted changes or with unpushed commits in a
+nested repository (such as a submodule), unless Intent saw those commits merged in a
+pull request.
 
 A purged workspace still shows as archived and its history stays readable.
 Unarchiving it, or sending a message, recreates it from a fresh checkout of the

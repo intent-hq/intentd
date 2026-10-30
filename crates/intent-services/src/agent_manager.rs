@@ -21257,7 +21257,7 @@ mod disabled_provider_rehome_tests {
             .expect_err("disabled provider without a default must not spawn");
         assert!(
             matches!(&err, Error::InvalidParams(m)
-                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Agents")),
+                if m.starts_with("session/prompt:") && m.contains("\"codex\"") && m.contains("not enabled") && m.contains("Settings > Providers")),
             "distinct not-enabled rejection: {err:?}"
         );
         assert!(!mgr.contains(&agent_id), "no child spawned");

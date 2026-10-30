@@ -35756,6 +35756,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        Box::pin(async move {
+            self.ports
+                .runtime()
+                .rehome_superseded_browser_tabs(self, client_id, superseded)
+                .await
+        })
+    }
+
     fn draft_get(
         &self,
         workspace_id: WorkspaceId,

@@ -620,6 +620,16 @@ impl RuntimePort for FakeRuntime {
         })
     }
 
+    /// The fake has no tab registry semantics to repair: nothing moves.
+    fn rehome_superseded_browser_tabs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _client_id: ClientId,
+        _superseded: Vec<ClientId>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
     fn discard_sandbox<'a>(
         &'a self,
         svc: &'a Services,

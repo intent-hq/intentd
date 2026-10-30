@@ -1130,7 +1130,7 @@ pub(crate) fn ensure_provider_enabled(
         let display = intent_providers::provider_config(provider_id).display_name;
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
-             Settings > Agents."
+             Settings > Providers, or choose an enabled provider or model."
         )));
     }
     Ok(())

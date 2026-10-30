@@ -19,12 +19,96 @@ use crate::{
 /// user code could bypass the wrapper), rejects non-JSON-serializable arguments
 /// with a clear `TypeError`, and turns a `{ok:false, error}` frame back into a
 /// JS `Error`.
+///
+/// `JSON.stringify` silently turns non-finite numbers into `null` and drops
+/// functions and symbols, so a computed `NaN` option used to reach a binding
+/// as "absent" (intentd#2800). The replacer refuses those values, plus boxed
+/// primitives and `BigInt`, anywhere in the argument and names their path. It
+/// runs after `toJSON`, so `Date`s still serialize as strings, and `null` /
+/// `undefined` keep their usual JSON handling. Every global it relies on is
+/// captured before user code runs, so patching them cannot disable it.
 const HOST_BRIDGE_JS: &str = r#"
     (() => {
         const raw = globalThis.__hostRaw;
         delete globalThis.__hostRaw;
+        const stringify = JSON.stringify;
+        const apply = Reflect.apply;
+        const isArray = Array.isArray;
+        const isFinite = Number.isFinite;
+        const WM = WeakMap;
+        const wmGet = WeakMap.prototype.get;
+        const wmSet = WeakMap.prototype.set;
+        const reExec = RegExp.prototype.exec;
+        const toStr = String;
+        const identifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+        const boxes = [
+            ["Number", Number.prototype.valueOf],
+            ["String", String.prototype.valueOf],
+            ["Boolean", Boolean.prototype.valueOf],
+        ];
+        if (typeof BigInt === "function") boxes.push(["BigInt", BigInt.prototype.valueOf]);
+        if (typeof Symbol === "function") boxes.push(["Symbol", Symbol.prototype.valueOf]);
+
+        const boxedKind = (value) => {
+            for (let i = 0; i < boxes.length; i++) {
+                try {
+                    apply(boxes[i][1], value, []);
+                    return boxes[i][0];
+                } catch {}
+            }
+            return null;
+        };
+        const describe = (value) => {
+            switch (typeof value) {
+                case "number":
+                    return isFinite(value) ? null : toStr(value);
+                case "function":
+                    return "a function";
+                case "symbol":
+                    return "a symbol";
+                case "bigint":
+                    return "a BigInt";
+                case "object": {
+                    if (value === null) return null;
+                    const kind = boxedKind(value);
+                    return kind === null ? null : "a boxed " + kind;
+                }
+                default:
+                    return null;
+            }
+        };
+        const childPath = (parent, holder, key) => {
+            if (isArray(holder)) return parent + "[" + key + "]";
+            if (apply(reExec, identifier, [key]) !== null) return parent === "" ? key : parent + "." + key;
+            return parent + "[" + stringify(key) + "]";
+        };
+        const methodPrefix = (arg) => {
+            try {
+                if (arg !== null && typeof arg === "object" && typeof arg.method === "string") {
+                    return arg.method + ": ";
+                }
+            } catch {}
+            return "";
+        };
+        const encode = (arg) => {
+            const paths = new WM();
+            return stringify(arg, function (key, value) {
+                const parent = apply(wmGet, paths, [this]);
+                const path = parent === undefined ? "" : childPath(parent, this, key);
+                const problem = describe(value);
+                if (problem !== null) {
+                    throw new TypeError(
+                        "host(arg): " + methodPrefix(arg) + (path === "" ? "argument" : path) +
+                        " is " + problem + ", which JSON cannot represent"
+                    );
+                }
+                if (value !== null && typeof value === "object") apply(wmSet, paths, [value, path]);
+                return value;
+            });
+        };
+
         globalThis.host = async function host(arg) {
-            const stringified = JSON.stringify(arg === undefined ? null : arg);
+            const stringified = encode(arg === undefined ? null : arg);
             if (typeof stringified !== "string") {
                 throw new TypeError("host(arg): argument is not JSON-serializable");
             }
