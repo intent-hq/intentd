@@ -81,6 +81,9 @@ mod tests;
 #[cfg(test)]
 mod tests_wsapi5;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod egress_registry;
+
 #[cfg(test)]
 mod tests_hidden_field_egress;
 
