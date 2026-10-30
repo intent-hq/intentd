@@ -553,6 +553,137 @@ expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
 [[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
 
+# intent-js is the host() bridge the ws.* bindings and hook scripts cross: a
+# change to it also selects the library unit tests (--lib) of each crate
+# depending on it directly that has a testable src/lib.rs (intentd#2811
+# changed only intent-js/src and failed in the merge queue). Its own dependents
+# and the integration tests of its dependents are not selected. The fixture
+# adds intent-js with a plain dependency (alpha, whose dependent delta is not
+# selected), a workspace-inherited dev-dependency (intent-services, whose
+# feature crates and intent-app are not selected), binary-only dependents
+# (beta, intentd: no library) and a lib that opts out of tests (epsilon).
+setup_intent_js() {
+  write crates/intent-js/Cargo.toml $'[package]\nname = "intent-js"'
+  write crates/intent-js/src/lib.rs
+  write crates/intent-js/src/engine.rs
+  write crates/intent-js/tests/bridge.rs
+  write crates/intent-js/resources/prelude.js
+  write crates/alpha/Cargo.toml $'[package]\nname = "alpha"\n\n[dependencies]\nintent-core = { path = "../intent-core", version = "0.1" }\nintent-js = { path = "../intent-js" }'
+  write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies]\n# intent-core = { path = "../intent-core" }\nserde = "1"\nintent-js = { path = "../intent-js" }'
+  write crates/intent-services/Cargo.toml $'[package]\nname = "intent-services"\n\n[target."cfg(unix)".dependencies]\nintent-core.workspace = true\n\n[dev-dependencies]\nintent-js.workspace = true'
+  write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\n\n[dependencies.intent-services]\nworkspace = true\n\n[dependencies.intent-js]\nworkspace = true'
+  write crates/epsilon/Cargo.toml $'[package]\nname = "epsilon"\n\n[lib]\ntest = false\n\n[dependencies]\nintent-js = { path = "../intent-js" }'
+  write crates/epsilon/src/lib.rs
+  commit_all "intent-js fixture"
+  g update-ref refs/remotes/origin/main HEAD
+}
+js_lib_rdeps="-p alpha -p intent-services --lib"
+js_own="-p intent-js --lib --bins --tests"
+js_note="[test-changed] note: crates/intent-js changed; the library unit tests of the crates depending on it directly run too (alpha, intent-services)"
+js_epsilon_note="[test-changed] note: crates/epsilon depends on intent-js but its library unit tests cannot run (crates/epsilon/Cargo.toml sets [lib] test = false)"
+
+case_name="intent-js src change selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+commit_all
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_plan "$js_lib_rdeps" "$js_own"
+expect_cargo "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *"$js_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+[[ "$stdout" == *"$js_epsilon_note"* ]] || fail "$case_name: no untestable-lib note: $stdout"
+[[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 2 ]] || fail "$case_name: expected two notes: $stdout"
+
+case_name="intent-js non-src crate file also selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/resources/prelude.js
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "-p intent-js"
+[[ "$stdout" == *"$js_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+
+case_name="intent-js test-only change selects only intent-js"
+reset_repo
+setup_intent_js
+edit crates/intent-js/tests/bridge.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-js --test bridge"
+[[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
+
+# A dependent's own selection combines with its --lib: alpha's src change
+# subsumes it (and says delta is not selected), and an intent-services test
+# file runs that target next to the library unit tests.
+case_name="intent-js dependents' own selections combine with their library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+edit crates/alpha/src/lib.rs
+edit crates/intent-services/tests/smoke.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p alpha -p intent-js --lib --bins --tests" "-p intent-services --lib --test smoke"
+[[ "$stdout" == *"note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no alpha note: $stdout"
+[[ "$stdout" != *"crates/intent-js/src changed"* ]] || fail "$case_name: misleading intent-js note: $stdout"
+
+# alpha and intent-services are intent-core reverse dependencies, so every
+# target of them runs: the intent-js note does not claim only --lib runs.
+case_name="intent-js and intent-core changes together keep intent-core's full propagation"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+edit crates/intent-core/src/lib.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p alpha -p delta -p gamma -p intent-app -p intent-core -p intent-js -p intent-services -p intent-svc-transfer --lib --bins --tests" "-p intentd --bins --tests"
+[[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+[[ "$stdout" != *"crates/intent-js changed"* ]] || fail "$case_name: misleading lib-dependents note: $stdout"
+[[ "$stdout" == *"$js_epsilon_note"* ]] || fail "$case_name: no untestable-lib note: $stdout"
+
+case_name="intent-js dependent whose lib is not src/lib.rs gets a note"
+reset_repo
+setup_intent_js
+write crates/zeta/Cargo.toml $'[package]\nname = "zeta"\n\n[lib]\npath = "src/bridge.rs"\n\n[dependencies]\nintent-js = { path = "../intent-js" }'
+write crates/zeta/src/bridge.rs
+commit_all "zeta"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-js/src/engine.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *'[test-changed] note: crates/zeta depends on intent-js but its library unit tests cannot run (crates/zeta/Cargo.toml sets [lib] path = "src/bridge.rs", not src/lib.rs)'* ]] || fail "$case_name: no moved-lib note: $stdout"
+
+case_name="intent-js lib propagation merges with a <crate>::lib map entry"
+reset_repo
+setup_intent_js
+write .config/e2e-test-map.txt $'crates/intent-js/src/*      alpha::lib\ncrates/intent-js/src/*      intentd::suite_wss'
+commit_all "map"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-js/src/engine.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "$js_own" "-p intentd --test suite_wss"
+
+case_name="instrumented intent-js src change selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+run_script --instrumented
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cov "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *"[coverage-changed] note: crates/intent-js changed; the library unit tests of the crates depending on it directly run too (alpha, intent-services)"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+
 # --print-edges / --print-rdeps expose the scanner's view for
 # scripts/check-rdeps-parity.py, which compares it with cargo metadata in CI.
 fixture_edges=$'alpha\tintent-core\ndelta\talpha\ngamma\tintent-core\nintent-app\tintent-services\nintent-services\tintent-core\nintent-svc-transfer\tintent-services\nintentd\tintent-services'

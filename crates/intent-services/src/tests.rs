@@ -23,6 +23,7 @@ pub(crate) mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
+mod workspace_auto_archive_disabled;
 pub(crate) mod workspace_delete;
 mod workspace_label;
 
@@ -774,6 +775,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     );
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
     row.label = Some("Customer escalations for later".to_string());
+    row.auto_archive_disabled = true;
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(
@@ -32281,6 +32283,11 @@ mod worktree_provisioning {
             obj.get("workspaceLabels"),
             Some(&serde_json::json!(1)),
             "workspace labels are advertised as exact integer 1: {caps}"
+        );
+        assert_eq!(
+            obj.get("workspaceAutoArchiveOptOut"),
+            Some(&serde_json::json!(1)),
+            "the auto-archive opt-out is advertised as exact integer 1: {caps}"
         );
     }
 

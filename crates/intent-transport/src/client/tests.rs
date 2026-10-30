@@ -184,6 +184,11 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
         assert_eq!(server["capabilities"]["prWorkspaceLookup"], json!(1));
         assert_eq!(server["capabilities"]["agentWorkers"], json!(1));
         assert_eq!(server["capabilities"]["workspaceLabels"], json!(1));
+        assert_eq!(server["capabilities"]["secretRequests"], json!(1));
+        assert_eq!(
+            server["capabilities"]["workspaceAutoArchiveOptOut"],
+            json!(1)
+        );
         for capability in [
             "repositoryContext",
             "repositorySelection",

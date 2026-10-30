@@ -114,13 +114,13 @@ async fn ineligible_and_unhelloed_connections_never_receive_default_dispatch() {
     let (desktop, mut rx_desktop) = idle_channel();
     let _g_ios = reg.register(ios, ReverseTransport::Wss);
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("fe-aux", false));
+    g_aux.bind_hello(identity("fe-aux", false));
     assert!(
         !reg.is_connected(),
         "no eligible client yet: un-hello'd and capability-less connections do not count"
     );
     let g_desktop = reg.register(desktop.clone(), ReverseTransport::Wss);
-    g_desktop.bind(identity("fe-desktop", true));
+    g_desktop.bind_hello(identity("fe-desktop", true));
     assert_eq!(reg.len(), 3);
     assert!(reg.is_connected());
 
@@ -154,7 +154,7 @@ async fn non_administrator_connections_are_never_eligible_reverse_targets() {
     let guest = ReverseChannel::new(guest_tx).with_administrator(false);
     let (owner, mut rx_owner) = idle_channel();
     let g_guest = reg.register(guest, ReverseTransport::Wss);
-    g_guest.bind(identity("guest", true));
+    g_guest.bind_hello(identity("guest", true));
     assert!(
         !reg.is_connected(),
         "a non-administrator connection must not count as an eligible client"
@@ -166,7 +166,7 @@ async fn non_administrator_connections_are_never_eligible_reverse_targets() {
     ));
 
     let g_owner = reg.register(owner.clone(), ReverseTransport::Wss);
-    g_owner.bind(identity("owner", true));
+    g_owner.bind_hello(identity("owner", true));
     assert!(reg.is_connected());
     let out = dispatch_and_reply(
         &reg,
@@ -197,8 +197,8 @@ async fn default_dispatch_routes_to_the_first_connected_eligible_channel() {
     let g_a = reg.register(a.clone(), ReverseTransport::Wss);
     let g_b = reg.register(b, ReverseTransport::Wss);
     // Hello order is the reverse of arrival order: arrival still wins.
-    g_b.bind(identity("b", true));
-    g_a.bind(identity("a", true));
+    g_b.bind_hello(identity("b", true));
+    g_a.bind_hello(identity("a", true));
 
     let out = dispatch_and_reply(
         &reg,
@@ -231,11 +231,11 @@ async fn default_dispatch_uses_the_newest_connection_of_the_first_connected_clie
     let (other, mut rx_other) = idle_channel();
     let (fresh, mut rx_fresh) = idle_channel();
     let g_stale = reg.register(stale, ReverseTransport::Uds);
-    g_stale.bind(identity("x", true));
+    g_stale.bind_hello(identity("x", true));
     let g_other = reg.register(other, ReverseTransport::Wss);
-    g_other.bind(identity("y", true));
+    g_other.bind_hello(identity("y", true));
     let g_fresh = reg.register(fresh.clone(), ReverseTransport::Uds);
-    g_fresh.bind(identity("x", true));
+    g_fresh.bind_hello(identity("x", true));
 
     let out = dispatch_and_reply(
         &reg,
@@ -273,9 +273,9 @@ async fn dispatch_timeout_names_the_silent_client_and_connection() {
     let (silent, _rx_silent) = idle_channel();
     let (later, _rx_later) = idle_channel();
     let g_silent = reg.register(silent, ReverseTransport::Uds);
-    g_silent.bind(identity("a", true));
+    g_silent.bind_hello(identity("a", true));
     let g_later = reg.register(later, ReverseTransport::Wss);
-    g_later.bind(identity("b", true));
+    g_later.bind_hello(identity("b", true));
 
     let err = reg
         .dispatch(
@@ -320,7 +320,7 @@ async fn client_error_replies_are_never_relabeled_as_timeouts() {
     let reg = PrimaryReverseRegistry::new();
     let (a, mut rx_a) = idle_channel();
     let g_a = reg.register(a.clone(), ReverseTransport::Uds);
-    g_a.bind(identity("a", true));
+    g_a.bind_hello(identity("a", true));
     let dispatch = tokio::spawn({
         let reg = reg.clone();
         async move {
@@ -356,7 +356,7 @@ async fn dispatch_timeout_escapes_the_hello_name() {
     let g_a = reg.register(a, ReverseTransport::Wss);
     let mut quoted = identity("a", true);
     quoted.name = Some("Bob\" (admin) on connection 9".to_string());
-    g_a.bind(quoted);
+    g_a.bind_hello(quoted);
     let err = reg
         .dispatch(
             "browser.exec",
@@ -381,11 +381,11 @@ async fn dropping_the_primary_promotes_the_next_eligible_registration() {
     let (aux, mut rx_aux) = idle_channel();
     let (b, mut rx_b) = idle_channel();
     let g_a = reg.register(a, ReverseTransport::Wss);
-    g_a.bind(identity("a", true));
+    g_a.bind_hello(identity("a", true));
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("aux", false));
+    g_aux.bind_hello(identity("aux", false));
     let g_b = reg.register(b.clone(), ReverseTransport::Wss);
-    g_b.bind(identity("b", true));
+    g_b.bind_hello(identity("b", true));
     drop(g_a);
     assert_eq!(reg.len(), 2);
 
@@ -408,9 +408,9 @@ async fn dropping_a_non_primary_leaves_the_head_unchanged() {
     let (a, mut rx_a) = idle_channel();
     let (b, mut _rx_b) = idle_channel();
     let g_a = reg.register(a.clone(), ReverseTransport::Wss);
-    g_a.bind(identity("a", true));
+    g_a.bind_hello(identity("a", true));
     let g_b = reg.register(b, ReverseTransport::Wss);
-    g_b.bind(identity("b", true));
+    g_b.bind_hello(identity("b", true));
     drop(g_b);
     assert_eq!(reg.len(), 1);
 
@@ -434,15 +434,15 @@ async fn client_target_routes_to_the_newest_eligible_connection_of_that_client()
     let (new, mut rx_new) = idle_channel();
     let (aux, mut rx_aux) = idle_channel();
     let g_other = reg.register(other, ReverseTransport::Wss);
-    g_other.bind(identity("other", true));
+    g_other.bind_hello(identity("other", true));
     let g_old = reg.register(old, ReverseTransport::Wss);
-    g_old.bind(identity("x", true));
+    g_old.bind_hello(identity("x", true));
     let g_new = reg.register(new.clone(), ReverseTransport::Uds);
-    g_new.bind(identity("x", true));
+    g_new.bind_hello(identity("x", true));
     // A newer connection of the same logical client WITHOUT the capability
     // (an FE auxiliary socket sharing the clientId) is skipped.
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("x", false));
+    g_aux.bind_hello(identity("x", false));
 
     for target in [client("x"), pinned("x")] {
         let out = dispatch_and_reply(&reg, target, &new, &mut rx_new, json!({ "host": "new" }))
@@ -471,7 +471,7 @@ async fn client_and_pinned_targets_report_typed_offline_errors() {
     let reg = PrimaryReverseRegistry::new();
     let (a, _rx_a) = idle_channel();
     let g_a = reg.register(a, ReverseTransport::Wss);
-    g_a.bind(identity("a", true));
+    g_a.bind_hello(identity("a", true));
 
     // Never-seen client: no name is known.
     let err = reg
@@ -508,7 +508,7 @@ async fn client_and_pinned_targets_report_typed_offline_errors() {
     // offline for browser purposes — and its name is known.
     let (aux, _rx_aux) = idle_channel();
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("b", false));
+    g_aux.bind_hello(identity("b", false));
     let err = reg.resolve(&pinned("b")).expect_err("offline");
     assert_eq!(
         err,
@@ -540,7 +540,7 @@ async fn default_without_an_eligible_client_reports_no_client() {
     let reg = PrimaryReverseRegistry::new();
     let (aux, _rx_aux) = idle_channel();
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("aux", false));
+    g_aux.bind_hello(identity("aux", false));
     let err = reg
         .dispatch("browser.exec", json!({}), ReverseTarget::Default)
         .await
@@ -574,19 +574,19 @@ fn bind_and_drop_queue_logical_client_transitions_in_mutation_order() {
     assert!(drain(&mut rx).is_empty(), "registration alone is silent");
 
     // First hello of a client ⇒ it becomes live.
-    g1.bind(identity("x", true));
+    g1.bind_hello(identity("x", true));
     assert_eq!(
         drain(&mut rx),
         vec![ClientTransition::Connected(identity("x", true))]
     );
     // A second connection of the same client ⇒ no transition.
-    g2.bind(identity("x", false));
+    g2.bind_hello(identity("x", false));
     // Re-hello on the same connection ⇒ no transition (entry updated).
-    g1.bind(identity("x", true));
+    g1.bind_hello(identity("x", true));
     assert!(drain(&mut rx).is_empty());
     // Re-hello with a different clientId ⇒ the old client stays live through
     // g2, the new one comes up.
-    g1.bind(identity("y", true));
+    g1.bind_hello(identity("y", true));
     assert_eq!(
         drain(&mut rx),
         vec![ClientTransition::Connected(identity("y", true))]
@@ -627,7 +627,7 @@ fn non_administrator_hellos_never_enter_presence_projections() {
     let (guest_tx, _rx_guest) = mpsc::channel::<crate::OutboundFrame>(4);
     let guest = ReverseChannel::new(guest_tx).with_administrator(false);
     let g_guest = reg.register(guest, ReverseTransport::Wss);
-    g_guest.bind(identity("owner", true));
+    g_guest.bind_hello(identity("owner", true));
 
     let owner_id = ClientId::from_string("owner");
     assert!(
@@ -651,7 +651,7 @@ fn non_administrator_hellos_never_enter_presence_projections() {
     // The real owner comes and goes; the guest sharing the id changes nothing.
     let (owner, _rx_owner) = idle_channel();
     let g_owner = reg.register(owner, ReverseTransport::Wss);
-    g_owner.bind(identity("owner", true));
+    g_owner.bind_hello(identity("owner", true));
     assert_eq!(
         drain(&mut rx),
         vec![ClientTransition::Connected(identity("owner", true))]
@@ -690,8 +690,8 @@ fn transitions_keep_disconnect_before_reconnect_order() {
     let mut rx = reg.take_transitions().expect("queue");
     let (c1, _rx1) = idle_channel();
     let g1 = reg.register(c1, ReverseTransport::Wss);
-    g1.bind(identity("x", true));
-    g1.bind(identity("y", true));
+    g1.bind_hello(identity("x", true));
+    g1.bind_hello(identity("y", true));
     assert_eq!(
         drain(&mut rx),
         vec![
@@ -707,7 +707,7 @@ fn transitions_keep_disconnect_before_reconnect_order() {
     drop(g1);
     let (c2, _rx2) = idle_channel();
     let g2 = reg.register(c2, ReverseTransport::Wss);
-    g2.bind(identity("y", true));
+    g2.bind_hello(identity("y", true));
     assert_eq!(
         drain(&mut rx),
         vec![
@@ -720,7 +720,7 @@ fn transitions_keep_disconnect_before_reconnect_order() {
     // never went offline.
     let (c3, _rx3) = idle_channel();
     let g3 = reg.register(c3, ReverseTransport::Wss);
-    g3.bind(identity("y", true));
+    g3.bind_hello(identity("y", true));
     drop(g2);
     assert!(drain(&mut rx).is_empty());
     drop(g3);
@@ -737,7 +737,7 @@ fn transitions_queued_before_the_claim_are_retained() {
     let reg = PrimaryReverseRegistry::new();
     let (c1, _rx1) = idle_channel();
     let g1 = reg.register(c1, ReverseTransport::Uds);
-    g1.bind(identity("x", true));
+    g1.bind_hello(identity("x", true));
     drop(g1);
     let mut rx = reg.take_transitions().expect("queue");
     let transitions = drain(&mut rx);
@@ -764,9 +764,9 @@ fn live_clients_groups_hellod_connections_by_client() {
     let guard_a_first = reg.register(a1, ReverseTransport::Wss);
     let guard_b = reg.register(b1, ReverseTransport::Uds);
     let guard_a_second = reg.register(a2, ReverseTransport::Uds);
-    guard_b.bind(identity("b", false));
-    guard_a_first.bind(identity("a", true));
-    guard_a_second.bind(identity("a", true));
+    guard_b.bind_hello(identity("b", false));
+    guard_a_first.bind_hello(identity("a", true));
+    guard_a_second.bind_hello(identity("a", true));
 
     let clients = reg.live_clients();
     assert_eq!(clients.len(), 2, "un-hello'd connections are not clients");
@@ -808,10 +808,10 @@ fn live_clients_aggregate_browser_exec_across_connections() {
     let (main, _rx_main) = idle_channel();
     let (aux, _rx_aux) = idle_channel();
     let g_main = reg.register(main, ReverseTransport::Wss);
-    g_main.bind(identity("x", true));
+    g_main.bind_hello(identity("x", true));
     // Newest hello lacks the capability (e.g. an FE auxiliary JsonRpcClient).
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("x", false));
+    g_aux.bind_hello(identity("x", false));
 
     let clients = reg.live_clients();
     assert_eq!(clients.len(), 1);
@@ -840,9 +840,9 @@ fn live_clients_aggregate_browser_exec_across_connections() {
     let (aux, _rx_aux) = idle_channel();
     let (main, _rx_main) = idle_channel();
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("y", false));
+    g_aux.bind_hello(identity("y", false));
     let g_main = reg.register(main, ReverseTransport::Wss);
-    g_main.bind(identity("y", true));
+    g_main.bind_hello(identity("y", true));
     let clients = reg.live_clients();
     assert!(clients[0].browser_exec);
     assert_eq!(clients[0].capabilities["browserExec"], json!(true));
@@ -870,13 +870,13 @@ fn live_clients_project_the_most_recent_hello_regardless_of_registration_order()
     let g_first = reg.register(first, ReverseTransport::Wss);
     let g_second = reg.register(second, ReverseTransport::Uds);
     // The later-registered connection hellos first ...
-    g_second.bind(ReverseClientIdentity {
+    g_second.bind_hello(ReverseClientIdentity {
         name: Some("stale".into()),
         capabilities: json!({ "browserExec": false, "rev": 1 }),
         ..identity("x", false)
     });
     // ... then the earlier-registered connection hellos with newer data.
-    g_first.bind(ReverseClientIdentity {
+    g_first.bind_hello(ReverseClientIdentity {
         name: Some("fresh".into()),
         capabilities: json!({ "browserExec": true, "rev": 2 }),
         host: ClientHostInfo {
@@ -898,7 +898,7 @@ fn live_clients_project_the_most_recent_hello_regardless_of_registration_order()
     assert_eq!(x.host.device_kind.as_deref(), Some("laptop"));
 
     // A re-hello on the older-registered connection supersedes again.
-    g_second.bind(ReverseClientIdentity {
+    g_second.bind_hello(ReverseClientIdentity {
         name: Some("freshest".into()),
         capabilities: json!({ "browserExec": false, "rev": 3 }),
         ..identity("x", false)
@@ -937,9 +937,9 @@ fn host_presence_follows_bind_rehello_and_drop() {
         "un-hello'd connections are not present"
     );
 
-    guard_a_first.bind(identity("a", true));
-    guard_a_second.bind(identity("a", false));
-    guard_b.bind(identity("b", false));
+    guard_a_first.bind_hello(identity("a", true));
+    guard_a_second.bind_hello(identity("a", false));
+    guard_b.bind_hello(identity("b", false));
     let presence = ask(&[&a_id, &b_id, &c_id]);
     assert_eq!(presence.len(), 2, "unknown ids are simply absent");
     assert_eq!(presence[&a_id].connections, 2);
@@ -948,7 +948,7 @@ fn host_presence_follows_bind_rehello_and_drop() {
     assert_eq!(ask(&[&b_id]).len(), 1, "only the asked ids are looked up");
 
     // Re-hello under the same id refreshes the display name only.
-    guard_a_second.bind(ReverseClientIdentity {
+    guard_a_second.bind_hello(ReverseClientIdentity {
         name: Some("renamed a".to_string()),
         ..identity("a", false)
     });
@@ -959,7 +959,7 @@ fn host_presence_follows_bind_rehello_and_drop() {
     // Re-hello under another id moves the connection between clients; a's
     // name falls back to its remaining (older) hello instead of keeping the
     // departed connection's "renamed a".
-    guard_a_second.bind(identity("c", false));
+    guard_a_second.bind_hello(identity("c", false));
     let presence = ask(&[&a_id, &c_id]);
     assert_eq!(presence[&a_id].connections, 1);
     assert_eq!(presence[&a_id].name.as_deref(), Some("client a"));
@@ -971,7 +971,7 @@ fn host_presence_follows_bind_rehello_and_drop() {
     // applies — rather than keeping the dropped connection's name.
     let (a3, _rx4) = idle_channel();
     let guard_a_third = reg.register(a3, ReverseTransport::Wss);
-    guard_a_third.bind(ReverseClientIdentity {
+    guard_a_third.bind_hello(ReverseClientIdentity {
         name: Some("third a".to_string()),
         ..identity("a", false)
     });
@@ -1021,12 +1021,12 @@ fn host_presence_name_follows_highest_hello_seq_not_registration_order() {
     };
 
     // The later-registered connection hellos first ...
-    g_second.bind(ReverseClientIdentity {
+    g_second.bind_hello(ReverseClientIdentity {
         name: Some("stale".into()),
         ..identity("x", false)
     });
     // ... then the earlier-registered one hellos with the newer name.
-    g_first.bind(ReverseClientIdentity {
+    g_first.bind_hello(ReverseClientIdentity {
         name: Some("fresh".into()),
         ..identity("x", true)
     });
@@ -1036,7 +1036,7 @@ fn host_presence_name_follows_highest_hello_seq_not_registration_order() {
     assert_eq!(presence[&x_id].name, live_name());
 
     // A re-hello on the later-registered connection supersedes again.
-    g_second.bind(ReverseClientIdentity {
+    g_second.bind_hello(ReverseClientIdentity {
         name: Some("freshest".into()),
         ..identity("x", false)
     });
@@ -1066,7 +1066,7 @@ fn bound_client_id_tracks_this_connections_hello() {
     let guard_b = reg.register(b, ReverseTransport::Uds);
 
     assert_eq!(guard_a.bound_client_id(), None);
-    guard_b.bind(identity("b", false));
+    guard_b.bind_hello(identity("b", false));
     assert_eq!(
         guard_a.bound_client_id(),
         None,
@@ -1074,9 +1074,9 @@ fn bound_client_id_tracks_this_connections_hello() {
     );
     assert_eq!(guard_b.bound_client_id(), Some(ClientId::from_string("b")));
 
-    guard_a.bind(identity("a", true));
+    guard_a.bind_hello(identity("a", true));
     assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("a")));
-    guard_a.bind(identity("c", true));
+    guard_a.bind_hello(identity("c", true));
     assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("c")));
     drop(guard_b);
     assert_eq!(guard_a.bound_client_id(), Some(ClientId::from_string("c")));
@@ -1094,7 +1094,7 @@ async fn dropping_guard_closes_an_accepted_request() {
     let reg = PrimaryReverseRegistry::new();
     let (channel, mut rx) = idle_channel();
     let guard = reg.register(channel, ReverseTransport::Wss);
-    guard.bind(identity("a", true));
+    guard.bind_hello(identity("a", true));
     let dispatch = tokio::spawn({
         let reg = reg.clone();
         async move {
@@ -1123,7 +1123,7 @@ async fn stale_primary_clone_cannot_request_after_guard_drop() {
     let reg = PrimaryReverseRegistry::new();
     let (channel, mut rx) = idle_channel();
     let guard = reg.register(channel, ReverseTransport::Wss);
-    guard.bind(identity("a", true));
+    guard.bind_hello(identity("a", true));
     let stale = reg.primary().expect("primary clone");
 
     drop(guard);
@@ -1158,7 +1158,7 @@ async fn dispatch_reports_transport_error_when_channel_is_closed() {
     let reg = PrimaryReverseRegistry::new();
     let (a, rx_a) = idle_channel();
     let g_a = reg.register(a, ReverseTransport::Wss);
-    g_a.bind(identity("a", true));
+    g_a.bind_hello(identity("a", true));
     // Drop the receiver so the outbound queue is closed; `request` should
     // surface a transport error rather than `NoClient`.
     drop(rx_a);
@@ -1179,7 +1179,7 @@ async fn identity_drift_never_resolves_stale_targets_by_suffix() {
     let reg = PrimaryReverseRegistry::new();
     let (desktop, mut rx) = idle_channel();
     let guard = reg.register(desktop.clone(), ReverseTransport::Wss);
-    guard.bind(identity("desktop", true));
+    guard.bind_hello(identity("desktop", true));
     assert_eq!(
         dispatch_and_reply(
             &reg,
@@ -1193,7 +1193,7 @@ async fn identity_drift_never_resolves_stale_targets_by_suffix() {
         json!({"host": "before-rehello"})
     );
     // The same healthy physical connection re-hellos with a changed logical ID.
-    guard.bind(identity("alice:bob:desktop", true));
+    guard.bind_hello(identity("alice:bob:desktop", true));
     for id in ["desktop", "bob:desktop", "alice:desktop"] {
         for target in [client(id), pinned(id)] {
             let err = reg
@@ -1228,12 +1228,12 @@ async fn identity_drift_unauthorized_exact_collision_cannot_capture_reverse_auth
     let reg = PrimaryReverseRegistry::new();
     let (owner, mut owner_rx) = idle_channel();
     let owner_guard = reg.register(owner.clone(), ReverseTransport::Wss);
-    owner_guard.bind(identity("alice:desktop", true));
+    owner_guard.bind_hello(identity("alice:desktop", true));
     let (foreign, mut foreign_rx) = idle_channel();
     let foreign_guard = reg.register(foreign.with_administrator(false), ReverseTransport::Wss);
     // Deliberately bypass hello's namespace protection: reverse routing must
     // independently reject an unauthorized newest connection with an exact ID.
-    foreign_guard.bind(identity("alice:desktop", true));
+    foreign_guard.bind_hello(identity("alice:desktop", true));
     for target in [client("alice:desktop"), pinned("alice:desktop")] {
         assert_eq!(
             dispatch_and_reply(
@@ -1381,10 +1381,13 @@ fn fixture_registry(case: &serde_json::Value) -> (PrimaryReverseRegistry, Vec<Fi
             .iter()
             .find(|c| &c.id == id)
             .expect("checked against the connections above");
-        conn.guard.as_ref().expect("live guard").bind(identity(
-            conn.client.as_deref().expect("hello'd"),
-            conn.browser_exec,
-        ));
+        conn.guard
+            .as_ref()
+            .expect("live guard")
+            .bind_hello(identity(
+                conn.client.as_deref().expect("hello'd"),
+                conn.browser_exec,
+            ));
     }
     for drop_id in case["drops"].as_array().expect("drops") {
         let conn = conns
@@ -1533,12 +1536,12 @@ fn connection_snapshot_lists_connections_and_names_the_routed_one() {
     let (aux, _rx_aux) = idle_channel();
     let (new_desk, _rx_new) = idle_channel();
     let g_old = reg.register(old_desk, ReverseTransport::Wss);
-    g_old.bind(identity("desk", true));
+    g_old.bind_hello(identity("desk", true));
     let _g_unhelloed = reg.register(unhelloed, ReverseTransport::Wss);
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(identity("desk", false));
+    g_aux.bind_hello(identity("desk", false));
     let g_new = reg.register(new_desk, ReverseTransport::Wss);
-    g_new.bind(identity("desk", true));
+    g_new.bind_hello(identity("desk", true));
 
     let snapshot = reg.connection_snapshot(
         &workspace("ws-1"),
@@ -1585,11 +1588,11 @@ fn connection_snapshot_orders_clients_by_first_connection() {
     let (b, _rx_b) = idle_channel();
     let (a2, _rx_a2) = idle_channel();
     let g_b = reg.register(b, ReverseTransport::Uds);
-    g_b.bind(identity("cli", false));
+    g_b.bind_hello(identity("cli", false));
     let g_a = reg.register(a, ReverseTransport::Wss);
-    g_a.bind(identity("desk", true));
+    g_a.bind_hello(identity("desk", true));
     let g_a2 = reg.register(a2, ReverseTransport::Wss);
-    g_a2.bind(identity("desk", true));
+    g_a2.bind_hello(identity("desk", true));
 
     let snapshot = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
     let ids: Vec<_> = snapshot
@@ -1651,7 +1654,7 @@ fn connection_snapshot_routes_chief_to_administrator_connections_only() {
     );
     member.set_browser_member(true);
     let g_member = reg.register(member, ReverseTransport::Wss);
-    g_member.bind(identity("member", true));
+    g_member.bind_hello(identity("member", true));
 
     let workspace_route = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
     assert_eq!(workspace_route.routes[0].connection_id, Some(0));
@@ -1680,12 +1683,12 @@ fn connection_snapshot_route_uses_the_listed_client_name() {
     let (desk, _rx_desk) = idle_channel();
     let (aux, _rx_aux) = idle_channel();
     let g_desk = reg.register(desk, ReverseTransport::Wss);
-    g_desk.bind(ReverseClientIdentity {
+    g_desk.bind_hello(ReverseClientIdentity {
         name: Some("Old".to_string()),
         ..identity("desk", true)
     });
     let g_aux = reg.register(aux, ReverseTransport::Uds);
-    g_aux.bind(ReverseClientIdentity {
+    g_aux.bind_hello(ReverseClientIdentity {
         name: Some("New".to_string()),
         ..identity("desk", false)
     });
@@ -1712,9 +1715,86 @@ fn client_active_covers_in_flight_hellos_and_bound_clients() {
     assert!(reg.client_active(&id), "reserved before the hello persists");
     drop(first);
     assert!(reg.client_active(&id), "reservations are counted");
-    guard.bind(identity("dev-1", true));
-    drop(second);
+    let hello = second
+        .into_hello_binding(identity("dev-1", true))
+        .unwrap_or_else(|_| panic!("matching id"));
+    guard.bind(&hello);
+    drop(hello);
     assert!(reg.client_active(&id), "bound after the reservation");
     drop(guard);
     assert!(!reg.client_active(&id), "gone with its last connection");
+}
+
+/// A reservation only pairs with an identity for the `clientId` it reserved,
+/// so a [`super::HelloBinding`] never binds an id `client_active` does not
+/// already report (intent-hq/intent#8045).
+#[test]
+fn into_hello_binding_refuses_an_identity_for_another_client_id() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desktop, _rx) = idle_channel();
+    let guard = reg.register(desktop, ReverseTransport::Wss);
+    let reservation = guard
+        .reserve_binding(ClientId::from_string("dev-1"))
+        .expect("registered guard");
+    let Err(reservation) = reservation.into_hello_binding(identity("dev-2", true)) else {
+        panic!("a mismatched identity must be refused");
+    };
+    assert_eq!(
+        reservation.client_id().as_str(),
+        "dev-1",
+        "handed back intact"
+    );
+    assert!(reg.client_active(&ClientId::from_string("dev-1")));
+    assert!(!reg.client_active(&ClientId::from_string("dev-2")));
+    let hello = reservation
+        .into_hello_binding(identity("dev-1", true))
+        .unwrap_or_else(|_| panic!("matching id"));
+    assert_eq!(hello.client_id().as_str(), "dev-1");
+    assert_eq!(hello.identity().client_id.as_str(), "dev-1");
+}
+
+/// Only the connection that reserved an id can bind with it: another live
+/// connection — same registry or not — holding that binding stays unbound.
+#[test]
+fn foreign_reservation_cannot_bind_another_connection() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a_channel, _a_rx) = idle_channel();
+    let (b_channel, _b_rx) = idle_channel();
+    let a = reg.register(a_channel, ReverseTransport::Wss);
+    let b = reg.register(b_channel, ReverseTransport::Wss);
+    let hello = a
+        .reserve_binding(ClientId::from_string("dev-1"))
+        .expect("registered guard")
+        .into_hello_binding(identity("dev-1", true))
+        .unwrap_or_else(|_| panic!("matching id"));
+    b.bind(&hello);
+    assert_eq!(b.bound_client_id(), None, "b never reserved dev-1");
+    assert!(reg.live_clients().is_empty());
+
+    let other = PrimaryReverseRegistry::new();
+    let (c_channel, _c_rx) = idle_channel();
+    let c = other.register(c_channel, ReverseTransport::Wss);
+    c.bind(&hello);
+    assert_eq!(c.bound_client_id(), None, "a reservation is per registry");
+    assert!(other.live_clients().is_empty());
+
+    a.bind(&hello);
+    assert_eq!(
+        a.bound_client_id().as_ref().map(ClientId::as_str),
+        Some("dev-1")
+    );
+}
+
+/// A guard detached from a closed registry cannot reserve, so it has no
+/// [`super::HelloBinding`] to bind with.
+#[test]
+fn detached_guard_cannot_reserve_a_binding() {
+    let reg = PrimaryReverseRegistry::new();
+    reg.begin_shutdown();
+    let (channel, _rx) = idle_channel();
+    let guard = reg.register(channel, ReverseTransport::Wss);
+    assert!(guard
+        .reserve_binding(ClientId::from_string("dev-1"))
+        .is_none());
+    assert_eq!(guard.bound_client_id(), None);
 }

@@ -1393,6 +1393,253 @@ async fn pending_proposals_projection_over_wss() {
     );
 }
 
+/// `workspace.create { origin }` over WSS (PROTOCOL §5.1 "Proposal origin",
+/// intent-hq/intent#8086): a client applying a `proposeSibling` card passes
+/// the card's identity, and the daemon resolves the proposal itself — the
+/// response is the ordinary create result, `workspace:created` echoes the
+/// provenance with the daemon-derived `sourceWorkspaceId`, `agent:updated`
+/// moves the entry to `proposalResolutions`, and the proposing agent gets
+/// the `proposal_resolved` notice naming the created workspace, with no
+/// client-side `agent.resolveProposal`.
+#[tokio::test]
+async fn workspace_create_with_proposal_origin_resolves_over_wss() {
+    let Some(script) = gate("WSS workspace.create origin E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "origin test\n").unwrap();
+    for args in [&["add", "README.md"][..], &["commit", "-m", "initial"][..]] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success());
+    }
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_FOR_ORIGIN_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Origin follow-up",
+        initialPrompt: "Verify the workspace.create origin end to end."
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": proposal_code, "summary": "propose sibling workspace" }
+            },
+            "response": "Proposal filed.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    // The created workspace mints its own id, outside the scoped
+    // subscription above.
+    let mut created_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut created_sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:created"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    // The created workspace's initial agent (the proposal names none) plans
+    // against the mock provider.
+    let settings = wss_rpc(
+        &mut rpc,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
+    )
+    .await;
+    assert_eq!(settings["applied"][0]["value"], json!("mock"), "{settings}");
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "OriginProposer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+    let end_data = await_stream_end(&mut sub, &agent_id).await;
+    let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
+
+    // Recover the card exactly as a client does: from the carrier message.
+    let conversation = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let carrier = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["id"] == turn_message_id)
+        .unwrap_or_else(|| panic!("carrier message persisted: {conversation:#}"));
+    let block = carrier["contentBlocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|b| b["type"] == "resource" && b["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("proposal resource on the carrier: {carrier:#}"));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    let proposal_id = proposal["preview"]["title"].as_str().unwrap().to_string();
+    assert_eq!(proposal_id, "Create workspace: Origin follow-up");
+
+    // Card Apply: the proposal's create params plus `origin`.
+    let mut params = proposal["payload"]["params"].clone();
+    params["origin"] = json!({
+        "kind": "proposal",
+        "agentId": agent_id,
+        "proposalId": proposal_id,
+        "sourceWorkspaceId": "ws-forged",
+    });
+    let result = wss_rpc(&mut rpc, 20, "workspace.create", params).await;
+    let created_ws_id = result["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace.id in result: {result}"))
+        .to_string();
+    assert_eq!(result["workspace"]["title"], "Origin follow-up", "{result}");
+    assert!(
+        result["workspace"].get("origin").is_none(),
+        "origin is never a workspace field: {result}"
+    );
+    // The result tells the client the daemon handled the card, so it must
+    // not fall back to its own agent.resolveProposal.
+    assert_eq!(
+        result["proposalOrigin"],
+        json!({ "proposalId": proposal_id, "outcome": "applied" }),
+        "{result}"
+    );
+
+    // `workspace:created` echoes the provenance; the source is derived.
+    let created_event = loop {
+        let frame = wss_event(&mut created_sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == created_ws_id {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        created_event["origin"],
+        json!({
+            "kind": "proposal",
+            "proposalId": proposal_id,
+            "agentId": agent_id,
+            "sourceWorkspaceId": ws_id,
+        }),
+        "{created_event}"
+    );
+
+    // The daemon resolved the card: `agent:updated` carries the outcome,
+    // then the notice turn runs to its stream:end.
+    let resolve_update = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["type"] == "agent:updated"
+            && ev["data"].get("proposalResolutions").is_some()
+        {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        resolve_update["pendingProposals"],
+        json!([]),
+        "{resolve_update}"
+    );
+    assert_eq!(
+        resolve_update["proposalResolutions"],
+        json!({ proposal_id.as_str(): "applied" }),
+        "{resolve_update}"
+    );
+    await_stream_end(&mut sub, &agent_id).await;
+    let conversation = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notices: Vec<&str> = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["role"] == "user" && m["metadata"]["type"] == "proposal_resolved")
+        .map(|m| m["contentBlocks"][0]["text"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        notices,
+        vec![format!(
+            "User applied the proposal '{proposal_id}'. Created workspace {created_ws_id}."
+        )],
+        "exactly one applied notice: {conversation:#}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sub-agent gate: per-agent MCP bridge client (parse the generated
 // `intentd-mcp-*.json` and speak newline-delimited JSON-RPC to the loopback

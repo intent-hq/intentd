@@ -113,6 +113,10 @@ impl Outcome {
 struct Pending {
     request_id: String,
     name: String,
+    /// Whether the request's card has reached a persisted assistant message
+    /// (the turn-end drain). Only surfaced requests make the workspace need
+    /// the user: a card dropped with a cancelled turn never strands it.
+    surfaced: bool,
 }
 
 struct Answered {
@@ -233,12 +237,66 @@ impl SecretVault {
         entry.pending.push(Pending {
             request_id: request_id.clone(),
             name: name.to_string(),
+            surfaced: false,
         });
         state.requests.insert(request_id.clone(), key);
         Ok(RequestTicket {
             request_id,
             created: true,
         })
+    }
+
+    /// Whether the agent has any pending (unanswered) request. Memory only,
+    /// so a restart ends the pending state with the requests themselves.
+    pub(crate) fn has_pending(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> bool {
+        self.lock()
+            .agents
+            .get(&(workspace_id.clone(), agent_id.clone()))
+            .is_some_and(|entry| !entry.pending.is_empty())
+    }
+
+    /// Mark the agent's pending requests named in `request_ids` as surfaced
+    /// (their card was persisted). Returns whether anything changed.
+    pub(crate) fn mark_surfaced(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        request_ids: &[String],
+    ) -> bool {
+        if request_ids.is_empty() {
+            return false;
+        }
+        let mut state = self.lock();
+        let Some(entry) = state
+            .agents
+            .get_mut(&(workspace_id.clone(), agent_id.clone()))
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for pending in &mut entry.pending {
+            if !pending.surfaced && request_ids.contains(&pending.request_id) {
+                pending.surfaced = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The agents in `workspace_id` with at least one surfaced pending
+    /// request — one lock for a whole workspace's attention derivation.
+    pub(crate) fn agents_awaiting_user(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> std::collections::HashSet<AgentId> {
+        self.lock()
+            .agents
+            .iter()
+            .filter(|(key, entry)| {
+                &key.0 == workspace_id && entry.pending.iter().any(|p| p.surfaced)
+            })
+            .map(|(key, _)| key.1.clone())
+            .collect()
     }
 
     /// The owner of a pending request in `workspace_id`, without answering it.
@@ -372,6 +430,35 @@ impl SecretVault {
         state.agents.retain(|key, _| &key.0 != workspace_id);
         state.requests.retain(|_, key| &key.0 != workspace_id);
     }
+}
+
+/// The `requestId`s of the secret-request resource blocks in a message's
+/// content-block array, in block order. Malformed blocks are skipped.
+pub(crate) fn secret_request_ids(content: &Value) -> Vec<String> {
+    content
+        .as_array()
+        .map_or_else(Vec::new, |blocks| secret_request_ids_in(blocks))
+}
+
+/// [`secret_request_ids`] over an already-borrowed block slice (the turn-end
+/// persist holds the blocks before wrapping them).
+pub(crate) fn secret_request_ids_in(blocks: &[Value]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter(|block| {
+            block.get("type").and_then(Value::as_str) == Some("resource")
+                && block.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE)
+        })
+        .filter_map(|block| {
+            let text = block.pointer("/resource/text").and_then(Value::as_str)?;
+            let payload: Value = serde_json::from_str(text).ok()?;
+            payload
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Replace every exact occurrence of a secret value with `[secret:NAME]` in
@@ -613,7 +700,7 @@ impl Services {
         });
         if let Err(error) = WorkspaceApi::agent_send_message(
             self,
-            workspace_id,
+            workspace_id.clone(),
             answer.agent_id.clone(),
             content,
             None,
@@ -635,7 +722,70 @@ impl Services {
                 "secret request notice delivery failed"
             );
         }
+        // Answering may end the workspace's needs-attention state (§5.56).
+        // Recomputed after the notice delivery, which (for an idle agent)
+        // already started its turn, so clients never see a transient `idle`.
+        self.maybe_emit_display_status_changed(&workspace_id).await;
         Ok(json!({ "ok": true, "requestId": request_id, "name": answer.name }))
+    }
+
+    /// Turn-end hook: the persisted assistant message carries these
+    /// secret-request cards (`request_ids`, read with
+    /// [`secret_request_ids_in`]), so the requests are now in front of the
+    /// user. Recomputes the workspace's displayStatus when this surfaces a
+    /// pending request — the same point a question-bearing turn end raises
+    /// `needs_attention`.
+    pub(crate) async fn surface_secret_requests(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        request_ids: &[String],
+    ) {
+        if self
+            .secret_vault
+            .mark_surfaced(workspace_id, agent_id, request_ids)
+        {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+    }
+
+    /// `agent.dismissQuestions` on a message also declines that message's
+    /// pending secret requests (PROTOCOL §5.56 "Attention"), one declined
+    /// notice each. One bounded single-message read; requests already
+    /// answered, lost or owned by another agent are skipped.
+    pub(crate) async fn decline_secret_requests_on_message(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) {
+        let message = match self
+            .store
+            .get_agent_message_by_id(agent_id, message_id)
+            .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, error = %error, "secret request decline: message read failed");
+                return;
+            }
+        };
+        for request_id in secret_request_ids(&message.content) {
+            let owned = self
+                .secret_vault
+                .pending_owner(workspace_id, &request_id)
+                .is_some_and(|owner| &owner.agent_id == agent_id);
+            if !owned {
+                continue;
+            }
+            if let Err(error) = self
+                .secret_answer_op(workspace_id.clone(), request_id, Outcome::Declined, None)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %error, "secret request decline failed");
+            }
+        }
     }
 
     /// `ws.host.exec` from an agent's own turn: resolve `secretEnv` from the
@@ -981,6 +1131,57 @@ mod tests {
         assert_eq!(on["secretRequests"], json!(true));
         let decoded: AgentFeaturesSettings = serde_json::from_value(on).unwrap();
         assert!(decoded.secret_requests);
+    }
+
+    #[test]
+    fn only_surfaced_requests_await_the_user() {
+        let vault = SecretVault::default();
+        let (w, a) = (ws("w"), agent("a"));
+        let ticket = vault.request(&w, &a, "KEY").unwrap();
+        assert!(vault.agents_awaiting_user(&w).is_empty());
+        assert!(!vault.mark_surfaced(&w, &a, &["sec-unknown".to_string()]));
+        assert!(vault.mark_surfaced(&w, &a, std::slice::from_ref(&ticket.request_id)));
+        assert!(!vault.mark_surfaced(&w, &a, std::slice::from_ref(&ticket.request_id)));
+        assert_eq!(
+            vault.agents_awaiting_user(&w),
+            [a.clone()].into_iter().collect()
+        );
+        assert!(vault.agents_awaiting_user(&ws("other")).is_empty());
+        vault
+            .answer(&w, &ticket.request_id, Outcome::Declined, None)
+            .unwrap();
+        assert!(vault.agents_awaiting_user(&w).is_empty());
+    }
+
+    #[test]
+    fn has_pending_tracks_open_requests_only() {
+        let vault = SecretVault::default();
+        let (w, a) = (ws("w"), agent("a"));
+        assert!(!vault.has_pending(&w, &a));
+        let ticket = vault.request(&w, &a, "KEY").unwrap();
+        assert!(vault.has_pending(&w, &a));
+        assert!(!vault.has_pending(&ws("other"), &a));
+        vault
+            .answer(&w, &ticket.request_id, Outcome::Provided, Some(secret("v")))
+            .unwrap();
+        assert!(!vault.has_pending(&w, &a));
+    }
+
+    #[test]
+    fn secret_request_ids_reads_only_well_formed_cards() {
+        let mime = intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE;
+        let content = json!([
+            { "type": "text", "text": "hi" },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "{\"requestId\":\"sec-1\"}" } },
+            { "type": "resource", "resource": { "mimeType": "application/vnd.intent.question+json", "text": "{\"requestId\":\"q\"}" } },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "not json" } },
+            { "type": "resource", "resource": { "mimeType": mime, "text": "{\"requestId\":\"sec-2\"}" } },
+        ]);
+        assert_eq!(
+            secret_request_ids(&content),
+            vec!["sec-1".to_string(), "sec-2".to_string()]
+        );
+        assert!(secret_request_ids(&json!("text")).is_empty());
     }
 
     #[test]

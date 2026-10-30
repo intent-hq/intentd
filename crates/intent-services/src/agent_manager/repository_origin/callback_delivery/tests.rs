@@ -1455,6 +1455,7 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                     captured: None,
                     required: None,
                 }),
+                false,
             )
             .await
             .unwrap();
@@ -1512,6 +1513,7 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                     captured: None,
                     required: None,
                 }),
+                false,
             )
             .await
             .unwrap();
@@ -4056,6 +4058,7 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                     captured: None,
                     required: None,
                 }),
+                false,
             )
             .await
             .unwrap();
@@ -4113,6 +4116,7 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                     captured: None,
                     required: None,
                 }),
+                false,
             )
             .await
             .unwrap();
@@ -8103,6 +8107,7 @@ mod normal_launch {
                                 captured: None,
                                 required: Some(Box::new(prepared)),
                             }),
+                            false,
                         ).await.is_ok();
                         if retire_at.contains("wrong-") {
                             assert!(!result);

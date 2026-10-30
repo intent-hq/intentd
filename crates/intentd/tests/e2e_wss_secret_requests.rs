@@ -14,6 +14,8 @@
 //!   `ws.script.create` reject `secretEnv`.
 //! * `secret.dismiss` delivers the declined notice; `ws.secret.forget` drops
 //!   the value.
+//! * The workspace shows `needs_attention` while the request is open, the
+//!   hello advertises `secretRequests: 1`.
 //! * Finally every file under the daemon's data dir (store, WAL, logs, the
 //!   mock's prompt log) is scanned: the value must appear nowhere.
 //!
@@ -360,6 +362,33 @@ where
     }
 }
 
+/// Poll `workspace.get` until its derived `displayStatus` equals `want`.
+async fn poll_display_status<S>(rpc: &mut WebSocketStream<S>, ws_id: &str, want: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut last = String::new();
+    for attempt in 0..120 {
+        let got = wss_rpc(
+            rpc,
+            900 + attempt,
+            "workspace.get",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        last = got["workspace"]["displayStatus"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if last == want {
+            return;
+        }
+        // timing-guard: poll interval for a derived status; the loop bound caps the wait
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("displayStatus never reached {want}; last {last}");
+}
+
 /// Write `[agentFeatures] secretRequests = true` before the daemon starts.
 fn enable_secret_requests(data_dir: &Path) {
     std::fs::write(
@@ -482,6 +511,12 @@ async fn secret_request_round_trip_over_wss() {
     );
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    let hello = wss_rpc(&mut rpc, 9, "client.hello", json!({ "name": "secret-e2e" })).await;
+    assert_eq!(
+        hello["server"]["capabilities"]["secretRequests"],
+        json!(1),
+        "secretRequests advertised: {hello}"
+    );
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -526,6 +561,9 @@ async fn secret_request_round_trip_over_wss() {
         "card payload carries no value"
     );
 
+    // An idle agent waiting on its secret request needs the user.
+    poll_display_status(&mut rpc, &ws_id, "needs_attention").await;
+
     let listed = wss_rpc(
         &mut rpc,
         13,
@@ -569,6 +607,8 @@ async fn secret_request_round_trip_over_wss() {
         json!({ "ok": true, "requestId": request_id, "name": "E2E_KEY" })
     );
     await_stream_end(&mut sub, &agent_a).await;
+    // Answered: nothing left that needs the user.
+    poll_display_status(&mut rpc, &ws_id, "idle").await;
     let again = wss_rpc_raw(
         &mut rpc,
         16,

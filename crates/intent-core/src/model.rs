@@ -361,6 +361,12 @@ pub struct Workspace {
     /// workspaces hold. Omitted (not `null`) when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Per-workspace auto-archive opt-out (§5.1 "Auto-archive opt-out"):
+    /// while `true` the automatic archive sweep never archives this
+    /// workspace. Off by default. Set via `workspace.update
+    /// { autoArchiveDisabled }` (owner-only). Omitted (not `false`) while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_archive_disabled: bool,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -674,6 +680,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "statusMessage",
     "statusImageAssetId",
     "label",
+    "autoArchiveDisabled",
     "activity",
     "attention",
     "createdAt",
@@ -1515,6 +1522,15 @@ pub struct WorkspaceCreate {
     /// set it, so clients can surface the new workspace next to its source.
     #[serde(skip)]
     pub origin: Option<WorkspaceCreateOrigin>,
+    /// Wire `origin` param (PROTOCOL §5.1 "Proposal origin",
+    /// intent-hq/intent#8086): the proposal card a client's create applies.
+    /// The service validates it, derives the source workspace from the
+    /// agent, records it as [`Self::origin`] and resolves the proposal
+    /// `applied` after a successful create. Its shape is always validated;
+    /// it is otherwise ignored when an in-process caller already set
+    /// [`Self::origin`] (such callers clear it to be safe).
+    #[serde(rename = "origin")]
+    pub origin_request: Option<WorkspaceCreateOriginRequest>,
 }
 
 /// Provenance of a `workspace.create` (see [`WorkspaceCreate::origin`]),
@@ -1529,6 +1545,22 @@ pub enum WorkspaceCreateOrigin {
         proposal_id: String,
         agent_id: AgentId,
         source_workspace_id: WorkspaceId,
+    },
+}
+
+/// Wire shape of `workspace.create`'s `origin` param (PROTOCOL §5.1). Only
+/// `kind: "proposal"` exists; any other `kind` fails deserialization
+/// (`-32602`). A client-sent `sourceWorkspaceId` is ignored: the daemon
+/// derives it from the agent's session.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkspaceCreateOriginRequest {
+    /// The `workspace-create` proposal `proposalId` (its `pendingProposals`
+    /// key) that agent `agentId` emitted.
+    #[serde(rename_all = "camelCase")]
+    Proposal {
+        agent_id: String,
+        proposal_id: String,
     },
 }
 
@@ -1575,7 +1607,33 @@ pub struct WorkspaceCreateResult {
     pub workspace: Workspace,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_agent: Option<serde_json::Value>,
+    /// What this request's wire `origin` did (PROTOCOL §5.1 "Proposal
+    /// origin"): present whenever the request carried a well-formed
+    /// `origin`, so a client knows the daemon handled the card and must not
+    /// fall back to its own `agent.resolveProposal` — except after a failed
+    /// resolution write of an accepted origin, where it is omitted so that
+    /// fallback retries. Computed per request (an idempotent replay reports
+    /// its own `origin`), never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_origin: Option<WorkspaceCreateProposalOutcome>,
 }
+
+/// `workspace.create` result `proposalOrigin` (PROTOCOL §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCreateProposalOutcome {
+    /// The request's `origin.proposalId`.
+    pub proposal_id: String,
+    /// The proposal's persisted outcome after this create: `"applied"` or
+    /// `"dismissed"` (an earlier resolution is kept), or `"notResolved"`
+    /// when the daemon declined the origin (unknown agent, no access, not a
+    /// pending `workspace-create` card, or another card's idempotency key).
+    pub outcome: String,
+}
+
+/// [`WorkspaceCreateProposalOutcome::outcome`] when the daemon declined the
+/// origin and left the proposal as it was.
+pub const PROPOSAL_ORIGIN_NOT_RESOLVED: &str = "notResolved";
 
 /// Wire input for `workspace.update` (PROTOCOL §5.1). Every field is optional;
 /// an absent field leaves the stored value unchanged (`workspaceId` is supplied
@@ -1617,6 +1675,17 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_optional_field"
     )]
     pub label: Option<Option<String>>,
+    /// Auto-archive opt-out (§5.1 `Workspace.autoArchiveDisabled`): `true`
+    /// exempts the workspace from the automatic archive sweep, `false`
+    /// re-enables it, missing leaves it untouched; an explicit `null` (or any
+    /// other non-boolean) is a deserialize error (`-32602`). Owner-only — not
+    /// in the collaborator-editable allowlist.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_field"
+    )]
+    pub auto_archive_disabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1689,6 +1758,17 @@ pub struct WorkspaceUpdate {
     pub attention: Option<WorkspaceAttention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+/// A field that is optional but, when present, must hold a non-null `T`:
+/// missing (via `#[serde(default)]`) is `None`, a present value is
+/// `Some(value)`, and a wire `null` fails like any other wrong type.
+fn deserialize_present_field<'de, T, D>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing

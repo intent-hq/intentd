@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.82] - 2026-10-30
+
+### 🧪 Testing
+
+- Prove no secret value survives any agent-facing egress ([#2827](https://github.com/intent-hq/intentd/pull/2827))
+
+
+## [0.11.81] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(agent)* Redrive a prompt the provider cancelled before any output ([#2817](https://github.com/intent-hq/intentd/pull/2817))
+- Resolve card-applied proposals inside workspace.create ([#2819](https://github.com/intent-hq/intentd/pull/2819))
+
+
+## [0.11.80] - 2026-10-30
+
+### 🚀 Features
+
+- Surface pending secret requests and advertise secretRequests ([#2813](https://github.com/intent-hq/intentd/pull/2813))
+
+### 🐛 Bug Fixes
+
+- *(services)* Stop the native review monitor from refusing stage checks ([#2815](https://github.com/intent-hq/intentd/pull/2815))
+- Bump Codex ACP fallback to v2.5.0 ([#2818](https://github.com/intent-hq/intentd/pull/2818))
+
+
+## [0.11.79] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Auto-purge lets merged PRs cover nested unpushed commits ([#2814](https://github.com/intent-hq/intentd/pull/2814))
+- *(js)* Refuse values JSON cannot represent at the host() bridge ([#2811](https://github.com/intent-hq/intentd/pull/2811))
+
+### 📚 Documentation
+
+- *(app-guide)* Describe which agent the Home preview opens ([#2812](https://github.com/intent-hq/intentd/pull/2812))
+
+
 ## [0.11.78] - 2026-10-30
 
 ### 🚀 Features

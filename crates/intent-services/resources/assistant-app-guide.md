@@ -400,7 +400,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -445,7 +445,10 @@ paused work stay available; dismissal does not answer, resume, complete, or merg
 anything. A dismissed reminder shows **Running** if work is running, otherwise
 **Waiting**. Blocked and failed work keeps its status.
 
-<!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
+Where supported, secret-request cards that need your attention must be answered
+or declined; **Dismiss for now** is unavailable while those requests are pending.
+
+<!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-services/src/secret_requests.rs; crates/intent-transport/src/router.rs. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/{home-model,home-preview-agent}.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
@@ -716,7 +719,7 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs; packages/intentd/crates/intent-git/src/local_changes.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs; packages/intentd/crates/intent-git/src/local_changes.rs. -->
 
 In **Home → Workspaces**, right-click a workspace and choose **Archive** to put
 it away while keeping its folder. Archiving stops its agents, hooks and PR
@@ -736,6 +739,11 @@ commits also block it. On newer daemons, commits covered by the recorded head of
 pull request Intent saw merged no longer block archiving, even after its remote
 branch is deleted. Commits made after that head still block it. Unreadable
 local-change state blocks the sweep; linked repositories outside the folder do not.
+
+Newer or test app builds with matching daemon support may offer **Disable
+auto-archive** in the workspace's Home menu. Check released-app support before
+directing users to this control. Only the owner can change it; it starts off for
+each workspace and leaves manual archiving available. Older apps may not offer it.
 
 In app and daemon versions offering folder cleanup, choose **Purge workspace
 folder** on an archived workspace, then confirm. This deletes the folder,
