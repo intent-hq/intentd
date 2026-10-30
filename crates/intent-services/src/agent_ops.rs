@@ -10103,18 +10103,24 @@ impl Services {
 
     /// `workspace.create { origin }` (PROTOCOL §5.1 "Proposal origin",
     /// intent-hq/intent#8086), first half — runs BEFORE any side effect.
-    /// Takes the wire `origin` off `input`, rejects a malformed shape with
+    /// Takes the wire `origin` off `input` and rejects a malformed shape with
     /// `-32602` (blank `agentId` / `proposalId`, either over the id length
-    /// cap), and — unless an in-process caller already set `input.origin`
-    /// (`ws.workspace.applyProposal` keeps its own provenance and resolution)
-    /// — derives the source workspace from the agent's session and records it
-    /// as `input.origin` for the `workspace:created` echo. Lookup problems are
-    /// fail-soft: an unknown agent, or a caller who is not a member of the
-    /// source workspace, logs a warning and the create proceeds without a
-    /// proposal to resolve.
+    /// cap). Unless an in-process caller already set `input.origin`
+    /// (`ws.workspace.applyProposal` keeps its own provenance and
+    /// resolution), it then accepts the origin only when the named proposal
+    /// is still pending on the agent, is a `workspace-create` proposal, and —
+    /// when its params carry an `idempotencyKey` — this create uses that same
+    /// key (so neither another kind of card nor a replay naming a different
+    /// card can be marked applied). An accepted origin is recorded as
+    /// `input.origin` for the `workspace:created` echo. A rejected one is
+    /// fail-soft — an unknown agent, a caller without access to the agent's
+    /// workspace, or a proposal failing those checks logs a warning and the
+    /// create proceeds with nothing to resolve. Any other store error fails
+    /// the create before it starts, so the client can retry.
     pub(crate) async fn prepare_create_proposal_origin(
         &self,
         input: &mut intent_core::WorkspaceCreate,
+        idempotency_key: Option<&str>,
     ) -> Result<Option<CreateProposalOrigin>> {
         let Some(request) = input.origin_request.take() else {
             return Ok(None);
@@ -10123,19 +10129,20 @@ impl Services {
             agent_id,
             proposal_id,
         } = request;
-        if agent_id.trim().is_empty() {
-            return Err(Error::InvalidParams(
-                "origin.agentId is required".to_string(),
-            ));
-        }
+        let agent_id = agent_id.trim();
         // Matched verbatim against the pending entry (see
         // `agent_resolve_proposal_op`), so only blankness is checked.
-        if proposal_id.trim().is_empty() {
-            return Err(Error::InvalidParams(
-                "origin.proposalId is required".to_string(),
-            ));
-        }
-        for (field, value) in [("agentId", &agent_id), ("proposalId", &proposal_id)] {
+        for (field, value, blank) in [
+            ("agentId", agent_id, agent_id.is_empty()),
+            (
+                "proposalId",
+                proposal_id.as_str(),
+                proposal_id.trim().is_empty(),
+            ),
+        ] {
+            if blank {
+                return Err(Error::InvalidParams(format!("origin.{field} is required")));
+            }
             if value.len() > MAX_MESSAGE_ID_LEN {
                 return Err(Error::InvalidParams(format!(
                     "origin.{field} exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
@@ -10145,35 +10152,66 @@ impl Services {
         if input.origin.is_some() {
             return Ok(None);
         }
-        let agent_id = AgentId::from(agent_id.trim());
-        let source_workspace_id = match self.store.get_agent_session_summary(&agent_id).await {
-            Ok(session) => session.workspace_id,
-            Err(e) => {
-                tracing::warn!(
-                    agent = %agent_id,
-                    proposal = %proposal_id,
-                    error = %e,
-                    "workspace.create origin names an unknown agent; the proposal is not resolved"
-                );
-                return Ok(None);
-            }
-        };
-        if let Err(e) = self.require_member(&source_workspace_id).await {
+        let agent_id = AgentId::from(agent_id);
+        let skip = |reason: &str| {
             tracing::warn!(
                 agent = %agent_id,
-                workspace = %source_workspace_id.as_str(),
-                error = %e,
-                "workspace.create caller cannot act on the origin's workspace; the proposal is not resolved"
+                proposal = %proposal_id,
+                reason,
+                "workspace.create origin not resolved"
             );
-            return Ok(None);
+            Ok(None)
+        };
+        let session = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(session) => session,
+            Err(Error::NotFound(_)) => return skip("unknown agent"),
+            Err(e) => return Err(e),
+        };
+        match self.require_agent_member(&agent_id).await {
+            Ok(()) => {}
+            Err(Error::NotFound(_)) => {
+                return skip("caller is not a member of the agent's workspace")
+            }
+            Err(e) => return Err(e),
+        }
+        let Some(entry) = session
+            .pending_proposals()
+            .into_iter()
+            .find(|p| p.proposal_id == proposal_id)
+        else {
+            return skip("proposal is not pending");
+        };
+        let Some(proposal) = self
+            .proposal_from_message(&agent_id, &entry.message_id, &proposal_id)
+            .await
+        else {
+            return skip("proposal block could not be loaded");
+        };
+        let kind = proposal.get("kind").and_then(Value::as_str);
+        let operation = proposal
+            .get("payload")
+            .and_then(|p| p.get("operation"))
+            .and_then(Value::as_str);
+        if kind != Some("workspace-create") || operation != Some("workspace.create") {
+            return skip("proposal is not a workspace-create proposal");
+        }
+        if let Some(bound) = proposal
+            .get("payload")
+            .and_then(|p| p.get("params"))
+            .and_then(|p| p.get("idempotencyKey"))
+            .and_then(Value::as_str)
+        {
+            if idempotency_key != Some(bound) {
+                return skip("create does not use the proposal's idempotencyKey");
+            }
         }
         input.origin = Some(intent_core::WorkspaceCreateOrigin::Proposal {
             proposal_id: proposal_id.clone(),
             agent_id: agent_id.clone(),
-            source_workspace_id: source_workspace_id.clone(),
+            source_workspace_id: session.workspace_id.clone(),
         });
         Ok(Some(CreateProposalOrigin {
-            source_workspace_id,
+            source_workspace_id: session.workspace_id,
             agent_id,
             proposal_id,
         }))
@@ -10229,6 +10267,27 @@ impl Services {
         message_id: &str,
         proposal_id: &str,
     ) -> Option<String> {
+        let blocks = self.message_blocks(agent_id, message_id).await?;
+        crate::tool_block::proposal_title_in(&blocks, proposal_id)
+    }
+
+    /// The parsed proposal `proposal_id` carried by persisted message
+    /// `message_id` (same bounded seek as
+    /// [`Services::proposal_title_from_message`]).
+    async fn proposal_from_message(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        proposal_id: &str,
+    ) -> Option<Value> {
+        let blocks = self.message_blocks(agent_id, message_id).await?;
+        crate::tool_block::proposal_in(&blocks, proposal_id)
+    }
+
+    /// Content blocks of persisted message `message_id`: one index lookup +
+    /// one single-message page, never a transcript hydration. `None` when
+    /// the message is gone or carries no block array.
+    async fn message_blocks(&self, agent_id: &AgentId, message_id: &str) -> Option<Vec<Value>> {
         let idx = self
             .store
             .get_agent_message_index(agent_id, message_id)
@@ -10239,9 +10298,11 @@ impl Services {
             .get_agent_messages_page(agent_id, idx, 1)
             .await
             .ok()?;
-        let msg = page.first().filter(|m| m.id == message_id)?;
-        let blocks = msg.content.as_array()?;
-        crate::tool_block::proposal_title_in(blocks, proposal_id)
+        let msg = page.into_iter().next().filter(|m| m.id == message_id)?;
+        match msg.content {
+            Value::Array(blocks) => Some(blocks),
+            _ => None,
+        }
     }
 
     /// Deliver the proposal-resolved system notice (`agent.resolveProposal`,

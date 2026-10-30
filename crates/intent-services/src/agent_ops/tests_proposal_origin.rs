@@ -20,18 +20,67 @@ async fn setup() -> (TempDb, Services, WorkspaceId, crate::EventBus) {
     (tmp, svc, ws, bus)
 }
 
-/// Seed `proposal_id` as a pending proposal on a fresh agent in `ws`.
-async fn pending_proposal(svc: &Services, ws: &WorkspaceId, proposal_id: &str) -> AgentId {
-    let id = create_agent(svc, ws, "Proposer").await;
+/// A persisted assistant content-block array carrying one lifted
+/// `workspace-create` proposal (the shape `ws.workspace.proposeSibling`
+/// produces), identified by `applyToolCallId = proposal_id`, whose params
+/// carry `idempotency_key` when given.
+fn create_proposal_blocks(proposal_id: &str, idempotency_key: Option<&str>) -> Value {
+    let mut params = json!({ "title": "Follow-up", "skipIsolation": true });
+    if let Some(key) = idempotency_key {
+        params["idempotencyKey"] = json!(key);
+    }
+    let proposal = json!({
+        "kind": "workspace-create",
+        "applyToolCallId": proposal_id,
+        "preview": { "title": "Create workspace: Follow-up" },
+        "payload": { "operation": "workspace.create", "params": params },
+    });
+    json!([
+        { "type": "text", "text": "Here is a proposal." },
+        {
+            "type": "resource",
+            "id": "m:1",
+            "resource": {
+                "uri": format!("intent-proposal://workspace-create/{proposal_id}"),
+                "name": "Create workspace: Follow-up",
+                "mimeType": "application/vnd.intent.proposal+json",
+                "text": serde_json::to_string(&proposal).unwrap(),
+            }
+        }
+    ])
+}
+
+/// Record `blocks` (carrying `proposal_id`) as a pending proposal on `agent`.
+async fn seed(
+    svc: &Services,
+    ws: &WorkspaceId,
+    agent: &AgentId,
+    proposal_id: &str,
+    blocks: &Value,
+) {
     let msg = svc
         .store()
-        .append_agent_message(&id, "assistant", &proposal_blocks(proposal_id), &now_iso())
+        .append_agent_message(agent, "assistant", blocks, &now_iso())
         .await
         .expect("append proposal");
     assert!(
-        svc.record_pending_proposals(ws, &id, &msg.id, &[proposal_id.to_string()])
+        svc.record_pending_proposals(ws, agent, &msg.id, &[proposal_id.to_string()])
             .await
     );
+}
+
+/// Seed a key-less `workspace-create` proposal `proposal_id` as pending on
+/// a fresh agent in `ws`.
+async fn pending_proposal(svc: &Services, ws: &WorkspaceId, proposal_id: &str) -> AgentId {
+    let id = create_agent(svc, ws, "Proposer").await;
+    seed(
+        svc,
+        ws,
+        &id,
+        proposal_id,
+        &create_proposal_blocks(proposal_id, None),
+    )
+    .await;
     id
 }
 
@@ -119,7 +168,7 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
     assert_eq!(
         proposal_resolved_notices(&messages),
         vec![format!(
-            "User applied the proposal 'Update Setting'. Created workspace {new_id}."
+            "User applied the proposal 'Create workspace: Follow-up'. Created workspace {new_id}."
         )],
     );
 }
@@ -427,4 +476,112 @@ async fn in_process_origin_takes_precedence_over_the_wire_param() {
         "the binding resolves its own proposal"
     );
     assert!(notices_for(&svc, &agent).await.is_empty());
+}
+
+/// Only a `workspace-create` proposal can be applied by a create: naming a
+/// pending proposal of another kind (here a settings change) resolves
+/// nothing, so that card stays actionable.
+#[tokio::test]
+async fn non_workspace_create_proposal_is_not_resolved() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = create_agent(&svc, &ws, "Proposer").await;
+    seed(
+        &svc,
+        &ws,
+        &agent,
+        "tc-settings",
+        &proposal_blocks("tc-settings"),
+    )
+    .await;
+
+    create_as_owner(
+        &svc,
+        wire_create(json!({ "title": "Wrong card", "skipIsolation": true, "origin": origin(&agent, "tc-settings") })),
+        None,
+    )
+    .await
+    .expect("create still succeeds");
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_proposals().len(),
+        1,
+        "settings card stays pending"
+    );
+    assert!(notices_for(&svc, &agent).await.is_empty());
+}
+
+/// A card whose params carry an `idempotencyKey` is applied only by a create
+/// under that key — so a replay of another card's key cannot mark it applied.
+#[tokio::test]
+async fn origin_is_bound_to_the_cards_idempotency_key() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = create_agent(&svc, &ws, "Proposer").await;
+    seed(
+        &svc,
+        &ws,
+        &agent,
+        "tc-1",
+        &create_proposal_blocks("tc-1", Some("key-1")),
+    )
+    .await;
+    seed(
+        &svc,
+        &ws,
+        &agent,
+        "tc-2",
+        &create_proposal_blocks("tc-2", Some("key-2")),
+    )
+    .await;
+
+    // Card 1 applied under its own key.
+    create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "One", "skipIsolation": true, "origin": origin(&agent, "tc-1") }),
+        ),
+        Some("key-1"),
+    )
+    .await
+    .expect("create card 1");
+    // A replay of key-1 naming card 2, and a key-less create naming card 2.
+    create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "One", "skipIsolation": true, "origin": origin(&agent, "tc-2") }),
+        ),
+        Some("key-1"),
+    )
+    .await
+    .expect("replay of key-1");
+    create_as_owner(
+        &svc,
+        wire_create(
+            json!({ "title": "Two", "skipIsolation": true, "origin": origin(&agent, "tc-2") }),
+        ),
+        None,
+    )
+    .await
+    .expect("key-less create");
+
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_resolutions().get("tc-1"),
+        Some(&json!("applied"))
+    );
+    let pending: Vec<String> = session
+        .pending_proposals()
+        .into_iter()
+        .map(|p| p.proposal_id)
+        .collect();
+    assert_eq!(pending, vec!["tc-2".to_string()], "card 2 is untouched");
+    assert_eq!(notices_for(&svc, &agent).await.len(), 1);
 }

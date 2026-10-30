@@ -21583,6 +21583,9 @@ impl WorkspaceApi for Services {
             == Some(SettingOrigin::Flag);
         self.execution_call(async move {
             let native_checkout = native_checkout.await?;
+            // The caller's key, before any native-checkout derivation: a
+            // proposal origin is bound to the key its card carries.
+            let requested_key = idempotency_key.clone();
             let idempotency_key = match &native_checkout {
                 Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
                 None => idempotency_key,
@@ -21594,7 +21597,9 @@ impl WorkspaceApi for Services {
             // Proposal origin (PROTOCOL §5.1, intent-hq/intent#8086): shape
             // `-32602`s here, before any side effect; resolved after success.
             let mut input = input;
-            let proposal_origin = services.prepare_create_proposal_origin(&mut input).await?;
+            let proposal_origin = services
+                .prepare_create_proposal_origin(&mut input, requested_key.as_deref())
+                .await?;
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
