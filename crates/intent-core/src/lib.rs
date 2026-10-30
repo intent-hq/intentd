@@ -242,9 +242,9 @@ pub use settings_file::{
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
-    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, GitDiffPage,
-    PublishEvent, ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem,
-    ReverseClientConnections, ReverseConnectionInfo, ReverseConnectionSnapshot,
+    browser_navigation_actions, AgentReverseDispatch, BoxFuture, ContextEngine, ContextError,
+    EngineAvailability, GitDiffPage, PublishEvent, ResolvedClient, RetrieveRequest, RetrieveResult,
+    RetrievedItem, ReverseClientConnections, ReverseConnectionInfo, ReverseConnectionSnapshot,
     ReverseDispatchError, ReverseLiveClient, ReverseRoute, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
