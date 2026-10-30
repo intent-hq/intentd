@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.83] - 2026-10-30
+
+### 🚀 Features
+
+- Per-workspace auto-archive opt-out ([#2825](https://github.com/intent-hq/intentd/pull/2825))
+
+### 🐛 Bug Fixes
+
+- *(selection)* Free the operation lane before a public reply is sent ([#2824](https://github.com/intent-hq/intentd/pull/2824))
+
+### 🔧 Refactor
+
+- *(transport)* Require a binding reservation to bind a browser host ([#2823](https://github.com/intent-hq/intentd/pull/2823))
+
+### 📚 Documentation
+
+- Point the startup-progress guide sources at the connection-layer files ([#2831](https://github.com/intent-hq/intentd/pull/2831))
+- *(browser)* State full frame rate during agent use ([#2830](https://github.com/intent-hq/intentd/pull/2830))
+
+### 🧪 Testing
+
+- *(core)* Split repo-slug fold lint at top-level && / || operands ([#2822](https://github.com/intent-hq/intentd/pull/2822))
+
+
 ## [0.11.82] - 2026-10-30
 
 ### 🧪 Testing
