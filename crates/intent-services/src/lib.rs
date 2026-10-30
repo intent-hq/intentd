@@ -1190,8 +1190,8 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
-    last_attention_reminder_reasons:
-        Arc<Mutex<HashMap<WorkspaceId, Vec<intent_core::AttentionReminderReason>>>>,
+    last_attention_reminder_inputs:
+        Arc<Mutex<HashMap<WorkspaceId, workspace_attention_reminders::AttentionReminderInputs>>>,
     /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1):
     /// the recompute-and-compare seam behind
     /// [`Services::maybe_emit_waiting_changed`]. See
@@ -1814,7 +1814,7 @@ impl Services {
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
-            last_attention_reminder_reasons: Arc::new(Mutex::new(HashMap::new())),
+            last_attention_reminder_inputs: Arc::new(Mutex::new(HashMap::new())),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,

@@ -12,7 +12,39 @@ use sha2::{Digest, Sha256};
 
 use crate::{publish_event, workspace_updated_event, Services};
 
+/// Private invalidation inputs. Secret requests are not acknowledgement
+/// reasons: while one needs the user, the personal projection is unavailable.
+/// Tracking that availability alongside reasons refreshes clients even when
+/// raw NeedsAttention and the public reason set stay unchanged.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AttentionReminderInputs {
+    reasons: Vec<AttentionReminderReason>,
+    secret_request_pending: bool,
+}
+
 impl Services {
+    fn attention_reminder_inputs(
+        &self,
+        workspace: &Workspace,
+        sessions: &[AgentSession],
+        reasons: Vec<AttentionReminderReason>,
+    ) -> AttentionReminderInputs {
+        let secret_request_pending = sessions.iter().any(|session| {
+            session.parent_agent_id.is_none()
+                && !session.is_background
+                && session.status != AgentStatus::Deleted
+                && session.retired_at.is_none()
+                && !session.notifications_muted
+                && self
+                    .secret_vault
+                    .has_surfaced_pending(&workspace.id, &session.id)
+        });
+        AttentionReminderInputs {
+            reasons,
+            secret_request_pending,
+        }
+    }
+
     pub(crate) async fn attention_reminder_reasons(
         &self,
         workspace: &Workspace,
@@ -162,6 +194,7 @@ impl Services {
         else {
             return;
         };
+        let inputs = self.attention_reminder_inputs(workspace, sessions, reasons.clone());
         let receipts: BTreeSet<AttentionReminderReason> =
             match state.get(&format!("receipt:{}", principal_id.as_str())) {
                 None => BTreeSet::new(),
@@ -184,10 +217,16 @@ impl Services {
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| "needs_attention".into())
         };
-        if let Ok(mut cache) = self.last_attention_reminder_reasons.lock() {
+        if let Ok(mut cache) = self.last_attention_reminder_inputs.lock() {
             cache
                 .entry(workspace.id.clone())
-                .or_insert_with(|| reasons.clone());
+                .or_insert_with(|| inputs.clone());
+        }
+        // This hold is outside the acknowledgement contract. Omitting the
+        // projection preserves raw attention and disables the reason-aware UI
+        // action, without answering or declining the request.
+        if inputs.secret_request_pending {
+            return;
         }
         workspace.attention_reminder = Some(WorkspaceAttentionReminder {
             reasons,
@@ -234,14 +273,16 @@ impl Services {
         else {
             return;
         };
+        let inputs = self.attention_reminder_inputs(workspace, &sessions, reasons.clone());
         let changed = self
-            .last_attention_reminder_reasons
+            .last_attention_reminder_inputs
             .lock()
             .ok()
             .is_some_and(|mut cache| {
-                cache
-                    .insert(workspace.id.clone(), reasons.clone())
-                    .map_or(!reasons.is_empty(), |old| old != reasons)
+                cache.insert(workspace.id.clone(), inputs.clone()).map_or(
+                    !reasons.is_empty() || inputs.secret_request_pending,
+                    |old| old != inputs,
+                )
             });
         if changed || (raised && !reasons.is_empty()) {
             self.emit_attention_reminder_invalidation(&workspace.id)

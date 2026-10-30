@@ -674,7 +674,7 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
-        if let Ok(mut cache) = self.last_attention_reminder_reasons.lock() {
+        if let Ok(mut cache) = self.last_attention_reminder_inputs.lock() {
             cache.remove(workspace_id);
         }
         self.scripts_running_state.evict(workspace_id);
@@ -963,13 +963,10 @@ impl Services {
         // or lost on restart, and a card dropped with a cancelled turn never
         // strands the workspace.
         if !signals.needs_attention {
-            if let Some(first) = top_level.first() {
-                let awaiting = self.secret_vault.agents_awaiting_user(&first.workspace_id);
-                signals.needs_attention = !awaiting.is_empty()
-                    && top_level
-                        .iter()
-                        .any(|session| awaiting.contains(&session.id));
-            }
+            signals.needs_attention = top_level.iter().any(|session| {
+                self.secret_vault
+                    .has_surfaced_pending(workspace_id, &session.id)
+            });
         }
         signals
     }
