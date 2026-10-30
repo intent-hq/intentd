@@ -1941,4 +1941,32 @@ async fn successful_hello_keeps_its_client_id_active_for_the_connection_life() {
         !registry.client_active(&scoped),
         "released with the connection's state"
     );
+
+    // A hello without `clientId` reserves the server-generated scoped id.
+    let mut h = h;
+    let mut subs = ConnSubs::default();
+    let minted = json!({"jsonrpc":"2.0","id":3,"method":"client.hello","params":{}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &minted.to_string()).await);
+    let mut response = h.response().await;
+    while response["id"] != json!(3) {
+        response = h.response().await;
+    }
+    let generated = ClientId::from_string(
+        response["result"]["clientId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("generated client id: {response}")),
+    );
+    assert!(
+        generated
+            .as_str()
+            .starts_with(&format!("{}:", h.api.principal.as_str())),
+        "{generated:?}"
+    );
+    guard.unbind();
+    assert!(
+        registry.client_active(&generated),
+        "a generated id stays active while the connection lives, though unbound"
+    );
+    drop(subs);
+    assert!(!registry.client_active(&generated));
 }

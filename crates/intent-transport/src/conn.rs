@@ -979,6 +979,13 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
+            // A server-generated id (no `clientId` presented) is reserved as
+            // soon as it is resolved — before the response reveals it, so no
+            // client can present a namespaced form of it earlier.
+            let binding = match (binding, &bound) {
+                (None, Some(identity)) => reverse_guard.reserve_binding(identity.client_id.clone()),
+                (binding, _) => binding,
+            };
             let ordinary_source = bound.as_ref().and_then(|identity| {
                 let principal = crate::context::current_caller()?.principal_id()?.clone();
                 reverse_guard.prepare_ordinary_monitor_source(identity.client_id.clone(), principal)
