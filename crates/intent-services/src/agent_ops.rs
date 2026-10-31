@@ -17429,8 +17429,11 @@ impl Services {
     /// Replace a still-UNDELIVERED automatic wake (see
     /// [`Services::replaceable_pending_wake`] for which entries qualify)
     /// with a NEW entry at the back of the queue, in one step: the old entry
-    /// is removed and the new one appended under the same drain and queue
-    /// locks, so no pop, snapshot or write-through ever sees neither. The
+    /// is removed and the new one appended while the drain lock is held
+    /// throughout, so no pop ([`Services::pop_draining`]), snapshot or
+    /// write-through ever sees neither. (Direct queue mutations that skip the
+    /// drain lock — clear, delete, held-message enqueue — can interleave, as
+    /// they already can with an ordinary wake delivery.) The
     /// PR monitor uses this for a newer CHANGE update, so the owner never
     /// reads the stale one and the replacement waits behind work queued
     /// after it.
