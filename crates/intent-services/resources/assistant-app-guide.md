@@ -714,8 +714,9 @@ made after the merge still do.
 
 To keep one workspace from being archived automatically, right-click it in **Home →
 Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
-off for every workspace by default, only the workspace owner sees it, and it does not
-stop you archiving the workspace yourself.
+off for every workspace by default, only the workspace owner sees it, it appears only
+while **Archive idle workspaces** is on, and it does not stop you archiving the
+workspace yourself.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
