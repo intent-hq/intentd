@@ -183,6 +183,57 @@ fn proposal_result(proposal: &Value) -> Result<Value, String> {
     }))
 }
 
+/// Check a proposed value against the daemon's wire definition (type / enum /
+/// min / max / nullability) so the assistant gets the rejection now instead of
+/// the user getting it on Apply. Mirrors `SettingDefinition::validate`;
+/// `settings.update` stays the final arbiter (e.g. whole-day counts).
+fn validate_proposed_value(path: &str, definition: &Value, value: &Value) -> Result<(), String> {
+    let invalid = |reason: String| Err(format!("Invalid app setting change: {path}: {reason}"));
+    if value.is_null() {
+        // A setting without a default reads `null` when unset; proposing
+        // `null` clears it (the app applies it as `settings.reset`).
+        if definition.get("defaultValue").is_none() {
+            return Ok(());
+        }
+        return invalid("this setting cannot be cleared; propose a value".to_string());
+    }
+    match definition.get("type").and_then(Value::as_str) {
+        Some("boolean") if !value.is_boolean() => invalid("expected true or false".to_string()),
+        Some("string") if !value.is_string() => invalid("expected a string".to_string()),
+        Some("object") if !(value.is_object() || value.is_array()) => {
+            invalid("expected an object or array".to_string())
+        }
+        Some("enum") => {
+            let allowed: Vec<&str> = definition
+                .get("enumValues")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            match value.as_str() {
+                Some(v) if allowed.contains(&v) => Ok(()),
+                _ => invalid(format!("must be one of [{}]", allowed.join(", "))),
+            }
+        }
+        Some("number") => {
+            let Some(n) = value.as_f64() else {
+                return invalid("expected a number".to_string());
+            };
+            if let Some(min) = definition.get("min").and_then(Value::as_f64) {
+                if n < min {
+                    return invalid(format!("must be >= {min}"));
+                }
+            }
+            if let Some(max) = definition.get("max").and_then(Value::as_f64) {
+                if n > max {
+                    return invalid(format!("must be <= {max}"));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
     // Extract changes from input (can be array or { changes: [...] })
     let changes = if let Some(arr) = args.as_array() {
@@ -229,6 +280,17 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
                 "Invalid app setting change: {path} setting is sensitive and cannot be changed via MCP proposals"
             ));
         }
+        // The daemon's `proposable` flag (§5.12) is the single gate for what a
+        // chat card may change; the app refuses to apply anything else, so a
+        // card for it would only fail on Apply.
+        if definition.get("proposable") != Some(&json!(true)) {
+            return Err(format!(
+                "Invalid app setting change: {path} cannot be changed from a chat card \
+                 (read-only or security-relevant); point the user to Settings instead"
+            ));
+        }
+        let value = change.get("value").unwrap_or(&Value::Null);
+        validate_proposed_value(path, definition, value)?;
 
         validated_changes.push((
             change,
@@ -381,7 +443,63 @@ mod tests {
                             "path": "user.name",
                             "category": "user",
                             "sensitive": false,
+                            "proposable": true,
                             "type": "string"
+                        }
+                    })),
+                    "server.port" => Ok(json!({
+                        "path": "server.port",
+                        "value": 8080,
+                        "definition": {
+                            "path": "server.port",
+                            "category": "server",
+                            "type": "number",
+                            "proposable": false
+                        }
+                    })),
+                    "legacy.flag" => Ok(json!({
+                        "path": "legacy.flag",
+                        "value": true,
+                        "definition": {
+                            "path": "legacy.flag",
+                            "category": "legacy",
+                            "type": "boolean"
+                        }
+                    })),
+                    "prMonitor.pollSeconds" => Ok(json!({
+                        "path": "prMonitor.pollSeconds",
+                        "value": 60.0,
+                        "definition": {
+                            "path": "prMonitor.pollSeconds",
+                            "label": "PR monitor poll interval (seconds)",
+                            "category": "prMonitor",
+                            "type": "number",
+                            "min": 10.0,
+                            "defaultValue": 60,
+                            "proposable": true
+                        }
+                    })),
+                    "workspace.purgeArchivedAfterDays" => Ok(json!({
+                        "path": "workspace.purgeArchivedAfterDays",
+                        "value": 14.0,
+                        "definition": {
+                            "path": "workspace.purgeArchivedAfterDays",
+                            "category": "workspace",
+                            "type": "number",
+                            "min": 1.0,
+                            "proposable": true
+                        }
+                    })),
+                    "logging.level" => Ok(json!({
+                        "path": "logging.level",
+                        "value": "info",
+                        "definition": {
+                            "path": "logging.level",
+                            "category": "logging",
+                            "type": "enum",
+                            "enumValues": ["error", "warn", "info", "debug", "trace"],
+                            "defaultValue": "info",
+                            "proposable": true
                         }
                     })),
                     "api.token" => Ok(json!({
@@ -703,5 +821,61 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("intent-proposal://"));
+    }
+
+    async fn propose_error(change: Value) -> String {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        dispatch(&api, &WorkspaceId::chief(), "propose", &json!([change]))
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn test_propose_rejects_settings_the_daemon_marks_not_proposable() {
+        let error = propose_error(json!({ "path": "server.port", "value": 9000 })).await;
+        assert!(
+            error.contains("server.port cannot be changed from a chat card"),
+            "{error}"
+        );
+    }
+
+    /// An older daemon omits `proposable`; the app would refuse such a card,
+    /// so the binding must refuse it too rather than treat absence as allowed.
+    #[tokio::test]
+    async fn test_propose_rejects_settings_without_the_proposable_flag() {
+        let error = propose_error(json!({ "path": "legacy.flag", "value": false })).await;
+        assert!(
+            error.contains("cannot be changed from a chat card"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propose_validates_the_value_against_the_definition() {
+        let error = propose_error(json!({ "path": "prMonitor.pollSeconds", "value": 5 })).await;
+        assert!(error.contains("must be >= 10"), "{error}");
+        let error = propose_error(json!({ "path": "prMonitor.pollSeconds", "value": "30" })).await;
+        assert!(error.contains("expected a number"), "{error}");
+        let error = propose_error(json!({ "path": "logging.level", "value": "loud" })).await;
+        assert!(error.contains("must be one of [error, warn"), "{error}");
+        let error = propose_error(json!({ "path": "user.name", "value": 3 })).await;
+        assert!(error.contains("expected a string"), "{error}");
+        let error = propose_error(json!({ "path": "prMonitor.pollSeconds", "value": null })).await;
+        assert!(error.contains("cannot be cleared"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_propose_accepts_valid_daemon_settings_and_null_for_unset() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        for change in [
+            json!({ "path": "prMonitor.pollSeconds", "value": 30 }),
+            json!({ "path": "logging.level", "value": "debug" }),
+            json!({ "path": "workspace.purgeArchivedAfterDays", "value": null }),
+        ] {
+            let result = dispatch(&api, &WorkspaceId::chief(), "propose", &json!([change]))
+                .await
+                .unwrap_or_else(|error| panic!("{change}: {error}"));
+            assert_eq!(result["proposal"]["kind"], "settings-change");
+        }
     }
 }
