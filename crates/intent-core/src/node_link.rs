@@ -18,13 +18,35 @@ use crate::{AgentId, Error, Result, WorkspaceId};
 /// Identifies one RPC request on the link.
 pub type LinkId = uuid::Uuid;
 
-/// The private node-link protocol versions this build speaks: the
-/// daemon-to-daemon executor link starts at 6. Version 5 (the single-node
-/// link) never shipped and is not supported; the prepared enrollment-based
-/// versions 2-4 in monorepo `docs/protocol/node-link.md` are a different
-/// protocol. Within a version, later additions are optional with defaults,
-/// so peers on different builds interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 6, max: 6 };
+/// Identifies one stop the backend asked for. The backend chooses it and
+/// reuses it when it resends the same stop, on the same link or after a
+/// reconnect; only a [`LinkFrame::StopAck`] carrying it confirms that stop.
+pub type StopId = uuid::Uuid;
+
+/// What a machine reports when it has applied a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopOutcome {
+    /// The agent was running for this backend; its process tree is gone and
+    /// its shared slot is free. Its `exited` journal record follows on the
+    /// journal lane, before or after the acknowledgement.
+    Stopped,
+    /// The machine runs no agent with that id for this backend: it already
+    /// exited, was never launched, or is unknown.
+    NotRunning,
+}
+
+/// The private node-link protocol versions this build speaks. The
+/// daemon-to-daemon executor link started at 6; 7 adds the correlated stop
+/// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]).
+/// Neither 6 nor the single-node 5 ever shipped, and a protocol-6 peer
+/// cannot confirm a stop, so this build speaks 7 only: a backend never
+/// takes a stop as confirmed by a machine that cannot acknowledge it. The
+/// prepared enrollment-based versions 2-4 in monorepo
+/// `docs/protocol/node-link.md` are a different protocol. Within a version,
+/// later additions are optional with defaults, so peers on different builds
+/// interoperate inside their common range.
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 7 };
 
 /// An inclusive range of node-link protocol versions a peer speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +88,7 @@ impl std::fmt::Display for ProtocolRange {
 /// responses to the machine's forwarded `workspace.call` requests. Nothing
 /// else is admitted from an executor credential; the machine-to-backend
 /// frames (`welcome`, `journal`, `replayComplete`, `request`,
-/// `capabilitiesReply`) and `cancelRequest` are refused. Git sessions use the
+/// `capabilitiesReply`, `stopAck`) and `cancelRequest` are refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
 /// [`LinkFrame::admitted_from_executor`] is the typed form.
 pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
@@ -391,10 +413,21 @@ pub enum LinkFrame {
     Cancel {
         agent_id: AgentId,
     },
-    /// Stop the agent's process.
+    /// Stop the agent's process. The machine answers with a
+    /// [`LinkFrame::StopAck`] for `stop_id` once the stop is applied; a
+    /// repeated `stop_id` is the same stop.
     #[serde(rename_all = "camelCase")]
     Stop {
         agent_id: AgentId,
+        stop_id: StopId,
+    },
+    /// Machine to backend: the stop `stop_id` for `agent_id` is applied.
+    /// May arrive in any order relative to other frames and acks.
+    #[serde(rename_all = "camelCase")]
+    StopAck {
+        stop_id: StopId,
+        agent_id: AgentId,
+        outcome: StopOutcome,
     },
     Journal(JournalRecord),
     /// Head has ingested every record up to and including `seq`.
@@ -439,6 +472,7 @@ impl LinkFrame {
             | Self::Prompt { .. }
             | Self::Cancel { .. }
             | Self::Stop { .. }
+            | Self::StopAck { .. }
             | Self::Capabilities
             | Self::CapabilitiesReply { .. } => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
@@ -470,7 +504,8 @@ impl LinkFrame {
             | Self::ReplayComplete { .. }
             | Self::Request(_)
             | Self::CancelRequest { .. }
-            | Self::CapabilitiesReply { .. } => false,
+            | Self::CapabilitiesReply { .. }
+            | Self::StopAck { .. } => false,
         }
     }
 

@@ -27,6 +27,7 @@ use intent_acp::{
 };
 use intent_core::node_link::{
     ExitFailure, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
+    StopOutcome,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -165,6 +166,41 @@ struct State {
     /// The workspace of every agent launched since start, so a prompt for an
     /// agent that has exited can still be answered with a journal record.
     workspaces: HashMap<AgentId, WorkspaceId>,
+    /// Agents that left `agents` (their process tree is gone and their slot
+    /// free) whose exit record is not journaled yet, so a stop arriving in
+    /// that window still waits for the record.
+    exiting: HashMap<AgentId, watch::Receiver<bool>>,
+}
+
+/// What [`Runner::stop`] leaves to wait for before the stop may be
+/// acknowledged.
+pub(super) enum StopWait {
+    /// No agent with that id runs or is exiting.
+    NotRunning,
+    /// Resolves with `outcome` once the agent's exit record is journaled.
+    Pending {
+        outcome: StopOutcome,
+        journaled: watch::Receiver<bool>,
+    },
+}
+
+impl StopWait {
+    /// Wait until the stop is applied: the agent's process tree is gone, its
+    /// shared slot is free and its exit record is journaled.
+    pub(super) async fn wait(self) -> StopOutcome {
+        match self {
+            Self::NotRunning => StopOutcome::NotRunning,
+            Self::Pending {
+                outcome,
+                mut journaled,
+            } => {
+                // A closed channel means the pump is gone: nothing more is
+                // journaled for the agent.
+                let _ = journaled.wait_for(|done| *done).await;
+                outcome
+            }
+        }
+    }
 }
 
 struct Agent {
@@ -181,6 +217,8 @@ struct Agent {
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Turns true once the agent's exit record is journaled.
+    journaled: watch::Receiver<bool>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
     /// Whether a turn is running; refuses a second one.
     busy: Mutex<bool>,
@@ -625,6 +663,7 @@ impl Runner {
         }
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
+        let (journaled_tx, journaled_rx) = watch::channel(false);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let agent = Arc::new(Agent {
@@ -639,6 +678,7 @@ impl Runner {
             worktree: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
             stop: Mutex::new(Some(stop_tx)),
+            journaled: journaled_rx,
             ready: ready_rx,
             busy: Mutex::new(false),
             descendants: Arc::new(Mutex::new(Vec::new())),
@@ -663,6 +703,7 @@ impl Runner {
             (agent.activity.clone(), agent.redactor.clone()),
             notes_rx,
             marks_rx,
+            journaled_tx,
         ));
         {
             let mut pumps = lock(&self.inner.pumps);
@@ -695,6 +736,7 @@ impl Runner {
         (activity, redactor): (ActivityTracker, Arc<Redactor>),
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
+        journaled: watch::Sender<bool>,
     ) {
         let mut turn: Option<String> = None;
         loop {
@@ -734,6 +776,7 @@ impl Runner {
                 },
                 else => break,
             };
+            let exit = matches!(body, JournalBody::Exited { .. });
             self.append(JournalEntry {
                 agent_id: agent_id.clone(),
                 workspace_id: workspace_id.clone(),
@@ -742,6 +785,25 @@ impl Runner {
                 body,
             })
             .await;
+            if exit {
+                self.exit_journaled(&agent_id, &journaled);
+            }
+        }
+        // However the pump ends, nothing more is journaled for the agent.
+        self.exit_journaled(&agent_id, &journaled);
+    }
+
+    /// The agent's exit record is journaled (or never will be): release its
+    /// stop waits and forget it as exiting.
+    fn exit_journaled(&self, agent_id: &AgentId, journaled: &watch::Sender<bool>) {
+        journaled.send_replace(true);
+        let mut state = lock(&self.inner.state);
+        if state
+            .exiting
+            .get(agent_id)
+            .is_some_and(|waiting| waiting.same_channel(&journaled.subscribe()))
+        {
+            state.exiting.remove(agent_id);
         }
     }
 
@@ -865,6 +927,9 @@ impl Runner {
             {
                 state.agents.remove(&agent.id);
                 self.inner.admission.release(&agent.id);
+                state
+                    .exiting
+                    .insert(agent.id.clone(), agent.journaled.clone());
             }
         }
         let _ = agent.marks.send(Mark::Exited { exit_code, error });
@@ -1100,12 +1165,30 @@ impl Runner {
     }
 
     /// Stop the agent's provider process tree. Its exit is journaled.
-    pub(super) fn stop(&self, agent_id: &AgentId) {
-        let agent = lock(&self.inner.state).agents.get(agent_id).cloned();
-        if let Some(agent) = agent {
+    ///
+    /// The returned wait resolves once the stop is applied: `stopped` when
+    /// the agent was running (or being set up), after its process tree is
+    /// killed, its shared slot freed and its exit record journaled;
+    /// `not-running` when no such agent runs, once any exit record still
+    /// being written for it is journaled. Repeating a stop is harmless.
+    pub(super) fn stop(&self, agent_id: &AgentId) -> StopWait {
+        let state = lock(&self.inner.state);
+        if let Some(agent) = state.agents.get(agent_id).cloned() {
+            drop(state);
             if let Some(stop) = lock(&agent.stop).take() {
                 let _ = stop.send(());
             }
+            return StopWait::Pending {
+                outcome: StopOutcome::Stopped,
+                journaled: agent.journaled.clone(),
+            };
+        }
+        match state.exiting.get(agent_id) {
+            Some(journaled) => StopWait::Pending {
+                outcome: StopOutcome::NotRunning,
+                journaled: journaled.clone(),
+            },
+            None => StopWait::NotRunning,
         }
     }
 

@@ -1271,3 +1271,69 @@ fn a_refresh_settles_the_failures_it_saw_and_keeps_newer_ones() {
         ]
     );
 }
+
+/// End to end over the daemon's WSS listener: the backend's stop is
+/// acknowledged `stopped` only once the agent's process tree is gone and
+/// its shared slot is free; repeating the same stop id, or stopping an
+/// agent that is not running, is acknowledged `notRunning`.
+#[tokio::test]
+async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
+    use intent_core::node_link::{StopId, StopOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let pid_file = dir
+        .path()
+        .join("executor")
+        .join(&id.0)
+        .join("agents")
+        .join("a1")
+        .join("work")
+        .join("agent.pid");
+    let pids: serde_json::Value = {
+        let deadline = tokio::time::Instant::now() + wait();
+        loop {
+            if let Some(pids) = std::fs::read(&pid_file)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                break pids;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let pid = |key: &str| i32::try_from(pids[key].as_i64().unwrap()).unwrap();
+    let stop_id = StopId::new_v4();
+    let outcome = dialed
+        .link
+        .stop(AgentId::from("a1"), stop_id, wait())
+        .await
+        .unwrap();
+    assert_eq!(outcome, StopOutcome::Stopped);
+    // Already true when the acknowledgement arrives: no polling.
+    assert!(process_gone(pid("agent")), "the provider still runs");
+    assert!(process_gone(pid("child")), "its helper still runs");
+    assert!(admission.running.lock().unwrap().is_empty(), "slot held");
+    assert_eq!(node.service.status(&id).running_agents, 0);
+
+    // A resend of the same stop is idempotent.
+    let again = dialed
+        .link
+        .stop(AgentId::from("a1"), stop_id, wait())
+        .await
+        .unwrap();
+    assert_eq!(again, StopOutcome::NotRunning);
+    let unknown = dialed
+        .link
+        .stop(AgentId::from("never-launched"), StopId::new_v4(), wait())
+        .await
+        .unwrap();
+    assert_eq!(unknown, StopOutcome::NotRunning);
+    node.stop().await;
+}

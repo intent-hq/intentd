@@ -299,6 +299,66 @@ async fn node_runner_runs_a_turn_and_stop_kills_the_process_tree() {
     assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
 }
 
+/// The wait a stop returns resolves `stopped` only once the agent's whole
+/// process tree is gone and its shared slot is free, so a stop
+/// acknowledgement sent on it never confirms a still-running agent.
+#[tokio::test]
+async fn node_runner_stop_wait_resolves_only_once_the_agent_is_gone() {
+    use intent_core::node_link::StopOutcome;
+    let Some(h) = harness(2, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    let (agent, child) = agent_pids(&h.storage, "a1").await;
+    let first = h.runner.stop(&AgentId::from("a1"));
+    // A repeated stop while the first is still being applied waits too.
+    let repeat = h.runner.stop(&AgentId::from("a1"));
+    assert_eq!(
+        tokio::time::timeout(wait(), first.wait()).await.unwrap(),
+        StopOutcome::Stopped
+    );
+    // No polling: everything is already true when the wait resolves.
+    assert!(gone(agent), "provider {agent} still running");
+    assert!(gone(child), "helper {child} still running");
+    assert!(h.runner.running().is_empty());
+    assert!(lock(&h.admission.running).is_empty(), "slot not released");
+    assert_eq!(
+        tokio::time::timeout(wait(), repeat.wait()).await.unwrap(),
+        StopOutcome::Stopped
+    );
+    // Once gone, a stop for the agent (or for one never launched) reports
+    // that it is not running, at once.
+    for id in ["a1", "ghost"] {
+        assert_eq!(
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(500)),
+                h.runner.stop(&AgentId::from(id)).wait()
+            )
+            .await
+            .unwrap(),
+            StopOutcome::NotRunning,
+            "{id}"
+        );
+    }
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+/// A stop arriving while the agent is still being set up waits for it to be
+/// torn down as well.
+#[tokio::test]
+async fn node_runner_stop_wait_covers_an_agent_stopped_during_setup() {
+    use intent_core::node_link::StopOutcome;
+    let Some(h) = harness(1, &["--hang-setup"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    let (agent, child) = agent_pids(&h.storage, "a1").await;
+    let outcome = tokio::time::timeout(wait(), h.runner.stop(&AgentId::from("a1")).wait())
+        .await
+        .unwrap();
+    assert_eq!(outcome, StopOutcome::Stopped);
+    assert!(gone(agent) && gone(child));
+    assert!(lock(&h.admission.running).is_empty());
+}
+
 #[tokio::test]
 async fn node_runner_enforces_capacity_and_frees_the_slot_on_exit() {
     let Some(h) = harness(1, &[]) else { return };
