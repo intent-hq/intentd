@@ -18017,6 +18017,7 @@ mod stderr_capture_hint_decision_tests {
         assert_eq!(d(true, false, true), None);
         assert_eq!(d(false, false, true), None);
         assert_eq!(d(false, false, false), None);
+        assert_eq!(d(true, false, false), None);
         // Capture file exists: named with today's wording, settled or not.
         assert_eq!(d(true, true, true), Some(false));
         assert_eq!(d(false, true, true), Some(false));
