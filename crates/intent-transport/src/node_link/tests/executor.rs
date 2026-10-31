@@ -334,25 +334,7 @@ impl Machine {
     /// Upgrade `path` with `headers` and report the HTTP status: `101` on
     /// success (with the socket), the refusal status otherwise.
     async fn upgrade(&self, target: &str, headers: &[(&str, &str)]) -> (u16, Option<Socket>) {
-        let tcp = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
-        let mut request = format!("wss://127.0.0.1:{}{target}", self.port)
-            .into_client_request()
-            .unwrap();
-        for (name, value) in headers {
-            request.headers_mut().insert(
-                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                http::HeaderValue::from_str(value).unwrap(),
-            );
-        }
-        let pin = CertificatePin::parse(&self.certificate.fingerprint256).unwrap();
-        let tls = TlsConnector::from(Arc::new(pin::client_config(pin).unwrap()))
-            .connect(
-                rustls_pki_types::ServerName::try_from("localhost").unwrap(),
-                tcp,
-            )
-            .await
-            .unwrap();
-        status_of(tokio_tungstenite::client_async(request, MaybeTls::Tls(Box::new(tls))).await)
+        upgrade_tls(self.port, &self.certificate, target, headers).await
     }
 
     async fn upgrade_plain(&self, target: &str, headers: &[(&str, &str)]) -> u16 {
@@ -458,11 +440,54 @@ fn git_headers(binding: &LeaseBinding) -> Vec<(&'static str, String)> {
 }
 
 /// Bind `binding` as a raw client and return the socket after the welcome.
+/// Upgrade `target` over pinned TLS and report the HTTP status: `101` on
+/// success (with the socket), the refusal status otherwise.
+async fn upgrade_tls(
+    port: u16,
+    certificate: &TlsCertificate,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Option<Socket>) {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut request = format!("wss://127.0.0.1:{port}{target}")
+        .into_client_request()
+        .unwrap();
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    let pin = CertificatePin::parse(&certificate.fingerprint256).unwrap();
+    let tls = TlsConnector::from(Arc::new(pin::client_config(pin).unwrap()))
+        .connect(
+            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    status_of(tokio_tungstenite::client_async(request, MaybeTls::Tls(Box::new(tls))).await)
+}
+
 async fn raw_bind(machine: &Machine, token: &str, binding: LeaseBinding) -> Socket {
+    raw_bind_at(machine.port, &machine.certificate, token, binding).await
+}
+
+/// [`raw_bind`] against any listener.
+async fn raw_bind_at(
+    port: u16,
+    certificate: &TlsCertificate,
+    token: &str,
+    binding: LeaseBinding,
+) -> Socket {
     let auth = bearer(token);
-    let (status, socket) = machine
-        .upgrade(LINK_PATH, &[("authorization", auth.as_str())])
-        .await;
+    let (status, socket) = upgrade_tls(
+        port,
+        certificate,
+        LINK_PATH,
+        &[("authorization", auth.as_str())],
+    )
+    .await;
     assert_eq!(status, 101);
     let mut socket = socket.unwrap();
     socket
@@ -1036,4 +1061,74 @@ async fn a_link_upgraded_before_stop_cannot_bind_after_it() {
     .await
     .unwrap();
     let _ = machine.accepted_link().await;
+}
+
+/// End to end with the real services and store: `executor.revoke` closes a
+/// live `/node/link` with `1008`, and the token is refused afterwards.
+#[tokio::test]
+async fn executor_revoke_closes_a_live_link_with_1008() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = intent_store::Store::open(&dir.path().join("machine.db"))
+        .await
+        .unwrap();
+    let services = Arc::new(intent_services::Services::new(store.clone()));
+    let credential = credential(BACKEND);
+    store
+        .insert_executor_credential(&credential, &crate::auth::hash_token(&executor_token()))
+        .await
+        .unwrap();
+    let certificate = certificate();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
+    let mut server = WsApiServer::new(
+        services.clone(),
+        EventBus::new(store.clone()),
+        &certificate,
+        &tokens,
+        WsOptions {
+            base_port: 0,
+            ..WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let (tx, mut accepted) = mpsc::unbounded_channel();
+    server.install_executor_links(ExecutorLinks::new(Arc::new(Host {
+        enabled: AtomicBool::new(true),
+        accepted: tx,
+    })));
+    let port = server.start().await.unwrap();
+
+    let binding = machine_binding(BACKEND, 1);
+    let mut socket = raw_bind_at(port, &certificate, &executor_token(), binding.clone()).await;
+    let _node_link = tokio::time::timeout(wait(), accepted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.executor_binding(&credential.id).await.unwrap(),
+        Some(binding),
+        "the bind is persisted in the store"
+    );
+
+    intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        services.executor_revoke(credential.id.to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        close_frame(&mut socket).await,
+        Some((CloseCode::Policy, REVOKED_CLOSE_REASON.to_owned()))
+    );
+    let auth = bearer(&executor_token());
+    let (status, _) = upgrade_tls(
+        port,
+        &certificate,
+        LINK_PATH,
+        &[("authorization", auth.as_str())],
+    )
+    .await;
+    assert_eq!(status, 401, "a revoked token is refused");
+    server.stop().await;
 }

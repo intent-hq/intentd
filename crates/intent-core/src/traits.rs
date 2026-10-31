@@ -5997,6 +5997,39 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `executor.mint` (daemon-to-daemon remote agents, owner-only): params
+    /// `{ backendId, backendName, backendFingerprint? }` → `{ credentialId,
+    /// token, machine }`. The token is returned once and never logged.
+    fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_mint not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.list` (owner-only): `{ backends }`, the unrevoked
+    /// credentials with live status, never tokens.
+    fn executor_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.revoke` (owner-only): `{ ok: true }`; an already revoked id
+    /// is a no-op, an unknown id is `Error::NotFound`.
+    fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = credential_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_revoke not implemented".into(),
+            ))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /

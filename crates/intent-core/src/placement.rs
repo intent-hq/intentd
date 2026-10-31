@@ -211,6 +211,29 @@ pub struct AgentPlatform {
 }
 
 impl AgentPlatform {
+    /// The platform for Rust's `std::env::consts::{OS, ARCH}` names, or
+    /// `None` for one remote agents do not run on.
+    #[must_use]
+    pub fn of(os: &str, arch: &str) -> Option<Self> {
+        let os = match os {
+            "linux" => NodeOs::Linux,
+            "macos" => NodeOs::Macos,
+            _ => return None,
+        };
+        let arch = match arch {
+            "x86_64" => NodeArch::X86_64,
+            "aarch64" => NodeArch::Aarch64,
+            _ => return None,
+        };
+        Some(Self { os, arch })
+    }
+
+    /// This process's platform, or `None` where remote agents do not run.
+    #[must_use]
+    pub fn host() -> Option<Self> {
+        Self::of(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
     fn sort_key(self) -> (&'static str, &'static str) {
         (os_name(self.os), arch_name(self.arch))
     }

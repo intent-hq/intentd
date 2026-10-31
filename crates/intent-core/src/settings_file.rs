@@ -93,6 +93,8 @@ pub struct SettingsFile {
     pub pr_monitor: PrMonitorSettings,
     pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
+    pub remote_agents: RemoteAgentsSettings,
+    pub experimental: ExperimentalSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -1240,6 +1242,40 @@ impl Default for PrCacheSettings {
             max_age_seconds: DEFAULT_PR_CACHE_MAX_AGE_SECONDS,
         }
     }
+}
+
+/// `[remoteAgents]` — machine side of daemon-to-daemon remote agents
+/// (`remoteAgents.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteAgentsSettings {
+    /// `remoteAgents.enabled` — serve the executor link and allow
+    /// `executor.mint`. Off by default.
+    pub enabled: bool,
+    /// `remoteAgents.permission` — how remote agents' provider permission
+    /// prompts are answered, since no client is attached.
+    pub permission: RemoteAgentPermission,
+}
+
+/// `remoteAgents.permission` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteAgentPermission {
+    #[default]
+    AllowAll,
+    AutoByRisk,
+    DenyAll,
+}
+
+/// `[experimental]` — features that are off until they leave experimental
+/// (`experimental.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExperimentalSettings {
+    /// `experimental.remoteAgents` — backend side of daemon-to-daemon remote
+    /// agents: the `remoteMachines.*` mutations, placement on exposed
+    /// machines and the `remoteMachines` capability.
+    pub remote_agents: bool,
 }
 
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw

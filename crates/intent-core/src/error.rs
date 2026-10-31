@@ -119,6 +119,13 @@ pub enum Error {
     #[error("{0}")]
     MachineUpdateRequired(Box<crate::machines::MachineUpdateRequired>),
 
+    /// A remote-agents request while its setting is off: `remoteAgents.enabled`
+    /// on the machine (`executor.mint`) or `experimental.remoteAgents` on the
+    /// backend. Surfaces as `-32602` with `error.data = { code:
+    /// "remote-agents-disabled" }`.
+    #[error("remote agents are disabled on this daemon: turn on {setting} first")]
+    RemoteAgentsDisabled { setting: &'static str },
+
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
     /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
@@ -618,6 +625,7 @@ impl Error {
             | Error::PlacementUnavailable(_)
             | Error::ModelUnavailable(_)
             | Error::MachineUpdateRequired(_)
+            | Error::RemoteAgentsDisabled { .. }
             | Error::ContentBaseMismatch { .. }
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
