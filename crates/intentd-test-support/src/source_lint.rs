@@ -986,6 +986,87 @@ pub fn matching_close(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
+/// The closing delimiter matching an opening one, on blanked text.
+fn closing_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+/// Index of the delimiter closing the `(…)` / `[…]` / `{…}` group that opens
+/// at `open`, on blanked text (so a delimiter inside a comment or literal
+/// never counts): [`skip_group`] as an index into the text. Only the group's
+/// own delimiter pair is counted. `None` when `chars[open]` is not an opening
+/// delimiter or the group never closes.
+#[must_use]
+pub fn group_close(chars: &[char], open: usize) -> Option<usize> {
+    let open_c = *chars.get(open)?;
+    let close_c = closing_of(open_c)?;
+    let past = skip_group(chars, open, open_c, close_c);
+    let group = &chars[open..past];
+    let opens = group.iter().filter(|&&c| c == open_c).count();
+    let closes = group.iter().filter(|&&c| c == close_c).count();
+    (opens == closes).then(|| past - 1)
+}
+
+/// Index of the delimiter opening the group whose closing `)` / `]` / `}`
+/// sits at `close` — the reverse of [`group_close`].
+#[must_use]
+pub fn group_open(chars: &[char], close: usize) -> Option<usize> {
+    let close_c = *chars.get(close)?;
+    let open_c = ['(', '[', '{']
+        .into_iter()
+        .find(|&o| closing_of(o) == Some(close_c))?;
+    let mut depth = 0usize;
+    for k in (0..=close).rev() {
+        if chars[k] == close_c {
+            depth += 1;
+        } else if chars[k] == open_c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Maps char offsets to 1-based line numbers in O(log n) per lookup, so a
+/// lint reporting many offsets in a large file does not rescan it from the
+/// start for each one.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    /// Char offset at which each line starts; `starts[0] == 0`.
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    /// Indexes the line starts of `chars` (blanked or not: blanking keeps
+    /// every newline).
+    #[must_use]
+    pub fn new(chars: &[char]) -> Self {
+        let starts = std::iter::once(0)
+            .chain(
+                chars
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c == '\n')
+                    .map(|(k, _)| k + 1),
+            )
+            .collect();
+        Self { starts }
+    }
+
+    /// 1-based line holding char offset `offset`.
+    #[must_use]
+    pub fn line(&self, offset: usize) -> usize {
+        self.starts.partition_point(|&start| start <= offset)
+    }
+}
+
 /// The cargo workspace root (the directory holding `Cargo.toml` and
 /// `crates/`), resolved from this crate's own manifest directory so every
 /// lint gets the same answer whichever crate it lives in.
@@ -1087,6 +1168,7 @@ mod tests {
 
     use super::*;
 
+    #[track_caller]
     fn line_of(src: &str, needle: &str) -> usize {
         let Some(index) = src.lines().position(|l| l.contains(needle)) else {
             panic!("fixture has no line containing {needle:?}")
@@ -1855,5 +1937,34 @@ let h = 8;
         assert_eq!(skip_group(&chars, 1, '(', ')'), 8);
         let chars: Vec<char> = "{ a { } ".chars().collect();
         assert_eq!(skip_group(&chars, 0, '{', '}'), chars.len());
+    }
+}
+
+#[cfg(test)]
+mod group_and_line_tests {
+    use super::*;
+
+    #[test]
+    fn group_close_and_open_match_their_own_pair_only() {
+        let chars: Vec<char> = "f(a[1], {b(2)}) [x]".chars().collect();
+        assert_eq!(group_close(&chars, 1), Some(14));
+        assert_eq!(group_close(&chars, 3), Some(5));
+        assert_eq!(group_close(&chars, 8), Some(13));
+        assert_eq!(group_open(&chars, 14), Some(1));
+        assert_eq!(group_open(&chars, 13), Some(8));
+        assert_eq!(group_open(&chars, 18), Some(16));
+        assert_eq!(group_close(&chars, 0), None, "`f` is not a delimiter");
+        let unclosed: Vec<char> = "{ (".chars().collect();
+        assert_eq!(group_close(&unclosed, 0), None);
+        let ends_on_inner_close: Vec<char> = "{ { }".chars().collect();
+        assert_eq!(group_close(&ends_on_inner_close, 0), None);
+    }
+
+    #[test]
+    fn line_index_maps_offsets_to_one_based_lines() {
+        let chars: Vec<char> = "ab\nc\n\nd".chars().collect();
+        let index = LineIndex::new(&chars);
+        let lines: Vec<usize> = (0..chars.len()).map(|k| index.line(k)).collect();
+        assert_eq!(lines, vec![1, 1, 1, 2, 2, 3, 4]);
     }
 }

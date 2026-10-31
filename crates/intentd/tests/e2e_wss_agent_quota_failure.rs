@@ -560,6 +560,7 @@ async fn startup_quota_failure_names_the_attempted_provider_over_wss() {
 
 /// Assert the fields that exist on EVERY `agent:failed`, quota or not: the
 /// stamp is additive, so nothing here may shift when `errorCode` appears.
+#[track_caller]
 fn assert_base_failure_shape(data: &Value, agent_name_hint: &str) {
     assert!(
         data["agentId"].as_str().is_some_and(|s| !s.is_empty()),

@@ -582,6 +582,7 @@ fn durable_use_id(blocks: &[Value], tool_call_id: &str) -> String {
 /// owns with a different type. A mispredicted `tool_result` id lands on the
 /// interleaved text block (shape a) or the sibling call's `tool_use` (shape b),
 /// and every id-keyed client replaces it for the rest of the turn.
+#[track_caller]
 fn assert_live_ids_never_retype_durable_blocks(turn: &Turn) {
     let durable: HashMap<String, String> = turn
         .durable_blocks()

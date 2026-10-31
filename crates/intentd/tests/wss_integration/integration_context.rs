@@ -137,6 +137,7 @@ async fn integration_context_retains_integration_and_git_authorization() {
     srv.ws.stop().await;
 }
 
+#[track_caller]
 fn git(path: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)

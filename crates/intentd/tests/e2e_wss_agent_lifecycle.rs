@@ -14539,6 +14539,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
 }
 
 /// Walk a served payload and fail on any `file` block still carrying `data`.
+#[track_caller]
 fn assert_no_file_data(v: &Value, surface: &str) {
     match v {
         Value::Object(map) => {

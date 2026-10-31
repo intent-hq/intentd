@@ -2133,6 +2133,22 @@ jobs:
             ci
             perf
 
+  # Docs-title scope guard: a `docs:` title whose diff changes files that are
+  # not documentation fails, naming them and suggesting a type (test:, fix:,
+  # ...); the docs-with-code-intended label skips it. intentd#2839 ("docs:
+  # explain sidebar multi-pane selection") also carried the hook_manager.rs
+  # flaky-test fix, and a later search for that fix missed it by title. The
+  # check lives in the monorepo (scripts/check-docs-pr-scope.mjs) and reads the
+  # current title and labels from the API, so after a retitle or label change
+  # re-run this job. Same-repo PRs only (fork PRs get no CI — see the
+  # `pull_request` trigger comment); skipped on merge_group like pr-title.
+  docs-pr-scope:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: intent-hq/intent/.github/workflows/docs-pr-scope.yml@main
+
   # Conflict-marker guard: fails the PR if any changed file contains committed
   # git conflict markers (the #588 incident: release-plz pushed a branch with
   # '<' x7 / '>' x7 marker lines in CHANGELOG.md, Cargo.lock and Cargo.toml,
@@ -2625,7 +2641,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2661,6 +2677,7 @@ jobs:
               optional coverage-all "${{ needs.coverage-all.result }}"
               "$slow" coverage-changed "${{ needs.coverage-changed.result }}"
               require pr-title "${{ needs.pr-title.result }}"
+              require docs-pr-scope "${{ needs.docs-pr-scope.result }}"
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               optional deb-packaging "${{ needs.deb-packaging.result }}"
@@ -2683,6 +2700,7 @@ jobs:
               require coverage-all "${{ needs.coverage-all.result }}"
               require coverage-changed "${{ needs.coverage-changed.result }}"
               optional pr-title "${{ needs.pr-title.result }}"
+              optional docs-pr-scope "${{ needs.docs-pr-scope.result }}"
               optional conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               require deb-packaging "${{ needs.deb-packaging.result }}"
@@ -2717,6 +2735,7 @@ jobs:
               optional coverage-all "${{ needs.coverage-all.result }}"
               optional coverage-changed "${{ needs.coverage-changed.result }}"
               optional pr-title "${{ needs.pr-title.result }}"
+              optional docs-pr-scope "${{ needs.docs-pr-scope.result }}"
               optional conflict-markers "${{ needs.conflict-markers.result }}"
               optional monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               require deb-packaging "${{ needs.deb-packaging.result }}"

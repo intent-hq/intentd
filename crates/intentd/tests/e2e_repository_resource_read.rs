@@ -617,6 +617,7 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]

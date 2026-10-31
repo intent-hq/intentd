@@ -19,12 +19,15 @@ impl intent_transport::SystemControl for HelperControl {
     fn daemon_version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+    #[track_caller]
     fn status(&self) -> intent_transport::SystemStatus {
         panic!("helper control does not supply daemon status")
     }
+    #[track_caller]
     fn host_environment(&self) -> intent_transport::HostEnvironment {
         panic!("helper control does not supply host environment")
     }
+    #[track_caller]
     fn request_shutdown(&self) {
         panic!("helper control does not shut down the daemon")
     }

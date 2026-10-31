@@ -69,6 +69,7 @@ struct Daemon {
 }
 
 impl Drop for Daemon {
+    #[track_caller]
     fn drop(&mut self) {
         // Providers own separate process groups. Let normal daemon shutdown
         // stop them before reaping the daemon; the guard remains the fallback.
@@ -500,6 +501,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// Seed `agents.flushQueuedMessages = <mode>` into the data dir's
 /// `config.toml` BEFORE boot (must run before `enable_ws_api` appends the
 /// `[server.wsApi]` table, and the two tables must not collide).
+#[track_caller]
 fn seed_flush_mode(data_dir: &Path, mode: &str) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");

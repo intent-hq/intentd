@@ -62,6 +62,7 @@ fn gate() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[track_caller]
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
