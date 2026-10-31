@@ -2166,7 +2166,7 @@ async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
 fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<chrono::Utc> {
     let cache = &fx.mgr.services.provider_quota_cache;
     let now = chrono::Utc::now();
-    cache.mark_exhausted(selection, None, now);
+    cache.mark_exhausted(selection, None, now, || true);
     cache.exhausted_until(selection, now).expect("just marked")
 }
 
@@ -2177,7 +2177,7 @@ fn mark_working_elsewhere(fx: &Fixture, selection: &str) {
     fx.mgr
         .services
         .provider_quota_cache
-        .mark_working(selection, later, later);
+        .mark_working(selection, later, later, || true);
 }
 
 /// A configuration another conversation found out of quota is skipped at the
