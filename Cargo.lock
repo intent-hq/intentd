@@ -2493,7 +2493,6 @@ dependencies = [
  "intent-transport",
  "intentd-test-support",
  "libc",
- "serde",
  "serde_json",
  "sqlx",
  "tempfile",

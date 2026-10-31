@@ -143,6 +143,11 @@ impl Machine {
     /// A machine that minted a credential for `backend_id`, listening on
     /// `port` (`0` for any).
     async fn start(backend_id: &str, port: u16) -> Self {
+        Self::start_on([127, 0, 0, 1], backend_id, port).await
+    }
+
+    /// A machine listening only on loopback address `ip`.
+    async fn start_on(ip: [u8; 4], backend_id: &str, port: u16) -> Self {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let services = Arc::new(Services::new(store.clone()));
@@ -165,6 +170,7 @@ impl Machine {
             &certificate,
             &tokens,
             WsOptions {
+                bind_addresses: vec![std::net::IpAddr::from(ip)],
                 base_port: port,
                 ..WsOptions::default()
             },
@@ -570,6 +576,19 @@ fn text_prompt(text: &str) -> Vec<ContentBlock> {
     vec![serde_json::from_value(json!({"type": "text", "text": text})).unwrap()]
 }
 
+/// Wait until `node` has bound the link the machine accepted. A prompt
+/// waits only the (short, test) link-loss grace for a link, so a test that
+/// prompts right after the machine accepts must first let the bind land.
+async fn bound(node: &RemoteNode) {
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().current_link().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connector publishes the bound link");
+}
+
 /// Wait until `node` reports no link.
 async fn disconnected(node: &RemoteNode) {
     tokio::time::timeout(wait(), async {
@@ -732,6 +751,7 @@ async fn a_prompt_completes_with_its_turn_end() {
     let runtime = node.attach(&agent, &workspace());
     let mut link = machine.accept().await;
     link.replay_complete(0).await;
+    bound(&node).await;
 
     assert!(runtime.is_alive());
     assert_eq!(runtime.spawned_pid(), None);
@@ -797,6 +817,7 @@ async fn a_failed_turn_and_an_exit_fail_the_prompt() {
     let runtime = node.attach(&agent, &workspace());
     let mut link = machine.accept().await;
     link.replay_complete(0).await;
+    bound(&node).await;
 
     let spawn_prompt = |runtime: Arc<crate::RemoteAgentRuntime>| {
         tokio::spawn(async move {
@@ -842,6 +863,7 @@ async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
     let mut link = machine.accept().await;
+    bound(&node).await;
     let prompt = {
         let runtime = runtime.clone();
         tokio::spawn(async move {
@@ -978,6 +1000,7 @@ async fn stopping_the_agent_fails_a_waiting_prompt() {
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
     let mut link = machine.accept().await;
+    bound(&node).await;
     let prompt = {
         let runtime = runtime.clone();
         tokio::spawn(async move {

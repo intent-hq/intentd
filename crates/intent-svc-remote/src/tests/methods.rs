@@ -405,8 +405,17 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
         .await
         .unwrap();
     assert!(leases.iter().all(|lease| lease.state.is_terminal()));
-    let event = changes(&mut sub, 1).await.remove(0);
-    assert_eq!(event, json!({ "machineId": machine.id(), "removed": true }));
+    // The stopped agent's count change may be announced first.
+    let removed_event = json!({ "machineId": machine.id(), "removed": true });
+    let mut seen = Vec::new();
+    while !seen.contains(&removed_event) {
+        seen.extend(changes(&mut sub, 1).await);
+    }
+    assert_eq!(
+        seen.last(),
+        Some(&removed_event),
+        "removal is announced last"
+    );
 
     // Unknown: a no-op.
     assert_eq!(
@@ -442,4 +451,146 @@ async fn adding_again_with_a_new_credential_starts_a_fresh_lease() {
     assert_eq!(link.hello.binding.lease_id, fresh.status().lease_id);
     assert_eq!(link.hello.acked_seq, NodeCounter(0), "a fresh journal");
     fresh.shutdown();
+}
+
+/// Review of intentd#2872: a direct host that accepts TCP but fails the
+/// bind (here another daemon with a different certificate) must not hide a
+/// valid host listed after it. Which host accepts first is a race, so the
+/// connect is repeated.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_that_fails_the_bind_does_not_hide_a_valid_one() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let decoy = Machine::start_on([127, 0, 0, 2], &backend.id().await, machine.port).await;
+    assert_eq!(decoy.port, machine.port);
+    let mut params = machine.add_params();
+    params["hosts"] = json!(["127.0.0.2", "127.0.0.1"]);
+    backend
+        .call("add", params)
+        .await
+        .expect("add past the decoy");
+    machine.accept().await;
+
+    let target = crate::machine::MachineTarget::from_parts(
+        &machine.id(),
+        "Test machine",
+        vec!["127.0.0.2".into(), "127.0.0.1".into()],
+        machine.port,
+        None,
+        &machine.certificate.fingerprint256,
+        &machine.token,
+        None,
+    )
+    .unwrap();
+    let owner = crate::lease::new_owner(backend.store(), &machine.id())
+        .await
+        .unwrap();
+    for generation in 10..18 {
+        let connected = crate::connect::connect(&target, &tuning().connect, None, || {
+            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            async move { Ok(hello) }
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("connect {generation}: {failure:?}"));
+        connected.dialed.link.close();
+        machine.accept().await;
+    }
+    drop(decoy);
+}
+
+/// Review of intentd#2872: adding a machine again with the same credential
+/// (a route refresh) keeps its lease and offers a newer generation, so the
+/// machine does not refuse it as stale.
+#[tokio::test]
+async fn adding_again_with_the_same_credential_keeps_the_lease() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let lease = node.status().lease_id;
+    node.connect().await.unwrap();
+    let first = machine.accept().await;
+
+    let again = backend
+        .call("add", machine.add_params())
+        .await
+        .expect("add again");
+    assert!(again.get("replacedCredentialId").is_none(), "{again}");
+    let probe = machine.accept().await;
+    assert_eq!(probe.hello.binding.lease_id, lease, "the same lease");
+    assert!(probe.hello.binding.generation > first.hello.binding.generation);
+    assert_eq!(backend.node(&machine.id()).await.status().lease_id, lease);
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert_eq!(
+        leases.iter().filter(|l| !l.state.is_terminal()).count(),
+        1,
+        "no second live lease"
+    );
+}
+
+/// Review of intentd#2872: removing a machine whose link is down must not
+/// drop the stops it still owes the machine. The removal fails, the machine
+/// and its credential stay, and once the machine is back the stop is
+/// delivered and the removal goes through.
+#[tokio::test]
+async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    machine.stop().await;
+    disconnected(&node).await;
+
+    let error = backend
+        .call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+    assert!(!runtime.is_running(), "the agent is stopped on this side");
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1
+    );
+    assert!(backend
+        .services
+        .load_remote_machine_token(&machine.id())
+        .await
+        .unwrap()
+        .is_some());
+
+    machine.restart().await;
+    let mut link = machine.accept().await;
+    link.replay_complete(0).await;
+    link.expect(|frame| match frame {
+        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        _ => None,
+    })
+    .await;
+    let removed = backend
+        .call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        removed,
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
 }

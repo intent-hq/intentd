@@ -227,6 +227,13 @@ impl Shared {
         !lock(&self.pending_stops).is_empty()
     }
 
+    /// Dial `hosts` and `tc_address` from now on.
+    pub(crate) fn set_routes(&self, hosts: Vec<String>, tc_address: Option<String>) {
+        let mut target = lock(&self.target);
+        target.hosts = hosts;
+        target.tc_address = tc_address;
+    }
+
     fn target(&self) -> MachineTarget {
         lock(&self.target).clone()
     }

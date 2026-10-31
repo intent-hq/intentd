@@ -16,7 +16,7 @@ use intent_services::feature_api::Services;
 
 use crate::connect::{connect, ConnectFailure, Connected};
 use crate::connector::Shared;
-use crate::lease::{new_owner, probe_hello, record_new_lease};
+use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
 
@@ -256,6 +256,9 @@ fn add_params(params: &Value) -> Result<AddParams> {
 async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let params = add_params(params)?;
     ensure_enabled(svc)?;
+    // Held until saved, so no agent starts on the machine between the
+    // in-use check and a credential replacement.
+    let _lifecycle = feature.lifecycle(&params.machine_id).await;
     let store = svc.store();
     let previous = store.get_exposed_machine(&params.machine_id).await?;
     let replacing_credential = previous
@@ -281,14 +284,37 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         feature.tailcat_bin(),
     )?;
 
-    // Probe: bind a new lease of this credential, exactly as the connector
-    // will, without saving anything yet.
-    let owner = new_owner(store, &params.machine_id).await?;
+    // Adding the machine's current credential again only refreshes its
+    // routes: keep its live lease and offer that lease's next generation, as
+    // the connector would, since the machine refuses one it already saw.
+    let kept = if previous.is_some() && !replacing_credential {
+        HeadLease::open(store.clone(), &params.machine_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    // Otherwise probe a new lease of this credential, exactly as the
+    // connector will, without saving anything yet.
+    let owner = match &kept {
+        Some(lease) => lease.owner().clone(),
+        None => new_owner(store, &params.machine_id).await?,
+    };
+    let acked = match &kept {
+        Some(lease) => lease.acked().await?,
+        None => NodeCounter(0),
+    };
     let generation = std::sync::atomic::AtomicU64::new(0);
     let probed = connect(&target, &feature.tuning().connect, None, || {
+        let kept = kept.clone();
         let next = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let hello = probe_hello(&owner, NodeCounter(next));
-        async move { Ok(hello) }
+        let fresh = probe_hello(&owner, NodeCounter(next));
+        async move {
+            match kept {
+                Some(lease) => lease.next_hello(acked).await,
+                None => Ok(fresh),
+            }
+        }
     })
     .await
     .map_err(|failure| match failure {
@@ -326,15 +352,21 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         last_connected_at: Some(now),
     };
 
-    // Save: the old connector stops first, so nothing dials with the old
-    // credential or lease once the new ones are in place.
-    if let Some(node) = feature.take_node(&params.machine_id) {
-        node.shutdown();
+    // Save. A new credential replaces the lease: the old connector stops
+    // first, so nothing dials with the old credential or lease once the new
+    // ones are in place. The same credential keeps its connector (and any
+    // live agents), which takes the refreshed routes.
+    if kept.is_none() {
+        if let Some(node) = feature.take_node(&params.machine_id) {
+            node.shutdown();
+        }
     }
     svc.store_remote_machine_token(&params.machine_id, &params.token)
         .await?;
     let saved = async {
-        record_new_lease(store, &target, &owner, bound_at).await?;
+        if kept.is_none() {
+            record_new_lease(store, &target, &owner, bound_at).await?;
+        }
         store.save_exposed_machine(&row).await
     }
     .await;
@@ -348,6 +380,8 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         }
     };
     let node = feature.node(svc, &params.machine_id).await?;
+    node.shared_ref()
+        .set_routes(row.hosts.clone(), row.tc_address.clone());
     let machine = machine_json(&row, Some(node.shared_ref()));
     svc.publish_remote_machine_changed(json!({ "machine": machine.clone() }))
         .await;
@@ -379,6 +413,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         }
     };
     ensure_enabled(svc)?;
+    let _lifecycle = feature.lifecycle(&machine_id).await;
     let store = svc.store();
     let Some(row) = store.get_exposed_machine(&machine_id).await? else {
         return Ok(json!({ "ok": true }));
@@ -389,15 +424,9 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             return Err(in_use(&row.name, running));
         }
         node.stop_all();
+        deliver_stops(&node, &row.name).await?;
     }
     if let Some(node) = feature.take_node(&machine_id) {
-        // Let the stops go out before the link closes.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while node.shared_ref().has_pending_stops() && node.status().connected {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
         node.shutdown();
     }
     let credential = store.remove_exposed_machine(&machine_id).await?;
@@ -412,6 +441,39 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         result["credentialId"] = json!(credential);
     }
     Ok(result)
+}
+
+/// Send `node`'s pending stops before the machine is forgotten: the machine
+/// keeps its agents running across a lost link, and once its credential and
+/// lease are gone nothing could reach them. When they cannot be delivered
+/// the removal fails and everything stays, the stops still queued; the
+/// connector keeps redialing to deliver them.
+async fn deliver_stops(node: &RemoteNode, name: &str) -> Result<()> {
+    if !node.shared_ref().has_pending_stops() {
+        return Ok(());
+    }
+    if let Err(error) = node.connect().await {
+        // A machine that refuses the credential was revoked by its owner:
+        // no backend path to it is left to keep, so the removal goes on.
+        let revoked = matches!(&error, Error::RemoteMachine(failure)
+            if failure.data["code"] == crate::connect::MACHINE_REVOKED);
+        return if revoked { Ok(()) } else { Err(error) };
+    }
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while node.shared_ref().has_pending_stops() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if delivered.is_err() {
+        return Err(coded(
+            true,
+            crate::connect::MACHINE_UNREACHABLE,
+            format!("{name} did not take the stops of its agents; try again when it is reachable."),
+            json!({ "attempts": [] }),
+        ));
+    }
+    Ok(())
 }
 
 async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {

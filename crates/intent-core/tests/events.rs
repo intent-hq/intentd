@@ -444,6 +444,7 @@ fn member_event_administrator_remainder_is_frozen() {
         "mcp:notification",
         "principal:identity-changed",
         "providers:profiles-changed",
+        "remoteMachine:changed",
         "settings:changed",
         "sourceControl:auth-changed",
     ];

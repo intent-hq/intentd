@@ -64,6 +64,10 @@ mod tests;
 #[derive(Default)]
 pub struct RemoteFeature {
     nodes: Mutex<HashMap<String, RemoteNode>>,
+    /// Per-machine lifecycle locks: adding, replacing or removing a machine
+    /// and starting an agent on it take turns, so no agent starts under a
+    /// credential that is being replaced or removed.
+    lifecycles: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     tailcat_bin: Mutex<Option<PathBuf>>,
     /// Connector timing; the defaults unless a test shortens them.
     tuning: Mutex<Option<connector::Tuning>>,
@@ -84,6 +88,15 @@ impl RemoteFeature {
 
     pub(crate) fn take_node(&self, machine_id: &str) -> Option<RemoteNode> {
         lock(&self.nodes).remove(machine_id)
+    }
+
+    /// Wait for machine `machine_id`'s lifecycle lock.
+    pub(crate) async fn lifecycle(&self, machine_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let machine = lock(&self.lifecycles)
+            .entry(machine_id.to_owned())
+            .or_default()
+            .clone();
+        machine.lock_owned().await
     }
 
     pub(crate) fn tailcat_bin(&self) -> Option<PathBuf> {

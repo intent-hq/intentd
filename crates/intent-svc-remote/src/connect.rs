@@ -3,8 +3,9 @@
 //!
 //! The direct hosts are raced at the TCP level, all at once, each within
 //! [`ConnectTuning::attempt`]; the link is then dialed (TLS pin, token,
-//! bind) on the first host that accepted. If no direct host binds, the
-//! tailcat route is tried. The whole connect is bounded by
+//! bind) on each host that accepted, in the order they answered, until one
+//! binds, so a stale address or another service on a listed host cannot
+//! hide a valid one. If no direct host binds, the tailcat route is tried. The whole connect is bounded by
 //! [`ConnectTuning::total`]. Every route's failure is kept, by its executor
 //! link code, for `machine-unreachable`.
 
@@ -132,36 +133,32 @@ where
 {
     let mut attempts = Vec::new();
     let raced = tokio::time::timeout(tuning.total, async {
-        let mut candidates = Vec::new();
-        if let Some(route) = race_direct(target.direct_routes(), tuning, &mut attempts).await {
-            candidates.push(route);
-        }
-        candidates.extend(target.tailcat_route());
-        for route in candidates {
-            let offer = hello()
-                .await
-                .map_err(|error| ConnectFailure::Local(error.to_string()))?;
-            match link::dial_link(&route.endpoint, offer).await {
-                Ok(dialed) => {
-                    return Ok(Connected {
-                        dialed,
-                        endpoint: route.endpoint,
-                    })
-                }
-                Err(error) => {
-                    let code = code_of(&error);
-                    if code == codes::VERSION_MISMATCH {
-                        return Err(ConnectFailure::UpdateRequired(Box::new(update_required(
-                            target,
-                            machine_version,
-                            peer_protocol(&error),
-                        ))));
-                    }
+        let mut racing = race_direct(target.direct_routes(), tuning);
+        loop {
+            let route = match racing.join_next().await {
+                None => break,
+                Some(Ok((route, true))) => route,
+                Some(Ok((route, false))) => {
                     attempts.push(Attempt {
                         route: route.label,
-                        error: code,
+                        error: codes::UNAVAILABLE.into(),
                     });
+                    continue;
                 }
+                Some(Err(_)) => continue,
+            };
+            if let Some(connected) =
+                dial(target, machine_version, &mut hello, route, &mut attempts).await?
+            {
+                racing.abort_all();
+                return Ok(connected);
+            }
+        }
+        if let Some(route) = target.tailcat_route() {
+            if let Some(connected) =
+                dial(target, machine_version, &mut hello, route, &mut attempts).await?
+            {
+                return Ok(connected);
             }
         }
         Err(ConnectFailure::Unreachable(Vec::new()))
@@ -187,13 +184,50 @@ where
     Err(ConnectFailure::Unreachable(attempts))
 }
 
-/// Race `routes` at the TCP level; the first to accept wins. The others'
-/// failures are recorded in `attempts`; the losers are cancelled.
-async fn race_direct(
-    routes: Vec<Route>,
-    tuning: &ConnectTuning,
+/// Dial and bind on `route`: `Ok(None)` records its failure in `attempts`
+/// for the caller to try the next route; a version mismatch ends the
+/// connect, since every route reaches the same daemon.
+async fn dial<F, Fut>(
+    target: &MachineTarget,
+    machine_version: Option<&str>,
+    hello: &mut F,
+    route: Route,
     attempts: &mut Vec<Attempt>,
-) -> Option<Route> {
+) -> std::result::Result<Option<Connected>, ConnectFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<LinkHello>>,
+{
+    let offer = hello()
+        .await
+        .map_err(|error| ConnectFailure::Local(error.to_string()))?;
+    match link::dial_link(&route.endpoint, offer).await {
+        Ok(dialed) => Ok(Some(Connected {
+            dialed,
+            endpoint: route.endpoint,
+        })),
+        Err(error) => {
+            let code = code_of(&error);
+            if code == codes::VERSION_MISMATCH {
+                return Err(ConnectFailure::UpdateRequired(Box::new(update_required(
+                    target,
+                    machine_version,
+                    peer_protocol(&error),
+                ))));
+            }
+            attempts.push(Attempt {
+                route: route.label,
+                error: code,
+            });
+            Ok(None)
+        }
+    }
+}
+
+/// Race `routes` at the TCP level: each task yields its route and whether
+/// it accepted a connection within [`ConnectTuning::attempt`], in the order
+/// they finish.
+fn race_direct(routes: Vec<Route>, tuning: &ConnectTuning) -> tokio::task::JoinSet<(Route, bool)> {
     let mut racing = tokio::task::JoinSet::new();
     for route in routes {
         let limit = tuning.attempt;
@@ -205,20 +239,7 @@ async fn race_direct(
             (route, matches!(reached, Ok(Ok(_))))
         });
     }
-    while let Some(joined) = racing.join_next().await {
-        let Ok((route, reached)) = joined else {
-            continue;
-        };
-        if reached {
-            racing.abort_all();
-            return Some(route);
-        }
-        attempts.push(Attempt {
-            route: route.label,
-            error: codes::UNAVAILABLE.into(),
-        });
-    }
-    None
+    racing
 }
 
 fn update_required(

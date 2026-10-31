@@ -679,3 +679,96 @@ async fn the_commit_policy_is_the_workspaces_and_only_for_lease_agents() {
     );
     f.node.shutdown();
 }
+
+/// A TCP proxy on `ip`:`port` to 127.0.0.1:`port` that reports each
+/// accepted connection and holds it until `release` fires.
+#[cfg(target_os = "linux")]
+async fn held_proxy(
+    ip: [u8; 4],
+    port: u16,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::from(ip), port))
+        .await
+        .unwrap();
+    let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+    let (release, released) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let _ = accepted_tx.send(());
+            let mut released = released.clone();
+            tokio::spawn(async move {
+                let _ = released.wait_for(|go| *go).await;
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+                else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    (accepted, release)
+}
+
+/// Review of intentd#2872: a credential replacement whose probe is slow
+/// must not let an agent start under the old credential meanwhile, only to
+/// abandon it when the replacement lands. The start waits for the
+/// replacement and is then refused, since its lease is gone.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_start_during_a_credential_replacement_waits_and_is_refused() {
+    let (f, _link, machine) = fixture().await;
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let agent = f.agent(&view).await;
+    f.port()
+        .launch(
+            &f.services,
+            RemoteLaunchRequest {
+                workspace_id: workspace(),
+                agent_id: agent.clone(),
+                view: view.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let (mut accepted, release) = held_proxy([127, 0, 0, 2], machine.port).await;
+    let token = "b".repeat(64);
+    let credential = Machine::mint(machine.services.store(), &f.backend.id().await, &token).await;
+    let mut params = machine.add_params();
+    params["credentialId"] = json!(credential.id);
+    params["token"] = json!(token);
+    params["hosts"] = json!(["127.0.0.2"]);
+    let services = f.services.clone();
+    let add = tokio::spawn(async move {
+        with_caller(Caller::Daemon, services.remote_machines("add", params)).await
+    });
+    // The replacement is past its in-use check and probing.
+    tokio::time::timeout(wait(), accepted.recv())
+        .await
+        .expect("the probe dials the proxy");
+
+    let services = f.services.clone();
+    let start_agent = agent.clone();
+    let start = tokio::spawn(async move {
+        services
+            .feature_remote_launch_port()
+            .runtime(&services, &start_agent)
+            .await
+            .map(|_| ())
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release.send_replace(true);
+
+    let added = tokio::time::timeout(wait(), add).await.unwrap().unwrap();
+    let started = tokio::time::timeout(wait(), start).await.unwrap().unwrap();
+    let added = added.expect("the replacement lands");
+    assert_eq!(added["replacedCredentialId"], json!(machine.credential.id));
+    let error = started.expect_err("the start under the old lease is refused");
+    assert!(
+        error.to_string().contains("node-agent-unplaced"),
+        "{error:?}"
+    );
+}
