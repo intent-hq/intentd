@@ -23,6 +23,35 @@ async fn migration_adds_plain_folder_column_defaulting_off() {
         .expect("plain_folder column exists");
     assert_eq!(raw, 0);
     assert!(!store.get_workspace(&id).await.expect("get").plain_folder);
+
+    // The schema itself: NOT NULL with DEFAULT 0, so rows written by an older
+    // daemon (which never names the column) read back as off.
+    let (notnull, default): (i64, Option<String>) = sqlx::query_as(
+        "SELECT \"notnull\", dflt_value FROM pragma_table_info('workspace') WHERE name = 'plain_folder'",
+    )
+    .fetch_one(store.read_pool())
+    .await
+    .expect("plain_folder in table_info");
+    assert_eq!(notnull, 1, "plain_folder is NOT NULL");
+    assert_eq!(default.as_deref(), Some("0"), "plain_folder defaults to 0");
+    let legacy = WorkspaceId::new();
+    sqlx::query(
+        "INSERT INTO workspace (id, title, branch, status, created_at, updated_at) \
+         SELECT ?, title, branch, status, created_at, updated_at FROM workspace WHERE id = ?",
+    )
+    .bind(&legacy.0)
+    .bind(&id.0)
+    .execute(store.write_pool())
+    .await
+    .expect("insert without naming plain_folder");
+    assert!(
+        !store
+            .get_workspace(&legacy)
+            .await
+            .expect("get legacy")
+            .plain_folder,
+        "an insert that omits the column reads back as off"
+    );
 }
 
 /// Insert persists the flag; get, list and a reopened store read it back,
