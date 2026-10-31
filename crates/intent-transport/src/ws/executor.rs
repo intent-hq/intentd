@@ -13,20 +13,35 @@ use super::{
 };
 use crate::node_link::{ExecutorRoute, GIT_PATH};
 
+/// The parts of a `/node/*` upgrade request the gate reads.
+pub(super) struct ExecutorRequest<'a> {
+    pub path: &'a str,
+    pub authorization: Option<&'a str>,
+    pub has_origin: bool,
+    pub key: Option<String>,
+    /// The `x-intent-*` binding headers.
+    pub headers: &'a [(String, String)],
+    /// The link server's epoch when the TCP connection was accepted.
+    pub epoch: u64,
+}
+
 impl WsInner {
     pub(super) async fn executor_upgrade<S>(
         self: Arc<Self>,
         mut stream: S,
-        path: &str,
-        authorization: Option<&str>,
-        has_origin: bool,
-        key: Option<String>,
-        headers: &[(String, String)],
-        epoch: u64,
+        request: ExecutorRequest<'_>,
     ) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let ExecutorRequest {
+            path,
+            authorization,
+            has_origin,
+            key,
+            headers,
+            epoch,
+        } = request;
         let Some(links) = self.executor_links.clone() else {
             return reject(&mut stream, 404, "Not Found").await;
         };

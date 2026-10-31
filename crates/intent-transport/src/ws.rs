@@ -907,12 +907,14 @@ impl WsInner {
             return self
                 .executor_upgrade(
                     stream,
-                    path,
-                    authorization.as_deref(),
-                    has_origin,
-                    ws_key,
-                    &binding_headers,
-                    epoch,
+                    executor::ExecutorRequest {
+                        path,
+                        authorization: authorization.as_deref(),
+                        has_origin,
+                        key: ws_key,
+                        headers: &binding_headers,
+                        epoch,
+                    },
                 )
                 .await;
         }
