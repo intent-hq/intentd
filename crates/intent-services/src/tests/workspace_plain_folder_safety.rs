@@ -1097,3 +1097,55 @@ async fn create_rejects_a_plain_folder_containing_a_workspaces_root() {
     .await
     .expect("an unrelated sibling is accepted");
 }
+
+/// A plain folder created through a symlinked alias is stored by its
+/// canonical path, and a later unreadable alias ancestor cannot hide it from
+/// the guard: deleting another workspace whose candidate is the real folder
+/// keeps it (verifier: no lexical fallback for protected paths).
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn plain_folder_created_through_an_alias_stays_protected_when_the_alias_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new().await;
+    let t = h.parent().join("T");
+    let accessible = t.join("accessible");
+    let locked = t.join("locked");
+    std::fs::create_dir_all(accessible.join("victim")).expect("victim");
+    std::fs::create_dir_all(&locked).expect("locked");
+    std::os::unix::fs::symlink(accessible.join("victim"), locked.join("link")).expect("link");
+    let folder = accessible.join("victim");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    let plain = h
+        .svc
+        .create_workspace(
+            WorkspaceCreate {
+                plain_folder: Some(true),
+                repository_path: Some(locked.join("link").to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create through the alias")
+        .workspace;
+    let canonical = std::fs::canonicalize(&folder).expect("canonical");
+    assert_eq!(
+        plain.repository_path.as_deref(),
+        canonical.to_str(),
+        "the canonical folder is stored"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let other = WorkspaceId::from("victim");
+    h.store
+        .insert_workspace(&git_less_row(&other))
+        .await
+        .expect("insert other");
+    let svc = services_at(&h.store, &accessible);
+    let before = snapshot(&folder);
+    svc.delete_workspace(other.clone())
+        .await
+        .expect("delete other");
+    svc.store_tasks.drain_finite().await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    assert_untouched(&folder, &before, "alias behind an unreadable ancestor");
+}

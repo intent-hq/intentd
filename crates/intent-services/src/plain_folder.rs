@@ -81,6 +81,13 @@ pub(crate) enum PlainFolderTarget {
 }
 
 impl PlainFolderTarget {
+    /// The requested folder path.
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Existing(path) | Self::New(path) => path,
+        }
+    }
+
     /// Create the folder for [`PlainFolderTarget::New`] (that one directory,
     /// no `.git`); a no-op for an existing folder. Returns `true` when this
     /// call created the directory, so a failed create can remove it again.
@@ -120,6 +127,11 @@ impl PlainFolderTarget {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlainFolderGuard {
     folders: Vec<PathBuf>,
+    /// A protected folder could not be resolved (e.g. an alias behind an
+    /// unreadable ancestor): its real location is unknown, so nothing is
+    /// removable and everything counts as inside (fail closed). Never a
+    /// lexical guess.
+    unresolved: bool,
 }
 
 impl PlainFolderGuard {
@@ -138,18 +150,32 @@ impl PlainFolderGuard {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        Self {
-            folders: paths
-                .into_iter()
-                .filter(|p| !p.as_ref().as_os_str().is_empty())
-                .map(|p| resolved(p.as_ref()).unwrap_or_else(|| normalize_lexically(p.as_ref())))
-                .collect(),
+        let mut guard = Self::default();
+        for path in paths {
+            let path = path.as_ref();
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            match resolved(path) {
+                Some(folder) => guard.folders.push(folder),
+                None => {
+                    tracing::warn!(
+                        folder = %path.display(),
+                        "plain-folder path cannot be resolved; path-based cleanup is paused"
+                    );
+                    guard.unresolved = true;
+                }
+            }
         }
+        guard
     }
 
-    /// The resolved folders, to extend a loaded guard.
-    pub(crate) fn into_folders(self) -> Vec<PathBuf> {
-        self.folders
+    /// Add `folder` (already a guard's own protected path) to this guard.
+    pub(crate) fn with_folder(mut self, folder: &Path) -> Self {
+        let extra = Self::from_paths([folder]);
+        self.folders.extend(extra.folders);
+        self.unresolved |= extra.unresolved;
+        self
     }
 
     /// Whether `dir` overlaps a plain folder: it is one, holds one, or lies
@@ -166,6 +192,9 @@ impl PlainFolderGuard {
     /// expected git behavior, not a plain-folder change; only directory
     /// removal and creation go through this guard.
     pub(crate) fn protects(&self, dir: &Path) -> bool {
+        if self.unresolved {
+            return true;
+        }
         if self.folders.is_empty() {
             return false;
         }
@@ -181,6 +210,9 @@ impl PlainFolderGuard {
     /// would write into the user's folder). Uncertain resolution counts as
     /// inside (fail closed).
     pub(crate) fn is_inside(&self, dir: &Path) -> bool {
+        if self.unresolved {
+            return true;
+        }
         if self.folders.is_empty() {
             return false;
         }
@@ -715,5 +747,48 @@ mod tests {
             !guard.is_inside(&t.join("real")),
             "holding a plain folder is not inside"
         );
+    }
+
+    /// A protected folder that cannot be resolved (relative here; an alias
+    /// behind an unreadable ancestor in practice) puts the guard in a
+    /// fail-closed state: nothing is removable and everything counts as
+    /// inside, never a lexical guess.
+    #[test]
+    fn guard_fails_closed_when_a_protected_folder_cannot_be_resolved() {
+        let tmp = crate::test_support::test_tempdir("intentd-plain-guard-u-");
+        let elsewhere = tmp.path().join("elsewhere");
+        let guard = PlainFolderGuard::from_paths([Path::new("relative/notes")]);
+        assert!(guard.protects(&elsewhere));
+        assert!(guard.is_inside(&elsewhere));
+        let loaded: Result<PlainFolderGuard> = Ok(guard);
+        assert!(!PlainFolderGuard::removable(&loaded, &elsewhere, "test"));
+        assert!(!PlainFolderGuard::checkout_removable(
+            &loaded,
+            &elsewhere.join("ws").join("repo"),
+            "test"
+        ));
+    }
+
+    /// Same with a real unreadable alias ancestor (skipped when running with
+    /// privileges that ignore directory permissions).
+    #[cfg(unix)]
+    #[test]
+    fn guard_fails_closed_for_an_alias_behind_an_unreadable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::test_support::test_tempdir("intentd-plain-guard-l-");
+        let accessible = tmp.path().join("accessible");
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir_all(accessible.join("victim")).expect("victim");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::os::unix::fs::symlink(accessible.join("victim"), locked.join("link")).expect("link");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let unreadable = std::fs::canonicalize(locked.join("link")).is_err();
+        let guard = PlainFolderGuard::from_paths([locked.join("link")]);
+        let protected = guard.protects(&accessible.join("victim"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+        if unreadable {
+            assert!(protected, "the real folder stays protected");
+        }
     }
 }

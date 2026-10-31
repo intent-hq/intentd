@@ -18797,11 +18797,7 @@ impl Services {
                 let plain_guard = plain_folder::PlainFolderGuard::load(&store_bg)
                     .await
                     .map(|guard| match ws_for_cleanup_plain_folder.as_deref() {
-                        Some(own) => {
-                            let mut paths = vec![own.to_path_buf()];
-                            paths.extend(guard.into_folders());
-                            plain_folder::PlainFolderGuard::from_paths(paths)
-                        }
+                        Some(own) => guard.with_folder(own),
                         None => guard,
                     });
                 known_completion &= plain_guard.is_ok();
@@ -23561,6 +23557,25 @@ impl WorkspaceApi for Services {
                         Some(target) => target.materialize()?,
                         None => false,
                     };
+                    // Persist the folder's canonical path (it exists and
+                    // resolves now): the data-safety guard then never depends
+                    // on an alias that may later become unresolvable.
+                    if let Some(target) = &plain_target {
+                        match std::fs::canonicalize(target.path()) {
+                            Ok(canonical) => {
+                                ws.repository_path = Some(canonical.to_string_lossy().into_owned());
+                            }
+                            Err(e) => {
+                                if created_plain_folder {
+                                    let _ = std::fs::remove_dir(target.path());
+                                }
+                                return Err(Error::Internal(format!(
+                                    "cannot resolve plain folder {}: {e}",
+                                    target.path().display()
+                                )));
+                            }
+                        }
+                    }
                     if let Some(checkout) = &native_checkout {
                         boxed_await(|| checkout.insert(ws.clone(), global_auto_commit)).await?;
                     } else if let Err(e) = boxed_await(|| {

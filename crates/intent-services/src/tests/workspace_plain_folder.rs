@@ -81,7 +81,9 @@ async fn new_folder_is_created_without_git_and_marked_plain() {
         "nothing written into the folder"
     );
     assert!(ws.plain_folder);
-    assert_eq!(ws.repository_path.as_deref(), folder.to_str());
+    // The canonical folder is stored (§5.1 data safety).
+    let canonical = std::fs::canonicalize(&folder).expect("canonical");
+    assert_eq!(ws.repository_path.as_deref(), canonical.to_str());
     assert_eq!(
         ws.worktree_path, None,
         "the user's folder is never worktreePath"
