@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 #[cfg(test)]
+mod node_mode_tests;
+#[cfg(test)]
 mod tests;
 
 /// JSON-RPC error code for a request the bound principal may not make:
@@ -1004,4 +1006,115 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
 
 pub(crate) fn member_may_call(method: &str) -> bool {
     collaborator_may_call(method) || MEMBER_METHODS.contains(&canonical_method(method))
+}
+
+/// Human message of a node-mode refusal (`-32003`, `data.code: "node-mode"`).
+pub const NODE_MODE_ERROR_MESSAGE: &str = "Not available in node mode";
+
+/// `error.data` of a node-mode refusal: `{ code: "node-mode", detail }`.
+#[must_use]
+pub fn node_mode_error_data(detail: &str) -> serde_json::Value {
+    serde_json::json!({ "code": "node-mode", "detail": detail })
+}
+
+/// The deny-by-default method list a daemon in **node mode** serves
+/// (`intentd serve --node` or `daemon.mode = "node"`; monorepo nodes.md
+/// "Node mode"). Node mode turns the daemon's own orchestration off, so every
+/// other method — on every transport, local UDS included — is refused with
+/// `-32003` `data.code: "node-mode"` before any fast path or the router runs.
+/// The per-caller gates still apply on top (a guest calling a listed method is
+/// still refused by [`COLLABORATOR_METHODS`]), and local-only methods stay
+/// local-only. Adding a method is a deliberate one-line opt-in here plus the
+/// refused golden (`tests/goldens/node_mode_refused.txt`). The executor link's
+/// frame list is a second, separate opt-in.
+pub const NODE_MODE_METHODS: &[(&str, &str)] = &[
+    (
+        "client.hello",
+        "Session handshake; every client sends it first.",
+    ),
+    (
+        "executor.list",
+        "Owner: the backends with access to this machine.",
+    ),
+    (
+        "executor.mint",
+        "Owner: expose this machine to a backend (one scoped credential).",
+    ),
+    ("executor.revoke", "Owner: withdraw a backend's access."),
+    (
+        "host.status",
+        "Host OS, display and locality probe used by clients and the sitter.",
+    ),
+    (
+        "models.list",
+        "The models this machine's providers offer (capabilities report).",
+    ),
+    (
+        "pairing.getInfo",
+        "Pairing payload for the owner's own devices; local-only as today.",
+    ),
+    (
+        "pairing.getSelfInfo",
+        "This machine's own pairing identity; local-only as today.",
+    ),
+    (
+        "principal.me",
+        "The caller's own role, so a client offers owner-only actions.",
+    ),
+    (
+        "providers.catalog",
+        "The provider catalog, for the capabilities report.",
+    ),
+    (
+        "providers.profiles.list",
+        "Provider profile metadata reads (no secret values).",
+    ),
+    (
+        "server.pairingInfo",
+        "Listener routes and certificate pin; local-only as today.",
+    ),
+    (
+        "settings.get",
+        "Only the remoteAgents.*, daemon.* and server.* keys (services refuse the rest).",
+    ),
+    (
+        "settings.update",
+        "Only the remoteAgents.*, daemon.* and server.* keys (services refuse the rest).",
+    ),
+    ("system.requestUpdate", "Sitter update handshake."),
+    ("system.shutdown", "Sitter restart / intentd stop."),
+    (
+        "system.startupStatus",
+        "Startup progress, polled by the sitter and clients.",
+    ),
+    (
+        "system.status",
+        "Liveness and status snapshot (intentd status, the sitter).",
+    ),
+];
+
+/// Whether a daemon in node mode serves `method` (aliases canonicalised).
+#[must_use]
+pub fn node_mode_may_call(method: &str) -> bool {
+    static ALLOWED: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| NODE_MODE_METHODS.iter().map(|(m, _)| *m).collect())
+        .contains(canonical_method(method))
+}
+
+/// The HTTP paths of the WSS listener a daemon in node mode serves: health,
+/// the JSON-RPC socket (gated by [`NODE_MODE_METHODS`]) and the executor
+/// link. The guest invite endpoint and the loopback preview tunnel belong to
+/// the orchestration that node mode turns off and are refused with `403`.
+pub const NODE_MODE_HTTP_PATHS: &[&str] = &[
+    "/health",
+    crate::node_link::GIT_PATH,
+    crate::node_link::LINK_PATH,
+    "/ws",
+];
+
+/// Whether a daemon in node mode serves the HTTP `path`.
+#[must_use]
+pub fn node_mode_serves_path(path: &str) -> bool {
+    NODE_MODE_HTTP_PATHS.contains(&path)
 }

@@ -3481,6 +3481,8 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
+        self.services
+            .refuse_in_node_mode("starting a local agent")?;
         let cleanup_lease = {
             let closed = self.admission_closed.lock().unwrap();
             if *closed {
@@ -8380,6 +8382,8 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        self.services
+            .refuse_in_node_mode("sending to a local agent")?;
         crate::agent_ops::validate_submission_id(message_id.as_deref())?;
         if options.reject_on_shutdown && self.is_shutting_down() {
             return Err(Error::Internal("daemon is shutting down".into()));
@@ -25114,6 +25118,9 @@ mod fast_mode_tests;
 
 #[cfg(test)]
 mod desktop_lifecycle_tests;
+#[cfg(test)]
+#[path = "agent_manager/node_mode_tests.rs"]
+mod node_mode_tests;
 // Unix-only like its shared mock-agent helpers (`dead_child_respawn_tests`).
 #[cfg(all(test, unix))]
 #[path = "agent_manager/quota_failover_tests.rs"]

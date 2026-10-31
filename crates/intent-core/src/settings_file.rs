@@ -95,6 +95,7 @@ pub struct SettingsFile {
     pub updates: UpdatesSettings,
     pub remote_agents: RemoteAgentsSettings,
     pub experimental: ExperimentalSettings,
+    pub daemon: DaemonSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -1265,6 +1266,42 @@ pub enum RemoteAgentPermission {
     AllowAll,
     AutoByRisk,
     DenyAll,
+}
+
+/// `[daemon]` — how this daemon runs (`daemon.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct DaemonSettings {
+    /// `daemon.mode` — `regular` (default) or `node`. Changeable only over the
+    /// local UDS seat; read once at startup.
+    pub mode: DaemonMode,
+}
+
+/// Wire path of the `daemon.mode` setting.
+pub const DAEMON_MODE_SETTING: &str = "daemon.mode";
+
+/// The `settings.*` key families a daemon in node mode reads and writes;
+/// any other key is refused with `node-mode`.
+pub const NODE_MODE_SETTING_PREFIXES: &[&str] = &["remoteAgents.", "daemon.", "server."];
+
+/// Whether a daemon in node mode reads and writes the setting at `path`.
+#[must_use]
+pub fn node_mode_setting_allowed(path: &str) -> bool {
+    NODE_MODE_SETTING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// `daemon.mode` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DaemonMode {
+    /// The full daemon: workspaces, local agents and their background work.
+    #[default]
+    Regular,
+    /// Orchestration off: the daemon serves only the node-mode method list
+    /// and runs agents for the backends it is exposed to.
+    Node,
 }
 
 /// `[experimental]` — features that are off until they leave experimental
@@ -3832,5 +3869,38 @@ mod tests {
             Some(&serde_json::json!({ "ws1": "m1" }))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn node_mode_settings_are_limited_to_three_families() {
+        for path in [
+            "remoteAgents.enabled",
+            "remoteAgents.permission",
+            "daemon.mode",
+            "server.wsApi.enabled",
+            "server.tunnel.enabled",
+        ] {
+            assert!(node_mode_setting_allowed(path), "{path} must be allowed");
+        }
+        for path in [
+            "",
+            "remoteAgents",
+            "daemonx.mode",
+            "experimental.remoteAgents",
+            "agents.maxConcurrent",
+            "sourceControl.github.token",
+            "providers.active",
+            "serverx.port",
+        ] {
+            assert!(!node_mode_setting_allowed(path), "{path} must be refused");
+        }
+    }
+
+    #[test]
+    fn daemon_mode_defaults_to_regular_and_parses_node() {
+        assert_eq!(SettingsFile::default().daemon.mode, DaemonMode::Regular);
+        let parsed: SettingsFile = toml::from_str("[daemon]\nmode = \"node\"\n").unwrap();
+        assert_eq!(parsed.daemon.mode, DaemonMode::Node);
+        assert!(toml::from_str::<SettingsFile>("[daemon]\nmode = \"hub\"\n").is_err());
     }
 }

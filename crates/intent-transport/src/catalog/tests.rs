@@ -1310,7 +1310,7 @@ fn extract_subscription_channel_methods() -> HashSet<String> {
 
 /// Every method a client can put on the wire: router arms, fast paths, and
 /// the subscription channels.
-fn client_callable_universe() -> BTreeSet<String> {
+pub(super) fn client_callable_universe() -> BTreeSet<String> {
     ROUTER_METHODS
         .iter()
         .chain(FASTPATH_METHODS.iter())
