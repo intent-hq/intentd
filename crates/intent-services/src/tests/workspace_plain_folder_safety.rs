@@ -939,3 +939,161 @@ async fn git_create_refuses_a_workspaces_parent_inside_a_plain_folder() {
     assert!(!location.exists(), "location not created");
     assert_untouched(&plain, &before, "git create inside a plain folder");
 }
+
+/// A git checkout whose `<root>/<id>` parent merely HOLDS an unrelated plain
+/// folder (a sibling) is still cleaned up on delete; only the plain folder
+/// is kept (PR review: the parent check must not be bidirectional).
+#[intent_test_macros::daemon_test]
+async fn delete_still_cleans_a_checkout_beside_a_plain_folder() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let wt = PathBuf::from(git_ws.worktree_path.clone().expect("worktree"));
+    let folder = wt.parent().expect("parent").join("notes");
+    std::fs::create_dir_all(&folder).expect("sibling folder");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &folder))
+        .await
+        .expect("insert plain");
+    let before = snapshot(&folder);
+    f.svc
+        .delete_workspace(git_ws.id.clone())
+        .await
+        .expect("delete");
+    f.svc.store_tasks.drain_finite().await;
+    assert!(!wt.exists(), "the git checkout is still removed");
+    assert_untouched(&folder, &before, "plain folder beside the checkout");
+}
+
+/// Reviving (unarchiving) a purged git workspace never provisions a checkout
+/// inside a plain folder that now sits at its `<root>/<id>`.
+#[intent_test_macros::daemon_test]
+async fn revive_refuses_to_provision_inside_a_plain_folder() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let wt = PathBuf::from(git_ws.worktree_path.clone().expect("worktree"));
+    let parent = wt.parent().expect("parent").to_path_buf();
+    f.svc
+        .retire_workspace(git_ws.id.clone(), None)
+        .await
+        .expect("retire");
+    f.svc.store_tasks.drain_finite().await;
+    let svc = services_at(&f.store, &f.root);
+    std::fs::create_dir_all(&parent).expect("user folder at the old parent");
+    std::fs::write(parent.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &parent))
+        .await
+        .expect("insert plain");
+    let before = snapshot(&parent);
+    assert!(
+        svc.unarchive_workspace(git_ws.id.clone()).await.is_err(),
+        "revive refused"
+    );
+    assert!(f
+        .store
+        .get_workspace(&git_ws.id)
+        .await
+        .unwrap()
+        .is_retired());
+    assert_untouched(&parent, &before, "revive into a plain folder");
+}
+
+/// Duplicating a GIT workspace whose `worktreesLocation` lies inside a plain
+/// folder is refused before the location is created.
+#[intent_test_macros::daemon_test]
+async fn git_duplicate_refuses_a_workspaces_parent_inside_a_plain_folder() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let folder = test_tempdir("intentd-plain-safety-dup-");
+    let plain = folder.path().to_path_buf();
+    std::fs::write(plain.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &plain))
+        .await
+        .expect("insert plain");
+    let location = plain.join("worktrees");
+    let svc = f
+        .svc
+        .clone()
+        .with_settings_registry(location_registry(&f.root, &location.to_string_lossy()));
+    let before = snapshot(&plain);
+    let err = svc
+        .duplicate_workspace(git_ws.id.clone(), None)
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert!(!location.exists(), "location not created");
+    assert_untouched(&plain, &before, "git duplicate inside a plain folder");
+}
+
+/// With no plain folders at all, an unresolvable `worktreesLocation` keeps
+/// its ordinary error instead of a misleading plain-folder one.
+#[intent_test_macros::daemon_test]
+async fn no_plain_folders_means_no_plain_folder_refusal() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let svc = f
+        .svc
+        .clone()
+        .with_settings_registry(location_registry(&f.root, "relative/worktrees"));
+    let err = svc
+        .create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(f.repo.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("relative location is rejected");
+    assert!(
+        !err.to_string().contains("plain-folder"),
+        "ordinary error, got: {err}"
+    );
+}
+
+/// A plain folder that would CONTAIN a workspaces root (the boot root or a
+/// configured `worktreesLocation`) is rejected at create with
+/// `contains-workspaces-root`; an unrelated sibling is accepted.
+#[intent_test_macros::daemon_test]
+async fn create_rejects_a_plain_folder_containing_a_workspaces_root() {
+    let h = Harness::new().await;
+    let home = h.parent().join("home");
+    let location = home.join("Projects").join("worktrees");
+    std::fs::create_dir_all(&location).expect("location");
+    let svc = h
+        .svc
+        .clone()
+        .with_settings_registry(location_registry(&h.root, &location.to_string_lossy()));
+    let boot_parent = h.root.parent().expect("root parent").to_path_buf();
+    for path in [home.clone(), home.join("Projects"), boot_parent] {
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    plain_folder: Some(true),
+                    repository_path: Some(path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("a folder holding a workspaces root is rejected");
+        match &err {
+            Error::PlainFolderPathRejected(r) => {
+                assert_eq!(r.reason.as_str(), "contains-workspaces-root", "{path:?}");
+            }
+            other => panic!("{path:?}: {other:?}"),
+        }
+    }
+    let sibling = home.join("Notes");
+    svc.create_workspace(
+        WorkspaceCreate {
+            plain_folder: Some(true),
+            repository_path: Some(sibling.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("an unrelated sibling is accepted");
+}

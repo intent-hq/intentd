@@ -18900,17 +18900,11 @@ impl Services {
                                 // sibling trash path, removes the sibling
                                 // `.workspace` metadata and the empty parent:
                                 // the parent covers every path it mutates.
-                                if !plain_folder::PlainFolderGuard::removable(
+                                if !plain_folder::PlainFolderGuard::checkout_removable(
                                     &plain_guard,
                                     &wt_locked,
                                     "workspace.delete checkout",
-                                ) || !wt_locked.parent().is_some_and(|parent| {
-                                    plain_folder::PlainFolderGuard::removable(
-                                        &plain_guard,
-                                        parent,
-                                        "workspace.delete checkout parent",
-                                    )
-                                }) {
+                                ) {
                                     // Overlaps a plain folder (or the lookup
                                     // failed): never detached or removed.
                                 } else if is_standalone && !checkout_owned {

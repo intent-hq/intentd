@@ -3589,6 +3589,10 @@ fn plain_folder_errors_map_to_machine_readable_codes() {
             "inside-workspaces-root",
         ),
         (
+            intent_core::PlainFolderPathReason::ContainsWorkspacesRoot,
+            "contains-workspaces-root",
+        ),
+        (
             intent_core::PlainFolderPathReason::NotADirectory,
             "not-a-directory",
         ),

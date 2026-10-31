@@ -320,6 +320,9 @@ impl Services {
         // Same ownership proof as retire: revive detaches whatever sits at
         // the persisted path, so that path must be daemon-owned.
         self.require_owned_worktree(ws)?;
+        // Never provision (or detach) inside a plain folder (§5.1) that now
+        // sits at the persisted checkout's place.
+        self.refuse_checkout_in_plain_folder(ws).await?;
         let (Some(repo), Some(wt)) = (
             ws.repository_path.as_deref().map(PathBuf::from),
             ws.worktree_path.as_deref().map(PathBuf::from),
@@ -454,9 +457,12 @@ impl Services {
         let Some(wt) = ws.worktree_path.as_deref().filter(|p| !p.is_empty()) else {
             return Ok(());
         };
-        let guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await?;
-        let wt = Path::new(wt);
-        if guard.protects(wt) || wt.parent().is_none_or(|parent| guard.protects(parent)) {
+        let guard = Ok(crate::plain_folder::PlainFolderGuard::load(&self.store).await?);
+        if !crate::plain_folder::PlainFolderGuard::checkout_removable(
+            &guard,
+            Path::new(wt),
+            "workspace.retire",
+        ) {
             return Err(Error::RetireUnsupported {
                 workspace_id: ws.id.as_str().to_string(),
                 checkout_mode: None,
@@ -554,17 +560,11 @@ impl Services {
             .filter(|p| !p.is_empty())
             .map(Path::new)
             .is_none_or(|wt| {
-                crate::plain_folder::PlainFolderGuard::removable(
+                crate::plain_folder::PlainFolderGuard::checkout_removable(
                     &plain_guard,
                     wt,
                     "workspace.retire checkout",
-                ) && wt.parent().is_some_and(|parent| {
-                    crate::plain_folder::PlainFolderGuard::removable(
-                        &plain_guard,
-                        parent,
-                        "workspace.retire checkout parent",
-                    )
-                })
+                )
             });
         if !checkout_removable {
             return;

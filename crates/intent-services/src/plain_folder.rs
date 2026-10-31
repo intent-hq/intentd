@@ -166,6 +166,9 @@ impl PlainFolderGuard {
     /// expected git behavior, not a plain-folder change; only directory
     /// removal and creation go through this guard.
     pub(crate) fn protects(&self, dir: &Path) -> bool {
+        if self.folders.is_empty() {
+            return false;
+        }
         let Some(dir) = resolved(dir) else {
             return true;
         };
@@ -178,10 +181,38 @@ impl PlainFolderGuard {
     /// would write into the user's folder). Uncertain resolution counts as
     /// inside (fail closed).
     pub(crate) fn is_inside(&self, dir: &Path) -> bool {
+        if self.folders.is_empty() {
+            return false;
+        }
         let Some(dir) = resolved(dir) else {
             return true;
         };
         self.folders.iter().any(|folder| dir.starts_with(folder))
+    }
+
+    /// Whether the locked checkout cleanup may touch `checkout`: the
+    /// checkout itself does not overlap a plain folder, its `<root>/<id>`
+    /// parent (trash sibling, empty-parent removal) does not lie inside one,
+    /// and the sibling `.workspace` metadata dir does not overlap one. A
+    /// parent that merely HOLDS an unrelated plain folder is fine. `false`
+    /// when the guard could not be loaded (fail closed).
+    pub(crate) fn checkout_removable(
+        guard: &Result<Self>,
+        checkout: &Path,
+        sweep: &'static str,
+    ) -> bool {
+        let Ok(loaded) = guard else {
+            return Self::removable(guard, checkout, sweep);
+        };
+        let Some(parent) = checkout.parent() else {
+            return false;
+        };
+        if loaded.is_inside(parent) {
+            tracing::info!(sweep, dir = %parent.display(), "keeping a checkout whose parent lies inside a plain-folder workspace");
+            return false;
+        }
+        Self::removable(guard, checkout, sweep)
+            && Self::removable(guard, &parent.join(".workspace"), sweep)
     }
 
     /// Fail-closed removal check for a sweep that loaded `guard`: `false`
@@ -329,6 +360,20 @@ pub(crate) fn resolve_target(
     {
         return Err(rejected(
             PlainFolderPathReason::InsideWorkspacesRoot,
+            path,
+            None,
+        ));
+    }
+    // A folder holding a root would put every daemon-owned checkout inside
+    // the user's folder, where the data-safety guard keeps Intent from
+    // creating or removing anything.
+    if workspaces_roots
+        .iter()
+        .map(|root| comparable(root))
+        .any(|root| root.starts_with(&resolved))
+    {
+        return Err(rejected(
+            PlainFolderPathReason::ContainsWorkspacesRoot,
             path,
             None,
         ));

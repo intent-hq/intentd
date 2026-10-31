@@ -684,6 +684,9 @@ pub enum PlainFolderPathReason {
     InsideGitRepo,
     /// The path is the daemon workspaces root or inside it.
     InsideWorkspacesRoot,
+    /// The path contains a daemon workspaces root (the boot root or a
+    /// configured `workspace.worktreesLocation`), e.g. the home folder.
+    ContainsWorkspacesRoot,
     /// The path exists and is not a directory.
     NotADirectory,
     /// The path does not exist and neither does its parent.
@@ -697,6 +700,7 @@ impl PlainFolderPathReason {
         match self {
             Self::InsideGitRepo => "inside-git-repo",
             Self::InsideWorkspacesRoot => "inside-workspaces-root",
+            Self::ContainsWorkspacesRoot => "contains-workspaces-root",
             Self::NotADirectory => "not-a-directory",
             Self::ParentMissing => "parent-missing",
         }
@@ -725,6 +729,10 @@ impl PlainFolderPathRejection {
             ),
             PlainFolderPathReason::InsideWorkspacesRoot => format!(
                 "{} is inside the Intent workspaces folder; choose a folder outside it",
+                self.path
+            ),
+            PlainFolderPathReason::ContainsWorkspacesRoot => format!(
+                "{} contains the Intent workspaces folder; choose a folder that does not hold it",
                 self.path
             ),
             PlainFolderPathReason::NotADirectory => {
