@@ -788,7 +788,7 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     let mut fake = FakeNode::start_on(certificate, address).await;
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == early => Some(()),
+        LinkFrame::Stop { agent_id, .. } if agent_id == early => Some(()),
         _ => None,
     })
     .await;
@@ -802,8 +802,8 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     let live = AgentId::new();
     drop(node.attach(&live, &workspace()));
     link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == live => Some(()),
-        LinkFrame::Stop { agent_id } if agent_id == early => {
+        LinkFrame::Stop { agent_id, .. } if agent_id == live => Some(()),
+        LinkFrame::Stop { agent_id, .. } if agent_id == early => {
             panic!("a stop is sent once")
         }
         _ => None,
@@ -1071,7 +1071,7 @@ async fn stopping_the_agent_fails_a_waiting_prompt() {
         other => panic!("expected a stopped error, got {other:?}"),
     }
     link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
         _ => None,
     })
     .await;
@@ -1123,7 +1123,7 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
     let mut fake = FakeNode::start_on(certificate, address).await;
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
         LinkFrame::Prompt { .. } => panic!("a stopped agent's prompt is never sent"),
         _ => None,
     })
@@ -1669,7 +1669,7 @@ mod launch {
         let mut link = fake.accept().await;
         let stopped = link
             .expect(|frame| match frame {
-                LinkFrame::Stop { agent_id } => Some(agent_id),
+                LinkFrame::Stop { agent_id, .. } => Some(agent_id),
                 _ => None,
             })
             .await;
