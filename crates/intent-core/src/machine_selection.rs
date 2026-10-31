@@ -77,8 +77,9 @@ pub fn report_is_stale(observed_at: Option<&str>, now: OffsetDateTime) -> bool {
 /// installed, the machine's own sign-in usable (unless a profile is
 /// selected), model listed and free capacity; ordered by fewest running
 /// agents, then most recently used. Machines without a report, with one
-/// listing no providers yet or older than [`REPORT_MAX_AGE`], or last seen
-/// needing an update are refreshed first. `placement.nodeId` names the only candidate.
+/// listing no providers yet, a stale model list lacking the requested
+/// model, or one older than [`REPORT_MAX_AGE`], or last seen needing an
+/// update are refreshed first. `placement.nodeId` names the only candidate.
 ///
 /// # Errors
 ///
@@ -156,7 +157,8 @@ pub async fn select_machines(
             .as_ref()
             .is_none_or(|caps| caps.providers.is_empty())
             || row.state == RemoteMachineState::UpdateRequired
-            || report_is_stale(row.observed_at.as_deref(), now);
+            || report_is_stale(row.observed_at.as_deref(), now)
+            || models_pending(&row, &request);
         if maybe_matches && must_refresh {
             match source.refresh(&row.id).await {
                 Ok(capabilities) => {
@@ -334,6 +336,21 @@ fn no_platform(
             }))
         }
     }
+}
+
+/// Whether the requested provider's model list is still being discovered
+/// (stale, as in the machine's quick first report) and does not list the
+/// requested model yet, so only a fresh report can answer.
+fn models_pending(row: &ExposedMachine, request: &PlacementRequest<'_>) -> bool {
+    request.model.is_some_and(|model| {
+        provider_of(row, request.provider).is_some_and(|provider| {
+            provider.models_stale
+                && !provider
+                    .models
+                    .iter()
+                    .any(|listed| model_listed(listed, model))
+        })
+    })
 }
 
 fn provider_of<'a>(row: &'a ExposedMachine, provider: &str) -> Option<&'a ProviderCapability> {

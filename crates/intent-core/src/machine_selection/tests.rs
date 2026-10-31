@@ -414,9 +414,15 @@ async fn model_unavailable_without_a_model_names_the_provider_status() {
 async fn model_unavailable_is_retryable_with_a_stale_list_or_an_unreachable_machine() {
     let mut stale = provider("claude-code", ProviderStatus::SignedIn, &["sonnet"]);
     stale.models_stale = true;
-    let fake = Fake::new(vec![machine("mac", Some(report(MAC, FRESH, vec![stale])))]);
+    // Refreshed first; the machine still could not refresh its list.
+    let fake = Fake::new(vec![machine(
+        "mac",
+        Some(report(MAC, FRESH, vec![stale.clone()])),
+    )])
+    .on_refresh("mac", Ok(report(MAC, NOW, vec![stale])));
     let placement = remote();
     assert!(model_failure(select(&fake, request(&placement, Some("opus"))).await).retryable);
+    assert_eq!(fake.refreshed(), ["mac"]);
 
     let fake = Fake::new(vec![
         machine("mac", Some(report(MAC, FRESH, claude(&["sonnet"])))),
@@ -823,4 +829,52 @@ async fn a_slow_machine_without_a_report_is_a_retryable_refusal() {
     );
     assert_eq!(failure.data()["nodeId"], "new");
     assert_eq!(failure.data()["retryable"], true);
+}
+
+/// A fresh report whose provider models are still being discovered (the
+/// machine's quick first list: empty and stale) is refreshed when it cannot
+/// answer the requested model, for named and unnamed placement.
+#[tokio::test]
+async fn a_stale_model_list_that_lacks_the_model_is_refreshed() {
+    let mut primed = provider("claude-code", ProviderStatus::Unknown, &[]);
+    primed.models_stale = true;
+    for placement in [remote(), on(&remote(), "early")] {
+        let fake = Fake::new(vec![machine(
+            "early",
+            Some(report(MAC, FRESH, vec![primed.clone()])),
+        )])
+        .on_refresh("early", Ok(report(MAC, NOW, claude(&["opus"]))));
+        assert_eq!(
+            select(&fake, request(&placement, Some("opus")))
+                .await
+                .unwrap(),
+            ["early"]
+        );
+        assert_eq!(fake.refreshed(), ["early"]);
+    }
+
+    // Still discovering: the refusal stays retryable, and the next attempt
+    // asks again.
+    let fake = Fake::new(vec![machine(
+        "early",
+        Some(report(MAC, FRESH, vec![primed.clone()])),
+    )])
+    .on_refresh("early", Err(RefreshFailure::Slow));
+    let placement = remote();
+    assert!(model_failure(select(&fake, request(&placement, Some("opus"))).await).retryable);
+    assert!(model_failure(select(&fake, request(&placement, Some("opus"))).await).retryable);
+    assert_eq!(fake.refreshed(), ["early", "early"]);
+
+    // A stale list that has the model, or a request without one, decides
+    // on the cached report.
+    let mut listed = provider("claude-code", ProviderStatus::SignedIn, &["opus"]);
+    listed.models_stale = true;
+    let fake = Fake::new(vec![
+        machine("listed", Some(report(MAC, FRESH, vec![listed]))),
+        machine("primed", Some(report(MAC, FRESH, vec![primed]))),
+    ]);
+    let mut chosen = select(&fake, request(&placement, None)).await.unwrap();
+    chosen.sort();
+    assert_eq!(chosen, ["listed", "primed"]);
+    assert!(fake.refreshed().is_empty());
 }
