@@ -653,7 +653,7 @@ async fn creation_preferences_welcome_selection_freezes_complete_instructions() 
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
         for specialist in [
             Some("implementor"),
-            Some("verifier"),
+            Some("developer"),
             None,
             Some("implementor"),
         ] {
@@ -719,7 +719,7 @@ async fn creation_preferences_preserve_unmarked_legacy_and_changed_override_bodi
         }
         let preserved = metadata["behaviorPrompt"].as_str().unwrap().to_string();
         svc.store.update_agent_session(&ws, &session).await.unwrap();
-        for specialist in [None, Some("verifier")] {
+        for specialist in [None, Some("developer")] {
             svc.agent_update(
                 id.clone(),
                 Some(ws.clone()),

@@ -3980,7 +3980,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.5";
+pub const CURRENT_HARNESS_VERSION: &str = "3.6";
 
 /// Harness versions that receive repository guidance, oldest first. The single
 /// source for every admission gate and boundary test: bumping
@@ -3989,12 +3989,13 @@ pub const CURRENT_HARNESS_VERSION: &str = "3.5";
 /// check below fails the build until that is done. Exact strings only, so
 /// malformed or unknown stamps are never admitted.
 pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5"];
+    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
-pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &["3.2", "3.3", "3.4", "3.5"];
+pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] =
+    &["3.2", "3.3", "3.4", "3.5", "3.6"];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());

@@ -33778,7 +33778,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
 
     let input = AgentWakeOrCreateInput {
         create: Some(intent_core::AgentWakeCreateOptions {
-            specialist: Some("verifier".into()),
+            specialist: Some("developer".into()),
             ..Default::default()
         }),
         ..Default::default()
@@ -33796,7 +33796,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
         .expect("load new session");
     assert_eq!(
         session.specialist.as_deref(),
-        Some("verifier"),
+        Some("developer"),
         "stale inherited id falls back to the validated create.specialist"
     );
 }
@@ -46485,7 +46485,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
                     BatchTaskEntry::Id(plain.clone()),
                     BatchTaskEntry::Options(BatchTaskOptions {
                         task_note_id: custom.clone(),
-                        specialist: Some("verifier".into()),
+                        specialist: Some("developer".into()),
                         model: Some("mock:override".into()),
                         provider: None,
                         reasoning_effort: Some("high".into()),
@@ -46529,7 +46529,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
         .get_agent_session(&AgentId::from(rc["agentId"].as_str().unwrap()))
         .await
         .expect("custom session");
-    assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
+    assert_eq!(custom_session.specialist.as_deref(), Some("developer"));
     assert_eq!(custom_session.model.as_deref(), Some("override"));
     assert_eq!(custom_session.provider.as_deref(), Some("mock"));
     assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));

@@ -215,15 +215,13 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let mut r = BufReader::new(read);
     let wp = h.work_dir.to_string_lossy().to_string();
 
-    // list — bundled tier visible (no workspaceId required). Eight of the nine
-    // embedded reference specialists are catalog-visible; retired Ralph remains
-    // directly resolvable. The two dir-seeded files override embedded copies.
+    // Bundled files can override an embedded specialist or add a custom one.
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().expect("specialists array");
     assert_eq!(
         specs.len(),
         8,
-        "eight catalog-visible embedded ids, two overridden from dir"
+        "seven catalog-visible embedded ids plus the custom verifier"
     );
     assert!(
         specs.iter().all(|s| s["id"] != "ralph"),

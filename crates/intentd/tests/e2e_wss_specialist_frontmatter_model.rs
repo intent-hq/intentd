@@ -424,12 +424,7 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
     drop(daemon);
 }
 
-/// WSS e2e for specialist aliases (PROTOCOL §5.11): the bundled v1.1
-/// `spec-writer` carries `aliases: ["coordinator"]`, so `agent.create` with
-/// `specialistId: "coordinator"` persists the CANONICAL id (`spec-writer`)
-/// on the session — surfaced as `metadata.specialist` — and resolves the
-/// specialist's display name; `specialist.get` on the alias serves the
-/// canonical resolved view.
+/// Specialist aliases resolve and persist the canonical identity over WSS.
 #[tokio::test]
 async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let data_dir_guard = temp_data_dir();
@@ -478,7 +473,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         got["specialist"]["id"], "spec-writer",
         "alias resolves to the canonical def over WSS"
     );
-    assert_eq!(got["specialist"]["aliases"], json!(["coordinator"]));
+    assert_eq!(got["specialist"]["aliases"], json!(["coordinator", "lead"]));
 
     // agent.create with the alias persists the canonical specialist id and
     // derives the display name from the canonical specialist. The explicit
@@ -502,7 +497,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         created["agent"]["metadata"]["specialist"], "spec-writer",
         "alias create persists the canonical id, not the alias"
     );
-    assert_eq!(created["agent"]["name"], "Coordinator");
+    assert_eq!(created["agent"]["name"], "Lead");
 
     // agent.get round-trips the canonical id from the persisted row.
     let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
@@ -511,35 +506,42 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "persisted session carries the canonical id"
     );
 
-    // An UNKNOWN specialist id is rejected with `-32602` naming the id and
-    // the known catalog ids (monorepo#3497) — no session is created.
-    let rejected = wss_rpc_raw(
-        &mut ws,
-        5,
-        "agent.create",
-        json!({
-            "workspaceId": ws_id,
-            "specialistId": "no-such-specialist",
-            "model": "opus",
-            "provider": "auggie"
-        }),
-    )
-    .await;
-    assert_eq!(
-        rejected["error"]["code"], -32602,
-        "unknown specialist rejects with invalid-params: {rejected}"
-    );
-    let msg = rejected["error"]["message"]
-        .as_str()
-        .expect("error message");
-    assert!(
-        msg.contains("unknown specialist: no-such-specialist"),
-        "error names the id: {msg}"
-    );
-    assert!(
-        msg.contains("known specialists:") && msg.contains("spec-writer"),
-        "error lists the known ids: {msg}"
-    );
+    // Removed bundled choices cannot create new sessions.
+    for removed in [
+        "verifier",
+        "developer-legacy",
+        "coordinator-legacy",
+        "implementor-legacy",
+        "verifier-legacy",
+    ] {
+        let rejected = wss_rpc_raw(
+            &mut ws,
+            5,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "specialistId": removed,
+                "model": "opus",
+                "provider": "auggie"
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], -32602,
+            "unknown specialist rejects with invalid-params: {rejected}"
+        );
+        let msg = rejected["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            msg.contains(&format!("unknown specialist: {removed}")),
+            "error names the id: {msg}"
+        );
+        assert!(
+            msg.contains("known specialists:") && msg.contains("spec-writer"),
+            "error lists the known ids: {msg}"
+        );
+    }
 
     drop(daemon);
 }
@@ -665,10 +667,9 @@ async fn embedded_bundled_catalog_over_wss() {
             "pr-reviewer",
             "spec-writer",
             "ui-designer",
-            "verifier",
             "vulnerability-scanner",
         ],
-        "bundled catalog over WSS is exactly the eight catalog-visible embedded ids"
+        "bundled catalog over WSS contains only the current specialists"
     );
     assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
@@ -1221,6 +1222,32 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
         got["specialist"]["role"], created["specialist"]["role"],
         "create response agrees with the following get over WSS"
     );
+
+    let lead = wss_rpc(
+        &mut ws,
+        51,
+        "specialist.edit",
+        json!({"id":"sigma", "scope":"user", "spec":{
+            "name":"Sigma", "description":"Planning first", "role":"lead",
+            "teamAgents":["implementor"], "prompt":"Plan then edit or delegate."
+        }}),
+    )
+    .await;
+    assert_eq!(lead["specialist"]["role"], "lead");
+    let got = wss_rpc(&mut ws, 52, "specialist.get", json!({"id":"sigma"})).await;
+    assert_eq!(got["specialist"]["role"], "lead");
+
+    let created_lead = wss_rpc(
+        &mut ws,
+        53,
+        "specialist.create",
+        json!({"id":"planning-lead", "scope":"user", "spec":{
+            "name":"Planning lead", "description":"Planning first", "role":"lead",
+            "prompt":"Plan then edit or delegate."
+        }}),
+    )
+    .await;
+    assert_eq!(created_lead["specialist"]["role"], "lead");
 
     // edit — the explicit clears drop the fields.
     let edited = wss_rpc(
