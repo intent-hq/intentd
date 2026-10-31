@@ -883,6 +883,12 @@ impl WsInner {
                 .bootstrap_upgrade(stream, path, target, authorization.as_deref(), ws_key)
                 .await;
         }
+        // Node mode: the guest invite endpoint and the preview tunnel belong
+        // to the orchestration node mode turns off. Checked once ready; a
+        // startup upgrade serves only the startup status.
+        if self.api.node_mode() && !crate::catalog::node_mode_serves_path(path) {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
         // link — so it skips credential resolution and gets a dedicated loop

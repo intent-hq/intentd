@@ -135,6 +135,13 @@ enum Command {
         /// lifetime.
         #[arg(long)]
         specialists_dir: Option<std::path::PathBuf>,
+        /// Node mode for this run: orchestration off (no workspaces, local
+        /// agents, hooks, scripts, schedulers, PR or review monitors) and only
+        /// the node-mode method list served; other methods are refused with
+        /// `-32003` `node-mode`. The persisted `daemon.mode = "node"` setting
+        /// does the same on every start; this flag does not change it.
+        #[arg(long)]
+        node: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -412,11 +419,12 @@ async fn async_main(cli: Cli) -> ExitCode {
                 resume_all,
                 // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
                 specialists_dir: _,
+                node,
             } => {
                 // This measures the entire serve call, including startup and local
                 // destruction on return; cleanup has its own shutdown-only timer.
                 let serve = shutdown::Phase::start("serve_lifetime");
-                match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+                match cmd_serve(mode.as_deref(), insecure, resume_all, node).await {
                     Ok(code) => {
                         serve.complete();
                         code
@@ -1722,6 +1730,7 @@ async fn cmd_serve(
     mode: Option<&str>,
     insecure: bool,
     resume_all: bool,
+    node: bool,
 ) -> anyhow::Result<ExitCode> {
     // Build-identity banner on entering serve so every startup records
     // which build produced it (monorepo#3649). Same identity
@@ -1803,6 +1812,7 @@ async fn cmd_serve(
             config,
             insecure,
             resume_all,
+            node,
             locality_override,
             prepared,
             &mut bootstrap,
@@ -1833,6 +1843,7 @@ async fn cmd_serve_owned(
     config: Config,
     insecure: bool,
     resume_all: bool,
+    node_flag: bool,
     locality_override: Option<bool>,
     prepared: intent_store::PreparedDaemonStore,
     bootstrap: &mut startup::Bootstrap,
@@ -1858,6 +1869,15 @@ async fn cmd_serve_owned(
     // Snapshot of the effective boot settings for the boot-time reads below
     // (agents.maxConcurrent, server.wsApi.enabled).
     let boot_settings = settings_registry.snapshot();
+    // Node mode is fixed for the process lifetime: `--node` or the persisted
+    // `daemon.mode` read here, once (a later change applies at next start).
+    let node_mode = resolve_node_mode(node_flag, boot_settings.effective.daemon.mode);
+    if node_mode {
+        tracing::info!(
+            flag = node_flag,
+            "node mode: orchestration off, serving the node-mode method list"
+        );
+    }
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
     // runtime. Boot-time auto-start of the listener (see [`boot_ws_listener`]):
@@ -2188,7 +2208,8 @@ async fn cmd_serve_owned(
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
-        .with_hooks_max_per_agent(config.hooks_max_per_agent);
+        .with_hooks_max_per_agent(config.hooks_max_per_agent)
+        .with_node_mode(node_mode);
     // Remove secrets journaled by an interrupted profile create/delete.
     services.sweep_provider_profile_secrets().await;
     #[cfg(feature = "repository-test-fixtures")]
@@ -2381,6 +2402,13 @@ async fn cmd_serve_owned(
     };
     let startup_work =
         startup::WorkAdmission::new(startup_error.is_none(), bootstrap.cancellation.clone());
+    // The daemon's own orchestration (agents, workspaces, hooks, scripts,
+    // schedulers, PR monitors): closed in node mode, so none of it is
+    // restored or started while the shutdown join graph stays the same.
+    let orchestration = startup::WorkAdmission::new(
+        startup_error.is_none() && !node_mode,
+        bootstrap.cancellation.clone(),
+    );
     if !startup_work.allowed() {
         bootstrap.dispatch.status().fail();
     }
@@ -2392,7 +2420,7 @@ async fn cmd_serve_owned(
     // before the restart still redelivers the stopped message on the next
     // turn. Restore-only, like the queue rehydration above: it never starts a
     // turn. Best-effort: a failure is logged but never aborts startup.
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match manager.rehydrate_stop_redeliveries().await {
             Ok(0) => {}
             Ok(rehydrated) => tracing::info!(
@@ -2426,7 +2454,7 @@ async fn cmd_serve_owned(
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
     );
-    let startup_candidates = if resume_on_start && startup_work.allowed() {
+    let startup_candidates = if resume_on_start && orchestration.allowed() {
         match services.prepare_startup_resume().await {
             Ok(candidates) => Some(candidates),
             Err(error) => {
@@ -2440,7 +2468,7 @@ async fn cmd_serve_owned(
 
     // Restore groups before watches, without reconciling or waking agents.
     // Live requests must see the complete registries as soon as listeners open.
-    let startup_completions = if startup_work.allowed() {
+    let startup_completions = if orchestration.allowed() {
         Some(services.prepare_startup_completion_recovery().await)
     } else {
         None
@@ -2449,7 +2477,7 @@ async fn cmd_serve_owned(
     // registrations survive daemon restarts; rows whose subscriber agent is
     // gone are pruned. Best-effort: a failure is logged but never aborts
     // startup (agents can re-subscribe).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.heal_event_subscriptions_on_startup().await {
             Ok(0) => {}
             Ok(loaded) => tracing::info!(
@@ -2463,7 +2491,7 @@ async fn cmd_serve_owned(
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.hydrate_scripts().await {
             Ok(0) => {}
             Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
@@ -2475,7 +2503,7 @@ async fn cmd_serve_owned(
     // schedules resume after a restart; hooks whose owning agent is gone are
     // cancelled instead. Best-effort: a failure is logged but never aborts
     // startup (agents can re-schedule).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.rehydrate_hooks().await {
             Ok(0) => {}
             Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
@@ -2488,7 +2516,7 @@ async fn cmd_serve_owned(
     // monitor is marked for catch-up, so its first poll delivers any change
     // detected across the downtime immediately (no debounce). Best-effort: a
     // failure is logged but never aborts startup.
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.rehydrate_pr_monitors().await {
             Ok(0) => {}
             Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
@@ -2563,7 +2591,7 @@ async fn cmd_serve_owned(
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
     let pr_refresh =
-        startup_work.spawn(|| services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60)));
+        orchestration.spawn(|| services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60)));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]
@@ -2575,52 +2603,52 @@ async fn cmd_serve_owned(
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
-    let pr_monitor_loop = startup_work.spawn(|| services.spawn_pr_monitor_loop());
+    let pr_monitor_loop = orchestration.spawn(|| services.spawn_pr_monitor_loop());
     // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
     // There is no scan RPC. Aborted on clean shutdown.
-    let token_usage_scan = startup_work
+    let token_usage_scan = orchestration
         .spawn(|| services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300)));
     // Completion-delivery worker (AS-3): wake parents holding a
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
-    let completion_delivery = startup_work.spawn(|| services.spawn_completion_delivery_loop());
+    let completion_delivery = orchestration.spawn(|| services.spawn_completion_delivery_loop());
     // Auto-commit-on-idle worker (LNI-1, §5.6): subscribe to `agent:idle` and
     // commit each task-linked agent's changes with `Agent-Id:` and
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
-    let auto_commit_loop = startup_work.spawn(|| services.spawn_auto_commit_loop());
+    let auto_commit_loop = orchestration.spawn(|| services.spawn_auto_commit_loop());
     // Idle PR refresh worker: on `agent:idle`, check that workspace's branch
     // PR, git roots, and stale PR monitors once, through the same automatic
     // admission, rate-limit pause, and budgets as the 60 s sweep. No-op-safe
     // without an event bus. Aborted on clean shutdown.
-    let idle_pr_refresh_loop = startup_work.spawn(|| services.spawn_idle_pr_refresh_loop());
+    let idle_pr_refresh_loop = orchestration.spawn(|| services.spawn_idle_pr_refresh_loop());
     // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
     // status, auto-commit policy, and tracked-change events and publish the
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
-    let agent_locks_loop = startup_work.spawn(|| services.spawn_agent_locks_loop());
+    let agent_locks_loop = orchestration.spawn(|| services.spawn_agent_locks_loop());
     // Stale tracked-change sweep (intent-hq/intent#7266): shortly after
     // startup and then periodically, delete working-stage attribution rows
     // whose path git reports clean (ignored, deleted, reverted, committed
     // outside the daemon). Aborted on clean shutdown.
-    let tracked_changes_sweep = startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
+    let tracked_changes_sweep = orchestration.spawn(|| services.spawn_tracked_changes_sweep_loop());
     // Script output cleanup: at startup delete the on-disk output of
     // workspaces that no longer exist, then hourly delete run logs older than
     // `scripts.outputRetentionHours` (read live; `0` disables), keeping the
     // current run of any running script. Aborted on clean shutdown.
-    let script_output_sweep = startup_work.spawn(|| services.spawn_script_output_sweep_loop());
+    let script_output_sweep = orchestration.spawn(|| services.spawn_script_output_sweep_loop());
     // Automatic purge (PROTOCOL §5.1): shortly after startup and then
     // hourly, retire (purge the folders of) workspaces archived longer than
     // `workspace.purgeArchivedAfterDays` (read live; absent = off).
     // Aborted on clean shutdown.
-    let auto_retire_loop = startup_work.spawn(|| services.spawn_auto_retire_loop());
+    let auto_retire_loop = orchestration.spawn(|| services.spawn_auto_retire_loop());
     // Automatic archive (PROTOCOL §5.1): shortly after startup and then
     // hourly, archive workspaces idle longer than
     // `workspace.autoArchiveIdleAfterDays` (read live; default 7, 0 = off).
     // Aborted on clean shutdown.
-    let auto_archive_loop = startup_work.spawn(|| services.spawn_auto_archive_loop());
+    let auto_archive_loop = orchestration.spawn(|| services.spawn_auto_archive_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -2668,7 +2696,7 @@ async fn cmd_serve_owned(
     // like the pre-#592 fetch bug). First tick fires immediately so stuck
     // sandboxes self-heal on startup. Shutdown stops new ticks and joins the active sweep.
     let (stop_merge_retry, merge_retry_stopping) = tokio::sync::watch::channel(false);
-    let merge_retry_task = startup_work
+    let merge_retry_task = orchestration
         .spawn(|| spawn_sandbox_merge_retry_loop(services.clone(), merge_retry_stopping));
     // External MCP servers (§18.3): the health monitor (periodic ping +
     // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
@@ -2676,7 +2704,7 @@ async fn cmd_serve_owned(
     // init below because each handshake can take seconds. The hub is reaped on
     // shutdown so no orphan server processes remain (PTY-host reaping parity).
     let mcp_hub = services.mcp_hub();
-    let mcp_monitor = startup_work.spawn(|| mcp_hub.spawn_health_monitor());
+    let mcp_monitor = orchestration.spawn(|| mcp_hub.spawn_health_monitor());
 
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
@@ -2705,7 +2733,7 @@ async fn cmd_serve_owned(
     // timeout) and the watcher registry (serial FSEvents registrations, which on
     // a loaded macOS `fseventsd` cost seconds each). Shutdown stops new work
     // cooperatively and joins the current operation before closing the store.
-    let mcp_start_task = startup_work.spawn(|| {
+    let mcp_start_task = orchestration.spawn(|| {
         let services = services.clone();
         intent_core::spawn_daemon(async move { services.start_enabled_mcp_servers().await })
     });
@@ -2718,7 +2746,7 @@ async fn cmd_serve_owned(
     let watch_health = intent_services::WatchHealth::default();
     let watch_hub = intent_services::SharedWatchHub::new();
     let (stop_watchers, watcher_shutdown) = tokio::sync::oneshot::channel();
-    let watcher_init_task = startup_work.spawn(|| {
+    let watcher_init_task = orchestration.spawn(|| {
         spawn_watcher_registry_init(
             Arc::clone(&watch_hub),
             bus.clone(),
@@ -2998,7 +3026,7 @@ async fn cmd_serve_owned(
     // `resume_interrupted_agent` dedupes against a concurrent
     // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
     // wakeResume is disabled (no tracker exists), honoring the config gate.
-    let wake_resume = if let Some(tracker) = suspend_tracker.clone() {
+    let wake_resume = if let Some(tracker) = suspend_tracker.clone().filter(|_| !node_mode) {
         // Coalesce wake events landing within this window into one sweep.
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
         let services_clone = services.clone();
@@ -5284,6 +5312,12 @@ fn ws_options_from_env() -> WsOptions {
         opts.base_port = port;
     }
     opts
+}
+
+/// Node mode for this run: `intentd serve --node`, or the persisted
+/// `daemon.mode = "node"` setting. The flag never changes the setting.
+fn resolve_node_mode(flag: bool, setting: intent_core::settings_file::DaemonMode) -> bool {
+    flag || setting == intent_core::settings_file::DaemonMode::Node
 }
 
 /// Parse the optional `--mode` locality override (§5.14) into the transport
@@ -10326,6 +10360,29 @@ for line in sys.stdin:
         assert!(err.contains("expected a number"), "{err}");
         // Range enforcement stays with the daemon: out-of-range parses fine.
         assert_eq!(coerce_setting_value(&def, "99999").unwrap(), json!(99999));
+    }
+
+    #[test]
+    fn serve_node_flag_parses_and_defaults_off() {
+        for (args, want) in [
+            (&["intentd", "serve"][..], false),
+            (&["intentd", "serve", "--node"][..], true),
+        ] {
+            match Cli::try_parse_from(args).expect("serve parses").command {
+                Command::Serve { node, .. } => assert_eq!(node, want, "{args:?}"),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["intentd", "serve", "--node=yes"]).is_err());
+    }
+
+    #[test]
+    fn node_mode_is_the_flag_or_the_setting() {
+        use intent_core::settings_file::DaemonMode;
+        assert!(!resolve_node_mode(false, DaemonMode::Regular));
+        assert!(resolve_node_mode(true, DaemonMode::Regular));
+        assert!(resolve_node_mode(false, DaemonMode::Node));
+        assert!(resolve_node_mode(true, DaemonMode::Node));
     }
 
     #[test]

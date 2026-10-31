@@ -1392,6 +1392,10 @@ pub struct Services {
     /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
     /// composition root via [`Services::with_hooks_max_per_agent`].
     hooks_max_per_agent: u32,
+    /// Node mode (`intentd serve --node` or `daemon.mode = "node"`): the
+    /// daemon's own orchestration is off. Fixed by the composition root via
+    /// [`Services::with_node_mode`] before any listener serves.
+    node_mode: bool,
     /// Wall-clock budget for one hook script run (60 s in production). Tests
     /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
     /// timeout-eviction coverage completes in milliseconds.
@@ -1843,6 +1847,7 @@ impl Services {
             git_status_scan_probe: None,
             ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            node_mode: false,
             hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
@@ -2000,6 +2005,64 @@ impl Services {
     pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
         self.hooks_max_per_agent = cap;
         self
+    }
+
+    /// Run in node mode: the transport serves only the node-mode method list,
+    /// `settings.*` is limited to the node-mode key families, and the agent
+    /// manager's local front doors refuse with `node-mode`. Set once by the
+    /// composition root, before any listener serves.
+    #[must_use]
+    pub fn with_node_mode(mut self, node_mode: bool) -> Self {
+        self.node_mode = node_mode;
+        self
+    }
+
+    /// Whether this daemon runs in node mode.
+    #[must_use]
+    pub fn node_mode(&self) -> bool {
+        self.node_mode
+    }
+
+    /// The node-mode refusal of a local front door that would start work.
+    pub(crate) fn refuse_in_node_mode(&self, what: &str) -> Result<()> {
+        if self.node_mode {
+            return Err(Error::NodeMode(format!(
+                "{what} is off: this daemon runs in node mode"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The node-mode and `daemon.mode` guards of `settings.get` / `update` /
+    /// `reset`: in node mode only the `remoteAgents.*`, `daemon.*` and
+    /// `server.*` keys are served, and `daemon.mode` changes only over the
+    /// local UDS seat (fail-closed when the transport is unknown).
+    fn check_settings_paths<'a>(
+        &self,
+        method: &str,
+        paths: impl IntoIterator<Item = &'a str>,
+        write: bool,
+    ) -> Result<()> {
+        Self::require_administrator(method)?;
+        for path in paths {
+            if self.node_mode && !intent_core::settings_file::node_mode_setting_allowed(path) {
+                return Err(Error::NodeMode(format!(
+                    "{method} {path}: in node mode only the remoteAgents.*, daemon.* and server.* settings are served"
+                )));
+            }
+            if write
+                && path == intent_core::settings_file::DAEMON_MODE_SETTING
+                && self
+                    .server_control
+                    .get()
+                    .is_none_or(|control| control.is_tcp_connection())
+            {
+                return Err(Error::Forbidden(
+                    "daemon.mode can only be changed over the local socket".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Test-only: compress the hook script eval budget so timeout-eviction
@@ -18952,6 +19015,10 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn node_mode(&self) -> bool {
+        self.node_mode
+    }
+
     fn desktop_agent_call(
         &self,
         workspace: WorkspaceId,
@@ -19245,7 +19312,7 @@ impl WorkspaceApi for Services {
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("settings.get")?;
+            self.check_settings_paths("settings.get", [path.as_str()], false)?;
             let _secret_guards = self.settings_secret_gates.read(Some(&path)).await;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().get(&path).await?;
@@ -19258,11 +19325,23 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.settings_update_checking_profiles(changes))
+        Box::pin(async move {
+            let paths = changes
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str));
+            self.check_settings_paths("settings.update", paths, true)?;
+            self.settings_update_checking_profiles(changes).await
+        })
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(serde_json::Value::Null, Some(path)))
+        Box::pin(async move {
+            self.check_settings_paths("settings.reset", [path.as_str()], true)?;
+            self.owned_settings_mutation(serde_json::Value::Null, Some(path))
+                .await
+        })
     }
 
     fn settings_heal_default_provider(
@@ -38153,6 +38232,8 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+#[cfg(test)]
+mod node_mode_tests;
 mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).

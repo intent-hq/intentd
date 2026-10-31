@@ -52,6 +52,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "remoteAgents.enabled",
     "remoteAgents.permission",
     "experimental.remoteAgents",
+    "daemon.mode",
     "providers.active",
     "providers.enabled",
     "providers.paths",
