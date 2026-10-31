@@ -12158,15 +12158,17 @@ mod tests {
             .unwrap());
     }
 
-    /// Simulate `secs` of wall-clock passing for the due-sweep: shift every
-    /// active monitor's `lastPolledAt` back by that much (a missing stamp
-    /// stays missing).
-    async fn age_all(svc: &Services, secs: i64) {
+    /// Rewrite every active monitor's `lastPolledAt` through `restamp`,
+    /// preserving the rest of its poll state (a missing stamp stays missing).
+    async fn restamp_all(
+        svc: &Services,
+        restamp: impl Fn(time::OffsetDateTime) -> time::OffsetDateTime,
+    ) {
         for row in svc.store().load_active_pr_monitors().await.unwrap() {
             let Some(at) = row.last_polled_at.as_deref().and_then(parse_iso) else {
                 continue;
             };
-            let aged = (at - time::Duration::seconds(secs))
+            let restamped = restamp(at)
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap();
             assert!(svc
@@ -12179,7 +12181,7 @@ mod tests {
                         pending_changes: &row.pending_changes,
                         pending_since: row.pending_since.as_deref(),
                         last_change_at: row.last_change_at.as_deref(),
-                        last_polled_at: Some(&aged),
+                        last_polled_at: Some(&restamped),
                         last_error: row.last_error.as_deref(),
                         updated_at: &now_iso(),
                         expected_updated_at: &row.updated_at,
@@ -12188,6 +12190,25 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    /// Simulate `secs` of wall-clock passing for the due-sweep: shift every
+    /// active monitor's `lastPolledAt` back by that much. The shift is
+    /// relative to the stored stamp, so real time elapsed since that stamp
+    /// adds to it: use [`polled_ago_all`] when a test needs a monitor to stay
+    /// FRESH against a threshold.
+    async fn age_all(svc: &Services, secs: i64) {
+        restamp_all(svc, |at| at - time::Duration::seconds(secs)).await;
+    }
+
+    /// Stamp every active monitor's `lastPolledAt` exactly `secs` before
+    /// now. Unlike [`age_all`], the result does not depend on how much real
+    /// time passed since registration, so a test asserting "fresh" vs
+    /// "stale" against a minimum age keeps a wide margin on both sides of
+    /// the threshold on a loaded runner.
+    async fn polled_ago_all(svc: &Services, secs: i64) {
+        let at = time::OffsetDateTime::now_utc() - time::Duration::seconds(secs);
+        restamp_all(svc, |_| at).await;
     }
 
     #[tokio::test]
@@ -12344,14 +12365,17 @@ mod tests {
             }
         };
 
-        age_all(&svc, 59).await;
+        // Absolute stamps, well clear of the 60 s minimum age on both sides:
+        // a stamp relative to registration (e.g. "59 s older") turns stale
+        // after one real second of setup on a loaded runner.
+        polled_ago_all(&svc, 30).await;
         forge.take_fetched_numbers();
         let fresh = stamp(monitor.monitor_id.clone()).await;
         svc.nudge_workspace_pr_monitors(&ws, 60).await;
         assert!(forge.take_fetched_numbers().is_empty(), "polled < 60 s ago");
         assert_eq!(stamp(monitor.monitor_id.clone()).await, fresh);
 
-        age_all(&svc, 1).await;
+        polled_ago_all(&svc, 120).await;
         svc.sweep_rate_limit
             .pause_for(std::time::Duration::from_secs(3600), false);
         let paused = stamp(monitor.monitor_id.clone()).await;
