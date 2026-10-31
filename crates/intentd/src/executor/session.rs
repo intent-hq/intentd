@@ -137,6 +137,7 @@ pub(super) async fn serve_link(
     mut events: LinkEvents,
     hello: LinkHello,
     report: Report,
+    enabled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     let binding = hello.binding;
     let acked = hello.acked_seq;
@@ -162,6 +163,13 @@ pub(super) async fn serve_link(
         tokio::spawn(async move { stream_journal(runner, link, acked).await })
     };
     while let Some(event) = events.recv().await {
+        // `remoteAgents.enabled` turned off: apply nothing more; the
+        // service closes the remaining connections.
+        if !enabled() {
+            tracing::info!("node: remote agents disabled; closing the link");
+            link.close();
+            break;
+        }
         match event {
             // A read-only report; it neither needs the link gate nor waits
             // in line with control frames.

@@ -263,6 +263,8 @@ fn fixture_providers() -> Option<BTreeMap<String, ProviderLaunch>> {
 
 /// A daemon serving the executor link, with the executor service installed.
 struct Running {
+    /// `remoteAgents.enabled`.
+    enabled: Arc<std::sync::atomic::AtomicBool>,
     server: intent_transport::WsApiServer,
     service: Arc<ExecutorService>,
     api: Arc<MachineApi>,
@@ -291,13 +293,17 @@ impl Running {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
         });
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         // Agents work in plain directories here: no backend serves git. The
         // git checkout path is covered by the e2e tests.
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
                 data_dir: data_dir.to_owned(),
                 node_id: NODE_ID.into(),
-                enabled: Arc::new(|| true),
+                enabled: {
+                    let enabled = enabled.clone();
+                    Arc::new(move || enabled.load(std::sync::atomic::Ordering::SeqCst))
+                },
                 admission,
                 launch: Arc::new(FixedLaunch(providers)),
                 report: report.clone(),
@@ -335,7 +341,9 @@ impl Running {
             None,
         )
         .unwrap();
-        server.install_executor_links(ExecutorLinks::new(service.clone()));
+        let links = ExecutorLinks::new(service.clone());
+        service.attach_links(&links);
+        server.install_executor_links(links);
         let port = server.start().await.unwrap();
         let endpoint = NodeEndpoint {
             url: format!("wss://127.0.0.1:{port}"),
@@ -344,6 +352,7 @@ impl Running {
             tailcat: None,
         };
         Self {
+            enabled,
             server,
             service,
             api,
@@ -1011,5 +1020,75 @@ async fn shutdown_during_a_revocation_still_stops_its_agents() {
         admission.running.lock().unwrap().is_empty(),
         "shutdown returned with the revoked backend's agents still running"
     );
+    node.stop().await;
+}
+
+/// Turning `remoteAgents.enabled` off closes live executor connections: an
+/// already-bound backend can launch nothing more on its old session, and
+/// after re-enabling it binds afresh.
+#[tokio::test]
+async fn disabling_remote_agents_closes_live_links_and_re_enabling_admits_a_fresh_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let mut old = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut old).await;
+    old.link.send(&refused_launch("a1")).await.unwrap();
+    assert_eq!(next_record(&mut old).await.seq, NodeCounter(1));
+
+    node.enabled
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.service.on_settings_changed().await;
+    assert!(next_frame(&mut old).await.is_none(), "the live link closed");
+    // A launch on the old session is not applied: nothing is journaled.
+    let _ = old.link.send(&refused_launch("a2")).await;
+    assert!(
+        dial_link(&node.endpoint, hello(2, "lease-1", 1))
+            .await
+            .is_err(),
+        "disabled: no new bind"
+    );
+
+    node.enabled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    node.service.on_settings_changed().await;
+    let mut fresh = dial_link(&node.endpoint, hello(3, "lease-1", 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        replay_complete(&mut fresh).await,
+        NodeCounter(1),
+        "the old session's launch after disable was never journaled"
+    );
+    fresh.link.send(&refused_launch("a3")).await.unwrap();
+    assert_eq!(next_record(&mut fresh).await.seq, NodeCounter(2));
+    node.stop().await;
+}
+
+/// A frame that reaches a session after the setting turned off (before the
+/// close lands) is not applied either.
+#[tokio::test]
+async fn a_session_applies_no_frame_while_remote_agents_are_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let mut old = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut old).await;
+    // Off, but no settings-change notification yet.
+    node.enabled
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = old.link.send(&refused_launch("a1")).await;
+    assert!(
+        next_frame(&mut old).await.is_none(),
+        "the session closed instead of launching"
+    );
+    node.enabled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut fresh = dial_link(&node.endpoint, hello(2, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut fresh).await, NodeCounter(0));
     node.stop().await;
 }

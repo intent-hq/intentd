@@ -109,6 +109,13 @@ pub(crate) struct ExecutorService {
     /// Revoked backends being stopped; shutdown waits for them, so a
     /// backend taken out of `backends` is never abandoned half-stopped.
     stopping: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The link server, to close live connections when the setting turns
+    /// off. Weak: it holds this service as its host.
+    links: OnceLock<std::sync::Weak<intent_transport::node_link::ExecutorLinks>>,
+    /// `remoteAgents.enabled` at the last settings change.
+    was_enabled: std::sync::atomic::AtomicBool,
+    /// Follows settings changes (daemon only).
+    watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -136,6 +143,7 @@ impl ExecutorService {
     ) -> anyhow::Result<Arc<Self>> {
         let platform = host_platform()?;
         let (tx, rx) = mpsc::unbounded_channel();
+        let was_enabled = std::sync::atomic::AtomicBool::new((deps.enabled)());
         let service = Arc::new(Self {
             deps,
             platform,
@@ -145,6 +153,9 @@ impl ExecutorService {
             worker: Mutex::new(None),
             refresher: Mutex::new(None),
             stopping: Mutex::new(Vec::new()),
+            links: OnceLock::new(),
+            was_enabled,
+            watcher: Mutex::new(None),
         });
         // caller-binding: allow — the executor service's own connection worker
         let worker = tokio::spawn(serve_connections(Arc::downgrade(&service), rx, revocations));
@@ -152,11 +163,43 @@ impl ExecutorService {
         Ok(service)
     }
 
+    /// The link server serving this service, so turning the setting off
+    /// can close its live connections.
+    pub(crate) fn attach_links(&self, links: &Arc<intent_transport::node_link::ExecutorLinks>) {
+        let _ = self.links.set(Arc::downgrade(links));
+    }
+
+    /// Settings changed: when `remoteAgents.enabled` turned off, close every
+    /// live executor connection (links and git). New upgrades are already
+    /// refused while it is off; after it turns on again a backend binds
+    /// afresh. Remote agents keep running, as after a link loss.
+    pub(crate) async fn on_settings_changed(&self) {
+        let enabled = (self.deps.enabled)();
+        let was = self
+            .was_enabled
+            .swap(enabled, std::sync::atomic::Ordering::SeqCst);
+        if was && !enabled {
+            tracing::info!("executor: remote agents disabled; closing live executor links");
+            if let Some(links) = self.links.get().and_then(std::sync::Weak::upgrade) {
+                links.close_all().await;
+            }
+            for backend in lock(&self.backends).values_mut() {
+                for link in backend.links.drain(..) {
+                    link.close();
+                }
+            }
+        }
+    }
+
     /// Stop every backend's agents (the daemon is stopping).
     pub(crate) async fn shutdown(&self) {
-        for task in [lock(&self.worker).take(), lock(&self.refresher).take()]
-            .into_iter()
-            .flatten()
+        for task in [
+            lock(&self.worker).take(),
+            lock(&self.refresher).take(),
+            lock(&self.watcher).take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             task.abort();
         }
@@ -303,6 +346,7 @@ impl ExecutorService {
                     events,
                     hello,
                     report,
+                    self.deps.enabled.clone(),
                 )));
             }
             NodeConnection::Git(git) => {
@@ -643,6 +687,7 @@ impl MachineReport for DaemonReport {
 /// What [`start_in_daemon`] wires the executor service from.
 pub(crate) struct DaemonParts<'a> {
     pub slot: &'a Arc<ExecutorSlot>,
+    pub links: &'a Arc<intent_transport::node_link::ExecutorLinks>,
     pub services: &'a intent_services::Services,
     pub manager: &'a Arc<intent_services::AgentManager>,
     pub settings: &'a Arc<intent_services::SettingsRegistry>,
@@ -730,6 +775,22 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
         }
     });
     *lock(&service.refresher) = Some(refresher);
+    service.attach_links(parts.links);
+    // Turning `remoteAgents.enabled` off closes live executor connections.
+    // caller-binding: allow — the executor service's settings follower
+    let watcher = tokio::spawn({
+        let mut changes = parts.settings.subscribe();
+        let service = Arc::downgrade(&service);
+        async move {
+            while changes.changed().await.is_ok() {
+                let Some(service) = service.upgrade() else {
+                    return;
+                };
+                service.on_settings_changed().await;
+            }
+        }
+    });
+    *lock(&service.watcher) = Some(watcher);
     parts.slot.install(service.clone());
     parts.services.attach_executor_liveness(parts.slot.clone());
     Some(service)

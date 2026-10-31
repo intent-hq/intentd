@@ -2912,6 +2912,7 @@ async fn cmd_serve_owned(
     #[cfg(unix)]
     let executor_service = executor::start_in_daemon(executor::DaemonParts {
         slot: &executor_slot,
+        links: &executor_links,
         services: &services,
         manager: &manager,
         settings: &settings_registry,
