@@ -2184,8 +2184,14 @@ impl Services {
             }
         }
 
-        // The saved Default may now reach another account or key: forget
-        // its shared quota state before anyone reads the new revision.
+        // Every saved edit resets the Default's shared quota state before
+        // anyone reads the new revision. The saved fingerprint moves first,
+        // so a process still on the earlier settings cannot mark it again
+        // (see `crate::provider_quota_cache`).
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&key, Some(&env.fingerprint))
+        });
         self.provider_quota_cache.forget(base);
         let revision = store.bump_revision();
         crate::publish_event(
@@ -2193,10 +2199,7 @@ impl Services {
             default_changed_event(revision, "default-updated", base, Some(env_changed)),
         )
         .await;
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&key, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&key);
@@ -2490,8 +2493,16 @@ impl Services {
             return Err(e);
         }
 
-        // The saved profile may now reach another account or key: forget
-        // its shared quota state before anyone reads the new revision.
+        // Running processes keep the settings they started with; only the
+        // saved fingerprint moves. Nothing is interrupted or restarted. It
+        // moves before the profile's shared quota state is reset, so a
+        // process still on the earlier settings cannot mark it again (see
+        // `crate::provider_quota_cache`); every saved edit resets the state
+        // before anyone reads the new revision.
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&profile_id, Some(&env.fingerprint))
+        });
         self.provider_quota_cache.forget(&meta.provider_ref());
         let revision = store.bump_revision();
         crate::publish_event(
@@ -2505,12 +2516,7 @@ impl Services {
             ),
         )
         .await;
-        // Running processes keep the settings they started with; only the
-        // saved fingerprint moves. Nothing is interrupted or restarted.
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&profile_id, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&profile_id);
@@ -2579,6 +2585,11 @@ impl Services {
             }
         }
 
+        // An in-progress turn finishes on its process; later turns need a
+        // replacement (`providerReplacementRequired`), not earlier settings.
+        // The saved fingerprint goes before the quota state, so that
+        // process cannot mark the deleted reference again.
+        let changes = self.profile_activation.saved_changed(&profile_id, None);
         self.provider_quota_cache.forget(&reference);
         let revision = store.bump_revision();
         crate::publish_event(
@@ -2586,9 +2597,6 @@ impl Services {
             profiles_changed_event(revision, "deleted", &profile_id, None, None),
         )
         .await;
-        // An in-progress turn finishes on its process; later turns need a
-        // replacement (`providerReplacementRequired`), not earlier settings.
-        let changes = self.profile_activation.saved_changed(&profile_id, None);
         self.publish_activation_changes(changes).await;
 
         // Prune the profile's `model.providerDefaults` and

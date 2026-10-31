@@ -16,8 +16,14 @@
 //!   its next turn without waiting for its own timer.
 //!
 //! - Saving an edit to a configuration (or deleting a profile) forgets its
-//!   entry: the new settings may reach another account or key, so the old
-//!   observation no longer applies (see [`ProviderQuotaCache::forget`]).
+//!   entry, so every conversation tries it again (see
+//!   [`ProviderQuotaCache::forget`]). A process still running on the
+//!   settings from before an environment edit or a delete keeps reporting on
+//!   the old account or key, so its observations are dropped: each mark
+//!   takes a `still_current` check, run under the cache lock, and the edit
+//!   moves the saved settings fingerprint before it forgets. An observation
+//!   racing the edit is therefore either rejected by the check or cleared by
+//!   the forget. Lock order: this cache, then the profile activation registry.
 //!
 //! Exhausted marks are advisory: when every candidate is marked the turn
 //! still tries them (see `next_candidate_avoiding`). In-memory only — after a
@@ -57,17 +63,26 @@ impl ProviderQuotaCache {
     /// Record a quota failure on `selection` at `now`. The mark lasts until
     /// `reported` (the reset time parsed from the error) when usable, else
     /// [`MARK_DURATION`]. The newest failure always replaces the entry.
+    /// Nothing is recorded when `still_current` (run under the cache lock)
+    /// says the failing process runs settings that were since edited or
+    /// deleted.
     pub(crate) fn mark_exhausted(
         &self,
         selection: &str,
         reported: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
+        still_current: impl FnOnce() -> bool,
     ) {
         let until =
             crate::provider_return::usable_reset(reported, now).unwrap_or(now + MARK_DURATION);
         let selection = provider_profiles::canonical_selection(selection);
+        let mut entries = self.entries.lock().unwrap();
+        if !still_current() {
+            tracing::info!(provider = %selection, "quota failure on earlier provider settings; shared quota state unchanged");
+            return;
+        }
         tracing::info!(provider = %selection, until = %until, "provider marked out of quota for all conversations");
-        self.entries.lock().unwrap().insert(
+        entries.insert(
             selection,
             QuotaHealth::Exhausted {
                 marked_at: now,
@@ -80,15 +95,20 @@ impl ProviderQuotaCache {
     /// `attempt_started` produced output at `now`. An exhausted mark is only
     /// replaced when it was recorded before the attempt started: a turn
     /// already in flight when another one hit the quota proves nothing about
-    /// the quota now.
+    /// the quota now. Like [`Self::mark_exhausted`], nothing is recorded
+    /// when `still_current` is false.
     pub(crate) fn mark_working(
         &self,
         selection: &str,
         attempt_started: DateTime<Utc>,
         now: DateTime<Utc>,
+        still_current: impl FnOnce() -> bool,
     ) {
         let selection = provider_profiles::canonical_selection(selection);
         let mut entries = self.entries.lock().unwrap();
+        if !still_current() {
+            return;
+        }
         match entries.get(&selection) {
             Some(QuotaHealth::Working) => {}
             Some(QuotaHealth::Exhausted { marked_at, until })
@@ -105,7 +125,8 @@ impl ProviderQuotaCache {
     /// Drop whatever is known about `selection`'s quota, so every
     /// conversation treats it as unknown again: no longer skipped, and no
     /// longer a reason to return early. Called when an edit to the
-    /// configuration is saved or a profile is deleted.
+    /// configuration is saved or a profile is deleted, after the saved
+    /// settings fingerprint moved (see the module docs).
     pub(crate) fn forget(&self, selection: &str) {
         let selection = provider_profiles::canonical_selection(selection);
         if self.entries.lock().unwrap().remove(&selection).is_some() {
