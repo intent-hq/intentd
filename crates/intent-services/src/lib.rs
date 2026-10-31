@@ -13174,6 +13174,36 @@ fn resolve_workspaces_parent(
     Ok(dir)
 }
 
+/// Refuse a create or duplicate whose workspaces parent (the
+/// [`resolve_workspaces_parent`] choice, which `create_dir_all`s a configured
+/// `workspace.worktreesLocation`) is or lies inside a plain-folder
+/// workspace's folder (§5.1 "Plain-folder workspaces": Intent never creates
+/// anything there). A parent that merely holds a plain folder is fine: new
+/// `<parent>/<id>` directories are uniquified against existing ones.
+/// Read-only; runs before the parent is resolved. A failed plain-folder
+/// lookup refuses too (fail closed).
+async fn refuse_parent_in_plain_folder(
+    store: &intent_store::Store,
+    boot_root: Option<&Path>,
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Result<()> {
+    let location = worktrees_location.trim();
+    let parent = if root_pinned || location.is_empty() {
+        boot_root.map_or_else(default_workspaces_root, Path::to_path_buf)
+    } else {
+        PathBuf::from(intent_core::expand_tilde_string(location))
+    };
+    let guard = plain_folder::PlainFolderGuard::load(store).await?;
+    if !guard.is_inside(&parent) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "the workspaces folder {} is inside a plain-folder workspace; choose another workspace.worktreesLocation",
+        parent.display()
+    )))
+}
+
 /// Candidate `<parent>/<id>` directories for a workspace's on-disk layout,
 /// deduplicated in priority order. Teardown paths (`workspace.delete`,
 /// `workspace.cleanup`) must not re-derive the parent from current settings
@@ -18866,11 +18896,21 @@ impl Services {
                                 // intent-hq/monorepo#2611): never provisioned
                                 // by the daemon, never deleted with the
                                 // workspace.
+                                // The locked cleanup renames the checkout to a
+                                // sibling trash path, removes the sibling
+                                // `.workspace` metadata and the empty parent:
+                                // the parent covers every path it mutates.
                                 if !plain_folder::PlainFolderGuard::removable(
                                     &plain_guard,
                                     &wt_locked,
                                     "workspace.delete checkout",
-                                ) {
+                                ) || !wt_locked.parent().is_some_and(|parent| {
+                                    plain_folder::PlainFolderGuard::removable(
+                                        &plain_guard,
+                                        parent,
+                                        "workspace.delete checkout parent",
+                                    )
+                                }) {
                                     // Overlaps a plain folder (or the lookup
                                     // failed): never detached or removed.
                                 } else if is_standalone && !checkout_owned {
@@ -21921,6 +21961,8 @@ impl WorkspaceApi for Services {
                     let boot_root = workspaces_root
                         .clone()
                         .unwrap_or_else(default_workspaces_root);
+                    // No directory is ever created inside a plain folder (§5.1).
+                    refuse_parent_in_plain_folder(&store, workspaces_root.as_deref(), workspaces_root_pinned, &worktrees_location).await?;
                     let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
@@ -24411,6 +24453,25 @@ impl WorkspaceApi for Services {
                     "cannot duplicate chief workspace".to_string(),
                 ));
             }
+            let source = store.get_workspace(&id).await?;
+            // Plain folder (§5.1 "Plain-folder workspaces"): duplicate is
+            // git-only. Refused before anything is resolved or provisioned (the
+            // parent resolution below may create a directory) — a copy
+            // would point a second row at the user's folder, and a `.git`
+            // that appeared later would get a worktree added to it.
+            if source.plain_folder {
+                return Err(Error::PlainFolderUnsupported {
+                    operation: "workspace.duplicate",
+                });
+            }
+            // No directory is ever created inside a plain folder (§5.1).
+            refuse_parent_in_plain_folder(
+                &store,
+                boot_workspaces_root.as_deref(),
+                workspaces_root_pinned,
+                &worktrees_location,
+            )
+            .await?;
             // Same parent-dir precedence as `workspace.create`: startup pin >
             // `workspace.worktreesLocation` > boot root — so a duplicate lands
             // next to where a freshly created workspace would.
@@ -24419,16 +24480,6 @@ impl WorkspaceApi for Services {
                 workspaces_root_pinned,
                 &worktrees_location,
             )?;
-            let source = store.get_workspace(&id).await?;
-            // Plain folder (§5.1 "Plain-folder workspaces"): duplicate is
-            // git-only. Refused before anything is provisioned — a copy
-            // would point a second row at the user's folder, and a `.git`
-            // that appeared later would get a worktree added to it.
-            if source.plain_folder {
-                return Err(Error::PlainFolderUnsupported {
-                    operation: "workspace.duplicate",
-                });
-            }
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
             // Retries stay bounded so a wildly saturated slug space fails fast

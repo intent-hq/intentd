@@ -721,3 +721,221 @@ async fn delete_sweep_keeps_a_plain_folder_reached_through_a_symlink() {
         );
     }
 }
+
+/// Settings registry with `workspace.worktreesLocation` set to `location`
+/// (written as given, `..` and all).
+fn location_registry(dir: &Path, location: &str) -> Arc<SettingsRegistry> {
+    let registry = Arc::new(
+        SettingsRegistry::load(dir.join("plain-safety-location.config.toml")).expect("registry"),
+    );
+    registry
+        .apply(&[(
+            "workspace.worktreesLocation".to_string(),
+            serde_json::json!(location),
+        )])
+        .expect("apply worktreesLocation");
+    registry
+}
+
+/// Verifier repro: `worktreesLocation` = `<T>/alias/..` where `alias` is a
+/// symlink to `<T>/real/sub`. The kernel resolves `<T>/alias/../victim` to
+/// `<T>/real/victim` (the plain folder), while a lexical `..` first would
+/// see `<T>/victim`. Deleting another workspace with id `victim` and
+/// `workspace.cleanup` on it must keep the plain folder (new and existing).
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn sweeps_resolve_symlink_dotdot_locations_like_the_kernel() {
+    for variant in VARIANTS {
+        let h = Harness::new().await;
+        let t = h.parent().join("T");
+        std::fs::create_dir_all(t.join("real").join("sub")).expect("real/sub");
+        std::os::unix::fs::symlink(t.join("real").join("sub"), t.join("alias")).expect("alias");
+        let folder = t.join("real").join("victim");
+        if matches!(variant, Variant::ExistingFolder) {
+            std::fs::create_dir_all(folder.join("cache")).expect("existing folder");
+            std::fs::write(folder.join("cache").join("photo.jpg"), b"jpg").expect("file");
+        }
+        let plain = h
+            .svc
+            .create_workspace(
+                WorkspaceCreate {
+                    plain_folder: Some(true),
+                    repository_path: Some(folder.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create plain folder")
+            .workspace;
+        assert!(plain.plain_folder);
+        std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+        std::fs::create_dir_all(folder.join("cache")).expect("cache dir");
+        let other = WorkspaceId::from("victim");
+        h.store
+            .insert_workspace(&git_less_row(&other))
+            .await
+            .expect("insert other");
+        let location = format!("{}/alias/..", t.display());
+        let svc = h
+            .svc
+            .clone()
+            .with_settings_registry(location_registry(&h.root, &location));
+        let before = snapshot(&folder);
+        svc.cleanup_workspace(other.clone()).await.expect("cleanup");
+        assert_untouched(
+            &folder,
+            &before,
+            &format!("{variant:?} cleanup via alias/.."),
+        );
+        svc.delete_workspace(other.clone())
+            .await
+            .expect("delete other");
+        svc.store_tasks.drain_finite().await;
+        assert_untouched(
+            &folder,
+            &before,
+            &format!("{variant:?} delete via alias/.."),
+        );
+    }
+}
+
+/// A git workspace whose checkout lies inside a plain folder (the plain
+/// folder is its `<root>/<id>`): purge is refused up front with the
+/// plain-folder refusal and nothing is detached, renamed or removed; the
+/// automatic purge skips it.
+#[intent_test_macros::daemon_test]
+async fn purge_refuses_a_checkout_nested_in_a_plain_folder() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let wt = PathBuf::from(git_ws.worktree_path.clone().expect("worktree"));
+    let folder = wt.parent().expect("parent").to_path_buf();
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &folder))
+        .await
+        .expect("insert plain");
+    f.svc
+        .archive_workspace(git_ws.id.clone(), None)
+        .await
+        .expect("archive");
+    let before = snapshot(&folder);
+    let err = f
+        .svc
+        .retire_workspace(git_ws.id.clone(), None)
+        .await
+        .expect_err("purge of a checkout inside a plain folder is refused");
+    assert!(
+        matches!(
+            err,
+            Error::RetireUnsupported {
+                plain_folder: true,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(1), days_from_now(365))
+        .await;
+    assert_eq!(report.retired, 0, "{report:?}");
+    f.svc.store_tasks.drain_finite().await;
+    assert!(!f
+        .store
+        .get_workspace(&git_ws.id)
+        .await
+        .unwrap()
+        .is_retired());
+    assert!(wt.is_dir(), "checkout kept");
+    assert_untouched(&folder, &before, "purge with a nested checkout");
+}
+
+/// Delete of a git workspace whose `<root>/<id>/.workspace` metadata sibling
+/// is a plain folder: the locked cleanup (trash rename, metadata removal,
+/// empty-parent removal) must not touch it.
+#[intent_test_macros::daemon_test]
+async fn delete_keeps_a_plain_folder_at_the_metadata_sibling() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let wt = PathBuf::from(git_ws.worktree_path.clone().expect("worktree"));
+    let folder = wt.parent().expect("parent").join(".workspace");
+    std::fs::create_dir_all(&folder).expect("metadata dir");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &folder))
+        .await
+        .expect("insert plain");
+    let before = snapshot(&folder);
+    f.svc
+        .delete_workspace(git_ws.id.clone())
+        .await
+        .expect("delete");
+    f.svc.store_tasks.drain_finite().await;
+    assert_untouched(&folder, &before, "metadata sibling");
+}
+
+/// Duplicate is refused before the workspaces parent is resolved: a
+/// `worktreesLocation` inside the plain folder (missing) is never created,
+/// and the error is the plain-folder refusal.
+#[intent_test_macros::daemon_test]
+async fn duplicate_refuses_before_creating_the_workspaces_parent() {
+    for variant in VARIANTS {
+        let h = Harness::new().await;
+        let (ws, folder) = h.plain_workspace(variant, "Notes").await;
+        let location = folder.join("new-child");
+        let svc = h
+            .svc
+            .clone()
+            .with_settings_registry(location_registry(&h.root, &location.to_string_lossy()));
+        let before = snapshot(&folder);
+        let err = svc
+            .duplicate_workspace(ws.id.clone(), None)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(
+                err,
+                Error::PlainFolderUnsupported {
+                    operation: "workspace.duplicate"
+                }
+            ),
+            "{variant:?}: {err:?}"
+        );
+        assert!(!location.exists(), "{variant:?}: location not created");
+        assert_untouched(&folder, &before, &format!("{variant:?} duplicate"));
+    }
+}
+
+/// A git `workspace.create` whose `worktreesLocation` lies inside a plain
+/// folder is refused before anything is created there.
+#[intent_test_macros::daemon_test]
+async fn git_create_refuses_a_workspaces_parent_inside_a_plain_folder() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let folder = test_tempdir("intentd-plain-safety-parent-");
+    std::fs::write(folder.path().join("notes.md"), SENTINEL).expect("sentinel");
+    let plain = folder.path().to_path_buf();
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &plain))
+        .await
+        .expect("insert plain");
+    let location = plain.join("worktrees");
+    let svc = f
+        .svc
+        .clone()
+        .with_settings_registry(location_registry(&f.root, &location.to_string_lossy()));
+    let before = snapshot(&plain);
+    let err = svc
+        .create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(f.repo.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert!(!location.exists(), "location not created");
+    assert_untouched(&plain, &before, "git create inside a plain folder");
+}

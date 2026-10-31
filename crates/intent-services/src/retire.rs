@@ -20,7 +20,7 @@
 //! branch, at the same path. It is reached through `workspace.unarchive` /
 //! `workspace.restore` and the turn-start auto-unarchive.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use intent_core::{AgentId, Error, Result, Workspace, WorkspaceId, WorkspaceStatus};
 
@@ -140,6 +140,7 @@ impl Services {
         if !current.is_retired() {
             retire_supported(&current)?;
             self.require_owned_worktree(&current)?;
+            self.refuse_checkout_in_plain_folder(&current).await?;
             // A workspace inside its delete grace window is on its way out:
             // retiring it would race the committed delete.
             if self
@@ -199,6 +200,7 @@ impl Services {
         if !fresh.is_retired() {
             retire_supported(&fresh)?;
             self.require_owned_worktree(&fresh)?;
+            self.refuse_checkout_in_plain_folder(&fresh).await?;
         }
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
@@ -443,6 +445,27 @@ impl Services {
     /// folder the daemon cannot prove it created, so retire is refused with
     /// `retire-unsupported` and nothing changes. A present folder must also
     /// be a linked worktree registered in the source repository.
+    /// Refuse to retire a workspace whose checkout, or its `<root>/<id>`
+    /// parent, overlaps a plain-folder workspace's folder (§5.1): the purge
+    /// would delete the user's files. `retire-unsupported` with
+    /// `plainFolder: true`, so the automatic purge skips it for good. A
+    /// failed plain-folder lookup refuses with the lookup error (retried).
+    async fn refuse_checkout_in_plain_folder(&self, ws: &Workspace) -> Result<()> {
+        let Some(wt) = ws.worktree_path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await?;
+        let wt = Path::new(wt);
+        if guard.protects(wt) || wt.parent().is_none_or(|parent| guard.protects(parent)) {
+            return Err(Error::RetireUnsupported {
+                workspace_id: ws.id.as_str().to_string(),
+                checkout_mode: None,
+                plain_folder: true,
+            });
+        }
+        Ok(())
+    }
+
     fn require_owned_worktree(&self, ws: &Workspace) -> Result<()> {
         let workspaces_root = self
             .workspaces_root
@@ -517,6 +540,35 @@ impl Services {
         // [`retire_supported`] admitted only a daemon-owned git worktree
         // (`checkoutMode` worktree, not skipIsolation / remote), so both
         // paths are present.
+        // Never a plain folder (§5.1 "Plain-folder workspaces"): loaded
+        // BEFORE anything is detached, renamed or removed. A checkout (or its
+        // `<root>/<id>` parent: trash sibling, metadata, empty-parent removal)
+        // overlapping a plain folder is left entirely alone, as is every
+        // id-derived candidate; a failed lookup keeps everything (fail
+        // closed). The up-front refusal in `retire_workspace_inner` normally
+        // stops this earlier.
+        let plain_guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await;
+        let checkout_removable = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+            .is_none_or(|wt| {
+                crate::plain_folder::PlainFolderGuard::removable(
+                    &plain_guard,
+                    wt,
+                    "workspace.retire checkout",
+                ) && wt.parent().is_some_and(|parent| {
+                    crate::plain_folder::PlainFolderGuard::removable(
+                        &plain_guard,
+                        parent,
+                        "workspace.retire checkout parent",
+                    )
+                })
+            });
+        if !checkout_removable {
+            return;
+        }
         let worktree_path = ws.worktree_path.clone().filter(|p| !p.is_empty());
         let repo_dir = ws
             .repository_path
@@ -547,10 +599,6 @@ impl Services {
                 })
                 .await;
         }
-        // Never a plain folder (§5.1 "Plain-folder workspaces"): an
-        // id-derived candidate overlapping any plain folder is kept, and
-        // every candidate is kept when the lookup fails (fail closed).
-        let plain_guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await;
         // Sweep only candidates that canonically resolve inside a managed
         // root: a `<root>/<id>` that is a symlink to elsewhere is skipped.
         let dirs: Vec<PathBuf> = workspace_dir_candidates(

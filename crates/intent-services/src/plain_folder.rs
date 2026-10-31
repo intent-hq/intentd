@@ -142,7 +142,7 @@ impl PlainFolderGuard {
             folders: paths
                 .into_iter()
                 .filter(|p| !p.as_ref().as_os_str().is_empty())
-                .map(|p| resolved(p.as_ref()))
+                .map(|p| resolved(p.as_ref()).unwrap_or_else(|| normalize_lexically(p.as_ref())))
                 .collect(),
         }
     }
@@ -155,11 +155,33 @@ impl PlainFolderGuard {
     /// Whether `dir` overlaps a plain folder: it is one, holds one, or lies
     /// inside one. Paths are compared canonically (symlinks resolved) when
     /// they exist, else lexically.
+    ///
+    /// A `dir` whose resolution is uncertain counts as protected (fail
+    /// closed).
+    ///
+    /// Boundary: a git workspace the user later creates from a folder that
+    /// became a git repository is an ordinary git workspace. The git
+    /// housekeeping its delete or retire does on that repository's `.git`
+    /// (pruning the worktree registration and branch Intent created) is
+    /// expected git behavior, not a plain-folder change; only directory
+    /// removal and creation go through this guard.
     pub(crate) fn protects(&self, dir: &Path) -> bool {
-        let dir = resolved(dir);
+        let Some(dir) = resolved(dir) else {
+            return true;
+        };
         self.folders
             .iter()
             .any(|folder| folder.starts_with(&dir) || dir.starts_with(folder))
+    }
+
+    /// Whether `dir` is a plain folder or lies inside one (creating it
+    /// would write into the user's folder). Uncertain resolution counts as
+    /// inside (fail closed).
+    pub(crate) fn is_inside(&self, dir: &Path) -> bool {
+        let Some(dir) = resolved(dir) else {
+            return true;
+        };
+        self.folders.iter().any(|folder| dir.starts_with(folder))
     }
 
     /// Fail-closed removal check for a sweep that loaded `guard`: `false`
@@ -209,25 +231,42 @@ fn comparable(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexically(path))
 }
 
-/// `path` with `.`/`..` resolved lexically and symlinks resolved in its
-/// nearest existing ancestor, so an alias of a folder (or of a directory
-/// that does not exist yet under it) compares equal to the folder.
-fn resolved(path: &Path) -> PathBuf {
-    let path = normalize_lexically(path);
-    let mut existing = path.as_path();
-    let mut missing = Vec::new();
-    while std::fs::canonicalize(existing).is_err() {
-        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
-            return path;
-        };
-        missing.push(name.to_os_string());
-        existing = parent;
+/// `path` resolved with the kernel's own semantics: the longest existing
+/// prefix is canonicalized as written (symlinks are followed BEFORE any
+/// `..`, so `alias/../x` resolves to where the kernel would take it), then
+/// the missing tail is appended. `None` when the resolution is uncertain: a
+/// relative path, a missing tail holding `.`/`..`, a dangling symlink, or any
+/// I/O error other than not-found. Never normalizes lexically first.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
     }
-    let mut out = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
-    for name in missing.into_iter().rev() {
-        out.push(name);
+    let mut existing = path.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut out) => {
+                for name in missing.into_iter().rev() {
+                    out.push(name);
+                }
+                return Some(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Present but unresolvable (a dangling symlink): uncertain.
+                if existing.symlink_metadata().is_ok() {
+                    return None;
+                }
+                match existing.components().next_back() {
+                    Some(Component::Normal(name)) => missing.push(name.to_os_string()),
+                    _ => return None,
+                }
+                if !existing.pop() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
     }
-    out
 }
 
 /// Nearest ancestor of `dir` (inclusive) holding a `.git` entry — a
@@ -588,6 +627,48 @@ mod tests {
         assert!(
             !PlainFolderGuard::removable(&failed, &tmp.path().join("other"), "test"),
             "a failed lookup keeps every directory"
+        );
+    }
+
+    /// Kernel semantics, not lexical: `alias/..` follows the symlink first.
+    /// Uncertain resolutions (a `..` after a missing component, a dangling
+    /// symlink) are protected. `is_inside` is one-directional.
+    #[cfg(unix)]
+    #[test]
+    fn guard_resolves_like_the_kernel_and_fails_closed_when_uncertain() {
+        let tmp = crate::test_support::test_tempdir("intentd-plain-guard-k-");
+        let t = tmp.path();
+        std::fs::create_dir_all(t.join("real").join("sub")).expect("real/sub");
+        std::fs::create_dir_all(t.join("real").join("victim")).expect("victim");
+        std::os::unix::fs::symlink(t.join("real").join("sub"), t.join("alias")).expect("alias");
+        std::os::unix::fs::symlink(t.join("nowhere"), t.join("dangling")).expect("dangling");
+        let guard = PlainFolderGuard::from_paths([t.join("real").join("victim")]);
+
+        assert!(guard.protects(&t.join("alias").join("..").join("victim")));
+        assert!(guard.protects(&t.join("alias").join("..").join("victim").join("cache")));
+        assert!(!guard.protects(&t.join("alias").join("..").join("other")));
+        assert!(
+            !guard.protects(&t.join("victim")),
+            "lexical lookalike is a different dir"
+        );
+        assert!(
+            guard.protects(&t.join("missing").join("..").join("x")),
+            "uncertain"
+        );
+        assert!(
+            guard.protects(&t.join("dangling")),
+            "dangling symlink is uncertain"
+        );
+        assert!(
+            guard.protects(Path::new("relative/dir")),
+            "relative is uncertain"
+        );
+
+        assert!(guard.is_inside(&t.join("real").join("victim").join("new")));
+        assert!(guard.is_inside(&t.join("alias").join("..").join("victim")));
+        assert!(
+            !guard.is_inside(&t.join("real")),
+            "holding a plain folder is not inside"
         );
     }
 }
