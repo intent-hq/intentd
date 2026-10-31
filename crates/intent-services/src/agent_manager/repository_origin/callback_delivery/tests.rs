@@ -416,8 +416,12 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
     }
 
     async fn call(&self, method: &str, params: Value) -> Value {
+        self.call_with_timeout(method, params, fixture_wait()).await
+    }
+
+    async fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Value {
         self.connection
-            .request_timeout(method, params, fixture_wait())
+            .request_timeout(method, params, timeout)
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -2003,6 +2007,33 @@ impl McpPrivateHostScope for BudgetHostScope {
     }
 }
 
+struct BudgetTcpTrace {
+    records: usize,
+    started: std::time::Instant,
+    observer_done_ms: Option<u128>,
+    outcome: Option<&'static str>,
+}
+
+impl BudgetTcpTrace {
+    fn new(enabled: bool, boundary: Boundary, records: usize) -> Option<Self> {
+        (enabled && boundary == Boundary::TcpResponse).then(|| {
+            eprintln!("budget-tcp begin records={records}");
+            Self {
+                records,
+                started: std::time::Instant::now(),
+                observer_done_ms: None,
+                outcome: None,
+            }
+        })
+    }
+}
+
+impl Drop for BudgetTcpTrace {
+    fn drop(&mut self) {
+        eprintln!("budget-tcp end records={} elapsed_ms={} observer_done_ms={:?} outcome={:?} unwinding={}", self.records, self.started.elapsed().as_millis(), self.observer_done_ms, self.outcome, std::thread::panicking());
+    }
+}
+
 struct BudgetRequestTrace<'a> {
     control: &'a NativeControl,
     subcase: &'static str,
@@ -2012,10 +2043,17 @@ struct BudgetRequestTrace<'a> {
 }
 
 impl<'a> BudgetRequestTrace<'a> {
-    fn new(control: &'a NativeControl, subcase: &'static str, count: usize) -> Self {
+    fn new(
+        control: &'a NativeControl,
+        subcase: &'static str,
+        count: usize,
+        served: Duration,
+    ) -> Self {
         eprintln!(
-            "budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={}",
-            fixture_wait().as_millis()
+            "budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={} hang_guard_ms={}",
+            quota_script::QUOTA_TRANSPORT_WAIT.as_millis(),
+            served.as_millis(),
+            quota_script::QUOTA_HANG_GUARD.as_millis()
         );
         Self {
             control,
@@ -2148,6 +2186,11 @@ impl McpPrivatePolicy for NativePolicy {
                 .lock()
                 .unwrap()
                 .push((boundary.kind(), sealed.records().len()));
+            let mut trace = BudgetTcpTrace::new(
+                self.control.budget_hosts.is_some(),
+                boundary.kind(),
+                sealed.records().len(),
+            );
             let retained =
                 crate::repository_read_source::tests::retain_and_check_records(sealed.records())
                     .await;
@@ -2166,6 +2209,9 @@ impl McpPrivatePolicy for NativePolicy {
             if let Some((_, false, gate)) = &hold {
                 gate.wait().await;
             }
+            if let Some(trace) = &mut trace {
+                trace.observer_done_ms = Some(trace.started.elapsed().as_millis());
+            }
             // Delegate the same successful seal, optional evidence, boundary,
             // one-use packet and resulting receipt. No fixture authority.
             let actual = self
@@ -2180,6 +2226,9 @@ impl McpPrivatePolicy for NativePolicy {
                     McpPrivateAdmission::Refused => "refused",
                 };
                 *observed.admission.lock().unwrap() = Some((boundary.kind(), result));
+                if let Some(trace) = &mut trace {
+                    trace.outcome = Some(result);
+                }
             }
             if let Some((_, true, gate)) = &hold {
                 gate.wait().await;
@@ -2211,6 +2260,11 @@ impl McpPrivatePolicy for NativePolicy {
                 .lock()
                 .unwrap()
                 .push((boundary.kind(), records.len()));
+            let mut trace = BudgetTcpTrace::new(
+                self.control.budget_hosts.is_some(),
+                boundary.kind(),
+                records.len(),
+            );
             let retained =
                 crate::repository_read_source::tests::retain_and_check_records(records).await;
             let foreign = self.control.foreign.lock().unwrap().clone();
@@ -2235,6 +2289,9 @@ impl McpPrivatePolicy for NativePolicy {
             if let Some((_, false, gate)) = &hold {
                 gate.wait().await;
             }
+            if let Some(trace) = &mut trace {
+                trace.observer_done_ms = Some(trace.started.elapsed().as_millis());
+            }
             let actual = self.original.admit(boundary, records, packet).await;
             if let Some(observed) = &self.control.budget_hosts {
                 let result = match &actual {
@@ -2244,6 +2301,9 @@ impl McpPrivatePolicy for NativePolicy {
                     McpPrivateAdmission::Refused => "refused",
                 };
                 *observed.admission.lock().unwrap() = Some((boundary.kind(), result));
+                if let Some(trace) = &mut trace {
+                    trace.outcome = Some(result);
+                }
             }
             if let Some((_, true, gate)) = &hold {
                 gate.wait().await;
@@ -3055,7 +3115,12 @@ async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_origi
         h.start().await;
         let code = format!("for(let i=0;i<{count};i++) {{await ws.pr.snapshot(4);}} return 'bounded original success';");
         let name = h.confirmed(0).await;
-        let mut trace = BudgetRequestTrace::new(&control, "original-read-budget", count);
+        let mut trace = BudgetRequestTrace::new(
+            &control,
+            "original-read-budget",
+            count,
+            served_budget(&h.origin),
+        );
         let reply = h.quota_call("original-read-budget", 0, &name, &code).await;
         trace.returned = true;
         drop(trace);
@@ -4390,7 +4455,12 @@ mod confirmed_aliases {
                 expression("mr", true)
             );
             let name = h.confirmed(0).await;
-            let mut trace = BudgetRequestTrace::new(&control, "mixed-alias-budget", count);
+            let mut trace = BudgetRequestTrace::new(
+                &control,
+                "mixed-alias-budget",
+                count,
+                served_budget(&h.origin),
+            );
             let reply = h.quota_call("mixed-alias-budget", 0, &name, &code).await;
             trace.returned = true;
             drop(trace);

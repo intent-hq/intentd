@@ -105,6 +105,23 @@ pub enum WorkspaceActivity {
     AgentRunning,
 }
 
+/// Exact identity and generation of a currently dismissible human reminder.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttentionReminderReason {
+    pub id: String,
+    pub revision: String,
+}
+
+/// Caller-relative reminder state. `display_status` may also be `waiting`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceAttentionReminder {
+    pub reasons: Vec<AttentionReminderReason>,
+    pub dismissed: bool,
+    pub display_status: String,
+}
+
 /// Dismissible attention flag (blue dot; server-owned) (§9.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -457,6 +474,9 @@ pub struct Workspace {
     /// elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_status: Option<WorkspaceDisplayStatus>,
+    /// Person-specific reminder projection; underlying operational state is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_reminder: Option<WorkspaceAttentionReminder>,
     /// Daemon-owned orthogonal wait flag (PROTOCOL §5.1): `true` when the workspace
     /// has any of ACTIVE background hooks, ACTIVE PR monitors, or waiting
     /// agent subscriptions (undelivered child completion watches held by
@@ -706,6 +726,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "agentSummary",
     "diffSummary",
     "displayStatus",
+    "attentionReminder",
     "waiting",
     "cowSupported",
     "checkoutMode",

@@ -9096,7 +9096,10 @@ impl Services {
             .flatten()
     }
 
-    async fn try_pending_questions_from_tail(&self, agent_id: &AgentId) -> Result<Option<String>> {
+    pub(crate) async fn try_pending_questions_from_tail(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<String>> {
         // Trailing `system` rows (e.g. repeated interruption notices) are
         // transparent to the derivation, so the anchor is simply the newest
         // non-system row — resolved by the store in one index-backed
@@ -9212,6 +9215,8 @@ impl Services {
                     }),
                 )
                 .await;
+                self.emit_attention_reminder_invalidation(workspace_id)
+                    .await;
                 true
             }
             Ok(false) => false,
@@ -9299,6 +9304,8 @@ impl Services {
                     }),
                 )
                 .await;
+                self.emit_attention_reminder_invalidation(workspace_id)
+                    .await;
                 true
             }
             Ok(false) => false,
@@ -11375,6 +11382,7 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        self.emit_attention_reminder_raise(workspace_id).await;
         self.maybe_emit_display_status_changed(workspace_id).await;
     }
 

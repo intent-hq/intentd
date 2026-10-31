@@ -173,6 +173,7 @@ pub use model::{
     PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{AttentionReminderReason, WorkspaceAttentionReminder};
 pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
