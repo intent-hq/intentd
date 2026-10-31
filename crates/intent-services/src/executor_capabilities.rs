@@ -1,12 +1,17 @@
 //! The provider half of this machine's executor capabilities report: which
-//! providers a remote agent could launch here and their models, from the
-//! same launch resolution and `models.list` catalog local agents use.
+//! providers a remote agent could launch here, their models and their
+//! default account's sign-in, from the same launch resolution, `models.list`
+//! catalog and sign-in probes local agents use.
+
+use std::collections::HashMap;
+use std::time::Instant;
 
 use intent_core::node_link::{ProviderCapability, ProviderStatus};
 use intent_core::Error;
 use serde_json::Value;
 
 use crate::agent_manager::{resolve_provider_launch, ProviderLaunchSpec};
+use crate::provider_auth::DefaultSignIn;
 use crate::Services;
 
 /// A provider's status from its launch resolution alone: `cli-missing`
@@ -28,6 +33,31 @@ pub(crate) fn launch_status(resolved: &crate::Result<ProviderLaunchSpec>) -> Pro
     }
 }
 
+/// A launchable provider's reported status: its default account's sign-in,
+/// except that a launch without a profile that failed to authenticate at
+/// `auth_failed_at` reports `auth-failed` until a conclusive probe observed
+/// after it. A provider that cannot launch keeps its launch status.
+pub(crate) fn provider_status(
+    launch: ProviderStatus,
+    sign_in: DefaultSignIn,
+    auth_failed_at: Option<Instant>,
+) -> ProviderStatus {
+    if launch != ProviderStatus::Unknown {
+        return launch;
+    }
+    let current = match (auth_failed_at, sign_in.probed_at) {
+        (None, _) => true,
+        (Some(failed), Some(probed)) => probed > failed,
+        (Some(_), None) => false,
+    };
+    match sign_in.signed_in {
+        Some(true) if current => ProviderStatus::SignedIn,
+        Some(false) if current => ProviderStatus::SignedOut,
+        _ if auth_failed_at.is_some() => ProviderStatus::AuthFailed,
+        _ => ProviderStatus::Unknown,
+    }
+}
+
 /// The model ids of a `models.list` response.
 pub(crate) fn model_ids(response: &Value) -> Vec<String> {
     response
@@ -45,12 +75,19 @@ pub(crate) fn model_ids(response: &Value) -> Vec<String> {
 }
 
 impl Services {
-    /// Every enabled provider this build knows, with its launch status and
-    /// (for a launchable one) its models from `models.list`. Model
-    /// discovery may run provider CLIs, so callers cache the result.
-    pub async fn executor_provider_capabilities(&self) -> Vec<ProviderCapability> {
+    /// Every enabled provider this build knows, with its status and (for a
+    /// launchable one) its models from `models.list`. A launchable
+    /// provider's status is its default account's cached sign-in probe, or
+    /// `auth-failed` when `auth_failures` holds a launch without a profile
+    /// that failed to authenticate since (see [`provider_status`]). Model
+    /// discovery and sign-in probes may run provider CLIs, so callers cache
+    /// the result.
+    pub async fn executor_provider_capabilities(
+        &self,
+        auth_failures: &HashMap<String, Instant>,
+    ) -> Vec<ProviderCapability> {
         let settings = self.effective_settings();
-        let mut providers = Vec::new();
+        let mut launchable = Vec::new();
         for provider in intent_providers::ACP_PROVIDERS {
             if crate::agent_ops::provider_is_disabled(
                 provider.id,
@@ -58,12 +95,37 @@ impl Services {
             ) {
                 continue;
             }
+            let status = launch_status(&resolve_provider_launch(provider.id, &settings));
+            launchable.push((provider, status));
+        }
+        // Probes run in parallel and abort with this future.
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, (provider, status)) in launchable.iter().enumerate() {
+            if *status == ProviderStatus::Unknown {
+                let id = provider.id;
+                let override_path = settings.providers.paths.get(id).cloned();
+                probes.spawn(async move {
+                    (
+                        index,
+                        crate::provider_auth::default_sign_in(id, override_path).await,
+                    )
+                });
+            }
+        }
+        let mut sign_ins = vec![DefaultSignIn::default(); launchable.len()];
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, sign_in)) = joined {
+                sign_ins[index] = sign_in;
+            }
+        }
+        let mut providers = Vec::new();
+        for ((provider, launch), sign_in) in launchable.into_iter().zip(sign_ins) {
             let visible = intent_providers::gated_reason_with_env(provider, &|var| {
                 std::env::var_os(var).is_some()
             })
             .is_none();
-            let status = launch_status(&resolve_provider_launch(provider.id, &settings));
-            let (models, models_stale) = if status == ProviderStatus::Unknown {
+            let status = provider_status(launch, sign_in, auth_failures.get(provider.id).copied());
+            let (models, models_stale) = if launch == ProviderStatus::Unknown {
                 match self
                     .models_list_op(Some(provider.id.to_owned()), false)
                     .await
@@ -129,6 +191,150 @@ mod tests {
             launch_status(&Err(Error::NotFound("provider".into()))),
             ProviderStatus::CliMissing
         );
+    }
+
+    fn probed(signed_in: Option<bool>, at: Instant) -> DefaultSignIn {
+        DefaultSignIn {
+            signed_in,
+            probed_at: Some(at),
+        }
+    }
+
+    #[test]
+    fn provider_status_reports_the_default_accounts_sign_in() {
+        let now = Instant::now();
+        for (sign_in, expected) in [
+            (probed(Some(true), now), ProviderStatus::SignedIn),
+            (probed(Some(false), now), ProviderStatus::SignedOut),
+            (probed(None, now), ProviderStatus::Unknown),
+            (DefaultSignIn::default(), ProviderStatus::Unknown),
+        ] {
+            assert_eq!(
+                provider_status(ProviderStatus::Unknown, sign_in, None),
+                expected,
+                "{sign_in:?}"
+            );
+        }
+    }
+
+    /// A launch auth failure wins until a conclusive probe observed after
+    /// it; an older probe, an inconclusive one or an uncached one keeps it.
+    #[test]
+    fn a_launch_auth_failure_holds_until_a_newer_conclusive_probe() {
+        let before = Instant::now();
+        let failed = before + std::time::Duration::from_secs(1);
+        let after = failed + std::time::Duration::from_secs(1);
+        for (sign_in, expected) in [
+            (probed(Some(true), before), ProviderStatus::AuthFailed),
+            (probed(Some(false), before), ProviderStatus::AuthFailed),
+            (probed(Some(true), failed), ProviderStatus::AuthFailed),
+            (probed(None, after), ProviderStatus::AuthFailed),
+            (
+                DefaultSignIn {
+                    signed_in: Some(true),
+                    probed_at: None,
+                },
+                ProviderStatus::AuthFailed,
+            ),
+            (DefaultSignIn::default(), ProviderStatus::AuthFailed),
+            (probed(Some(true), after), ProviderStatus::SignedIn),
+            (probed(Some(false), after), ProviderStatus::SignedOut),
+        ] {
+            assert_eq!(
+                provider_status(ProviderStatus::Unknown, sign_in, Some(failed)),
+                expected,
+                "{sign_in:?}"
+            );
+        }
+    }
+
+    /// What the installation says applies to every launch, signed in or not.
+    #[test]
+    fn a_provider_that_cannot_launch_keeps_its_launch_status() {
+        let now = Instant::now();
+        for launch in [
+            ProviderStatus::CliMissing,
+            ProviderStatus::PrerequisiteMissing,
+        ] {
+            assert_eq!(
+                provider_status(launch, probed(Some(true), now), Some(now)),
+                launch
+            );
+        }
+    }
+
+    /// Each probe-able CLI's real output, run through its sign-in probe and
+    /// reported as the provider's status.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sign_in_probe_fixtures_map_to_provider_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures: &[(&str, &str, i32, ProviderStatus)] = &[
+            (
+                "claude-code",
+                r#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@example.com"}"#,
+                0,
+                ProviderStatus::SignedIn,
+            ),
+            (
+                "claude-code",
+                r#"{"loggedIn":false,"authMethod":"none"}"#,
+                1,
+                ProviderStatus::SignedOut,
+            ),
+            ("claude-code", "not json", 0, ProviderStatus::Unknown),
+            (
+                "codex",
+                "Logged in using ChatGPT",
+                0,
+                ProviderStatus::SignedIn,
+            ),
+            ("codex", "Not logged in", 1, ProviderStatus::SignedOut),
+            (
+                "opencode",
+                "anthropic/claude-sonnet-4-5",
+                0,
+                ProviderStatus::SignedIn,
+            ),
+            ("opencode", "", 0, ProviderStatus::SignedOut),
+            (
+                "opencode",
+                "Error: no providers",
+                1,
+                ProviderStatus::SignedOut,
+            ),
+            ("auggie", "", 0, ProviderStatus::SignedIn),
+            ("auggie", "", 1, ProviderStatus::SignedOut),
+        ];
+        for (index, (provider, stdout, exit, expected)) in fixtures.iter().enumerate() {
+            let args = intent_providers::find_provider(provider)
+                .unwrap()
+                .auth_check_args
+                .unwrap();
+            let stub = dir.path().join(format!("{provider}-{index}"));
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\n[ \"$*\" = '{}' ] || exit 127\nprintf '%s\\n' '{stdout}'\nexit {exit}\n",
+                    args.join(" ")
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let probe =
+                crate::provider_auth::check_provider_auth_cli(provider, stub.as_os_str(), args)
+                    .await;
+            let sign_in = DefaultSignIn {
+                signed_in: probe.auth_status(),
+                probed_at: Some(Instant::now()),
+            };
+            assert_eq!(
+                provider_status(ProviderStatus::Unknown, sign_in, None),
+                *expected,
+                "{provider} {stdout:?} exit {exit}"
+            );
+        }
     }
 
     #[test]

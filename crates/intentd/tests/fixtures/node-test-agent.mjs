@@ -8,9 +8,11 @@
 //   --dump-env              write its environment to `agent.env.json` in its
 //                           working directory (profile-overlay tests)
 //   --fail-setup-echo <VAR> fail session/new with an error quoting $VAR
+//   --auth-required-setup   fail session/new with ACP's auth-required error
 //
 // A prompt "echo-env <VAR>" streams $VAR as a chunk and then fails the turn
-// with an error quoting it (credential echo tests).
+// with an error quoting it (credential echo tests); "auth-required" fails
+// the turn with ACP's auth-required error (sign-in status tests).
 //
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
@@ -36,6 +38,8 @@ const hangSetup = argv.includes('--hang-setup');
 const failSetupAt = argv.indexOf('--fail-setup-echo');
 const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
 const detachedHelper = argv.includes('--detached-helper');
+const authRequiredSetup = argv.includes('--auth-required-setup');
+const AUTH_REQUIRED = { code: -32000, message: 'Authentication required' };
 if (argv.includes('--dump-env')) fs.writeFileSync('agent.env.json', JSON.stringify(process.env));
 
 const sleeper = spawn('sleep', ['300'], { stdio: 'ignore', detached: detachedHelper });
@@ -128,6 +132,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     case 'session/new':
       if (hangSetup) return;
       mcpServers = msg.params?.mcpServers ?? [];
+      if (authRequiredSetup) return send({ id: msg.id, error: AUTH_REQUIRED });
       if (failSetupVar) {
         const value = process.env[failSetupVar];
         return send({
@@ -163,6 +168,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `echo: ${text}` } },
         },
       });
+      if (text === 'auth-required') return send({ id: msg.id, error: AUTH_REQUIRED });
       const echo = text.match(/^echo-env (\S+)$/);
       if (echo) {
         const value = process.env[echo[1]];
