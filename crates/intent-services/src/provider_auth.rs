@@ -199,19 +199,65 @@ pub async fn check_provider_auth_cli(
     check_provider_auth_cli_in(provider_id, program, auth_check_args, None).await
 }
 
+/// The login-shell credential capture a profile-less launch gap-fills
+/// (`intent_acp` `build_command`). The first capture can block on the
+/// login shell, so it runs off the async executor; a failure is empty.
+async fn captured_credential_env() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    tokio::task::spawn_blocking(intent_core::path_utils::login_shell_credential_env)
+        .await
+        .unwrap_or(&EMPTY)
+}
+
+/// Gap-fill `captured` into a probe the way a profile-less launch does:
+/// a variable the daemon's own environment sets is never overridden.
+/// SECURITY: the values are secrets — never log them.
+fn gap_fill_credentials(
+    cmd: &mut tokio::process::Command,
+    captured: &std::collections::BTreeMap<String, String>,
+) {
+    for (key, value) in captured {
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, value);
+        }
+    }
+}
+
 /// [`check_provider_auth_cli`], optionally under a resolved installed
 /// context (a named profile): the probe then runs with exactly that
-/// context's environment, as its launches do.
+/// context's environment, as its launches do. Without one it runs with the
+/// environment a profile-less launch gets: the daemon's own, gap-filled
+/// with the captured login-shell credentials.
 async fn check_provider_auth_cli_in(
     provider_id: &str,
     program: &OsStr,
     auth_check_args: &[&str],
     context: Option<&crate::installed_cli::InstalledContext>,
 ) -> CliAuthProbe {
+    let captured = if context.is_none() && provider_id != "claude-code" {
+        captured_credential_env().await
+    } else {
+        static EMPTY: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        &EMPTY
+    };
+    check_provider_auth_cli_with(provider_id, program, auth_check_args, context, captured).await
+}
+
+/// [`check_provider_auth_cli_in`] with the captured credentials given
+/// (the test seam). claude-code applies its own allow-listed merge.
+async fn check_provider_auth_cli_with(
+    provider_id: &str,
+    program: &OsStr,
+    auth_check_args: &[&str],
+    context: Option<&crate::installed_cli::InstalledContext>,
+    captured: &std::collections::BTreeMap<String, String>,
+) -> CliAuthProbe {
     let probe_command = |program: &OsStr| {
         let mut cmd = probe_command(program);
-        if let Some(context) = context {
-            context.apply(&mut cmd);
+        match context {
+            Some(context) => context.apply(&mut cmd),
+            None => gap_fill_credentials(&mut cmd, captured),
         }
         cmd
     };
@@ -948,7 +994,7 @@ pub async fn default_sign_in(provider_id: &str, override_path: Option<String>) -
 
 /// Test seam: make one provider's cached verdict `by` older, so a test
 /// can step past the TTL without waiting.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn age_cached_verdict_for_tests(provider_id: &str, by: Duration) {
     let mut entries = cache().entries.lock().expect("auth cache poisoned");
     if let Some((at, _)) = entries.get_mut(provider_id) {
@@ -1753,6 +1799,48 @@ while IFS= read -r unexpected; do exit 95; done
                 "{id}"
             );
         }
+    }
+
+    /// A daemon started outside a login shell (a GUI app or service) sees
+    /// a CLI's credential location only through the captured login-shell
+    /// environment, which a profile-less launch gap-fills; the default
+    /// probe sees the same account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_cli_probe_sees_the_login_shell_credentials_a_launch_gets() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("CODEX_HOME").is_some() {
+            eprintln!("skipping: CODEX_HOME is set in the test environment");
+            return;
+        }
+        let dir = unique_temp_dir("shell-codex-home");
+        let home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        let stub = dir.path().join("codex");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$*\" = 'login status' ] || exit 64\n[ -n \"$CODEX_HOME\" ] && [ -f \"$CODEX_HOME/auth.json\" ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = &["login", "status"];
+        let shell_only = std::collections::BTreeMap::from([(
+            "CODEX_HOME".to_owned(),
+            home.to_str().unwrap().to_owned(),
+        )]);
+        let probe =
+            check_provider_auth_cli_with("codex", stub.as_os_str(), args, None, &shell_only).await;
+        assert_eq!(probe, CliAuthProbe::Authenticated);
+        let without = check_provider_auth_cli_with(
+            "codex",
+            stub.as_os_str(),
+            args,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(without, CliAuthProbe::NotAuthenticated);
     }
 
     fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
