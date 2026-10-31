@@ -30,6 +30,14 @@ impl Services {
         &'a self,
         future: impl Future<Output = Result<T>> + Send + 'a,
     ) -> BoxFuture<'a, Result<T>> {
+        #[cfg(test)]
+        LAST_INNER_FUTURE_SIZE.set(std::mem::size_of_val(&future));
+        // Box the caller's future once, up front. Moved into the `async move`
+        // block as-is, it is held both as a captured upvar and inside the
+        // awaited `scope(..)` future, so this wrapper reserved room for it
+        // twice — doubling large callers such as `workspace.create`
+        // (budgeted in `src/tests/workspace_create_future_size.rs`).
+        let future = Box::pin(future);
         Box::pin(async move {
             let member = match intent_core::current_caller() {
                 Some(Caller::Wire {
@@ -53,6 +61,19 @@ impl Services {
                 .await
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_INNER_FUTURE_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Size of the inner future handed to the most recent
+/// [`Services::execution_call`] on this thread. The wrapper boxes it, so
+/// `size_of_val` on the returned future no longer sees it.
+#[cfg(test)]
+pub(crate) fn last_inner_future_size() -> usize {
+    LAST_INNER_FUTURE_SIZE.get()
 }
 
 /// Test seam: [`forge_error`] for feature-crate tests.

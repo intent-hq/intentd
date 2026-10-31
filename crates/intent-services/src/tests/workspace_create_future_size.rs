@@ -1,4 +1,4 @@
-//! Future-size budget for `workspace.create` (`Services::create_workspace`).
+//! Future-size budgets for `workspace.create` (`Services::create_workspace`).
 //!
 //! The create future runs close to the default stack limit in debug builds.
 //! Growing it — most recently by rebinding the large `WorkspaceCreate` input
@@ -6,23 +6,28 @@
 //! an unrelated-looking "stack overflow" SIGABRT of
 //! `wss_workspace_create_context_links_round_trip_and_validation` late in a
 //! full test run (intent-hq/intent#6741). This test measures the unpolled
-//! future so the growth fails here, fast, with the fix in the message. Same
+//! futures so the growth fails here, fast, with the fix in the message. Same
 //! pattern as `agent_manager::future_size_tests` (turn-start path).
 //!
-//! `create_workspace` returns a `BoxFuture`; `size_of_val(&*boxed)` reads the
-//! concrete size of the boxed state machine (the `execution_call` wrapper that
-//! holds the create `async move` block) through the `dyn Future` vtable. The
-//! wrapper stores the inner future twice, so every byte added to the create
-//! block shows up about twice here: one rebinding of the input adds
-//! `2 * size_of::<WorkspaceCreate>()`.
+//! Two sizes are measured:
+//! - the create block: the `async move` future `create_workspace` hands to
+//!   `Services::execution_call`, recorded there before it is boxed
+//!   (`execution_call::last_inner_future_size`). One rebinding of the input
+//!   adds about one `WorkspaceCreate` to it.
+//! - the `execution_call` wrapper: the returned `BoxFuture`, read through the
+//!   `dyn Future` vtable with `size_of_val(&*boxed)`. The wrapper boxes the
+//!   create block once; un-boxing it again (holding the block inline) would
+//!   store the block twice and grow the wrapper by about twice its size.
 //!
-//! The budget is the debug-profile size (the test profile, where the overflow
-//! happened) measured on `x86_64` Linux, plus headroom smaller than one
-//! rebinding (`2 * size_of::<WorkspaceCreate>()`). Release builds and other
-//! targets lay futures out differently, so the module only builds for debug
-//! `x86_64` Linux (gated in `tests.rs`), the platform CI runs. Re-measure: run
-//! `make test-select E='test(/future_size/)'` with the budget lowered to 0;
-//! the failure message prints the size.
+//! Budgets are debug-profile sizes (the test profile, where the overflow
+//! happened) measured on `x86_64` Linux plus headroom. Release builds and
+//! other targets lay futures out differently, so the module only builds for
+//! debug `x86_64` Linux (gated in `tests.rs`), the platform CI runs.
+//! Re-measure: run `make test-select E='test(/future_size/)'` with a budget
+//! lowered to 0; the failure message prints every size.
+//!
+//! Stored size is only half of the stack story: each inline await also costs
+//! poll-frame stack that `size_of_val` cannot see (see `crate::stack_frame`).
 
 use intent_core::{WorkspaceApi, WorkspaceCreate};
 use intent_store::Store;
@@ -30,10 +35,14 @@ use intent_store::Store;
 use super::{TempDb, WorkspacesRoot};
 use crate::Services;
 
-/// `Services::create_workspace` (measured `38_032` bytes; `WorkspaceCreate`
-/// is `1_200`, so a stray rebinding adds `2_400`). Headroom stays below one
-/// rebinding so it trips the budget.
-const CREATE_WORKSPACE_BUDGET: usize = 38 * 1024;
+/// The create block (measured `17_744` bytes; `WorkspaceCreate` is `1_200`).
+/// Headroom stays below one `WorkspaceCreate` so a stray rebinding or clone
+/// of the request inside the block trips it.
+const CREATE_BLOCK_BUDGET: usize = 18 * 1024;
+/// The `execution_call` wrapper around it (measured `2_544` bytes): holds the
+/// create block behind one `Box::pin`. Holding it inline again grows this by
+/// about `2 * 17_744`.
+const EXECUTION_CALL_WRAPPER_BUDGET: usize = 4 * 1024;
 
 #[tokio::test]
 async fn workspace_create_future_size_stays_within_budget() {
@@ -42,34 +51,55 @@ async fn workspace_create_future_size_stays_within_budget() {
     let ws_root = WorkspacesRoot::new();
     let services = Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf());
 
-    // Never polled: only the generated state-machine layout is measured. No
+    // Never polled: only the generated state-machine layouts are measured. No
     // `repositoryCheckout`, so building the future has no side effects.
     let create = services.create_workspace(WorkspaceCreate::default(), Some("future-size".into()));
-    let size = std::mem::size_of_val(&*create);
+    let wrapper = std::mem::size_of_val(&*create);
+    let block = crate::execution_call::last_inner_future_size();
     drop(create);
     let input = std::mem::size_of::<WorkspaceCreate>();
 
+    let measured = [
+        ("workspace.create block", block, CREATE_BLOCK_BUDGET),
+        (
+            "execution_call wrapper",
+            wrapper,
+            EXECUTION_CALL_WRAPPER_BUDGET,
+        ),
+    ];
+    let over: Vec<String> = measured
+        .iter()
+        .filter(|(_, size, budget)| size > budget)
+        .map(|(name, size, budget)| format!("{name} future is {size} bytes (budget {budget})"))
+        .collect();
     assert!(
-        size <= CREATE_WORKSPACE_BUDGET,
-        "Services::create_workspace future is {size} bytes (budget {CREATE_WORKSPACE_BUDGET}). \
-         The workspace.create future grew, and it already runs close to the debug stack limit \
-         (overflowed wss_workspace_create_context_links_round_trip_and_validation: \
+        over.is_empty(),
+        "{}. The workspace.create future grew, and it already runs close to the debug stack \
+         limit (overflowed wss_workspace_create_context_links_round_trip_and_validation: \
          intent-hq/intent#6741, intent-hq/intentd#2819). Fix: move large awaits off the stack \
          with `Box::pin(..)` (or `crate::stack_frame::boxed_await(|| ..)`), and do not copy, \
          clone or rebind the `WorkspaceCreate` request ({input} bytes) inside the future — \
-         mutate `input` in place. If the growth is intentional and bounded (new locals, larger \
-         types, a toolchain bump), re-measure and raise CREATE_WORKSPACE_BUDGET in \
-         src/tests/workspace_create_future_size.rs, keeping the headroom below one rebinding \
-         (2 x the request)."
+         mutate `input` in place. A large wrapper means `Services::execution_call` holds its \
+         inner future inline again: keep the `Box::pin(future)` there. If the growth is \
+         intentional and bounded (new locals, larger types, a toolchain bump), re-measure and \
+         raise the budget in src/tests/workspace_create_future_size.rs, keeping the create \
+         block's headroom below one request. All sizes: {measured:?}",
+        over.join("; ")
     );
-    // Keeps the budget meaningful: a rebinding of the request inside the
-    // create block adds about `2 * input` here (the wrapper holds the inner
-    // future twice), so headroom must stay below that or it would slip under.
+    // Keeps the block budget meaningful: headroom must stay below one copy of
+    // the request, or a stray rebinding would slip under it.
     assert!(
-        CREATE_WORKSPACE_BUDGET - size < 2 * input,
-        "Services::create_workspace future shrank to {size} bytes, leaving at least one \
-         rebinding of WorkspaceCreate (2 x {input} bytes) of headroom under \
-         CREATE_WORKSPACE_BUDGET ({CREATE_WORKSPACE_BUDGET}), so a stray rebinding would no \
-         longer trip it. Re-measure and tighten the budget"
+        CREATE_BLOCK_BUDGET - block < input,
+        "workspace.create block shrank to {block} bytes, leaving at least one WorkspaceCreate \
+         ({input} bytes) of headroom under CREATE_BLOCK_BUDGET ({CREATE_BLOCK_BUDGET}), so a \
+         stray rebinding would no longer trip it. Re-measure and tighten the budget"
+    );
+    // Keeps the wrapper budget meaningful: it only catches an inline create
+    // block while that block is much larger than the budget.
+    assert!(
+        EXECUTION_CALL_WRAPPER_BUDGET < block,
+        "workspace.create block ({block} bytes) is no longer larger than \
+         EXECUTION_CALL_WRAPPER_BUDGET ({EXECUTION_CALL_WRAPPER_BUDGET}); an inline block in \
+         the wrapper would slip under it. Re-measure and tighten the budgets"
     );
 }
