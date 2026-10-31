@@ -210,9 +210,6 @@ impl WsInner {
             if !handles.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            if let Some(links) = &self.executor_links {
-                links.close_all().await;
-            }
             // (4)+(6) remove the upgrade handlers / close every listener.
             for tx in running.shutdown_txs.drain(..) {
                 let _ = tx.send(());
@@ -224,6 +221,11 @@ impl WsInner {
             // (7) await every listener closure so the port is fully released.
             for task in running.accept_tasks.drain(..) {
                 let _ = task.await;
+            }
+            // After the accept loops are gone: close executor links and
+            // fence out every connection accepted before now.
+            if let Some(links) = &self.executor_links {
+                links.close_all().await;
             }
             let _ = running.heartbeat_task.await;
         }

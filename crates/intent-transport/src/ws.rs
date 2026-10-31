@@ -776,14 +776,18 @@ impl WsInner {
                             tracing::info!(failures, "ws accept recovered");
                         }
                         let me = self.clone();
+                        // Taken at accept, before `stop()` can advance it, so
+                        // an executor connection accepted before a stop can
+                        // never bind after it.
+                        let epoch = me.executor_links.as_ref().map_or(0, |l| l.epoch());
                         tokio::spawn(async move {
                             let _ = tcp.set_nodelay(true);
                             let result = match me.acceptor.clone() {
                                 Some(acceptor) => match acceptor.accept(tcp).await {
-                                    Ok(tls) => me.handle_conn(tls).await,
+                                    Ok(tls) => me.handle_conn(tls, epoch).await,
                                     Err(e) => Err(e),
                                 },
-                                None => me.handle_conn(tcp).await,
+                                None => me.handle_conn(tcp, epoch).await,
                             };
                             if let Err(e) = result {
                                 tracing::debug!(error = %e, "ws connection setup failed");
@@ -854,7 +858,7 @@ impl WsInner {
     /// Parse the HTTP head from an established stream (TLS or plain TCP), and
     /// either answer `/health`, reject a bad `/ws` upgrade (401/403/404), or
     /// perform the WebSocket handshake and start the connection loop.
-    async fn handle_conn<S>(self: Arc<Self>, mut stream: S) -> std::io::Result<()>
+    async fn handle_conn<S>(self: Arc<Self>, mut stream: S, epoch: u64) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -908,6 +912,7 @@ impl WsInner {
                     has_origin,
                     ws_key,
                     &binding_headers,
+                    epoch,
                 )
                 .await;
         }

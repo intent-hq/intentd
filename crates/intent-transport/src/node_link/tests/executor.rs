@@ -989,3 +989,51 @@ async fn the_dialer_reaches_the_machine_through_a_tailcat_pipe_with_the_same_pin
     .unwrap_err();
     assert_eq!(error_code(&error), Some(codes::CONFIG), "{error}");
 }
+
+#[tokio::test]
+async fn a_link_upgraded_before_stop_cannot_bind_after_it() {
+    let mut machine = Machine::start(Mode::Secure { ws_enabled: true }).await;
+    let auth = bearer(&executor_token());
+    let (status, socket) = machine
+        .upgrade(LINK_PATH, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(status, 101);
+    let mut socket = socket.unwrap();
+
+    machine.server.stop().await;
+
+    let _ = socket
+        .send(Message::Binary(
+            LinkFrame::Hello(hello(machine_binding(BACKEND, 1)))
+                .encode()
+                .unwrap()
+                .into(),
+        ))
+        .await;
+    loop {
+        match tokio::time::timeout(wait(), socket.next()).await.unwrap() {
+            Some(Ok(Message::Binary(bytes))) => {
+                panic!("no frame after stop, got {:?}", LinkFrame::decode(&bytes))
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            _ => break,
+        }
+    }
+    machine.nothing_accepted().await;
+    assert_eq!(
+        machine.api.binding_of(&machine.executor.id),
+        None,
+        "nothing is persisted after stop"
+    );
+
+    // A restarted listener admits the backend again.
+    let port = machine.server.start().await.unwrap();
+    machine.port = port;
+    dial_link(
+        &machine.endpoint(&executor_token()),
+        hello(machine_binding(BACKEND, 2)),
+    )
+    .await
+    .unwrap();
+    let _ = machine.accepted_link().await;
+}

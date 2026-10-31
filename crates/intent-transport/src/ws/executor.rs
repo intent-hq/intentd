@@ -22,6 +22,7 @@ impl WsInner {
         has_origin: bool,
         key: Option<String>,
         headers: &[(String, String)],
+        epoch: u64,
     ) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -67,6 +68,10 @@ impl WsInner {
         } else {
             ExecutorRoute::Link
         };
+        // The listener stopped since this connection was accepted.
+        if links.epoch() != epoch {
+            return super::startup::unavailable(&mut stream).await;
+        }
         let Some(key) = key else {
             return reject(&mut stream, 400, "Bad Request").await;
         };
@@ -82,7 +87,7 @@ impl WsInner {
             Some(crate::node_link::socket_config()),
         )
         .await;
-        tokio::spawn(links.serve(api, credential, route, ws, revocations));
+        tokio::spawn(links.serve(api, credential, route, ws, revocations, epoch));
         Ok(())
     }
 }

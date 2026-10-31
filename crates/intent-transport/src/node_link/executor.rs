@@ -50,7 +50,8 @@ pub trait ExecutorHost: Send + Sync {
     /// The welcome for an accepted hello: capabilities, routes and this
     /// binding's running agents. The listener sets `protocol` and `nodeId`.
     fn welcome(&self, credential: &ExecutorCredential, hello: &LinkHello) -> LinkWelcome;
-    /// Take an admitted connection.
+    /// Take an admitted connection. Called with the link server's lock
+    /// held, so it must not block or call back into [`ExecutorLinks`].
     fn accept(&self, credential: ExecutorCredential, connection: NodeConnection);
 }
 
@@ -83,6 +84,10 @@ pub struct ExecutorLinks {
     /// Held across the bind decision so the persisted and in-memory
     /// bindings change together.
     current: tokio::sync::Mutex<HashMap<ExecutorCredentialId, Current>>,
+    /// Advanced (under the `current` lock) whenever the listener stops. A
+    /// connection admitted in an older epoch can no longer bind, register
+    /// or reach the host, so nothing outlives `stop()`.
+    epoch: watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for ExecutorLinks {
@@ -112,6 +117,7 @@ impl ExecutorLinks {
             host,
             tuning,
             current: tokio::sync::Mutex::new(HashMap::new()),
+            epoch: watch::channel(0).0,
         })
     }
 
@@ -161,16 +167,25 @@ impl ExecutorLinks {
         }
     }
 
-    /// Close every executor connection (the listener is stopping).
+    /// The current listener epoch; an upgrade records it before its `101`.
+    pub(crate) fn epoch(&self) -> u64 {
+        *self.epoch.borrow()
+    }
+
+    /// Close every executor connection (the listener is stopping) and fence
+    /// out connections upgraded before now that have not bound yet.
     pub async fn close_all(&self) {
-        for (_, mut entry) in self.current.lock().await.drain() {
+        let mut current = self.current.lock().await;
+        self.epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        for (_, mut entry) in current.drain() {
             entry.close_with(GOING_AWAY, "server shutting down");
         }
     }
 
-    /// Serve an upgraded `/node/*` connection. `revocations` must have been
-    /// subscribed before the credential was resolved, so a revocation racing
-    /// the upgrade is not missed.
+    /// Serve an upgraded `/node/*` connection admitted in listener `epoch`.
+    /// `revocations` must have been subscribed before the credential was
+    /// resolved, so a revocation racing the upgrade is not missed.
     pub(crate) async fn serve<S>(
         self: Arc<Self>,
         api: Arc<dyn WorkspaceApi>,
@@ -178,6 +193,7 @@ impl ExecutorLinks {
         route: ExecutorRoute,
         mut socket: WebSocketStream<S>,
         revocations: Option<broadcast::Receiver<ExecutorCredentialId>>,
+        epoch: u64,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -185,30 +201,38 @@ impl ExecutorLinks {
             ExecutorRoute::Git { binding, retire } => {
                 let git = GitConnection::start(socket, binding.clone(), Some(retire));
                 let closer = git.closer();
+                let id = credential.id.clone();
                 {
+                    // The hand-off happens under the lock, so a stop or
+                    // revocation either sees this connection or fences it.
                     let mut current = self.current.lock().await;
                     match current.get_mut(&credential.id) {
-                        Some(entry) if entry.binding == binding => {
+                        Some(entry) if entry.binding == binding && self.epoch() == epoch => {
                             entry.gits.retain(|g| !g.is_closed());
                             entry.gits.push(closer.clone());
+                            self.host.accept(credential, NodeConnection::Git(git));
                         }
-                        // Replaced or revoked since the upgrade check.
+                        // Replaced, revoked or stopped since the upgrade
+                        // check.
                         _ => {
                             git.close();
                             return;
                         }
                     }
                 }
-                let id = credential.id.clone();
-                self.host.accept(credential, NodeConnection::Git(git));
                 watch_revocation(self, id, revocations, async move { closer.closed().await });
             }
             ExecutorRoute::Link => {
-                let bound = tokio::time::timeout(
-                    HANDSHAKE_TIMEOUT,
-                    self.bind(api.as_ref(), &credential, &mut socket),
-                )
-                .await;
+                let mut stopped = self.epoch.subscribe();
+                let bound = tokio::select! {
+                    bound = tokio::time::timeout(
+                        HANDSHAKE_TIMEOUT,
+                        self.bind(api.as_ref(), &credential, &mut socket, epoch),
+                    ) => bound,
+                    // The listener stopped while the backend had not bound
+                    // yet: drop the connection instead of binding later.
+                    _ = stopped.wait_for(|current| *current != epoch) => return,
+                };
                 let hello = match bound {
                     Ok(Ok(hello)) => hello,
                     Ok(Err(error)) => {
@@ -225,30 +249,32 @@ impl ExecutorLinks {
                 };
                 let (link, events) =
                     NodeLink::start_with(socket, hello.binding.clone(), self.tuning, true);
+                let id = credential.id.clone();
+                let watched = link.clone();
                 {
+                    // The hand-off happens under the lock, so a stop or
+                    // revocation either sees this link or fences it.
                     let mut current = self.current.lock().await;
                     match current.get_mut(&credential.id) {
-                        Some(entry) if entry.binding == hello.binding => {
+                        Some(entry) if entry.binding == hello.binding && self.epoch() == epoch => {
                             entry.link = Some(link.clone());
+                            self.host.accept(
+                                credential,
+                                NodeConnection::Link {
+                                    link,
+                                    events,
+                                    hello,
+                                },
+                            );
                         }
-                        // A newer bind or a revocation won while this one
-                        // finished.
+                        // A newer bind, a revocation or a stop won while
+                        // this one finished.
                         _ => {
                             link.close();
                             return;
                         }
                     }
                 }
-                let id = credential.id.clone();
-                let watched = link.clone();
-                self.host.accept(
-                    credential,
-                    NodeConnection::Link {
-                        link,
-                        events,
-                        hello,
-                    },
-                );
                 watch_revocation(self, id, revocations, async move { watched.closed().await });
             }
         }
@@ -261,6 +287,7 @@ impl ExecutorLinks {
         api: &dyn WorkspaceApi,
         credential: &ExecutorCredential,
         socket: &mut WebSocketStream<S>,
+        epoch: u64,
     ) -> Result<LinkHello>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -290,6 +317,11 @@ impl ExecutorLinks {
         let node_id = self.host.node_id();
         {
             let mut current = self.current.lock().await;
+            if self.epoch() != epoch {
+                drop(current);
+                reject(socket, codes::UNAVAILABLE).await;
+                return Err(super::unavailable());
+            }
             let decision = api
                 .bind_executor(
                     credential.id.clone(),
