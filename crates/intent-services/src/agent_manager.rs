@@ -17823,8 +17823,10 @@ mod first_attempt_stderr_hint_tests {
                     hooks,
                 ));
                 install_handle_with_connection(mgr, agent_id, None, conn);
+                // Same-task concurrency (no spawn): the writer and the hint
+                // are polled together.
                 let (hint_done_tx, hint_done_rx) = tokio::sync::oneshot::channel::<()>();
-                let writer = tokio::spawn(async move {
+                let writer = async move {
                     if line_after_hint {
                         let _ = hint_done_rx.await;
                     } else {
@@ -17833,10 +17835,13 @@ mod first_attempt_stderr_hint_tests {
                     stderr_w.write_all(b"dying words\n").await.unwrap();
                     stderr_w.flush().await.unwrap();
                     drop(stderr_w);
-                });
-                let hint = stderr_capture_hint(mgr, agent_id, err).await;
-                let _ = hint_done_tx.send(());
-                writer.await.unwrap();
+                };
+                let hint = async {
+                    let hint = stderr_capture_hint(mgr, agent_id, err).await;
+                    let _ = hint_done_tx.send(());
+                    hint
+                };
+                let (hint, ()) = tokio::join!(hint, writer);
                 hint
             }
         };
