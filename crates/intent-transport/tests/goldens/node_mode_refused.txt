@@ -299,6 +299,11 @@ providers.setup.cancel
 providers.setup.login
 providers.setup.start
 providers.setup.status
+remoteMachines.add
+remoteMachines.backendInfo
+remoteMachines.list
+remoteMachines.refresh
+remoteMachines.remove
 repo.list
 repo.remove
 repo.warmCache

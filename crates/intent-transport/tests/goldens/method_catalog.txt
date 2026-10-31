@@ -319,6 +319,11 @@ router providers.profiles.list
 router providers.profiles.reorder
 router providers.profiles.update
 router providers.profiles.updateDefault
+router remoteMachines.add
+router remoteMachines.backendInfo
+router remoteMachines.list
+router remoteMachines.refresh
+router remoteMachines.remove
 router repo.list
 router repo.remove
 router repo.warmCache

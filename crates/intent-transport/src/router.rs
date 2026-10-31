@@ -242,11 +242,16 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "listener-down" })),
         },
-        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
-            code: e.code(),
-            message: failure.message.clone(),
-            data: Some(failure.data.clone()),
-        },
+        // An exposed-machine request failed (`machine-unreachable` with the
+        // routes tried, `machine-revoked`, `machine-in-use`): the
+        // service-built `data` verbatim.
+        ref e @ (Error::RemoteMachine(ref failure) | Error::ProviderProfile(ref failure)) => {
+            RpcErr {
+                code: e.code(),
+                message: failure.message.clone(),
+                data: Some(failure.data.clone()),
+            }
+        }
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
         // category so clients stop showing a bare "Internal error"
@@ -1471,6 +1476,15 @@ async fn dispatch(
             .executor_revoke(require_str_param(params, "credentialId")?)
             .await
             .map_err(domain_to_rpc),
+        // Daemon-to-daemon exposed machines (nodes.md "Backend methods:
+        // exposed machines"): owner-only, daemon-global. The services
+        // recheck the owner role; `add` carries the executor token, which no
+        // result or error ever echoes.
+        "remoteMachines.backendInfo" => remote_machines(api, "backendInfo", params).await,
+        "remoteMachines.add" => remote_machines(api, "add", params).await,
+        "remoteMachines.list" => remote_machines(api, "list", params).await,
+        "remoteMachines.remove" => remote_machines(api, "remove", params).await,
+        "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -5696,6 +5710,17 @@ fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, Rp
             "{name} must be a nonempty string of at most 256 bytes without control characters"
         ))),
     }
+}
+
+/// `remoteMachines.<method>` with the request's params object.
+async fn remote_machines(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.remote_machines(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
 }
 
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {

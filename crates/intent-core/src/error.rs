@@ -152,6 +152,14 @@ pub enum Error {
     #[error("{}", .0.message)]
     ProviderProfile(Box<ProviderProfileFailure>),
 
+    /// A `remoteMachines.*` request about an exposed machine failed
+    /// (`machine-unreachable` with the routes tried, `machine-revoked`,
+    /// `machine-in-use`). `data` (`data.code` plus details) is passed through
+    /// verbatim as `error.data`; `internal` selects `-32603`, otherwise
+    /// `-32602`. Neither carries the executor token.
+    #[error("{}", .0.message)]
+    RemoteMachine(Box<ProviderProfileFailure>),
+
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
     /// detail (git stderr tail with credentials redacted) so clients can show
@@ -622,7 +630,7 @@ impl Error {
                 _ => -32603,
             },
 
-            Error::ProviderProfile(failure) => {
+            Error::ProviderProfile(failure) | Error::RemoteMachine(failure) => {
                 if failure.internal {
                     -32603
                 } else {
@@ -698,6 +706,22 @@ impl Error {
         data: serde_json::Value,
     ) -> Self {
         Self::ProviderProfile(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
+    }
+}
+
+impl Error {
+    /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.
+    #[must_use]
+    pub fn remote_machine(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::RemoteMachine(Box::new(ProviderProfileFailure {
             internal,
             message: message.into(),
             data,

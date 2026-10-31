@@ -68,12 +68,10 @@ pub trait StartupExt {
     /// run. Called once at boot.
     fn sweep_stale_export_staging(&self) -> impl Future<Output = ()> + Send;
 
-    /// Start the connector to the execution node configured in `data_dir`
-    /// (`remote-node.json`). Returns `false` when no node is configured.
-    fn start_remote_node(
-        &self,
-        data_dir: &std::path::Path,
-    ) -> impl Future<Output = intent_services::Result<bool>> + Send;
+    /// Give the remote feature the tailcat binary used to reach exposed
+    /// machines over their tailcat address. Nothing is dialed until a
+    /// machine is needed.
+    fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>);
 }
 
 impl StartupExt for Services {
@@ -81,10 +79,7 @@ impl StartupExt for Services {
         intent_svc_transfer::TransferServicesExt::sweep_stale_export_staging(self)
     }
 
-    fn start_remote_node(
-        &self,
-        data_dir: &std::path::Path,
-    ) -> impl Future<Output = intent_services::Result<bool>> + Send {
-        intent_svc_remote::RemoteServicesExt::start_remote_node(self, data_dir)
+    fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>) {
+        intent_svc_remote::RemoteServicesExt::configure_remote_machines(self, tailcat_bin);
     }
 }

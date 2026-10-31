@@ -782,3 +782,81 @@ async fn remote_agents_are_recorded_per_lease_and_cascade_with_the_agent() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn a_machine_lease_is_renewed_for_a_new_credential_and_ended_on_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("machine-lease.db"))
+        .await
+        .unwrap();
+    let (node, first) = records();
+    // First use registers the machine; the probe already bound generation 1.
+    store
+        .renew_machine_lease(&node, &first, NodeCounter(1))
+        .await
+        .unwrap();
+    let lease = store.get_node_lease(&first.owner).await.unwrap();
+    assert_eq!(lease.link_generation, NodeCounter(1));
+    assert_eq!(lease.state, LeaseState::Acquiring);
+    assert_eq!(
+        store.next_node_link_generation(&first.owner).await.unwrap(),
+        NodeCounter(2),
+        "the next dial goes past the probe"
+    );
+    store
+        .advance_node_lease_ack(&first.owner, NodeCounter(7))
+        .await
+        .unwrap();
+
+    // A new credential gets a fresh lease (and journal ack); the old one ends.
+    let (mut renamed, mut second) = records();
+    renamed.name = "Renamed".into();
+    second.owner.lease_id = "lease-second".into();
+    second.owner.incarnation = uuid::Uuid::new_v4().to_string();
+    store
+        .renew_machine_lease(&renamed, &second, NodeCounter(3))
+        .await
+        .unwrap();
+    let old = store.get_node_lease(&first.owner).await.unwrap();
+    assert!(old.state.is_terminal(), "{old:?}");
+    assert!(old.fence.is_some());
+    let fresh = store.get_node_lease(&second.owner).await.unwrap();
+    assert_eq!(fresh.ack_seq, NodeCounter(0));
+    assert_eq!(fresh.link_generation, NodeCounter(3));
+    assert_eq!(
+        store.get_node(&node.id, &node.head_id).await.unwrap().name,
+        "Renamed"
+    );
+
+    // Another head cannot take the machine row over.
+    let (mut foreign, mut third) = records();
+    foreign.head_id = "other-head".into();
+    third.owner.head_id = "other-head".into();
+    third.owner.lease_id = "lease-third".into();
+    assert!(store
+        .renew_machine_lease(&foreign, &third, NodeCounter(1))
+        .await
+        .is_err());
+
+    assert_eq!(
+        store
+            .end_machine_leases(&node.id, &node.head_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store
+        .get_node_lease(&second.owner)
+        .await
+        .unwrap()
+        .state
+        .is_terminal());
+    assert_eq!(
+        store
+            .end_machine_leases(&node.id, &node.head_id)
+            .await
+            .unwrap(),
+        0,
+        "ending is idempotent"
+    );
+}

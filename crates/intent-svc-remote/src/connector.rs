@@ -1,41 +1,52 @@
-//! The head connector: dial the configured node, keep the link up, ingest
-//! its journal and ack it.
+//! The connector to one exposed machine: connect on demand, keep the link
+//! up while this backend has live agents there, ingest the machine's
+//! journal and ack it, and disconnect once idle.
+//!
+//! A link is wanted while an agent attached here is live, a stop is waiting
+//! to be sent, or someone asked to connect ([`RemoteNode::connect`], a
+//! prompt waiting for the link). With none of those for
+//! [`Tuning::idle_timeout`], the link is closed and nothing redials until
+//! the machine is needed again. A link lost while it is wanted is redialed
+//! with backoff.
 //!
 //! Every dial offers a generation durably advanced first, and the hello
-//! carries head's ingested sequence, so the node replays exactly what head
-//! has not ingested. Acks are batched: head persists the ingested sequence,
-//! then sends it, at most every [`Tuning::ack_interval`] or
-//! [`Tuning::ack_batch`] records, and right after the node's replay.
+//! carries head's ingested sequence, so the machine replays exactly what
+//! head has not ingested. Acks are batched: head persists the ingested
+//! sequence, then sends it, at most every [`Tuning::ack_interval`] or
+//! [`Tuning::ack_batch`] records, and right after the machine's replay.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
+    MachineCapabilities, StopId,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
 use intent_core::remote_launch::{EffectiveIsolation, PlacementError};
 use intent_core::{AgentId, Error, Result, WorkspaceId};
+use intent_services::feature_api::Services;
 use intent_store::Store;
 use intent_transport::node_link::{
-    self as link, Backoff, DialedLink, IncomingRequest, LinkEvent, LinkEvents, NodeEndpoint,
-    NodeLink,
+    self as link, Backoff, IncomingRequest, LinkEvent, LinkEvents, NodeEndpoint, NodeLink,
 };
 
 use crate::agents::Agents;
-use crate::config::HeadNodeConfig;
+use crate::connect::{connect, ConnectFailure, ConnectTuning, Connected};
 use crate::ingest::{Ingest, Step};
 use crate::lease::HeadLease;
 use crate::lock;
+use crate::machine::MachineTarget;
 use crate::rpc::HeadCalls;
 use crate::runtime::RemoteAgentRuntime;
 
-/// JSON-RPC "method not found", for node requests head cannot serve.
+/// JSON-RPC "method not found", for machine requests head cannot serve.
 const UNSUPPORTED_CODE: i32 = -32601;
 
 /// Timing knobs; tests shorten them.
@@ -49,13 +60,51 @@ pub(crate) struct Tuning {
     pub link_loss_grace: Duration,
     /// How often a waiting prompt checks the idle window and the link.
     pub turn_poll: Duration,
-    /// Wait after a permanent dial failure (certificate, token, ownership)
-    /// before trying again, in case the operator fixed the node.
+    /// Wait after a permanent dial failure (revoked credential, version
+    /// mismatch) before trying again while agents are live.
     pub permanent_retry: Duration,
     pub backoff: Backoff,
+    /// Close the link after this long without a reason to keep it.
+    pub idle_timeout: Duration,
+    /// How often a bound link checks whether it is still wanted.
+    pub idle_check: Duration,
+    /// Longest a capabilities request waits for the machine's reply.
+    pub capabilities_timeout: Duration,
+    /// Resend delays of an unacknowledged stop on a live link: 5 s, doubling
+    /// to 60 s, ±20% jitter.
+    pub stop_resend: Backoff,
+    /// Longest `remoteMachines.remove` waits for its stops' acks, the
+    /// connect included.
+    pub remove_timeout: Duration,
+    pub connect: ConnectTuning,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: runs at bind, after the queued stops are sent and before
+    /// the link is published.
+    #[cfg(test)]
+    pub before_publish: BeforePublish,
+}
+
+/// A test hook run with the connector's state just before a bound link is
+/// published.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct BeforePublish(pub Option<PublishHook>);
+
+/// See [`BeforePublish`].
+#[cfg(test)]
+pub(crate) type PublishHook = Arc<dyn Fn(&Arc<Shared>) + Send + Sync>;
+
+#[cfg(test)]
+impl std::fmt::Debug for BeforePublish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "BeforePublish(set)"
+        } else {
+            "BeforePublish(none)"
+        })
+    }
 }
 
 impl Default for Tuning {
@@ -67,13 +116,21 @@ impl Default for Tuning {
             turn_poll: Duration::from_secs(1),
             permanent_retry: Duration::from_secs(60),
             backoff: Backoff::default(),
+            idle_timeout: Duration::from_secs(10 * 60),
+            idle_check: Duration::from_secs(15),
+            capabilities_timeout: Duration::from_secs(10),
+            stop_resend: Backoff::new(Duration::from_secs(5), Duration::from_secs(60)),
+            remove_timeout: Duration::from_secs(30),
+            connect: ConnectTuning::default(),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
+            #[cfg(test)]
+            before_publish: BeforePublish::default(),
         }
     }
 }
 
-/// What head knows about the configured node.
+/// What head knows about the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
     pub node_id: String,
@@ -81,28 +138,48 @@ pub struct NodeStatus {
     pub lease_id: String,
     /// Whether a link is up now.
     pub connected: bool,
-    /// From the node's last welcome; `None` before the first bind.
+    /// From the machine's last welcome; `None` before the first bind.
     pub platform: Option<AgentPlatform>,
     pub max_agents: u32,
-    /// The agents the node said it runs when the link was last bound.
+    /// The agents the machine said it runs when the link was last bound.
     pub running_agents: Vec<AgentId>,
     pub intentd_version: Option<String>,
 }
+
+/// A connect request; answered once a link is bound or the dial failed.
+type Waiter = oneshot::Sender<std::result::Result<(), ConnectFailure>>;
 
 /// State shared by the connector task, the runtimes and [`RemoteNode`].
 pub(crate) struct Shared {
     pub agents: Agents,
     pub tuning: Tuning,
     pub store: Store,
-    /// Runtimes of agents the node was already running when head bound it
-    /// (after a head restart), kept so their records keep flowing until the
-    /// agent manager takes them.
+    /// The backend's services: answer forwarded calls and publish
+    /// `remoteMachine:changed`. `None` refuses every machine request.
+    services: Option<Services>,
+    /// Where the machine is dialed; refreshed from every welcome.
+    target: Mutex<MachineTarget>,
+    /// Runtimes of agents the machine was already running when head bound
+    /// it (after a head restart), kept so their records keep flowing until
+    /// the agent manager takes them.
     parked: Mutex<HashMap<AgentId, Arc<RemoteAgentRuntime>>>,
     link: watch::Sender<Option<NodeLink>>,
     status: Mutex<NodeStatus>,
-    /// Agents whose stop has not been sent yet.
-    pending_stops: Mutex<BTreeSet<AgentId>>,
+    /// Agents whose stop the machine has not acknowledged yet, with the
+    /// stop's id: one id per queued stop, reused by every resend on any
+    /// link of this binding (nodeProtocol 7).
+    stops: Mutex<BTreeMap<AgentId, StopId>>,
+    /// Bumped whenever a stop leaves the queue (acknowledged, or dropped on
+    /// revocation).
+    stops_changed: watch::Sender<u64>,
+    /// The stops a task is resending, with the link generation it resends
+    /// on, so one link has one resender per stop.
+    resending: Mutex<HashMap<StopId, u64>>,
+    /// Waiting for the machine's next capabilities report.
+    capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
+    /// Asks the connector for a link: `None` just wakes it.
+    demand: mpsc::UnboundedSender<Option<Waiter>>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -112,9 +189,17 @@ impl Shared {
         self.link.borrow().clone().filter(|link| !link.is_closed())
     }
 
-    /// The current link, waiting up to `grace` for one to come up.
+    /// Ask the connector for a link without waiting.
+    pub(crate) fn wake(&self) {
+        let _ = self.demand.send(None);
+    }
+
+    /// The current link, asking for one and waiting up to `grace` for it.
     pub(crate) async fn link_within(&self, grace: Duration) -> Option<NodeLink> {
         let mut rx = self.link.subscribe();
+        if self.current_link().is_none() {
+            self.wake();
+        }
         tokio::time::timeout(grace, async {
             loop {
                 let current = rx.borrow_and_update().clone();
@@ -139,49 +224,230 @@ impl Shared {
         link.send(frame).await
     }
 
-    /// Remember that `agent_id` must be stopped and send the stop now if a
-    /// link is up; otherwise it goes out when the next link is bound.
-    pub(crate) fn request_stop(
-        self: &Arc<Self>,
-        agent_id: &AgentId,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        lock(&self.pending_stops).insert(agent_id.clone());
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let shared = self.clone();
-        Some(runtime.spawn(async move { shared.flush_stops().await }))
+    /// Whether the link should stay up: a live agent, a stop to send or a
+    /// capabilities request is waiting.
+    fn wants_link(&self) -> bool {
+        self.agents.live_count() > 0
+            || !lock(&self.stops).is_empty()
+            || !lock(&self.capability_waiters).is_empty()
     }
 
-    async fn flush_stops(&self) {
+    /// Queue a stop for `agent_id` (reusing its id when one is already
+    /// queued) and start resending it now if a link is up; otherwise it goes
+    /// out right after the next bind. It stays queued, and is resent, until
+    /// the machine acknowledges it; nothing waits for that here.
+    pub(crate) fn request_stop(self: &Arc<Self>, agent_id: &AgentId) {
+        let stop_id = self.queue_stop(agent_id);
         let Some(link) = self.current_link() else {
+            self.wake();
             return;
         };
-        let agents: Vec<AgentId> = lock(&self.pending_stops).iter().cloned().collect();
-        for agent_id in agents {
-            let frame = LinkFrame::Stop {
-                agent_id: agent_id.clone(),
-                stop_id: intent_core::node_link::StopId::new_v4(),
-            };
-            if link.send(&frame).await.is_err() {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let shared = self.clone();
+        let agent_id = agent_id.clone();
+        // caller-binding: allow — resends one queued stop on its link until acknowledged
+        runtime.spawn(async move { shared.resend(link, agent_id, stop_id).await });
+    }
+
+    /// The id of `agent_id`'s queued stop, queuing a new one if none is.
+    fn queue_stop(&self, agent_id: &AgentId) -> StopId {
+        *lock(&self.stops)
+            .entry(agent_id.clone())
+            .or_insert_with(StopId::new_v4)
+    }
+
+    /// Whether stop `stop_id` of `agent_id` is still unacknowledged.
+    fn is_queued(&self, agent_id: &AgentId, stop_id: StopId) -> bool {
+        lock(&self.stops).get(agent_id) == Some(&stop_id)
+    }
+
+    /// Whether `agent_id` has an unacknowledged stop.
+    pub(crate) fn stop_queued(&self, agent_id: &AgentId) -> bool {
+        lock(&self.stops).contains_key(agent_id)
+    }
+
+    /// Stop `stop_id` of `agent_id` is acknowledged: it leaves the queue.
+    /// An ack never confirms another stop of the same agent.
+    fn confirm_stop(&self, agent_id: &AgentId, stop_id: StopId) {
+        let mut stops = lock(&self.stops);
+        if stops.get(agent_id) == Some(&stop_id) {
+            stops.remove(agent_id);
+            drop(stops);
+            self.stops_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// The machine revoked this binding's credential, which stops its agents
+    /// there: the queued stops are moot.
+    fn drop_stops(&self) {
+        let dropped = !std::mem::take(&mut *lock(&self.stops)).is_empty();
+        if dropped {
+            self.stops_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// The queued stops, by agent.
+    fn queued_stops(&self) -> Vec<(AgentId, StopId)> {
+        lock(&self.stops)
+            .iter()
+            .map(|(agent_id, stop_id)| (agent_id.clone(), *stop_id))
+            .collect()
+    }
+
+    /// Send every queued stop on `link`, which nothing else uses yet, so
+    /// they precede any launch or prompt on it.
+    async fn send_queued(&self, link: &NodeLink) {
+        for (agent_id, stop_id) in self.queued_stops() {
+            if link
+                .send(&LinkFrame::Stop { agent_id, stop_id })
+                .await
+                .is_err()
+            {
                 return;
             }
-            lock(&self.pending_stops).remove(&agent_id);
         }
+    }
+
+    /// Resend every queued stop on the just-published `link` until each is
+    /// acknowledged. Taken after publication, the snapshot includes any stop
+    /// queued while the bind was in progress (whose `request_stop` saw no
+    /// link); a stop queued later starts its own resender. One link resends
+    /// each stop once.
+    fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
+        for (agent_id, stop_id) in self.queued_stops() {
+            let shared = self.clone();
+            let link = link.clone();
+            // caller-binding: allow — resends one queued stop on its link until acknowledged
+            tokio::spawn(async move { shared.resend(link, agent_id, stop_id).await });
+        }
+    }
+
+    /// Send stop `stop_id` on `link` and resend it after 5 s, doubling to
+    /// 60 s (±20%), until the machine acknowledges it or the link closes
+    /// (the next bind sends it again). Only that stop's own ack confirms it.
+    async fn resend(&self, link: NodeLink, agent_id: AgentId, stop_id: StopId) {
+        let generation = link.binding().generation.0;
+        {
+            let mut resending = lock(&self.resending);
+            if resending.get(&stop_id) == Some(&generation) {
+                return;
+            }
+            resending.insert(stop_id, generation);
+        }
+        let mut delays = self.tuning.stop_resend.clone();
+        while self.is_queued(&agent_id, stop_id) && !link.is_closed() {
+            match link
+                .stop(agent_id.clone(), stop_id, delays.next_delay())
+                .await
+            {
+                Ok(outcome) => {
+                    tracing::debug!(agent = %agent_id, ?outcome, "remote machine: stop acknowledged");
+                    self.confirm_stop(&agent_id, stop_id);
+                }
+                Err(error) if link::error_code(&error) == Some(link::codes::TIMEOUT) => {}
+                Err(_) => break,
+            }
+        }
+        let mut resending = lock(&self.resending);
+        if resending.get(&stop_id) == Some(&generation) {
+            resending.remove(&stop_id);
+        }
+    }
+
+    /// Wait until none of `agents` has an unacknowledged stop, or until
+    /// `deadline`; returns those still unacknowledged.
+    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+        let mut changed = self.stops_changed.subscribe();
+        loop {
+            let unconfirmed: Vec<AgentId> = {
+                let stops = lock(&self.stops);
+                agents
+                    .iter()
+                    .filter(|agent_id| stops.contains_key(*agent_id))
+                    .cloned()
+                    .collect()
+            };
+            if unconfirmed.is_empty() {
+                return unconfirmed;
+            }
+            match tokio::time::timeout_at(deadline, changed.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return unconfirmed,
+            }
+        }
+    }
+
+    /// No launch or prompt goes out behind an unacknowledged stop of the
+    /// same agent, so a resent stop can never stop a newer process. Waits up
+    /// to [`Tuning::remove_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// `node-link-unavailable` when the stop is still unacknowledged.
+    pub(crate) async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
+        if !self.stop_queued(agent_id) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.tuning.remove_timeout;
+        if self
+            .wait_stops(std::slice::from_ref(agent_id), deadline)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        Err(Error::Internal(format!(
+            "{}: the machine has not acknowledged this agent's earlier stop",
+            link::codes::UNAVAILABLE
+        )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_stops(&self) -> bool {
+        !lock(&self.stops).is_empty()
+    }
+
+    /// Dial `target` (the routes, port and pin a refreshed registration
+    /// was accepted on) from now on.
+    pub(crate) fn set_target(&self, target: MachineTarget) {
+        *lock(&self.target) = target;
+    }
+
+    fn target(&self) -> MachineTarget {
+        lock(&self.target).clone()
+    }
+
+    fn machine_id(&self) -> String {
+        lock(&self.status).node_id.clone()
     }
 
     fn welcome(&self, welcome: &LinkWelcome) {
         let mut status = lock(&self.status);
         status.connected = true;
-        status.platform = Some(welcome.capabilities.platform);
-        status.max_agents = welcome.capabilities.capacity.agent_cap;
         status.running_agents.clone_from(&welcome.running_agents);
-        status.intentd_version = Some(welcome.capabilities.intentd_version.clone());
+        drop(status);
+        self.capabilities(&welcome.capabilities);
+        if !welcome.hosts.is_empty() {
+            let mut target = lock(&self.target);
+            target.hosts.clone_from(&welcome.hosts);
+            target.tc_address.clone_from(&welcome.tc_address);
+        }
+    }
+
+    fn capabilities(&self, capabilities: &MachineCapabilities) {
+        let mut status = lock(&self.status);
+        status.platform = Some(capabilities.platform);
+        status.max_agents = capabilities.capacity.agent_cap;
+        status.intentd_version = Some(capabilities.intentd_version.clone());
     }
 
     fn disconnected(&self) {
         lock(&self.status).connected = false;
     }
 
-    /// The node's platforms: supported once it has said what it runs, and
+    /// The machine's platforms: supported once it has said what it runs, and
     /// available while it is connected with a free agent slot.
     pub(crate) fn availability(&self) -> PlatformAvailability {
         let status = lock(&self.status).clone();
@@ -191,9 +457,74 @@ impl Shared {
         let available = if free { supported.clone() } else { Vec::new() };
         PlatformAvailability::new(supported, available, intent_core::now_iso())
     }
+
+    /// Persist what a new link reported: the machine's routes, capabilities
+    /// and a healthy resting state.
+    async fn record_link(&self, welcome: &LinkWelcome) {
+        let id = self.machine_id();
+        let now = intent_core::now_iso();
+        let target = self.target();
+        let recorded = async {
+            self.store
+                .record_exposed_machine_connection(
+                    &id,
+                    &target.hosts,
+                    target.tc_address.as_deref(),
+                    &now,
+                )
+                .await?;
+            self.store
+                .record_exposed_machine_capabilities(&id, &welcome.capabilities)
+                .await?;
+            self.store
+                .set_exposed_machine_state(&id, RemoteMachineState::Disconnected)
+                .await
+        };
+        if let Err(error) = recorded.await {
+            tracing::warn!(%error, machine = %id, "remote machine: could not record the new link");
+        }
+    }
+
+    /// Persist the resting state a failed connect leaves the machine in.
+    async fn record_failure(&self, failure: &ConnectFailure) {
+        let state = match failure {
+            ConnectFailure::Unreachable(_) => RemoteMachineState::Unreachable,
+            ConnectFailure::Revoked(_) => RemoteMachineState::Revoked,
+            ConnectFailure::UpdateRequired(_) => RemoteMachineState::UpdateRequired,
+            ConnectFailure::Local(_) => return,
+        };
+        let id = self.machine_id();
+        if let Err(error) = self.store.set_exposed_machine_state(&id, state).await {
+            tracing::warn!(%error, machine = %id, "remote machine: could not record its state");
+        }
+    }
+
+    /// Publish `remoteMachine:changed` with the machine as it is now.
+    pub(crate) async fn announce(&self) {
+        let Some(services) = &self.services else {
+            return;
+        };
+        match self.store.get_exposed_machine(&self.machine_id()).await {
+            Ok(Some(row)) => {
+                let machine = crate::methods::machine_json(&row, Some(self));
+                services
+                    .publish_remote_machine_changed(serde_json::json!({ "machine": machine }))
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "remote machine: could not read it to announce a change");
+            }
+        }
+    }
+
+    /// Whether a link is up now.
+    pub(crate) fn is_connected(&self) -> bool {
+        lock(&self.status).connected
+    }
 }
 
-/// A running connector to the configured node. Clones share it.
+/// A running connector to one exposed machine. Clones share it.
 #[derive(Clone)]
 pub struct RemoteNode {
     shared: Arc<Shared>,
@@ -208,31 +539,24 @@ impl std::fmt::Debug for RemoteNode {
 }
 
 impl RemoteNode {
-    /// Register the node and its lease if needed, then start dialing.
-    /// Forwarded `workspace_api` calls from the node's agents are answered
-    /// with `calls`; without it, every node request is refused.
+    /// Start the connector to `target` on this backend's live lease there.
+    /// Nothing is dialed until a link is wanted. Forwarded `workspace_api`
+    /// calls are answered and changes announced with `services`; without
+    /// them, every machine request is refused.
     pub(crate) async fn start(
         store: Store,
-        config: HeadNodeConfig,
-        calls: Option<HeadCalls>,
-    ) -> Result<Self> {
-        Self::start_with(store, config, Tuning::default(), calls).await
-    }
-
-    pub(crate) async fn start_with(
-        store: Store,
-        config: HeadNodeConfig,
+        target: MachineTarget,
         tuning: Tuning,
-        calls: Option<HeadCalls>,
+        services: Option<Services>,
     ) -> Result<Self> {
-        let lease = HeadLease::open(store, &config).await?;
+        let lease = HeadLease::open(store, &target.id).await?;
         #[cfg(test)]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
         let store = lease.store().clone();
         let status = NodeStatus {
-            node_id: config.node_id.clone(),
-            node_name: config.name.clone(),
+            node_id: target.id.clone(),
+            node_name: target.name.clone(),
             lease_id: lease.owner().lease_id.clone(),
             connected: false,
             platform: None,
@@ -240,24 +564,31 @@ impl RemoteNode {
             running_agents: Vec::new(),
             intentd_version: None,
         };
+        let (demand, demands) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             agents: Agents::default(),
             tuning,
             store,
+            services,
+            target: Mutex::new(target),
             parked: Mutex::new(HashMap::new()),
             link: watch::channel(None).0,
             status: Mutex::new(status),
-            pending_stops: Mutex::new(BTreeSet::new()),
+            stops: Mutex::new(BTreeMap::new()),
+            stops_changed: watch::channel(0).0,
+            resending: Mutex::new(HashMap::new()),
+            capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
+            demand,
             shutdown: watch::channel(false).0,
         });
-        intent_core::spawn_daemon(run(
-            shared.clone(),
-            config.endpoint,
-            lease,
-            Ingest::new(acked),
-            calls,
-        ));
+        // After a backend restart, agents placed here may still run: bind
+        // once to claim them (and let the idle timer close an unneeded link).
+        let lease_id = lease.owner().lease_id.clone();
+        if !shared.store.list_remote_agents(&lease_id).await?.is_empty() {
+            shared.wake();
+        }
+        intent_core::spawn_daemon(run(shared.clone(), lease, Ingest::new(acked), demands));
         Ok(Self { shared })
     }
 
@@ -266,7 +597,7 @@ impl RemoteNode {
         self.shared.clone()
     }
 
-    /// What head knows about the node now.
+    /// What head knows about the machine now.
     #[must_use]
     pub fn status(&self) -> NodeStatus {
         lock(&self.shared.status).clone()
@@ -278,9 +609,10 @@ impl RemoteNode {
         *lock(&self.shared.ingested)
     }
 
-    /// Attach `agent_id` (running, or about to be launched, on the node) and
-    /// return its runtime. Records for the agent are delivered to the
-    /// runtime from now on; attach before sending its launch.
+    /// Attach `agent_id` (running, or about to be launched, on the machine)
+    /// and return its runtime. Records for the agent are delivered to the
+    /// runtime from now on; attach before sending its launch. A live agent
+    /// keeps the link up.
     #[must_use]
     pub fn attach(
         &self,
@@ -288,11 +620,77 @@ impl RemoteNode {
         workspace_id: &WorkspaceId,
     ) -> Arc<RemoteAgentRuntime> {
         let sink = self.shared.agents.attach(agent_id, workspace_id.clone());
+        self.shared.wake();
         Arc::new(RemoteAgentRuntime::new(
             agent_id.clone(),
             sink,
             self.shared.clone(),
         ))
+    }
+
+    /// Connect now if no link is up, and wait for the bind.
+    ///
+    /// # Errors
+    ///
+    /// `machine-unreachable` (with the routes tried), `machine-revoked` or
+    /// `machine-update-required`.
+    pub async fn connect(&self) -> Result<()> {
+        if self.shared.current_link().is_some() {
+            // Keeps the idle timer from closing the link under the caller.
+            self.shared.wake();
+            return Ok(());
+        }
+        self.connect_raw()
+            .await
+            .map_err(|failure| failure.into_error(&self.status().node_name))
+    }
+
+    async fn connect_raw(&self) -> std::result::Result<(), ConnectFailure> {
+        let (tx, rx) = oneshot::channel();
+        if self.shared.demand.send(Some(tx)).is_err() {
+            return Err(ConnectFailure::Local("the connector has stopped".into()));
+        }
+        let limit = self.shared.tuning.connect.total + Duration::from_secs(5);
+        match tokio::time::timeout(limit, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ConnectFailure::Local("the connector has stopped".into())),
+            Err(_) => Err(ConnectFailure::Unreachable(Vec::new())),
+        }
+    }
+
+    /// Connect if needed and ask the machine for a fresh capabilities
+    /// report; it is recorded and announced before this returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
+    /// does not answer.
+    pub async fn refresh_capabilities(&self) -> Result<MachineCapabilities> {
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.capability_waiters).push(tx);
+        let reply = async {
+            self.connect().await?;
+            self.shared.send(&LinkFrame::Capabilities).await?;
+            tokio::time::timeout(self.shared.tuning.capabilities_timeout, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not report its capabilities",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        // On failure, drop this request so it no longer holds the link.
+        lock(&self.shared.capability_waiters).retain(|waiter| !waiter.is_closed());
+        reply
+    }
+
+    /// Wait until none of `agents` has an unacknowledged stop, or until
+    /// `deadline`; returns those still unacknowledged.
+    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+        self.shared.wait_stops(agents, deadline).await
     }
 
     /// Send a control frame (such as a launch) on the current link.
@@ -304,22 +702,44 @@ impl RemoteNode {
         self.shared.send(frame).await
     }
 
-    /// Agents head counts as running on the node.
+    /// Agents head counts as running on the machine.
     #[must_use]
     pub fn running(&self) -> usize {
         self.shared.agents.live_count()
     }
 
-    /// The node's supported and currently available platforms.
+    /// Stop every agent attached here: their runtimes end and the machine
+    /// is told to stop them. Returns every agent with a stop the machine has
+    /// not acknowledged yet, these included.
+    #[must_use = "the stops are only confirmed once acknowledged"]
+    pub fn stop_all(&self) -> Vec<AgentId> {
+        let mut stopped = self.shared.agents.live_ids();
+        for agent_id in &stopped {
+            self.shared.agents.close(agent_id);
+            self.shared.request_stop(agent_id);
+        }
+        for agent_id in lock(&self.shared.stops).keys() {
+            if !stopped.contains(agent_id) {
+                stopped.push(agent_id.clone());
+            }
+        }
+        stopped
+    }
+
+    /// The machine's supported and currently available platforms.
     #[must_use]
     pub fn availability(&self) -> PlatformAvailability {
         self.shared.availability()
     }
 
-    /// The runtime of `command`'s agent: the one kept for it when the node
-    /// was already running it at bind, or a new one, attached before the
-    /// launch is sent (waiting up to the link-loss grace for a link). A
-    /// launch for an agent the node already runs is ignored by the node.
+    pub(crate) fn shared_ref(&self) -> &Shared {
+        &self.shared
+    }
+
+    /// The runtime of `command`'s agent: the one kept for it when the
+    /// machine was already running it at bind, or a new one, attached before
+    /// the launch is sent (waiting up to the link-loss grace for a link). A
+    /// launch for an agent the machine already runs is ignored by it.
     ///
     /// # Errors
     ///
@@ -330,13 +750,16 @@ impl RemoteNode {
             return Ok(runtime);
         }
         let runtime = self.attach(&command.agent_id, &command.workspace_id);
+        // Never launch behind this agent's unacknowledged stop: a resend of
+        // it would stop the new process.
+        self.shared.no_stop_pending(&command.agent_id).await?;
         let link = self
             .shared
             .link_within(self.shared.tuning.link_loss_grace)
             .await
             .ok_or_else(|| {
                 Error::Internal(format!(
-                    "{}: the execution node is not connected",
+                    "{}: the machine is not connected",
                     link::codes::UNAVAILABLE
                 ))
             })?;
@@ -353,69 +776,136 @@ impl RemoteNode {
     }
 }
 
+/// Why a bound link stopped being served.
+enum Ended {
+    /// Nothing wanted it for the idle timeout.
+    Idle,
+    /// It closed, or a live gap needs a rebind.
+    Lost,
+    Shutdown,
+}
+
 async fn run(
     shared: Arc<Shared>,
-    endpoint: NodeEndpoint,
     lease: HeadLease,
     mut ingest: Ingest,
-    calls: Option<HeadCalls>,
+    mut demands: mpsc::UnboundedReceiver<Option<Waiter>>,
 ) {
+    let calls = shared.services.clone().map(HeadCalls::new);
     let mut backoff = shared.tuning.backoff.clone();
     let mut shutdown = shared.shutdown.subscribe();
+    let mut waiters: Vec<Waiter> = Vec::new();
+    // Redial after a failure or a lost link while the link is wanted.
+    let mut retry = false;
     loop {
+        if !retry && waiters.is_empty() && !shared.wants_link() {
+            tokio::select! {
+                demand = demands.recv() => match demand {
+                    Some(waiter) => waiters.extend(waiter),
+                    None => return,
+                },
+                () = wait_true(&mut shutdown) => return,
+            }
+        }
+        while let Ok(waiter) = demands.try_recv() {
+            waiters.extend(waiter);
+        }
+        let target = shared.target();
+        let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
-        let dialed = link::dial_with_backoff(
-            &endpoint,
-            || {
-                let lease = lease.clone();
-                async move { lease.next_hello(ingested).await }
-            },
-            &mut backoff,
-            shutdown.clone(),
-        )
+        let connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
+            let lease = lease.clone();
+            async move { lease.next_hello(ingested).await }
+        })
         .await;
         if *shutdown.borrow() {
-            if let Ok(dialed) = dialed {
-                dialed.link.close();
+            if let Ok(connected) = connected {
+                connected.dialed.link.close();
             }
             return;
         }
-        let DialedLink {
+        let Connected { dialed, endpoint } = match connected {
+            Ok(connected) => connected,
+            Err(failure) => {
+                tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
+                if matches!(failure, ConnectFailure::Revoked(_)) {
+                    shared.drop_stops();
+                }
+                shared.record_failure(&failure).await;
+                shared.announce().await;
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Err(failure.clone()));
+                }
+                // Fail the capability requests; they no longer hold a link.
+                lock(&shared.capability_waiters).clear();
+                retry = shared.wants_link();
+                if retry {
+                    let delay = match failure {
+                        ConnectFailure::Revoked(_) | ConnectFailure::UpdateRequired(_) => {
+                            shared.tuning.permanent_retry
+                        }
+                        _ => backoff.next_delay(),
+                    };
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        demand = demands.recv() => match demand {
+                            Some(waiter) => waiters.extend(waiter),
+                            None => return,
+                        },
+                        () = wait_true(&mut shutdown) => return,
+                    }
+                }
+                continue;
+            }
+        };
+        let link::DialedLink {
             link,
             events,
             welcome,
-        } = match dialed {
-            Ok(dialed) => dialed,
-            Err(error) => {
-                tracing::warn!(
-                    code = link::error_code(&error).unwrap_or("other"),
-                    "remote node: cannot bind the node; retrying later"
-                );
-                tokio::select! {
-                    () = tokio::time::sleep(shared.tuning.permanent_retry) => continue,
-                    () = wait_true(&mut shutdown) => return,
-                }
-            }
-        };
+        } = dialed;
+        backoff.reset();
+        retry = false;
         if let Err(error) = lease.record_welcome(&welcome).await {
-            tracing::warn!(%error, "remote node: could not record the node's welcome");
+            tracing::warn!(%error, "remote machine: could not record the welcome");
         }
         shared.welcome(&welcome);
+        shared.record_link(&welcome).await;
+        // Before the link is published: queue the stops of agents head no
+        // longer claims, then send every queued stop, so they precede any
+        // launch or prompt on this link.
+        claim(&shared, &welcome).await;
+        shared.send_queued(&link).await;
+        #[cfg(test)]
+        if let Some(hook) = &shared.tuning.before_publish.0 {
+            hook(&shared);
+        }
         shared.link.send_replace(Some(link.clone()));
+        shared.resend_queued(&link);
+        for waiter in waiters.drain(..) {
+            let _ = waiter.send(Ok(()));
+        }
         tracing::info!(
+            machine = %target.id,
             generation = link.binding().generation.0,
             ingested = ingested.0,
-            "remote node: link bound"
+            "remote machine: link bound"
         );
-        claim(&shared, &welcome, &link).await;
-        shared.flush_stops().await;
+        shared.announce().await;
         let git = serve_git(&shared, &endpoint, &link).await;
         let served = Served {
             lease: &lease,
             link: &link,
             calls: calls.as_ref(),
         };
-        serve(&shared, served, &mut ingest, events, &mut shutdown).await;
+        let ended = serve(
+            &shared,
+            served,
+            &mut ingest,
+            events,
+            &mut shutdown,
+            &mut demands,
+        )
+        .await;
         if let Some(git) = git {
             git.abort();
         }
@@ -430,10 +920,18 @@ async fn run(
             ours
         });
         shared.disconnected();
-        if *shutdown.borrow() {
-            return;
+        lock(&shared.capability_waiters).clear();
+        match ended {
+            Ended::Shutdown => return,
+            Ended::Idle => {
+                tracing::info!(machine = %target.id, "remote machine: idle; disconnected");
+            }
+            Ended::Lost => {
+                retry = shared.wants_link();
+                tracing::info!(machine = %target.id, redial = retry, "remote machine: link closed");
+            }
         }
-        tracing::info!("remote node: link closed; redialing");
+        shared.announce().await;
     }
 }
 
@@ -444,22 +942,27 @@ struct Served<'a> {
     calls: Option<&'a HeadCalls>,
 }
 
-/// Ingest one link's journal and answer its requests until it closes, a
-/// live gap needs a rebind, or shutdown.
+/// Ingest one link's journal, answer its requests and connect requests,
+/// until it closes, a live gap needs a rebind, it has been idle for
+/// [`Tuning::idle_timeout`], or shutdown.
 async fn serve(
     shared: &Arc<Shared>,
     Served { lease, link, calls }: Served<'_>,
     ingest: &mut Ingest,
     mut events: LinkEvents,
     shutdown: &mut watch::Receiver<bool>,
-) {
+    demands: &mut mpsc::UnboundedReceiver<Option<Waiter>>,
+) -> Ended {
     let mut acks = Acks::default();
+    let mut idle_since: Option<Instant> = None;
+    let mut idle_check = tokio::time::interval(shared.tuning.idle_check);
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ingest.start_link();
-    loop {
+    let ended = loop {
         let due = acks.due;
         tokio::select! {
             event = events.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else { break Ended::Lost };
                 match event {
                     LinkEvent::Frame(LinkFrame::Journal(record)) => {
                         let seq = record.seq;
@@ -472,7 +975,7 @@ async fn serve(
                                 tracing::warn!(
                                     from = lost.0 .0,
                                     through = lost.1 .0,
-                                    "remote node: journal records were lost on the node"
+                                    "remote machine: journal records were lost on the machine"
                                 );
                                 record_placement(shared, &record).await;
                                 shared.agents.deliver(record);
@@ -482,9 +985,9 @@ async fn serve(
                                 tracing::warn!(
                                     seq = seq.0,
                                     ingested = ingest.ingested().0,
-                                    "remote node: journal gap on the live link; rebinding"
+                                    "remote machine: journal gap on the live link; rebinding"
                                 );
-                                break;
+                                break Ended::Lost;
                             }
                         }
                         *lock(&shared.ingested) = ingest.ingested();
@@ -494,11 +997,26 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::ReplayComplete { through_seq }) => {
                         ingest.replay_complete();
-                        tracing::debug!(through = through_seq.0, "remote node: replay complete");
+                        tracing::debug!(through = through_seq.0, "remote machine: replay complete");
                         acks.flush(lease, link, ingest.ingested()).await;
                     }
+                    LinkEvent::Frame(LinkFrame::CapabilitiesReply { capabilities }) => {
+                        shared.capabilities(&capabilities);
+                        if let Err(error) = shared
+                            .store
+                            .record_exposed_machine_capabilities(&shared.machine_id(), &capabilities)
+                            .await
+                        {
+                            tracing::warn!(%error, "remote machine: could not record its capabilities");
+                        }
+                        shared.announce().await;
+                        let waiters: Vec<_> = lock(&shared.capability_waiters).drain(..).collect();
+                        for waiter in waiters {
+                            let _ = waiter.send(capabilities.clone());
+                        }
+                    }
                     LinkEvent::Frame(frame) => {
-                        tracing::debug!(channel = ?frame.channel(), "remote node: ignoring an unexpected frame");
+                        tracing::debug!(channel = ?frame.channel(), "remote machine: ignoring an unexpected frame");
                     }
                     LinkEvent::Request(request) => match calls {
                         Some(calls) => calls.answer(shared.clone(), request),
@@ -506,15 +1024,33 @@ async fn serve(
                     },
                 }
             }
+            demand = demands.recv() => {
+                // Someone needs the link: it is up, so answer at once and
+                // restart the idle window.
+                idle_since = None;
+                if let Some(Some(waiter)) = demand {
+                    let _ = waiter.send(Ok(()));
+                }
+            }
+            _ = idle_check.tick() => {
+                if shared.wants_link() {
+                    idle_since = None;
+                } else if idle_since.get_or_insert_with(Instant::now).elapsed()
+                    >= shared.tuning.idle_timeout
+                {
+                    break Ended::Idle;
+                }
+            }
             () = sleep_until(due), if due.is_some() => {
                 acks.flush(lease, link, ingest.ingested()).await;
             }
-            () = wait_true(shutdown) => break,
+            () = wait_true(shutdown) => break Ended::Shutdown,
         }
-    }
+    };
     // Persist what was ingested even if the ack can no longer be sent, so
     // the next hello asks for exactly the rest.
     acks.flush(lease, link, ingest.ingested()).await;
+    ended
 }
 
 /// Ack batching for one link.
@@ -556,10 +1092,11 @@ impl Acks {
 }
 
 /// Claim the node's running agents at bind: an agent head has no record of
-/// on this lease (a head crash mid-launch, a deleted agent) is stopped; one
+/// on this lease (a head crash mid-launch, a deleted agent) gets a queued
+/// stop with a new id, resent until acknowledged; one
 /// head knows but has not attached since it started gets a runtime, kept
 /// until the agent manager takes it, so its output is not dropped.
-async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
+async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome) {
     if welcome.running_agents.is_empty() {
         return;
     }
@@ -582,13 +1119,7 @@ async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
         match workspaces.get(agent_id) {
             None => {
                 tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
-                let stop = LinkFrame::Stop {
-                    agent_id: agent_id.clone(),
-                    stop_id: intent_core::node_link::StopId::new_v4(),
-                };
-                if link.send(&stop).await.is_err() {
-                    return;
-                }
+                shared.queue_stop(agent_id);
             }
             Some(workspace_id) if !shared.agents.is_attached(agent_id) => {
                 let sink = shared.agents.attach(agent_id, (*workspace_id).clone());
