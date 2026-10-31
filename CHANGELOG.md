@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.94] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(acp)* Fail requests registered after agent stdout EOF immediately ([#2879](https://github.com/intent-hq/intentd/pull/2879))
+
+
 ## [0.11.93] - 2026-10-31
 
 ### 🚀 Features
