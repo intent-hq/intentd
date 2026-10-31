@@ -1001,9 +1001,8 @@ available space. Moving the pointer between tabs smoothly switches the preview
 without changing your remembered section. In the expanded sidebar, selecting a
 different section leaves your open main content in place.
 
-Single-pane app versions keep one sidebar pane selected. In development or test
-builds that support multiple panes, **Shift-click** a section
-tab to add or remove its pane; selected panes stack in sidebar order, and at least
+Single-pane app versions keep one sidebar pane selected. In app versions that
+support multiple panes, **Shift-click** a section tab to add or remove its pane; selected panes stack in sidebar order, and at least
 one stays open. Your selection is remembered per workspace. Hold **Shift** while
 using arrow keys to move focus without changing the selection, then use
 **Shift+Enter** or **Shift+Space** to add or remove that pane. A normal click
