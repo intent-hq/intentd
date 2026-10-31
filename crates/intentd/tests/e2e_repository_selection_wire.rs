@@ -411,6 +411,26 @@ async fn native_selection_cold_uds_wss_manager_permission_cas_and_receipts() {
         .save(h.query(), &edit, json!({"mode":"automatic"}))
         .await;
     assert_eq!(changed["error"]["code"], -32602);
+    assert!(
+        changed["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Selection command already claimed")),
+        "{changed}"
+    );
+    let malformed_name = local
+        .save(
+            h.query(),
+            &edit,
+            json!({"mode":"explicit-remote","remoteName":" unobserved-local-intent"}),
+        )
+        .await;
+    assert_eq!(malformed_name["error"]["code"], -32602);
+    assert!(
+        malformed_name["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Invalid repository remote name")),
+        "{malformed_name}"
+    );
     let exact_q = json!({"workspaceId":h.workspace,"gitRootId":h.registered});
     let exact = owner.capture(exact_q.clone()).await;
     refused(

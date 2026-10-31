@@ -45,8 +45,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    blank_cfg_test_items, crate_src_files, lex, markers_by_line, split_statements, workspace_root,
-    Marker,
+    blank_cfg_test_items, crate_src_files, lex, markers_by_line, split_statements, tokenize_str,
+    workspace_root, Marker, Token, TokenKind,
 };
 
 const FOLD_CALLS: &[&str] = &[
@@ -69,114 +69,60 @@ struct Hit {
     marker_malformed: bool,
 }
 
-/// One token of a blanked statement: a word (identifier, keyword, or number)
-/// or a punctuation token (multi-character operators kept whole, so `&&` and
-/// `||` are single tokens).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tok<'a> {
-    Word(&'a str),
-    Punct(&'a str),
-}
-
-/// Multi-character operators the split depends on, longest first: `&&` /
-/// `||` are the split points, and every operator containing `=` must stay
-/// whole so a lone `=` token is always an assignment.
-const MULTI_PUNCT: &[&str] = &[
-    "<<=", ">>=", "..=", "==", "!=", "<=", ">=", "=>", "&&", "||", "+=", "-=", "*=", "/=", "%=",
-    "^=", "|=", "&=",
-];
 /// Assignment operators: what precedes the first top-level one is the
 /// statement's binding target.
 const ASSIGN_OPS: &[&str] = &[
     "=", "+=", "-=", "*=", "/=", "%=", "^=", "|=", "&=", "<<=", ">>=",
 ];
 
-fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn tokens(text: &str) -> Vec<Tok<'_>> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        if c.is_whitespace() {
-            rest = &rest[c.len_utf8()..];
-            continue;
-        }
-        let word = is_word_char(c);
-        let len = if word {
-            rest.find(|ch: char| !is_word_char(ch))
-                .unwrap_or(rest.len())
-        } else {
-            MULTI_PUNCT
-                .iter()
-                .find(|p| rest.starts_with(**p))
-                .map_or(c.len_utf8(), |p| p.len())
-        };
-        let (tok, tail) = rest.split_at(len);
-        out.push(if word {
-            Tok::Word(tok)
-        } else {
-            Tok::Punct(tok)
-        });
-        rest = tail;
-    }
-    out
-}
-
 /// Whether a `||` / `&&` after `prev` begins an operand — a closure opener
 /// (`= ||`, `move ||`, `async ||`, `&||`) or a double borrow (`= &&x`) —
 /// rather than joining two boolean operands.
-fn begins_operand(prev: Option<Tok>) -> bool {
-    match prev {
-        None => true,
-        Some(Tok::Punct(p)) => {
-            ASSIGN_OPS.contains(&p) || ["=>", "&", ",", ":", "!", "|", "(", "["].contains(&p)
-        }
-        Some(Tok::Word(w)) => ["move", "async", "return", "in"].contains(&w),
+fn begins_operand(prev: Option<&Token>) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    let p = prev.text.as_str();
+    if prev.kind == TokenKind::Punct {
+        ASSIGN_OPS.contains(&p) || ["=>", "&", ",", ":", "!", "|", "(", "["].contains(&p)
+    } else {
+        ["move", "async", "return", "in"].contains(&p)
     }
 }
 
 /// Splits a statement into its binding target (the tokens before its first
 /// top-level assignment operator; empty when it has none) and the top-level
 /// `&&` / `||` operands of the rest — split outside every `(…)` / `[…]`
-/// group, never at a `||` / `&&` that begins an operand.
-fn split_operands<'a, 't>(toks: &'t [Tok<'a>]) -> (&'t [Tok<'a>], Vec<&'t [Tok<'a>]>) {
-    let mut target: &[Tok] = &[];
+/// group (a statement holds no `{…}`: `split_statements` cuts at braces),
+/// never at a `||` / `&&` that begins an operand.
+fn split_operands(toks: &[Token]) -> (&[Token], Vec<&[Token]>) {
+    let mut target: &[Token] = &[];
     let mut assigned = false;
     let mut operands = Vec::new();
-    let mut depth = 0usize;
     let mut start = 0;
     for (i, t) in toks.iter().enumerate() {
-        let prev = i.checked_sub(1).map(|p| toks[p]);
-        match *t {
-            Tok::Punct("(" | "[") => depth += 1,
-            Tok::Punct(")" | "]") => depth = depth.saturating_sub(1),
-            Tok::Punct(p)
-                if depth == 0 && !assigned && operands.is_empty() && ASSIGN_OPS.contains(&p) =>
-            {
-                target = &toks[..i];
-                assigned = true;
-                start = i + 1;
-            }
-            Tok::Punct("&&" | "||") if depth == 0 && !begins_operand(prev) => {
-                operands.push(&toks[start..i]);
-                start = i + 1;
-            }
-            _ => {}
+        if t.depth != 0 || t.kind != TokenKind::Punct {
+            continue;
+        }
+        let p = t.text.as_str();
+        if !assigned && operands.is_empty() && ASSIGN_OPS.contains(&p) {
+            target = &toks[..i];
+            assigned = true;
+            start = i + 1;
+        } else if (p == "&&" || p == "||") && !begins_operand(i.checked_sub(1).map(|p| &toks[p])) {
+            operands.push(&toks[start..i]);
+            start = i + 1;
         }
     }
     operands.push(&toks[start..]);
     (target, operands)
 }
 
-/// Identifier words (not numbers or punctuation) among `toks`.
-fn identifiers<'a>(toks: &[Tok<'a>]) -> Vec<&'a str> {
+/// Identifiers (not numbers or punctuation) among `toks`.
+fn identifiers(toks: &[Token]) -> Vec<&str> {
     toks.iter()
-        .filter_map(|t| match *t {
-            Tok::Word(w) if w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') => Some(w),
-            _ => None,
-        })
+        .filter(|t| t.is_ident())
+        .map(|t| t.text.as_str())
         .collect()
 }
 
@@ -191,7 +137,7 @@ fn is_flagged(statement: &str) -> bool {
     if !FOLD_CALLS.iter().any(|f| statement.contains(f)) {
         return false;
     }
-    let toks = tokens(statement);
+    let toks = tokenize_str(statement);
     let has_owner = identifiers(&toks)
         .iter()
         .any(|id| has_component(id, "owner"));

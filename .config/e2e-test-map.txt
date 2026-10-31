@@ -41,16 +41,26 @@ crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  s
 # scripts over MCP, and e2e_wss_hook_mcp_tools runs hook scripts (hook_manager
 # evaluates them through intent-js). The workspace_api binding suites call
 # ws.* bindings through the bridge end to end, and e2e_hook_lifecycle runs
-# hook scripts. The library unit tests of every crate depending on intent-js
-# directly (intent-acp's tests_wsapi*, intent-services, intent-svc-runtime's
-# hook_manager) are selected by changed-tests.sh's lib_rdeps_roots, not by
-# entries here.
+# hook scripts. e2e_wss_archive_from_hook and e2e_wss_display_status_hooks
+# schedule hooks through workspace_api and run their scripts;
+# e2e_wss_chief_workspace and e2e_mock_agent_ws_app call ws.app.* and the
+# chief bindings through workspace_api; e2e_mcp_bridge_resilience runs a slow
+# workspace_api script (its other scenarios test the mcp-bridge transport, but
+# a map entry selects the whole module). The library unit tests of every
+# crate depending on intent-js directly (intent-acp's tests_wsapi*,
+# intent-services, intent-svc-runtime's hook_manager) are selected by
+# changed-tests.sh's lib_rdeps_roots, not by entries here.
 crates/intent-js/src/*                               intentd::wss_integration  desktop_control
 crates/intent-js/src/*                               intentd::wss_integration  script_lifecycle
 crates/intent-js/src/*                               intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools
 crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings
 crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings2
 crates/intent-js/src/*                               intentd::suite_e2e        e2e_hook_lifecycle
+crates/intent-js/src/*                               intentd::suite_e2e        e2e_mcp_bridge_resilience
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_archive_from_hook
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_display_status_hooks
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_chief_workspace
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_ws_app
 
 # Desktop binding (ws.desktop.*): the workspace_api tests that drive it.
 crates/intent-acp/src/mcp_server/bindings/desktop.rs intentd::wss_integration  desktop_control

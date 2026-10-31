@@ -1568,3 +1568,168 @@ async fn native_selection_public_reply_capture_is_published_before_transfer() {
         Persistence::Committed { .. }
     ));
 }
+
+#[track_caller]
+fn invalid_params_message(result: Result<Attempt>) -> String {
+    match result {
+        Err(Error::InvalidParams(message)) => message,
+        other => panic!("expected invalid params, got {other:?}"),
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_invalid_remote_name_reports_its_own_refusal() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    for name in [
+        String::new(),
+        " origin".into(),
+        "origin ".into(),
+        "ori\ngin".into(),
+        "a".repeat(1025),
+        // 513 characters, but 1026 UTF-8 bytes: the limit counts bytes.
+        "é".repeat(513),
+    ] {
+        let refused = s
+            .save(
+                &f,
+                &capture,
+                Choice::ExplicitRemote {
+                    remote_name: name.clone(),
+                },
+            )
+            .await;
+        assert_eq!(
+            invalid_params_message(refused),
+            "Invalid repository remote name",
+            "remote name {name:?}"
+        );
+    }
+
+    // A rejected name claims nothing: the same original selection still saves,
+    // and exactly 1024 bytes is within the limit.
+    let saved = s
+        .save(
+            &f,
+            &capture,
+            Choice::ExplicitRemote {
+                remote_name: "a".repeat(1024),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt(&saved).persistence,
+        Persistence::Committed { .. }
+    ));
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_changed_command_keeps_claimed_refusal() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    s.save(
+        &f,
+        &capture,
+        Choice::ExplicitRemote {
+            remote_name: "not-current-git".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        invalid_params_message(s.save(&f, &capture, Choice::Automatic {}).await),
+        "Selection command already claimed"
+    );
+    // Malformed input is reported as such even after a command was claimed.
+    assert_eq!(
+        invalid_params_message(
+            s.save(
+                &f,
+                &capture,
+                Choice::ExplicitRemote {
+                    remote_name: " not-current-git".into(),
+                },
+            )
+            .await
+        ),
+        "Invalid repository remote name"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_invalid_remote_name_neither_waits_for_nor_takes_the_lane() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let capture = s.capture(&f).await.unwrap();
+    let q = bound(&capture);
+    let mut malformed = save_query(&capture);
+    malformed.choice = Choice::ExplicitRemote {
+        remote_name: " not-current-git".into(),
+    };
+    let mut valid = save_query(&capture);
+    valid.choice = Choice::ExplicitRemote {
+        remote_name: "not-current-git".into(),
+    };
+    s.entered(async {
+        // An undelivered reconcile holds the operation's single request lane.
+        let holder = RetireFrame(
+            s.owner
+                .capture_selection(&Frame::Reconcile(q.clone()))
+                .unwrap(),
+        );
+        let (busy_guard, busy) = transferred(
+            &s,
+            Frame::Save(valid.clone()),
+            async { f.services.repository_selection_save(valid.clone()).await },
+            || {},
+        )
+        .await;
+        assert!(
+            matches!(busy, Err(Error::Forbidden(_))),
+            "the held lane refuses a valid save: {busy:?}"
+        );
+        drop(busy_guard);
+        let (refused_guard, refused) = transferred(
+            &s,
+            Frame::Save(malformed.clone()),
+            async {
+                f.services
+                    .repository_selection_save(malformed.clone())
+                    .await
+            },
+            || {},
+        )
+        .await;
+        assert_eq!(
+            invalid_params_message(refused),
+            "Invalid repository remote name",
+            "a malformed name is reported as such even while the lane is busy"
+        );
+        drop(refused_guard);
+        drop(holder);
+
+        // An undelivered malformed save must not hold the lane against a valid one.
+        let pending = RetireFrame(
+            s.owner
+                .capture_selection(&Frame::Save(malformed.clone()))
+                .unwrap(),
+        );
+        let (saved_guard, saved) = transferred(
+            &s,
+            Frame::Save(valid.clone()),
+            async { f.services.repository_selection_save(valid.clone()).await },
+            || {},
+        )
+        .await;
+        assert!(matches!(
+            receipt(&saved.expect("a malformed frame never claims the lane")).persistence,
+            Persistence::Committed { .. }
+        ));
+        drop(saved_guard);
+        drop(pending);
+    })
+    .await;
+}

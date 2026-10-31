@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.88] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(selection)* Report invalid remote names with the right error ([#2854](https://github.com/intent-hq/intentd/pull/2854))
+
+### 📚 Documentation
+
+- *(guide)* Mention the Assistant sidebar New chat action ([#2836](https://github.com/intent-hq/intentd/pull/2836))
+
+
+## [0.11.87] - 2026-10-31
+
+### 🔧 Refactor
+
+- *(transport)* Let client.hello take its client id from the reservation ([#2835](https://github.com/intent-hq/intentd/pull/2835))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Drop guide text and pointers for code that is not in the app ([#2849](https://github.com/intent-hq/intentd/pull/2849))
+
+
+## [0.11.86] - 2026-10-30
+
+### 🐛 Bug Fixes
+
+- Refresh remote base before creating local workspaces ([#2841](https://github.com/intent-hq/intentd/pull/2841))
+
+### 📚 Documentation
+
+- Describe personal workspace Set aside controls ([#2845](https://github.com/intent-hq/intentd/pull/2845))
+
+
 ## [0.11.85] - 2026-10-30
 
 ### 📚 Documentation
