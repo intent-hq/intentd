@@ -217,3 +217,46 @@ async fn search_requires_a_criterion_and_a_repository() {
         "{err}"
     );
 }
+
+/// Regression (intentd#2865 review): one sibling with many stronger note hits
+/// must not starve another sibling's weaker note match, alone or combined with
+/// that sibling's PR.
+#[intent_test_macros::daemon_test]
+async fn many_note_hits_in_one_sibling_do_not_hide_another() {
+    let h = harness().await;
+    let store = h.svc.store();
+    let login = WorkspaceId::from("ws-login");
+    for i in 0..210 {
+        let mut n = note(&login, &format!("z-{i}"), "zebra zebra zebra");
+        n.title = "Zebra".to_string();
+        store.insert_note(&n).await.expect("strong note");
+    }
+    store
+        .insert_note(&note(
+            &WorkspaceId::from("ws-dark"),
+            "z-dark",
+            "a long paragraph that only mentions a zebra once among many other words",
+        ))
+        .await
+        .expect("weak note");
+
+    let v = h
+        .svc
+        .cross_workspace_search(h.caller.clone(), search(Some("zebra"), None))
+        .await
+        .expect("search");
+    let got: Vec<&str> = v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, ["ws-login", "ws-dark"]);
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["matches"][0]["notes"].as_array().map(Vec::len), Some(3));
+
+    assert_eq!(
+        ids(&h, search(Some("zebra"), Some(INTENT_7))).await,
+        ["ws-dark"]
+    );
+}

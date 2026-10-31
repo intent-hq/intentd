@@ -20345,6 +20345,7 @@ impl WorkspaceApi for Services {
                 allowed_workspace_ids: visible.as_deref(),
                 include_archived,
                 limit,
+                per_workspace_limit: None,
             };
             let hits = match intent_search::fts_match_expr(&query) {
                 Some(expr) => self.store.search_notes_fts(&expr, &options).await?,

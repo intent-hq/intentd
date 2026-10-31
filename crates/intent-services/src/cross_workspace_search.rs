@@ -11,7 +11,7 @@
 //!   titles), for `query`;
 //! - the note FTS index restricted to the siblings, for `query`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use intent_core::{
     pull_request_key, CrossWorkspaceSearch, Error, PullRequestInfo, Result, Workspace, WorkspaceId,
@@ -21,10 +21,11 @@ use serde_json::{json, Value};
 
 use crate::{has_repository_identity, workspaces_share_repository, Services};
 
-/// Note hits kept per workspace in a result row.
+/// Note hits kept per workspace in a result row. Capped in SQL per
+/// workspace, so one sibling's many strong hits never crowd out another.
 const NOTES_PER_WORKSPACE: usize = 3;
-/// Note FTS hits read before grouping by workspace.
-const NOTE_HIT_BUDGET: i64 = 200;
+/// `NOTES_PER_WORKSPACE` as the store's SQL limit type; keep them equal.
+const NOTES_PER_WORKSPACE_SQL: i64 = 3;
 
 impl Services {
     /// The caller's sibling workspaces (`crossWorkspace.listSiblings` scope):
@@ -83,17 +84,36 @@ impl Services {
             .store
             .list_pull_request_links_for_workspaces(&ids)
             .await?;
+        // With a PR selector, only PR-matching siblings can survive ranking,
+        // so note search is restricted to them.
+        let note_scope: Vec<WorkspaceId> = match &search.pr {
+            Some(selector) => {
+                let matched: HashSet<&str> = links
+                    .iter()
+                    .filter(|l| selector.matches(&l.pr_key))
+                    .map(|l| l.workspace_id.as_str())
+                    .collect();
+                ids.iter()
+                    .filter(|id| matched.contains(id.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            None => ids.clone(),
+        };
         let note_hits = match query.and_then(intent_search::fts_match_expr) {
-            Some(expr) => {
+            Some(expr) if !note_scope.is_empty() => {
+                // The per-workspace cap bounds the result to
+                // `note_scope.len() * NOTES_PER_WORKSPACE` rows, so no global
+                // limit is needed and every eligible sibling is represented.
                 let options = NoteFtsOptions {
-                    allowed_workspace_ids: Some(&ids),
+                    allowed_workspace_ids: Some(&note_scope),
                     include_archived: true,
-                    limit: Some(NOTE_HIT_BUDGET),
+                    per_workspace_limit: Some(NOTES_PER_WORKSPACE_SQL),
                     ..NoteFtsOptions::default()
                 };
                 self.store.search_notes_fts(&expr, &options).await?
             }
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         Ok(rank_matches(
             siblings,
