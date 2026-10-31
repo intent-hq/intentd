@@ -32,7 +32,10 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 # not an intentd integration test, so it runs in coverage-all.sh but not here
 # --max-fail=25: report every failing test in one run, bounded, as
 # coverage-all.sh explains.
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 -p intentd \
+# In CI, ci-killed-rustc-retry.sh retries the build once when the runner
+# kills rustc with no compiler error (an out-of-memory kill); locally it
+# runs the command unchanged.
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/ci-killed-rustc-retry.sh "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 -p intentd \
     -E 'kind(test) and not binary(intentd) and not test(/^auggie_context_e2e::/)'
 
 # Generate lcov.info if requested (for CI artifact upload)
