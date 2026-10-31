@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.96] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(services)* Name the stderr capture dir when the settle bound expires ([#2893](https://github.com/intent-hq/intentd/pull/2893))
+
+### 🧪 Testing
+
+- Report held settings gates when the GitLab ABA settings.update stalls ([#2898](https://github.com/intent-hq/intentd/pull/2898))
+
+
 ## [0.11.95] - 2026-10-31
 
 ### 📚 Documentation
