@@ -10844,6 +10844,9 @@ mod wsapi6_bindings_tests {
         assert!(doc.contains("**Frame rate during agent use.**"));
         assert!(doc.contains("draws at full\nframe rate"));
         assert!(doc.contains("30 s\nafter your last action"));
+        // The idle rate is uneven (1-57 fps measured), not a fixed 1 fps.
+        assert!(doc.contains("throttled,\nuneven rate"));
+        assert!(!doc.contains("about 1 frame per second"));
     }
 
     #[tokio::test]

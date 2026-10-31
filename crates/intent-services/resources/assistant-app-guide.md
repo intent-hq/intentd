@@ -372,6 +372,8 @@ notice; if that one is still out of quota, Intent tries again later with growing
 waits. Conversations share what they learn: once one finds a configuration out of
 quota, others skip it on their next turn (until its reset time, or 5 hours), and once
 one succeeds on it again, conversations that left it go back on their next turn.
+Saving a change to a profile or to a Default configuration (for example a new API key
+or account folder) clears what was learned about it, so it is no longer skipped.
 Choosing a model or profile yourself makes that the new starting point. When every
 option is out of quota, Intent still tries them, and the usual quota message appears.
 
@@ -783,8 +785,9 @@ local-change state blocks the sweep; linked repositories outside the folder do n
 
 Newer or test app builds with matching daemon support may offer **Disable
 auto-archive** in the workspace's Home menu. Check released-app support before
-directing users to this control. Only the owner can change it; it starts off for
-each workspace and leaves manual archiving available. Older apps may not offer it.
+directing users to this control. Some app versions show it only while **Archive
+idle workspaces** is on. Only the owner can change it; it starts off for each
+workspace and leaves manual archiving available. Older apps may not offer it.
 
 In app and daemon versions offering folder cleanup, choose **Purge workspace
 folder** on an archived workspace, then confirm. This deletes the folder,

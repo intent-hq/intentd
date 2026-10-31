@@ -21125,6 +21125,15 @@ impl WorkspaceApi for Services {
         Box::pin(self.cross_workspace_search_op(workspace_id, search))
     }
 
+    fn app_workspaces_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: intent_core::CrossWorkspaceSearch,
+        repository: Option<intent_core::RepoRef>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.app_workspaces_search_op(workspace_id, search, repository))
+    }
+
     fn cross_workspace_list_notes(
         &self,
         workspace_id: WorkspaceId,

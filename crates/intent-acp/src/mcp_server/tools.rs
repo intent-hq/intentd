@@ -500,6 +500,7 @@ API:
   ws.app.workspaces.get(id) → workspace  // Assistant workspace only. Get one workspace metadata summary.
   ws.app.workspaces.transfer(id, { destination? }?) → ProposalCard  // Assistant workspace only. Proposes a project transfer to another device; reads metadata and transfer warnings without exporting or stopping agents. `destination` is a saved device name or connection ID hint; omit it to let the user choose. The desktop shows the actual source and destination for approval or cancellation. After approval, agents stop for export; success archives the source without restarting agents on the destination.
   ws.app.workspaces.list({ filter?, sort? }) → workspaces[]  // Assistant workspace only. Cross-workspace metadata list with query/status/repository/tags filtering; retired only via filter.includeRetired.
+  ws.app.workspaces.search(query | { query?, pr?, repository?, includeRetired?, limit? }) → { matches: [{ id, title, branch, status, archived, updatedAt, repository, repositoryPath, matchedOn, pullRequests?, notes?, link, markdownLink }], truncated }  // Assistant workspace only. Find workspaces in ANY repository by free text (title, branch, status, tags, PR titles, then note text) and/or a PR (`123`, `#123`, `owner/repo#123`, or URL; a bare number matches every repository). `repository: "owner/name"` narrows to one repo. Defaults to 20 results, max 100.
   ws.app.workspaces.open(id, { openInNewWindow? }?) → { ok, queued }  // Assistant workspace only. Opens a workspace through workspace-operations-saga. Pass `{ openInNewWindow: true }` to open in a new window.
 
   ws.note.read(id, { startLine?, maxLines? }?) → { id, title, content, rawContent, tags, totalLines, ... }  // Read a note. Use id=`spec` for the workspace spec. `content` is a DISPLAY rendering with line numbers like `   1 | text` — never write it back; `rawContent` is the editable Markdown to use for read-modify-write (the write ops reject numbered content).
@@ -2021,6 +2022,21 @@ mod tests {
         assert!(help.contains("without exporting or stopping agents"));
         assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains("ws.app.workspaces.transfer("));
         assert!(!WORKSPACE_API_DESCRIPTION.contains("ws.app.workspaces.transfer("));
+    }
+
+    #[test]
+    fn app_workspace_search_is_documented_only_in_chief_help() {
+        let help = help_namespace(
+            true,
+            &AgentFeaturesSettings::default(),
+            false,
+            "app.workspaces",
+        )
+        .unwrap();
+        assert!(help.contains("ws.app.workspaces.search(query | { query?, pr?, repository?"));
+        assert!(help.contains("in ANY repository"));
+        assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains("ws.app.workspaces.search("));
+        assert!(!WORKSPACE_API_DESCRIPTION.contains("ws.app.workspaces.search("));
     }
 
     // The compact description is a pure derivation of the full assembly: the
