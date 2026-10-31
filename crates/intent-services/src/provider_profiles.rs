@@ -2184,6 +2184,9 @@ impl Services {
             }
         }
 
+        // The saved Default may now reach another account or key: forget
+        // its shared quota state before anyone reads the new revision.
+        self.provider_quota_cache.forget(base);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -2487,6 +2490,9 @@ impl Services {
             return Err(e);
         }
 
+        // The saved profile may now reach another account or key: forget
+        // its shared quota state before anyone reads the new revision.
+        self.provider_quota_cache.forget(&meta.provider_ref());
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -2573,6 +2579,7 @@ impl Services {
             }
         }
 
+        self.provider_quota_cache.forget(&reference);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),

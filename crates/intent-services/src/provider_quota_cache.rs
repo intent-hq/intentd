@@ -15,6 +15,10 @@
 //!   conversation away from home whose home is marked working goes back on
 //!   its next turn without waiting for its own timer.
 //!
+//! - Saving an edit to a configuration (or deleting a profile) forgets its
+//!   entry: the new settings may reach another account or key, so the old
+//!   observation no longer applies (see [`ProviderQuotaCache::forget`]).
+//!
 //! Exhausted marks are advisory: when every candidate is marked the turn
 //! still tries them (see `next_candidate_avoiding`). In-memory only — after a
 //! daemon restart each conversation's persisted return timer applies as
@@ -95,6 +99,17 @@ impl ProviderQuotaCache {
                 }
                 entries.insert(selection, QuotaHealth::Working);
             }
+        }
+    }
+
+    /// Drop whatever is known about `selection`'s quota, so every
+    /// conversation treats it as unknown again: no longer skipped, and no
+    /// longer a reason to return early. Called when an edit to the
+    /// configuration is saved or a profile is deleted.
+    pub(crate) fn forget(&self, selection: &str) {
+        let selection = provider_profiles::canonical_selection(selection);
+        if self.entries.lock().unwrap().remove(&selection).is_some() {
+            tracing::info!(provider = %selection, "provider settings changed; quota state cleared for all conversations");
         }
     }
 

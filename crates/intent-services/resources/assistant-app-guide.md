@@ -338,6 +338,8 @@ notice; if that one is still out of quota, Intent tries again later with growing
 waits. Conversations share what they learn: once one finds a configuration out of
 quota, others skip it on their next turn (until its reset time, or 5 hours), and once
 one succeeds on it again, conversations that left it go back on their next turn.
+Saving a change to a profile or to a Default configuration (for example a new API key
+or account folder) clears what was learned about it, so it is no longer skipped.
 Choosing a model or profile yourself makes that the new starting point. When every
 option is out of quota, Intent still tries them, and the usual quota message appears.
 

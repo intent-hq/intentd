@@ -118,3 +118,21 @@ fn clones_share_the_same_state() {
     cache.mark_exhausted("codex", None, now);
     assert!(clone.is_exhausted("codex", now));
 }
+
+#[test]
+fn forgetting_a_configuration_clears_any_state_for_everyone() {
+    let cache = ProviderQuotaCache::default();
+    let clone = cache.clone();
+    let now = utc("2026-10-23T10:00:00Z");
+    cache.mark_exhausted("codex", None, now);
+    cache.mark_exhausted("codex@work", None, now);
+    cache.mark_working("claude-code", now, now);
+
+    cache.forget("codex");
+    cache.forget("claude-code");
+    assert!(!clone.is_exhausted("codex", now));
+    assert!(!clone.is_known_working("claude-code"));
+    assert!(clone.is_exhausted("codex@work", now));
+    assert_eq!(clone.exhausted(now), vec!["codex@work".to_owned()]);
+    cache.forget("never-marked");
+}
