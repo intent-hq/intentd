@@ -42,8 +42,18 @@
 //!   `||` splitting, closure `||`, bracket matching) never reached the
 //!   others; rules now read tokens with `source_lint::tokenize`. This is a
 //!   name check, not a proof: a reader under another name passes.
+//! - `AGENTS.md` drifts from the tree (a separate test,
+//!   `agents_md_lists_every_crate_and_lint`): a `*_lint.rs` file whose stem
+//!   has no row in the source-lint table, a row whose first cell names no
+//!   lint file (or repeats one), a crate directory (one with a `Cargo.toml`)
+//!   under `crates/` with no `├── <crate>/` line in the fenced block under
+//!   `## Project layout`, or a layout line naming no crate. Agents navigate by
+//!   those lists; intentd#2853 found six crates and one lint row missing. The
+//!   table is the rows after the `| Lint |` header up to the first line not
+//!   starting with `|`; a missing table or layout block fails rather than
+//!   passing vacuously.
 //!
-//! Opt out of either rule with a standalone
+//! Opt out of the scaffolding or token-reader rule with a standalone
 //! `// source-lint-scaffolding: allow — <reason>` on the line above the `fn`
 //! / `enum` / `struct` keyword; a marker without a reason is itself a
 //! failure. The shared module lives under `src/`, so the rules never see it.
@@ -344,11 +354,168 @@ fn every_lint_file_is_a_lint_test_target() {
     );
 }
 
+/// The first line of the `AGENTS.md` lint table (its header row).
+const LINT_TABLE_HEADER: &str = "| Lint |";
+/// The `AGENTS.md` heading whose first fenced block is the crate tree.
+const LAYOUT_HEADING: &str = "## Project layout";
+
+/// `(line, name)` for every row of the `AGENTS.md` source-lint table: the
+/// rows that follow the `| Lint |` header up to the first line that does not
+/// start with `|`, minus the `| --- |` separator. `name` is the first cell
+/// with its backticks removed; `None` when no table header exists.
+fn lint_table_rows(agents: &str) -> Option<Vec<(usize, String)>> {
+    let mut lines = agents.lines().enumerate();
+    lines.find(|(_, l)| l.trim_start().starts_with(LINT_TABLE_HEADER))?;
+    let rows = lines
+        .take_while(|(_, l)| l.trim_start().starts_with('|'))
+        .filter_map(|(i, l)| {
+            let cell = l.trim_start().strip_prefix('|')?.split('|').next()?.trim();
+            if cell.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
+                return None;
+            }
+            Some((i + 1, cell.trim_matches('`').to_string()))
+        })
+        .collect();
+    Some(rows)
+}
+
+/// `(line, crate)` for every `├── <crate>/` / `└── <crate>/` entry of the
+/// first fenced block under `## Project layout` in `AGENTS.md` (the `crates/`
+/// root line carries no tree glyph and is skipped); `None` when the heading
+/// or its fenced block is missing.
+fn layout_crates(agents: &str) -> Option<Vec<(usize, String)>> {
+    let mut lines = agents.lines().enumerate();
+    lines.find(|(_, l)| l.trim_end() == LAYOUT_HEADING)?;
+    lines.find(|(_, l)| l.trim_start().starts_with("```"))?;
+    let mut out = Vec::new();
+    let mut closed = false;
+    for (i, line) in lines {
+        if line.trim_start().starts_with("```") {
+            closed = true;
+            break;
+        }
+        let Some((_, entry)) = line.split_once("── ") else {
+            continue;
+        };
+        let name = entry.split_whitespace().next().unwrap_or("");
+        if let Some(name) = name.strip_suffix('/') {
+            out.push((i + 1, name.to_string()));
+        }
+    }
+    closed.then_some(out)
+}
+
+/// Every crate directory under `root/crates` (one holding a `Cargo.toml`, so
+/// a stray directory left by a branch switch is not a crate), sorted.
+fn crate_dirs(root: &Path) -> BTreeSet<String> {
+    let crates_dir = root.join("crates");
+    fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
+        .flatten()
+        .filter(|e| e.path().join("Cargo.toml").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Drift between `root/AGENTS.md` and the tree: a `*_lint.rs` file with no
+/// lint-table row, a row naming no lint file (or named twice), a crate
+/// directory missing from the project-layout block, or a layout entry naming
+/// no crate — each rendered as one failure line naming the entry.
+fn agents_md_drift(root: &Path) -> Vec<String> {
+    let agents = fs::read_to_string(root.join("AGENTS.md")).unwrap_or_default();
+    let mut failures = Vec::new();
+
+    let lints: Vec<(String, PathBuf)> = lint_files(root)
+        .into_iter()
+        .filter_map(|rel| {
+            let stem = rel.file_stem()?.to_string_lossy().into_owned();
+            Some((stem, rel))
+        })
+        .collect();
+    match lint_table_rows(&agents) {
+        None => failures.push(format!(
+            "AGENTS.md: no source-lint table (a `{LINT_TABLE_HEADER} …` header row) — the \
+             table under \"Gates\" must list every `*_lint.rs`"
+        )),
+        Some(rows) => {
+            let mut seen = BTreeSet::new();
+            for (line, name) in &rows {
+                if !seen.insert(name.as_str()) {
+                    failures.push(format!(
+                        "AGENTS.md:{line}: lint table row `{name}` is a duplicate — remove it"
+                    ));
+                } else if !lints.iter().any(|(stem, _)| stem == name) {
+                    failures.push(format!(
+                        "AGENTS.md:{line}: lint table row `{name}` names no \
+                         `crates/*/tests/{name}.rs` — remove the stale row or fix its name"
+                    ));
+                }
+            }
+            for (stem, rel) in &lints {
+                if !seen.contains(stem.as_str()) {
+                    failures.push(format!(
+                        "AGENTS.md: lint table has no row for `{stem}` ({}) — add one saying \
+                         what it fails on and how to opt out",
+                        display_rel(rel)
+                    ));
+                }
+            }
+        }
+    }
+
+    let crates = crate_dirs(root);
+    match layout_crates(&agents) {
+        None => failures.push(format!(
+            "AGENTS.md: no fenced crate tree under `{LAYOUT_HEADING}` — the layout block \
+             must list every crate under `crates/`"
+        )),
+        Some(entries) => {
+            let mut seen = BTreeSet::new();
+            for (line, name) in &entries {
+                if !seen.insert(name.as_str()) {
+                    failures.push(format!(
+                        "AGENTS.md:{line}: project layout lists `{name}/` twice — remove one"
+                    ));
+                } else if !crates.contains(name) {
+                    failures.push(format!(
+                        "AGENTS.md:{line}: project layout lists `{name}/`, but \
+                         `crates/{name}/Cargo.toml` does not exist — remove the stale line or \
+                         fix its name"
+                    ));
+                }
+            }
+            for name in &crates {
+                if !seen.contains(name.as_str()) {
+                    failures.push(format!(
+                        "AGENTS.md: project layout does not list crate `{name}/` \
+                         (crates/{name}/Cargo.toml) — add a `├── {name}/  # <purpose>` line"
+                    ));
+                }
+            }
+        }
+    }
+    failures
+}
+
+#[test]
+fn agents_md_lists_every_crate_and_lint() {
+    let root = workspace_root();
+    let failures = agents_md_drift(&root);
+    assert!(
+        failures.is_empty(),
+        "\n\nAGENTS.md has drifted from the tree. Agents use its crate layout and source-lint \
+         table to find code, so every crate under `crates/` needs a layout line and every \
+         `crates/*/tests/*_lint.rs` needs a lint-table row — and neither list may name \
+         something that no longer exists.\n\n{}\n",
+        failures.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod fixture {
     use super::{
-        scaffolding_definitions, token_reader_definitions, undiscovered_lints, CI_INVOCATION,
-        CI_WORKFLOW,
+        agents_md_drift, scaffolding_definitions, token_reader_definitions, undiscovered_lints,
+        CI_INVOCATION, CI_WORKFLOW,
     };
     use std::fs;
     use std::path::Path;
@@ -741,5 +908,140 @@ mod fixture {
                 vec![(1, format!("fn {name}"))]
             );
         }
+    }
+
+    const AGENTS_MD: &str = "# Guide\n\n## Project layout\n\n```text\ncrates/\n\
+                             └── a/  # the only crate\n```\n\n## Gates\n\n\
+                             | Lint | Fails on | Opt-out / baseline |\n| --- | --- | --- |\n\
+                             | `x_lint` | everything | none |\n\nTrailing prose.\n";
+
+    fn write_agents(dir: &Path, content: &str) {
+        fs::write(dir.join("AGENTS.md"), content).unwrap();
+    }
+
+    #[test]
+    fn agents_md_listing_every_crate_and_lint_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(tmp.path(), AGENTS_MD);
+        assert_eq!(agents_md_drift(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn lint_file_without_a_table_row_is_reported_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        fs::write(
+            tmp.path().join("crates/a/tests/y_lint.rs"),
+            "#[test]\nfn t() {}\n",
+        )
+        .unwrap();
+        write_agents(tmp.path(), AGENTS_MD);
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md: lint table has no row for `y_lint` (crates/a/tests/y_lint.rs)",
+        );
+    }
+
+    #[test]
+    fn table_row_naming_no_lint_file_is_reported_at_its_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &AGENTS_MD.replace(
+                "| `x_lint` | everything | none |\n",
+                "| `x_lint` | everything | none |\n| `gone_lint` | nothing | none |\n",
+            ),
+        );
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md:15: lint table row `gone_lint` names no `crates/*/tests/gone_lint.rs`",
+        );
+    }
+
+    #[test]
+    fn duplicate_table_row_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &AGENTS_MD.replace(
+                "| `x_lint` | everything | none |\n",
+                "| `x_lint` | everything | none |\n| `x_lint` | again | none |\n",
+            ),
+        );
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md:15: lint table row `x_lint` is a duplicate",
+        );
+    }
+
+    #[test]
+    fn crate_missing_from_the_layout_is_reported_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        let b = tmp.path().join("crates/b");
+        fs::create_dir_all(b.join("src")).unwrap();
+        fs::write(
+            b.join("Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(b.join("src/lib.rs"), "").unwrap();
+        fs::create_dir_all(tmp.path().join("crates/not-a-crate")).unwrap();
+        write_agents(tmp.path(), AGENTS_MD);
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md: project layout does not list crate `b/` (crates/b/Cargo.toml)",
+        );
+    }
+
+    #[test]
+    fn layout_line_naming_no_crate_is_reported_at_its_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &AGENTS_MD.replace("└── a/", "├── gone/         # removed crate\n└── a/"),
+        );
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md:7: project layout lists `gone/`, but `crates/gone/Cargo.toml` does not exist",
+        );
+    }
+
+    #[test]
+    fn missing_table_and_layout_are_reported_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(tmp.path(), "# Guide\n\nNo lists here.\n");
+        let failures = agents_md_drift(tmp.path());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].starts_with("AGENTS.md: no source-lint table"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].starts_with("AGENTS.md: no fenced crate tree"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn unclosed_layout_fence_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            "## Project layout\n\n```text\ncrates/\n└── a/\n",
+        );
+        let failures = agents_md_drift(tmp.path());
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.starts_with("AGENTS.md: no fenced crate tree")),
+            "{failures:?}"
+        );
     }
 }
