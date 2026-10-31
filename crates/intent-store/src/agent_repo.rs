@@ -4790,6 +4790,64 @@ impl Store {
             .await
     }
 
+    /// Pause one workspace teardown after transcript/metadata statements have
+    /// released their connections, before the agent or workspace root is removed.
+    /// Dropping the release sender also lets an entered pause finish.
+    ///
+    /// # Errors
+    /// Returns an error if this Store already has an armed pause or its fixture
+    /// bookkeeping was poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pause_workspace_transcript_delete_for_test(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let mut slot = self.transcript_delete_test_pause.lock().map_err(|_| {
+            Error::Internal("workspace transcript deletion test pause poisoned".into())
+        })?;
+        if slot.is_some() {
+            return Err(Error::InvalidParams(
+                "workspace transcript deletion test pause already armed".into(),
+            ));
+        }
+        let (reached, entered) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        *slot = Some(WorkspaceTranscriptDeletePause {
+            workspace_id,
+            reached,
+            resume,
+        });
+        Ok((entered, release))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn wait_workspace_transcript_delete_for_test(&self, workspace_id: &WorkspaceId) {
+        let pause = {
+            let mut slot = self
+                .transcript_delete_test_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|pause| &pause.workspace_id == workspace_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            // An abandoned observer must not leave teardown parked.
+            if pause.reached.send(()).is_ok() {
+                let _ = pause.resume.await;
+            }
+        }
+    }
+
     /// Only for workspace deletion after its recovery and desktop sweeps have
     /// completed, with workspace writers stopped. Keep ownership checks and
     /// all other child sweeps identical to standalone agent deletion.
@@ -4848,6 +4906,11 @@ impl Store {
         for sql in delete_agent_metadata_batch_statements() {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if !cleanup_scope {
+            self.wait_workspace_transcript_delete_for_test(workspace_id)
+                .await;
+        }
         // Recovery history has no FK cascade. There is at most one row per
         // agent; require both owners so inconsistent metadata is not erased.
         if cleanup_scope {
@@ -4903,6 +4966,13 @@ impl Store {
         lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() > 0)
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct WorkspaceTranscriptDeletePause {
+    workspace_id: WorkspaceId,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 pub(crate) const DELETE_AGENT_SESSION_SQL: &str =
