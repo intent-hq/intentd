@@ -1,5 +1,9 @@
 //! Node side: the TLS listener that admits head's link and git
 //! connections.
+//!
+//! Deprecated: kept only for `intentd node`; remove with it once the runner
+//! moves into the daemon's executor service, which serves the link on the
+//! daemon listener with per-credential bindings ([`super::ExecutorLinks`]).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

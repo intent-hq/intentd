@@ -13,9 +13,17 @@
 //! Error text is fixed per failure kind and never carries the token, the
 //! endpoint's credentials or a peer-supplied string, so link errors and logs
 //! are safe to surface.
+//!
+//! Daemon-to-daemon remote agents serve the same link on the daemon's own
+//! WSS listener ([`ExecutorLinks`], admitted by executor credentials and
+//! bound per credential). The separate node listener ([`NodeListener`]),
+//! its certificate, [`BindingFile`] and [`LeaseToken`] remain only for
+//! `intentd node` and are removed together with it when the runner moves
+//! into the daemon.
 
 mod binding_file;
 mod dial;
+mod executor;
 mod git;
 #[cfg(unix)]
 mod git_helper;
@@ -27,7 +35,10 @@ mod reconnect;
 mod secret;
 
 pub use binding_file::BindingFile;
-pub use dial::{dial_git, dial_link, DialedLink, NodeEndpoint};
+pub(crate) use dial::socket_config;
+pub use dial::{dial_git, dial_link, DialedLink, NodeEndpoint, TailcatRoute};
+pub(crate) use executor::ExecutorRoute;
+pub use executor::{ExecutorHost, ExecutorLinks, REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON};
 pub use git::{GitConnection, GitSender};
 #[cfg(unix)]
 pub use git_helper::run_git_remote_helper;

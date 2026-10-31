@@ -464,3 +464,38 @@ async fn the_minted_token_is_never_logged() {
         "token leaked into logs: {logged:?}"
     );
 }
+
+#[tokio::test]
+async fn revoke_tells_the_listeners_so_live_links_close() {
+    use intent_core::WorkspaceApi as _;
+    let f = fixture(true, Some(routes())).await;
+    let minted = mint(&f, Caller::Daemon).await.unwrap();
+    let id = minted["credentialId"].as_str().unwrap().to_string();
+    let mut revocations = f.services.subscribe_executor_revocations().unwrap();
+
+    let refused = with_caller(
+        Caller::Wire {
+            principal_id: f.member.clone(),
+            host_role: HostRole::Member,
+        },
+        f.services.executor_revoke_op(&id),
+    )
+    .await;
+    assert!(refused.is_err());
+    let missing = with_caller(owner(&f).await, f.services.executor_revoke_op("nope")).await;
+    assert!(matches!(missing, Err(Error::NotFound(_))));
+    assert!(
+        revocations.try_recv().is_err(),
+        "a refused or unknown revoke closes nothing"
+    );
+
+    with_caller(owner(&f).await, f.services.executor_revoke_op(&id))
+        .await
+        .unwrap();
+    assert_eq!(revocations.try_recv().unwrap().as_str(), id);
+    // A repeat revoke repeats the notice, so a missed one can be retried.
+    with_caller(owner(&f).await, f.services.executor_revoke_op(&id))
+        .await
+        .unwrap();
+    assert_eq!(revocations.try_recv().unwrap().as_str(), id);
+}

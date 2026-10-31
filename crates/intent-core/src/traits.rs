@@ -6181,6 +6181,44 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Transport seam (daemon-to-daemon executor link): resolve a presented
+    /// `/node/*` bearer token, already hashed (hex SHA-256), to its **active**
+    /// executor credential, touching its last use. Only the `/node/*` gate
+    /// calls this; executor credentials are never looked up on `/ws`,
+    /// `/tunnel` or `/invite`. `None` for an unknown or revoked hash.
+    /// Default: no executor credentials exist.
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<crate::machines::ExecutorCredential>>> {
+        let _ = token_hash;
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam (executor link): decide a backend's bind offer on this
+    /// machine (`node_id`) for one executor credential and, when accepted,
+    /// durably store it as that credential's binding before returning.
+    /// `NotFound` when the credential is unknown or revoked. Default: refuse.
+    fn bind_executor(
+        &self,
+        credential_id: crate::ids::ExecutorCredentialId,
+        node_id: String,
+        offered: crate::node_link::LeaseBinding,
+    ) -> BoxFuture<'_, Result<crate::node_link::BindDecision>> {
+        let _ = (credential_id, node_id, offered);
+        Box::pin(async { Err(Error::NotFound("executor credential".into())) })
+    }
+
+    /// Transport seam (executor link): a live feed of executor credentials
+    /// just revoked, so the listener closes their `/node/*` connections with
+    /// `1008`. A lagged or closed feed must fail closed. `None` when the
+    /// implementation has no executor store (test stubs).
+    fn subscribe_executor_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::ids::ExecutorCredentialId>> {
+        None
+    }
+
     /// Transport seam: resolve a credential-bound principal's current host
     /// authority. Never infer a role from credential storage or client input.
     /// Unknown principals and unavailable authority fail closed.

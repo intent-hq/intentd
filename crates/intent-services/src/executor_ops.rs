@@ -193,7 +193,12 @@ impl Services {
                     "executor credential {credential_id}"
                 )));
             }
-            ExecutorRevocation::Revoked | ExecutorRevocation::AlreadyRevoked => {}
+            // Close the credential's live `/node/*` connections with `1008`.
+            // Repeated on an already revoked credential so a retry after a
+            // missed notice still closes them.
+            ExecutorRevocation::Revoked | ExecutorRevocation::AlreadyRevoked => {
+                self.notify_executor_revoked(&id);
+            }
         }
         Ok(json!({ "ok": true }))
     }

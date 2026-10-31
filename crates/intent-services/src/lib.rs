@@ -104,6 +104,7 @@ mod event_ops;
 mod event_subscriptions;
 pub mod events;
 mod execution_call;
+mod executor_link;
 #[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
@@ -1282,6 +1283,9 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    /// Live feed of executor credentials just revoked, consumed by the
+    /// transport to close their `/node/*` connections with `1008`.
+    executor_revocations: executor_link::ExecutorRevocations,
     /// Where the executor link can be dialed (`executor.mint`), attached by
     /// the composition root; the transport owns the listener.
     machine_routes: Arc<OnceLock<Arc<dyn intent_core::machines::MachineRoutesSource>>>,
@@ -1822,6 +1826,10 @@ impl Services {
             #[cfg(test)]
             queue_drain_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             principal_revocations: tokio::sync::broadcast::channel(
+                invite_ops::REVOCATION_CHANNEL_CAPACITY,
+            )
+            .0,
+            executor_revocations: tokio::sync::broadcast::channel(
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
             .0,
@@ -34712,6 +34720,35 @@ impl WorkspaceApi for Services {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
         Some(self.principal_revocations.subscribe())
+    }
+
+    fn subscribe_executor_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::ExecutorCredentialId>> {
+        Some(self.executor_revocations.subscribe())
+    }
+
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<intent_core::machines::ExecutorCredential>>> {
+        let store = self.store.clone();
+        // One atomic resolve+touch so a concurrent revoke never still admits.
+        Box::pin(async move { store.resolve_active_executor_credential(&token_hash).await })
+    }
+
+    fn bind_executor(
+        &self,
+        credential_id: intent_core::ExecutorCredentialId,
+        node_id: String,
+        offered: intent_core::node_link::LeaseBinding,
+    ) -> BoxFuture<'_, Result<intent_core::node_link::BindDecision>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store
+                .bind_executor(&credential_id, &node_id, &offered)
+                .await
+        })
     }
 
     fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
