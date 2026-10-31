@@ -23,19 +23,30 @@
 //!   between the two-space-indented `check:` key and the next key at that
 //!   indent or shallower, and the invocation must sit on the `run:` line
 //!   itself, not inside a `run: |` block;
-//! - a `crates/*/tests/**/*_lint.rs` file defines its own `fn lex(`,
-//!   `fn markers_by_line(`, `fn blank_cfg_test_items(`,
-//!   `fn cfg_test_item_ranges(`, or `fn split_statements(` (`pub` optional;
-//!   any whitespace, line breaks included, between `fn`, the name, and `(`;
-//!   matched on the whole comment- and literal-blanked text and reported at
-//!   the line of the `fn` keyword). Those are the shared scaffolding in
-//!   `intentd_test_support::source_lint`; the lints used to carry private
-//!   copies, and two #2073 fixes (`102c347a` statement line accounting,
-//!   `f2c685af` `cfg(test)` bracket nesting) had to be re-applied copy by
-//!   copy. Opt out with a standalone
-//!   `// source-lint-scaffolding: allow — <reason>` on the line above the
-//!   `fn` keyword; a marker without a reason is itself a failure. The shared
-//!   module lives under `src/`, so the rule never sees it.
+//! - a `crates/*/tests/**/*_lint.rs` file defines its own copy of a shared
+//!   scaffolding function — `fn lex(`, `fn markers_by_line(`,
+//!   `fn blank_cfg_test_items(`, `fn cfg_test_item_ranges(`,
+//!   `fn split_statements(`, `fn tokenize(`, `fn tokenize_str(`,
+//!   `fn tokenize_from(`, `fn matching_close(`, or `fn skip_group(` (`pub`
+//!   optional; generics allowed; any whitespace, line breaks included,
+//!   between `fn`, the name, and `(` or `<`; matched on the whole comment- and literal-blanked text and
+//!   reported at the line of the `fn` keyword). Those are the shared
+//!   scaffolding in `intentd_test_support::source_lint`; the lints used to
+//!   carry private copies, and two #2073 fixes (`102c347a` statement line
+//!   accounting, `f2c685af` `cfg(test)` bracket nesting) had to be re-applied
+//!   copy by copy;
+//! - a `*_lint.rs` file defines its own token reader: a `fn tokens(`, or an
+//!   `enum` / `struct` named exactly `Tok`, `Token`, or `TokenKind` (reported
+//!   at the line of its keyword). Five lints once carried their own readers,
+//!   and the nine intent-hq/intentd#2822 review fixes to one of them (`&&` /
+//!   `||` splitting, closure `||`, bracket matching) never reached the
+//!   others; rules now read tokens with `source_lint::tokenize`. This is a
+//!   name check, not a proof: a reader under another name passes.
+//!
+//! Opt out of either rule with a standalone
+//! `// source-lint-scaffolding: allow — <reason>` on the line above the `fn`
+//! / `enum` / `struct` keyword; a marker without a reason is itself a
+//! failure. The shared module lives under `src/`, so the rules never see it.
 //!
 //! The workspace root is located from `CARGO_MANIFEST_DIR`, as the other lints
 //! do; the checks themselves take any root, which is how the fixture tests
@@ -46,7 +57,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use intentd_test_support::source_lint::{lex, markers_by_line, skip_whitespace, word_at, Marker};
+use intentd_test_support::source_lint::{lex, markers_by_line, tokenize_str, Marker, Token};
 
 const LINT_SUFFIX: &str = "_lint";
 const RS_LINT_SUFFIX: &str = "_lint.rs";
@@ -56,13 +67,23 @@ const SELF_FILE: &str = "crates/intent-core/tests/source_lint_discovery_lint.rs"
 const SHARED_MODULE: &str = "intentd_test_support::source_lint";
 const SCAFFOLDING_TAG: &str = "source-lint-scaffolding";
 /// Shared scaffolding functions a lint must import rather than define.
-const SCAFFOLDING_FNS: [&str; 5] = [
+const SCAFFOLDING_FNS: [&str; 10] = [
     "lex",
     "markers_by_line",
     "blank_cfg_test_items",
     "cfg_test_item_ranges",
     "split_statements",
+    "tokenize",
+    "tokenize_str",
+    "tokenize_from",
+    "matching_close",
+    "skip_group",
 ];
+/// Function names that mark a private token reader even though no shared
+/// function carries them (`fn tokens(` was the usual spelling).
+const TOKEN_READER_FNS: [&str; 1] = ["tokens"];
+/// Type names that mark a private token reader (`enum Tok`, `struct Token`).
+const TOKEN_READER_TYPES: [&str; 3] = ["Tok", "Token", "TokenKind"];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -173,46 +194,55 @@ fn display_rel(rel: &Path) -> String {
         .join("/")
 }
 
-/// Whether the keyword `fn` starts at `i`: not glued to an identifier
-/// character before it and followed by whitespace (so `fnlex`, `pub_fn`, and
-/// the `fn(` of a function-pointer type are not keywords).
-fn fn_keyword_at(chars: &[char], i: usize) -> bool {
-    chars.get(i) == Some(&'f')
-        && chars.get(i + 1) == Some(&'n')
-        && chars.get(i + 2).is_some_and(|c| c.is_whitespace())
-        && !i
-            .checked_sub(1)
-            .is_some_and(|p| chars[p].is_ascii_alphanumeric() || chars[p] == '_')
+/// `(line, name)` of every `fn <name>(` / `fn <name><…>(` definition in
+/// `tokens` (of comment- and literal-blanked source), so any whitespace —
+/// line breaks included — may sit between `fn`, the name, and `(` or the
+/// generics, while `fnlex`, `pub_fn`, and the `fn(` of a function-pointer
+/// type are not definitions. `line` is the 1-based line of the `fn` keyword.
+fn fn_definitions(tokens: &[Token]) -> Vec<(usize, &str)> {
+    tokens
+        .windows(3)
+        .filter(|w| w[0].is("fn") && w[1].is_ident() && (w[2].is("(") || w[2].is("<")))
+        .map(|w| (w[0].line, w[1].text.as_str()))
+        .collect()
 }
 
-/// `(line, name)` for every definition in `blanked` (comment- and
-/// literal-blanked source) of a function named after one of
-/// [`SCAFFOLDING_FNS`]: the keyword `fn`, the name, then `(`, with any
-/// whitespace — line breaks included — between them. `line` is the 1-based
-/// line of the `fn` keyword.
+/// `(line, name)` for every definition in `blanked` of a function named
+/// after one of [`SCAFFOLDING_FNS`].
 fn scaffolding_definitions(blanked: &str) -> Vec<(usize, &'static str)> {
-    let chars: Vec<char> = blanked.chars().collect();
-    let mut hits = Vec::new();
-    let mut line = 1;
-    for (i, &c) in chars.iter().enumerate() {
-        if c == '\n' {
-            line += 1;
-            continue;
-        }
-        if !fn_keyword_at(&chars, i) {
-            continue;
-        }
-        let Some((word, after_name)) = word_at(&chars, skip_whitespace(&chars, i + 2)) else {
-            continue;
-        };
-        if chars.get(skip_whitespace(&chars, after_name)) != Some(&'(') {
-            continue;
-        }
-        if let Some(name) = SCAFFOLDING_FNS.into_iter().find(|name| *name == word) {
-            hits.push((line, name));
-        }
-    }
-    hits
+    let tokens = tokenize_str(blanked);
+    fn_definitions(&tokens)
+        .into_iter()
+        .filter_map(|(line, word)| {
+            SCAFFOLDING_FNS
+                .into_iter()
+                .find(|name| *name == word)
+                .map(|name| (line, name))
+        })
+        .collect()
+}
+
+/// `(line, what)` for every private token reader in `blanked`: a `fn` named
+/// after one of [`TOKEN_READER_FNS`], or an `enum` / `struct` named exactly
+/// one of [`TOKEN_READER_TYPES`] (`TokenBudget` is not). `what` is the
+/// definition as written (`fn tokens`, `enum Tok`); `line` is the line of
+/// its keyword.
+fn token_reader_definitions(blanked: &str) -> Vec<(usize, String)> {
+    let tokens = tokenize_str(blanked);
+    let fns = fn_definitions(&tokens)
+        .into_iter()
+        .filter(|(_, word)| TOKEN_READER_FNS.contains(word))
+        .map(|(line, word)| (line, format!("fn {word}")));
+    let types = tokens
+        .windows(2)
+        .filter(|w| {
+            (w[0].is("enum") || w[0].is("struct"))
+                && TOKEN_READER_TYPES.contains(&w[1].text.as_str())
+        })
+        .map(|w| (w[0].line, format!("{} {}", w[0].text, w[1].text)));
+    let mut out: Vec<_> = fns.chain(types).collect();
+    out.sort();
+    out
 }
 
 /// Every private copy of a shared scaffolding function defined in a
@@ -228,19 +258,33 @@ fn scaffolding_copies(root: &Path) -> Vec<String> {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let lexed = lex(&src);
         let markers = markers_by_line(&src, &lexed.line_comments, SCAFFOLDING_TAG);
-        for (line_no, name) in scaffolding_definitions(&lexed.blanked) {
+        let copies = scaffolding_definitions(&lexed.blanked)
+            .into_iter()
+            .map(|(line, name)| (line, format!("private copy of source_lint::{name}")));
+        let readers = token_reader_definitions(&lexed.blanked)
+            .into_iter()
+            .map(|(line, what)| {
+                (
+                    line,
+                    format!(
+                        "private token reader (`{what}`); read tokens with source_lint::tokenize"
+                    ),
+                )
+            });
+        let mut found: Vec<_> = copies.chain(readers).collect();
+        found.sort();
+        for (line_no, what) in found {
             let marker_above = markers.get(line_no - 1).copied().unwrap_or(Marker::Absent);
             let file = display_rel(&rel);
             match marker_above {
                 Marker::WithReason => {}
                 Marker::Absent => failures.push(format!(
-                    "{file}:{line_no} — private copy of source_lint::{name}; import \
-                     {SHARED_MODULE} instead"
+                    "{file}:{line_no} — {what}; import {SHARED_MODULE} instead"
                 )),
                 Marker::Malformed => failures.push(format!(
-                    "{file}:{line_no} — private copy of source_lint::{name} under a \
-                     `// {SCAFFOLDING_TAG}: allow` marker with no reason; write \
-                     `// {SCAFFOLDING_TAG}: allow — <reason>` or import {SHARED_MODULE}"
+                    "{file}:{line_no} — {what} under a `// {SCAFFOLDING_TAG}: allow` marker \
+                     with no reason; write `// {SCAFFOLDING_TAG}: allow — <reason>` or import \
+                     {SHARED_MODULE}"
                 )),
             }
         }
@@ -302,7 +346,10 @@ fn every_lint_file_is_a_lint_test_target() {
 
 #[cfg(test)]
 mod fixture {
-    use super::{scaffolding_definitions, undiscovered_lints, CI_INVOCATION, CI_WORKFLOW};
+    use super::{
+        scaffolding_definitions, token_reader_definitions, undiscovered_lints, CI_INVOCATION,
+        CI_WORKFLOW,
+    };
     use std::fs;
     use std::path::Path;
 
@@ -586,5 +633,113 @@ mod fixture {
         assert_eq!(scaffolding_definitions("fnlex(x: &str) {"), vec![]);
         assert_eq!(scaffolding_definitions("pub_fn lex(x: &str) {"), vec![]);
         assert_eq!(scaffolding_definitions("let f: fn(&str) = lex;"), vec![]);
+        assert_eq!(
+            scaffolding_definitions("fn matching_close<T>(x: T) {"),
+            vec![(1, "matching_close")]
+        );
+        assert_eq!(
+            scaffolding_definitions("fn tokenize<'a>(x: &'a str) {"),
+            vec![(1, "tokenize")]
+        );
+    }
+
+    #[test]
+    fn private_token_reader_type_is_reported_at_its_keyword_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "use std::fs;\n\n#[derive(Debug)]\nenum Tok<'a> {\n    Word(&'a str),\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs:4 — private token reader (`enum Tok`); read tokens with \
+             source_lint::tokenize; import intentd_test_support::source_lint instead",
+        );
+    }
+
+    #[test]
+    fn private_tokens_fn_split_across_lines_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "struct\n    Token {\n    text: String,\n}\n\nfn\ntokens\n(text: &str) -> Vec<Token> {\n    vec![]\n}\n\n#[test]\nfn t() {}\n",
+        );
+        let failures = undiscovered_lints(tmp.path());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0]
+                .starts_with("crates/a/tests/x_lint.rs:1 — private token reader (`struct Token`)"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1]
+                .starts_with("crates/a/tests/x_lint.rs:6 — private token reader (`fn tokens`)"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn reasoned_marker_above_a_private_token_reader_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "// source-lint-scaffolding: allow — fixture reading shell, not Rust\n\
+             enum Tok {\n    Pipe,\n}\n\n#[test]\nfn t() {}\n",
+        );
+        assert_eq!(undiscovered_lints(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bare_marker_above_a_private_token_reader_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_lint(
+            tmp.path(),
+            "// source-lint-scaffolding: allow\nstruct TokenKind;\n\n#[test]\nfn t() {}\n",
+        );
+        assert_single_failure_at(
+            &undiscovered_lints(tmp.path()),
+            "crates/a/tests/x_lint.rs:2 — private token reader (`struct TokenKind`); read tokens \
+             with source_lint::tokenize under a `// source-lint-scaffolding: allow` marker with \
+             no reason; ",
+        );
+    }
+
+    #[test]
+    fn token_reader_lookalikes_are_not_hits() {
+        let src = "// enum Tok was here\n\
+                   const DOC: &str = \"struct Token\";\n\
+                   struct TokenBudget;\n\
+                   enum Tokens { A }\n\
+                   fn tokens_for(x: u8) {}\n\
+                   fn run(t: Token) -> Vec<Tok> { tokens(DOC) }\n\
+                   use intentd_test_support::source_lint::Token;\n";
+        let blanked = intentd_test_support::source_lint::lex(src).blanked;
+        assert_eq!(token_reader_definitions(&blanked), Vec::new());
+    }
+
+    #[test]
+    fn token_reader_definitions_match_each_name() {
+        for name in super::TOKEN_READER_TYPES {
+            for keyword in ["enum", "struct"] {
+                assert_eq!(
+                    token_reader_definitions(&format!("\npub(crate) {keyword} {name} {{")),
+                    vec![(2, format!("{keyword} {name}"))]
+                );
+            }
+        }
+        for name in super::TOKEN_READER_FNS {
+            assert_eq!(
+                token_reader_definitions(&format!("fn {name}(x: &str) {{")),
+                vec![(1, format!("fn {name}"))]
+            );
+            assert_eq!(
+                token_reader_definitions(&format!("fn {name}<'a>(x: &'a str) {{")),
+                vec![(1, format!("fn {name}"))]
+            );
+        }
     }
 }
