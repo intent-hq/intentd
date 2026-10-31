@@ -155,3 +155,23 @@ async fn daemon_mode_changes_only_over_the_local_socket() {
         assert!(read.is_ok(), "reads stay open: {read:?}");
     }
 }
+
+/// `remoteMachines: 1` is advertised only by a backend with
+/// `experimental.remoteAgents` on, never in node mode.
+#[tokio::test]
+async fn remote_machines_capability_follows_the_experimental_setting_outside_node_mode() {
+    for node_mode in [false, true] {
+        let dir = crate::test_support::test_tempdir("remote-machines-capability");
+        let (svc, registry) = services(&dir, node_mode, Some(false)).await;
+        assert!(!svc.remote_machines_capability(), "off by default");
+        registry
+            .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
+            .unwrap();
+        assert!(registry.snapshot().effective.experimental.remote_agents);
+        assert_eq!(
+            svc.remote_machines_capability(),
+            !node_mode,
+            "node mode {node_mode}"
+        );
+    }
+}

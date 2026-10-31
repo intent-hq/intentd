@@ -980,7 +980,7 @@ pub async fn default_sign_in(provider_id: &str, override_path: Option<String>) -
         return DefaultSignIn::default();
     };
     let verdict = resolve_auth_status(id, false, override_path).await;
-    match cache().fresh_entry(id) {
+    let sign_in = match cache().fresh_entry(id) {
         Some((at, cached)) => DefaultSignIn {
             signed_in: cached.authenticated,
             probed_at: Some(at),
@@ -989,7 +989,24 @@ pub async fn default_sign_in(provider_id: &str, override_path: Option<String>) -
             signed_in: verdict.authenticated,
             probed_at: None,
         },
+    };
+    default_account_sign_in(id, sign_in)
+}
+
+/// Providers whose sign-in probe runs an ACP adapter without the
+/// login-shell credentials a profile-less launch gap-fills, so a daemon
+/// started outside a login shell can see a signed-out account that its
+/// launches would find signed in.
+const PROBES_WITHOUT_LAUNCH_ENV: &[&str] = &["droid", "pi", "antigravity"];
+
+/// What a probe says about the default account a launch uses: a signed-out
+/// verdict from a probe without the launch's environment is only `unknown`,
+/// so placement does not skip a machine on it.
+fn default_account_sign_in(provider_id: &str, mut sign_in: DefaultSignIn) -> DefaultSignIn {
+    if PROBES_WITHOUT_LAUNCH_ENV.contains(&provider_id) && sign_in.signed_in == Some(false) {
+        sign_in.signed_in = None;
     }
+    sign_in
 }
 
 /// Test seam: make one provider's cached verdict `by` older, so a test
@@ -1787,6 +1804,35 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(again.signed_in, Some(false));
         assert!(again.probed_at.expect("cached") > probed_at.checked_sub(AUTH_CACHE_TTL).unwrap());
         assert_eq!(probes(), 2);
+    }
+
+    /// droid, pi and antigravity probe without the login-shell credentials
+    /// a launch gets, so their signed-out verdict reads as unknown for the
+    /// default account; a signed-in one stands, and other providers keep
+    /// theirs.
+    #[tokio::test]
+    async fn default_sign_in_does_not_trust_signed_out_from_probes_without_the_launch_env() {
+        for id in ["droid", "pi", "antigravity"] {
+            let prior = cache().fresh(id);
+            cache().store(id, AuthVerdict::plain(Some(false)));
+            let sign_in = default_sign_in(id, None).await;
+            assert_eq!(sign_in.signed_in, None, "{id}");
+            assert!(sign_in.probed_at.is_some(), "{id}: still an observation");
+            cache().store(id, AuthVerdict::plain(Some(true)));
+            assert_eq!(
+                default_sign_in(id, None).await.signed_in,
+                Some(true),
+                "{id}"
+            );
+            cache().store(id, prior.unwrap_or_default());
+        }
+        let probed = DefaultSignIn {
+            signed_in: Some(false),
+            probed_at: None,
+        };
+        for id in ["claude-code", "codex", "opencode", "grok", "auggie"] {
+            assert_eq!(default_account_sign_in(id, probed), probed, "{id}");
+        }
     }
 
     /// A provider without a sign-in probe is unknown and never cached.
