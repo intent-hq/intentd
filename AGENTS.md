@@ -7,7 +7,10 @@ Rust backend daemon.
 
 **Assistant app guide:** a user-facing change updates the affected section of
 [`crates/intent-services/resources/assistant-app-guide.md`](crates/intent-services/resources/assistant-app-guide.md)
-in the same change — see the root guide for the full rule.
+in the same change, including changes coordinated with the frontend. Do not promote
+unfinished, Labs-only or unreleased features as normal options. Before opening a PR,
+record the affected guide section or explain why there is no user-help impact. Full rule:
+[root `AGENTS.md`](https://github.com/intent-hq/intent/blob/main/AGENTS.md).
 
 > **Merge permission**: never merge a PR or arm auto-merge without explicit permission
 > from a human — approved + green is not enough. See the
@@ -301,12 +304,18 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `settle_only_wait_lint` | a use of `SubHandle::wait_settled_even_if_failed` in any `crates/**/*.rs` file, test code included — it returns on a registration settled as FAILED, so a test writing next races the shared watch's creation retry and its event wait hangs (intent-hq/intent#4845, #4852, #6128); sync on `wait_established` / `wait_all_established` / `RegistrationProbe::wait_live`, which ride the retry out; one marker covers one use, and a marker that covers no use is stale | `// settle-only-wait: allow — <reason>` on the line above the use or its statement, only for a test that expects the registration to fail |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the submodule-PR → monorepo-bump
-workflow, conventional commits, and the rule never to quote the breaking-change footer
-token in commit messages, PR text, or review comments.
+workflow and conventional commits. Never quote the literal breaking-change footer token
+(`BREAKING CHANGE:` / `BREAKING-CHANGE:`, or `Release-As:`) in commit messages — branch
+commit bodies fold into the squash and trigger a false major bump or pinned version
+(intent-hq/intent#2988) — nor in PR titles/bodies or review comments; write "the
+breaking-change footer token" instead.
 
 ## Filing issues
 
 File bugs on [intent-hq/intent](https://github.com/intent-hq/intent/issues) with labels
-`component:intentd` + `agent-filed`; never track issues in markdown files. Reference the
-fix with `Fixes intent-hq/intent#N` on every fix PR — see the [root `AGENTS.md`](../../AGENTS.md)
-→ Filing Issues and Phase 1 for dedup and why a plain mention earns no release comment.
+`component:intentd` + `agent-filed`; never track issues in markdown files. Put `Fixes
+intent-hq/intent#N` on every fix PR: the release notifier comments on a closed issue only
+once at least one linked intentd fix PR has merged, every merged one is in the released
+tag, and none is still open (PRs closed without merging are ignored); a plain mention
+never earns a comment. Dedup and cross-referencing: [root `AGENTS.md` → Filing
+Issues](https://github.com/intent-hq/intent/blob/main/AGENTS.md#filing-issues).
