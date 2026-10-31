@@ -562,6 +562,40 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
     held.abort();
 }
 
+/// Review of intentd#2872: a connector is created only under the machine's
+/// lifecycle lock, so `refresh` (or a placement) racing a credential
+/// replacement cannot cache a connector built on the old lease.
+#[tokio::test]
+async fn a_connector_is_created_only_under_the_lifecycle_lock() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    let feature = backend.services.remote_feature().unwrap();
+    feature.take_node(&machine.id()).unwrap().shutdown();
+
+    let held = feature.lifecycle(&machine.id()).await;
+    let refresh = backend.call("refresh", json!({ "machineId": machine.id() }));
+    tokio::pin!(refresh);
+    tokio::select! {
+        result = &mut refresh => panic!("refresh ran under a held lifecycle lock: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+    }
+    assert!(
+        feature.running_node(&machine.id()).is_none(),
+        "no connector is created while the lock is held"
+    );
+    drop(held);
+    let (refreshed, ()) = tokio::join!(refresh, async {
+        machine
+            .accept()
+            .await
+            .answer_capabilities(capabilities(0))
+            .await;
+    });
+    refreshed.expect("refresh once the lock is free");
+    feature.take_node(&machine.id()).unwrap().shutdown();
+}
+
 /// Review of intentd#2872: adding the same credential again with a new
 /// listener port moves the retained connector to that port too, not only
 /// its hosts.

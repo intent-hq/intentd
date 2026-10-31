@@ -912,6 +912,16 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
         _ => None,
     })
     .await;
+    // The machine confirms it; until then the stop stays queued and would be
+    // sent again.
+    link.answer_capabilities(capabilities(0)).await;
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().has_pending_stops() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the machine's answer confirms the stop");
 
     // Stopped agents' records are no longer delivered.
     link.replay_complete(0).await;

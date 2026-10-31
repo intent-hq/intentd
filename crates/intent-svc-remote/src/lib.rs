@@ -107,14 +107,33 @@ impl RemoteFeature {
         lock(&self.tuning).clone().unwrap_or_default()
     }
 
-    /// The connector to exposed machine `machine_id`, started if needed.
-    /// Starting dials nothing.
+    /// The connector to exposed machine `machine_id`, started if needed
+    /// under the machine's lifecycle lock, so a credential replacement or
+    /// removal in progress finishes first and the connector is built from
+    /// its outcome, not from the lease and token it replaces. Starting
+    /// dials nothing.
     ///
     /// # Errors
     ///
     /// `not-found` for an unknown machine; when its token is missing from
     /// the secret store or its lease has ended.
     pub(crate) async fn node(&self, svc: &Services, machine_id: &str) -> Result<RemoteNode> {
+        if !svc.node_mode() {
+            if let Some(node) = self.running_node(machine_id) {
+                return Ok(node);
+            }
+        }
+        let _lifecycle = self.lifecycle(machine_id).await;
+        self.node_locked(svc, machine_id).await
+    }
+
+    /// [`Self::node`] for a caller already holding `machine_id`'s lifecycle
+    /// lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::node`].
+    pub(crate) async fn node_locked(&self, svc: &Services, machine_id: &str) -> Result<RemoteNode> {
         // Node mode turns this daemon's orchestration off, including acting
         // as a backend: no outbound connector, so no remote agent can reach
         // its workspaces through forwarded calls. The inbound executor link

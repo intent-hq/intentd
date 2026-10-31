@@ -379,7 +379,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
             return Err(error);
         }
     };
-    let node = feature.node(svc, &params.machine_id).await?;
+    let node = feature.node_locked(svc, &params.machine_id).await?;
     let mut accepted = target;
     accepted.hosts.clone_from(&row.hosts);
     accepted.tc_address.clone_from(&row.tc_address);

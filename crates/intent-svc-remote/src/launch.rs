@@ -284,7 +284,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             // Held until the runtime is attached, so a replacement or removal
             // of the machine either sees this agent or happens first.
             let _lifecycle = feature.lifecycle(&record.node_id).await;
-            let node = feature.node(svc, &record.node_id).await?;
+            let node = feature.node_locked(svc, &record.node_id).await?;
             let status = node.status();
             if record.lease_id != status.lease_id {
                 return Err(Error::InvalidParams(format!(
