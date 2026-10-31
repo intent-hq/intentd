@@ -369,30 +369,26 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
 
     let mut sub = subscribe(&backend);
     // Review of intentd#2872: handing the stop to the link is not delivery.
-    // The removal waits until the machine has applied it (its answer to a
-    // capabilities request sent after the stop on the same link).
+    // The removal waits for the machine's acknowledgement of that stop.
     let remove = backend.call(
         "remove",
         json!({ "machineId": machine.id(), "stopAgents": true }),
     );
     tokio::pin!(remove);
-    tokio::select! {
-        result = &mut remove => panic!("removed before the machine confirmed the stop: {result:?}"),
-        () = async {
-            link.expect(|frame| match frame {
-                LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
-                _ => None,
-            })
-            .await;
+    let stop_id = tokio::select! {
+        result = &mut remove => panic!("removed before the machine acked the stop: {result:?}"),
+        stop_id = async {
+            let stop_id = link.stop_for(&agent).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        } => {}
-    }
+            stop_id
+        } => stop_id,
+    };
     assert_eq!(
         backend.store().list_exposed_machines().await.unwrap().len(),
         1,
         "the machine stays until its stops are confirmed"
     );
-    let (removed, ()) = tokio::join!(remove, link.answer_capabilities(capabilities(0)));
+    let (removed, ()) = tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
     assert_eq!(
         removed.unwrap(),
         json!({ "ok": true, "credentialId": machine.credential.id })
@@ -562,6 +558,50 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
     held.abort();
 }
 
+/// A removal whose stops the machine does not acknowledge in time fails
+/// `machine-unreachable`, naming the unconfirmed agents, and deletes
+/// nothing; the stops stay queued.
+#[tokio::test]
+async fn remove_fails_and_keeps_everything_when_stops_go_unacknowledged() {
+    let mut quick = tuning();
+    quick.remove_timeout = std::time::Duration::from_millis(800);
+    let backend = Backend::with_tuning(quick).await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let _runtime = node.attach(&agent, &workspace());
+    let mut link = machine.accept().await;
+    link.replay_complete(0).await;
+
+    let (error, _) = tokio::join!(
+        backend.call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        ),
+        link.stop_for(&agent),
+    );
+    let error = error.unwrap_err();
+    assert_eq!(error.code(), -32603, "{error:?}");
+    assert_eq!(data(&error)["code"], "machine-unreachable");
+    assert_eq!(data(&error)["unconfirmedStops"], json!([agent.to_string()]));
+    assert_eq!(data(&error)["attempts"], json!([]));
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1
+    );
+    assert!(backend
+        .services
+        .load_remote_machine_token(&machine.id())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        node.shared_ref().has_pending_stops(),
+        "the stop stays queued"
+    );
+    node.shutdown();
+}
+
 /// Review of intentd#2872: a connector is created only under the machine's
 /// lifecycle lock, so `refresh` (or a placement) racing a credential
 /// replacement cannot cache a connector built on the old lease.
@@ -704,6 +744,7 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
         .await
         .unwrap_err();
     assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+    assert_eq!(data(&error)["unconfirmedStops"], json!([agent.to_string()]));
     assert!(!runtime.is_running(), "the agent is stopped on this side");
     assert_eq!(
         backend.store().list_exposed_machines().await.unwrap().len(),
@@ -718,15 +759,10 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
 
     machine.restart().await;
     let mut link = machine.accept().await;
-    link.replay_complete(0).await;
-    link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
-        _ => None,
-    })
-    .await;
-    // The stop counts only once the machine confirms it.
+    let stop_id = link.stop_for(&agent).await;
+    // The stop counts only once the machine acks it.
     assert!(node.shared_ref().has_pending_stops());
-    link.answer_capabilities(capabilities(0)).await;
+    link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
     tokio::time::timeout(wait(), async {
         while node.shared_ref().has_pending_stops() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

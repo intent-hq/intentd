@@ -105,15 +105,16 @@ impl RemoteAgentRuntime {
             .map(|error| AcpError::Transport(format!("node-agent-not-running: {error}")))
     }
 
-    /// Detach from ingestion and queue the node-side stop; idempotent.
-    fn begin_stop(&self) -> Option<tokio::task::JoinHandle<()>> {
+    /// Detach from ingestion and queue the node-side stop, which is resent
+    /// until the machine acknowledges it; idempotent.
+    fn begin_stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
-            return None;
+            return;
         }
         self.shared.agents.detach(&self.agent_id, &self.sink);
         // Fail prompts already waiting; they would never see a turn end.
         self.sink.close();
-        self.shared.request_stop(&self.agent_id)
+        self.shared.request_stop(&self.agent_id);
     }
 
     async fn run_prompt(
@@ -159,6 +160,11 @@ impl RemoteAgentRuntime {
         if let Some(error) = self.not_running() {
             return Err(error);
         }
+        // Never prompt behind this agent's unacknowledged stop.
+        self.shared
+            .no_stop_pending(&self.agent_id)
+            .await
+            .map_err(|_| undelivered())?;
         link.send(&LinkFrame::Prompt {
             agent_id: self.agent_id.clone(),
             turn_id: turn_id.clone(),
@@ -284,17 +290,13 @@ impl AgentRuntime for RemoteAgentRuntime {
     }
 
     fn stop(&self) -> BoxFuture<'static, ()> {
-        let sent = self.begin_stop();
-        Box::pin(async move {
-            if let Some(sent) = sent {
-                let _ = sent.await;
-            }
-        })
+        self.begin_stop();
+        Box::pin(async {})
     }
 }
 
 impl Drop for RemoteAgentRuntime {
     fn drop(&mut self) {
-        drop(self.begin_stop());
+        self.begin_stop();
     }
 }

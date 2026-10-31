@@ -15,7 +15,7 @@
 //! sequence, then sends it, at most every [`Tuning::ack_interval`] or
 //! [`Tuning::ack_batch`] records, and right after the machine's replay.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +70,12 @@ pub(crate) struct Tuning {
     pub idle_check: Duration,
     /// Longest a capabilities request waits for the machine's reply.
     pub capabilities_timeout: Duration,
+    /// Resend delays of an unacknowledged stop on a live link: 5 s, doubling
+    /// to 60 s, ±20% jitter.
+    pub stop_resend: Backoff,
+    /// Longest `remoteMachines.remove` waits for its stops' acks, the
+    /// connect included.
+    pub remove_timeout: Duration,
     pub connect: ConnectTuning,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
@@ -88,6 +94,8 @@ impl Default for Tuning {
             idle_timeout: Duration::from_secs(10 * 60),
             idle_check: Duration::from_secs(15),
             capabilities_timeout: Duration::from_secs(10),
+            stop_resend: Backoff::new(Duration::from_secs(5), Duration::from_secs(60)),
+            remove_timeout: Duration::from_secs(30),
             connect: ConnectTuning::default(),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
@@ -130,8 +138,16 @@ pub(crate) struct Shared {
     parked: Mutex<HashMap<AgentId, Arc<RemoteAgentRuntime>>>,
     link: watch::Sender<Option<NodeLink>>,
     status: Mutex<NodeStatus>,
-    /// Agents whose stop has not been sent yet.
-    pending_stops: Mutex<BTreeSet<AgentId>>,
+    /// Agents whose stop the machine has not acknowledged yet, with the
+    /// stop's id: one id per queued stop, reused by every resend on any
+    /// link of this binding (nodeProtocol 7).
+    stops: Mutex<BTreeMap<AgentId, StopId>>,
+    /// Bumped whenever a stop leaves the queue (acknowledged, or dropped on
+    /// revocation).
+    stops_changed: watch::Sender<u64>,
+    /// The stops a task is resending, with the link generation it resends
+    /// on, so one link has one resender per stop.
+    resending: Mutex<HashMap<StopId, u64>>,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
@@ -185,86 +201,174 @@ impl Shared {
     /// capabilities request is waiting.
     fn wants_link(&self) -> bool {
         self.agents.live_count() > 0
-            || !lock(&self.pending_stops).is_empty()
+            || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
     }
 
-    /// Remember that `agent_id` must be stopped and send the stop now if a
-    /// link is up; otherwise it goes out when the next link is bound.
-    pub(crate) fn request_stop(
-        self: &Arc<Self>,
-        agent_id: &AgentId,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        lock(&self.pending_stops).insert(agent_id.clone());
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let shared = self.clone();
-        Some(runtime.spawn(async move {
-            if shared.current_link().is_some() {
-                shared.flush_stops().await;
-            } else {
-                shared.wake();
-            }
-        }))
-    }
-
-    /// Send the pending stops on the current link and confirm them; they
-    /// leave the queue only once the machine has applied them.
-    async fn flush_stops(&self) {
+    /// Queue a stop for `agent_id` (reusing its id when one is already
+    /// queued) and start resending it now if a link is up; otherwise it goes
+    /// out right after the next bind. It stays queued, and is resent, until
+    /// the machine acknowledges it; nothing waits for that here.
+    pub(crate) fn request_stop(self: &Arc<Self>, agent_id: &AgentId) {
+        let stop_id = self.queue_stop(agent_id);
         let Some(link) = self.current_link() else {
+            self.wake();
             return;
         };
-        let agents: Vec<AgentId> = lock(&self.pending_stops).iter().cloned().collect();
-        if agents.is_empty() {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
-        }
-        if let Err(error) = self.confirm_on(&link, &agents).await {
-            tracing::debug!(%error, "remote machine: stops not confirmed yet; they stay queued");
+        };
+        let shared = self.clone();
+        let agent_id = agent_id.clone();
+        // caller-binding: allow — resends one queued stop on its link until acknowledged
+        runtime.spawn(async move { shared.resend(link, agent_id, stop_id).await });
+    }
+
+    /// The id of `agent_id`'s queued stop, queuing a new one if none is.
+    fn queue_stop(&self, agent_id: &AgentId) -> StopId {
+        *lock(&self.stops)
+            .entry(agent_id.clone())
+            .or_insert_with(StopId::new_v4)
+    }
+
+    /// Whether stop `stop_id` of `agent_id` is still unacknowledged.
+    fn is_queued(&self, agent_id: &AgentId, stop_id: StopId) -> bool {
+        lock(&self.stops).get(agent_id) == Some(&stop_id)
+    }
+
+    /// Whether `agent_id` has an unacknowledged stop.
+    pub(crate) fn stop_queued(&self, agent_id: &AgentId) -> bool {
+        lock(&self.stops).contains_key(agent_id)
+    }
+
+    /// Stop `stop_id` of `agent_id` is acknowledged: it leaves the queue.
+    /// An ack never confirms another stop of the same agent.
+    fn confirm_stop(&self, agent_id: &AgentId, stop_id: StopId) {
+        let mut stops = lock(&self.stops);
+        if stops.get(agent_id) == Some(&stop_id) {
+            stops.remove(agent_id);
+            drop(stops);
+            self.stops_changed.send_modify(|n| *n += 1);
         }
     }
 
-    /// Send `agents`' stops on `link` and wait until the machine has
-    /// applied them. Handing a frame to the link is not delivery; the
-    /// machine handles its control frames in order, so its answer to a
-    /// capabilities request sent after the stops on the same link confirms
-    /// them. Confirmed stops leave the pending queue; on failure they stay.
-    async fn confirm_on(&self, link: &NodeLink, agents: &[AgentId]) -> Result<()> {
-        for agent_id in agents {
-            link.send(&LinkFrame::Stop {
+    /// The machine revoked this binding's credential, which stops its agents
+    /// there: the queued stops are moot.
+    fn drop_stops(&self) {
+        let dropped = !std::mem::take(&mut *lock(&self.stops)).is_empty();
+        if dropped {
+            self.stops_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Send every queued stop on `link`, which nothing else uses yet, so
+    /// they precede any launch or prompt on it; then resend each until it is
+    /// acknowledged.
+    async fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
+        let queued: Vec<(AgentId, StopId)> = lock(&self.stops)
+            .iter()
+            .map(|(agent_id, stop_id)| (agent_id.clone(), *stop_id))
+            .collect();
+        for (agent_id, stop_id) in &queued {
+            let frame = LinkFrame::Stop {
                 agent_id: agent_id.clone(),
-                stop_id: StopId::new_v4(),
-            })
-            .await?;
+                stop_id: *stop_id,
+            };
+            if link.send(&frame).await.is_err() {
+                return;
+            }
         }
-        let (tx, rx) = oneshot::channel();
-        lock(&self.capability_waiters).push(tx);
-        let answered = async {
-            link.send(&LinkFrame::Capabilities).await?;
-            tokio::time::timeout(self.tuning.capabilities_timeout, rx)
+        for (agent_id, stop_id) in queued {
+            let shared = self.clone();
+            let link = link.clone();
+            // caller-binding: allow — resends one queued stop on its link until acknowledged
+            tokio::spawn(async move { shared.resend(link, agent_id, stop_id).await });
+        }
+    }
+
+    /// Send stop `stop_id` on `link` and resend it after 5 s, doubling to
+    /// 60 s (±20%), until the machine acknowledges it or the link closes
+    /// (the next bind sends it again). Only that stop's own ack confirms it.
+    async fn resend(&self, link: NodeLink, agent_id: AgentId, stop_id: StopId) {
+        let generation = link.binding().generation.0;
+        {
+            let mut resending = lock(&self.resending);
+            if resending.get(&stop_id) == Some(&generation) {
+                return;
+            }
+            resending.insert(stop_id, generation);
+        }
+        let mut delays = self.tuning.stop_resend.clone();
+        while self.is_queued(&agent_id, stop_id) && !link.is_closed() {
+            match link
+                .stop(agent_id.clone(), stop_id, delays.next_delay())
                 .await
-                .map_err(|_| {
-                    Error::Internal(format!(
-                        "{}: the machine did not confirm the stops",
-                        link::codes::TIMEOUT
-                    ))
-                })?
-                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+            {
+                Ok(outcome) => {
+                    tracing::debug!(agent = %agent_id, ?outcome, "remote machine: stop acknowledged");
+                    self.confirm_stop(&agent_id, stop_id);
+                }
+                Err(error) if link::error_code(&error) == Some(link::codes::TIMEOUT) => {}
+                Err(_) => break,
+            }
         }
-        .await;
-        lock(&self.capability_waiters).retain(|waiter| !waiter.is_closed());
-        answered?;
-        if link.is_closed() {
-            return Err(Error::Internal(link::codes::CLOSED.into()));
+        let mut resending = lock(&self.resending);
+        if resending.get(&stop_id) == Some(&generation) {
+            resending.remove(&stop_id);
         }
-        let mut pending = lock(&self.pending_stops);
-        for agent_id in agents {
-            pending.remove(agent_id);
+    }
+
+    /// Wait until none of `agents` has an unacknowledged stop, or until
+    /// `deadline`; returns those still unacknowledged.
+    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+        let mut changed = self.stops_changed.subscribe();
+        loop {
+            let unconfirmed: Vec<AgentId> = {
+                let stops = lock(&self.stops);
+                agents
+                    .iter()
+                    .filter(|agent_id| stops.contains_key(*agent_id))
+                    .cloned()
+                    .collect()
+            };
+            if unconfirmed.is_empty() {
+                return unconfirmed;
+            }
+            match tokio::time::timeout_at(deadline, changed.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return unconfirmed,
+            }
         }
-        Ok(())
+    }
+
+    /// No launch or prompt goes out behind an unacknowledged stop of the
+    /// same agent, so a resent stop can never stop a newer process. Waits up
+    /// to [`Tuning::remove_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// `node-link-unavailable` when the stop is still unacknowledged.
+    pub(crate) async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
+        if !self.stop_queued(agent_id) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.tuning.remove_timeout;
+        if self
+            .wait_stops(std::slice::from_ref(agent_id), deadline)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        Err(Error::Internal(format!(
+            "{}: the machine has not acknowledged this agent's earlier stop",
+            link::codes::UNAVAILABLE
+        )))
     }
 
     #[cfg(test)]
     pub(crate) fn has_pending_stops(&self) -> bool {
-        !lock(&self.pending_stops).is_empty()
+        !lock(&self.stops).is_empty()
     }
 
     /// Dial `target` (the routes, port and pin a refreshed registration
@@ -432,7 +536,9 @@ impl RemoteNode {
             parked: Mutex::new(HashMap::new()),
             link: watch::channel(None).0,
             status: Mutex::new(status),
-            pending_stops: Mutex::new(BTreeSet::new()),
+            stops: Mutex::new(BTreeMap::new()),
+            stops_changed: watch::channel(0).0,
+            resending: Mutex::new(HashMap::new()),
             capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
             demand,
@@ -543,23 +649,10 @@ impl RemoteNode {
         reply
     }
 
-    /// Stop `agents` on the machine and wait until it has applied the stops.
-    /// Handing a frame to the link is not delivery; the machine handles its
-    /// control frames in order, so its answer to a capabilities request sent
-    /// after the stops on the same link confirms them. Confirmed stops leave
-    /// the pending queue; on failure they stay queued for the next link.
-    ///
-    /// # Errors
-    ///
-    /// The connect error; `node-link-unavailable` / `node-link-closed` when
-    /// the link is lost first; `node-link-timeout` without an answer.
-    pub(crate) async fn confirm_stops(&self, agents: &[AgentId]) -> Result<()> {
-        self.connect().await?;
-        let link = self
-            .shared
-            .current_link()
-            .ok_or_else(|| Error::Internal(link::codes::UNAVAILABLE.into()))?;
-        self.shared.confirm_on(&link, agents).await
+    /// Wait until none of `agents` has an unacknowledged stop, or until
+    /// `deadline`; returns those still unacknowledged.
+    pub(crate) async fn wait_stops(&self, agents: &[AgentId], deadline: Instant) -> Vec<AgentId> {
+        self.shared.wait_stops(agents, deadline).await
     }
 
     /// Send a control frame (such as a launch) on the current link.
@@ -578,16 +671,16 @@ impl RemoteNode {
     }
 
     /// Stop every agent attached here: their runtimes end and the machine
-    /// is told to stop them. Returns every agent with a stop not yet
-    /// confirmed by the machine, these included.
-    #[must_use = "the stops are only confirmed once delivered"]
+    /// is told to stop them. Returns every agent with a stop the machine has
+    /// not acknowledged yet, these included.
+    #[must_use = "the stops are only confirmed once acknowledged"]
     pub fn stop_all(&self) -> Vec<AgentId> {
         let mut stopped = self.shared.agents.live_ids();
         for agent_id in &stopped {
             self.shared.agents.close(agent_id);
-            let _ = self.shared.request_stop(agent_id);
+            self.shared.request_stop(agent_id);
         }
-        for agent_id in lock(&self.shared.pending_stops).iter() {
+        for agent_id in lock(&self.shared.stops).keys() {
             if !stopped.contains(agent_id) {
                 stopped.push(agent_id.clone());
             }
@@ -619,6 +712,9 @@ impl RemoteNode {
             return Ok(runtime);
         }
         let runtime = self.attach(&command.agent_id, &command.workspace_id);
+        // Never launch behind this agent's unacknowledged stop: a resend of
+        // it would stop the new process.
+        self.shared.no_stop_pending(&command.agent_id).await?;
         let link = self
             .shared
             .link_within(self.shared.tuning.link_loss_grace)
@@ -694,6 +790,9 @@ async fn run(
             Ok(connected) => connected,
             Err(failure) => {
                 tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
+                if matches!(failure, ConnectFailure::Revoked(_)) {
+                    shared.drop_stops();
+                }
                 shared.record_failure(&failure).await;
                 shared.announce().await;
                 for waiter in waiters.drain(..) {
@@ -733,6 +832,11 @@ async fn run(
         }
         shared.welcome(&welcome);
         shared.record_link(&welcome).await;
+        // Before the link is published: queue the stops of agents head no
+        // longer claims, then send every queued stop, so they precede any
+        // launch or prompt on this link.
+        claim(&shared, &welcome).await;
+        shared.resend_queued(&link).await;
         shared.link.send_replace(Some(link.clone()));
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));
@@ -744,10 +848,6 @@ async fn run(
             "remote machine: link bound"
         );
         shared.announce().await;
-        claim(&shared, &welcome, &link).await;
-        // Confirming needs the serve loop below to read the answer.
-        let flushing = shared.clone();
-        tokio::spawn(async move { flushing.flush_stops().await });
         let git = serve_git(&shared, &endpoint, &link).await;
         let served = Served {
             lease: &lease,
@@ -949,10 +1049,11 @@ impl Acks {
 }
 
 /// Claim the node's running agents at bind: an agent head has no record of
-/// on this lease (a head crash mid-launch, a deleted agent) is stopped; one
+/// on this lease (a head crash mid-launch, a deleted agent) gets a queued
+/// stop with a new id, resent until acknowledged; one
 /// head knows but has not attached since it started gets a runtime, kept
 /// until the agent manager takes it, so its output is not dropped.
-async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
+async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome) {
     if welcome.running_agents.is_empty() {
         return;
     }
@@ -975,13 +1076,7 @@ async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
         match workspaces.get(agent_id) {
             None => {
                 tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
-                let stop = LinkFrame::Stop {
-                    agent_id: agent_id.clone(),
-                    stop_id: StopId::new_v4(),
-                };
-                if link.send(&stop).await.is_err() {
-                    return;
-                }
+                shared.queue_stop(agent_id);
             }
             Some(workspace_id) if !shared.agents.is_attached(agent_id) => {
                 let sink = shared.agents.attach(agent_id, (*workspace_id).clone());

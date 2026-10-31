@@ -426,7 +426,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             return Err(in_use(&row.name, running));
         }
         let stopped = node.stop_all();
-        deliver_stops(&node, &stopped, &row.name).await?;
+        deliver_stops(feature, &node, &stopped, &row.name).await?;
     }
     if let Some(node) = feature.take_node(&machine_id) {
         node.shutdown();
@@ -445,33 +445,56 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     Ok(result)
 }
 
-/// Stop `agents` on the machine, confirmed, before it is forgotten: the
-/// machine keeps its agents running across a lost link, and once its
-/// credential and lease are gone nothing could reach them. When the stops
-/// cannot be confirmed the removal fails and everything stays, the stops
-/// still queued; the connector keeps redialing to deliver them.
-async fn deliver_stops(node: &RemoteNode, agents: &[AgentId], name: &str) -> Result<()> {
+/// Wait for the machine to acknowledge the stops of `agents` before it is
+/// forgotten: the machine keeps its agents running across a lost link, and
+/// once its credential and lease are gone nothing could reach them. Waits at
+/// most [`crate::connector::Tuning::remove_timeout`] (30 s), the connect
+/// included. When any stop is unacknowledged the removal fails
+/// `machine-unreachable` with `unconfirmedStops` and everything stays, the
+/// stops still queued and resent. A revoked credential needs no stops.
+async fn deliver_stops(
+    feature: &RemoteFeature,
+    node: &RemoteNode,
+    agents: &[AgentId],
+    name: &str,
+) -> Result<()> {
     if agents.is_empty() {
         return Ok(());
     }
-    let Err(error) = node.confirm_stops(agents).await else {
-        return Ok(());
-    };
-    // A machine that refuses the credential was revoked by its owner: no
-    // backend path to it is left to keep, so the removal goes on.
-    if matches!(&error, Error::RemoteMachine(failure)
-        if failure.data["code"] == crate::connect::MACHINE_REVOKED)
-    {
-        return Ok(());
+    let deadline = tokio::time::Instant::now() + feature.tuning().remove_timeout;
+    let mut attempts = json!([]);
+    // A connect that does not finish in time leaves the stops unconfirmed.
+    if let Ok(Err(error)) = tokio::time::timeout_at(deadline, node.connect()).await {
+        match error {
+            Error::RemoteMachine(failure)
+                if failure.data["code"] == crate::connect::MACHINE_REVOKED =>
+            {
+                return Ok(());
+            }
+            Error::RemoteMachine(failure) => attempts = failure.data["attempts"].clone(),
+            other => return Err(other),
+        }
     }
-    if matches!(&error, Error::RemoteMachine(_)) {
-        return Err(error);
+    // An unreachable machine cannot ack now; the stops stay queued.
+    let unconfirmed = if attempts.as_array().is_some_and(|a| !a.is_empty()) {
+        node.wait_stops(agents, tokio::time::Instant::now()).await
+    } else {
+        node.wait_stops(agents, deadline).await
+    };
+    if unconfirmed.is_empty() {
+        return Ok(());
     }
     Err(coded(
         true,
         crate::connect::MACHINE_UNREACHABLE,
-        format!("{name} did not confirm the stops of its agents; try again when it is reachable."),
-        json!({ "attempts": [] }),
+        format!(
+            "{name} did not acknowledge the stops of {} agent(s); try again when it is reachable, or revoke the credential on the machine.",
+            unconfirmed.len()
+        ),
+        json!({
+            "attempts": attempts,
+            "unconfirmedStops": unconfirmed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
     ))
 }
 

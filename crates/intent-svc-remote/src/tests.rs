@@ -15,7 +15,8 @@ use intent_acp::AcpError;
 use intent_core::agent_runtime::AgentRuntime;
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
-    JournalBody, JournalRecord, LinkFrame, LinkHello, LinkOutcome, LinkWelcome, MachineCapabilities,
+    JournalBody, JournalRecord, LaunchCommand, LinkFrame, LinkHello, LinkOutcome, LinkWelcome,
+    MachineCapabilities, StopId, StopOutcome,
 };
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
@@ -58,6 +59,8 @@ fn tuning() -> Tuning {
         idle_timeout: Duration::from_secs(600),
         idle_check: Duration::from_millis(20),
         capabilities_timeout: wait(),
+        stop_resend: Backoff::new(Duration::from_millis(150), Duration::from_millis(600)),
+        remove_timeout: wait(),
         connect: ConnectTuning {
             attempt: Duration::from_millis(500),
             total: wait(),
@@ -345,6 +348,28 @@ impl NodeEnd {
             _ => None,
         })
         .await;
+    }
+
+    /// The id of the next stop head sends for `agent`, skipping other
+    /// frames.
+    async fn stop_for(&mut self, agent: &AgentId) -> StopId {
+        self.expect(|frame| match frame {
+            LinkFrame::Stop { agent_id, stop_id } if agent_id == *agent => Some(stop_id),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Acknowledge stop `stop_id` for `agent`.
+    async fn ack_stop(&self, stop_id: StopId, agent: &AgentId, outcome: StopOutcome) {
+        self.link
+            .send(&LinkFrame::StopAck {
+                stop_id,
+                agent_id: agent.clone(),
+                outcome,
+            })
+            .await
+            .unwrap();
     }
 
     /// Answer head's next capabilities request with `capabilities`.
@@ -907,21 +932,18 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     // The pending stop keeps the connector redialing until it is sent.
     machine.restart().await;
     let mut link = machine.accept().await;
-    link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id, .. } if agent_id == early => Some(()),
-        _ => None,
-    })
-    .await;
+    let early_stop = link.stop_for(&early).await;
     // The machine confirms it; until then the stop stays queued and would be
     // sent again.
-    link.answer_capabilities(capabilities(0)).await;
+    link.ack_stop(early_stop, &early, StopOutcome::Stopped)
+        .await;
     tokio::time::timeout(wait(), async {
         while node.shared_ref().has_pending_stops() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the machine's answer confirms the stop");
+    .expect("the machine's ack confirms the stop");
 
     // Stopped agents' records are no longer delivered.
     link.replay_complete(0).await;
@@ -1216,6 +1238,245 @@ mod on_demand {
         second.replay_complete(2).await;
         second.acked(2).await;
         assert_eq!(texts(&runtime, 2).await, ["before", "after"]);
+        node.shutdown();
+    }
+}
+
+/// Stop acknowledgement (nodeProtocol 7): a stop stays queued, and is
+/// resent with its id, until the machine acks that id.
+mod stop_acks {
+    use super::*;
+    use intentd_test_support::test_timeout;
+
+    fn launch_of(agent: &AgentId) -> LaunchCommand {
+        LaunchCommand {
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            provider: "codex".into(),
+            model: None,
+            base_commit: "0".repeat(40),
+            repo_key: "repo".into(),
+            agent_features: serde_json::json!({}),
+            is_sub_agent: false,
+            profile_env: None,
+        }
+    }
+
+    async fn confirmed(node: &RemoteNode) {
+        tokio::time::timeout(wait(), async {
+            while node.shared_ref().has_pending_stops() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stop is confirmed");
+    }
+
+    /// A live agent's link, bound and replayed.
+    async fn live(
+        machine: &mut Machine,
+        node: &RemoteNode,
+    ) -> (AgentId, Arc<crate::RemoteAgentRuntime>, NodeEnd) {
+        let agent = AgentId::new();
+        let runtime = node.attach(&agent, &workspace());
+        let link = machine.accept().await;
+        link.replay_complete(0).await;
+        bound(node).await;
+        (agent, runtime, link)
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_confirmed_only_by_its_own_ack() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+
+        // Neither a capabilities reply, an exit record, another stop's ack
+        // nor this stop's id for another agent confirms it.
+        link.link
+            .send(&LinkFrame::CapabilitiesReply {
+                capabilities: capabilities(0),
+            })
+            .await
+            .unwrap();
+        link.journal(exited(1, &agent)).await;
+        link.ack_stop(StopId::new_v4(), &agent, StopOutcome::Stopped)
+            .await;
+        link.ack_stop(stop_id, &AgentId::new(), StopOutcome::Stopped)
+            .await;
+        // timing-guard: the wrong acks have been read by head
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.shared_ref().has_pending_stops());
+
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_unacked_stop_is_resent_with_the_same_id() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let first = link.stop_for(&agent).await;
+        let again = link.stop_for(&agent).await;
+        assert_eq!(again, first, "a resend keeps the stop id");
+        link.ack_stop(first, &agent, StopOutcome::NotRunning).await;
+        confirmed(&node).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_older_ack_never_confirms_a_newer_stop() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let older = link.stop_for(&agent).await;
+        link.ack_stop(older, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
+
+        // The agent runs again and is stopped again: a new stop id.
+        let again = node.attach(&agent, &workspace());
+        again.stop().await;
+        let newer = link.stop_for(&agent).await;
+        assert_ne!(newer, older);
+        // A late duplicate ack of the older stop confirms nothing.
+        link.ack_stop(older, &agent, StopOutcome::NotRunning).await;
+        // timing-guard: the late ack has been read by head
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.shared_ref().has_pending_stops());
+        link.ack_stop(newer, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queued_stops_go_out_first_after_a_reconnect_with_their_ids() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        // The launch below waits for the machine to come back.
+        let mut slow = tuning();
+        slow.link_loss_grace = wait();
+        let node = backend.bare_with(&machine, slow).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // The machine drops off before acking; the agent never shows in a
+        // welcome, which is no confirmation either.
+        machine.stop().await;
+        disconnected(&node).await;
+        assert!(node.shared_ref().has_pending_stops());
+
+        let other = AgentId::new();
+        let launching = {
+            let node = node.clone();
+            let command = launch_of(&other);
+            // The launched runtime is kept: dropping it would stop the agent.
+            tokio::spawn(async move { node.launch(command).await })
+        };
+        machine.restart().await;
+        let mut link = machine.accept().await;
+        let first = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop { agent_id, stop_id } => Some((agent_id, stop_id)),
+                LinkFrame::Launch(_) | LinkFrame::Prompt { .. } => {
+                    panic!("a launch went out before the queued stop")
+                }
+                _ => None,
+            })
+            .await;
+        assert_eq!(first, (agent.clone(), stop_id), "resent with its id");
+        link.ack_stop(stop_id, &agent, StopOutcome::NotRunning)
+            .await;
+        confirmed(&node).await;
+        link.expect(|frame| matches!(frame, LinkFrame::Launch(_)).then_some(()))
+            .await;
+        let _launched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        node.shutdown();
+    }
+
+    /// A lost ack and its resend must never stop a newer process: the agent
+    /// is not launched again until its stop is acknowledged.
+    #[tokio::test]
+    async fn a_launch_waits_for_its_agents_unconfirmed_stop() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // The ack is lost. The agent is launched again meanwhile.
+        let launching = {
+            let node = node.clone();
+            let command = launch_of(&agent);
+            // The launched runtime is kept: dropping it would stop the agent.
+            tokio::spawn(async move { node.launch(command).await })
+        };
+        let resent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop { agent_id, stop_id } if agent_id == agent => Some(stop_id),
+                LinkFrame::Launch(_) => panic!("launched behind an unconfirmed stop"),
+                _ => None,
+            })
+            .await;
+        assert_eq!(resent, stop_id);
+        assert!(!launching.is_finished(), "the launch waits for the ack");
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            LinkFrame::Stop { .. } => panic!("a resend raced the launch"),
+            _ => None,
+        })
+        .await;
+        let _launched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // No resend follows the ack: the new process is never stopped.
+        let late = tokio::time::timeout(test_timeout(Duration::from_millis(800)), async {
+            link.expect(|frame| matches!(frame, LinkFrame::Stop { .. }).then_some(()))
+                .await;
+        })
+        .await;
+        assert!(late.is_err(), "the confirmed stop is not sent again");
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_queued_stop_keeps_the_link_up() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let mut quick = tuning();
+        quick.idle_timeout = Duration::from_millis(300);
+        let node = backend.bare_with(&machine, quick).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // timing-guard: three idle windows pass while the stop is unacked
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!link.link.is_closed(), "a queued stop holds the link");
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.closed_by_head().await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_drops_the_queue() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (_agent, runtime, _link) = live(&mut machine, &node).await;
+        machine.stop().await;
+        disconnected(&node).await;
+        runtime.stop().await;
+        assert!(node.shared_ref().has_pending_stops());
+        // Revocation stops the binding's agents on the machine: the queued
+        // stop is moot and dropped once the machine refuses the credential.
+        machine.revoke().await;
+        machine.restart().await;
+        confirmed(&node).await;
         node.shutdown();
     }
 }
