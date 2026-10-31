@@ -17384,6 +17384,135 @@ impl Services {
             .remove(agent_id);
     }
 
+    /// The position of `message_id` in `queue` when it is still exactly the
+    /// automatic wake the daemon queued, so a newer wake may replace it: in
+    /// the live queue and NOT popped for delivery (a draining entry is being
+    /// processed, and may already be in the transcript), with no user origin,
+    /// edit, hold, merge, retry, attachment or prepend state, and metadata
+    /// `supersedes` confirms. Shared by [`Services::remove_pending_wake`]
+    /// and [`Services::rewrite_pending_wake`]; callers hold the drain lock
+    /// and the queue lock, so the check and the mutation are one step.
+    fn replaceable_pending_wake(
+        queue: &[QueuedMessage],
+        draining: &[QueuedMessage],
+        message_id: &str,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> Option<usize> {
+        let index = queue.iter().position(|m| m.id == message_id)?;
+        let entry = &queue[index];
+        let in_delivery = draining
+            .iter()
+            .any(|d| d.id == entry.id || d.turn_id == entry.turn_id);
+        let untouched = entry.monitor_turn.is_none()
+            && !entry.user_origin
+            && !entry.is_human_queue_entry()
+            && !entry.editing
+            && entry.editing_message_id.is_none()
+            && entry.edit_appended.is_empty()
+            && entry.edit_prepended.is_empty()
+            && !entry.persisted
+            && !entry.requeued_after_failure
+            && !entry.provisional
+            && !entry.interrupt_priority
+            && entry.hold_kind.is_none()
+            && entry.delivery_groups.is_none()
+            && entry.prepend_delivery_groups.is_none()
+            && entry.prepend_content.is_none()
+            && !entry.has_attachments()
+            && entry.merged_submission_ids.is_empty()
+            && entry.recovery_sources.is_empty();
+        (!in_delivery && untouched && entry.message_metadata.as_ref().is_some_and(supersedes))
+            .then_some(index)
+    }
+
+    /// Remove a still-UNDELIVERED automatic wake from the agent's queue
+    /// (see [`Services::replaceable_pending_wake`] for which entries
+    /// qualify). The PR monitor uses this for a newer CHANGE update: the
+    /// older queued one is removed and the newer one joins the back of the
+    /// queue (or starts a turn) through the ordinary delivery path, so the
+    /// owner never reads the stale one. A concurrent pop either takes the
+    /// entry first (this returns `false`) or never sees it.
+    ///
+    /// Returns whether the entry was removed. The caller publishes
+    /// `agent:queue:updated` (which also writes the queue through).
+    pub(crate) fn remove_pending_wake(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> bool {
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let mut live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let Some(queue) = live.get_mut(agent_id) else {
+            return false;
+        };
+        let draining = draining
+            .get(agent_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(index) = Self::replaceable_pending_wake(queue, draining, message_id, supersedes)
+        else {
+            return false;
+        };
+        queue.remove(index);
+        if queue.is_empty() {
+            live.remove(agent_id);
+        }
+        true
+    }
+
+    /// Rewrite a still-UNDELIVERED automatic wake IN PLACE (see
+    /// [`Services::replaceable_pending_wake`] for which entries qualify):
+    /// same id and queue position, new `content` and `messageMetadata`, and
+    /// a refreshed `queued_at` so the dequeue-wait note dates the new
+    /// content. The PR monitor uses this for the merged/closed FINAL update,
+    /// which takes over the older queued update's place instead of waiting
+    /// behind work queued after it.
+    ///
+    /// Returns whether the entry was rewritten. The caller publishes
+    /// `agent:queue:updated` (which also writes the queue through).
+    pub(crate) fn rewrite_pending_wake(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        content: &str,
+        message_metadata: &Value,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> bool {
+        let mut content = content.to_string();
+        annotate_sender_attribution(&mut content, Some(message_metadata));
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let mut live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let Some(queue) = live.get_mut(agent_id) else {
+            return false;
+        };
+        let draining = draining
+            .get(agent_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(index) = Self::replaceable_pending_wake(queue, draining, message_id, supersedes)
+        else {
+            return false;
+        };
+        let entry = &mut queue[index];
+        entry.content = content;
+        entry.message_metadata = Some(message_metadata.clone());
+        entry.queued_at = now_iso();
+        true
+    }
+
     /// `true` iff the agent has at least one queued message that is **not**
     /// under edit and **not** under an unexpired debounce hold (i.e. the
     /// "ready-to-send" queue is non-empty). Drives the self-drain trigger and

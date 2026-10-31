@@ -416,6 +416,7 @@ impl Services {
             return Ok(None);
         }
         self.consume_pr_monitor_catch_up(&monitor.monitor_id);
+        self.forget_queued_pr_monitor_wake(&monitor.monitor_id);
         Ok(Some(monitor))
     }
 
