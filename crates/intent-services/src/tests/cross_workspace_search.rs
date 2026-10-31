@@ -260,3 +260,113 @@ async fn many_note_hits_in_one_sibling_do_not_hide_another() {
         ["ws-dark"]
     );
 }
+
+fn chief() -> WorkspaceId {
+    WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID)
+}
+
+async fn app_search(
+    h: &Harness,
+    s: CrossWorkspaceSearch,
+    repository: Option<intent_core::RepoRef>,
+) -> Value {
+    h.svc
+        .app_workspaces_search(chief(), s, repository)
+        .await
+        .expect("app search")
+}
+
+fn sorted_ids(v: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = v["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `ws.app.workspaces.search` (Assistant only) spans repositories, keeps the
+/// sibling search's ranking and PR rules, and narrows by GitHub repository.
+#[intent_test_macros::daemon_test]
+async fn app_search_spans_repositories_and_filters_by_repository() {
+    let h = harness().await;
+    let store = h.svc.store();
+    let mut fe = workspace(&WorkspaceId::from("ws-fe"));
+    fe.title = "Login screen polish".to_string();
+    fe.repository_path = Some("/repo/fe".to_string());
+    fe.repository_owner = Some("intent-hq".to_string());
+    fe.repository_name = Some("cloudlands-fe".to_string());
+    store.insert_workspace(&fe).await.expect("fe workspace");
+    // The store's Assistant anchor row is never a result, even when it
+    // matches.
+    let mut anchor = store.get_workspace(&chief()).await.expect("chief row");
+    anchor.title = "login".to_string();
+    anchor.repository_path = Some("/repo/a".to_string());
+    store
+        .update_workspace(&anchor)
+        .await
+        .expect("update chief row");
+
+    let v = app_search(&h, search(Some("login"), None), None).await;
+    assert_eq!(
+        sorted_ids(&v),
+        ["ws-caller", "ws-fe", "ws-login", "ws-notes", "ws-other"]
+    );
+    let matches = v["matches"].as_array().unwrap();
+    assert_eq!(matches.last().unwrap()["id"], "ws-notes");
+    let other = matches.iter().find(|m| m["id"] == "ws-other").unwrap();
+    assert_eq!(other["repositoryPath"], "/repo/b");
+    assert_eq!(other["repository"], Value::Null);
+    let fe_row = matches.iter().find(|m| m["id"] == "ws-fe").unwrap();
+    assert_eq!(fe_row["repository"], "intent-hq/cloudlands-fe");
+
+    // A bare PR number matches every repository; retired stays opt-in.
+    let v = app_search(&h, search(None, Some("7")), None).await;
+    assert_eq!(
+        sorted_ids(&v),
+        ["ws-caller", "ws-dark", "ws-login", "ws-other"]
+    );
+    let mut with_retired = search(Some("login"), None);
+    with_retired.include_retired = true;
+    assert!(
+        sorted_ids(&app_search(&h, with_retired, None).await).contains(&"ws-retired".to_string())
+    );
+
+    // The repository filter is case-insensitive and tolerates `.git`.
+    let v = app_search(
+        &h,
+        search(Some("login"), None),
+        Some(intent_core::RepoRef::new("Intent-HQ", "cloudlands-fe.git")),
+    )
+    .await;
+    assert_eq!(sorted_ids(&v), ["ws-fe"]);
+    let v = app_search(
+        &h,
+        search(Some("login"), None),
+        Some(intent_core::RepoRef::new("intent-hq", "nope")),
+    )
+    .await;
+    assert_eq!(v["matches"], Value::Array(Vec::new()));
+}
+
+#[intent_test_macros::daemon_test]
+async fn app_search_is_assistant_only_and_needs_a_criterion() {
+    let h = harness().await;
+    let err = h
+        .svc
+        .app_workspaces_search(h.caller.clone(), search(Some("login"), None), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::Forbidden(_)),
+        "non-Assistant caller must be refused: {err}"
+    );
+    let err = h
+        .svc
+        .app_workspaces_search(chief(), search(Some("  "), None), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("non-empty query"), "{err}");
+}

@@ -1,25 +1,32 @@
-//! `ws.crossWorkspace.search`: find sibling workspaces by free text and/or a
-//! pull-request reference.
+//! Workspace search by free text and/or a pull-request reference.
 //!
-//! Scope is exactly the `crossWorkspace.*` sibling set (same repository,
-//! membership-narrowed, self excluded), so every hit is a workspace the
-//! agent can already open with `crossWorkspace.listNotes` / `readNote`.
-//! Three indexes feed it:
+//! - `ws.crossWorkspace.search`: exactly the `crossWorkspace.*` sibling set
+//!   (same repository, membership-narrowed, self excluded), so every hit is
+//!   a workspace the agent can already open with `crossWorkspace.listNotes`
+//!   / `readNote`.
+//! - `ws.app.workspaces.search`: the Assistant (Chief of Staff) workspace
+//!   only; every membership-visible workspace in any repository, optionally
+//!   narrowed to one GitHub repository.
+//!
+//! Three indexes feed both:
 //!
 //! - the PR <-> workspace link index (migration 0161), for `pr`;
 //! - workspace metadata (title, branch, status message, label, tags, PR
 //!   titles), for `query`;
-//! - the note FTS index restricted to the siblings, for `query`.
+//! - the note FTS index restricted to the candidates, for `query`.
 
 use std::collections::{HashMap, HashSet};
 
 use intent_core::{
-    pull_request_key, CrossWorkspaceSearch, Error, PullRequestInfo, Result, Workspace, WorkspaceId,
+    pull_request_key, CrossWorkspaceSearch, Error, PullRequestInfo, RepoRef, Result, Workspace,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::{NoteFtsMatch, NoteFtsOptions, PullRequestLink};
 use serde_json::{json, Value};
 
-use crate::{has_repository_identity, workspaces_share_repository, Services};
+use crate::{
+    github_repository_identity, has_repository_identity, workspaces_share_repository, Services,
+};
 
 /// Note hits kept per workspace in a result row. Capped in SQL per
 /// workspace, so one sibling's many strong hits never crowd out another.
@@ -63,29 +70,66 @@ impl Services {
         workspace_id: WorkspaceId,
         search: CrossWorkspaceSearch,
     ) -> Result<Value> {
-        let query = search
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|q| !q.is_empty());
-        if query.is_none() && search.pr.is_none() {
-            return Err(Error::InvalidParams(
-                "Provide a non-empty query, a pr, or both".to_string(),
-            ));
-        }
+        let search = normalize_search(search)?;
         let siblings = self
             .cross_workspace_siblings(&workspace_id, search.include_retired)
             .await?;
-        if siblings.is_empty() {
+        self.search_workspaces(siblings, search, false).await
+    }
+
+    /// `ws.app.workspaces.search`: every workspace the caller can see, in any
+    /// repository, optionally narrowed to one GitHub repository. Only the
+    /// Assistant (Chief of Staff) workspace may call it; the Assistant
+    /// workspace itself is never a result.
+    pub(crate) async fn app_workspaces_search_op(
+        &self,
+        workspace_id: WorkspaceId,
+        search: CrossWorkspaceSearch,
+        repository: Option<RepoRef>,
+    ) -> Result<Value> {
+        if !workspace_id.is_chief() {
+            return Err(Error::Forbidden(
+                "ws.app.workspaces.search is only available in the Assistant workspace".to_string(),
+            ));
+        }
+        let search = normalize_search(search)?;
+        let wanted = repository.as_ref().map(repository_identity);
+        let mut candidates = self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::new(
+                true,
+                search.include_retired,
+            ))
+            .await?;
+        self.retain_member_workspaces(&mut candidates).await?;
+        candidates.retain(|w| {
+            !w.id.is_chief()
+                && w.status != WorkspaceStatus::Deleted
+                && wanted
+                    .as_ref()
+                    .is_none_or(|want| github_repository_identity(w).as_ref() == Some(want))
+        });
+        self.search_workspaces(candidates, search, true).await
+    }
+
+    /// Shared search over an already-authorized candidate set.
+    async fn search_workspaces(
+        &self,
+        candidates: Vec<Workspace>,
+        search: CrossWorkspaceSearch,
+        with_repository: bool,
+    ) -> Result<Value> {
+        if candidates.is_empty() {
             return Ok(json!({ "matches": [], "truncated": false }));
         }
-        let ids: Vec<WorkspaceId> = siblings.iter().map(|w| w.id.clone()).collect();
+        let query = search.query.as_deref();
+        let ids: Vec<WorkspaceId> = candidates.iter().map(|w| w.id.clone()).collect();
         let links = self
             .store
             .list_pull_request_links_for_workspaces(&ids)
             .await?;
-        // With a PR selector, only PR-matching siblings can survive ranking,
-        // so note search is restricted to them.
+        // With a PR selector, only PR-matching workspaces can survive
+        // ranking, so note search is restricted to them.
         let note_scope: Vec<WorkspaceId> = match &search.pr {
             Some(selector) => {
                 let matched: HashSet<&str> = links
@@ -104,7 +148,7 @@ impl Services {
             Some(expr) if !note_scope.is_empty() => {
                 // The per-workspace cap bounds the result to
                 // `note_scope.len() * NOTES_PER_WORKSPACE` rows, so no global
-                // limit is needed and every eligible sibling is represented.
+                // limit is needed and every eligible workspace is represented.
                 let options = NoteFtsOptions {
                     allowed_workspace_ids: Some(&note_scope),
                     include_archived: true,
@@ -115,16 +159,55 @@ impl Services {
             }
             _ => Vec::new(),
         };
-        Ok(rank_matches(
-            siblings,
-            &CrossWorkspaceSearch {
-                query: query.map(str::to_string),
-                ..search
-            },
-            &links,
-            note_hits,
-        ))
+        let mut result = rank_matches(candidates.clone(), &search, &links, note_hits);
+        if with_repository {
+            let by_id: HashMap<&str, &Workspace> =
+                candidates.iter().map(|w| (w.id.as_str(), w)).collect();
+            if let Some(rows) = result["matches"].as_array_mut() {
+                for row in rows {
+                    let Some(w) = row["id"].as_str().and_then(|id| by_id.get(id)) else {
+                        continue;
+                    };
+                    row["repository"] = w.repo().map_or(Value::Null, |r| {
+                        Value::String(format!("{}/{}", r.owner, r.name))
+                    });
+                    row["repositoryPath"] = w
+                        .repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map_or(Value::Null, |p| Value::String(p.to_string()));
+                }
+            }
+        }
+        Ok(result)
     }
+}
+
+/// Trim the query and require a criterion.
+fn normalize_search(search: CrossWorkspaceSearch) -> Result<CrossWorkspaceSearch> {
+    let query = search
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string);
+    if query.is_none() && search.pr.is_none() {
+        return Err(Error::InvalidParams(
+            "Provide a non-empty query, a pr, or both".to_string(),
+        ));
+    }
+    Ok(CrossWorkspaceSearch { query, ..search })
+}
+
+/// Case-folded `(owner, name)` with `.git` stripped, comparable with
+/// [`github_repository_identity`].
+fn repository_identity(repo: &RepoRef) -> (String, String) {
+    let (owner, name) = repo.identity_parts();
+    let name = name.trim();
+    (
+        owner.trim().to_string(),
+        name.strip_suffix(".git").unwrap_or(name).to_string(),
+    )
 }
 
 /// Score, filter and shape sibling rows (pure, so the ranking rules are
