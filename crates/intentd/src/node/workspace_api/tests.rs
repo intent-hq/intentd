@@ -306,6 +306,7 @@ async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
         url: format!("wss://{}", listener.local_addr()),
         pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
         token: token(),
+        tailcat: None,
     };
     let hello = LinkHello {
         protocol: NODE_LINK_PROTOCOLS,

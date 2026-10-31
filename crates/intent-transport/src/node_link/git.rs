@@ -5,6 +5,7 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -22,6 +23,7 @@ pub struct GitConnection {
     out: mpsc::Sender<Vec<u8>>,
     incoming: mpsc::Receiver<Vec<u8>>,
     close: watch::Sender<bool>,
+    close_frame: std::sync::Arc<std::sync::Mutex<Option<CloseFrame>>>,
 }
 
 impl GitConnection {
@@ -39,6 +41,8 @@ impl GitConnection {
         let (out, mut out_rx) = mpsc::channel::<Vec<u8>>(QUEUE);
         let (in_tx, incoming) = mpsc::channel(QUEUE);
         let (close, _) = watch::channel(false);
+        let close_frame = std::sync::Arc::new(std::sync::Mutex::new(None::<CloseFrame>));
+        let close_frame_task = close_frame.clone();
         let (mut sink, mut stream) = socket.split();
         let mut closed = close.subscribe();
         let close_tx = close.clone();
@@ -91,9 +95,13 @@ impl GitConnection {
                 }
             }
             close_tx.send_replace(true);
+            let frame = close_frame_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             // A peer that stopped reading must not hold this task open.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let _ = sink.send(Message::Close(None)).await;
+                let _ = sink.send(Message::Close(frame)).await;
                 let _ = sink.close().await;
             })
             .await;
@@ -103,6 +111,7 @@ impl GitConnection {
             out,
             incoming,
             close,
+            close_frame,
         }
     }
 
@@ -144,10 +153,56 @@ impl GitConnection {
         self.close.send_replace(true);
     }
 
+    /// Close with a WebSocket close `code` and `reason` (for example `1008`
+    /// when the peer's credential was revoked).
+    pub fn close_with(&self, code: u16, reason: &'static str) {
+        self.closer().close_with(code, reason);
+    }
+
+    /// A handle that can close this connection after it has been handed
+    /// off.
+    pub(super) fn closer(&self) -> GitCloser {
+        GitCloser {
+            close: self.close.clone(),
+            close_frame: self.close_frame.clone(),
+        }
+    }
+
     /// Resolves once the connection has closed.
     pub async fn closed(&self) {
         let mut rx = self.close.subscribe();
         super::wait_true(&mut rx).await;
+    }
+}
+
+/// Closes a [`GitConnection`] that has been handed off.
+#[derive(Debug, Clone)]
+pub(super) struct GitCloser {
+    close: watch::Sender<bool>,
+    close_frame: std::sync::Arc<std::sync::Mutex<Option<CloseFrame>>>,
+}
+
+impl GitCloser {
+    pub(super) fn is_closed(&self) -> bool {
+        *self.close.borrow()
+    }
+
+    pub(super) async fn closed(&self) {
+        let mut rx = self.close.subscribe();
+        super::wait_true(&mut rx).await;
+    }
+
+    pub(super) fn close_with(&self, code: u16, reason: &'static str) {
+        if !self.is_closed() {
+            *self
+                .close_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CloseFrame {
+                code: code.into(),
+                reason: reason.into(),
+            });
+        }
+        self.close.send_replace(true);
     }
 }
 

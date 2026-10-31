@@ -164,6 +164,7 @@ impl Fixture {
             url: format!("wss://{}", listener.local_addr()),
             pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
             token,
+            tailcat: None,
         };
         let binding = LeaseBinding {
             head_id: "head-1".into(),

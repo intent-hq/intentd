@@ -94,6 +94,7 @@ impl Node {
             url: format!("wss://{}", self.listener.local_addr()),
             pin: CertificatePin::parse(&self.certificate.fingerprint256).unwrap(),
             token: self.token.clone(),
+            tailcat: None,
         }
     }
 
@@ -629,6 +630,7 @@ async fn reconnects_with_backoff_once_the_node_is_up() {
         url: format!("wss://{address}"),
         pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
         token: token.clone(),
+        tailcat: None,
     };
     let generations = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next_hello = {
@@ -1292,4 +1294,5 @@ async fn abandoned_queued_request_is_never_sent_uncancelled() {
     link.close();
 }
 
+mod executor;
 mod git_sessions;

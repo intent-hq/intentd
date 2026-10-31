@@ -143,7 +143,7 @@ impl HeadNodeConfig {
         Ok(Self {
             node_id,
             name,
-            endpoint: NodeEndpoint { url, pin, token },
+            endpoint: NodeEndpoint::direct(url, pin, token),
             certificate_sha256,
         })
     }

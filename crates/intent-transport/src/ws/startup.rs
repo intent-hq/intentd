@@ -134,7 +134,7 @@ impl WsInner {
     }
 }
 
-async fn unavailable<W: AsyncWrite + Unpin>(stream: &mut W) -> std::io::Result<()> {
+pub(super) async fn unavailable<W: AsyncWrite + Unpin>(stream: &mut W) -> std::io::Result<()> {
     stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
     stream.shutdown().await
 }
