@@ -368,22 +368,35 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
     assert_eq!(data(&error)["runningAgents"], 1);
 
     let mut sub = subscribe(&backend);
-    let removed = backend
-        .call(
-            "remove",
-            json!({ "machineId": machine.id(), "stopAgents": true }),
-        )
-        .await
-        .unwrap();
+    // Review of intentd#2872: handing the stop to the link is not delivery.
+    // The removal waits until the machine has applied it (its answer to a
+    // capabilities request sent after the stop on the same link).
+    let remove = backend.call(
+        "remove",
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    );
+    tokio::pin!(remove);
+    tokio::select! {
+        result = &mut remove => panic!("removed before the machine confirmed the stop: {result:?}"),
+        () = async {
+            link.expect(|frame| match frame {
+                LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+                _ => None,
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        } => {}
+    }
     assert_eq!(
-        removed,
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1,
+        "the machine stays until its stops are confirmed"
+    );
+    let (removed, ()) = tokio::join!(remove, link.answer_capabilities(capabilities(0)));
+    assert_eq!(
+        removed.unwrap(),
         json!({ "ok": true, "credentialId": machine.credential.id })
     );
-    link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
-        _ => None,
-    })
-    .await;
     assert!(!runtime.is_running());
     assert!(backend
         .store()
@@ -499,6 +512,107 @@ async fn a_host_that_fails_the_bind_does_not_hide_a_valid_one() {
     drop(decoy);
 }
 
+/// Review of intentd#2872: a host that accepts TCP but then stalls in the
+/// handshake gets one attempt's budget, not the whole connect's, so the valid
+/// host behind it is still tried.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let stalled = tokio::net::TcpListener::bind(("127.0.0.2", machine.port))
+        .await
+        .expect("bind the stalled host");
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = stalled.accept().await {
+            sockets.push(socket);
+        }
+    });
+    let target = crate::machine::MachineTarget::from_parts(
+        &machine.id(),
+        "Test machine",
+        vec!["127.0.0.2".into(), "127.0.0.1".into()],
+        machine.port,
+        None,
+        &machine.certificate.fingerprint256,
+        &machine.token,
+        None,
+    )
+    .unwrap();
+    let owner = crate::lease::new_owner(backend.store(), &machine.id())
+        .await
+        .unwrap();
+    // The whole budget stays under the dialer's own 10 s handshake bound,
+    // which is the bound a stalled host used to consume.
+    let budget = crate::connect::ConnectTuning {
+        attempt: std::time::Duration::from_secs(2),
+        total: std::time::Duration::from_secs(8),
+    };
+    for generation in 1..5 {
+        let connected = crate::connect::connect(&target, &budget, None, || {
+            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            async move { Ok(hello) }
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("connect {generation}: {failure:?}"));
+        connected.dialed.link.close();
+        machine.accept().await;
+    }
+    held.abort();
+}
+
+/// Review of intentd#2872: adding the same credential again with a new
+/// listener port moves the retained connector to that port too, not only
+/// its hosts.
+#[tokio::test]
+async fn adding_again_on_a_new_port_moves_the_connector() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let old_port = proxy.local_addr().unwrap().port();
+    let real_port = machine.port;
+    let forward = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut outbound) =
+                    tokio::net::TcpStream::connect(("127.0.0.1", real_port)).await
+                else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    let mut params = machine.add_params();
+    params["port"] = json!(old_port);
+    backend
+        .call("add", params)
+        .await
+        .expect("add on the old port");
+    machine.accept().await.closed_by_head().await;
+    let node = backend.node(&machine.id()).await;
+    node.connect().await.unwrap();
+    let first = machine.accept().await;
+
+    backend
+        .call("add", machine.add_params())
+        .await
+        .expect("add again on the new port");
+    machine.accept().await;
+    forward.abort();
+    first.link.close();
+    disconnected(&node).await;
+
+    node.connect()
+        .await
+        .expect("the connector dials the new port");
+    machine.accept().await;
+    node.shutdown();
+}
+
 /// Review of intentd#2872: adding a machine again with the same credential
 /// (a route refresh) keeps its lease and offers a newer generation, so the
 /// machine does not refuse it as stale.
@@ -576,15 +690,24 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
         _ => None,
     })
     .await;
+    // The stop counts only once the machine confirms it.
+    assert!(node.shared_ref().has_pending_stops());
+    link.answer_capabilities(capabilities(0)).await;
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().has_pending_stops() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the machine's answer confirms the stop");
     let removed = backend
         .call(
             "remove",
             json!({ "machineId": machine.id(), "stopAgents": true }),
         )
-        .await
-        .unwrap();
+        .await;
     assert_eq!(
-        removed,
+        removed.unwrap(),
         json!({ "ok": true, "credentialId": machine.credential.id })
     );
     assert!(backend

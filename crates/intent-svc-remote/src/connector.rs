@@ -207,31 +207,69 @@ impl Shared {
         }))
     }
 
+    /// Send the pending stops on the current link and confirm them; they
+    /// leave the queue only once the machine has applied them.
     async fn flush_stops(&self) {
         let Some(link) = self.current_link() else {
             return;
         };
         let agents: Vec<AgentId> = lock(&self.pending_stops).iter().cloned().collect();
-        for agent_id in agents {
-            let frame = LinkFrame::Stop {
-                agent_id: agent_id.clone(),
-            };
-            if link.send(&frame).await.is_err() {
-                return;
-            }
-            lock(&self.pending_stops).remove(&agent_id);
+        if agents.is_empty() {
+            return;
+        }
+        if let Err(error) = self.confirm_on(&link, &agents).await {
+            tracing::debug!(%error, "remote machine: stops not confirmed yet; they stay queued");
         }
     }
 
+    /// Send `agents`' stops on `link` and wait until the machine has
+    /// applied them. Handing a frame to the link is not delivery; the
+    /// machine handles its control frames in order, so its answer to a
+    /// capabilities request sent after the stops on the same link confirms
+    /// them. Confirmed stops leave the pending queue; on failure they stay.
+    async fn confirm_on(&self, link: &NodeLink, agents: &[AgentId]) -> Result<()> {
+        for agent_id in agents {
+            link.send(&LinkFrame::Stop {
+                agent_id: agent_id.clone(),
+            })
+            .await?;
+        }
+        let (tx, rx) = oneshot::channel();
+        lock(&self.capability_waiters).push(tx);
+        let answered = async {
+            link.send(&LinkFrame::Capabilities).await?;
+            tokio::time::timeout(self.tuning.capabilities_timeout, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not confirm the stops",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        lock(&self.capability_waiters).retain(|waiter| !waiter.is_closed());
+        answered?;
+        if link.is_closed() {
+            return Err(Error::Internal(link::codes::CLOSED.into()));
+        }
+        let mut pending = lock(&self.pending_stops);
+        for agent_id in agents {
+            pending.remove(agent_id);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_pending_stops(&self) -> bool {
         !lock(&self.pending_stops).is_empty()
     }
 
-    /// Dial `hosts` and `tc_address` from now on.
-    pub(crate) fn set_routes(&self, hosts: Vec<String>, tc_address: Option<String>) {
-        let mut target = lock(&self.target);
-        target.hosts = hosts;
-        target.tc_address = tc_address;
+    /// Dial `target` (the routes, port and pin a refreshed registration
+    /// was accepted on) from now on.
+    pub(crate) fn set_target(&self, target: MachineTarget) {
+        *lock(&self.target) = target;
     }
 
     fn target(&self) -> MachineTarget {
@@ -504,6 +542,25 @@ impl RemoteNode {
         reply
     }
 
+    /// Stop `agents` on the machine and wait until it has applied the stops.
+    /// Handing a frame to the link is not delivery; the machine handles its
+    /// control frames in order, so its answer to a capabilities request sent
+    /// after the stops on the same link confirms them. Confirmed stops leave
+    /// the pending queue; on failure they stay queued for the next link.
+    ///
+    /// # Errors
+    ///
+    /// The connect error; `node-link-unavailable` / `node-link-closed` when
+    /// the link is lost first; `node-link-timeout` without an answer.
+    pub(crate) async fn confirm_stops(&self, agents: &[AgentId]) -> Result<()> {
+        self.connect().await?;
+        let link = self
+            .shared
+            .current_link()
+            .ok_or_else(|| Error::Internal(link::codes::UNAVAILABLE.into()))?;
+        self.shared.confirm_on(&link, agents).await
+    }
+
     /// Send a control frame (such as a launch) on the current link.
     ///
     /// # Errors
@@ -520,12 +577,21 @@ impl RemoteNode {
     }
 
     /// Stop every agent attached here: their runtimes end and the machine
-    /// is told to stop them.
-    pub fn stop_all(&self) {
-        for agent_id in self.shared.agents.live_ids() {
-            self.shared.agents.close(&agent_id);
-            let _ = self.shared.request_stop(&agent_id);
+    /// is told to stop them. Returns every agent with a stop not yet
+    /// confirmed by the machine, these included.
+    #[must_use = "the stops are only confirmed once delivered"]
+    pub fn stop_all(&self) -> Vec<AgentId> {
+        let mut stopped = self.shared.agents.live_ids();
+        for agent_id in &stopped {
+            self.shared.agents.close(agent_id);
+            let _ = self.shared.request_stop(agent_id);
         }
+        for agent_id in lock(&self.shared.pending_stops).iter() {
+            if !stopped.contains(agent_id) {
+                stopped.push(agent_id.clone());
+            }
+        }
+        stopped
     }
 
     /// The machine's supported and currently available platforms.
@@ -678,7 +744,9 @@ async fn run(
         );
         shared.announce().await;
         claim(&shared, &welcome, &link).await;
-        shared.flush_stops().await;
+        // Confirming needs the serve loop below to read the answer.
+        let flushing = shared.clone();
+        tokio::spawn(async move { flushing.flush_stops().await });
         let git = serve_git(&shared, &endpoint, &link).await;
         let served = Served {
             lease: &lease,

@@ -147,16 +147,32 @@ where
                 }
                 Some(Err(_)) => continue,
             };
-            if let Some(connected) =
-                dial(target, machine_version, &mut hello, route, &mut attempts).await?
+            // A host that accepted TCP gets one attempt's budget for the
+            // handshake, so one that stalls cannot hide the hosts after it.
+            if let Some(connected) = dial(
+                target,
+                machine_version,
+                &mut hello,
+                route,
+                Some(tuning.attempt),
+                &mut attempts,
+            )
+            .await?
             {
                 racing.abort_all();
                 return Ok(connected);
             }
         }
         if let Some(route) = target.tailcat_route() {
-            if let Some(connected) =
-                dial(target, machine_version, &mut hello, route, &mut attempts).await?
+            if let Some(connected) = dial(
+                target,
+                machine_version,
+                &mut hello,
+                route,
+                None,
+                &mut attempts,
+            )
+            .await?
             {
                 return Ok(connected);
             }
@@ -184,14 +200,16 @@ where
     Err(ConnectFailure::Unreachable(attempts))
 }
 
-/// Dial and bind on `route`: `Ok(None)` records its failure in `attempts`
-/// for the caller to try the next route; a version mismatch ends the
-/// connect, since every route reaches the same daemon.
+/// Dial and bind on `route`, within `bound` when given: `Ok(None)` records
+/// its failure in `attempts` for the caller to try the next route; a
+/// version mismatch ends the connect, since every route reaches the same
+/// daemon.
 async fn dial<F, Fut>(
     target: &MachineTarget,
     machine_version: Option<&str>,
     hello: &mut F,
     route: Route,
+    bound: Option<Duration>,
     attempts: &mut Vec<Attempt>,
 ) -> std::result::Result<Option<Connected>, ConnectFailure>
 where
@@ -201,7 +219,18 @@ where
     let offer = hello()
         .await
         .map_err(|error| ConnectFailure::Local(error.to_string()))?;
-    match link::dial_link(&route.endpoint, offer).await {
+    let dialed = match bound {
+        Some(bound) => tokio::time::timeout(bound, link::dial_link(&route.endpoint, offer))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Internal(format!(
+                    "{}: the handshake took too long",
+                    codes::TIMEOUT
+                )))
+            }),
+        None => link::dial_link(&route.endpoint, offer).await,
+    };
+    match dialed {
         Ok(dialed) => Ok(Some(Connected {
             dialed,
             endpoint: route.endpoint,

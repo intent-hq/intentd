@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use intent_core::machines::{ExposedMachine, RemoteMachineState};
 use intent_core::nodes::NodeCounter;
-use intent_core::{now_iso, Error, ExecutorCredentialId, Result};
+use intent_core::{now_iso, AgentId, Error, ExecutorCredentialId, Result};
 use intent_services::feature_api::Services;
 
 use crate::connect::{connect, ConnectFailure, Connected};
@@ -380,8 +380,10 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         }
     };
     let node = feature.node(svc, &params.machine_id).await?;
-    node.shared_ref()
-        .set_routes(row.hosts.clone(), row.tc_address.clone());
+    let mut accepted = target;
+    accepted.hosts.clone_from(&row.hosts);
+    accepted.tc_address.clone_from(&row.tc_address);
+    node.shared_ref().set_target(accepted);
     let machine = machine_json(&row, Some(node.shared_ref()));
     svc.publish_remote_machine_changed(json!({ "machine": machine.clone() }))
         .await;
@@ -423,8 +425,8 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         if running > 0 && !stop_agents {
             return Err(in_use(&row.name, running));
         }
-        node.stop_all();
-        deliver_stops(&node, &row.name).await?;
+        let stopped = node.stop_all();
+        deliver_stops(&node, &stopped, &row.name).await?;
     }
     if let Some(node) = feature.take_node(&machine_id) {
         node.shutdown();
@@ -443,37 +445,34 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     Ok(result)
 }
 
-/// Send `node`'s pending stops before the machine is forgotten: the machine
-/// keeps its agents running across a lost link, and once its credential and
-/// lease are gone nothing could reach them. When they cannot be delivered
-/// the removal fails and everything stays, the stops still queued; the
-/// connector keeps redialing to deliver them.
-async fn deliver_stops(node: &RemoteNode, name: &str) -> Result<()> {
-    if !node.shared_ref().has_pending_stops() {
+/// Stop `agents` on the machine, confirmed, before it is forgotten: the
+/// machine keeps its agents running across a lost link, and once its
+/// credential and lease are gone nothing could reach them. When the stops
+/// cannot be confirmed the removal fails and everything stays, the stops
+/// still queued; the connector keeps redialing to deliver them.
+async fn deliver_stops(node: &RemoteNode, agents: &[AgentId], name: &str) -> Result<()> {
+    if agents.is_empty() {
         return Ok(());
     }
-    if let Err(error) = node.connect().await {
-        // A machine that refuses the credential was revoked by its owner:
-        // no backend path to it is left to keep, so the removal goes on.
-        let revoked = matches!(&error, Error::RemoteMachine(failure)
-            if failure.data["code"] == crate::connect::MACHINE_REVOKED);
-        return if revoked { Ok(()) } else { Err(error) };
+    let Err(error) = node.confirm_stops(agents).await else {
+        return Ok(());
+    };
+    // A machine that refuses the credential was revoked by its owner: no
+    // backend path to it is left to keep, so the removal goes on.
+    if matches!(&error, Error::RemoteMachine(failure)
+        if failure.data["code"] == crate::connect::MACHINE_REVOKED)
+    {
+        return Ok(());
     }
-    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while node.shared_ref().has_pending_stops() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    if delivered.is_err() {
-        return Err(coded(
-            true,
-            crate::connect::MACHINE_UNREACHABLE,
-            format!("{name} did not take the stops of its agents; try again when it is reachable."),
-            json!({ "attempts": [] }),
-        ));
+    if matches!(&error, Error::RemoteMachine(_)) {
+        return Err(error);
     }
-    Ok(())
+    Err(coded(
+        true,
+        crate::connect::MACHINE_UNREACHABLE,
+        format!("{name} did not confirm the stops of its agents; try again when it is reachable."),
+        json!({ "attempts": [] }),
+    ))
 }
 
 async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
