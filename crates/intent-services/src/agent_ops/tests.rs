@@ -36549,25 +36549,50 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
 /// the boot-rehydration re-arm): a held entry migrated off a poisoned
 /// session still flushes at its deadline on the replacement's queue instead
 /// of sitting parked until an unrelated queue event.
+///
+/// Neither half depends on how long setup and the migration's store writes
+/// take (intent-hq/intent#8181: a 300 ms wall-clock deadline expired before
+/// the marker check on a loaded host). The `kept` entry's deadline is far
+/// away, so its marker must arrive intact. The `due` entry is armed far away
+/// on the poisoned agent and its deadline is then moved into the past in
+/// memory without re-arming, so only the migration's re-arm can flush it
+/// before the liveness bound; the poisoned agent's own timer would sleep
+/// for a minute.
 #[tokio::test]
 async fn migrate_queue_rearms_hold_timers_for_target() {
     let (_t, svc, ws) = setup().await;
     let poisoned = create_agent(&svc, &ws, "PoisonedHeld").await;
     let target = create_agent(&svc, &ws, "FreshHeld").await;
 
-    // Park one short-deadline held entry on the poisoned session (armed
-    // against the poisoned agent id) alongside a normal entry.
-    let soon = intent_core::iso_ms_from_now(300);
-    let (held, _) = svc
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (kept, _) = svc
         .enqueue_held_message(
             &poisoned,
-            "held wake".into(),
+            "kept wake".into(),
             None,
             "debounce",
-            &soon,
+            &far,
             "child-1",
         )
         .await;
+    let (due, _) = svc
+        .enqueue_held_message(
+            &poisoned,
+            "due wake".into(),
+            None,
+            "debounce",
+            &far,
+            "child-2",
+        )
+        .await;
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let entry = guard
+            .get_mut(&poisoned)
+            .and_then(|queue| queue.iter_mut().find(|m| m.id == due.id))
+            .expect("due entry queued on the poisoned agent");
+        entry.hold_until = Some(intent_core::iso_ms_from_now(0));
+    }
     svc.enqueue_message(
         &poisoned,
         "plain".into(),
@@ -36583,26 +36608,26 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
         .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
         .await
         .expect("migrate");
-    assert_eq!(migrated, 2);
+    assert_eq!(migrated, 3);
 
     // The held entry moved with its marker intact...
     let snapshot = svc.queue_snapshot(&target);
     let moved = snapshot
         .iter()
-        .find(|e| e["id"] == json!(held.id))
+        .find(|e| e["id"] == json!(kept.id))
         .expect("held entry migrated");
     assert_eq!(moved["holdKind"], "debounce");
 
-    // ...and the re-armed timer flushes it on the TARGET at the deadline —
-    // no manual release, no unrelated queue event.
+    // ...and the re-armed timer flushes the due entry on the TARGET — no
+    // manual release, no unrelated queue event.
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let snapshot = svc.queue_snapshot(&target);
         let entry = snapshot
             .iter()
-            .find(|e| e["id"] == json!(held.id))
-            .expect("held entry stays queued");
+            .find(|e| e["id"] == json!(due.id))
+            .expect("due entry stays queued");
         if entry["holdKind"].is_null() {
             break;
         }
@@ -36612,6 +36637,15 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let snapshot = svc.queue_snapshot(&target);
+    let kept_entry = snapshot
+        .iter()
+        .find(|e| e["id"] == json!(kept.id))
+        .expect("kept entry stays queued");
+    assert_eq!(
+        kept_entry["holdKind"], "debounce",
+        "the far-deadline hold stays held"
+    );
     assert!(svc.has_ready_to_send(&target));
 }
 
