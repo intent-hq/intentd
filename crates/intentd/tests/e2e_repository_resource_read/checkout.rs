@@ -38,10 +38,13 @@ fn set(server: &Server, path: &str, body: Value, next: Option<&str>) {
         .unwrap()
         .insert(path.into(), next.unwrap_or_default().into());
 }
-/// Failure-path report for a stalled owner `settings.update`
-/// (intent-hq/intent#8252): which settings lock it could be queued behind.
-/// Read-only: a revision-gate try-lock and the public credential-gate read.
-async fn settings_stall_report(h: &Harness) -> String {
+/// Failure-path sample for a stalled owner `settings.update`
+/// (intent-hq/intent#8252), taken once at the timeout. Strictly read-only:
+/// revision-gate try-locks (released at once) and the fake provider's counters.
+/// The GitLab credential gate has no read-only probe; `settings.update` takes
+/// it before the revision gate, so a free revision gate means the update is
+/// parked earlier (credential gate or worker start) or after its last lock.
+fn settings_stall_report(h: &Harness) -> String {
     let gate = h.services.settings_revision_gate();
     let revision = if gate.try_write().is_ok() {
         "free"
@@ -51,18 +54,8 @@ async fn settings_stall_report(h: &Harness) -> String {
         "write-held"
     };
     let server = h.server.as_ref().unwrap();
-    let started = std::time::Instant::now();
-    let credential = match tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(500)),
-        h.services.own_gitlab_token(&server.host),
-    )
-    .await
-    {
-        Ok(_) => format!("acquired in {:?}", started.elapsed()),
-        Err(_) => "not acquired (held, or its secret read stalled)".into(),
-    };
     format!(
-        "settings stall probe: revision gate {revision}; gitlab credential gate {credential}; provider requests active={} completed={} routed={}",
+        "settings stall sample: revision gate {revision}; provider requests active={} completed={} routed={}",
         server.state.active.load(Ordering::SeqCst),
         server.state.completed.load(Ordering::SeqCst),
         server.count()
@@ -205,9 +198,9 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
     }
 }
 
-/// The #8252 stall diagnostic names a held settings lock. Holding the revision
-/// gate parks `settings.update` after it took the credential gate, so the
-/// report must show both instead of a bare `Elapsed`.
+/// The #8252 stall diagnostic names a held settings lock instead of a bare
+/// `Elapsed`: holding the revision gate parks `settings.update`, and the
+/// sample must report it write-held with no provider request in flight.
 #[intent_test_macros::daemon_test]
 async fn checkout_settings_update_stall_report_names_held_gates() {
     let h = Harness::with_workspace(false).await;
@@ -228,10 +221,6 @@ async fn checkout_settings_update_stall_report_names_held_gates() {
         "{stall}"
     );
     assert!(stall.contains("revision gate write-held"), "{stall}");
-    assert!(
-        stall.contains("gitlab credential gate not acquired"),
-        "{stall}"
-    );
     assert!(stall.contains("provider requests active=0"), "{stall}");
     drop(held);
     // Nothing arrived before the stall, so the original reply is still whole.

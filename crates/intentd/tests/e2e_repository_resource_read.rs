@@ -609,17 +609,17 @@ impl Client {
     /// [`Client::rpc`] that, when no frame arrives within `budget`, runs `probe`
     /// and returns its report instead of a bare `Elapsed` (intent-hq/intent#8252).
     /// The probe runs only on that failure path.
-    async fn try_rpc_probed<F: std::future::Future<Output = String>>(
+    async fn try_rpc_probed(
         &mut self,
         method: &str,
         params: Value,
         budget: Duration,
-        probe: impl FnOnce() -> F,
+        probe: impl FnOnce() -> String,
     ) -> Result<Value, String> {
         self.send(method, params).await;
         loop {
             let Some(result) = self.try_next(budget).await else {
-                let report = probe().await;
+                let report = probe();
                 return Err(format!(
                     "no reply to {method} id {} within {budget:?}; {report}",
                     self.id
