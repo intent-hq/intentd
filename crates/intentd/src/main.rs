@@ -2563,7 +2563,8 @@ async fn cmd_serve_owned(
     // if there is one; without the file nothing starts.
     let services_remote = services.clone();
     let remote_data_dir = config.data_dir.clone();
-    startup_work.spawn(|| {
+    // The outbound head connector is orchestration: off in node mode.
+    orchestration.spawn(|| {
         intent_core::spawn_daemon(async move {
             match services_remote.start_remote_node(&remote_data_dir).await {
                 Ok(true) => tracing::info!("remote node: connector started"),

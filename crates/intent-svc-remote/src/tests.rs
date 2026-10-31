@@ -874,6 +874,48 @@ mod services {
     }
 }
 
+#[cfg(unix)]
+mod node_mode {
+    use super::*;
+    use crate::RemoteServicesExt as _;
+    use intent_services::feature_api::Services;
+
+    /// A configured head restarted in node mode never starts the outbound
+    /// connector, so no remote agent can dispatch forwarded calls into it.
+    #[tokio::test]
+    async fn node_mode_never_starts_the_head_connector() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let services = crate::register(Services::new(store).with_node_mode(true));
+        let data = tempfile::tempdir().unwrap();
+        let mut fake = FakeNode::start().await;
+        let config = json!({
+            "nodeId": NODE,
+            "endpoint": format!("wss://{}", fake.listener.local_addr()),
+            "certificateSha256": fake.certificate.fingerprint256,
+            "token": token().expose(),
+        });
+        let path = data.path().join(crate::CONFIG_FILE);
+        std::fs::write(&path, config.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!crate::start_configured(&services, data.path())
+            .await
+            .unwrap());
+        assert!(!services.start_remote_node(data.path()).await.unwrap());
+        assert!(
+            services.remote_node().is_none(),
+            "no connector in node mode"
+        );
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fake.listener.accept(),
+        )
+        .await;
+        assert!(accepted.is_err(), "the node is never dialed");
+    }
+}
+
 /// The runtime fits the agent manager's runtime slot: the same associated
 /// types as the local ACP runtime, as a shared trait object.
 #[test]

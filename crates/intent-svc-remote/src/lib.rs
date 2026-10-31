@@ -146,6 +146,16 @@ impl RemoteServicesExt for Services {
 
 /// [`RemoteServicesExt::start_remote_node`] past the experimental switch.
 pub(crate) async fn start_configured(services: &Services, data_dir: &Path) -> Result<bool> {
+    // Node mode turns this daemon's orchestration off, including acting as
+    // a head: no outbound connector, so no remote agent can reach its
+    // workspaces through forwarded calls. The inbound executor link is
+    // separate and stays available.
+    if services.node_mode() {
+        if data_dir.join(CONFIG_FILE).exists() {
+            tracing::info!("remote node: {CONFIG_FILE} is ignored in node mode");
+        }
+        return Ok(false);
+    }
     let Some(feature) = services.feature::<RemoteFeature>() else {
         return Err(intent_core::Error::Internal(
             "the remote feature is not registered".into(),
