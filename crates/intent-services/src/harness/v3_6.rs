@@ -1,4 +1,4 @@
-//! Focused specialist workflows with shared, risk-based verification evidence.
+//! Source-aligned Developer and Lead workflows with minimal verification.
 
 use super::{Doctrine, HarnessEntry};
 
@@ -26,7 +26,7 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "bd75ebcf9071ee767f408275b11c10ba6437bf0d3a3166f0dfc974e36d85b0c6",
+                "78a5c202fb320a498445e02c88459035b2976f26b303986346c28ca7437fa51e",
             ),
             (
                 "implementor",
@@ -34,7 +34,7 @@ mod tests {
             ),
             (
                 "spec-writer",
-                "c9b522adf49085acf0a4defd12f3e7974dfa9af8b54137d9b4f5389570b6d54c",
+                "ea4d894f36a2863db0738045f326b2c502cc4b35003efa053209d3a6fc3ed903",
             ),
             (
                 "pr-reviewer",

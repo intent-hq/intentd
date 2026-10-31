@@ -270,8 +270,9 @@ plan, then edits directly or delegates when useful. Developer implements directl
 and plans as needed. Both can use Implementors for focused work and own their
 verification. Lead remains available in the team picker and can
 use file-editing tools; existing Coordinator sessions keep their original behavior.
-These defaults keep planning and checks proportional to the change, reuse relevant
-test evidence, give shared checks one owner, and preserve required repository checks.
+Both defer verification until work is complete and minimize verification runs.
+Lead strongly prefers end-to-end tests and considers isolated-system failure modes
+before coding.
 For UI work, they reuse app patterns, preserve user context, and show screenshots
 of the rendered result. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
