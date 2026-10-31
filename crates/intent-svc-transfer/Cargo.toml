@@ -24,7 +24,7 @@ tempfile = "3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 intent-services = { path = "../intent-services", version = "0.11.93", features = ["test-hooks"] }
