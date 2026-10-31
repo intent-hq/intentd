@@ -342,6 +342,7 @@ impl Services {
                                 return Err(Error::RetireUnsupported {
                                     workspace_id: name.clone(),
                                     checkout_mode,
+                                    plain_folder: false,
                                 });
                             }
                             intent_git::worktree::detach_worktree(&repo, &wt)?
@@ -483,6 +484,7 @@ impl Services {
             Err(Error::RetireUnsupported {
                 workspace_id: ws.id.as_str().to_string(),
                 checkout_mode: ws.checkout_mode,
+                plain_folder: false,
             })
         }
     }
@@ -632,16 +634,27 @@ pub(crate) fn resolve_within_root(
     (resolved != root && resolved.starts_with(&root)).then_some(resolved)
 }
 
-/// Retire is only for daemon-owned git worktrees: `cow` / `direct`
-/// checkouts (the folder IS the repository — deleting it loses the branch),
-/// `skipIsolation` workspaces (the folder is the user's repository), remote
-/// workspaces and checkout-less rows are refused with
-/// [`Error::RetireUnsupported`] before anything changes.
+/// Retire is only for daemon-owned git worktrees: plain-folder workspaces
+/// (the folder is the user's, §5.1 "Plain-folder workspaces" — checked
+/// first, from the persisted flag, whatever else the row holds), `cow` /
+/// `direct` checkouts (the folder IS the repository — deleting it loses the
+/// branch), `skipIsolation` workspaces (the folder is the user's
+/// repository), remote workspaces and checkout-less rows are refused with
+/// [`Error::RetireUnsupported`] before anything changes. The automatic
+/// purge skips every refused workspace.
 pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
+    if ws.plain_folder {
+        return Err(Error::RetireUnsupported {
+            workspace_id: ws.id.as_str().to_string(),
+            checkout_mode: None,
+            plain_folder: true,
+        });
+    }
     let refuse = |checkout_mode: Option<intent_core::CheckoutMode>| {
         Err(Error::RetireUnsupported {
             workspace_id: ws.id.as_str().to_string(),
             checkout_mode,
+            plain_folder: false,
         })
     };
     if ws.is_remote {

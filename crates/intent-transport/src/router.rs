@@ -251,11 +251,16 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // `workspace.retire` on a non-worktree checkout (§5.1): -32602 with
         // `data = { code: "retire-unsupported", checkoutMode? }`.
         ref e @ Error::RetireUnsupported {
-            ref checkout_mode, ..
+            ref checkout_mode,
+            plain_folder,
+            ..
         } => {
             let mut data = json!({ "code": "retire-unsupported" });
             if let Some(mode) = checkout_mode {
                 data["checkoutMode"] = json!(mode);
+            }
+            if plain_folder {
+                data["plainFolder"] = json!(true);
             }
             RpcErr {
                 code: e.code(),
@@ -263,6 +268,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 data: Some(data),
             }
         }
+        // An operation needing git or a forge on a plain-folder workspace
+        // (§5.1 "Plain-folder workspaces"): -32602 with `data = { code:
+        // "plain-folder-unsupported", operation }`.
+        ref e @ Error::PlainFolderUnsupported { operation } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "plain-folder-unsupported", "operation": operation })),
+        },
         // Plain-folder create shape rejection (§5.1 "Plain-folder
         // workspaces"): -32602 with `data = { code: "invalid-params" }`.
         ref e @ Error::PlainFolderInvalidParams(_) => RpcErr {

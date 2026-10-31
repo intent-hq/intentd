@@ -3497,6 +3497,7 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: Some(intent_core::CheckoutMode::Cow),
+        plain_folder: false,
     });
     assert_eq!(rpc.code, -32602);
     assert_eq!(
@@ -3506,10 +3507,46 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: None,
+        plain_folder: false,
     });
     assert_eq!(
         rpc.data,
         Some(serde_json::json!({ "code": "retire-unsupported" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+        plain_folder: true,
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "plainFolder": true }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.retire is not available in plain-folder workspaces"
+    );
+}
+
+/// An operation needing git or a forge on a plain-folder workspace (§5.1)
+/// carries `plain-folder-unsupported` with the refused operation.
+#[test]
+fn plain_folder_unsupported_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderUnsupported {
+        operation: "workspace.duplicate",
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-unsupported",
+            "operation": "workspace.duplicate",
+        }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.duplicate is not available in plain-folder workspaces"
     );
 }
 

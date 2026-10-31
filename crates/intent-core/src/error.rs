@@ -46,12 +46,23 @@ pub enum Error {
     /// workspace (the folder is the user's repository), a remote workspace,
     /// or one without a checkout. Nothing is changed. Surfaces as `-32602`
     /// with `error.data = { code: "retire-unsupported", checkoutMode? }`.
+    /// A plain-folder workspace (`plain_folder: true`, §5.1 "Plain-folder
+    /// workspaces") adds `plainFolder: true` and the message
+    /// `workspace.retire is not available in plain-folder workspaces`.
     /// Kept small (no owned reason string) so [`Error`] does not grow.
-    #[error("workspace {workspace_id} cannot be retired: only git worktree workspaces can retire")]
+    #[error("{}", retire_unsupported_message(workspace_id, *plain_folder))]
     RetireUnsupported {
         workspace_id: String,
         checkout_mode: Option<crate::model::CheckoutMode>,
+        plain_folder: bool,
     },
+
+    /// An operation that needs git or a forge, called for a plain-folder
+    /// workspace (§5.1 "Plain-folder workspaces"), e.g. `workspace.duplicate`.
+    /// Nothing is changed. Surfaces as `-32602` with `error.data = { code:
+    /// "plain-folder-unsupported", operation }`.
+    #[error("{operation} is not available in plain-folder workspaces")]
+    PlainFolderUnsupported { operation: &'static str },
 
     /// A `workspace.create { plainFolder: true }` request-shape rejection
     /// (§5.1 "Plain-folder workspaces"): a git-only option, a pr-kind
@@ -579,6 +590,17 @@ impl CloneErrorCategory {
     }
 }
 
+/// Message for [`Error::RetireUnsupported`].
+fn retire_unsupported_message(workspace_id: &str, plain_folder: bool) -> String {
+    if plain_folder {
+        "workspace.retire is not available in plain-folder workspaces".to_string()
+    } else {
+        format!(
+            "workspace {workspace_id} cannot be retired: only git worktree workspaces can retire"
+        )
+    }
+}
+
 impl Error {
     #[must_use]
     pub fn execution_authorization(
@@ -613,6 +635,7 @@ impl Error {
             | Error::NotFound(_)
             | Error::WorkspaceRetired { .. }
             | Error::RetireUnsupported { .. }
+            | Error::PlainFolderUnsupported { .. }
             | Error::PlainFolderInvalidParams(_)
             | Error::PlainFolderPathRejected(_)
             | Error::SecretRequest { .. }

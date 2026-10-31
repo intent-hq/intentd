@@ -131,7 +131,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 /// Canonical form when the path exists, else its lexical normal form.
-fn comparable(path: &Path) -> PathBuf {
+pub(crate) fn comparable(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexically(path))
 }
 

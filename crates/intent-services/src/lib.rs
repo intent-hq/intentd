@@ -18632,6 +18632,13 @@ impl Services {
             let mut known_completion =
                 matches!(&workspace_observation, Ok(_) | Err(Error::NotFound(_)));
             let ws_for_cleanup = workspace_observation.ok();
+            // The plain folder the background sweep must never touch.
+            let ws_for_cleanup_plain_folder = ws_for_cleanup
+                .as_ref()
+                .filter(|w| w.plain_folder)
+                .and_then(|w| w.repository_path.as_deref())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
             let branch_observation = store.workspace_branch_auto_generated(&id).await;
             known_completion &= matches!(&branch_observation, Ok(_) | Err(Error::NotFound(_)));
             let branch_auto_generated = branch_observation.unwrap_or(false);
@@ -18731,6 +18738,9 @@ impl Services {
                 known_completion &=
                     matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
                 let recreated = recreated_observation.ok();
+                // A plain-folder row (§5.1) never reaches the checkout
+                // cleanup: its folder is `repositoryPath` and is the user's.
+                let ws_for_cleanup = ws_for_cleanup.filter(|w| !w.plain_folder);
                 let deleted_worktree_path = ws_for_cleanup
                     .as_ref()
                     .and_then(|w| w.worktree_path.clone());
@@ -18923,6 +18933,15 @@ impl Services {
                     .filter(|p| !p.is_empty())
                     .and_then(|wt_path| Path::new(wt_path).parent())
                     .map(Path::to_path_buf);
+                // Plain folder (§5.1 "Plain-folder workspaces"): the folder
+                // is the user's and is never deleted. A candidate that is the
+                // folder, holds it or lies inside it is skipped — the
+                // `<parent>/<id>` candidates are derived from the id and the
+                // roots alone (intent-hq/intent#6229), so a later root or
+                // location change can point one at the user's folder.
+                let plain_folder_bg = ws_for_cleanup_plain_folder
+                    .as_deref()
+                    .map(plain_folder::comparable);
                 for dir in workspace_dir_candidates(
                     &id_bg,
                     sweep_worktree_path,
@@ -18931,6 +18950,17 @@ impl Services {
                 ) {
                     if recreated_parent.as_deref() == Some(dir.as_path()) {
                         continue;
+                    }
+                    if let Some(folder) = plain_folder_bg.as_deref() {
+                        let candidate = plain_folder::comparable(&dir);
+                        if folder.starts_with(&candidate) || candidate.starts_with(folder) {
+                            tracing::debug!(
+                                workspace = %id_bg.as_str(),
+                                dir = %dir.display(),
+                                "workspace.delete: candidate overlaps the plain folder; keeping it"
+                            );
+                            continue;
+                        }
                     }
                     // Shared parallel removal helper; `NotFound` is already
                     // folded into `Ok` there.
@@ -24359,6 +24389,15 @@ impl WorkspaceApi for Services {
                 &worktrees_location,
             )?;
             let source = store.get_workspace(&id).await?;
+            // Plain folder (§5.1 "Plain-folder workspaces"): duplicate is
+            // git-only. Refused before anything is provisioned — a copy
+            // would point a second row at the user's folder, and a `.git`
+            // that appeared later would get a worktree added to it.
+            if source.plain_folder {
+                return Err(Error::PlainFolderUnsupported {
+                    operation: "workspace.duplicate",
+                });
+            }
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
             // Retries stay bounded so a wildly saturated slug space fails fast

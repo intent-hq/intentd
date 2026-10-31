@@ -240,6 +240,7 @@ mod tests {
         let unsupported: intent_core::Result<Option<()>> = Err(Error::RetireUnsupported {
             workspace_id: "ws-1".to_string(),
             checkout_mode: None,
+            plain_folder: true,
         });
         assert_eq!(classify(&unsupported), Attempt::Skipped);
         for err in [
