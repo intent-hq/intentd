@@ -3521,7 +3521,10 @@ fn plain_folder_errors_map_to_machine_readable_codes() {
         "isNewRepo cannot be combined with plainFolder".to_string(),
     ));
     assert_eq!(rpc.code, -32602);
-    assert_eq!(rpc.data, Some(serde_json::json!({ "code": "invalid-params" })));
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "invalid-params" }))
+    );
     assert!(rpc.message.contains("isNewRepo"), "{}", rpc.message);
 
     let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
@@ -3544,9 +3547,18 @@ fn plain_folder_errors_map_to_machine_readable_codes() {
     assert!(rpc.message.contains("/home/u/repo"), "{}", rpc.message);
 
     for (reason, wire) in [
-        (intent_core::PlainFolderPathReason::InsideWorkspacesRoot, "inside-workspaces-root"),
-        (intent_core::PlainFolderPathReason::NotADirectory, "not-a-directory"),
-        (intent_core::PlainFolderPathReason::ParentMissing, "parent-missing"),
+        (
+            intent_core::PlainFolderPathReason::InsideWorkspacesRoot,
+            "inside-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::NotADirectory,
+            "not-a-directory",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ParentMissing,
+            "parent-missing",
+        ),
     ] {
         let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
             intent_core::PlainFolderPathRejection {
@@ -3575,7 +3587,10 @@ async fn workspace_update_rejects_plain_folder() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
-    assert_eq!(v["error"]["data"]["code"], serde_json::json!("invalid-params"));
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
     assert!(
         v["error"]["message"]
             .as_str()

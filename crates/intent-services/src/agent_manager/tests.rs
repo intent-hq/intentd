@@ -19643,8 +19643,8 @@ async fn resolve_spawn_uses_the_plain_folder() {
         plain_folder: true,
         ..Default::default()
     };
-    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
-        .expect("plain folder resolves");
+    let resolved =
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("plain folder resolves");
     assert_eq!(resolved.cwd, folder, "cwd is the plain folder");
 }
 

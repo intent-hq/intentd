@@ -76,10 +76,16 @@ async fn new_folder_is_created_without_git_and_marked_plain() {
 
     assert!(folder.is_dir(), "the new folder exists");
     assert!(!folder.join(".git").exists(), "no git repository");
-    assert!(entries(&folder).is_empty(), "nothing written into the folder");
+    assert!(
+        entries(&folder).is_empty(),
+        "nothing written into the folder"
+    );
     assert!(ws.plain_folder);
     assert_eq!(ws.repository_path.as_deref(), folder.to_str());
-    assert_eq!(ws.worktree_path, None, "the user's folder is never worktreePath");
+    assert_eq!(
+        ws.worktree_path, None,
+        "the user's folder is never worktreePath"
+    );
     assert_eq!(ws.checkout_mode, None);
     assert_eq!(ws.branch, "");
     assert_eq!(ws.base_ref, None);
@@ -89,7 +95,14 @@ async fn new_folder_is_created_without_git_and_marked_plain() {
 
     let wire = serde_json::to_value(&ws).expect("serialize");
     assert_eq!(wire["plainFolder"], serde_json::json!(true));
-    for key in ["branch", "worktreePath", "checkoutMode", "baseRef", "prUrl", "prNumber"] {
+    assert_eq!(wire["branch"], serde_json::json!(""), "no git branch");
+    for key in [
+        "worktreePath",
+        "checkoutMode",
+        "baseRef",
+        "prUrl",
+        "prNumber",
+    ] {
         assert!(wire.get(key).is_none(), "{key} is omitted: {wire}");
     }
     assert!(
@@ -168,10 +181,19 @@ async fn rejected_paths_have_no_side_effects() {
     let cases = [
         (repo.join("docs"), PlainFolderPathReason::InsideGitRepo),
         (repo.clone(), PlainFolderPathReason::InsideGitRepo),
-        (inside_root.clone(), PlainFolderPathReason::InsideWorkspacesRoot),
-        (h.ws_root.path().to_path_buf(), PlainFolderPathReason::InsideWorkspacesRoot),
+        (
+            inside_root.clone(),
+            PlainFolderPathReason::InsideWorkspacesRoot,
+        ),
+        (
+            h.ws_root.path().to_path_buf(),
+            PlainFolderPathReason::InsideWorkspacesRoot,
+        ),
         (file.clone(), PlainFolderPathReason::NotADirectory),
-        (scratch.path().join("a").join("b"), PlainFolderPathReason::ParentMissing),
+        (
+            scratch.path().join("a").join("b"),
+            PlainFolderPathReason::ParentMissing,
+        ),
     ];
     for (path, want) in cases {
         let err = h

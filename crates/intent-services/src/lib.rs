@@ -62,8 +62,8 @@ mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
 mod auto_archive;
-mod plain_folder;
 mod auto_retire;
+mod plain_folder;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;

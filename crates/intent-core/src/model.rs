@@ -338,10 +338,8 @@ pub enum WorkspaceDisplayStatus {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub title: String,
-    /// The workspace's working branch. Empty — and then omitted on the wire —
-    /// only for plain-folder workspaces (§5.1 "Plain-folder workspaces"),
-    /// which have no git branch; every git create path names a branch.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// The workspace's working branch. Empty (`""`) for plain-folder
+    /// workspaces (§5.1 "Plain-folder workspaces"), which have no git branch.
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,

@@ -64,7 +64,9 @@ pub(crate) fn validate_create_shape(input: &WorkspaceCreate) -> Result<()> {
         ));
     }
     if !nonblank(input.repository_path.as_deref()) {
-        return Err(invalid("repositoryPath is required when plainFolder is true"));
+        return Err(invalid(
+            "repositoryPath is required when plainFolder is true",
+        ));
     }
     Ok(())
 }
@@ -104,11 +106,7 @@ impl PlainFolderTarget {
     }
 }
 
-fn rejected(
-    reason: PlainFolderPathReason,
-    path: &Path,
-    repository_root: Option<&Path>,
-) -> Error {
+fn rejected(reason: PlainFolderPathReason, path: &Path, repository_root: Option<&Path>) -> Error {
     Error::PlainFolderPathRejected(Box::new(PlainFolderPathRejection {
         reason,
         path: path.to_string_lossy().into_owned(),
@@ -155,19 +153,30 @@ fn enclosing_git_repo(dir: &Path) -> Option<PathBuf> {
 /// [`Error::PlainFolderInvalidParams`] for a relative path or one without a
 /// final folder name; [`Error::PlainFolderPathRejected`] with the documented
 /// `reason` otherwise.
-pub(crate) fn resolve_target(path: &Path, workspaces_roots: &[PathBuf]) -> Result<PlainFolderTarget> {
+pub(crate) fn resolve_target(
+    path: &Path,
+    workspaces_roots: &[PathBuf],
+) -> Result<PlainFolderTarget> {
     if !path.is_absolute() {
-        return Err(invalid("repositoryPath must be an absolute path when plainFolder is true"));
+        return Err(invalid(
+            "repositoryPath must be an absolute path when plainFolder is true",
+        ));
     }
     let (target, probe, resolved) = match std::fs::metadata(path) {
         Ok(meta) if meta.is_dir() => {
             let resolved = comparable(path);
-            (PlainFolderTarget::Existing(path.to_path_buf()), resolved.clone(), resolved)
+            (
+                PlainFolderTarget::Existing(path.to_path_buf()),
+                resolved.clone(),
+                resolved,
+            )
         }
         Ok(_) => return Err(rejected(PlainFolderPathReason::NotADirectory, path, None)),
         Err(_) => {
             let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-                return Err(invalid("repositoryPath must name a folder when plainFolder is true"));
+                return Err(invalid(
+                    "repositoryPath must name a folder when plainFolder is true",
+                ));
             };
             match std::fs::metadata(parent) {
                 Ok(meta) if meta.is_dir() => {}
@@ -184,10 +193,18 @@ pub(crate) fn resolve_target(path: &Path, workspaces_roots: &[PathBuf]) -> Resul
         .map(|root| comparable(root))
         .any(|root| resolved.starts_with(&root))
     {
-        return Err(rejected(PlainFolderPathReason::InsideWorkspacesRoot, path, None));
+        return Err(rejected(
+            PlainFolderPathReason::InsideWorkspacesRoot,
+            path,
+            None,
+        ));
     }
     if let Some(repo) = enclosing_git_repo(&probe) {
-        return Err(rejected(PlainFolderPathReason::InsideGitRepo, path, Some(&repo)));
+        return Err(rejected(
+            PlainFolderPathReason::InsideGitRepo,
+            path,
+            Some(&repo),
+        ));
     }
     Ok(target)
 }
@@ -225,14 +242,29 @@ mod tests {
 
     #[test]
     fn shape_rejects_each_git_only_option_by_name() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut WorkspaceCreate)>)> = vec![
-            ("githubUrl", Box::new(|i| i.github_url = Some("https://github.com/o/r".into()))),
-            ("clonePath", Box::new(|i| i.clone_path = Some("/tmp/x".into()))),
-            ("isNewRepo", Box::new(|i| i.is_new_repo = Some(true))),
-            ("baseRef", Box::new(|i| i.base_ref = Some("main".into()))),
-            ("branch", Box::new(|i| i.branch = Some("feature".into()))),
-            ("worktreePath", Box::new(|i| i.worktree_path = Some("/tmp/wt".into()))),
-            ("isRemote", Box::new(|i| i.is_remote = Some(true))),
+        type SetOption = fn(&mut WorkspaceCreate);
+        let cases: [(&str, SetOption); 7] = [
+            ("githubUrl", |i| {
+                i.github_url = Some("https://github.com/o/r".into());
+            }),
+            ("clonePath", |i| {
+                i.clone_path = Some("/tmp/x".into());
+            }),
+            ("isNewRepo", |i| {
+                i.is_new_repo = Some(true);
+            }),
+            ("baseRef", |i| {
+                i.base_ref = Some("main".into());
+            }),
+            ("branch", |i| {
+                i.branch = Some("feature".into());
+            }),
+            ("worktreePath", |i| {
+                i.worktree_path = Some("/tmp/wt".into());
+            }),
+            ("isRemote", |i| {
+                i.is_remote = Some(true);
+            }),
         ];
         for (name, set) in cases {
             let mut input = plain("/tmp/folder");
@@ -278,7 +310,10 @@ mod tests {
         let mut input = plain("/tmp/folder");
         input.context_links = Some(vec![link(ContextLinkKind::Issue)]);
         validate_create_shape(&input).expect("issue links are accepted");
-        input.context_links = Some(vec![link(ContextLinkKind::Issue), link(ContextLinkKind::Pr)]);
+        input.context_links = Some(vec![
+            link(ContextLinkKind::Issue),
+            link(ContextLinkKind::Pr),
+        ]);
         assert!(matches!(
             validate_create_shape(&input),
             Err(Error::PlainFolderInvalidParams(_))
@@ -315,7 +350,9 @@ mod tests {
         assert!(target.materialize().expect("create"));
         assert!(new.is_dir());
         assert!(!new.join(".git").exists());
-        assert!(!PlainFolderTarget::Existing(existing).materialize().expect("noop"));
+        assert!(!PlainFolderTarget::Existing(existing)
+            .materialize()
+            .expect("noop"));
     }
 
     #[test]
