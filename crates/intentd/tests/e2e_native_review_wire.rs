@@ -761,10 +761,12 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
 }
+#[track_caller]
 fn git(path: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         // Keep automatic maintenance within the original owned command's wait.
@@ -837,6 +839,7 @@ async fn run_in_tls_process(name: &str) -> bool {
     drop(directory);
     true
 }
+#[track_caller]
 fn make_fixture_certificate(directory: &std::path::Path) {
     let cert = directory.join("ca.pem");
     let key = directory.join("key.pem");
@@ -2386,6 +2389,7 @@ impl DriverTest {
         )
         .unwrap()
     }
+    #[track_caller]
     fn record(&self, name: &str, value: &Value) {
         assert!(driver_safe(value));
         private_json(&self.directory.path().join(name), value).unwrap();
@@ -3486,6 +3490,7 @@ while True:signal.pause()
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
+    #[track_caller]
     fn observed_json(path: &std::path::Path) -> Value {
         let started = Instant::now();
         loop {
@@ -3825,6 +3830,7 @@ while True:
             .stderr(Stdio::inherit());
         Allocation::spawn(&mut command).unwrap()
     }
+    #[track_caller]
     fn nonce(directory: &std::path::Path) -> String {
         let challenge = uuid::Uuid::new_v4().to_string();
         std::fs::write(directory.join("nonce"), &challenge).unwrap();
@@ -4253,6 +4259,7 @@ async fn metadata_effects(h: &Harness) -> Value {
         "unsupportedCalls":h.metadata.unsupported_calls.load(std::sync::atomic::Ordering::SeqCst),
         "tokenWrites":h.metadata_token.writes.load(std::sync::atomic::Ordering::SeqCst)})
 }
+#[track_caller]
 fn metadata_public(frame: &Value) {
     let text = frame.to_string();
     for token in [TOKEN, MEMBER, GUEST] {

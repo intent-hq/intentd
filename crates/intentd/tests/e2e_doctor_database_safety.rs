@@ -81,6 +81,7 @@ impl Fixture {
         Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap()
     }
 
+    #[track_caller]
     fn assert_owned(&self) {
         let file = OpenOptions::new()
             .read(true)
@@ -162,6 +163,7 @@ impl Fixture {
         self.run_expected(command, "doctor", success)
     }
 
+    #[track_caller]
     fn doctor(&self) {
         let stdout = self.doctor_output(true);
         assert!(stdout.contains("migrations current"), "{stdout}");

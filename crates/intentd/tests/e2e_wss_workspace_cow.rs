@@ -316,6 +316,7 @@ fn mock_gate(test: &str) -> Option<String> {
     Some(script)
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git")
         .args(args)

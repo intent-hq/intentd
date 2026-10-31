@@ -10,6 +10,7 @@ fn repo() -> Value {
 fn branch(name: &str) -> Value {
     json!({"name":name,"commit":{"id":SHA},"protected":false})
 }
+#[track_caller]
 fn ready(response: &Value) -> &Value {
     let result = success(response);
     assert_eq!(result["status"], "ready", "{response}");

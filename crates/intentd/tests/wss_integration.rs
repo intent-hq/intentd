@@ -424,6 +424,7 @@ fn status_code(response: &str) -> u16 {
 
 /// Assert `response` is the guest-cap refusal: `503` carrying
 /// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+#[track_caller]
 fn assert_guest_cap_refused(response: &str, ctx: &str) {
     assert_eq!(status_code(response), 503, "{ctx}: {response}");
     let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
@@ -4559,6 +4560,7 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
 
+    #[track_caller]
     fn assert_not_found(v: &Value, what: &str) {
         assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
         assert_eq!(v["error"]["data"]["code"], "not-found", "{what}: {v}");
@@ -5314,6 +5316,7 @@ fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
+#[track_caller]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -9335,6 +9338,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 #[intent_test_macros::daemon_test]
 async fn wss_agent_set_model_provider_id_param() {
     /// Assert the JSON-RPC response envelope: version and id correlation.
+    #[track_caller]
     fn assert_envelope(resp: &Value, id: i64) {
         assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
         assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
@@ -21979,6 +21983,7 @@ async fn wss_transfer_preserves_remote_state() {
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
 
+    #[track_caller]
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)

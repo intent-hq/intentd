@@ -49,6 +49,7 @@ use intent_core::{
 };
 use intent_core::{AgentReverseDispatch, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
+use stack_frame::boxed_await;
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
@@ -88,6 +89,7 @@ mod completion_interception_tests;
 mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
+mod cross_workspace_search;
 mod delete_grace;
 mod delivery_tasks;
 mod desktop;
@@ -20391,6 +20393,7 @@ impl WorkspaceApi for Services {
                 allowed_workspace_ids: visible.as_deref(),
                 include_archived,
                 limit,
+                per_workspace_limit: None,
             };
             let hits = match intent_search::fts_match_expr(&query) {
                 Some(expr) => self.store.search_notes_fts(&expr, &options).await?,
@@ -21094,28 +21097,11 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let current = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(Error::NotFound(_)) => {
-                    return Err(Error::Internal("Current workspace not found".to_string()));
-                }
-                Err(e) => return Err(e),
-            };
-            if !has_repository_identity(&current) {
-                return Err(Error::Internal(
-                    "Current workspace is not associated with a repository".to_string(),
-                ));
-            }
-            let mut all = store
-                .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
-                .await?;
-            self.retain_member_workspaces(&mut all).await?;
-            let siblings: Vec<serde_json::Value> = all
+            let siblings: Vec<serde_json::Value> = self
+                .cross_workspace_siblings(&workspace_id, include_retired)
+                .await?
                 .into_iter()
-                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -21129,6 +21115,14 @@ impl WorkspaceApi for Services {
                 .collect();
             Ok(serde_json::Value::Array(siblings))
         })
+    }
+
+    fn cross_workspace_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: intent_core::CrossWorkspaceSearch,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.cross_workspace_search_op(workspace_id, search))
     }
 
     fn cross_workspace_list_notes(
@@ -21631,27 +21625,34 @@ impl WorkspaceApi for Services {
             .as_deref()
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
+        // Runs close to the debug stack limit: its size is budgeted by
+        // `src/tests/workspace_create_future_size.rs` (intent-hq/intent#6741).
         self.execution_call(async move {
+            // Large awaits on this path go through `boxed_await`: debug poll
+            // frames hold every inline awaited future twice, and this path
+            // already nests under deep transport frames (see
+            // `crate::stack_frame`; guard: `tests/workspace_create_stack.rs`).
             let native_checkout = native_checkout.await?;
             // The caller's key, before any native-checkout derivation: a
             // proposal origin is bound to the key its card carries.
             let requested_key = idempotency_key.clone();
             let idempotency_key = match &native_checkout {
-                Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
+                Some(checkout) => {
+                    boxed_await(|| checkout.current()).await?;
+                    checkout.idempotency_key(idempotency_key)
+                }
                 None => idempotency_key,
             };
             // Creation is host-wide and must also work before any workspace exists.
-            services
-                .require_workspace_creator("workspace.create")
-                .await?;
+            boxed_await(|| services.require_workspace_creator("workspace.create")).await?;
             // Proposal origin (PROTOCOL §5.1, intent-hq/intent#8086): shape
             // `-32602`s here, before any side effect; resolved after success.
             // Boxed like the create op below: inlining these futures grows
             // the create future enough to overflow the default stack in
             // debug builds.
-            let proposal_origin = Box::pin(
-                services.prepare_create_proposal_origin(&mut input, requested_key.as_deref()),
-            )
+            let proposal_origin = boxed_await(|| {
+                services.prepare_create_proposal_origin(&mut input, requested_key.as_deref())
+            })
             .await?;
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
@@ -21688,7 +21689,7 @@ impl WorkspaceApi for Services {
             let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let executed_op = executed.clone();
             let inflight = services.idempotency_inflight.clone();
-            let result = with_idempotency(
+            let result = boxed_await(|| with_idempotency(
                 &inflight,
                 &store,
                 "",
@@ -21852,8 +21853,8 @@ impl WorkspaceApi for Services {
                             // the insert, right before persist. The workspace
                             // id is derived after the plan and handed to the
                             // persist half directly.
-                            let plan = services
-                                .plan_agent_create(
+                            let plan = boxed_await(|| {
+                                services.plan_agent_create(
                                     "workspace.create",
                                     nonempty_owned(agent.name),
                                     nonempty_owned(agent.model),
@@ -21865,7 +21866,8 @@ impl WorkspaceApi for Services {
                                     spec_wp,
                                     crate::agent_ops::CreateModelSource::Caller,
                                 )
-                                .await?;
+                            })
+                            .await?;
                             Some((plan, prompt, image_blocks))
                         }
                         None => None,
@@ -21889,16 +21891,18 @@ impl WorkspaceApi for Services {
                     // tombstone, or leftover directory) so the on-disk
                     // directory reflects intent and deleted ids are never
                     // recycled.
-                    let id = derive_workspace_id(
-                        &store,
-                        planned_initial_agent
-                            .as_ref()
-                            .and_then(|(_, prompt, _)| prompt.as_deref()),
-                        &workspaces_root,
-                    )
+                    let id = boxed_await(|| {
+                        derive_workspace_id(
+                            &store,
+                            planned_initial_agent
+                                .as_ref()
+                                .and_then(|(_, prompt, _)| prompt.as_deref()),
+                            &workspaces_root,
+                        )
+                    })
                     .await;
                     if let Some(checkout) = &native_checkout {
-                        checkout.current().await?;
+                        boxed_await(|| checkout.current()).await?;
                         checkout.configure(&mut input, &workspaces_root, &id)?;
                     }
                     let progress = progress_id.and_then(|pid| {
@@ -21912,9 +21916,8 @@ impl WorkspaceApi for Services {
                     });
                     if let Some(reporter) = progress.clone() {
                         *progress_slot_op.lock().unwrap() = Some(reporter.clone());
-                        reporter
-                            .milestone("starting", 0, "Preparing workspace...")
-                            .await;
+                        boxed_await(|| reporter.milestone("starting", 0, "Preparing workspace..."))
+                        .await;
                     }
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
@@ -22002,34 +22005,39 @@ impl WorkspaceApi for Services {
                                 // the exactly-one done).
                                 match progress.as_deref() {
                                     Some(reporter) => {
-                                        reporter
-                                            .milestone(
+                                        boxed_await(|| {
+                                            reporter.milestone(
                                                 "cache",
                                                 5,
                                                 "Preparing repository cache...",
                                             )
-                                            .await;
+                                        })
+                                        .await;
                                     }
                                     None => {
-                                        clone_ops::publish(
-                                            &bus_ref,
-                                            &id,
-                                            clone_ops::progress_event(
+                                        boxed_await(|| {
+                                            clone_ops::publish(
+                                                &bus_ref,
                                                 &id,
-                                                &request_id,
-                                                "starting",
-                                                0,
-                                                "Preparing repository cache...",
-                                                None,
-                                            ),
-                                        )
+                                                clone_ops::progress_event(
+                                                    &id,
+                                                    &request_id,
+                                                    "starting",
+                                                    0,
+                                                    "Preparing repository cache...",
+                                                    None,
+                                                ),
+                                            )
+                                        })
                                         .await;
                                     }
                                 }
-                                let token = github_git_token_for_url(
-                                    services.settings_registry.as_deref(),
-                                    url,
-                                )
+                                let token = boxed_await(|| {
+                                    github_git_token_for_url(
+                                        services.settings_registry.as_deref(),
+                                        url,
+                                    )
+                                })
                                 .await;
                                 let cache_root =
                                     intent_git::repo_cache::cache_root_for(&workspaces_root);
@@ -22048,14 +22056,16 @@ impl WorkspaceApi for Services {
                                     None => (None, None),
                                 };
                                 let ensure_result =
-                                    intent_git::repo_cache::ensure_cached_repo_with_progress(
-                                        &cache_root,
-                                        url,
-                                        &owner,
-                                        &name,
-                                        token.as_deref(),
-                                        ensure_progress,
-                                    )
+                                    boxed_await(|| {
+                                        intent_git::repo_cache::ensure_cached_repo_with_progress(
+                                            &cache_root,
+                                            url,
+                                            &owner,
+                                            &name,
+                                            token.as_deref(),
+                                            ensure_progress,
+                                        )
+                                    })
                                     .await;
                                 if let Some(pump) = ensure_pump {
                                     // Bounded: on the ensure's timeout path a
@@ -22093,18 +22103,20 @@ impl WorkspaceApi for Services {
                                         // terminal done to the wrapper (which
                                         // sees this same CloneFailed error).
                                         if progress.is_none() {
-                                            clone_ops::publish(
-                                                &bus_ref,
-                                                &id,
-                                                clone_ops::done_event(
+                                            boxed_await(|| {
+                                                clone_ops::publish(
+                                                    &bus_ref,
                                                     &id,
-                                                    &request_id,
-                                                    false,
-                                                    Some(&detail),
-                                                    error_code,
-                                                    None,
-                                                ),
-                                            )
+                                                    clone_ops::done_event(
+                                                        &id,
+                                                        &request_id,
+                                                        false,
+                                                        Some(&detail),
+                                                        error_code,
+                                                        None,
+                                                    ),
+                                                )
+                                            })
                                             .await;
                                         }
                                         return Err(Error::CloneFailed {
@@ -22114,39 +22126,44 @@ impl WorkspaceApi for Services {
                                     }
                                 };
                                 if let Some(reporter) = progress.as_deref() {
-                                    reporter
-                                        .milestone(
+                                    boxed_await(|| {
+                                        reporter.milestone(
                                             "cache",
                                             create_progress::CLONE_SEGMENT_END,
                                             "Repository cache ready",
                                         )
-                                        .await;
-                                } else {
-                                    clone_ops::publish(
-                                        &bus_ref,
-                                        &id,
-                                        clone_ops::progress_event(
-                                            &id,
-                                            &request_id,
-                                            "checkout",
-                                            90,
-                                            "Repository cache ready",
-                                            None,
-                                        ),
-                                    )
+                                    })
                                     .await;
-                                    clone_ops::publish(
-                                        &bus_ref,
-                                        &id,
-                                        clone_ops::done_event(
+                                } else {
+                                    boxed_await(|| {
+                                        clone_ops::publish(
+                                            &bus_ref,
                                             &id,
-                                            &request_id,
-                                            true,
-                                            None,
-                                            None,
-                                            None,
-                                        ),
-                                    )
+                                            clone_ops::progress_event(
+                                                &id,
+                                                &request_id,
+                                                "checkout",
+                                                90,
+                                                "Repository cache ready",
+                                                None,
+                                            ),
+                                        )
+                                    })
+                                    .await;
+                                    boxed_await(|| {
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::done_event(
+                                                &id,
+                                                &request_id,
+                                                true,
+                                                None,
+                                                None,
+                                                None,
+                                            ),
+                                        )
+                                    })
                                     .await;
                                 }
                                 // Persisted owner/name carry GitHub identity
@@ -22216,10 +22233,12 @@ impl WorkspaceApi for Services {
                             // non-GitHub URLs skip resolution entirely; the
                             // value travels to the child via the environment
                             // only and is never logged.
-                            let token = github_git_token_for_url(
-                                services.settings_registry.as_deref(),
-                                url,
-                            )
+                            let token = boxed_await(|| {
+                                github_git_token_for_url(
+                                    services.settings_registry.as_deref(),
+                                    url,
+                                )
+                            })
                             .await;
                             // Clone failures surface as a typed error carrying
                             // the sanitized stderr tail so clients can show the
@@ -22228,18 +22247,20 @@ impl WorkspaceApi for Services {
                             // streamed `git:clone:done.errorCode` — with `None`
                             // (spawn/wait failures) mapping to the `clone-failed`
                             // catch-all (PROTOCOL §9.1).
-                            clone_ops::perform_clone(clone_ops::CloneJob {
-                                request_id,
-                                workspace_id: Some(id.clone()),
-                                url: url.to_string(),
-                                target_path: target.clone(),
-                                token,
-                                bus: bus_ref,
-                                progress: progress.clone(),
-                                // Workspace checkouts should land with
-                                // populated submodules, like the cache
-                                // hydration path (decision 2026-08-10).
-                                recurse_submodules: true,
+                            boxed_await(|| {
+                                clone_ops::perform_clone(clone_ops::CloneJob {
+                                    request_id,
+                                    workspace_id: Some(id.clone()),
+                                    url: url.to_string(),
+                                    target_path: target.clone(),
+                                    token,
+                                    bus: bus_ref,
+                                    progress: progress.clone(),
+                                    // Workspace checkouts should land with
+                                    // populated submodules, like the cache
+                                    // hydration path (decision 2026-08-10).
+                                    recurse_submodules: true,
+                                })
                             })
                             .await
                             .map_err(|failure| Error::CloneFailed {
@@ -22290,7 +22311,7 @@ impl WorkspaceApi for Services {
                                             .to_string(),
                                     )
                                 })?;
-                            initialize_repository_for_create(repo_path).await?;
+                            boxed_await(|| initialize_repository_for_create(repo_path)).await?;
                             new_repo_direct = true;
                         }
                     } else if input.is_new_repo.unwrap_or(false)
@@ -22309,7 +22330,7 @@ impl WorkspaceApi for Services {
                         // are untouched, and the clone arm plus legacy
                         // (non-`isNewRepo`) behavior stay unchanged.
                         if let Some(repo_path) = existing_repo.clone() {
-                            initialize_repository_for_create(repo_path).await?;
+                            boxed_await(|| initialize_repository_for_create(repo_path)).await?;
                         }
                         new_repo_direct = true;
                     }
@@ -22430,7 +22451,8 @@ impl WorkspaceApi for Services {
                     let mut linked_pr: Option<intent_sourcecontrol::PullRequest> = None;
                     let mut pr_derived_branch = false;
                     if let Some(link) = pr_link.as_ref() {
-                        match pr_ops::resolve_source_control(services.source_control.clone())
+                        let source_control = services.source_control.clone();
+                        match boxed_await(|| pr_ops::resolve_source_control(source_control))
                             .await
                         {
                             Ok(sc) => {
@@ -22550,7 +22572,8 @@ impl WorkspaceApi for Services {
                             .filter(|p| !p.is_empty())
                             .map(PathBuf::from)
                         {
-                            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                            let repo_config =
+                                boxed_await(|| repo_config::read_repo_config(&repo_path)).await;
                             match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
                                 Some(p) => p,
                                 None => settings_branch_prefix,
@@ -22681,7 +22704,15 @@ impl WorkspaceApi for Services {
                     let workspaces_root_pathbuf = workspaces_root.clone();
                     if let Some(checkout) = &native_checkout {
                         let path = repo_dir.clone().ok_or_else(|| Error::Internal("native checkout path missing".into()))?;
-                        checkout.provision(path.clone(), ws.branch.clone(), &workspaces_root_pathbuf, progress.clone()).await?;
+                        boxed_await(|| {
+                            checkout.provision(
+                                path.clone(),
+                                ws.branch.clone(),
+                                &workspaces_root_pathbuf,
+                                progress.clone(),
+                            )
+                        })
+                        .await?;
                         ws.worktree_path = Some(path.to_string_lossy().into_owned());
                         ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
                     } else if let Some((cache_path, hydration_url)) = cache_hydration {
@@ -22755,25 +22786,37 @@ impl WorkspaceApi for Services {
                             if let Some(reporter) = progress.as_deref() {
                                 match mode {
                                     intent_core::CheckoutMode::Cow => {
-                                        reporter
-                                            .milestone("cow-copy", 88, "Copying repository...")
-                                            .await;
+                                        boxed_await(|| {
+                                            reporter.milestone(
+                                                "cow-copy",
+                                                88,
+                                                "Copying repository...",
+                                            )
+                                        })
+                                        .await;
                                     }
                                     _ => {
-                                        reporter
-                                            .milestone(
+                                        boxed_await(|| {
+                                            reporter.milestone(
                                                 "checkout",
                                                 88,
                                                 "Checking out repository...",
                                             )
-                                            .await;
+                                        })
+                                        .await;
                                     }
                                 }
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
                             let pr_token = if pr_checkout.is_some() {
-                                github_git_token(services.settings_registry.as_deref(), &cache_path).await
+                                boxed_await(|| {
+                                    github_git_token(
+                                        services.settings_registry.as_deref(),
+                                        &cache_path,
+                                    )
+                                })
+                                .await
                             } else {
                                 None
                             };
@@ -22889,7 +22932,7 @@ impl WorkspaceApi for Services {
                                     result
                                 }
                             };
-                            let sha = match provision(mode).await {
+                            let sha = match boxed_await(|| provision(mode)).await {
                                 Ok(sha) => sha,
                                 Err(Error::Unsupported(reason))
                                     if mode == intent_core::CheckoutMode::Cow =>
@@ -22904,7 +22947,7 @@ impl WorkspaceApi for Services {
                                     );
                                     remove_workspace_dir_if_empty(&ws_dir);
                                     mode = intent_core::CheckoutMode::Direct;
-                                    match provision(mode).await {
+                                    match boxed_await(|| provision(mode)).await {
                                         Ok(sha) => sha,
                                         Err(e) => {
                                             remove_workspace_dir_if_empty(&ws_dir);
@@ -22956,13 +22999,14 @@ impl WorkspaceApi for Services {
                                 // branch checkout is the only provisioning
                                 // step on this fast path.
                                 if let Some(reporter) = progress.as_deref() {
-                                    reporter
-                                        .milestone(
+                                    boxed_await(|| {
+                                        reporter.milestone(
                                             "checkout",
                                             50,
                                             "Checking out workspace branch...",
                                         )
-                                        .await;
+                                    })
+                                    .await;
                                 }
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
@@ -22970,7 +23014,13 @@ impl WorkspaceApi for Services {
                                 let pr_checkout = pr_checkout.clone();
                                 let pr_remote = input.remote.clone().unwrap_or_else(|| "origin".into());
                                 let pr_token = if pr_checkout.is_some() {
-                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                    boxed_await(|| {
+                                        github_git_token(
+                                            services.settings_registry.as_deref(),
+                                            &repo_dir,
+                                        )
+                                    })
+                                    .await
                                 } else {
                                     None
                                 };
@@ -23069,7 +23119,13 @@ impl WorkspaceApi for Services {
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
                                 let pr_token =
-                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await;
+                                    boxed_await(|| {
+                                        github_git_token(
+                                            services.settings_registry.as_deref(),
+                                            &repo_dir,
+                                        )
+                                    })
+                                    .await;
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -23143,22 +23199,24 @@ impl WorkspaceApi for Services {
                                 if let Some(reporter) = progress.as_deref() {
                                     match mode {
                                         intent_core::CheckoutMode::Cow => {
-                                            reporter
-                                                .milestone(
+                                            boxed_await(|| {
+                                                reporter.milestone(
                                                     "cow-copy",
                                                     30,
                                                     "Copying repository (CoW)...",
                                                 )
-                                                .await;
+                                            })
+                                            .await;
                                         }
                                         _ => {
-                                            reporter
-                                                .milestone(
+                                            boxed_await(|| {
+                                                reporter.milestone(
                                                     "worktree",
                                                     30,
                                                     "Creating linked worktree...",
                                                 )
-                                                .await;
+                                            })
+                                            .await;
                                         }
                                     }
                                 }
@@ -23268,7 +23326,7 @@ impl WorkspaceApi for Services {
                                             .await
                                     }
                                 };
-                                let sha = match provision(mode).await {
+                                let sha = match boxed_await(|| provision(mode)).await {
                                     Ok(sha) => sha,
                                     Err(Error::Unsupported(reason))
                                         if mode == intent_core::CheckoutMode::Cow =>
@@ -23286,7 +23344,7 @@ impl WorkspaceApi for Services {
                                         );
                                         remove_workspace_dir_if_empty(&ws_dir);
                                         mode = intent_core::CheckoutMode::Worktree;
-                                        match provision(mode).await {
+                                        match boxed_await(|| provision(mode)).await {
                                             Ok(sha) => sha,
                                             Err(e) => {
                                                 // `provision_worktree` creates
@@ -23387,9 +23445,10 @@ impl WorkspaceApi for Services {
                     // bookkeeping — the unified scale's last milestone before
                     // the wrapper's terminal `complete 100` + done.
                     if let Some(reporter) = progress.as_deref() {
-                        reporter
-                            .milestone("finalizing", 95, "Finalizing workspace...")
-                            .await;
+                        boxed_await(|| {
+                            reporter.milestone("finalizing", 95, "Finalizing workspace...")
+                        })
+                        .await;
                     }
                     // Mirror-at-creation (spec Diagnosis §3b): persist the
                     // global `git.autoCommit` as the workspace's own override
@@ -23397,9 +23456,12 @@ impl WorkspaceApi for Services {
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
                     if let Some(checkout) = &native_checkout {
-                        checkout.insert(ws.clone(), global_auto_commit).await?;
+                        boxed_await(|| checkout.insert(ws.clone(), global_auto_commit)).await?;
                     } else {
-                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit)).await?;
+                        boxed_await(|| {
+                            store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                        })
+                        .await?;
                     }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
@@ -23420,9 +23482,9 @@ impl WorkspaceApi for Services {
                     // guard is `branchName === workspaceId`). Best-effort — a
                     // failure leaves the conservative default (never delete).
                     if branch_auto_generated {
-                        if let Err(e) = store
-                            .set_workspace_branch_auto_generated(&ws.id, true)
-                            .await
+                        if let Err(e) =
+                            boxed_await(|| store.set_workspace_branch_auto_generated(&ws.id, true))
+                                .await
                         {
                             tracing::warn!(error = %e, "failed to record branch provenance");
                         }
@@ -23458,9 +23520,9 @@ impl WorkspaceApi for Services {
                         });
                     if let Some(repo_path) = repo_path {
                         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
-                        if let Err(e) = store
-                            .upsert_known_repo(repo_path, &name, ws.repository_owner.as_deref())
-                            .await
+                        let owner = ws.repository_owner.as_deref();
+                        if let Err(e) =
+                            boxed_await(|| store.upsert_known_repo(repo_path, &name, owner)).await
                         {
                             tracing::warn!(error = %e, "failed to register repo in registry");
                         }
@@ -23468,16 +23530,18 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(
-                        bus.as_ref(),
-                        workspace_created_event_with_origin(&ws, create_origin.as_ref()),
-                    )
+                    boxed_await(|| {
+                        publish_event(
+                            bus.as_ref(),
+                            workspace_created_event_with_origin(&ws, create_origin.as_ref()),
+                        )
+                    })
                     .await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back
                     // and this branch never re-runs.
-                    ensure_spec_note(&store, bus.as_ref(), &ws.id).await?;
+                    boxed_await(|| ensure_spec_note(&store, bus.as_ref(), &ws.id)).await?;
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent`, always create the agent
                     // row (reference parity: `workspace.service.ts` persists the
@@ -23500,7 +23564,9 @@ impl WorkspaceApi for Services {
                     // `ws.workspace.details().setupStatus`. `pending` when a
                     // worktree exists; `skipped` when the stage never runs
                     // (skipWorktree / no worktree provisioned).
-                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
+                    if let Some(checkout) = &native_checkout {
+                        boxed_await(|| checkout.current()).await?;
+                    }
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -23519,10 +23585,10 @@ impl WorkspaceApi for Services {
                     // param is execute-only, never persisted (§5.1).
                     let effective_setup_script = match &setup_worktree {
                         Some(worktree) => {
-                            test_hold_setup_resolution().await;
+                            boxed_await(test_hold_setup_resolution).await;
                             match explicit_setup_script {
                                 Some(explicit) => Some(explicit),
-                                None => crate::repo_config::read_repo_config(worktree)
+                                None => boxed_await(|| repo_config::read_repo_config(worktree))
                                     .await
                                     .setup_script
                                     .filter(|s| !s.is_empty())
@@ -23549,10 +23615,12 @@ impl WorkspaceApi for Services {
                         // `skipped` above), but the lifecycle still completes
                         // (§6.5) — before the initial agent exists, so
                         // `workspace:setup:completed` precedes `agent:created`.
-                        publish_event(
-                            bus.as_ref(),
-                            workspace_setup_completed_event(&ws.id, false, None),
-                        )
+                        boxed_await(|| {
+                            publish_event(
+                                bus.as_ref(),
+                                workspace_setup_completed_event(&ws.id, false, None),
+                            )
+                        })
                         .await;
                     }
                     let mut initial_agent = None;
@@ -23563,7 +23631,7 @@ impl WorkspaceApi for Services {
                         // auto-commit (just seeded above) is off. The one
                         // post-plan input (see `AgentCreatePlan`).
                         plan.skip_auto_commit =
-                            !services.effective_auto_commit(&ws.id).await;
+                            !boxed_await(|| services.effective_auto_commit(&ws.id)).await;
                         // Persist half: the plan was validated before the
                         // first side effect, so this can only fail on
                         // infrastructure (`AgentPersistError` → `-32603`) —
@@ -23576,9 +23644,10 @@ impl WorkspaceApi for Services {
                         // before the setup task below is scheduled, so the
                         // already-inserted row would otherwise read `pending`
                         // forever: the stage never runs — record `skipped`.
-                        let created = match services
-                            .persist_agent_create(plan, ws.id.clone(), snapshot_wp)
-                            .await
+                        let created = match boxed_await(|| {
+                            services.persist_agent_create(plan, ws.id.clone(), snapshot_wp)
+                        })
+                        .await
                         {
                             Ok(created) => created,
                             Err(e) => {
@@ -23645,13 +23714,20 @@ impl WorkspaceApi for Services {
                             };
                             let send = match services.agent_manager() {
                                 Some(manager) => {
-                                    manager
-                                        .send_message(child, ws.id.clone(), prompt_text, None, options)
-                                        .await
+                                    boxed_await(|| {
+                                        manager.send_message(
+                                            child,
+                                            ws.id.clone(),
+                                            prompt_text,
+                                            None,
+                                            options,
+                                        )
+                                    })
+                                    .await
                                 }
                                 None => {
-                                    services
-                                        .agent_send_message_op(
+                                    boxed_await(|| {
+                                        services.agent_send_message_op(
                                             child,
                                             prompt_text,
                                             None,
@@ -23659,7 +23735,8 @@ impl WorkspaceApi for Services {
                                             created_file_blocks,
                                             message_metadata,
                                         )
-                                        .await
+                                    })
+                                    .await
                                 }
                             };
                             if let Err(e) = send {
@@ -23683,7 +23760,9 @@ impl WorkspaceApi for Services {
                     // exactly one `workspace:setup:completed` fires per logical create
                     // on every terminal path of the setup stage. Idempotent replays
                     // publish nothing (same as `workspace:created`).
-                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
+                    if let Some(checkout) = &native_checkout {
+                        boxed_await(|| checkout.current()).await?;
+                    }
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
                     if let (Some(worktree_path_buf), Some(script)) =
@@ -23746,7 +23825,7 @@ impl WorkspaceApi for Services {
                         proposal_origin: None,
                     })
                 }),
-            )
+            ))
             .await;
 
             // Terminal frame ownership (PROTOCOL §5.1): when the create armed
@@ -23774,16 +23853,15 @@ impl WorkspaceApi for Services {
             }
             if let Some(reporter) = reporter {
                 match &result {
-                    Ok(_) => reporter.done_ok().await,
+                    Ok(_) => boxed_await(|| reporter.done_ok()).await,
                     Err(Error::CloneFailed { category, detail }) => {
                         let error_code = (*category != intent_core::CloneErrorCategory::Other)
                             .then_some(*category);
-                        reporter.done_err(detail, error_code).await;
+                        boxed_await(|| reporter.done_err(detail, error_code)).await;
                     }
                     Err(e) => {
-                        reporter
-                            .done_err(&clone_ops::redact_credentials(&e.to_string()), None)
-                            .await;
+                        let detail = clone_ops::redact_credentials(&e.to_string());
+                        boxed_await(|| reporter.done_err(&detail, None)).await;
                     }
                 }
             }
@@ -23800,15 +23878,12 @@ impl WorkspaceApi for Services {
                 );
             }
             let mut result = result.map_err(|e| execution_call::git_error(e, execution_origin.as_deref()))?;
-            self.attach_workspace_membership(&mut result.workspace)
-                .await;
+            boxed_await(|| self.attach_workspace_membership(&mut result.workspace)).await;
             if let Some(origin) = proposal_origin {
                 let replayed = !executed.load(std::sync::atomic::Ordering::Relaxed);
-                result.proposal_origin = Box::pin(self.resolve_create_proposal_origin(
-                    origin,
-                    &result.workspace.id,
-                    replayed,
-                ))
+                result.proposal_origin = boxed_await(|| {
+                    self.resolve_create_proposal_origin(origin, &result.workspace.id, replayed)
+                })
                 .await;
             }
             Ok(result)

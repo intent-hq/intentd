@@ -22,6 +22,14 @@
 //! `agent_manager::tests::second_pre_output_transport_failure_takes_terminal_path`
 //! (runs the path on a 1 MiB stack) and `agent_manager::future_size_tests`
 //! (stored future sizes).
+//!
+//! `workspace.create` (`Services::create_workspace`, under the transport's
+//! deep dispatch frames) follows the same rule: `execution_call` boxes the
+//! future it scopes, and the create block and its boxed op await crate async
+//! fns through `boxed_await`. Its guard is
+//! `tests::workspace_create_stack::workspace_create_runs_within_reduced_stack`
+//! (a reduced-stack run of the create cases that overflowed
+//! `wss_workspace_create_context_links_round_trip_and_validation`).
 
 use std::future::Future;
 use std::pin::Pin;

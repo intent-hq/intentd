@@ -65,6 +65,7 @@ fn fake_auggie(reply_json: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, bin)
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git")
         .args(args)

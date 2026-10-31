@@ -69,6 +69,7 @@ pub(crate) fn is_marked(paths: &BTreeMap<String, String>, provider_id: &str) -> 
 /// When a name is a profile reference (mark the base provider, which covers
 /// all of its profiles), not a registered provider, or a provider that
 /// honors `providers.paths` (use an executable override for it).
+#[track_caller]
 pub(crate) fn mark(paths: &mut BTreeMap<String, String>, bases: &[&str]) {
     for base in bases {
         assert_eq!(

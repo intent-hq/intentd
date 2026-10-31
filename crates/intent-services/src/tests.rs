@@ -15,6 +15,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod auto_archive_workspace;
+mod cross_workspace_search;
 mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;
@@ -24,6 +25,10 @@ mod skill_list;
 mod task_list_latency;
 mod task_push;
 mod workspace_auto_archive_disabled;
+// Budgets are debug-profile future sizes measured on x86_64 Linux (CI).
+#[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+mod workspace_create_future_size;
+mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
 

@@ -133,6 +133,7 @@ fn lint_files(root: &Path) -> Vec<PathBuf> {
 /// Canonical `src_path` of every cargo test target under `root` whose name
 /// ends in `_lint`, read from `cargo metadata --no-deps` (manifests only, no
 /// build, no dependency resolution).
+#[track_caller]
 fn lint_target_sources(root: &Path) -> BTreeSet<PathBuf> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -385,6 +386,7 @@ mod fixture {
         fs::write(ci, content).unwrap();
     }
 
+    #[track_caller]
     fn assert_single_failure_at(failures: &[String], prefix: &str) {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].starts_with(prefix), "{failures:?}");

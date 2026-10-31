@@ -308,12 +308,35 @@ command menu first. **Disable experimental provider profiles** hides profile
 management again. A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
-Claude Code and choose **Add profile**: enter a name and environment variables
-(literal values, **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
-the provider host user's home folder (`~user` stays literal). The user signs in or
-prepares that account outside Intent. Credentials inherited from the environment can still
-apply: for a Claude Code profile that should use another account (or none), set
+Claude Code and choose **Add profile**. If this opens a name and environment-variable
+editor, use that form with the environment-variable rules below; sign in or prepare
+the account outside Intent.
+
+**Guided profile setup requires a supporting released app.** Do not offer the
+following flow as a normal option until released-app availability is confirmed;
+a newer daemon alone does not add it. Until then, discuss it only when explicitly
+asked or developing/testing it. In a supporting app, **Add profile** offers a kind:
+**Different login**, **API key** (Claude Code only), **Token**, or **Advanced**.
+**Different login** creates a new
+sign-in folder under `~/intent/profiles/` on the daemon host. **Create & sign in**
+closes the dialog and runs the sign-in in the bottom terminal; the profile row shows
+**Waiting for sign-in…**, then a **Signed in** toast. When the daemon runs on another
+machine, Codex shows a one-time device code instead of a browser sign-in; device code
+login must first be turned on in ChatGPT → **Settings → Security** (or allowed by a
+workspace admin). The folder starts without the user's usual Claude Code or Codex
+settings (instructions, MCP servers, skills). Later, ⋯ → **Log In** on a Different-login
+profile signs in again to the same folder. Removing that profile leaves its folder,
+with its saved login, on disk. **API key** saves an Anthropic key (optionally a custom
+endpoint); **Token** saves a `claude setup-token` token, or a Codex access token
+(ChatGPT Business or Enterprise only). After **Create**, Intent runs a test prompt and
+shows **Key works** or **Key was rejected**. These kinds also unset inherited
+credentials that would otherwise win. **Advanced** is the raw editor: a name and
+environment variables (literal values, **Empty value**, or **Unset**; no shell
+expansion). Use `CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there
+only, a leading `~` or `~/` means the provider host user's home folder (`~user` stays
+literal), and the saved folder path is shown as typed while other saved values stay
+hidden. Credentials inherited from the environment can still apply when using the
+raw editor: for a Claude Code profile that should use another account (or none), set
 inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
 **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
 custom base URL from the environment; for a different endpoint, give the profile

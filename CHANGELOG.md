@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.90] - 2026-10-31
+
+### 🚀 Features
+
+- *(acp)* Add ws.crossWorkspace.search across sibling workspaces ([#2865](https://github.com/intent-hq/intentd/pull/2865))
+
+### 📚 Documentation
+
+- *(guide)* Describe guided provider-profile setup ([#2862](https://github.com/intent-hq/intentd/pull/2862))
+
+### 🧪 Testing
+
+- *(runtime)* Wait for the recorded pty in service_pty_is_released_after_its_supervisor_settles ([#2867](https://github.com/intent-hq/intentd/pull/2867))
+- *(services)* Make migrate_queue_rearms_hold_timers_for_target independent of setup time ([#2866](https://github.com/intent-hq/intentd/pull/2866))
+
+
+## [0.11.89] - 2026-10-31
+
+### 🚀 Features
+
+- *(providers)* Return profile folder paths unmasked ([#2848](https://github.com/intent-hq/intentd/pull/2848))
+
+### 🐛 Bug Fixes
+
+- *(services)* Keep workspace.create poll frames off the debug stack ([#2860](https://github.com/intent-hq/intentd/pull/2860))
+
+### 🔧 Refactor
+
+- Share one token reader across intentd source lints ([#2855](https://github.com/intent-hq/intentd/pull/2855))
+
+### ⚡ Performance
+
+- *(services)* Store the execution_call inner future once and budget workspace.create ([#2847](https://github.com/intent-hq/intentd/pull/2847))
+
+
 ## [0.11.88] - 2026-10-31
 
 ### 🐛 Bug Fixes

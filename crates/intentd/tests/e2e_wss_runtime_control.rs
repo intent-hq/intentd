@@ -202,6 +202,7 @@ fn serve_command_builders_own_the_tcp_port_seam() {
 /// closed only at that child's own exec), making exec of the fresh copy
 /// fail with "Text file busy". Only needed for the COPIED sitter/decoy
 /// binaries (intent-hq/monorepo#4220).
+#[track_caller]
 fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> GuardedChild {
     for _ in 0..400 {
         match GuardedChild::spawn(cmd) {
