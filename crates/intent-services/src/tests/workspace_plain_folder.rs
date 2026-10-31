@@ -113,6 +113,45 @@ async fn new_folder_is_created_without_git_and_marked_plain() {
     assert!(stored.plain_folder);
 }
 
+/// Caller-supplied `path`, blank `worktreePath` / `baseRef` and a
+/// `baseCommitSha` never persist on a plain-folder row: the folder at
+/// `repositoryPath` stays the agents' working directory (PR review).
+#[intent_test_macros::daemon_test]
+async fn plain_folder_row_drops_caller_path_and_git_fields() {
+    let h = harness().await;
+    let folder = test_tempdir("intentd-plain-fields-");
+    let elsewhere = test_tempdir("intentd-plain-elsewhere-");
+    let mut input = plain(folder.path());
+    input.path = Some(elsewhere.path().to_string_lossy().into_owned());
+    input.worktree_path = Some(String::new());
+    input.base_ref = Some("  ".to_string());
+    input.base_commit_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+
+    let ws = h
+        .services
+        .create_workspace(input, None)
+        .await
+        .expect("create")
+        .workspace;
+    let stored = h.store.get_workspace(&ws.id).await.expect("get");
+    for row in [&ws, &stored] {
+        assert_eq!(row.path, None, "caller path is not persisted");
+        assert_eq!(row.worktree_path, None);
+        assert_eq!(row.base_ref, None);
+        assert_eq!(row.base_commit_sha, None);
+    }
+    assert_eq!(
+        crate::git_ops::worktree_path(&stored).as_deref(),
+        Some(folder.path()),
+        "agents resolve the plain folder, not the caller path"
+    );
+    assert_eq!(
+        stored.effective_path(),
+        folder.path().to_str(),
+        "the effective path is the plain folder"
+    );
+}
+
 #[intent_test_macros::daemon_test]
 async fn existing_folder_gets_a_row_only_and_its_files_are_untouched() {
     let h = harness().await;

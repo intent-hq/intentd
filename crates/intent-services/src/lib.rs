@@ -22676,6 +22676,16 @@ impl WorkspaceApi for Services {
                     // supplying their own `worktreePath`, and repository paths
                     // that are not a local git repo (registry-only rows keep
                     // the prior behavior).
+                    // Plain folder (§5.1): the folder at `repositoryPath` is
+                    // the only location. Caller-supplied `path` (which would
+                    // outrank it for the agent cwd) and blank git fields that
+                    // passed the shape check never persist.
+                    if ws.plain_folder {
+                        ws.path = None;
+                        ws.worktree_path = None;
+                        ws.base_ref = None;
+                        ws.base_commit_sha = None;
+                    }
                     let has_worktree = ws
                         .worktree_path
                         .as_deref()
