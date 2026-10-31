@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.95] - 2026-10-31
+
+### 📚 Documentation
+
+- Record Set aside alpha availability ([#2892](https://github.com/intent-hq/intentd/pull/2892))
+
+
 ## [0.11.94] - 2026-10-31
 
 ### 🐛 Bug Fixes
