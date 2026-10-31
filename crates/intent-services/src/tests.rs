@@ -15,6 +15,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod auto_archive_workspace;
+mod cross_workspace_search;
 mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;

@@ -1843,6 +1843,55 @@ impl Store {
             })
             .collect()
     }
+
+    /// Every PR link recorded for the workspaces in `workspace_ids`
+    /// (`ws.crossWorkspace.search({ pr })`), most recently linked first, ties
+    /// by key then workspace id. The caller resolves which keys a reference
+    /// names (`intent_core::PullRequestSelector`); this read uses the
+    /// `workspace_id` index, so its cost tracks the scoped workspaces' links
+    /// rather than the whole table. An empty scope reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_links_for_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PullRequestLink>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(workspace_ids)
+            .map_err(|e| Error::Internal(format!("encode workspace ids failed: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT pr_key, workspace_id, linked_at FROM pull_request_workspace \
+             WHERE workspace_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY linked_at DESC, pr_key ASC, workspace_id ASC",
+        )
+        .bind(ids)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list pull request links failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(PullRequestLink {
+                    pr_key: col(row, "pr_key")?,
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    linked_at: col(row, "linked_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One recorded PR <-> workspace link (migration 0161): the canonical
+/// `<host>/<owner>/<repo>/pull/<number>` key, the linked workspace, and when
+/// the link was first recorded (RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestLink {
+    pub pr_key: String,
+    pub workspace_id: WorkspaceId,
+    pub linked_at: String,
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>

@@ -139,6 +139,23 @@ pub struct PullRequestWorkspace {
     pub linked_at: String,
 }
 
+/// `ws.crossWorkspace.search` input: free text and/or a pull-request
+/// reference, scoped to the caller's sibling workspaces (the
+/// `crossWorkspace.*` same-repository rule). When both are set a workspace
+/// must match both. `limit` caps the returned workspaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossWorkspaceSearch {
+    /// Case-insensitive free text: every whitespace-separated term must
+    /// appear in the workspace's metadata, or the note index must match it.
+    pub query: Option<String>,
+    /// A pull-request reference resolved against the PR link index.
+    pub pr: Option<crate::PullRequestSelector>,
+    /// Include retired siblings (archived siblings are always searched).
+    pub include_retired: bool,
+    /// Maximum workspaces returned.
+    pub limit: usize,
+}
+
 /// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
 /// (§7.6; TS `PullRequestInfo` in `src/shared/types.ts`). A focused subset of
 /// the TS shape populated from the host-agnostic forge `PullRequest`; required

@@ -611,3 +611,59 @@ async fn bench_note_fts() {
         }
     }
 }
+
+#[tokio::test]
+async fn note_fts_per_workspace_limit_applies_before_the_global_limit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let strong = workspace(&store, "strong", false).await;
+    let weak = workspace(&store, "weak", false).await;
+    for i in 0..5 {
+        note(&store, &strong, &format!("s{i}"), "Needle", "needle needle").await;
+    }
+    note(
+        &store,
+        &weak,
+        "w0",
+        "Other",
+        "a long body that mentions the needle once among many words",
+    )
+    .await;
+
+    // Without the cap, the strong workspace fills a small global limit.
+    let mut options = NoteFtsOptions {
+        limit: Some(3),
+        ..Default::default()
+    };
+    let got = store.search_notes_fts("needle", &options).await.unwrap();
+    assert!(got.iter().all(|h| h.workspace_id == "strong"));
+
+    options.per_workspace_limit = Some(2);
+    let got = store.search_notes_fts("needle", &options).await.unwrap();
+    let pairs: Vec<(&str, &str)> = got
+        .iter()
+        .map(|h| (h.workspace_id.as_str(), h.note_id.as_str()))
+        .collect();
+    assert_eq!(pairs.len(), 3, "{pairs:?}");
+    assert_eq!(pairs.iter().filter(|(w, _)| *w == "strong").count(), 2);
+    assert!(pairs.contains(&("weak", "w0")), "{pairs:?}");
+    assert!(got.windows(2).all(|p| p[0].rank <= p[1].rank));
+
+    options.limit = None;
+    assert_eq!(
+        store
+            .search_notes_fts("needle", &options)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    options.per_workspace_limit = Some(0);
+    assert!(store
+        .search_notes_fts("needle", &options)
+        .await
+        .unwrap()
+        .is_empty());
+    options.per_workspace_limit = Some(-1);
+    assert!(store.search_notes_fts("needle", &options).await.is_err());
+}
