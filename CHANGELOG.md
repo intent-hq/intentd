@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.92] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(providers)* Clear shared quota state when a provider configuration is edited ([#2878](https://github.com/intent-hq/intentd/pull/2878))
+
+### 🧪 Testing
+
+- *(lint)* Fail when AGENTS.md crate layout or lint table drifts ([#2875](https://github.com/intent-hq/intentd/pull/2875))
+
+
 ## [0.11.91] - 2026-10-31
 
 ### 🧪 Testing
