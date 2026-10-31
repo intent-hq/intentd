@@ -158,6 +158,9 @@ router discussion.stopAgent
 router event.agentActivity
 router event.query
 router event.workspaceSummary
+router executor.list
+router executor.mint
+router executor.revoke
 router file-tracking.getAgentLocks
 router file-tracking.getChanges
 router file-tracking.loadCommits

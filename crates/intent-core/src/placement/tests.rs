@@ -481,3 +481,27 @@ fn machine_refusals_name_the_machine_and_say_whether_to_retry() {
         assert!(data.get("limit").is_none());
     }
 }
+
+#[test]
+fn platform_of_names_only_supported_pairs() {
+    assert_eq!(
+        AgentPlatform::of("linux", "x86_64"),
+        Some(AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64,
+        })
+    );
+    assert_eq!(
+        AgentPlatform::of("macos", "aarch64"),
+        Some(AgentPlatform {
+            os: NodeOs::Macos,
+            arch: NodeArch::Aarch64,
+        })
+    );
+    assert_eq!(AgentPlatform::of("windows", "x86_64"), None);
+    assert_eq!(AgentPlatform::of("linux", "riscv64"), None);
+    assert_eq!(
+        AgentPlatform::host(),
+        AgentPlatform::of(std::env::consts::OS, std::env::consts::ARCH)
+    );
+}

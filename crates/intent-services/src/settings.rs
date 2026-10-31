@@ -2682,6 +2682,28 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(86_400.0),
             120.0,
         ),
+        boolean(
+            "remoteAgents.enabled",
+            "Run agents for other daemons",
+            "Let backends you expose this machine to run remote agents here: serves the executor link (/node/link, /node/git) and allows executor.mint. Remote agents run code as this machine's OS user. Off refuses executor links and closes live ones",
+            "remoteAgents",
+            false,
+        ),
+        enumerated(
+            "remoteAgents.permission",
+            "Remote agent permissions",
+            "How provider permission prompts of remote agents are answered on this machine, since no client is attached (allowAll, autoByRisk or denyAll)",
+            "remoteAgents",
+            &["allowAll", "autoByRisk", "denyAll"],
+            "allowAll",
+        ),
+        boolean(
+            "experimental.remoteAgents",
+            "Remote agents on exposed machines (experimental)",
+            "Backend side of daemon-to-daemon remote agents: adding and refreshing exposed machines, placing agents on them and advertising the remoteMachines capability",
+            "experimental",
+            false,
+        ),
     ];
     definitions.extend(
         intent_providers::ACP_PROVIDERS
@@ -7965,6 +7987,94 @@ mod tests {
         assert_eq!(intent_core::config::DEFAULT_PR_CACHE_MAX_AGE_SECONDS, 60);
         assert_eq!(intent_core::config::MIN_PR_CACHE_MAX_AGE_SECONDS, 10);
         assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
+    }
+
+    /// Daemon-to-daemon remote agents: `remoteAgents.enabled` (default off)
+    /// and `remoteAgents.permission` (default `allowAll`) on the machine,
+    /// `experimental.remoteAgents` (default off) on the backend. All are
+    /// TOML-backed, owner-editable and round-trip through the registry.
+    #[tokio::test]
+    async fn remote_agents_settings_round_trip_via_registry() {
+        for (path, category, default) in [
+            ("remoteAgents.enabled", "remoteAgents", json!(false)),
+            ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
+            ("experimental.remoteAgents", "experimental", json!(false)),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must be editable");
+            assert_eq!(def.category, category, "{path} category");
+            assert_eq!(def.default_value, Some(default), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        assert!(matches!(
+            find_definition("remoteAgents.enabled").unwrap().ty,
+            SettingType::Boolean
+        ));
+        assert!(matches!(
+            find_definition("experimental.remoteAgents").unwrap().ty,
+            SettingType::Boolean
+        ));
+        let SettingType::Enum(values) = find_definition("remoteAgents.permission").unwrap().ty
+        else {
+            panic!("remoteAgents.permission must be an enum");
+        };
+        assert_eq!(values, ["allowAll", "autoByRisk", "denyAll"]);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let effective = registry.snapshot().effective.clone();
+        assert!(!effective.remote_agents.enabled);
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::AllowAll
+        );
+        assert!(!effective.experimental.remote_agents);
+
+        svc.update(&json!([
+            { "path": "remoteAgents.enabled", "value": true },
+            { "path": "remoteAgents.permission", "value": "denyAll" },
+            { "path": "experimental.remoteAgents", "value": true },
+        ]))
+        .await
+        .expect("update");
+        let effective = registry.snapshot().effective.clone();
+        assert!(effective.remote_agents.enabled);
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert!(effective.experimental.remote_agents);
+        for path in [
+            "remoteAgents.enabled",
+            "remoteAgents.permission",
+            "experimental.remoteAgents",
+        ] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+        }
+        let err = svc
+            .update(&json!([{ "path": "remoteAgents.permission", "value": "ask" }]))
+            .await
+            .expect_err("an unknown permission must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("remoteAgents.enabled").await.expect("reset");
+        assert_eq!(reset["value"], json!(false));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default

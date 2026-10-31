@@ -4,6 +4,8 @@
 //! when it places an agent or connects to a machine.
 
 use std::fmt::{self, Write as _};
+use std::future::Future;
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
@@ -298,6 +300,44 @@ pub struct ExposedMachine {
     pub state: RemoteMachineState,
     pub added_at: String,
     pub last_connected_at: Option<String>,
+}
+
+/// Where this machine's executor link can be dialed, as `executor.mint`
+/// reports it: its display name and the routes and certificate fingerprint of
+/// its WSS listener (the same ones the pairing payload advertises).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineRoutes {
+    pub name: String,
+    pub port: u16,
+    pub hosts: Vec<String>,
+    pub tc_address: Option<String>,
+    pub fingerprint: String,
+}
+
+/// Resolves [`MachineRoutes`]. The transport owns the listener, so it
+/// implements this and the composition root attaches it to the services.
+pub trait MachineRoutesSource: Send + Sync {
+    /// The current routes; [`crate::Error::ListenerDown`] while the WSS
+    /// listener is stopped.
+    fn machine_routes(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<MachineRoutes>> + Send + '_>>;
+}
+
+/// The live state of one executor credential on this machine, for
+/// `executor.list`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutorLiveStatus {
+    /// Whether the credential's backend has an executor link open.
+    pub connected: bool,
+    /// Remote agents the credential's backend runs here.
+    pub running_agents: u32,
+}
+
+/// Reports [`ExecutorLiveStatus`]. The executor link implements it; without
+/// one every credential reads as disconnected with no agents.
+pub trait ExecutorLiveness: Send + Sync {
+    fn status(&self, credential_id: &ExecutorCredentialId) -> ExecutorLiveStatus;
 }
 
 #[cfg(test)]

@@ -179,3 +179,39 @@ fn remote_machine_state_names_match_the_wire() {
     }
     assert_eq!(RemoteMachineState::parse("online"), None);
 }
+
+#[test]
+fn remote_agents_disabled_is_invalid_params_naming_the_setting() {
+    let error = Error::RemoteAgentsDisabled {
+        setting: "remoteAgents.enabled",
+    };
+    assert_eq!(error.code(), -32602);
+    assert_eq!(
+        error.to_string(),
+        "remote agents are disabled on this daemon: turn on remoteAgents.enabled first"
+    );
+}
+
+#[test]
+fn executor_live_status_defaults_to_disconnected() {
+    assert_eq!(
+        ExecutorLiveStatus::default(),
+        ExecutorLiveStatus {
+            connected: false,
+            running_agents: 0,
+        }
+    );
+}
+
+#[test]
+fn machine_routes_debug_names_every_route() {
+    let routes = MachineRoutes {
+        name: "Build box".into(),
+        port: 7443,
+        hosts: vec!["10.0.0.2".into()],
+        tc_address: Some("tc1".into()),
+        fingerprint: "AA:BB".into(),
+    };
+    let text = format!("{routes:?}");
+    assert!(text.contains("7443") && text.contains("10.0.0.2") && text.contains("tc1"));
+}

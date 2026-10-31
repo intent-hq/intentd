@@ -401,3 +401,25 @@ async fn exposed_machine_state_routes_and_capabilities_are_cached() {
         "routes never move the credential"
     );
 }
+
+#[tokio::test]
+async fn daemon_id_is_minted_once_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("executor.db");
+    let store = Store::open(&path).await.unwrap();
+    let (a, b) = tokio::join!(store.daemon_id(), store.daemon_id());
+    let first = a.unwrap();
+    assert_eq!(b.unwrap(), first, "concurrent first reads agree");
+    assert!(!first.is_empty());
+    assert_eq!(store.daemon_id().await.unwrap(), first);
+    drop(store);
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.daemon_id().await.unwrap(), first);
+
+    let (_other_dir, other) = open().await;
+    assert_ne!(
+        other.daemon_id().await.unwrap(),
+        first,
+        "each data dir has its own id"
+    );
+}
