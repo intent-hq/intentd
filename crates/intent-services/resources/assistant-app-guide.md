@@ -684,11 +684,11 @@ grouping choices keep their behavior.
 
 ## Set aside workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
 
-**Set aside** is unreleased until the companion frontend change ships. In a
-supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
-view moves it into a collapsed **Set aside** section; board view shows it in the
+**Set aside** is available in alpha builds starting with v2.262.0. Use **Set aside**
+on a Home workspace row, card or menu. List view moves it into a collapsed
+**Set aside** section; board view shows it in the
 **Set aside** column on the right, and dragging a card into that column also sets it
 aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
 action. Searching includes set-aside workspaces. With a Home
@@ -705,10 +705,10 @@ not hide the workspace for collaborators or mark its work complete.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
-Archive is the one way to put a workspace away. In **Home → Workspaces**,
-right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
-and PR monitors and keeps its folder. Archived workspaces appear under the
-**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
+In **Home → Workspaces**, right-click a workspace and choose **Archive**.
+Archiving stops its agents, hooks and PR monitors and keeps its folder. Archived
+workspaces appear under the **Archived** filter. Choose **Unarchive**, or send an
+agent a message, to continue.
 
 Intent can archive idle workspaces automatically. It is off by default; turn on
 **Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
