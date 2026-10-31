@@ -108,7 +108,6 @@ esac
     path
 }
 
-#[track_caller]
 fn mock_identity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");

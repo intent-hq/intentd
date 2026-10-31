@@ -445,7 +445,6 @@ async fn next_subscription_push(ws: &mut TlsWs) -> Value {
 /// git-root first then monitor-derived entries, deduped by URL with
 /// cancelled monitors excluded, and the nothing-to-merge row keeps the
 /// field omitted (never `[]`).
-#[track_caller]
 fn assert_merged_rows(rows: &[Value], ws_merge: &WorkspaceId, ws_plain: &WorkspaceId, path: &str) {
     let merged = rows
         .iter()

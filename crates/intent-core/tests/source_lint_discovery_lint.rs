@@ -111,7 +111,6 @@ fn collect_lint_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Every `crates/*/tests/**/*_lint.rs` under `root`, sorted, as paths
 /// relative to `root`.
-#[track_caller]
 fn lint_files(root: &Path) -> Vec<PathBuf> {
     let crates_dir = root.join("crates");
     let crates = fs::read_dir(&crates_dir)
@@ -252,7 +251,6 @@ fn token_reader_definitions(blanked: &str) -> Vec<(usize, String)> {
 /// `// source-lint-scaffolding: allow` marker on the line above the `fn`
 /// keyword with a reason suppresses the hit, one without a reason is
 /// reported instead.
-#[track_caller]
 fn scaffolding_copies(root: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     for rel in lint_files(root) {

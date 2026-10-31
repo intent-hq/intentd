@@ -3542,7 +3542,6 @@ while True:signal.pause()
             .stderr(Stdio::from(log));
         command
     }
-    #[track_caller]
     fn assert_inert_cleanup(directory: &std::path::Path, supervisor: &mut Controller) -> Value {
         let status = supervisor.wait().unwrap();
         let record = observed_json(&directory.join("failed.json"));
@@ -3991,7 +3990,6 @@ async fn prerequisite_snapshot(h: &Harness) -> Value {
     driver_snapshot(h, &provider)
 }
 
-#[track_caller]
 fn prerequisite_unchanged(before: &Value, after: &Value) {
     for key in [
         "primaryHead",

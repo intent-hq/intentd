@@ -313,7 +313,6 @@ where
     note_id
 }
 
-#[track_caller]
 fn row_for<'a>(resp: &'a Value, id: &str) -> &'a Value {
     resp["tasks"]
         .as_array()

@@ -130,7 +130,6 @@ async fn reject_other_token(port: u16, fp: &str, token: &str) {
     }
 }
 
-#[track_caller]
 fn stop(child: &mut GuardedChild) {
     child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(child

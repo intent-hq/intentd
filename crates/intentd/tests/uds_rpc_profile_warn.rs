@@ -194,7 +194,6 @@ struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Create a temporary git repo (initial commit on `main`) carrying the given
 /// `.intent/config.json` contents.
-#[track_caller]
 fn create_repo_with_config(config: &str) -> TempRepo {
     let repo_dir = common::test_tempdir("itdp-repo-");
     let repo_path = repo_dir.path().to_path_buf();

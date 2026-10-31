@@ -166,7 +166,6 @@ async fn wait_for_output(socket: &mut Socket, terminal_id: &str, markers: &[&str
     })
 }
 
-#[track_caller]
 fn seed_repo(path: &Path) {
     for args in [
         vec!["init", "--initial-branch=main"],

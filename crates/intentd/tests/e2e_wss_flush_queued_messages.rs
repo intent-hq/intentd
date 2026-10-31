@@ -727,7 +727,6 @@ async fn await_prompts(prompt_log: &Path, min_lines: usize) -> Vec<String> {
 
 /// The `agent.getConversation` user row whose first text block starts with
 /// `needle` (metadata assertions need the full row, not just its text).
-#[track_caller]
 fn user_row<'a>(conv: &'a Value, needle: &str) -> &'a Value {
     conv["messages"]
         .as_array()
@@ -849,7 +848,6 @@ async fn observe_drain(
 /// Queue snapshot lengths from the DRAIN phase: everything after the last
 /// length-2 snapshot (the enqueue phase publishes 1 → 2 before the busy turn
 /// ends; the subscription sees those buffered events too).
-#[track_caller]
 fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
     let last_two = queue_lengths
         .iter()

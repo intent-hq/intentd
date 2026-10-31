@@ -11,7 +11,6 @@ async fn rpc(client: &mut PresenceClient, method: &str, params: Value) -> Value 
     response["result"].clone()
 }
 
-#[track_caller]
 fn range(value: &Value, field: &str) -> (Vec<u8>, u64, u64) {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value[field].as_str().unwrap())

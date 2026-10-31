@@ -1188,7 +1188,6 @@ fn shell_control(body: impl FnOnce(&mut ControlShell) -> io::Result<()>) -> Cont
     }
 }
 
-#[track_caller]
 fn require_control(outcome: ControlOutcome) {
     // Original outcome takes precedence. The separately emitted receipt exposes
     // cleanup/report errors even when the original error or panic is propagated.

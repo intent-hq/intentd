@@ -44,7 +44,6 @@ fn spawn_serve(data_dir: &Path, home_dir: &Path) -> GuardedChild {
     spawn_serve_with_claude_config(data_dir, home_dir, None)
 }
 
-#[track_caller]
 fn spawn_serve_with_claude_config(
     data_dir: &Path,
     home_dir: &Path,

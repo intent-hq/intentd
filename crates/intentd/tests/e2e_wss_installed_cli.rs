@@ -115,7 +115,6 @@ fn install_cli(home: &Path, provider: &str, generation: u32, log: &Path) {
     );
     executable(&home.join(".local/bin").join(name), &body);
 }
-#[track_caller]
 fn package(key: &str, spec: &str, dependency: &str) -> (PathBuf, Vec<u8>) {
     let dir = PathBuf::from(
         std::env::var_os(key)

@@ -573,7 +573,6 @@ fn check(
 
 /// Every `*.rs` under `dir`, skipping test code by path (`tests/` directories,
 /// `tests.rs`, `*_tests.rs`, `tests_*.rs`).
-#[track_caller]
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for entry in entries {
@@ -674,7 +673,6 @@ fn every_queue_entry_egress_is_registered_in_the_contract_table() {
 // ---- fixtures ---------------------------------------------------------------
 
 /// 1-based line of the first line containing `needle`.
-#[track_caller]
 fn line_of(src: &str, needle: &str) -> usize {
     src.lines()
         .position(|l| l.contains(needle))

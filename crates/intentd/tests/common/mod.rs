@@ -19,6 +19,24 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+/// Names an async test helper's caller when the helper panics.
+///
+/// `#[track_caller]` is a no-op on an `async fn` (rust-lang/rust#110011), so
+/// an async helper's failure reports a line inside the helper. A sync
+/// `#[track_caller]` fn that captures `Location::caller()` and returns the
+/// future can hold this guard inside it: any panic in the future — an
+/// assertion, a timeout, an `unwrap()` — then also prints the calling test
+/// line. See `test_helper_track_caller_lint`.
+pub struct CallerOnPanic(pub &'static std::panic::Location<'static>);
+
+impl Drop for CallerOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("note: the failing helper was called at {}", self.0);
+        }
+    }
+}
+
 /// The libtest name of test `name` declared in the module whose
 /// `module_path!()` is `module_path`: that path below the crate root, then
 /// `name`. A test re-executing its own binary with `--exact` must pass this,
@@ -670,7 +688,6 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
 /// `env_remove` or an inherited host value does not). Every daemon fixture
 /// passes through here — `serve_spawn_lint.rs` requires it — so no restart
 /// can quietly resume an interrupted turn on a headless CI runner.
-#[track_caller]
 pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
     let resume_is_caller_owned = cmd.get_envs().any(|(key, value)| {
         key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV) && value.is_some()
@@ -789,7 +806,6 @@ pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, dat
 /// the two builders in code (comments do not count), or carry a reasoned
 /// `serve-spawn: allow` marker. Appends to an existing seeded config; no-op if
 /// the table is already present.
-#[track_caller]
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
@@ -1285,7 +1301,6 @@ mod tests {
         std::thread::spawn(f).join().expect("test thread")
     }
 
-    #[track_caller]
     fn caught_panic() {
         let _ = std::panic::catch_unwind(|| panic!("intentional: exercise retention hook"));
     }

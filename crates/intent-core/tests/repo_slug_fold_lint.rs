@@ -258,7 +258,6 @@ fn slug_identity_is_only_folded_inside_repo_ref() {
 // ---- scanner fixtures -------------------------------------------------------
 
 /// 1-based line of the first line containing `needle`.
-#[track_caller]
 fn line_of(src: &str, needle: &str) -> usize {
     src.lines()
         .position(|l| l.contains(needle))

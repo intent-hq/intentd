@@ -551,7 +551,6 @@ async fn user_message_texts(data_dir: &Path, agent_id: &str) -> Vec<String> {
 /// Assert the resume-ordering contract on the transcript: the continuation
 /// user message lands strictly BEFORE both preserved queued messages, which
 /// appear exactly once each, in their original FIFO order.
-#[track_caller]
 fn assert_continuation_first_then_fifo(users: &[String]) {
     // Prefix match: drained queue entries carry the appended dequeue-wait
     // system note after the original content.

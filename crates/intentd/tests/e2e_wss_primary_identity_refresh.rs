@@ -336,7 +336,6 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
 }
 
 /// The owner row of a `workspace.members.list` result.
-#[track_caller]
 fn owner_row(result: &Value) -> &Value {
     result["members"]
         .as_array()
@@ -347,7 +346,6 @@ fn owner_row(result: &Value) -> &Value {
 /// The documented owner row keys, including the additive `hostRole`.
 /// The `identity` triple is present exactly when the owner is linked
 /// (`login` is a string) and absent otherwise.
-#[track_caller]
 fn assert_member_row_shape(row: &Value) {
     let mut keys: Vec<&str> = row
         .as_object()

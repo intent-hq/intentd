@@ -82,7 +82,6 @@ fn test_target_sources(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 /// One crate's top-level `tests/*.rs` files: (file stem, canonical path, text).
-#[track_caller]
 fn top_level_test_files(tests: &Path) -> Vec<(String, PathBuf, String)> {
     let Ok(entries) = fs::read_dir(tests) else {
         return Vec::new();

@@ -1120,7 +1120,6 @@ const DEFER_TAIL_MS: u64 = 10_000;
 /// no attention fields on the raiser's `agent:updated`, no `needs_attention`/
 /// `blocked` promotion, and no transcript-notice `agent:message` (matched via
 /// the `meta.kind` marker in the serialized event).
-#[track_caller]
 fn assert_not_surfaced_mid_turn(ev: &Value, agent_id: &str, meta_kind: &str) {
     let data = &ev["data"];
     match ev["type"].as_str().unwrap_or_default() {

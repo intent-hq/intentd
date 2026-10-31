@@ -474,7 +474,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-#[track_caller]
 fn assert_shutdown_phase_order(log: &str) {
     let phases = [
         "cleanup",

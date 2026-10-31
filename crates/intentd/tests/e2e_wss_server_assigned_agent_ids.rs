@@ -134,7 +134,6 @@ fn dir_entries(path: &PathBuf) -> Vec<String> {
 }
 
 /// Initialize a git repository with one commit using the git CLI.
-#[track_caller]
 fn init_git_repo(path: &PathBuf) {
     std::fs::create_dir_all(path).unwrap();
     let run = |args: &[&str]| {

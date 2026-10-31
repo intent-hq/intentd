@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use intentd_test_support::GuardedChild;
 
-#[track_caller]
 fn install_sh() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -30,7 +29,6 @@ fn install_sh() -> String {
 
 /// Extract one shell function from install.sh (its header through the first
 /// column-0 `}`), so a driver can run the shipped implementation verbatim.
-#[track_caller]
 fn sh_function(script: &str, name: &str) -> String {
     let header = format!("{name}() {{");
     let start = script
@@ -132,7 +130,6 @@ fn owner_capture_frame(os: &str, output: &std::process::Output) -> String {
     )
 }
 
-#[track_caller]
 fn owner_refusal_diagnostic_driver(mut driver: String) -> String {
     {
         let original = sh_function(&driver, "pid_under");

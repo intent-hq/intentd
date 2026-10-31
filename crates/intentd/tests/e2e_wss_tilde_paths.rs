@@ -260,7 +260,6 @@ fn gate() -> bool {
 }
 
 /// Init a small local repo (one commit on `main`) at `dir` and return it.
-#[track_caller]
 fn seed_repo(dir: &Path) -> PathBuf {
     std::fs::create_dir_all(dir).expect("mkdir seed repo");
     let run = |args: &[&str]| {

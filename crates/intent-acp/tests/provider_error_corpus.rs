@@ -51,7 +51,6 @@ fn expect_quota(entry: &Value, what: &str) -> bool {
     }
 }
 
-#[track_caller]
 fn object<'a>(value: &'a Value, what: &str) -> &'a Map<String, Value> {
     value
         .as_object()
@@ -68,7 +67,6 @@ fn internal_error(data: Value) -> JsonRpcError {
 
 /// One rendering per structured kind: the kind alone, with no wording, so the
 /// structured signal is tested on its own.
-#[track_caller]
 fn kind_cases(corpus: &Value) -> Vec<Case> {
     let mut cases = Vec::new();
     for (adapter, table) in object(&corpus["kinds"], "kinds") {

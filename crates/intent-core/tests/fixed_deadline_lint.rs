@@ -803,7 +803,6 @@ struct Tree {
 /// whole, other `src/` files for their `#[cfg(test)]` items, then — until
 /// nothing changes — promotes to whole every `src/` file an out-of-line test
 /// module resolves to (including modules declared by a promoted file).
-#[track_caller]
 fn scan_tree(root: &Path) -> Tree {
     let crates_dir = root.join("crates");
     let mut krates: Vec<PathBuf> = fs::read_dir(&crates_dir)

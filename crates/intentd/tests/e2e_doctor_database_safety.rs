@@ -121,7 +121,6 @@ impl Fixture {
         self.run_expected(command, label, true)
     }
 
-    #[track_caller]
     fn run_expected(&self, mut command: Command, label: &str, success: bool) -> String {
         let stdout_path = self.root.path().join(format!("{label}.stdout"));
         let stderr_path = self.root.path().join(format!("{label}.stderr"));

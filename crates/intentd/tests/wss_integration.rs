@@ -3111,7 +3111,6 @@ async fn next_subscription_push(
 /// `harnessFeatures` rides along), every render preview is capped to
 /// `AGENT_LIST_PREVIEW_BUDGET_BYTES`, and the serialized row fits
 /// `AGENT_LIST_ROW_BUDGET_BYTES`.
-#[track_caller]
 fn assert_agent_list_projected_row(label: &str, row: &Value) {
     use intent_core::{
         format_key_bytes_table, serialized_key_bytes, AGENT_LIST_PREVIEW_BUDGET_BYTES,
@@ -5213,7 +5212,6 @@ impl Guest {
 
 /// A tiny real repository (one commit on `main`, repo-local identity) for
 /// direct-checkout workspaces in the in-process harness.
-#[track_caller]
 fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     let dir = test_tempdir(prefix);
     let repo = dir.path().to_path_buf();
@@ -11498,7 +11496,6 @@ async fn multi_bind_serves_every_configured_address() {
 /// Reservation of the pair is retried on a fresh ephemeral port when
 /// `::1:port` happens to be taken already; the server bind itself is never
 /// retried.
-#[track_caller]
 fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::TcpSocket, u16) {
     for _ in 0..16 {
         let blocker = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("blocker bind");
@@ -21988,7 +21985,6 @@ async fn wss_transfer_preserves_remote_state() {
 
     /// The archive with only `git/refs.json` replaced; the bundle bytes are
     /// untouched, so a rejection is purely metadata validation.
-    #[track_caller]
     fn relabel(archive: &[u8], tampered_refs: &Value) -> Vec<u8> {
         let mut original = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

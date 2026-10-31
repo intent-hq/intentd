@@ -32,7 +32,6 @@ fn run(root: &Path, id: &str, shell: &str, timeout: &str) -> GuardedChild {
     .unwrap()
 }
 
-#[track_caller]
 fn result(root: &Path, id: &str) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .args(["command-result", "--record-dir"])

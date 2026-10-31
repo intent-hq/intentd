@@ -39,7 +39,6 @@ impl Capture {
     }
 }
 
-#[track_caller]
 fn record<'a>(log: &'a str, phase: &str, state: &str) -> &'a str {
     log.lines()
         .find(|line| {

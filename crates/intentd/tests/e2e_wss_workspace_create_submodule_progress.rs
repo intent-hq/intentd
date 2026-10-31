@@ -383,7 +383,6 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
 /// echoes `progressId`, percent is a normalized non-decreasing 0–100 series
 /// ending in `complete 100`, and exactly one `git:clone:done { ok:true }`
 /// terminates the stream.
-#[track_caller]
 fn assert_progress_stream(events: &[Value], progress_id: &str) {
     assert!(!events.is_empty(), "create emitted progress frames");
     for e in events {

@@ -653,7 +653,6 @@ fn wait_exit_within(child: &mut GuardedChild, window: Duration) -> ExitStatus {
 /// never exits — the shape of every leaked fake. The sitter has been told to
 /// stop and is sitting out its hour-long kill timeout. Returns the sitter and
 /// the daemon's pid.
-#[track_caller]
 fn sitter_with_a_daemon_that_ignores_term(dir: &Path) -> (GuardedChild, u32) {
     let paths = SitterPaths::from_data_dir(dir);
     preinstall(
@@ -4618,7 +4617,6 @@ fn start_and_restart_do_not_duplicate_an_unsupervised_daemon() {
 /// Subreaping keeps the orphan's PID reserved until the test reaps it, making
 /// both the cleanup guard and the liveness assertion independent of init timing.
 #[cfg(target_os = "linux")]
-#[track_caller]
 fn supervisor_death_during_startup(ready: bool) {
     use nix::sys::signal::Signal;
     use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
@@ -4733,7 +4731,6 @@ fn indexing_fixture(dir: &Path) -> BackgroundFixture {
     fixture
 }
 
-#[track_caller]
 fn live_indexing_deadline_case(detached: bool, terminal: &str) {
     let dir = tempfile::tempdir().unwrap();
     let fixture = indexing_fixture(dir.path());
@@ -4822,7 +4819,6 @@ fn live_indexing_concurrent_stop_during_first_probe_never_relaunches() {
     }
 }
 
-#[track_caller]
 fn stop_during_probe_case(contended: bool) {
     let dir = tempfile::tempdir().unwrap();
     let fixture = indexing_fixture(dir.path());

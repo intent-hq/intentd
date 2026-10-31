@@ -13,7 +13,6 @@ fn limit() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(45))
 }
 
-#[track_caller]
 fn run_tool(mut command: Command) {
     command
         .stdin(Stdio::null())
@@ -103,7 +102,6 @@ fn tls(root: &Path) -> Arc<rustls::ServerConfig> {
         .unwrap(),
     )
 }
-#[track_caller]
 fn git(path: &Path, args: &[&str]) -> String {
     let mut command = Command::new("git");
     command
@@ -232,7 +230,6 @@ async fn checkout_legacy_local_repository_and_public_git_route_remain_available(
     h.finish().await;
 }
 
-#[track_caller]
 fn backend(root: PathBuf, method: String, target: &str, body: &[u8]) -> Vec<u8> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let mut command = Command::new("git");

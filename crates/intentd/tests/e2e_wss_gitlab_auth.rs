@@ -734,7 +734,6 @@ async fn subscriber(h: &Harness) -> Ws {
     sub
 }
 
-#[track_caller]
 fn expect_typed_error(v: &Value, code: &str) {
     let err = &v["error"];
     assert_eq!(err["code"], json!(-32603), "envelope: {v}");
@@ -2748,7 +2747,6 @@ async fn await_log_marker(log: &Path, marker: &str, what: &str) {
     .unwrap_or_else(|_| panic!("{what}: daemon log never reported {marker:?}"));
 }
 
-#[track_caller]
 fn stored_in(secrets: &Value) -> Stored {
     let token = secrets["sourceControl.gitlab.token"].as_str();
     let refresh = secrets.get("sourceControl.gitlab.refreshToken").is_some();

@@ -117,7 +117,6 @@ async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
 }
 
 /// Pull the `settings.list` entry for `path`.
-#[track_caller]
 fn entry<'a>(list: &'a Value, path: &str) -> &'a Value {
     list["settings"]
         .as_array()

@@ -252,7 +252,6 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// Assert the `diskUsage` payload shape: physical bytes cover the seeded
 /// 8 KiB file, `fileCount` counts it, `computedAt` is present, and the
 /// breakdown names the `repo` top-level directory.
-#[track_caller]
 fn assert_disk_usage_shape(du: &Value) {
     let bytes = du["bytes"].as_u64().expect("bytes is u64");
     assert!(bytes >= 8192, "allocated bytes cover the seeded file: {du}");

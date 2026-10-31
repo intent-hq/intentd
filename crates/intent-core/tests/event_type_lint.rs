@@ -230,7 +230,6 @@ fn event_type_literals_are_in_the_catalog() {
 // ---- scanner fixtures -------------------------------------------------------
 
 /// 1-based line of the first line containing `needle`.
-#[track_caller]
 fn line_of(src: &str, needle: &str) -> usize {
     src.lines()
         .position(|l| l.contains(needle))

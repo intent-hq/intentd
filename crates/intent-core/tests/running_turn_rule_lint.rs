@@ -459,7 +459,6 @@ fn running_turn_sql_list_is_generated_not_spelled_in_store() {
 // ---- scanner fixtures -------------------------------------------------------
 
 /// 1-based line of the first line containing `needle`.
-#[track_caller]
 fn line_of(src: &str, needle: &str) -> usize {
     src.lines()
         .position(|l| l.contains(needle))

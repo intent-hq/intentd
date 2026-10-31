@@ -248,7 +248,6 @@ fn stop(mut child: GuardedChild) {
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
 /// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
-#[track_caller]
 fn create_test_repo() -> tempfile::TempDir {
     let repo = common::test_tempdir("scrst-repo-");
     let repo_path = repo.path().to_path_buf();

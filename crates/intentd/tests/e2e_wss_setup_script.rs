@@ -347,7 +347,6 @@ where
 const COMMITTED_CONFIG: &str = r#"{"setupScript": "pnpm install"}"#;
 
 /// Create a git repo without any committed `.intent/config.json`.
-#[track_caller]
 fn create_bare_test_repo() -> tempfile::TempDir {
     let repo_dir = common::test_tempdir("setup-repo-");
     let repo_path = repo_dir.path().to_path_buf();
@@ -386,7 +385,6 @@ fn create_bare_test_repo() -> tempfile::TempDir {
     repo_dir
 }
 
-#[track_caller]
 fn create_test_repo() -> tempfile::TempDir {
     let repo_dir = create_bare_test_repo();
     let repo_path = repo_dir.path().to_path_buf();

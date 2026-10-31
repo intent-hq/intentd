@@ -12,7 +12,6 @@ fn write_agent(path: &Path, name: &str, extra: &str, body: &str) {
     .unwrap();
 }
 
-#[track_caller]
 fn definition<'a>(list: &'a Value, id: &str) -> &'a Value {
     list["specialists"]
         .as_array()

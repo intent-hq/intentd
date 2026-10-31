@@ -530,7 +530,6 @@ fn read_jsonl(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-#[track_caller]
 fn assert_error(frame: &Value, code: i64, data_code: &str) {
     assert!(frame.get("result").is_none(), "expected an error: {frame}");
     assert_eq!(frame["jsonrpc"], "2.0", "{frame}");

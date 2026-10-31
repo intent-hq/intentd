@@ -115,7 +115,6 @@ impl Fixture {
         }
     }
 
-    #[track_caller]
     fn git(&self, path: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
@@ -839,7 +838,6 @@ fn observed_root_id() -> RepositoryRootId {
     }
 }
 
-#[track_caller]
 fn assert_same_observations(observed: &RepositoryObservedRoot, admitted: &RepositoryContextRead) {
     let public = &admitted.context.roots[0];
     assert_eq!(observed.root, public.root);

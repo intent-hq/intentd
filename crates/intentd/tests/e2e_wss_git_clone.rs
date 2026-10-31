@@ -262,7 +262,6 @@ fn gate() -> bool {
 }
 
 /// Materialise a tiny bare source repository inside `dir` and return its path.
-#[track_caller]
 fn make_source_repo(dir: &Path) -> PathBuf {
     let seed = dir.join("seed");
     let bare = dir.join("src.git");

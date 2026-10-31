@@ -233,7 +233,6 @@ impl Host {
     }
 }
 
-#[track_caller]
 fn assert_safe_in_band(reply: &serde_json::Value) {
     assert_eq!(reply["jsonrpc"], "2.0");
     assert_eq!(reply["id"], 10);

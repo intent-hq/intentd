@@ -313,6 +313,7 @@ impl Conn {
     fn expect_ok(&mut self, id: i64) -> impl std::future::Future<Output = ()> + '_ {
         let caller = std::panic::Location::caller();
         async move {
+            let _guard = common::CallerOnPanic(caller);
             let [(_, frame)] = self.responses(&[id]).await.try_into().unwrap();
             assert!(
                 frame.get("error").is_none(),
@@ -363,7 +364,6 @@ fn echo_request(id: i64) -> Message {
 }
 
 /// Assert one frame is the exact `-32011` overload envelope with the echoed id.
-#[track_caller]
 fn assert_overload(id: i64, frame: &Value) {
     assert_eq!(frame["jsonrpc"], "2.0", "overload frame: {frame}");
     assert_eq!(frame["id"], json!(id), "overload frame echoes id: {frame}");

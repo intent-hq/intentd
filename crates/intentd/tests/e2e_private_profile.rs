@@ -143,7 +143,6 @@ async fn assert_private(data: &Path) {
     assert!(credential["result"]["credential"].is_null(), "{credential}");
 }
 
-#[track_caller]
 fn stop(daemon: &mut GuardedChild) {
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     let exit = daemon

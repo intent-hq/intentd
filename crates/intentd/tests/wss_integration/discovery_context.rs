@@ -34,6 +34,7 @@ fn success<'a>(
 ) -> impl std::future::Future<Output = Value> + 'a {
     let caller = std::panic::Location::caller();
     async move {
+        let _guard = crate::common::CallerOnPanic(caller);
         let reply = equivalent(client, method, params).await;
         assert!(
             reply.get("error").is_none(),

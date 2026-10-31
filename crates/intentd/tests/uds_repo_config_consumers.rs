@@ -87,7 +87,6 @@ async fn call(
 struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Utility: create a temporary git repo with a .intent/config.json file.
-#[track_caller]
 fn create_test_repo_with_config(config: &str) -> TempRepo {
     let repo_dir = common::test_tempdir("repo-");
     let repo_path = repo_dir.path().to_path_buf();

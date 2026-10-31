@@ -190,7 +190,6 @@ fn versions(text: &str) -> Vec<(usize, &str)> {
 /// Every hand-written CLI version in `regions` that no reasoned marker
 /// covers, plus every reasoned marker (by 1-based line in `markers`) that
 /// covers none.
-#[track_caller]
 fn scan_regions(regions: &[Region<'_>], markers: &[Marker]) -> Vec<Finding> {
     let marker = |line: usize| markers.get(line).copied().unwrap_or(Marker::Absent);
     let mut used = BTreeSet::new();
@@ -290,7 +289,6 @@ fn scan_script(src: &str) -> Vec<Finding> {
 
 /// Every non-Rust fixture script under `dir`, sorted.
 fn script_files(dir: &Path) -> Vec<PathBuf> {
-    #[track_caller]
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let entries =
             fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
