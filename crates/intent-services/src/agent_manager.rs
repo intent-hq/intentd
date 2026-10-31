@@ -17631,6 +17631,13 @@ mod first_attempt_stderr_hint_tests {
         let tmp = crate::tests::test_tempdir("intentd-first-attempt-hint-");
         let attempt_file = tmp.path().join("attempts.txt");
         let attempt_file = attempt_file.to_string_lossy().into_owned();
+        // intent-hq/intent#8145: the hint names the dir only if the capture
+        // file exists when the settle wait ends. The production 2s bound is a
+        // diagnostic budget; on a loaded runner the capture can land after it
+        // and the WARN underclaims. Stretch it like any other hang guard.
+        let settle_ms = intentd_test_support::test_timeout(Duration::from_secs(10))
+            .as_millis()
+            .to_string();
         let _env = EnvGuard::apply(&[
             ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
             (
@@ -17639,6 +17646,7 @@ mod first_attempt_stderr_hint_tests {
             ),
             ("MOCK_AGENT_ATTEMPT_FILE", Some(attempt_file.as_str())),
             ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("0,0")),
+            ("INTENTD_STDERR_SETTLE_TIMEOUT_MS", Some(settle_ms.as_str())),
         ]);
         let (mgr, _seeded, _db) = manager_with(None, None).await;
         let log_root = tmp.path().join("agent-logs");
@@ -17764,6 +17772,90 @@ mod first_attempt_stderr_hint_tests {
             "a non-child-death error never carries the hint"
         );
         mgr.kill_child_only(&agent_id).await;
+    }
+
+    /// intent-hq/intent#8145 mechanism: the hint is dropped exactly when the
+    /// settle bound expires before this child's stderr reaches the capture
+    /// file, and a bound that outlasts the same schedule names the dir. A
+    /// late EOF alone does not drop it (once a line is on disk the dir is
+    /// named even if settle times out), so the schedule delays the line
+    /// itself — the same observable state as a capture-file create/flush
+    /// starved past the bound on a loaded runner.
+    #[tokio::test]
+    async fn hint_is_dropped_iff_capture_lands_after_the_bound() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // fixed-deadline: allow — a schedule, not a wait: the stderr line
+        // lands this long into the long bound's wait.
+        const LATE_LINE_DELAY: Duration = Duration::from_secs(1);
+        let tmp = crate::tests::test_tempdir("intentd-late-settle-hint-");
+        let log_root = tmp.path().join("agent-logs");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let agent_id = AgentId::from("agent-late-settle");
+        let dir = log_root.join(&agent_id.0);
+        let err = Error::Internal(STDOUT_CLOSED.to_string());
+
+        // `line_after_hint`: the line is written only once the hint has
+        // returned (the bound certainly expired first); otherwise it lands
+        // LATE_LINE_DELAY into the hint's wait.
+        let run = |bound_ms: String, line_after_hint: bool| {
+            let mgr = &mgr;
+            let agent_id = &agent_id;
+            let dir = dir.clone();
+            let err = &err;
+            async move {
+                let _env = EnvGuard::apply(&[(
+                    "INTENTD_STDERR_SETTLE_TIMEOUT_MS",
+                    Some(bound_ms.as_str()),
+                )]);
+                let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+                let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+                let (mut stderr_w, stderr_r) = tokio::io::duplex(4096);
+                let hooks = ConnectionHooks {
+                    stderr_log_dir: Some(dir),
+                    ..ConnectionHooks::default()
+                };
+                let conn = Arc::new(Connection::new(
+                    c2a_client,
+                    a2c_client,
+                    Some(Box::new(stderr_r)),
+                    hooks,
+                ));
+                install_handle_with_connection(mgr, agent_id, None, conn);
+                let (hint_done_tx, hint_done_rx) = tokio::sync::oneshot::channel::<()>();
+                let writer = tokio::spawn(async move {
+                    if line_after_hint {
+                        let _ = hint_done_rx.await;
+                    } else {
+                        tokio::time::sleep(LATE_LINE_DELAY).await;
+                    }
+                    stderr_w.write_all(b"dying words\n").await.unwrap();
+                    stderr_w.flush().await.unwrap();
+                    drop(stderr_w);
+                });
+                let hint = stderr_capture_hint(mgr, agent_id, err).await;
+                let _ = hint_done_tx.send(());
+                writer.await.unwrap();
+                hint
+            }
+        };
+
+        // fixed-deadline: allow — any bound works: the line is withheld
+        // until the hint returns.
+        let short = run("200".to_string(), true).await;
+        assert!(
+            short.is_none(),
+            "a bound that expires before the capture lands drops the hint: {short:?}"
+        );
+        let long_ms = intentd_test_support::test_timeout(Duration::from_secs(10))
+            .as_millis()
+            .to_string();
+        assert_eq!(
+            run(long_ms, false).await,
+            Some(dir.clone()),
+            "a bound that outlasts the same capture schedule names the dir"
+        );
     }
 }
 
