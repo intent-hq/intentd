@@ -122,8 +122,10 @@ impl Api {
                                     "createdAt":p["created_at"],"updatedAt":p["updated_at"]})
                             })
                             .collect();
+                        let more = nodes.len() > 100;
+                        let nodes: Vec<_> = nodes.into_iter().take(100).collect();
                         json!({"data":{"repository":{"pullRequests":{
-                            "pageInfo":{"hasNextPage":false},"nodes":nodes}}}})
+                            "pageInfo":{"hasNextPage":more},"nodes":nodes}}}})
                     } else if request.starts_with("POST ") {
                         items.last().cloned().unwrap()
                     } else if url.path().ends_with("/pulls") {
@@ -456,21 +458,25 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
             }
         })
         .await;
-        assert_eq!(counts(&traffic), (expected_pages, 0, 0));
-        assert_eq!(graphql_discovery(&traffic), u64::from(size > 1000));
-        assert!(api
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|p| !p.contains("head=")));
+        // An oversized repository adds one owner-scoped head query.
+        let head_queries = u64::from(size > 1000);
+        assert_eq!(counts(&traffic), (expected_pages + head_queries, 0, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
+        let requests = api.requests.lock().unwrap();
+        let heads: Vec<_> = requests.iter().filter(|p| p.contains("head=")).collect();
+        assert_eq!(heads.len() as u64, head_queries, "{heads:?}");
+        assert!(
+            heads.iter().all(|p| p.contains("head=o%3Amissing")),
+            "{heads:?}"
+        );
     }
 }
 
 /// intent-hq/intent#7187: a repository with more than 1,000 open PRs
 /// cannot be listed within the page cap. Discovery must still find the
-/// workspace PR, including one opened from a contributor's fork, with one
-/// head query, and must not re-list the whole repository every window.
+/// workspace PR with one head query scoped to the repository owner (never a
+/// contributor fork's same-name head, intent-hq/intent#8010), and must not
+/// re-list the whole repository every window.
 #[tokio::test]
 async fn shared_discovery_oversized_repository_uses_head_query() {
     let mut data: Vec<_> = (1..=1200).map(|n| pull(n, "other")).collect();
@@ -495,8 +501,8 @@ async fn shared_discovery_oversized_repository_uses_head_query() {
             .unwrap();
         assert_eq!(
             fork.map(|pr| pr.number),
-            Some(1301),
-            "fork heads still match"
+            None,
+            "another owner's fork head is not the workspace's"
         );
         assert!(svc
             .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
@@ -504,8 +510,8 @@ async fn shared_discovery_oversized_repository_uses_head_query() {
             .unwrap()
             .is_none());
         // Ten capped listing pages once, then one head query per branch.
-        assert_eq!(counts(&traffic), (10, 2, 0));
-        assert_eq!(graphql_discovery(&traffic), 3);
+        assert_eq!(counts(&traffic), (13, 1, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
         for _ in 0..5 {
             svc.pr_discovery.expire();
             assert_eq!(
@@ -517,16 +523,140 @@ async fn shared_discovery_oversized_repository_uses_head_query() {
             );
         }
         // Later windows re-read only the head, never the full list.
-        assert_eq!(counts(&traffic), (10, 7, 0));
-        assert_eq!(graphql_discovery(&traffic), 8);
+        assert_eq!(counts(&traffic), (18, 6, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
     })
     .await;
-    assert!(api
-        .requests
-        .lock()
+    let requests = api.requests.lock().unwrap();
+    let heads: Vec<_> = requests.iter().filter(|p| p.contains("head=")).collect();
+    assert_eq!(heads.len(), 8, "{heads:?}");
+    assert!(heads.iter().all(|p| p.contains("head=o%3A")), "{heads:?}");
+}
+
+fn fork_pull(number: u64, branch: &str, owner: &str) -> serde_json::Value {
+    let mut pr = pull(number, branch);
+    pr["head"]["repo"] = json!({"owner":{"login":owner}});
+    pr["user"] = json!({"login":owner});
+    pr
+}
+
+/// More than 1,000 open PRs: discovery uses the per-head query.
+fn oversized(extra: impl IntoIterator<Item = serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut data: Vec<_> = (1..=1001).map(|n| pull(n, "other")).collect();
+    data.extend(extra);
+    data
+}
+
+/// intent-hq/intent#8010: two forks with the same branch name. Only the
+/// workspace repository owner's head matches; another fork's PR, even a
+/// newer one, is never attached.
+#[tokio::test]
+async fn shared_discovery_head_query_ignores_other_forks_with_the_same_branch() {
+    let api = Api::new(oversized([
+        fork_pull(1300, "feature", "o"),
+        fork_pull(1301, "feature", "contributor"),
+        fork_pull(1302, "fork-only", "contributor"),
+    ]))
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|pr| pr.number), Some(1300));
+    let other = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "fork-only", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        other.map(|pr| pr.number),
+        None,
+        "another fork's PR is not the workspace's"
+    );
+}
+
+/// intent-hq/intent#8010: a common head name (`main`) carried by more than
+/// one page of other forks' PRs neither fails discovery nor matches them.
+#[tokio::test]
+async fn shared_discovery_head_query_survives_many_fork_heads_with_a_common_name() {
+    let forks = (0..150).map(|i| fork_pull(2000 + i, "main", &format!("fork-{i}")));
+    let api = Api::new(oversized(forks)).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "main", None, None)
+        .await
+        .expect("other forks' heads are not a discovery failure");
+    assert_eq!(found.map(|pr| pr.number), None);
+    api.pulls.lock().unwrap().push(fork_pull(3000, "main", "o"));
+    svc.pr_discovery.expire();
+    let own = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "main", None, None)
+        .await
+        .unwrap();
+    assert_eq!(own.map(|pr| pr.number), Some(3000));
+}
+
+/// intent-hq/intent#8010: the head is scoped by head repository owner, not
+/// by PR author, so a PR opened by someone else from the workspace
+/// repository's branch still matches.
+#[tokio::test]
+async fn shared_discovery_head_query_matches_a_pr_authored_by_someone_else() {
+    let mut pr = fork_pull(1300, "feature", "o");
+    pr["user"] = json!({"login":"maintainer"});
+    let api = Api::new(oversized([pr])).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
         .unwrap()
-        .iter()
-        .all(|p| !p.contains("head=")));
+        .expect("head owner, not author, scopes the match");
+    assert_eq!((found.number, found.author.as_str()), (1300, "maintainer"));
+}
+
+/// intent-hq/intent#8010 on the repository-wide listing (at most 1,000 open
+/// PRs, i.e. most repositories): another fork's same-name head, even a newer
+/// one, never matches; the owner's head matches whoever authored it; a head
+/// whose fork was deleted matches nothing.
+#[tokio::test]
+async fn shared_discovery_listing_ignores_other_forks_with_the_same_branch() {
+    let mut authored = fork_pull(4, "authored", "o");
+    authored["user"] = json!({"login":"maintainer"});
+    let mut deleted = pull(5, "gone");
+    deleted["head"]["repo"] = serde_json::Value::Null;
+    let api = Api::new(vec![
+        fork_pull(1, "feature", "o"),
+        fork_pull(2, "feature", "contributor"),
+        fork_pull(3, "fork-only", "contributor"),
+        authored,
+        deleted,
+    ])
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = |branch: &'static str| {
+        let (svc, sc, repo) = (&svc, sc.clone(), repo.clone());
+        async move {
+            svc.discover_shared_pr(sc.as_ref(), &repo, branch, None, None)
+                .await
+                .unwrap()
+                .map(|pr| (pr.number, pr.author))
+        }
+    };
+    assert_eq!(found("feature").await, Some((1, "o".into())));
+    assert_eq!(found("fork-only").await, None, "another fork's PR");
+    assert_eq!(
+        found("authored").await,
+        Some((4, "maintainer".into())),
+        "head owner, not author, scopes the match"
+    );
+    assert_eq!(found("gone").await, None, "a deleted fork's head");
 }
 
 /// A head query that observes a PR open supersedes an older cached record of

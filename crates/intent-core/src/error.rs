@@ -53,6 +53,13 @@ pub enum Error {
         checkout_mode: Option<crate::model::CheckoutMode>,
     },
 
+    /// A §5.56 secret-request call failed for a typed reason
+    /// (`secret-request-unknown`, `invalid-params`, `secret-unavailable`).
+    /// Surfaces as `-32602` with `error.data = { code }`. The message names
+    /// the request or secret only — it never carries a secret value.
+    #[error("{message}")]
+    SecretRequest { code: &'static str, message: String },
+
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
     #[error("internal error: {0}")]
@@ -125,6 +132,15 @@ pub enum Error {
     /// "remote-agents-disabled" }`.
     #[error("remote agents are disabled on this daemon: turn on {setting} first")]
     RemoteAgentsDisabled { setting: &'static str },
+
+    /// The daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): its own orchestration is off, so a method
+    /// outside the node-mode list, or a front door that would start local
+    /// work, is refused. Surfaces as `-32003` with `error.data = { code:
+    /// "node-mode", detail }`, the same envelope the transport's node-mode
+    /// gate emits.
+    #[error("not available in node mode: {0}")]
+    NodeMode(String),
 
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
@@ -628,6 +644,7 @@ impl Error {
             | Error::NotFound(_)
             | Error::WorkspaceRetired { .. }
             | Error::RetireUnsupported { .. }
+            | Error::SecretRequest { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::PlacementUnavailable(_)
@@ -663,7 +680,7 @@ impl Error {
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Forbidden(_) => -32003,
+            Error::Forbidden(_) | Error::NodeMode(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
     }

@@ -362,7 +362,9 @@ fn in_use(name: &str, running: usize) -> Error {
     coded(
         false,
         "machine-in-use",
-        format!("{running} remote agent(s) still run on {name}; stop them or pass stopAgents: true."),
+        format!(
+            "{running} remote agent(s) still run on {name}; stop them or pass stopAgents: true."
+        ),
         json!({ "runningAgents": running }),
     )
 }
@@ -415,7 +417,12 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
 async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let machine_id = required(params, "machineId")?.to_owned();
     ensure_enabled(svc)?;
-    if svc.store().get_exposed_machine(&machine_id).await?.is_none() {
+    if svc
+        .store()
+        .get_exposed_machine(&machine_id)
+        .await?
+        .is_none()
+    {
         return Err(not_found(&machine_id));
     }
     let node = feature.node(svc, &machine_id).await?;

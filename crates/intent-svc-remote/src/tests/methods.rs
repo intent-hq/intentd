@@ -15,10 +15,7 @@ fn data(error: &Error) -> Value {
 }
 
 /// The next `remoteMachine:changed` payloads, up to `count`.
-async fn changes(
-    sub: &mut intent_services::feature_api::Subscription,
-    count: usize,
-) -> Vec<Value> {
+async fn changes(sub: &mut intent_services::feature_api::Subscription, count: usize) -> Vec<Value> {
     let mut out = Vec::new();
     tokio::time::timeout(wait(), async {
         while out.len() < count {
@@ -124,10 +121,7 @@ async fn an_unreachable_machine_saves_nothing_and_names_the_routes_tried() {
     let machine = backend.machine().await;
     machine.stop().await;
     let mut sub = subscribe(&backend);
-    let error = backend
-        .call("add", machine.add_params())
-        .await
-        .unwrap_err();
+    let error = backend.call("add", machine.add_params()).await.unwrap_err();
     assert_eq!(error.code(), -32603);
     let data = data(&error);
     assert_eq!(data["code"], "machine-unreachable");
@@ -136,7 +130,12 @@ async fn an_unreachable_machine_saves_nothing_and_names_the_routes_tried() {
         json!([{ "route": format!("127.0.0.1:{}", machine.port), "error": "node-link-unavailable" }])
     );
     assert!(!error.to_string().contains(&machine.token));
-    assert!(backend.store().list_exposed_machines().await.unwrap().is_empty());
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         backend
             .services
@@ -173,7 +172,12 @@ async fn a_wrong_token_or_pin_is_unreachable_with_the_link_code() {
         data(&error)["attempts"][0]["error"],
         "node-link-certificate-mismatch"
     );
-    assert!(backend.store().list_exposed_machines().await.unwrap().is_empty());
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -191,7 +195,10 @@ async fn add_rejects_malformed_params_before_dialing() {
         let mut params = machine.add_params();
         params[field] = value;
         let error = backend.call("add", params).await.unwrap_err();
-        assert!(matches!(error, Error::InvalidParams(_)), "{field}: {error:?}");
+        assert!(
+            matches!(error, Error::InvalidParams(_)),
+            "{field}: {error:?}"
+        );
         assert!(!error.to_string().contains(&machine.token));
     }
 }
@@ -213,7 +220,12 @@ async fn mutations_need_the_experimental_setting() {
     ] {
         let error = backend.call(method, params).await.unwrap_err();
         assert!(
-            matches!(error, Error::RemoteAgentsDisabled { setting: "experimental.remoteAgents" }),
+            matches!(
+                error,
+                Error::RemoteAgentsDisabled {
+                    setting: "experimental.remoteAgents"
+                }
+            ),
             "{method}: {error:?}"
         );
     }
@@ -316,7 +328,11 @@ async fn an_unreachable_refresh_marks_the_machine_unreachable() {
             .await
         })
     };
-    machine.accept().await.answer_capabilities(capabilities(0)).await;
+    machine
+        .accept()
+        .await
+        .answer_capabilities(capabilities(0))
+        .await;
     refreshing.await.unwrap().unwrap();
     let row = backend
         .store()
@@ -324,7 +340,10 @@ async fn an_unreachable_refresh_marks_the_machine_unreachable() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.state, intent_core::machines::RemoteMachineState::Disconnected);
+    assert_eq!(
+        row.state,
+        intent_core::machines::RemoteMachineState::Disconnected
+    );
 }
 
 #[tokio::test]
@@ -347,7 +366,10 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
 
     let mut sub = subscribe(&backend);
     let removed = backend
-        .call("remove", json!({ "machineId": machine.id(), "stopAgents": true }))
+        .call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -360,7 +382,12 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
     })
     .await;
     assert!(!runtime.is_running());
-    assert!(backend.store().list_exposed_machines().await.unwrap().is_empty());
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         backend
             .services

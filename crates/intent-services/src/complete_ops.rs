@@ -459,6 +459,18 @@ impl Services {
             },
         };
 
+        // Keep named-profile replacement errors intact; a bare selection uses
+        // the existing one-shot unavailable result. Check the resolved route,
+        // since a legacy quick-action override can name a different provider.
+        self.ensure_provider_ref_selectable_in(&run_provider, &settings.providers)?;
+        if let Err(error) = crate::agent_ops::ensure_provider_enabled(
+            "agent.completeOnce",
+            &run_provider,
+            settings.providers.enabled.as_ref(),
+        ) {
+            return Ok(unavailable(error));
+        }
+
         let effort = resolve_quick_action_effort(
             &settings,
             quick_action_type.as_deref(),
@@ -815,7 +827,7 @@ mod tests {
                 serde_json::json!("auggie"),
             )])
             .expect("set model.defaultProvider");
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_auggie_bin(bin)
             .with_settings_registry(registry);
         (tmp, services)
@@ -854,8 +866,8 @@ mod tests {
         // `model.defaultProvider` unset.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services =
-            Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+        let services = Services::new_isolated(store)
+            .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
             .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
@@ -885,7 +897,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect();
         registry.apply(&applied).expect("apply settings");
-        let services = Services::new(store).with_settings_registry(registry);
+        let services = Services::new_isolated(store).with_settings_registry(registry);
         // Installed providers use a pinned adapter through npx. Route their
         // fixture executables through the explicit npx test seam as well.
         let fixture_npx = keys
@@ -900,6 +912,63 @@ mod tests {
             services
         };
         (tmp, services)
+    }
+
+    #[tokio::test]
+    async fn complete_once_disabled_provider_never_launches_default_or_override() {
+        for provider in ["auggie", "codex", "claude-code", "pi"] {
+            for explicit_model in [None, Some("default".to_string())] {
+                let (_tmp, services) = services_with_settings(&[
+                    ("model.defaultProvider", json!(provider)),
+                    ("providers.enabled", json!({ provider: false })),
+                ])
+                .await;
+                let result = services
+                    .agent_complete_once_op(
+                        "hi".into(),
+                        None,
+                        explicit_model,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["available"], false, "{provider}: {result}");
+                let reason = result["reason"].as_str().unwrap();
+                assert!(reason.contains("is not enabled"), "{result}");
+                assert!(reason.contains("Settings > Providers"), "{result}");
+            }
+        }
+
+        // The override's route is disabled even though the app default is not.
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", json!("codex")),
+            (
+                "quickActions.typeOverrides",
+                json!({ "commit": "auggie:sonnet4.5" }),
+            ),
+            ("providers.enabled", json!({ "auggie": false })),
+        ])
+        .await;
+        let result = services
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["available"], false);
+        assert!(
+            result["reason"].as_str().unwrap().contains("\"auggie\""),
+            "{result}"
+        );
     }
 
     /// Executable stand-in for a provider's ACP adapter: a shell wrapper that
@@ -1720,7 +1789,8 @@ rl.on('line', (line) => {
                 json!(fake.to_str().unwrap()),
             )])
             .expect("set setting");
-        let services = Services::new(store.clone()).with_settings_registry(registry.clone());
+        let services =
+            Services::new_isolated(store.clone()).with_settings_registry(registry.clone());
         let result = services
             .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await
@@ -1734,7 +1804,8 @@ rl.on('line', (line) => {
                 json!("/nonexistent/auggie"),
             )])
             .expect("set setting");
-        let services = Services::new(store.clone()).with_settings_registry(registry.clone());
+        let services =
+            Services::new_isolated(store.clone()).with_settings_registry(registry.clone());
         let err = services
             .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await

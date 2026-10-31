@@ -201,6 +201,7 @@ impl PreparedMonitorTurn {
                     captured: None,
                     required: Some(Box::new(admission)),
                 }),
+                false,
             )
             .await;
         manager.registry.mark_idle_slot_held(&monitor.agent_id);

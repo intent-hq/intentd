@@ -116,7 +116,7 @@ async fn file_write_via_sandboxed_agent_is_contained() {
         .expect("insert agent");
 
     // Create Services before provisioning so it has access to the store
-    let svc = crate::test_runtime::with_runtime(Services::new(store.clone()));
+    let svc = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
 
     // Provision sandbox
     let config = ProvisionConfig { workspaces_root };

@@ -51,6 +51,36 @@ pub fn fetch(worktree_path: &Path, remote: &str, branch: &str, token: Option<&st
     fetch_with_timeout(worktree_path, remote, branch, token, SHELL_FETCH_TIMEOUT)
 }
 
+/// Refresh a workspace base that resolves to a remote-tracking branch.
+/// Explicit local refs, tags, commits, and HEAD retain their local semantics.
+/// Callers hold the provisioning lock across refresh and checkout.
+///
+/// # Errors
+/// Returns an error if the repository cannot be opened or the required fetch fails.
+pub fn refresh_workspace_base(
+    path: &Path,
+    base_ref: Option<&str>,
+    remote: &str,
+    token: Option<&str>,
+) -> Result<()> {
+    let Some(base) = base_ref.filter(|base| !base.is_empty()) else {
+        return Ok(());
+    };
+    let prefix = format!("refs/remotes/{remote}/");
+    let branch = base.strip_prefix(&prefix).unwrap_or(base);
+    let tracking_ref = format!("{prefix}{branch}");
+    if !git2::Reference::is_valid_name(&tracking_ref) {
+        return Ok(());
+    }
+    let repo = git2::Repository::open(path).map_err(crate::map_git_err)?;
+    match repo.find_reference(&tracking_ref) {
+        Ok(_) => {}
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+        Err(error) => return Err(crate::map_git_err(error)),
+    }
+    fetch(path, remote, branch, token)
+}
+
 /// Timeout-parameterised body of [`fetch`], factored out so tests can drive
 /// the deadline-kill path against a stub git binary without waiting 100s.
 pub(crate) fn fetch_with_timeout(
@@ -267,6 +297,63 @@ mod tests {
     use crate::auth::token_helper_config;
     use crate::testutil::{commit_file, init_repo};
     use git2::Repository;
+
+    #[test]
+    fn workspace_base_refreshes_selected_remote_without_changing_source() {
+        let upstream = init_repo("workspace-base-upstream");
+        commit_file(upstream.path(), "a.txt", "old\n");
+        let source = init_repo("workspace-base-source");
+        let source_path = source.path().join("clone");
+        let repo = Repository::clone(upstream.path().to_str().unwrap(), &source_path).unwrap();
+        repo.remote_rename("origin", "team").unwrap();
+        let branch = crate::status::current_branch(&repo);
+        let old = crate::refs::rev_parse(&source_path, "HEAD").unwrap();
+        std::fs::write(source_path.join("a.txt"), "local draft\n").unwrap();
+        for base in [branch.clone(), format!("refs/remotes/team/{branch}")] {
+            commit_file(upstream.path(), "a.txt", &base);
+            let tip = crate::refs::rev_parse(upstream.path(), "HEAD").unwrap();
+            refresh_workspace_base(&source_path, Some(&base), "team", None).unwrap();
+            assert_eq!(
+                crate::refs::rev_parse(&source_path, &format!("refs/remotes/team/{branch}"))
+                    .unwrap(),
+                tip
+            );
+            assert_eq!(crate::refs::rev_parse(&source_path, "HEAD").unwrap(), old);
+            assert_eq!(
+                std::fs::read_to_string(source_path.join("a.txt")).unwrap(),
+                "local draft\n"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_base_preserves_local_refs_and_fails_on_unreachable_remote_base() {
+        let source = init_repo("workspace-base-local");
+        commit_file(source.path(), "a.txt", "local\n");
+        let repo = Repository::open(source.path()).unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("local-only", &tip, false).unwrap();
+        repo.tag_lightweight("v1", tip.as_object(), false).unwrap();
+        repo.reference("refs/remotes/origin/main", tip.id(), false, "test")
+            .unwrap();
+        repo.remote("origin", source.path().join("missing").to_str().unwrap())
+            .unwrap();
+        let sha = tip.id().to_string();
+        for base in [
+            None,
+            Some(""),
+            Some("HEAD"),
+            Some("HEAD~0"),
+            Some("local-only"),
+            Some("refs/heads/local-only"),
+            Some("v1"),
+            Some(sha.as_str()),
+        ] {
+            refresh_workspace_base(source.path(), base, "origin", None).unwrap();
+        }
+        assert!(refresh_workspace_base(source.path(), Some("main"), "origin", None).is_err());
+        assert_eq!(repo.head().unwrap().target(), Some(tip.id()));
+    }
 
     /// Fetch a branch from a local bare remote and confirm the local
     /// remote-tracking ref now points at the remote commit.

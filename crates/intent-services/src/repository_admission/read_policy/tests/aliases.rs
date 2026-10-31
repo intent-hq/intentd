@@ -118,7 +118,7 @@ async fn ordinary_github_aliases_need_neither_gitlab_readiness_nor_qualified_pol
                 .unwrap();
             auth.service.as_ref().clone()
         } else {
-            crate::Services::new(git.store.clone())
+            crate::Services::new_isolated(git.store.clone())
         }
         .with_source_control(Arc::new(crate::tests::pr::StubForge::default()));
         assert!(service.gitlab_repository_settled_connection().is_err());

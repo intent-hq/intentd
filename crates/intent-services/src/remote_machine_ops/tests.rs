@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::{with_caller, AgentId, Caller, Error, ExecutorCredentialId, HostRole, PrincipalId};
+use intent_core::{
+    with_caller, AgentId, Caller, Error, ExecutorCredentialId, HostRole, PrincipalId,
+};
 use intent_store::Store;
 use serde_json::json;
 
@@ -61,11 +63,7 @@ async fn only_the_owner_reaches_remote_machines() {
     };
     // Without the remote feature the owner reaches the default port.
     for caller in [owner, Caller::Daemon] {
-        let result = with_caller(
-            caller,
-            f.services.remote_machines_op("list", json!({})),
-        )
-        .await;
+        let result = with_caller(caller, f.services.remote_machines_op("list", json!({}))).await;
         assert!(matches!(result, Err(Error::Unsupported(_))), "{result:?}");
     }
     let refused = [
@@ -112,7 +110,10 @@ async fn the_token_lives_in_the_secret_store_under_the_machine_account() {
         super::remote_machine_token_account("m-1"),
         "remoteMachines.m-1.token"
     );
-    assert_eq!(f.services.load_remote_machine_token("m-1").await.unwrap(), None);
+    assert_eq!(
+        f.services.load_remote_machine_token("m-1").await.unwrap(),
+        None
+    );
     f.services
         .store_remote_machine_token("m-1", "secret-token")
         .await
@@ -123,7 +124,10 @@ async fn the_token_lives_in_the_secret_store_under_the_machine_account() {
     );
     f.services.delete_remote_machine_token("m-1").await.unwrap();
     f.services.delete_remote_machine_token("m-1").await.unwrap();
-    assert_eq!(f.services.load_remote_machine_token("m-1").await.unwrap(), None);
+    assert_eq!(
+        f.services.load_remote_machine_token("m-1").await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -152,7 +156,10 @@ async fn remote_machine_changed_is_global_and_owner_only() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(batch[0].data, json!({ "machineId": "m-1", "removed": true }));
+    assert_eq!(
+        batch[0].data,
+        json!({ "machineId": "m-1", "removed": true })
+    );
     assert_eq!(batch[0].workspace_id.as_str(), "", "a global event");
     assert!(!intent_core::events::is_collaborator_event_type(
         intent_core::events::REMOTE_MACHINE_CHANGED

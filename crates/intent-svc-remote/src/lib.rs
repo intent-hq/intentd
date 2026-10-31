@@ -29,7 +29,8 @@
 //! it with [`register`] and hands it the tailcat binary with
 //! [`RemoteServicesExt::configure_remote_machines`]. It is experimental:
 //! with `experimental.remoteAgents` off, the `remoteMachines.*` mutations
-//! fail with `remote-agents-disabled` and no agent is placed remotely.
+//! fail with `remote-agents-disabled` and no agent is placed remotely. In
+//! node mode no connector ever starts.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,6 +106,15 @@ impl RemoteFeature {
     /// `not-found` for an unknown machine; when its token is missing from
     /// the secret store or its lease has ended.
     pub(crate) async fn node(&self, svc: &Services, machine_id: &str) -> Result<RemoteNode> {
+        // Node mode turns this daemon's orchestration off, including acting
+        // as a backend: no outbound connector, so no remote agent can reach
+        // its workspaces through forwarded calls. The inbound executor link
+        // is separate and stays available.
+        if svc.node_mode() {
+            return Err(Error::NodeMode(
+                "exposed machines are off: this daemon runs in node mode".into(),
+            ));
+        }
         if let Some(node) = self.running_node(machine_id) {
             return Ok(node);
         }
@@ -174,14 +184,5 @@ impl RemoteServicesExt for Services {
 
     fn remote_feature(&self) -> Option<&RemoteFeature> {
         self.feature::<RemoteFeature>()
-    }
-}
-
-/// Shut every connector down (daemon exit).
-pub fn shutdown_remote_machines(services: &Services) {
-    if let Some(feature) = services.remote_feature() {
-        for node in lock(&feature.nodes).drain().map(|(_, node)| node) {
-            node.shutdown();
-        }
     }
 }

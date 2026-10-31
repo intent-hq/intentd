@@ -1011,6 +1011,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
         # The queue builds one entry at a time and coverage-all on xl (~20 min)
         # sets its pace. check takes a free xl or bigmem slot after coverage-all
         # and coverage-e2e (it slows down least on 8 CPUs), else bursts at 16x.
+        # coverage-all takes only an xl slot (on an 8-CPU bigmem slot it took
+        # p50 27 / p90 39 min and held up the queue), else bursts at 16x.
         # coverage-changed stays on WarpBuild in the queue.
         fleet = [xl_slot(), xl_slot(), slot(), slot()]
         warp16 = ["warp-ubuntu-2404-x64-16x"]
@@ -1019,7 +1021,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         for xl_free, big_free, expected in (
                 (2, 2, {"coverage-all": XL, "coverage-e2e": XL, "check": BIG, "daemon-lifecycle-linux": BIG}),
                 (1, 2, {"coverage-all": XL, "coverage-e2e": BIG, "check": BIG, "daemon-lifecycle-linux": warp16}),
-                (0, 2, {"coverage-all": BIG, "coverage-e2e": BIG, "check": warp16, "daemon-lifecycle-linux": warp16}),
+                (0, 2, {"coverage-all": warp16, "coverage-e2e": BIG, "check": BIG, "daemon-lifecycle-linux": warp16}),
                 (2, 0, {"coverage-all": XL, "coverage-e2e": XL, "check": warp16, "daemon-lifecycle-linux": warp16}),
                 (0, 0, {"coverage-all": warp16, "coverage-e2e": warp16, "check": warp16, "daemon-lifecycle-linux": warp16})):
             with self.subTest(xl_free=xl_free, big_free=big_free):

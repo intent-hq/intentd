@@ -86,6 +86,39 @@ pub(crate) const MODELS_BACKGROUND_REFRESH_TIMEOUT: std::time::Duration =
 /// timeout starts only once the fetch actually runs.
 pub(crate) const MODELS_BACKGROUND_REFRESH_CONCURRENCY: usize = 2;
 
+/// Machine-readable cause of a failed catalog fetch, served as the
+/// provider-scoped `models.list` `warningKind` (PROTOCOL §5.30 "Warning
+/// kind"). Only causes a client can act on get a kind; every other failure
+/// carries none, so clients key presentation on this, never on `warning`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelWarningKind {
+    /// The provider CLI binary the catalog requires is not installed.
+    CliMissing,
+    /// A runtime the pinned adapter needs (Node.js with `npx`) is missing.
+    PrerequisiteMissing,
+}
+
+impl ModelWarningKind {
+    /// The wire value.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::CliMissing => "cli-missing",
+            Self::PrerequisiteMissing => "prerequisite-missing",
+        }
+    }
+}
+
+/// Add `warningKind` to a provider-scoped `models.list` response object.
+/// A no-op without a kind or without a `warning` (the kind only ever
+/// qualifies a warning).
+pub(crate) fn insert_warning_kind(out: &mut Value, kind: Option<ModelWarningKind>) {
+    let Some(kind) = kind else { return };
+    if let Some(obj) = out.as_object_mut().filter(|o| o.contains_key("warning")) {
+        obj.insert("warningKind".into(), Value::String(kind.as_wire().into()));
+    }
+}
+
 /// Outcome of one provider model probe: `models: None` means the probe failed
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
 /// `warning` carries a human-readable reason either way.
@@ -95,6 +128,8 @@ pub struct ModelFetchResult {
     pub models: Option<Vec<Value>>,
     /// Human-readable degradation reason, when applicable.
     pub warning: Option<String>,
+    /// Machine-readable cause of a failed fetch, when known.
+    pub warning_kind: Option<ModelWarningKind>,
 }
 
 /// One registered provider model source: how to probe it and which version
@@ -168,10 +203,12 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
             Some(models) => ModelFetchResult {
                 models: Some(models),
                 warning: None,
+                warning_kind: None,
             },
             None => ModelFetchResult {
                 models: None,
                 warning: Some("auggie CLI unavailable or returned no models".to_string()),
+                warning_kind: None,
             },
         }
     })
@@ -200,6 +237,7 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
             models: Some(Vec::new()),
             warning: source_gated_reason("cortex")
                 .map(|reason| format!("Cortex not available ({reason})")),
+            warning_kind: None,
         }
     })
 }
@@ -213,6 +251,7 @@ pub(crate) fn from_provider_fetch(
     ModelFetchResult {
         models: fetched.models,
         warning: fetched.warning,
+        warning_kind: fetched.warning_kind,
     }
 }
 
@@ -270,6 +309,7 @@ fn droid_fetch() -> BoxFuture<'static, ModelFetchResult> {
             return ModelFetchResult {
                 models: Some(Vec::new()),
                 warning: Some(format!("Droid not available ({reason})")),
+                warning_kind: None,
             };
         }
         from_provider_fetch(crate::provider_models::fetch_provider_models("droid").await)
@@ -388,6 +428,7 @@ struct NegativeEntry {
     version_key: String,
     failed_at_ms: u64,
     reason: String,
+    kind: Option<ModelWarningKind>,
 }
 
 /// A shared in-flight probe slot: the first caller initializes the cell (runs
@@ -722,12 +763,24 @@ struct InstalledSelection {
     /// under (`None` = Default). A saved edit never reuses the old command.
     profile_key: Option<String>,
     key: String,
-    command: Result<crate::acp_adapter::AcpAdapterCommand, String>,
+    command:
+        Result<crate::acp_adapter::AcpAdapterCommand, crate::provider_models::CatalogUnavailable>,
 }
 
 /// Whether a prior installed selection still describes the requested launch:
 /// observed after the request (or recently, when not forced) and prepared
 /// under exactly the same profile settings.
+/// Cache key for an installed-CLI catalog whose command could not be
+/// prepared. The failure's kind is part of it, so a changed cause (Node.js
+/// installed, CLI still missing) never reads the previous cause's negative
+/// entry — and its `warningKind` — for the rest of the 60s window.
+fn unavailable_key(provider: &str, kind: Option<ModelWarningKind>) -> String {
+    match kind {
+        Some(kind) => format!("installed-unavailable:{provider}:{}", kind.as_wire()),
+        None => format!("installed-unavailable:{provider}"),
+    }
+}
+
 fn reusable_selection(
     prior: &InstalledSelection,
     requested: tokio::time::Instant,
@@ -800,7 +853,9 @@ impl ModelCatalogCache {
                     .as_ref()
                     .ok()
                     .and_then(crate::acp_adapter::AcpAdapterCommand::installed_key)
-                    .unwrap_or_else(|| format!("installed-unavailable:{provider}"));
+                    .unwrap_or_else(|| {
+                        unavailable_key(provider, command.as_ref().err().and_then(|e| e.kind))
+                    });
                 let selection = InstalledSelection {
                     observed: tokio::time::Instant::now(),
                     profile_key: profile_key.clone(),
@@ -822,10 +877,11 @@ impl ModelCatalogCache {
             Box::pin(async move {
                 let command = match selection.command {
                     Ok(c) => c,
-                    Err(reason) => {
+                    Err(err) => {
                         return ModelFetchResult {
                             models: None,
-                            warning: Some(reason),
+                            warning: Some(err.reason),
+                            warning_kind: err.kind,
                         }
                     }
                 };
@@ -855,6 +911,7 @@ impl ModelCatalogCache {
                 models: None,
                 stale: false,
                 warning: Some(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned()),
+                warning_kind: None,
             };
         }
         result
@@ -971,7 +1028,12 @@ impl ModelCatalogCache {
     /// entry stamped ahead of `now` (system clock moved backwards) is not
     /// fresh, so a negative entry can never outlive its TTL through clock
     /// adjustments.
-    fn negative_reason(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<String> {
+    fn negative_reason(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<(String, Option<ModelWarningKind>)> {
         let negative = self.negative.lock().expect("model negative cache poisoned");
         let entry = negative.get(provider_id)?;
         if entry.version_key != version_key || now_ms < entry.failed_at_ms {
@@ -979,12 +1041,19 @@ impl ModelCatalogCache {
         }
         let age = now_ms - entry.failed_at_ms;
         (age < u64::try_from(MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX))
-            .then(|| entry.reason.clone())
+            .then(|| (entry.reason.clone(), entry.kind))
     }
 
     /// Record a probe failure so non-forced reads within
     /// [`MODELS_NEGATIVE_TTL`] do not re-spawn the adapter.
-    fn store_negative(&self, provider_id: &str, version_key: &str, reason: String, now_ms: u64) {
+    fn store_negative(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        reason: String,
+        kind: Option<ModelWarningKind>,
+        now_ms: u64,
+    ) {
         self.negative
             .lock()
             .expect("model negative cache poisoned")
@@ -994,6 +1063,7 @@ impl ModelCatalogCache {
                     version_key: version_key.to_string(),
                     failed_at_ms: now_ms,
                     reason,
+                    kind,
                 },
             );
     }
@@ -1061,6 +1131,29 @@ impl ModelCatalogCache {
         self.store(provider_id, version_key, models, now_ms);
     }
 
+    /// Test-only: record a fresh installed-CLI selection for `provider`
+    /// whose command could not be prepared, so the next read serves `err`
+    /// without discovering a real CLI.
+    #[cfg(test)]
+    pub(crate) fn test_install_selection_error(
+        &self,
+        provider: &str,
+        err: crate::provider_models::CatalogUnavailable,
+    ) {
+        self.installed
+            .lock()
+            .expect("installed catalog poisoned")
+            .insert(
+                provider.to_owned(),
+                InstalledSelection {
+                    observed: tokio::time::Instant::now(),
+                    profile_key: None,
+                    key: unavailable_key(provider, err.kind),
+                    command: Err(err),
+                },
+            );
+    }
+
     /// Test-only negative-window observation (see [`Self::test_store`]).
     #[cfg(test)]
     pub(crate) fn test_negative_reason(
@@ -1070,6 +1163,7 @@ impl ModelCatalogCache {
         now_ms: u64,
     ) -> Option<String> {
         self.negative_reason(provider_id, version_key, now_ms)
+            .map(|(reason, _)| reason)
     }
 
     /// Test-only in-flight observation: whether the `(provider_id,
@@ -1135,6 +1229,8 @@ pub struct ResolvedModels {
     pub stale: bool,
     /// Human-readable degradation reason, when applicable.
     pub warning: Option<String>,
+    /// Machine-readable cause of the failure behind `warning`, when known.
+    pub warning_kind: Option<ModelWarningKind>,
 }
 
 /// The single cache policy every provider goes through (PROTOCOL §5.30):
@@ -1189,10 +1285,11 @@ where
                 models: Some(models),
                 stale: false,
                 warning: None,
+                warning_kind: None,
             };
         }
-        if let Some(reason) = cache.negative_reason(provider_id, version_key, now_ms) {
-            return failure_fallback(cache, provider_id, version_key, reason);
+        if let Some((reason, kind)) = cache.negative_reason(provider_id, version_key, now_ms) {
+            return failure_fallback(cache, provider_id, version_key, reason, kind);
         }
         // Stale-while-revalidate: any last-good list under the current
         // version key is served immediately; the refresh runs detached.
@@ -1204,6 +1301,7 @@ where
                 warning: Some(format!(
                     "cached model list for '{provider_id}' is stale; refreshing in the background"
                 )),
+                warning_kind: None,
             };
         }
     }
@@ -1229,6 +1327,7 @@ where
             models: None,
             stale: false,
             warning: Some(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned()),
+            warning_kind: None,
         };
     }
     if let Some(models) = fetched.models {
@@ -1236,12 +1335,20 @@ where
             models: Some(models),
             stale: false,
             warning: fetched.warning,
+            // A kind only ever qualifies a failed fetch (§5.30).
+            warning_kind: None,
         }
     } else {
         let reason = fetched
             .warning
             .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-        failure_fallback(cache, provider_id, version_key, reason)
+        failure_fallback(
+            cache,
+            provider_id,
+            version_key,
+            reason,
+            fetched.warning_kind,
+        )
     }
 }
 
@@ -1277,7 +1384,13 @@ fn record_probe_outcome(
             .warning
             .clone()
             .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-        cache.store_negative(provider_id, version_key, reason, now_ms);
+        cache.store_negative(
+            provider_id,
+            version_key,
+            reason,
+            fetched.warning_kind,
+            now_ms,
+        );
     }
 }
 
@@ -1332,6 +1445,7 @@ fn spawn_background_refresh<F>(
                         "model discovery for '{provider_id}' timed out after {}s",
                         MODELS_BACKGROUND_REFRESH_TIMEOUT.as_secs()
                     )),
+                    warning_kind: None,
                 });
             record_probe_outcome(
                 &cache,
@@ -1355,17 +1469,20 @@ fn failure_fallback(
     provider_id: &str,
     version_key: &str,
     reason: String,
+    kind: Option<ModelWarningKind>,
 ) -> ResolvedModels {
     match cache.last_good(provider_id, version_key) {
         Some(models) => ResolvedModels {
             models: Some(models),
             stale: true,
             warning: Some(format!("{reason}; serving last known model list")),
+            warning_kind: kind,
         },
         None => ResolvedModels {
             models: None,
             stale: false,
             warning: Some(reason),
+            warning_kind: kind,
         },
     }
 }

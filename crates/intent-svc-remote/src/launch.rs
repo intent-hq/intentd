@@ -92,9 +92,10 @@ async fn machines_availability(svc: &Services) -> Result<PlatformAvailability> {
         let usable = !matches!(
             row.state,
             RemoteMachineState::Revoked | RemoteMachineState::UpdateRequired
-        ) && row.capabilities.as_ref().is_none_or(|caps| {
-            caps.capacity.running_agents < caps.capacity.agent_cap
-        });
+        ) && row
+            .capabilities
+            .as_ref()
+            .is_none_or(|caps| caps.capacity.running_agents < caps.capacity.agent_cap);
         if usable && !available.contains(&platform) {
             available.push(platform);
         }
@@ -128,7 +129,10 @@ async fn help_text(svc: &Services) -> Option<String> {
             } else {
                 row.state.as_str().to_owned()
             };
-            format!("\"{}\" (nodeId `{}`, {platform}, {state})", row.name, row.id)
+            format!(
+                "\"{}\" (nodeId `{}`, {platform}, {state})",
+                row.name, row.id
+            )
         })
         .collect();
     Some(format!(

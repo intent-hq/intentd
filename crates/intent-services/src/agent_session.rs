@@ -167,6 +167,21 @@ mod tests_meta;
 pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
     "session/prompt transport closed before output:";
 
+/// Prefix marking a prompt ended by a stale daemon cancel: it resolved
+/// `stopReason: "cancelled"` before any `session/update` or client request,
+/// on a turn-worker attempt that started shortly after the daemon wrote
+/// `session/cancel` for this agent (`AgentManager::stale_cancels`). Every daemon-initiated cancel aborts the
+/// turn worker (`interrupt_inner`) or drops the prompt future first
+/// (idle-timeout settle), so the worker never sees the cancel it asked for —
+/// but ACP cancels are notifications, and an adapter that applies one late
+/// (the Claude adapter processes cancels asynchronously) ends the NEXT
+/// prompt instead. [`Services::run_prompt_turn`] returns this for
+/// turn-worker turns, without the empty marker row or any terminal event, so
+/// the worker redrives the prompt once instead of leaving a silent idle
+/// agent.
+pub(crate) const PROMPT_SPURIOUS_CANCEL_PREFIX: &str =
+    "session/prompt cancelled before output without a daemon cancel:";
+
 /// Suffix appended to the wrapped idle-timeout error when the timed-out turn
 /// DID receive `session/update` traffic before going silent (`session/prompt
 /// failed: session/prompt idle timeout (…) [turn streamed output]`). ANY
@@ -3847,6 +3862,7 @@ impl Services {
             prompt,
             turn_id,
             None,
+            false,
         )
         .await
     }
@@ -3865,6 +3881,7 @@ impl Services {
         prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
+        redrive_spurious_cancel: bool,
     ) -> Result<StopReason> {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
@@ -4340,6 +4357,17 @@ impl Services {
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
             && blocks.is_empty();
+        // Stale-cancel classification (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        // `redrive_spurious_cancel` is set only when the turn worker took a
+        // fresh stale-cancel mark for this attempt. A client request
+        // (permission prompt, fs write, terminal) means the turn may have had
+        // side effects or a user decision, so it settles instead.
+        let spurious_cancel = redrive_spurious_cancel
+            && matches!(&result, Ok(StopReason::Cancelled))
+            && !closed
+            && !any_update_received
+            && conn.client_request_seq() == client_request_watermark
+            && blocks.is_empty();
         // Idle-timeout classification (warn-and-continue): the turn went the
         // whole idle window with no `session/update` traffic. The partial
         // transcript (if any) is flushed and the normal `agent:stream:end`
@@ -4359,6 +4387,7 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Proposal ids carried by this turn's lifted proposal-resource blocks
         // (both the registry/array path and the wrapped-echo path in
         // `record_tool` land as persisted blocks) — computed BEFORE the
@@ -4400,6 +4429,20 @@ impl Services {
                 )
                 .await;
         }
+        if spurious_cancel {
+            tracing::warn!(
+                agent = %agent_id,
+                "prompt resolved cancelled before any output right after a daemon cancel — handing it back to the worker for one redrive"
+            );
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "spurious_cancel",
+                Some(turn_started.elapsed()),
+                block_count,
+                "redrive",
+            );
+        }
         // Record the silent tail for `agent.diagnostics`
         // (intent-hq/monorepo#2669). A pre-output transport failure is
         // excluded: the attempt is invisible (the worker may silently
@@ -4412,6 +4455,7 @@ impl Services {
         // insert leaves one stale u64, which the diagnostics read (it
         // iterates live sessions) never serves.
         if !pre_output_transport_failure
+            && !spurious_cancel
             && self.store.get_agent_session_summary(agent_id).await.is_ok()
         {
             self.record_turn_silent_tail(agent_id, silent_tail_ms);
@@ -4509,7 +4553,7 @@ impl Services {
             .ok()
             .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
             .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
-        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
+        if !spurious_cancel && (!blocks.is_empty() || abnormal_finish_reason.is_some()) {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
@@ -4592,6 +4636,12 @@ impl Services {
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
+        // Persisted secret-request cards (§5.56) put their requests in front
+        // of the user: surface them for the needs_attention derivation.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
+        }
         // Stored-on-write pending-proposals recording (PROTOCOL §5.5): a
         // proposal-bearing tail merges its `{ proposalId, messageId }`
         // entries into the session's ordered pending set (dedupe by id,
@@ -4628,8 +4678,12 @@ impl Services {
         // its predecessor via [`TurnBookkeeping`]) so a delayed task from
         // turn N can neither skew turn N+1's stats delta nor overwrite its
         // newer cumulative snapshot.
-        let run_completed = result.is_ok();
-        if turn_usage.is_some() || turn_cost.is_some() || run_completed {
+        // A stale-cancel attempt is not a completed run (the redrive is), but
+        // any usage the provider reported for it is still recorded —
+        // including a `_meta`-only bill (grok), which the task below resolves
+        // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
+        let run_completed = result.is_ok() && !spurious_cancel;
+        if turn_usage.is_some() || turn_cost.is_some() || turn_meta.is_some() || run_completed {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
@@ -4701,6 +4755,14 @@ impl Services {
                     chain.insert(agent_id.clone(), handle);
                 }
             }
+        }
+        // Stale daemon cancel: nothing was persisted and no terminal event
+        // fires — the turn worker redrives the prompt and that attempt closes
+        // the turn (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        if spurious_cancel {
+            return Err(Error::Internal(format!(
+                "{PROMPT_SPURIOUS_CANCEL_PREFIX} stopReason cancelled"
+            )));
         }
         // Post-output transient fetch failure (intent-hq/intent#5419): the
         // turn is about to fail terminally exactly as today (Error status,
@@ -5569,6 +5631,7 @@ impl Services {
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Same pre-append proposal-id scan as the prompt-turn persist
         // (PROTOCOL §5.5, pending proposals).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
@@ -5647,6 +5710,11 @@ impl Services {
         // question-bearing tail moves the pending-questions derivation.
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+        // Same §5.56 surfacing as the prompt-turn persist.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
         }
         // Same stored-on-write pending-proposals recording as the prompt-turn
         // persist (PROTOCOL §5.5).

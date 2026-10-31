@@ -252,7 +252,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = intent_app::compose(Services::new(store.clone()))
+    let mut services = intent_app::compose(Services::new_isolated(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -8628,7 +8628,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -8763,7 +8763,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -12808,6 +12808,71 @@ async fn wss_agent_complete_once_round_trip() {
     assert_eq!(resp["id"], 41);
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["result"]["text"], "fix-login-flow");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn wss_disabling_default_provider_blocks_quick_actions_until_reenabled() {
+    let (_dir, bin) = fake_auggie_script("disable-default", "printf 'recovered\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("sonnet4.5"));
+    srv.set_setting(
+        "model.providerDefaults",
+        serde_json::json!({ "auggie": "sonnet4.5" }),
+    );
+    srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":[{"path":"providers.enabled","value":{"auggie":false}}]}}"#,
+    ).await;
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert!(
+        resp.get("error").is_none(),
+        "default and saved models must not veto disable: {resp}"
+    );
+
+    for method in ["agent.completeOnce", "agent.enhancePrompt"] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": method,
+            "params": { "prompt": "hello", "mode": "layout" }
+        })
+        .to_string();
+        let resp = wss_call(srv.port, srv.cfg.clone(), &request).await;
+        assert_eq!(resp["id"], 2);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["result"]["available"], false, "{method}: {resp}");
+        let reason = resp["result"]["reason"].as_str().unwrap();
+        assert!(reason.contains("is not enabled"), "{resp}");
+        assert!(reason.contains("Settings > Providers"), "{resp}");
+    }
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"settings.get","params":{"path":"model.defaultProvider"}}"#,
+    ).await;
+    assert_eq!(
+        resp["result"]["value"], "auggie",
+        "disable preserves the saved choice: {resp}"
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"settings.update","params":{"changes":[{"path":"providers.enabled","value":{"auggie":true}}]}}"#,
+    ).await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.completeOnce","params":{"prompt":"hello"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["text"], "recovered");
     srv.ws.stop().await;
 }
 
@@ -22722,7 +22787,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)

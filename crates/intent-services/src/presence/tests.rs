@@ -156,7 +156,7 @@ async fn member_services(
         .add_workspace_member(&ws, &principal.id, WorkspaceRole::Collaborator)
         .await
         .expect("member");
-    let services = crate::Services::new(store.clone())
+    let services = crate::Services::new_isolated(store.clone())
         .with_workspaces_root(root.path().to_path_buf())
         .with_event_bus(crate::events::EventBus::new(store.clone()));
     let caller = Caller::Wire {

@@ -158,7 +158,7 @@ impl Harness {
             };
             let created = intent_core::with_caller(
                 creator,
-                Services::new(store.clone())
+                Services::new_isolated(store.clone())
                     .with_workspaces_root(root_dir.path().to_path_buf())
                     .create_workspace(
                         intent_core::WorkspaceCreate {
@@ -214,8 +214,9 @@ impl Harness {
                 ("providers.paths".into(), json!({"auggie":"/bin/sh"})),
             ])
             .unwrap();
-        let mut services =
-            crate::test_support::fake_runtime::FakeRuntime::install(Services::new(store.clone()));
+        let mut services = crate::test_support::fake_runtime::FakeRuntime::install(
+            Services::new_isolated(store.clone()),
+        );
         if let Some(root) = dirs.get(1) {
             services = services.with_workspaces_root(root.path().to_path_buf());
         }
@@ -896,7 +897,7 @@ async fn restart_retains_stop_credential_and_permission_but_never_execution() {
         .unwrap()
         .clone();
     let restarted =
-        Services::new(h.services.store.clone()).with_reverse_dispatch(h.executor.clone());
+        Services::new_isolated(h.services.store.clone()).with_reverse_dispatch(h.executor.clone());
     intent_core::with_caller(Caller::Daemon, restarted.desktop_recover())
         .await
         .unwrap();

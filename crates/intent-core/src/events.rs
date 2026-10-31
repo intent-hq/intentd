@@ -848,6 +848,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "archived",
             "archivedAt",
             "attention",
+            "autoArchiveDisabled",
             "autoCommitEnabled",
             "autoUnarchive",
             "baseCommitSha",

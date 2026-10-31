@@ -359,6 +359,10 @@ router search.fileNames
 router search.inFiles
 router search.messages
 router search.notes
+router secret.dismiss
+router secret.forget
+router secret.list
+router secret.provide
 router sentry.assignIssue
 router sentry.authStatus
 router sentry.getIssue

@@ -388,7 +388,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
     store.insert_workspace(&ws).await.expect("seed workspace");
 
     let services = Arc::new(
-        Services::new(store.clone())
+        Services::new_isolated(store.clone())
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_source_control(Arc::new(forge)),

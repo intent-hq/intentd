@@ -14,6 +14,7 @@ mod e2e_wss_script_monitors;
 mod e2e_wss_script_persistence;
 mod e2e_wss_script_restarting;
 mod e2e_wss_script_run_cancellation;
+mod e2e_wss_secret_requests;
 mod e2e_wss_self_send_rejected;
 mod e2e_wss_sentry_pagination;
 mod e2e_wss_serve_resume_all;

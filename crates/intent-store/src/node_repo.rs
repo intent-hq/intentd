@@ -166,13 +166,15 @@ impl Store {
             }
             Some(head) if head == record.head_id => {
                 end_live_leases(&mut tx, &record.id).await?;
-                sqlx::query("UPDATE execution_node SET node_identity = ?, record_json = ? WHERE id = ?")
-                    .bind(&record.node_identity)
-                    .bind(encode(record)?)
-                    .bind(&record.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db)?;
+                sqlx::query(
+                    "UPDATE execution_node SET node_identity = ?, record_json = ? WHERE id = ?",
+                )
+                .bind(&record.node_identity)
+                .bind(encode(record)?)
+                .bind(&record.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
             }
             Some(_) => return Err(invalid("node is registered by another head")),
         }
@@ -194,14 +196,13 @@ impl Store {
     /// Returns database or decoding errors.
     pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
-        let owned: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM execution_node WHERE id = ? AND head_id = ?",
-        )
-        .bind(node_id)
-        .bind(head_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?;
+        let owned: Option<String> =
+            sqlx::query_scalar("SELECT id FROM execution_node WHERE id = ? AND head_id = ?")
+                .bind(node_id)
+                .bind(head_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
         if owned.is_none() {
             return Ok(0);
         }
@@ -283,7 +284,6 @@ fn validate_enrollment(record: &NodeRecord, initial: &NodeLease) -> Result<()> {
 }
 
 impl Store {
-
     /// Enumerate durable registrations for one head installation on restart.
     /// These private records must be projected before public inventory delivery.
     /// # Errors

@@ -1640,7 +1640,7 @@ mod tests {
         let forge = std::sync::Arc::new(crate::tests::pr::StubForge::with_get_user_gate(
             gate.clone(),
         ));
-        let services = Services::new(store.clone()).with_source_control(forge.clone());
+        let services = Services::new_isolated(store.clone()).with_source_control(forge.clone());
         let (services, primary, ws) = (&services, &primary, &ws);
         let list = |what: &'static str| async move {
             tokio::time::timeout(

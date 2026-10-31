@@ -1959,7 +1959,7 @@ mod tests {
             .transfer_import_rows(&transformed.rows)
             .await
             .unwrap();
-        let service = crate::register(Services::new(target));
+        let service = crate::register(Services::new_isolated(target));
         let caller = Caller::Wire {
             principal_id: local.id.clone(),
             host_role: HostRole::Owner,
@@ -2499,7 +2499,7 @@ mod tests {
         let db_dir = intent_services::feature_api::test_support::test_tempdir("import-test-");
         let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        let svc = crate::register(Services::new(store))
+        let svc = crate::register(Services::new_isolated(store))
             .with_workspaces_root(workspaces_root.to_path_buf())
             .with_assets_root(assets_root.to_path_buf());
         (db_dir, svc)
@@ -3252,6 +3252,7 @@ mod tests {
                                 intent_services::feature_api::model_catalog::ModelFetchResult {
                                     models: None,
                                     warning: Some("temporary authentication probe failure".into()),
+                                    warning_kind: None,
                                 }
                             })
                         },

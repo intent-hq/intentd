@@ -223,7 +223,10 @@ async fn admission_matches_the_machines_platform_and_capacity() {
 
     let help = f.port().placement_help(&f.services).await.unwrap();
     assert!(help.contains("\"Test machine\""), "{help}");
-    assert!(help.contains(&format!("nodeId `{id}`, macos/aarch64, connected")), "{help}");
+    assert!(
+        help.contains(&format!("nodeId `{id}`, macos/aarch64, connected")),
+        "{help}"
+    );
     assert!(
         help.contains("uncommitted changes are not carried"),
         "{help}"
@@ -500,8 +503,7 @@ async fn git_sessions_are_confined_to_the_leases_agents() {
     let unplaced = f.agent(&view).await;
     let access = crate::git::HeadGitAccess::new(f.node.shared());
     let binding = link.hello.binding.clone();
-    let remote =
-        |agent: &AgentId| AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
+    let remote = |agent: &AgentId| AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
 
     let path = access.repository(&binding, &remote(&agent)).await.unwrap();
     assert_eq!(path, f.repo.path());

@@ -15,8 +15,7 @@ use intent_acp::AcpError;
 use intent_core::agent_runtime::AgentRuntime;
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
-    JournalBody, JournalRecord, LinkFrame, LinkHello, LinkOutcome, LinkWelcome,
-    MachineCapabilities,
+    JournalBody, JournalRecord, LinkFrame, LinkHello, LinkOutcome, LinkWelcome, MachineCapabilities,
 };
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
@@ -435,8 +434,7 @@ impl Backend {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let config = tempfile::TempDir::new().unwrap();
-        let registry =
-            Arc::new(SettingsRegistry::load(config.path().join("config.toml")).unwrap());
+        let registry = Arc::new(SettingsRegistry::load(config.path().join("config.toml")).unwrap());
         registry
             .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
             .unwrap();
@@ -470,7 +468,11 @@ impl Backend {
     }
 
     async fn call(&self, method: &'static str, params: Value) -> intent_core::Result<Value> {
-        with_caller(Caller::Daemon, self.services.remote_machines(method, params)).await
+        with_caller(
+            Caller::Daemon,
+            self.services.remote_machines(method, params),
+        )
+        .await
     }
 
     /// Expose `machine` (consuming the probe's link) and return its

@@ -592,6 +592,14 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
         "stamped on the input in `WorkspaceApi::agent_wake_or_create`; the wake row, parked queue entry and worker options carry it",
     ),
     (
+        "secret.dismiss",
+        "the declined notice is a user-origin row delivered through `WorkspaceApi::agent_send_message`, which stamps it",
+    ),
+    (
+        "secret.provide",
+        "the provided notice (name only, never the value) is a user-origin row delivered through `WorkspaceApi::agent_send_message`, which stamps it",
+    ),
+    (
         "workspace.create",
         "the `initialAgent.prompt` kickoff is the creator's first user row, stamped in `WorkspaceApi::create_workspace` before the runtime / store-only delivery",
     ),
@@ -944,6 +952,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "search.inFiles",
     "search.messages",
     "search.notes",
+    "secret.forget",
+    "secret.list",
     "sentry.assignIssue",
     "sentry.authStatus",
     "sentry.getIssue",
@@ -1174,9 +1184,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        12,
-        "the user-origin entry points including explicit queue batching and \
-         workspace.create's initialAgent kickoff; a change here needs \
+        14,
+        "the user-origin entry points including explicit queue batching, \
+         workspace.create's initialAgent kickoff and the §5.56 secret-request \
+         notices; a change here needs \
          attribution coverage and docs/protocol/ updated alongside"
     );
 
@@ -1310,7 +1321,7 @@ fn extract_subscription_channel_methods() -> HashSet<String> {
 
 /// Every method a client can put on the wire: router arms, fast paths, and
 /// the subscription channels.
-fn client_callable_universe() -> BTreeSet<String> {
+pub(super) fn client_callable_universe() -> BTreeSet<String> {
     ROUTER_METHODS
         .iter()
         .chain(FASTPATH_METHODS.iter())

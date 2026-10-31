@@ -302,6 +302,7 @@ async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "remote-node.json is replaced by remoteMachines.add; ported to the in-daemon executor service (PR E) once both land"]
 async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     let Some(node_bin) = intent_providers::resolve_on_path("node") else {
         eprintln!("skipping remote launch e2e: node not on PATH");

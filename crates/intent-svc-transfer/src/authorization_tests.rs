@@ -36,7 +36,7 @@ async fn fixture(tmp: &TempDb) -> (Services, PrincipalId, PrincipalId) {
         .unwrap();
     let root = tmp.path.parent().unwrap().join("workspaces");
     (
-        crate::register(Services::new(store)).with_workspaces_root(root),
+        crate::register(Services::new_isolated(store)).with_workspaces_root(root),
         owner.id,
         member.id,
     )
@@ -78,7 +78,12 @@ async fn conversation_fixture() -> (TempDb, Services, WorkspaceId, Vec<Principal
         }
         people.push(p);
     }
-    (tmp, crate::register(Services::new(store)), ws, people)
+    (
+        tmp,
+        crate::register(Services::new_isolated(store)),
+        ws,
+        people,
+    )
 }
 
 fn recipients(ids: &[PrincipalId]) -> DiscussionTarget {

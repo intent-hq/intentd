@@ -121,7 +121,7 @@ async fn fixture() -> Fixture {
         })
         .await
         .expect("insert workspace");
-    let services = intent_app::compose(Services::new(store))
+    let services = intent_app::compose(Services::new_isolated(store))
         .with_workspaces_root(dir.path().join("workspaces"))
         .with_assets_root(dir.path().join("assets"));
     Fixture { services, ws, dir }
@@ -333,6 +333,22 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             json!({ "workspaceId": ws, "monitorId": "m1" }),
         ),
         ("principal.list", json!({})),
+        (
+            "remoteMachines.add",
+            json!({
+                "machineId": "m-1",
+                "name": "Machine",
+                "hosts": ["127.0.0.1"],
+                "port": 9,
+                "fingerprint": "ab".repeat(32),
+                "credentialId": "c-1",
+                "token": "t".repeat(64),
+            }),
+        ),
+        ("remoteMachines.backendInfo", json!({})),
+        ("remoteMachines.list", json!({})),
+        ("remoteMachines.refresh", json!({ "machineId": "m-1" })),
+        ("remoteMachines.remove", json!({ "machineId": "m-1" })),
         ("repo.list", json!({})),
         ("repo.remove", json!({ "path": dir })),
         (

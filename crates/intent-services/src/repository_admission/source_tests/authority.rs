@@ -123,7 +123,7 @@ pub(super) fn input(f: &Fixture) -> RepositorySourceInput {
 #[tokio::test]
 async fn explicit_local_source_uses_original_caller_and_retires_escaped_admission() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let original = owner(&f, false).await;
     let escaped = with_caller(
         Caller::Daemon,
@@ -156,7 +156,7 @@ async fn explicit_local_source_uses_original_caller_and_retires_escaped_admissio
 async fn original_personal_hash_never_uses_a_new_or_foreign_credential() {
     for mode in 0..3 {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let captured = owner(&f, true).await;
         match mode {
             0 => {
@@ -201,7 +201,7 @@ async fn original_personal_hash_never_uses_a_new_or_foreign_credential() {
 async fn guest_source_preserves_git_permission_without_create_or_forge_credential_authority() {
     let f = Fixture::new().await;
     let person = guest(&f).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         wire(&person.id, HostRole::Guest, Some(HASH)).await,
@@ -251,7 +251,7 @@ async fn direct_grant_remove_readd_retires_old_operation_but_fresh_request_can_e
     let f = &owned;
     let owned_person = guest(f).await;
     let person = &owned_person;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         wire(&person.id, HostRole::Guest, Some(HASH)).await,
@@ -304,7 +304,7 @@ async fn role_or_credential_aba_is_not_hidden_by_restoring_identical_current_val
                 .await
                 .unwrap();
         }
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         with_repository_source(
             &services,
             wire(&person.id, HostRole::Guest, Some(HASH)).await,
@@ -357,7 +357,7 @@ async fn role_or_credential_aba_is_not_hidden_by_restoring_identical_current_val
 async fn changed_primary_or_deleted_original_principal_never_borrows_current_owner() {
     for remove in [false, true] {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let original = owner(&f, true).await;
         let primary = f.store.get_primary_principal().await.unwrap();
         with_repository_source(
@@ -399,7 +399,7 @@ async fn changed_primary_or_deleted_original_principal_never_borrows_current_own
 async fn queued_permission_aba_is_checked_after_the_real_worktree_lock_wait() {
     let f = Fixture::new().await;
     let person = guest(&f).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let locks = services.worktree_locks.clone();
     let path = f.path.clone();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -444,7 +444,7 @@ async fn queued_permission_aba_is_checked_after_the_real_worktree_lock_wait() {
 async fn workspace_recreation_and_live_git_ref_changes_stop_the_bound_source() {
     for recreate in [false, true] {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         with_repository_source(
             &services,
             owner(&f, false).await,
@@ -474,7 +474,7 @@ async fn workspace_recreation_and_live_git_ref_changes_stop_the_bound_source() {
 #[tokio::test]
 async fn no_op_credential_touch_and_profile_update_preserve_current_source() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let original = owner(&f, true).await;
     with_repository_source(
         &services,
@@ -504,7 +504,7 @@ async fn no_op_credential_touch_and_profile_update_preserve_current_source() {
 async fn completed_commit_survives_real_revocation_without_claiming_publication() {
     let f = Fixture::new().await;
     let person = guest(&f).await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(&services,wire(&person.id,HostRole::Guest,Some(HASH)).await,"commit-then-push".into(),
         vec![NativeReviewStage::Commit,NativeReviewStage::Push],input(&f),RepositoryRetirement::default(),|admission|async move {
             let stamp=begin_repository_stage(revalidate_repository_stage(&admission,NativeReviewStage::Commit).await.unwrap()).unwrap();
@@ -524,7 +524,7 @@ async fn completed_commit_survives_real_revocation_without_claiming_publication(
 #[tokio::test]
 async fn closed_store_is_local_unavailable_without_a_provider_auth_failure() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         owner(&f, false).await,
@@ -574,7 +574,7 @@ pub(super) async fn agent(f: &Fixture) -> AgentId {
 async fn internal_entries_use_workspace_only_facts_and_their_own_lifetime() {
     for is_agent in [false, true] {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let caller = if is_agent {
             Caller::Agent {
                 agent_id: agent(&f).await,
@@ -633,7 +633,7 @@ async fn internal_entries_use_workspace_only_facts_and_their_own_lifetime() {
 #[tokio::test]
 async fn missing_agent_or_human_identity_cannot_take_a_different_source_branch() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     for original in [
         internal(Caller::Agent {
             agent_id: AgentId::new(),
@@ -661,7 +661,7 @@ async fn missing_agent_or_human_identity_cannot_take_a_different_source_branch()
 async fn agent_retirement_pending_delete_and_replacement_stop_the_original_request() {
     for change in 0..4 {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let id = agent(&f).await;
         let original = internal(Caller::Agent {
             agent_id: id.clone(),
@@ -691,7 +691,7 @@ async fn agent_retirement_pending_delete_and_replacement_stop_the_original_reque
 #[tokio::test]
 async fn internal_workspace_recreation_is_detected_without_a_human_generation() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         internal(Caller::Daemon).await,
@@ -715,7 +715,7 @@ async fn internal_workspace_recreation_is_detected_without_a_human_generation() 
 
 async fn assert_observed_root_denial_is_permanent(pending_delete: bool) {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     let fixture = &f;
     let service = &services;
     with_repository_source(
@@ -817,7 +817,7 @@ async fn observed_pending_delete_denial_retires_same_request_and_checked_handle_
 async fn observed_detached_ref_mismatch_retires_same_request_after_restore() {
     let owned = Fixture::new().await;
     let f = &owned;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         owner(f, false).await,
@@ -870,7 +870,7 @@ async fn observed_detached_ref_mismatch_retires_same_request_after_restore() {
 async fn retryable_root_and_git_read_unavailability_preserves_same_request_after_recovery() {
     for missing_path in [false, true] {
         let f = Fixture::new().await;
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let retirement = RepositoryRetirement::default();
         with_repository_source(
             &services,
@@ -914,7 +914,7 @@ async fn retryable_root_and_git_read_unavailability_preserves_same_request_after
 #[tokio::test]
 async fn completed_commit_survives_observed_archive_denial_without_publication() {
     let f = Fixture::new().await;
-    let services = Services::new(f.store.clone());
+    let services = Services::new_isolated(f.store.clone());
     with_repository_source(
         &services,
         owner(&f, false).await,

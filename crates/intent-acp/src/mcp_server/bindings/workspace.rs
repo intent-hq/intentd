@@ -616,7 +616,10 @@ async fn apply_proposal(
     let mut input: WorkspaceCreate = serde_json::from_value(Value::Object(params))
         .map_err(|e| format!("invalid proposal params: {e}"))?;
     // Lets clients open the new workspace as a background tab beside the
-    // conversation that proposed it (`workspace:created` `data.origin`).
+    // conversation that proposed it (`workspace:created` `data.origin`). A
+    // wire `origin` carried in the proposal params never names another card:
+    // this binding resolves its own proposal below.
+    input.origin_request = None;
     input.origin = Some(WorkspaceCreateOrigin::Proposal {
         proposal_id: proposal_id.clone(),
         agent_id: caller.clone(),

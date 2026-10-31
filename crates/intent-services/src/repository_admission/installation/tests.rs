@@ -34,7 +34,7 @@ impl Fixture {
         store.insert_agent_session(&row).await.unwrap();
         Self {
             dir,
-            services: Services::new(store),
+            services: Services::new_isolated(store),
             workspace,
             agent,
         }
@@ -96,7 +96,7 @@ async fn construction_is_uninstalled_and_clones_install_the_same_original_regist
 #[tokio::test]
 async fn competing_services_instances_cannot_replace_the_winning_observer() {
     let f = Fixture::new().await;
-    let other = Services::new(f.services.store().clone());
+    let other = Services::new_isolated(f.services.store().clone());
     let (first, second) = tokio::join!(
         f.services.repository_lifecycle_registry(),
         other.repository_lifecycle_registry(),
@@ -187,7 +187,7 @@ async fn unknown_preinstallation_write_survives_reopen_and_keeps_local_reads_ava
     } = f;
     drop(services);
     let reopened = Store::open(&dir.path().join("store.db")).await.unwrap();
-    let replacement = Services::new(reopened);
+    let replacement = Services::new_isolated(reopened);
     assert!(matches!(
         replacement.repository_lifecycle_registry().await,
         Err(AdmissionError::Unavailable)
@@ -212,7 +212,7 @@ async fn repeated_installation_and_reopen_cannot_settle_an_unknown_original_writ
     let repeated = f.services.repository_lifecycle_registry().await.unwrap();
     assert!(Arc::ptr_eq(&original, &repeated));
     f.assert_creation_unavailable(&repeated);
-    let replacement = Services::new(reopened);
+    let replacement = Services::new_isolated(reopened);
     assert!(matches!(
         replacement.repository_lifecycle_registry().await,
         Err(AdmissionError::Unavailable)
@@ -661,7 +661,7 @@ mod read_owner {
     async fn independent_services_registry_and_directory_cannot_replace_original_anchor() {
         let f = Fixture::new().await;
         let owner = confirmed(&f).await;
-        let other = Services::new(f.services.store().clone());
+        let other = Services::new_isolated(f.services.store().clone());
         assert!(!Arc::ptr_eq(
             &f.services.repository_lifecycle_registry,
             &other.repository_lifecycle_registry

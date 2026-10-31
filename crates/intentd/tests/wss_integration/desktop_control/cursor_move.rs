@@ -101,12 +101,26 @@ async fn wss_desktop_move_binding_preserves_action_and_refuses_invalid_or_revoke
         .iter()
         .filter(|p| p["operation"] == "prepareCommand")
         .count();
+    // Non-finite coordinates never reach the binding: the shared host()
+    // bridge refuses them because JSON would turn them into null.
+    for (args, path) in [
+        ("{x:0,y:NaN,layoutId:'l'}", "desktop.move: args.y is NaN"),
+        (
+            "{x:Infinity,y:0,layoutId:'l'}",
+            "desktop.move: args.x is Infinity",
+        ),
+    ] {
+        let request = tool(&format!("return await ws.desktop.move({args});"));
+        let response = drive(&mut socket, bridge.handle_message(&request), &mut calls)
+            .await
+            .unwrap();
+        assert_tool_error(&response, path);
+        assert_tool_error(&response, "JSON cannot represent");
+    }
     for args in [
         "{}",
         "{x:0,y:0}",
         "{x:-1,y:0,layoutId:'l'}",
-        "{x:0,y:NaN,layoutId:'l'}",
-        "{x:Infinity,y:0,layoutId:'l'}",
         "{x:0,y:'1',layoutId:'l'}",
         "{x:0,y:0,layoutId:'l',button:'left'}",
         "{x:0,y:0,layoutId:'l',clickCount:1}",

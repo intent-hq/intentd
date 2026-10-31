@@ -525,7 +525,7 @@ mod unit_tests {
     use crate::{EventBus, Services};
 
     async fn services(tmp: &TempDb) -> Services {
-        Services::new(Store::open(&tmp.path).await.expect("open store"))
+        Services::new_isolated(Store::open(&tmp.path).await.expect("open store"))
     }
 
     #[tokio::test]
@@ -540,7 +540,7 @@ mod unit_tests {
 
         let roots = test_tempdir("feature-api-");
         let store = Store::open(&tmp.path).await.expect("open store");
-        let configured = Services::new(store.clone())
+        let configured = Services::new_isolated(store.clone())
             .with_assets_root(roots.path().join("assets"))
             .with_workspaces_root(roots.path().join("workspaces"))
             .with_event_bus(EventBus::new(store));

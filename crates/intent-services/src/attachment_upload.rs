@@ -1197,7 +1197,7 @@ mod tests {
         let mut row = crate::tests::workspace(ws);
         row.worktree_path = Some(checkout.to_string_lossy().into_owned());
         store.insert_workspace(&row).await.expect("seed workspace");
-        let svc = Services::new(store).with_workspaces_root(ws_root.to_path_buf());
+        let svc = Services::new_isolated(store).with_workspaces_root(ws_root.to_path_buf());
         (db_dir, svc)
     }
 
