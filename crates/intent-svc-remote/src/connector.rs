@@ -80,6 +80,31 @@ pub(crate) struct Tuning {
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: runs at bind, after the queued stops are sent and before
+    /// the link is published.
+    #[cfg(test)]
+    pub before_publish: BeforePublish,
+}
+
+/// A test hook run with the connector's state just before a bound link is
+/// published.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct BeforePublish(pub Option<PublishHook>);
+
+/// See [`BeforePublish`].
+#[cfg(test)]
+pub(crate) type PublishHook = Arc<dyn Fn(&Arc<Shared>) + Send + Sync>;
+
+#[cfg(test)]
+impl std::fmt::Debug for BeforePublish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "BeforePublish(set)"
+        } else {
+            "BeforePublish(none)"
+        })
+    }
 }
 
 impl Default for Tuning {
@@ -99,6 +124,8 @@ impl Default for Tuning {
             connect: ConnectTuning::default(),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
+            #[cfg(test)]
+            before_publish: BeforePublish::default(),
         }
     }
 }
@@ -261,24 +288,35 @@ impl Shared {
         }
     }
 
-    /// Send every queued stop on `link`, which nothing else uses yet, so
-    /// they precede any launch or prompt on it; then resend each until it is
-    /// acknowledged.
-    async fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
-        let queued: Vec<(AgentId, StopId)> = lock(&self.stops)
+    /// The queued stops, by agent.
+    fn queued_stops(&self) -> Vec<(AgentId, StopId)> {
+        lock(&self.stops)
             .iter()
             .map(|(agent_id, stop_id)| (agent_id.clone(), *stop_id))
-            .collect();
-        for (agent_id, stop_id) in &queued {
-            let frame = LinkFrame::Stop {
-                agent_id: agent_id.clone(),
-                stop_id: *stop_id,
-            };
-            if link.send(&frame).await.is_err() {
+            .collect()
+    }
+
+    /// Send every queued stop on `link`, which nothing else uses yet, so
+    /// they precede any launch or prompt on it.
+    async fn send_queued(&self, link: &NodeLink) {
+        for (agent_id, stop_id) in self.queued_stops() {
+            if link
+                .send(&LinkFrame::Stop { agent_id, stop_id })
+                .await
+                .is_err()
+            {
                 return;
             }
         }
-        for (agent_id, stop_id) in queued {
+    }
+
+    /// Resend every queued stop on the just-published `link` until each is
+    /// acknowledged. Taken after publication, the snapshot includes any stop
+    /// queued while the bind was in progress (whose `request_stop` saw no
+    /// link); a stop queued later starts its own resender. One link resends
+    /// each stop once.
+    fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
+        for (agent_id, stop_id) in self.queued_stops() {
             let shared = self.clone();
             let link = link.clone();
             // caller-binding: allow — resends one queued stop on its link until acknowledged
@@ -836,8 +874,13 @@ async fn run(
         // longer claims, then send every queued stop, so they precede any
         // launch or prompt on this link.
         claim(&shared, &welcome).await;
-        shared.resend_queued(&link).await;
+        shared.send_queued(&link).await;
+        #[cfg(test)]
+        if let Some(hook) = &shared.tuning.before_publish.0 {
+            hook(&shared);
+        }
         shared.link.send_replace(Some(link.clone()));
+        shared.resend_queued(&link);
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));
         }

@@ -66,6 +66,7 @@ fn tuning() -> Tuning {
             total: wait(),
         },
         fail_ack_writes: Arc::default(),
+        before_publish: crate::connector::BeforePublish::default(),
     }
 }
 
@@ -1443,6 +1444,28 @@ mod stop_acks {
         })
         .await;
         assert!(late.is_err(), "the confirmed stop is not sent again");
+        node.shutdown();
+    }
+
+    /// Review of intentd#2872: a stop queued while a bind is between
+    /// sending the queued stops and publishing the link must still go out
+    /// on that link, without a reconnect.
+    #[tokio::test]
+    async fn a_stop_queued_during_a_bind_goes_out_on_that_link() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let late = AgentId::new();
+        let mut hooked = tuning();
+        let queued = late.clone();
+        hooked.before_publish = crate::connector::BeforePublish(Some(Arc::new(
+            move |shared: &Arc<crate::connector::Shared>| shared.request_stop(&queued),
+        )));
+        let node = backend.bare_with(&machine, hooked).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        let stop_id = link.stop_for(&late).await;
+        link.ack_stop(stop_id, &late, StopOutcome::NotRunning).await;
+        confirmed(&node).await;
         node.shutdown();
     }
 
