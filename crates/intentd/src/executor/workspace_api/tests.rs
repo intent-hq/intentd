@@ -2,20 +2,12 @@
 //! local calls on its worktree, forwarded calls over a real link (the test
 //! plays head), and the namespaces a node refuses.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use intent_core::node_link::{
-    LeaseBinding, LinkHello, LinkOutcome, LinkRpcError, LinkWelcome, NODE_LINK_PROTOCOLS,
-};
-use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
-use intent_core::placement::AgentPlatform;
-use intent_transport::node_link::{
-    dial_link, BindingFile, CertificatePin, DialedLink, LeaseToken, LinkEvent, NodeConnection,
-    NodeEndpoint, NodeListener, NodeListenerConfig,
-};
+use intent_core::node_link::{LinkOutcome, LinkRpcError};
+use intent_transport::node_link::{DialedLink, LinkEvent};
 
 use super::*;
 
@@ -269,66 +261,9 @@ async fn a_forwarded_call_without_a_link_fails_clearly() {
     assert!(text.contains("node-link-unavailable"), "{text}");
 }
 
-/// A bound link: the node's end and head's (the test's) end.
-async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
-    let certificate =
-        intent_transport::generate_certificate(vec!["localhost".into(), "127.0.0.1".into()])
-            .unwrap();
-    let token = || LeaseToken::new("w".repeat(40)).unwrap();
-    let mut listener = NodeListener::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        NodeListenerConfig {
-            node_id: "node-1".into(),
-            token: token(),
-            binding_file: BindingFile::new(dir.join("binding.json")),
-            certificate: certificate.clone(),
-        },
-        Arc::new(|_| LinkWelcome {
-            protocol: NODE_LINK_PROTOCOLS.max,
-            node_id: "node-1".into(),
-            running_agents: Vec::new(),
-            capabilities: intent_core::node_link::MachineCapabilities::new(
-                AgentPlatform {
-                    os: NodeOs::Linux,
-                    arch: NodeArch::X86_64,
-                },
-                "test",
-                1,
-                "2026-10-30T00:00:00Z",
-            ),
-            hosts: Vec::new(),
-            tc_address: None,
-        }),
-    )
-    .await
-    .unwrap();
-    let endpoint = NodeEndpoint {
-        url: format!("wss://{}", listener.local_addr()),
-        pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
-        token: token(),
-        tailcat: None,
-    };
-    let hello = LinkHello {
-        protocol: NODE_LINK_PROTOCOLS,
-        intentd_version: "test".into(),
-        binding: LeaseBinding {
-            head_id: "head-1".into(),
-            node_id: "node-1".into(),
-            lease_id: "lease-1".into(),
-            generation: NodeCounter(1),
-        },
-        acked_seq: NodeCounter(0),
-    };
-    let (dialed, accepted) = tokio::join!(dial_link(&endpoint, hello), async {
-        loop {
-            match tokio::time::timeout(wait(), listener.accept()).await {
-                Ok(Some(NodeConnection::Link { link, .. })) => return link,
-                Ok(Some(NodeConnection::Git(_))) => {}
-                other => panic!("expected a link, got {other:?}"),
-            }
-        }
-    });
-    (accepted, dialed.unwrap())
+/// A bound link: the machine's end and the backend's (the test's) end.
+async fn bound_link(dir: &Path) -> (NodeLink, DialedLink, crate::executor::test_link::Served) {
+    crate::executor::test_link::bound_link(dir).await
 }
 
 /// Forwarded frames reach head as one `workspace.call` request for the
@@ -336,7 +271,7 @@ async fn bound_link(dir: &Path) -> (NodeLink, DialedLink) {
 #[tokio::test]
 async fn control_plane_calls_are_forwarded_to_head_for_the_agent() {
     let dir = tempfile::tempdir().unwrap();
-    let (node_end, mut head_end) = bound_link(dir.path()).await;
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
     let head = HeadLink::default();
     head.set(node_end);
     let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
@@ -413,7 +348,7 @@ async fn git_commit_honors_the_workspaces_auto_commit_setting_from_head() {
     let (failed, text) = call(&unlinked, r#"return await ws.git.commit("one");"#).await;
     assert!(failed && text.contains("auto-commit setting"), "{text}");
 
-    let (node_end, mut head_end) = bound_link(dir.path()).await;
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
     let head = HeadLink::default();
     head.set(node_end);
     let server = server(&agent(), &workspace(), &repo, &gates(), head).unwrap();

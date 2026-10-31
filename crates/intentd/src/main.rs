@@ -38,11 +38,11 @@ mod client;
 mod command_evidence;
 mod doctor_codex;
 mod exact_update;
+#[cfg(unix)]
+mod executor;
 mod git_credential;
 #[cfg(unix)]
 mod git_remote_intent;
-#[cfg(unix)]
-mod node;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -93,12 +93,6 @@ enum Command {
     #[command(hide = true)]
     #[command(name = "command-worker")]
     EvidenceWorker { directory: PathBuf },
-    /// Run an execution node: listen for this user's head daemon over the
-    /// authenticated node link and run the agents it launches with this
-    /// machine's provider CLIs (Unix). Configured by hand with a private
-    /// config file; experimental and not yet used by head.
-    #[cfg(unix)]
-    Node(node::Args),
     /// Provider authentication and internal ACP launch helpers.
     Provider {
         #[command(subcommand)]
@@ -376,10 +370,6 @@ async fn async_main(cli: Cli) -> ExitCode {
             // signal. Do not initialize file logging or touch daemon state.
             return provider::run(command).await;
         }
-        // The node has its own composition root and stderr-only logging; it
-        // never touches the head's data directory or log files.
-        #[cfg(unix)]
-        Command::Node(args) => return to_exit(node::run(args).await),
         command => command,
     };
     init_tracing(matches!(command, Command::Serve { .. }));
@@ -410,8 +400,6 @@ async fn async_main(cli: Cli) -> ExitCode {
             | Command::EvidenceWorker { .. } => {
                 unreachable!("command evidence helpers run before the async runtime")
             }
-            #[cfg(unix)]
-            Command::Node(_) => unreachable!("intentd node returns before daemon setup"),
             Command::Provider { command } => provider::run(command).await,
             Command::Serve {
                 mode,
@@ -1987,6 +1975,13 @@ async fn cmd_serve_owned(
     // Ownership, effective file settings, TLS and the normal owner token are
     // resolved before binding. No database-dependent principal can enter yet.
     let boot_listener = boot_ws_listener(insecure, boot_settings.effective.server.ws_api.enabled);
+    // The executor link (`/node/*`) is served by every WSS listener this
+    // daemon starts; the executor service behind it is installed once the
+    // store is ready, and until then the link is refused as disabled.
+    #[cfg(unix)]
+    let executor_slot = Arc::new(executor::ExecutorSlot::default());
+    #[cfg(unix)]
+    let executor_links = intent_transport::node_link::ExecutorLinks::new(executor_slot.clone());
     let local = intent_transport::listener::StartupLocalListener::bind(&config.socket_path)?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     bootstrap.stop_local = Some(stop);
@@ -2002,13 +1997,19 @@ async fn cmd_serve_owned(
             ws_options.base_port,
         );
         ws_options.base_port = desired;
-        let server = WsApiServer::new_startup(
+        #[cfg_attr(
+            not(unix),
+            expect(unused_mut, reason = "the executor link is installed on Unix only")
+        )]
+        let mut server = WsApiServer::new_startup(
             bootstrap.dispatch.clone(),
             tls_cert.as_ref(),
             token_store.as_ref(),
             ws_options.clone(),
         )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        #[cfg(unix)]
+        server.install_executor_links(executor_links.clone());
         bootstrap.ws = Some(server.clone());
         let assign = !insecure
             && desired != 0
@@ -2782,6 +2783,10 @@ async fn cmd_serve_owned(
         ws_options: ws_options.clone(),
         reverse_registry: reverse_registry.clone(),
         data_dir: config.data_dir.clone(),
+        #[cfg(unix)]
+        executor_links: Some(executor_links.clone()),
+        #[cfg(not(unix))]
+        executor_links: None,
         state: tokio::sync::Mutex::new(WsRuntimeState {
             ws_server: bootstrap.ws.clone(),
             port: bootstrap.port,
@@ -2934,6 +2939,21 @@ async fn cmd_serve_owned(
             provider,
         )));
     }
+    // Run backends' remote agents in this daemon (`remoteAgents.enabled`
+    // gates the link), sharing the process registry's limits.
+    #[cfg(unix)]
+    let executor_service = executor::start_in_daemon(executor::DaemonParts {
+        slot: &executor_slot,
+        links: &executor_links,
+        services: &services,
+        manager: &manager,
+        settings: &settings_registry,
+        data_dir: &config.data_dir,
+        routes: pairing_info
+            .clone()
+            .map(|p| Arc::new(intent_transport::MachineRoutesResolver::new(p)) as _),
+    })
+    .await;
 
     // Live-reload of config.toml (§9.8): watch the file's parent directory
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
@@ -3366,6 +3386,10 @@ async fn cmd_serve_owned(
     let phase = shutdown::Phase::start("mcp_shutdown");
     mcp_hub.shutdown().await;
     phase.complete();
+    #[cfg(unix)]
+    if let Some(service) = &executor_service {
+        service.shutdown().await;
+    }
     let phase = shutdown::Phase::start("agent_shutdown");
     let native_shutdown = manager.shutdown_with_native_outcome().await;
     match &native_shutdown {
@@ -4471,6 +4495,8 @@ struct WsRuntimeControl {
     reverse_registry: Arc<PrimaryReverseRegistry>,
     /// Data directory for building pairing info provider (§5.2) in `start_ws_listener`.
     data_dir: PathBuf,
+    /// The executor link every started listener serves on `/node/*`.
+    executor_links: Option<Arc<intent_transport::node_link::ExecutorLinks>>,
     /// Mutable runtime state: the live `WsApiServer` (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
     /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
@@ -4924,6 +4950,9 @@ impl intent_core::ServerControl for DaemonControl {
                 )
             };
 
+            if let Some(links) = &runtime.executor_links {
+                server.install_executor_links(links.clone());
+            }
             // Install pairing info provider (§5.2) on runtime-started servers
             if let Some(ref ts) = runtime.token_store {
                 let pairing_provider = Arc::new(DaemonPairingInfo {

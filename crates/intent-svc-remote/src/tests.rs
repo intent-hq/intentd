@@ -1,5 +1,5 @@
-//! The connector and the remote runtime against a fake node on the real
-//! pinned-TLS node listener.
+//! The connector and the remote runtime against a fake machine serving the
+//! executor link on a real daemon WSS listener.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,17 +10,19 @@ use serde_json::{json, Value};
 use intent_acp::session::{ActivityTracker, ContentBlock, StopReason};
 use intent_acp::AcpError;
 use intent_core::agent_runtime::AgentRuntime;
+use intent_core::machines::ExecutorCredential;
+use intent_core::node_link::{BindDecision, LeaseBinding};
 use intent_core::node_link::{
     JournalBody, JournalRecord, LinkFrame, LinkHello, LinkOutcome, LinkWelcome,
 };
 use intent_core::nodes::{LeaseFence, LeaseFenceKind, LeaseState, NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_core::{AgentId, WorkspaceId};
+use intent_core::{BoxFuture, ExecutorCredentialId, HostRole, PrincipalId, WorkspaceApi};
 use intent_services::feature_api::tests::TempDb;
 use intent_store::Store;
 use intent_transport::node_link::{
-    BindingFile, LeaseToken, LinkEvent, LinkEvents, NodeConnection, NodeLink, NodeListener,
-    NodeListenerConfig, WelcomeFn,
+    ExecutorHost, ExecutorLinks, ExecutorToken, LinkEvent, LinkEvents, NodeConnection, NodeLink,
 };
 use intent_transport::{generate_certificate, TlsCertificate};
 
@@ -46,9 +48,12 @@ fn tuning() -> Tuning {
     }
 }
 
-fn token() -> LeaseToken {
-    LeaseToken::new("t".repeat(40)).unwrap()
+fn token() -> ExecutorToken {
+    ExecutorToken::new("t".repeat(40)).unwrap()
 }
+
+/// What the fake machine welcomes a bind with.
+type WelcomeFn = Arc<dyn Fn(&LinkHello) -> LinkWelcome + Send + Sync>;
 
 fn welcome() -> WelcomeFn {
     welcome_running(Vec::new())
@@ -74,10 +79,93 @@ fn welcome_running(running: Vec<AgentId>) -> WelcomeFn {
     })
 }
 
-/// A node that hands every admitted link to the test.
+/// The fake machine's store seams: one executor credential for [`token`],
+/// bound per the store's generation rule (any head may own it).
+struct MachineApi {
+    principal: PrincipalId,
+    credential: ExecutorCredential,
+    binding: std::sync::Mutex<Option<LeaseBinding>>,
+}
+
+impl WorkspaceApi for MachineApi {
+    fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
+        Box::pin(async move { Ok(self.principal.clone()) })
+    }
+
+    fn principal_host_role(
+        &self,
+        _id: PrincipalId,
+    ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+        Box::pin(async { Ok(HostRole::Member) })
+    }
+
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, intent_core::Result<Option<ExecutorCredential>>> {
+        let known = intent_transport::auth::hash_token(token().expose());
+        Box::pin(async move { Ok((token_hash == known).then(|| self.credential.clone())) })
+    }
+
+    fn bind_executor(
+        &self,
+        _credential_id: ExecutorCredentialId,
+        node_id: String,
+        offered: LeaseBinding,
+    ) -> BoxFuture<'_, intent_core::Result<BindDecision>> {
+        Box::pin(async move {
+            let mut binding = self.binding.lock().unwrap();
+            let decision = LeaseBinding::decide(&node_id, binding.as_ref(), &offered);
+            if decision == BindDecision::Accept {
+                *binding = Some(offered);
+            }
+            Ok(decision)
+        })
+    }
+}
+
+struct OwnerToken;
+
+impl intent_transport::TokenStore for OwnerToken {
+    fn load_token(&self) -> Option<String> {
+        Some("o".repeat(64))
+    }
+    fn store_token(&self, _token: &str) -> intent_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hands every admitted connection to the test.
+struct Host {
+    welcome: WelcomeFn,
+    accepted: tokio::sync::mpsc::UnboundedSender<NodeConnection>,
+    /// Cleared when the fake is dropped, so the machine admits nothing
+    /// while its listener stops.
+    up: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExecutorHost for Host {
+    fn enabled(&self) -> bool {
+        self.up.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn node_id(&self) -> String {
+        NODE.into()
+    }
+    fn welcome(&self, _credential: &ExecutorCredential, hello: &LinkHello) -> LinkWelcome {
+        (self.welcome)(hello)
+    }
+    fn accept(&self, _credential: ExecutorCredential, connection: NodeConnection) {
+        let _ = self.accepted.send(connection);
+    }
+}
+
+/// A machine that hands every admitted link to the test.
 struct FakeNode {
-    listener: NodeListener,
+    server: intent_transport::WsApiServer,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    port: u16,
     certificate: TlsCertificate,
+    accepted: tokio::sync::mpsc::UnboundedReceiver<NodeConnection>,
     git: Vec<intent_transport::node_link::GitConnection>,
     _dir: tempfile::TempDir,
 }
@@ -92,55 +180,75 @@ impl FakeNode {
     }
 
     async fn start_with(address: SocketAddr, welcome: WelcomeFn) -> Self {
-        let dir = tempfile::tempdir().unwrap();
         let certificate =
             generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        let listener = Self::listen_with(&dir, &certificate, address, welcome).await;
+        Self::serve(certificate, address, welcome).await
+    }
+
+    /// Serve on `address` with `certificate` (a node coming up where head
+    /// already dials).
+    async fn start_on(certificate: TlsCertificate, address: SocketAddr) -> Self {
+        Self::serve(certificate, address, welcome()).await
+    }
+
+    async fn serve(certificate: TlsCertificate, address: SocketAddr, welcome: WelcomeFn) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let bus =
+            intent_services::EventBus::new(Store::open(&dir.path().join("bus.db")).await.unwrap());
+        let api = Arc::new(MachineApi {
+            principal: PrincipalId::new(),
+            credential: ExecutorCredential {
+                id: ExecutorCredentialId::new(),
+                backend_id: "backend".into(),
+                backend_name: "Backend".into(),
+                backend_fingerprint: None,
+                created_at: "2026-10-30T00:00:00Z".into(),
+                last_used_at: None,
+                revoked_at: None,
+            },
+            binding: std::sync::Mutex::new(None),
+        });
+        let tokens = Arc::new(intent_transport::AsyncTokenStore::new(Arc::new(OwnerToken)));
+        let options = intent_transport::WsOptions {
+            base_port: address.port(),
+            ..intent_transport::WsOptions::default()
+        };
+        let mut server =
+            intent_transport::WsApiServer::new(api, bus, &certificate, &tokens, options, None)
+                .unwrap();
+        let (tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        server.install_executor_links(ExecutorLinks::new(Arc::new(Host {
+            welcome,
+            accepted: tx,
+            up: up.clone(),
+        })));
+        let port = server.start().await.unwrap();
+        assert!(address.port() == 0 || port == address.port());
         Self {
-            listener,
+            server,
+            up,
+            port,
             certificate,
+            accepted,
             git: Vec::new(),
             _dir: dir,
         }
     }
 
-    async fn listen(
-        dir: &tempfile::TempDir,
-        certificate: &TlsCertificate,
-        address: SocketAddr,
-    ) -> NodeListener {
-        Self::listen_with(dir, certificate, address, welcome()).await
-    }
-
-    async fn listen_with(
-        dir: &tempfile::TempDir,
-        certificate: &TlsCertificate,
-        address: SocketAddr,
-        welcome: WelcomeFn,
-    ) -> NodeListener {
-        NodeListener::bind(
-            address,
-            NodeListenerConfig {
-                node_id: NODE.into(),
-                token: token(),
-                binding_file: BindingFile::new(dir.path().join("binding.json")),
-                certificate: certificate.clone(),
-            },
-            welcome,
-        )
-        .await
-        .unwrap()
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], self.port))
     }
 
     fn config(&self) -> HeadNodeConfig {
-        config_for(self.listener.local_addr(), &self.certificate)
+        config_for(self.local_addr(), &self.certificate)
     }
 
     /// The next link. Head's git connections, dialed right after each
     /// bind, are kept in `git` (the fake serves no git).
     async fn accept(&mut self) -> NodeEnd {
         loop {
-            match tokio::time::timeout(wait(), self.listener.accept()).await {
+            match tokio::time::timeout(wait(), self.accepted.recv()).await {
                 Ok(Some(NodeConnection::Link {
                     link,
                     events,
@@ -172,6 +280,16 @@ fn config_for(address: SocketAddr, certificate: &TlsCertificate) -> HeadNodeConf
         .as_bytes(),
     )
     .unwrap()
+}
+
+impl Drop for FakeNode {
+    /// The machine goes away: refuse new links at once, then stop the
+    /// listener (which closes its executor links).
+    fn drop(&mut self) {
+        self.up.store(false, std::sync::atomic::Ordering::SeqCst);
+        let server = self.server.clone();
+        tokio::spawn(async move { server.stop().await });
+    }
 }
 
 /// The node's end of one bound link.
@@ -667,14 +785,7 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     runtime.stop().await;
     assert!(!runtime.is_alive());
 
-    let dir = tempfile::tempdir().unwrap();
-    let listener = FakeNode::listen(&dir, &certificate, address).await;
-    let mut fake = FakeNode {
-        listener,
-        certificate,
-        git: Vec::new(),
-        _dir: dir,
-    };
+    let mut fake = FakeNode::start_on(certificate, address).await;
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
         LinkFrame::Stop { agent_id } if agent_id == early => Some(()),
@@ -840,7 +951,7 @@ mod services {
         let mut fake = FakeNode::start().await;
         let config = json!({
             "nodeId": NODE,
-            "endpoint": format!("wss://{}", fake.listener.local_addr()),
+            "endpoint": format!("wss://{}", fake.local_addr()),
             "certificateSha256": fake.certificate.fingerprint256,
             "token": token().expose(),
         });
@@ -892,7 +1003,7 @@ mod node_mode {
         let mut fake = FakeNode::start().await;
         let config = json!({
             "nodeId": NODE,
-            "endpoint": format!("wss://{}", fake.listener.local_addr()),
+            "endpoint": format!("wss://{}", fake.local_addr()),
             "certificateSha256": fake.certificate.fingerprint256,
             "token": token().expose(),
         });
@@ -909,7 +1020,7 @@ mod node_mode {
         );
         let accepted = tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
-            fake.listener.accept(),
+            fake.accepted.recv(),
         )
         .await;
         assert!(accepted.is_err(), "the node is never dialed");
@@ -1009,14 +1120,7 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
         other => panic!("expected a stopped error, got {other:?}"),
     }
 
-    let dir = tempfile::tempdir().unwrap();
-    let listener = FakeNode::listen(&dir, &certificate, address).await;
-    let mut fake = FakeNode {
-        listener,
-        certificate,
-        git: Vec::new(),
-        _dir: dir,
-    };
+    let mut fake = FakeNode::start_on(certificate, address).await;
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
         LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),

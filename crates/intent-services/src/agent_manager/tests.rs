@@ -30684,3 +30684,124 @@ mod profile_routing_tests {
         }
     }
 }
+
+/// Remote (executor) launches share the slot cap with local agents and are
+/// refused, never queued, when it is full: `try_admit` answers at once with
+/// the running count and the cap.
+#[test]
+fn try_admit_refuses_at_the_shared_slot_cap_without_queueing() {
+    use intent_core::placement::CapacityRefusal;
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    reg.try_admit(&AgentId::from("remote-1"))
+        .expect("one free slot admits");
+    assert_eq!(reg.size(), 2, "the remote agent holds a slot");
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote-2")),
+        Err(CapacityRefusal::Count {
+            running_agents: 2,
+            agent_cap: 2,
+        })
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing local was evicted");
+    assert_eq!(reg.size(), 2, "a refused launch holds nothing");
+    assert!(
+        reg.inner.lock().unwrap().wait_queue.is_empty(),
+        "a refused launch is not queued"
+    );
+    assert!(reg.deregister(&local));
+    reg.try_admit(&AgentId::from("remote-2"))
+        .expect("the freed local slot admits a remote launch");
+}
+
+/// A remote agent is never an eviction candidate: a local spawn at the cap
+/// waits for a slot instead of killing it.
+#[tokio::test]
+async fn admitted_remote_agents_are_never_evicted_by_local_spawns() {
+    let reg = Arc::new(ProcessRegistry::new(1));
+    let remote = AgentId::from("remote");
+    reg.try_admit(&remote).expect("admits");
+    let local = AgentId::from("local");
+    let waiting = {
+        let reg = reg.clone();
+        tokio::spawn(async move { reg.acquire(&local, claim_all, release_none).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "the local spawn waits for the slot");
+    assert!(
+        reg.is_registered(&remote),
+        "the remote agent was not evicted"
+    );
+    assert!(reg.deregister(&remote));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        waiting,
+    )
+    .await
+    .expect("the released remote slot admits the local spawn")
+    .unwrap();
+}
+
+/// Over the shared memory budget (with the host short of headroom) a remote
+/// launch is refused with the charged and budgeted bytes.
+#[test]
+fn try_admit_refuses_over_the_shared_memory_budget() {
+    use intent_core::placement::CapacityRefusal;
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(5 * gb);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote")),
+        Err(CapacityRefusal::Memory {
+            charged_memory_bytes: 5 * gb,
+            memory_budget_bytes: 4 * gb,
+        })
+    );
+    assert_eq!(reg.size(), 1, "a refused launch holds nothing");
+    // Under budget, the admission is charged like a local spawn.
+    probe.set(gb);
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+    assert_eq!(
+        reg.budget_status().map(|(_, charged, _)| charged),
+        Some(Some(gb + PROVISIONAL_AGENT_BYTES))
+    );
+}
+
+/// A remote agent's provider resolves like a local spawn's: the configured
+/// `providers.paths` override wins, a profile resolves to its base, and an
+/// unknown or disabled provider is refused.
+#[cfg(unix)]
+#[test]
+fn resolve_provider_launch_matches_the_local_precedence() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = test_tempdir("resolve-launch");
+    let binary = dir.path().join("opencode");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    settings
+        .providers
+        .paths
+        .insert("opencode".into(), binary.display().to_string());
+    let spec = crate::resolve_provider_launch("opencode", &settings).expect("resolves");
+    assert_eq!(spec.provider.id, "opencode");
+    assert_eq!(spec.provider_binary.as_deref(), Some(binary.as_path()));
+    assert!(spec.npx_fallback_binary.is_none());
+
+    assert!(matches!(
+        crate::resolve_provider_launch("no-such-provider", &settings),
+        Err(Error::NotFound(_))
+    ));
+    settings.providers.enabled = Some([("opencode".to_owned(), false)].into());
+    assert!(matches!(
+        crate::resolve_provider_launch("opencode", &settings),
+        Err(Error::NotFound(_))
+    ));
+}
