@@ -362,7 +362,10 @@ const LAYOUT_HEADING: &str = "## Project layout";
 /// `(line, name)` for every row of the `AGENTS.md` source-lint table: the
 /// rows that follow the `| Lint |` header up to the first line that does not
 /// start with `|`, minus the `| --- |` separator. `name` is the first cell
-/// with its backticks removed; `None` when no table header exists.
+/// with its backticks removed, so that cell must hold exactly one backticked
+/// lint name (a list, a link or an empty cell reads as a stale row); `None`
+/// when no table header exists. Rows match lint files by file stem, so two
+/// crates' `*_lint.rs` files with the same name share one row.
 fn lint_table_rows(agents: &str) -> Option<Vec<(usize, String)>> {
     let mut lines = agents.lines().enumerate();
     lines.find(|(_, l)| l.trim_start().starts_with(LINT_TABLE_HEADER))?;
@@ -370,39 +373,51 @@ fn lint_table_rows(agents: &str) -> Option<Vec<(usize, String)>> {
         .take_while(|(_, l)| l.trim_start().starts_with('|'))
         .filter_map(|(i, l)| {
             let cell = l.trim_start().strip_prefix('|')?.split('|').next()?.trim();
-            if cell.chars().all(|c| matches!(c, '-' | ':' | ' ')) {
-                return None;
-            }
-            Some((i + 1, cell.trim_matches('`').to_string()))
+            let separator =
+                cell.contains('-') && cell.chars().all(|c| matches!(c, '-' | ':' | ' '));
+            (!separator).then(|| (i + 1, cell.trim_matches('`').to_string()))
         })
         .collect();
     Some(rows)
 }
 
-/// `(line, crate)` for every `├── <crate>/` / `└── <crate>/` entry of the
-/// first fenced block under `## Project layout` in `AGENTS.md` (the `crates/`
-/// root line carries no tree glyph and is skipped); `None` when the heading
-/// or its fenced block is missing.
+/// `(line, crate)` for every top-level `├── <crate>/` / `└── <crate>/` entry
+/// (the glyph at column 0, so a nested `│   └── tests/` subtree is not a
+/// crate; the trailing `/` and backticks are optional) of the first fenced
+/// block under `## Project layout` in `AGENTS.md`. The `crates/` root line
+/// carries no tree glyph and is skipped. `None` when the heading is missing,
+/// when the section ends (the next `#` heading) before a fenced block opens,
+/// or when the block never closes.
 fn layout_crates(agents: &str) -> Option<Vec<(usize, String)>> {
     let mut lines = agents.lines().enumerate();
     lines.find(|(_, l)| l.trim_end() == LAYOUT_HEADING)?;
-    lines.find(|(_, l)| l.trim_start().starts_with("```"))?;
-    let mut out = Vec::new();
-    let mut closed = false;
-    for (i, line) in lines {
+    for (_, line) in lines.by_ref() {
         if line.trim_start().starts_with("```") {
-            closed = true;
             break;
         }
-        let Some((_, entry)) = line.split_once("── ") else {
+        if line.starts_with('#') {
+            return None;
+        }
+    }
+    let mut out = Vec::new();
+    for (i, line) in lines {
+        if line.trim_start().starts_with("```") {
+            return Some(out);
+        }
+        let Some(entry) = line
+            .strip_prefix("├── ")
+            .or_else(|| line.strip_prefix("└── "))
+        else {
             continue;
         };
         let name = entry.split_whitespace().next().unwrap_or("");
-        if let Some(name) = name.strip_suffix('/') {
+        let name = name.trim_matches('`');
+        let name = name.strip_suffix('/').unwrap_or(name);
+        if !name.is_empty() {
             out.push((i + 1, name.to_string()));
         }
     }
-    closed.then_some(out)
+    None
 }
 
 /// Every crate directory under `root/crates` (one holding a `Cargo.toml`, so
@@ -422,7 +437,10 @@ fn crate_dirs(root: &Path) -> BTreeSet<String> {
 /// directory missing from the project-layout block, or a layout entry naming
 /// no crate — each rendered as one failure line naming the entry.
 fn agents_md_drift(root: &Path) -> Vec<String> {
-    let agents = fs::read_to_string(root.join("AGENTS.md")).unwrap_or_default();
+    let agents = match fs::read_to_string(root.join("AGENTS.md")) {
+        Ok(agents) => agents,
+        Err(e) => return vec![format!("AGENTS.md: cannot read it: {e}")],
+    };
     let mut failures = Vec::new();
 
     let lints: Vec<(String, PathBuf)> = lint_files(root)
@@ -1043,5 +1061,84 @@ mod fixture {
                 .any(|f| f.starts_with("AGENTS.md: no fenced crate tree")),
             "{failures:?}"
         );
+    }
+
+    #[test]
+    fn nested_layout_entries_are_not_crates() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &AGENTS_MD.replace(
+                "└── a/  # the only crate\n",
+                "└── a/  # the only crate\n    ├── src/\n    └── tests/\n",
+            ),
+        );
+        assert_eq!(agents_md_drift(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn layout_entry_without_slash_or_with_backticks_still_counts() {
+        for entry in ["└── a  # the only crate", "└── `a/`  # the only crate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            fixture(tmp.path(), "");
+            write_agents(
+                tmp.path(),
+                &AGENTS_MD.replace("└── a/  # the only crate", entry),
+            );
+            assert_eq!(agents_md_drift(tmp.path()), Vec::<String>::new(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn table_row_with_an_empty_first_cell_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &AGENTS_MD.replace(
+                "| `x_lint` | everything | none |\n",
+                "| `x_lint` | everything | none |\n| | nameless | none |\n",
+            ),
+        );
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md:15: lint table row `` names no",
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_and_escaped_pipes_in_later_cells_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        let agents = AGENTS_MD
+            .replace("| everything |", "| `a \\| b` pipelines |")
+            .replace('\n', "\r\n");
+        write_agents(tmp.path(), &agents);
+        assert_eq!(agents_md_drift(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn layout_section_without_a_fence_does_not_borrow_a_later_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        write_agents(
+            tmp.path(),
+            &(AGENTS_MD.replace(
+                "```text\ncrates/\n└── a/  # the only crate\n```\n",
+                "Prose.\n",
+            ) + "\n## Later\n\n```text\n└── a/\n```\n"),
+        );
+        assert_single_failure_at(
+            &agents_md_drift(tmp.path()),
+            "AGENTS.md: no fenced crate tree",
+        );
+    }
+
+    #[test]
+    fn missing_agents_md_is_reported_as_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path(), "");
+        assert_single_failure_at(&agents_md_drift(tmp.path()), "AGENTS.md: cannot read it");
     }
 }
