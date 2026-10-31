@@ -117,7 +117,10 @@ fn is_item_header(chars: &[char], start: usize) -> bool {
 /// reader's [`Token::depth`]), so a stray closer of another kind ends the
 /// body early instead of being skipped.
 fn close_of(tokens: &[Token], open: usize) -> Option<usize> {
-    let at = tokens.iter().position(|t| t.start == open)?;
+    let at = tokens.partition_point(|t| t.start < open);
+    if tokens.get(at)?.start != open {
+        return None;
+    }
     let depth = tokens[at].depth;
     tokens[at + 1..]
         .iter()
@@ -205,7 +208,8 @@ fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
     let lexed = lex(src);
     let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let chars: Vec<char> = lexed.blanked.chars().collect();
-    let tokens = tokenize(&chars);
+    // Tokenized on the first `Workspace {`: most files have none.
+    let mut tokens: Option<Vec<Token>> = None;
     let name: Vec<char> = TYPE_NAME.chars().collect();
     let mut hits = Vec::new();
     let mut used_markers = Vec::new();
@@ -224,7 +228,8 @@ fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
             continue;
         }
         let line = line_of(&chars, i);
-        let Some(close) = close_of(&tokens, open) else {
+        let tokens = tokens.get_or_insert_with(|| tokenize(&chars));
+        let Some(close) = close_of(tokens, open) else {
             hits.push(Hit {
                 line,
                 kind: HitKind::Unbalanced,

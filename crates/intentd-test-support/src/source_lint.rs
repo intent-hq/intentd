@@ -805,8 +805,9 @@ pub enum TokenKind {
     Ident,
     /// A numeric literal: a digit, then `[A-Za-z0-9_]*` (`1u8`, `0xff`,
     /// `1_000`), plus one fractional part when a `.` is directly followed by
-    /// a digit (`1.5`, `2.0f64`). `0..10` is `0`, `..`, `10`; `x.0.y` keeps
-    /// `0` alone.
+    /// a digit (`1.5`, `2.0f64`) and the number does not follow a lone `.`
+    /// (a tuple index; `..` is a range, so `0.0..1.5` keeps `1.5`). `0..10` is `0`, `..`, `10`; `x.0.y` keeps `0` alone, and
+    /// `t.0.1` reads as `t`, `.`, `0`, `.`, `1`.
     Number,
     /// One of [`MULTI_CHAR_PUNCT`], or any other single non-whitespace
     /// character (non-ASCII ones included).
@@ -887,7 +888,12 @@ pub fn tokenize_from(chars: &[char], first_line: usize) -> Vec<Token> {
             while chars.get(i).copied().is_some_and(is_word_char) {
                 i += 1;
             }
-            if chars.get(i) == Some(&'.') && chars.get(i + 1).is_some_and(char::is_ascii_digit) {
+            let tuple_index =
+                start > 0 && chars[start - 1] == '.' && (start < 2 || chars[start - 2] != '.');
+            if !tuple_index
+                && chars.get(i) == Some(&'.')
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit)
+            {
                 i += 1;
                 while chars.get(i).copied().is_some_and(is_word_char) {
                     i += 1;
@@ -1687,6 +1693,9 @@ let h = 8;
         assert_eq!(texts("0..10"), ["0", "..", "10"]);
         assert_eq!(texts("0..=9"), ["0", "..=", "9"]);
         assert_eq!(texts("x.0.y"), ["x", ".", "0", ".", "y"]);
+        assert_eq!(texts("t.0.1.data"), ["t", ".", "0", ".", "1", ".", "data"]);
+        assert_eq!(texts("x = 0.5"), ["x", "=", "0.5"]);
+        assert_eq!(texts("0.0..1.5"), ["0.0", "..", "1.5"]);
         assert_eq!(texts("1.max(2)"), ["1", ".", "max", "(", "2", ")"]);
         assert_eq!(texts("1e-5"), ["1e", "-", "5"]);
         assert_eq!(texts("r#type"), ["r", "#", "type"]);

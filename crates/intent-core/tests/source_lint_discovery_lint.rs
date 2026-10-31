@@ -28,8 +28,8 @@
 //!   `fn blank_cfg_test_items(`, `fn cfg_test_item_ranges(`,
 //!   `fn split_statements(`, `fn tokenize(`, `fn tokenize_str(`,
 //!   `fn tokenize_from(`, `fn matching_close(`, or `fn skip_group(` (`pub`
-//!   optional; any whitespace, line breaks included, between `fn`, the name,
-//!   and `(`; matched on the whole comment- and literal-blanked text and
+//!   optional; generics allowed; any whitespace, line breaks included,
+//!   between `fn`, the name, and `(` or `<`; matched on the whole comment- and literal-blanked text and
 //!   reported at the line of the `fn` keyword). Those are the shared
 //!   scaffolding in `intentd_test_support::source_lint`; the lints used to
 //!   carry private copies, and two #2073 fixes (`102c347a` statement line
@@ -194,15 +194,15 @@ fn display_rel(rel: &Path) -> String {
         .join("/")
 }
 
-/// `(line, name)` of every `fn <name>(` definition in `blanked` (comment- and
-/// literal-blanked source), read with the shared token reader so any
-/// whitespace — line breaks included — may sit between `fn`, the name, and
-/// `(`, while `fnlex`, `pub_fn`, and the `fn(` of a function-pointer type are
-/// not definitions. `line` is the 1-based line of the `fn` keyword.
+/// `(line, name)` of every `fn <name>(` / `fn <name><…>(` definition in
+/// `tokens` (of comment- and literal-blanked source), so any whitespace —
+/// line breaks included — may sit between `fn`, the name, and `(` or the
+/// generics, while `fnlex`, `pub_fn`, and the `fn(` of a function-pointer
+/// type are not definitions. `line` is the 1-based line of the `fn` keyword.
 fn fn_definitions(tokens: &[Token]) -> Vec<(usize, &str)> {
     tokens
         .windows(3)
-        .filter(|w| w[0].is("fn") && w[1].is_ident() && w[2].is("("))
+        .filter(|w| w[0].is("fn") && w[1].is_ident() && (w[2].is("(") || w[2].is("<")))
         .map(|w| (w[0].line, w[1].text.as_str()))
         .collect()
 }
@@ -633,6 +633,14 @@ mod fixture {
         assert_eq!(scaffolding_definitions("fnlex(x: &str) {"), vec![]);
         assert_eq!(scaffolding_definitions("pub_fn lex(x: &str) {"), vec![]);
         assert_eq!(scaffolding_definitions("let f: fn(&str) = lex;"), vec![]);
+        assert_eq!(
+            scaffolding_definitions("fn matching_close<T>(x: T) {"),
+            vec![(1, "matching_close")]
+        );
+        assert_eq!(
+            scaffolding_definitions("fn tokenize<'a>(x: &'a str) {"),
+            vec![(1, "tokenize")]
+        );
     }
 
     #[test]
@@ -726,6 +734,10 @@ mod fixture {
         for name in super::TOKEN_READER_FNS {
             assert_eq!(
                 token_reader_definitions(&format!("fn {name}(x: &str) {{")),
+                vec![(1, format!("fn {name}"))]
+            );
+            assert_eq!(
+                token_reader_definitions(&format!("fn {name}<'a>(x: &'a str) {{")),
                 vec![(1, format!("fn {name}"))]
             );
         }

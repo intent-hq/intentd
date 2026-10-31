@@ -44,7 +44,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use intentd_test_support::source_lint::{matching_close, tokenize_str, Token};
+use intentd_test_support::source_lint::{matching_close, tokenize_str, workspace_root, Token};
 
 const REGISTRY_FILE: &str = "crates/intent-acp/src/egress_registry.rs";
 const REGISTRY_CONST: &str = "AGENT_EGRESS_CALLS";
@@ -320,12 +320,12 @@ fn cfg_test_ranges(tokens: &[Token]) -> Vec<(usize, usize)> {
                 "(" | "[" => {
                     j = matching_close(tokens, j).map_or(tokens.len(), |c| c + 1);
                 }
-                "<" => {
-                    angle += 1;
-                    j += 1;
-                }
-                ">" => {
-                    angle = angle.saturating_sub(1);
+                // Every `<` / `>` character counts, as when each was its own
+                // token: `<=` / `<<=` open, `>=` / `>>=` / `=>` close; only a
+                // return arrow `->` is not an angle bracket.
+                t if t != "->" && t.contains(['<', '>']) => {
+                    angle += t.matches('<').count();
+                    angle = angle.saturating_sub(t.matches('>').count());
                     j += 1;
                 }
                 _ => j += 1,
@@ -338,13 +338,13 @@ fn cfg_test_ranges(tokens: &[Token]) -> Vec<(usize, usize)> {
 }
 
 /// Tokens outside every `#[cfg(test)]` range.
-fn non_test_tokens(tokens: &[Token]) -> Vec<Token> {
-    let ranges = cfg_test_ranges(tokens);
+fn non_test_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let ranges = cfg_test_ranges(&tokens);
     tokens
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(i, _)| !ranges.iter().any(|(s, e)| (*s..*e).contains(i)))
-        .map(|(_, t)| t.clone())
+        .map(|(_, t)| t)
         .collect()
 }
 
@@ -435,6 +435,8 @@ fn receiver_is_borrowed(body: &[Token], dot: usize) -> bool {
     if prev.is_some_and(|p| body[p].is("mut")) {
         prev = prev.and_then(|p| p.checked_sub(1));
     }
+    // `&&` counts as a borrow (`&&a.data`) as it did when it read as two `&`
+    // tokens, so a logical `ok && a.data` is a known false negative.
     prev.is_some_and(|p| body[p].is("&") || body[p].is("&&"))
 }
 
@@ -584,21 +586,22 @@ struct SourceFile {
 /// named by a sibling's `#[cfg(test)] mod name;` are dropped.
 fn scan_dir(root: &Path, dir: &str) -> Vec<SourceFile> {
     let files = rust_files(&root.join(dir));
-    let mut loaded: Vec<(PathBuf, String)> = files
+    let mut loaded: Vec<(PathBuf, Vec<Token>)> = files
         .into_iter()
-        .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)))
+        .filter_map(|p| {
+            let src = fs::read_to_string(&p).ok()?;
+            Some((p, tokenize_str(&blank_literals_and_comments(&src))))
+        })
         .collect();
     let mut test_mods: BTreeSet<PathBuf> = BTreeSet::new();
-    for (path, src) in &loaded {
-        let blanked = blank_literals_and_comments(src);
-        let tokens = tokenize_str(&blanked);
+    for (path, tokens) in &loaded {
         let parent = path.parent().unwrap_or(Path::new(""));
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string());
         let mod_dir = match stem.as_deref() {
             Some("mod" | "lib" | "main") | None => parent.to_path_buf(),
             Some(stem) => parent.join(stem),
         };
-        for name in cfg_test_module_decls(&tokens) {
+        for name in cfg_test_module_decls(tokens) {
             test_mods.insert(mod_dir.join(format!("{name}.rs")));
             test_mods.insert(mod_dir.join(&name).join("mod.rs"));
         }
@@ -606,12 +609,9 @@ fn scan_dir(root: &Path, dir: &str) -> Vec<SourceFile> {
     loaded.retain(|(p, _)| !test_mods.contains(p) && !is_test_path(&rel(root, p)));
     loaded
         .into_iter()
-        .map(|(path, src)| {
-            let tokens = non_test_tokens(&tokenize_str(&blank_literals_and_comments(&src)));
-            SourceFile {
-                rel: rel(root, &path),
-                tokens,
-            }
+        .map(|(path, tokens)| SourceFile {
+            rel: rel(root, &path),
+            tokens: non_test_tokens(tokens),
         })
         .collect()
 }
@@ -760,14 +760,6 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
     failures.sort();
     failures.dedup();
     failures
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/intent-acp has a workspace root")
-        .to_path_buf()
 }
 
 #[test]
