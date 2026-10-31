@@ -80,7 +80,7 @@ impl RemoteAgentRuntime {
     /// Neither stopped by head nor exited on the node.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        !self.stopped.load(Ordering::SeqCst) && self.sink.exit().is_none()
+        !self.stopped.load(Ordering::SeqCst) && !self.sink.is_closed() && self.sink.exit().is_none()
     }
 
     /// The node's exit report, once the agent's provider exited.
@@ -255,7 +255,7 @@ impl AgentRuntime for RemoteAgentRuntime {
     }
 
     fn is_alive(&self) -> bool {
-        !self.stopped.load(Ordering::SeqCst) && self.sink.exit().is_none()
+        self.is_running()
     }
 
     fn client_request_seq(&self) -> u64 {

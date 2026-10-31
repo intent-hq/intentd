@@ -248,6 +248,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "mcp:notification",
     "principal:identity-changed",
     "providers:profiles-changed",
+    "remoteMachine:changed",
     "script:changed",
     "script:output",
     "script:state",

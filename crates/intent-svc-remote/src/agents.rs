@@ -90,6 +90,11 @@ impl AgentSink {
         state.turns.clear();
     }
 
+    /// Whether head closed the sink (the agent was stopped from here).
+    pub(crate) fn is_closed(&self) -> bool {
+        lock(&self.state).closed
+    }
+
     pub(crate) fn exit(&self) -> Option<Exit> {
         lock(&self.state).exit.clone()
     }
@@ -160,6 +165,22 @@ impl Agents {
             .values()
             .filter(|sink| sink.is_live())
             .count()
+    }
+
+    /// The attached agents that are still live.
+    pub(crate) fn live_ids(&self) -> Vec<AgentId> {
+        lock(&self.sinks)
+            .iter()
+            .filter(|(_, sink)| sink.is_live())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// End `agent_id`'s sink: waiting prompts fail and it is no longer live.
+    pub(crate) fn close(&self, agent_id: &AgentId) {
+        if let Some(sink) = lock(&self.sinks).remove(agent_id) {
+            sink.close();
+        }
     }
 
     /// Detach `agent_id` if `sink` is still its sink.

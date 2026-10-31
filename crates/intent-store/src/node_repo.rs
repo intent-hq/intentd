@@ -118,49 +118,8 @@ impl Store {
     /// # Errors
     /// Rejects malformed/mismatched records, reused identity or database errors.
     pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+        validate_enrollment(record, initial)?;
         let owner = &initial.owner;
-        if record.id.is_empty()
-            || record.head_id.is_empty()
-            || record.node_identity.is_empty()
-            || owner.node_id != record.id
-            || owner.head_id != record.head_id
-            || owner.node_identity != record.node_identity
-            || owner.lease_id.is_empty()
-            || uuid::Uuid::parse_str(&owner.incarnation).is_err()
-            || initial.state != LeaseState::Acquiring
-            || initial.release_requested
-            || initial.fence.is_some()
-            || initial.ack_seq != NodeCounter(0)
-            || initial.link_generation != NodeCounter(0)
-        {
-            return Err(invalid("invalid initial node/lease binding"));
-        }
-        if record.capacity.memory_budget_bytes > MAX_SAFE_INTEGER
-            || record.capacity.used_memory_bytes > MAX_SAFE_INTEGER
-        {
-            return Err(invalid("capacity exceeds safe JSON integer"));
-        }
-        match record.kind {
-            NodeKind::Static => {
-                if !record
-                    .endpoint
-                    .as_ref()
-                    .is_some_and(|s| s.starts_with("wss://") && s.ends_with("/node"))
-                    || !record.certificate_sha256.as_ref().is_some_and(|s| {
-                        s.len() == 64
-                            && s.bytes()
-                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    })
-                {
-                    return Err(invalid("static node requires pinned WSS endpoint"));
-                }
-            }
-            NodeKind::Local => {
-                if record.endpoint.is_some() || record.certificate_sha256.is_some() {
-                    return Err(invalid("local node has no network credential"));
-                }
-            }
-        }
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query("INSERT INTO execution_node (id, head_id, node_identity, record_json) VALUES (?, ?, ?, ?)")
             .bind(&record.id).bind(&record.head_id).bind(&record.node_identity).bind(encode(record)?)
@@ -174,6 +133,156 @@ impl Store {
             .map_err(db)?;
         tx.commit().await.map_err(db)
     }
+
+    /// Daemon-to-daemon: start `initial`, a fresh lease on exposed machine
+    /// `record.id` for a newly added executor credential. Registers the
+    /// machine on first use and otherwise refreshes its record (same head
+    /// only), ends every live lease the head holds on it (`lost`, fenced:
+    /// the caller has stopped or refused their agents), then inserts the new
+    /// lease at link generation `generation`, the one its probe bound with.
+    /// # Errors
+    /// Rejects a malformed binding, a machine registered by another head or
+    /// database errors.
+    pub async fn renew_machine_lease(
+        &self,
+        record: &NodeRecord,
+        initial: &NodeLease,
+        generation: NodeCounter,
+    ) -> Result<()> {
+        validate_enrollment(record, initial)?;
+        let owner = &initial.owner;
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let head: Option<String> =
+            sqlx::query_scalar("SELECT head_id FROM execution_node WHERE id = ?")
+                .bind(&record.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        match head {
+            None => {
+                sqlx::query("INSERT INTO execution_node (id, head_id, node_identity, record_json) VALUES (?, ?, ?, ?)")
+                    .bind(&record.id).bind(&record.head_id).bind(&record.node_identity).bind(encode(record)?)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
+            Some(head) if head == record.head_id => {
+                end_live_leases(&mut tx, &record.id).await?;
+                sqlx::query("UPDATE execution_node SET node_identity = ?, record_json = ? WHERE id = ?")
+                    .bind(&record.node_identity)
+                    .bind(encode(record)?)
+                    .bind(&record.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+            }
+            Some(_) => return Err(invalid("node is registered by another head")),
+        }
+        let mut lease = initial.clone();
+        lease.link_generation = generation;
+        sqlx::query("INSERT INTO node_lease (id, node_id, record_json) VALUES (?, ?, ?)")
+            .bind(&owner.lease_id)
+            .bind(&record.id)
+            .bind(encode(&lease)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// Daemon-to-daemon: end every live lease on exposed machine `node_id`
+    /// owned by `head_id` (the machine was removed). Returns how many ended.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let owned: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM execution_node WHERE id = ? AND head_id = ?",
+        )
+        .bind(node_id)
+        .bind(head_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if owned.is_none() {
+            return Ok(0);
+        }
+        let ended = end_live_leases(&mut tx, node_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(ended)
+    }
+}
+
+/// End every live lease of `node_id` as `lost`, fenced now.
+async fn end_live_leases(conn: &mut SqliteConnection, node_id: &str) -> Result<usize> {
+    let rows = sqlx::query("SELECT record_json FROM node_lease WHERE node_id = ? AND terminal = 0")
+        .bind(node_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+    let mut ended = 0;
+    for row in rows {
+        let mut record: NodeLease = decode(row.get("record_json"))?;
+        if record.state.is_terminal() {
+            continue;
+        }
+        record.state = LeaseState::Lost;
+        record.fence = Some(LeaseFence {
+            kind: intent_core::nodes::LeaseFenceKind::ProcessesStopped,
+            recorded_at: now_iso(),
+        });
+        save_lease(&mut *conn, &record).await?;
+        ended += 1;
+    }
+    Ok(ended)
+}
+
+fn validate_enrollment(record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+    let owner = &initial.owner;
+    if record.id.is_empty()
+        || record.head_id.is_empty()
+        || record.node_identity.is_empty()
+        || owner.node_id != record.id
+        || owner.head_id != record.head_id
+        || owner.node_identity != record.node_identity
+        || owner.lease_id.is_empty()
+        || uuid::Uuid::parse_str(&owner.incarnation).is_err()
+        || initial.state != LeaseState::Acquiring
+        || initial.release_requested
+        || initial.fence.is_some()
+        || initial.ack_seq != NodeCounter(0)
+        || initial.link_generation != NodeCounter(0)
+    {
+        return Err(invalid("invalid initial node/lease binding"));
+    }
+    if record.capacity.memory_budget_bytes > MAX_SAFE_INTEGER
+        || record.capacity.used_memory_bytes > MAX_SAFE_INTEGER
+    {
+        return Err(invalid("capacity exceeds safe JSON integer"));
+    }
+    match record.kind {
+        NodeKind::Static => {
+            if !record
+                .endpoint
+                .as_ref()
+                .is_some_and(|s| s.starts_with("wss://") && s.ends_with("/node"))
+                || !record.certificate_sha256.as_ref().is_some_and(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                return Err(invalid("static node requires pinned WSS endpoint"));
+            }
+        }
+        NodeKind::Local => {
+            if record.endpoint.is_some() || record.certificate_sha256.is_some() {
+                return Err(invalid("local node has no network credential"));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Store {
 
     /// Enumerate durable registrations for one head installation on restart.
     /// These private records must be projected before public inventory delivery.

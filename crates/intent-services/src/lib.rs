@@ -63,6 +63,7 @@ mod agent_workers;
 mod auto_archive;
 mod auto_retire;
 mod executor_ops;
+mod remote_machine_ops;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -34682,6 +34683,14 @@ impl WorkspaceApi for Services {
 
     fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.executor_revoke_op(&credential_id).await })
+    }
+
+    fn remote_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.remote_machines_op(method, params))
     }
 
     // Presence (multiplayer w5) — see `presence`.

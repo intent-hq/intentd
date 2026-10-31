@@ -82,7 +82,7 @@ impl Services {
     /// Owner-only gate for the `executor.*` methods: the daemon itself, or a
     /// wire caller admitted as the owner whose durable host role is still
     /// owner. Members, guests, agents and executor credentials are refused.
-    async fn require_machine_owner(&self, what: &str) -> Result<()> {
+    pub(crate) async fn require_machine_owner(&self, what: &str) -> Result<()> {
         match current_caller() {
             Some(Caller::Daemon) => Ok(()),
             Some(Caller::Wire {
