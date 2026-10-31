@@ -196,7 +196,7 @@ section above. Credentials, remote access and sharing, forge connections,
 executable and folder paths, command permissions, and global or workspace
 instructions are refused: use Settings for those changes.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/settings.rs (PROPOSAL_EXCLUDED_*); packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/settings.rs; packages/cloudlands-fe/src/lib/components/chat/proposals/settings-proposal-actions.ts; packages/cloudlands-fe/src/shared/app-settings-schema.ts. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/settings.rs (PROPOSAL_EXCLUDED_*); packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/settings.rs; packages/cloudlands-fe/src/lib/components/chat/proposals/{settings-proposal-actions,settings-proposal-definitions}.ts; packages/cloudlands-fe/src/shared/app-settings-schema.ts. -->
 
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
@@ -323,10 +323,10 @@ Claude Code and choose **Add profile**. If this opens a name and environment-var
 editor, use that form with the environment-variable rules below; sign in or prepare
 the account outside Intent.
 
-**Guided profile setup requires a supporting released app.** Do not offer the
-following flow as a normal option until released-app availability is confirmed;
-a newer daemon alone does not add it. Until then, discuss it only when explicitly
-asked or developing/testing it. In a supporting app, **Add profile** offers a kind:
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ProviderProfileDialog,ProviderProfileAddDialog,ProviderProfileEditDialog}.svelte; src/lib/components/settings/profile-kinds/ProviderProfileKindDialog.svelte; src/lib/provider-profile-kinds.ts; src/store/renderer/slices/provider-settings/sagas/provider-profile-setup-saga.ts. -->
+
+**Guided profile setup.** With matching app and daemon support, **Add profile**
+offers a kind:
 **Different login**, **API key** (Claude Code only), **Token**, or **Advanced**.
 **Different login** creates a new
 sign-in folder under `~/intent/profiles/` on the daemon host. **Create & sign in**
@@ -754,7 +754,7 @@ grouping choices keep their behavior.
 
 ## Set aside workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceList}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-attention,home-set-aside-saga}.ts. -->
 
 **Set aside** is unreleased until the companion frontend change ships. In a
 supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
