@@ -254,20 +254,28 @@ impl Services {
             (attempt.selection.clone(), attempt.started_at)
         };
         self.provider_quota_cache
-            .mark_working(&noted.0, noted.1, chrono::Utc::now());
+            .mark_working(&noted.0, noted.1, chrono::Utc::now(), || {
+                self.profile_activation()
+                    .runs_saved_settings(agent_id, &noted.0)
+            });
     }
 
-    /// Record a quota failure on `selection` in the shared cache, so every
-    /// other conversation skips it until `reported` (the error's reset time,
-    /// when usable) or the default mark duration.
-    fn note_provider_exhausted(
+    /// Record `agent_id`'s quota failure on `selection` in the shared cache,
+    /// so every other conversation skips it until `reported` (the error's
+    /// reset time, when usable) or the default mark duration. Ignored when
+    /// the agent's process runs settings edited or deleted since it started.
+    pub(crate) fn note_provider_exhausted(
         &self,
+        agent_id: &AgentId,
         selection: &str,
         reported: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
     ) {
         self.provider_quota_cache
-            .mark_exhausted(selection, reported, now);
+            .mark_exhausted(selection, reported, now, || {
+                self.profile_activation()
+                    .runs_saved_settings(agent_id, selection)
+            });
     }
 
     /// Configurations the shared cache marks exhausted right now.
@@ -413,7 +421,7 @@ impl Services {
         // failed (never a configuration the user switched to meanwhile).
         let recorded = failed_provider.filter(|p| !p.trim().is_empty());
         if let Some(failed) = recorded {
-            self.note_provider_exhausted(failed, reported, now);
+            self.note_provider_exhausted(agent_id, failed, reported, now);
         }
         if self
             .chain_for_failed_attempt(agent_id, &session, failed_provider)
@@ -424,7 +432,7 @@ impl Services {
         }
         if recorded.is_none() {
             if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
-                self.note_provider_exhausted(failed, reported, now);
+                self.note_provider_exhausted(agent_id, failed, reported, now);
             }
         }
         let Some(from) = session.provider.clone() else {
