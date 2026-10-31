@@ -152,10 +152,13 @@ async fn remote_machine_changed_is_global_and_owner_only() {
     f.services
         .publish_remote_machine_changed(json!({ "machineId": "m-1", "removed": true }))
         .await;
-    let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         batch[0].data,
         json!({ "machineId": "m-1", "removed": true })

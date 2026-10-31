@@ -65,7 +65,7 @@ mod tests;
 pub struct RemoteFeature {
     nodes: Mutex<HashMap<String, RemoteNode>>,
     tailcat_bin: Mutex<Option<PathBuf>>,
-    #[cfg(test)]
+    /// Connector timing; the defaults unless a test shortens them.
     tuning: Mutex<Option<connector::Tuning>>,
 }
 
@@ -91,11 +91,7 @@ impl RemoteFeature {
     }
 
     pub(crate) fn tuning(&self) -> connector::Tuning {
-        #[cfg(test)]
-        if let Some(tuning) = lock(&self.tuning).clone() {
-            return tuning;
-        }
-        connector::Tuning::default()
+        lock(&self.tuning).clone().unwrap_or_default()
     }
 
     /// The connector to exposed machine `machine_id`, started if needed.

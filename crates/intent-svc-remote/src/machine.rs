@@ -77,7 +77,7 @@ impl MachineTarget {
     /// # Errors
     ///
     /// As [`MachineTarget::new`].
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the add params, one value each")]
     pub(crate) fn from_parts(
         id: &str,
         name: &str,

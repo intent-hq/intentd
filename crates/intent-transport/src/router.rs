@@ -245,16 +245,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // An exposed-machine request failed (`machine-unreachable` with the
         // routes tried, `machine-revoked`, `machine-in-use`): the
         // service-built `data` verbatim.
-        ref e @ Error::RemoteMachine(ref failure) => RpcErr {
-            code: e.code(),
-            message: failure.message.clone(),
-            data: Some(failure.data.clone()),
-        },
-        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
-            code: e.code(),
-            message: failure.message.clone(),
-            data: Some(failure.data.clone()),
-        },
+        ref e @ (Error::RemoteMachine(ref failure) | Error::ProviderProfile(ref failure)) => {
+            RpcErr {
+                code: e.code(),
+                message: failure.message.clone(),
+                data: Some(failure.data.clone()),
+            }
+        }
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
         // category so clients stop showing a bare "Internal error"

@@ -34,8 +34,6 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::common;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
-/// The head id the machine's executor credential is minted for; the head's
-/// node registration is pre-enrolled under it.
 
 fn wait() -> Duration {
     common::test_timeout(Duration::from_secs(60))

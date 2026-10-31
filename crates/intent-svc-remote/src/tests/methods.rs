@@ -145,9 +145,12 @@ async fn an_unreachable_machine_saves_nothing_and_names_the_routes_tried() {
         None
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await
+        .is_err(),
         "nothing is announced"
     );
 }
