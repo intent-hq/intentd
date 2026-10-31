@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -22,7 +23,6 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -45,44 +45,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    // Listener shutdown retires every live connection, and the resulting
-    // `*.retired` notifications share the priority lane with the control
-    // reply, so they may arrive first (intent-hq/intent#8199). Correlate by
-    // `id` like the shipped CLI (`intentd::client::exchange`) does.
-    timeout(common::rpc_read_timeout(), async {
-        loop {
-            let mut buf = String::new();
-            let n = reader.read_line(&mut buf).await.expect("read uds response");
-            assert!(
-                n > 0,
-                "UDS RPC {method} (id {id}): daemon closed the connection without responding"
-            );
-            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
-            if frame.get("id") == Some(&json!(id)) {
-                return frame;
-            }
-            assert!(
-                frame.get("id").is_none() && frame["method"].is_string(),
-                "UDS RPC {method} (id {id}): unexpected non-notification frame {frame}"
-            );
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
 }
 
 #[derive(Debug)]
