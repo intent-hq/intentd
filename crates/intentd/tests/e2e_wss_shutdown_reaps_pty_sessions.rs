@@ -59,12 +59,30 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    // Listener shutdown retires every live connection, and the resulting
+    // `*.retired` notifications share the priority lane with the control
+    // reply, so they may arrive first (intent-hq/intent#8199). Correlate by
+    // `id` like the shipped CLI (`intentd::client::exchange`) does.
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            let mut buf = String::new();
+            let n = reader.read_line(&mut buf).await.expect("read uds response");
+            assert!(
+                n > 0,
+                "UDS RPC {method} (id {id}): daemon closed the connection without responding"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame.get("id") == Some(&json!(id)) {
+                return frame;
+            }
+            assert!(
+                frame.get("id").is_none() && frame["method"].is_string(),
+                "UDS RPC {method} (id {id}): unexpected non-notification frame {frame}"
+            );
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
 }
 
 #[derive(Debug)]
@@ -397,7 +415,11 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
     let started_at = Instant::now();
     let shutdown = uds_rpc(&socket, 5, "system.shutdown", json!({})).await;
-    assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
+    assert_eq!(
+        shutdown["result"].get("ok"),
+        Some(&json!(true)),
+        "system.shutdown reply: {shutdown}"
+    );
 
     // Both stragglers must be gone within the bounded sweep: scripts are
     // flagged user-stopped synchronously, then one concurrent kill-all covers
