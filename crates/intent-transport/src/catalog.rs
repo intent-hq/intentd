@@ -1106,7 +1106,12 @@ pub fn node_mode_may_call(method: &str) -> bool {
 /// the JSON-RPC socket (gated by [`NODE_MODE_METHODS`]) and the executor
 /// link. The guest invite endpoint and the loopback preview tunnel belong to
 /// the orchestration that node mode turns off and are refused with `403`.
-pub const NODE_MODE_HTTP_PATHS: &[&str] = &["/health", "/node/git", "/node/link", "/ws"];
+pub const NODE_MODE_HTTP_PATHS: &[&str] = &[
+    "/health",
+    crate::node_link::GIT_PATH,
+    crate::node_link::LINK_PATH,
+    "/ws",
+];
 
 /// Whether a daemon in node mode serves the HTTP `path`.
 #[must_use]

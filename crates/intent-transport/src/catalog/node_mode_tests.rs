@@ -178,7 +178,12 @@ fn node_mode_lookup_denies_by_default() {
 
 #[test]
 fn node_mode_http_paths_keep_rpc_health_and_executor_link() {
-    for path in ["/health", "/ws", "/node/link", "/node/git"] {
+    for path in [
+        "/health",
+        "/ws",
+        crate::node_link::LINK_PATH,
+        crate::node_link::GIT_PATH,
+    ] {
         assert!(node_mode_serves_path(path), "{path} must be served");
     }
     for path in ["/invite", "/tunnel", "/", "/node", "/node/other", "/ws/"] {
