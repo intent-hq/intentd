@@ -4,21 +4,21 @@
     "cliPackage": "@anthropic-ai/claude-code",
     "package": {
       "dependencies": {
-        "@agentclientprotocol/sdk": "2.0.1",
-        "@anthropic-ai/claude-agent-sdk": "0.3.309",
+        "@agentclientprotocol/sdk": "2.1.0",
+        "@anthropic-ai/claude-agent-sdk": "0.3.312",
         "diff": "9.0.0",
         "zod": "4.6.7"
       },
       "name": "@agentclientprotocol/claude-agent-acp",
       "optionalDependencies": {},
       "peerDependencies": {},
-      "version": "0.95.0"
+      "version": "0.99.1"
     },
     "pinConstant": "CLAUDE_AGENT_ACP_NPX_PACKAGE",
     "runtime": {
-      "claudeCodeVersion": "2.1.309",
+      "claudeCodeVersion": "2.1.312",
       "name": "@anthropic-ai/claude-agent-sdk",
-      "version": "0.3.309"
+      "version": "0.3.312"
     },
     "runtimePackage": "@anthropic-ai/claude-agent-sdk",
     "runtimeVersionField": "claudeCodeVersion"
