@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use intent_core::agent_runtime::AgentRuntime;
 use intent_core::placement::AgentPlacement;
 use intent_core::placement::PlatformAvailability;
-use intent_core::remote_launch::{RemoteLaunchRequest, RemotePlacementView};
+use intent_core::remote_launch::{RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView};
 use intent_core::transfer::TransferPlan;
 
 use intent_core::execution::HostExecutionContext;
@@ -1209,21 +1209,32 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     /// `None` when no node is configured.
     fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>>;
 
-    /// Check that an agent with `placement` can start in `workspace_id` now,
-    /// before anything is created, and resolve where it would run.
+    /// Check that an agent with `placement` and `needs` (its provider,
+    /// model and whether a profile is sent) can start in `workspace_id`
+    /// now, before anything is created, and resolve where it would run.
     ///
     /// # Errors
     ///
     /// [`Error::PlacementUnavailable`] when no node matches the platform or
-    /// has capacity (or no node is configured); [`Error::InvalidParams`] for
-    /// an unsupported placement or a workspace without a commit to start
-    /// from.
+    /// has capacity (or no node is configured); [`Error::ModelUnavailable`]
+    /// when no machine offers the provider and model;
+    /// [`Error::MachineUpdateRequired`] for a version gap;
+    /// [`Error::InvalidParams`] for an unsupported placement or a workspace
+    /// without a commit to start from.
     fn admit<'a>(
         &'a self,
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
         placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>>;
+
+    /// Whether this port places agents on exposed machines (the backend
+    /// side of `remoteMachines.*`), which the `remoteMachines` capability
+    /// requires. `false` by default.
+    fn manages_machines(&self) -> bool {
+        false
+    }
 
     /// Place the created agent on the node: record it on the lease and
     /// write its `base` ref.
@@ -1297,6 +1308,7 @@ impl RemoteLaunchPort for UnavailableRemoteLaunch {
         _svc: &'a Services,
         _workspace_id: &'a WorkspaceId,
         placement: &'a AgentPlacement,
+        _needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
             let failure =
@@ -2397,7 +2409,10 @@ mod tests {
 
         let placement: AgentPlacement =
             serde_json::from_str(r#"{"target":"remote","os":"linux"}"#).unwrap();
-        let admitted = port.admit(&svc, &WorkspaceId::new(), &placement).await;
+        let needs = intent_core::remote_launch::RemoteLaunchNeeds::default();
+        let admitted = port
+            .admit(&svc, &WorkspaceId::new(), &placement, &needs)
+            .await;
         let Err(Error::PlacementUnavailable(failure)) = admitted else {
             panic!("expected placement-unavailable, got {admitted:?}");
         };

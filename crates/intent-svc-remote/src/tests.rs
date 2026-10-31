@@ -70,7 +70,8 @@ fn tuning() -> Tuning {
     }
 }
 
-/// A machine report: macOS on Apple silicon with two agent slots.
+/// A machine report observed now: macOS on Apple silicon with two agent
+/// slots and the mock provider signed in.
 fn capabilities(running: u32) -> MachineCapabilities {
     let mut capabilities = MachineCapabilities::new(
         AgentPlatform {
@@ -79,9 +80,18 @@ fn capabilities(running: u32) -> MachineCapabilities {
         },
         "machine-test",
         2,
-        "2026-10-30T00:00:00Z",
+        intent_core::now_iso(),
     );
     capabilities.capacity.running_agents = running;
+    capabilities
+        .providers
+        .push(intent_core::node_link::ProviderCapability {
+            id: "mock".into(),
+            visible: true,
+            status: intent_core::node_link::ProviderStatus::SignedIn,
+            models: vec!["mock-model".into()],
+            models_stale: false,
+        });
     capabilities
 }
 

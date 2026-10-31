@@ -123,6 +123,20 @@ impl PlacementError {
     }
 }
 
+/// What a remote launch needs from the machine it is placed on, for
+/// placement across exposed machines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteLaunchNeeds {
+    /// The base provider id the machines report (`claude-code`, `codex`),
+    /// without a profile suffix.
+    pub provider: String,
+    /// The requested model; `None` for the provider's default.
+    pub model: Option<String>,
+    /// The launch sends a selected profile's environment, so the machine's
+    /// own sign-in does not apply.
+    pub with_profile: bool,
+}
+
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an
 /// agent placed on a node, computed when they change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

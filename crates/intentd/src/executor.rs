@@ -55,6 +55,9 @@ pub(crate) trait MachineReport: Send + Sync {
     fn routes(&self) -> (Vec<String>, Option<String>);
     /// Observe the providers and routes again.
     fn refresh(&self) -> intent_core::BoxFuture<'_, ()>;
+    /// Before the first full report: fill the provider list with what is
+    /// cheap to know (launch resolution only). Never blocks for long.
+    fn prime(&self) {}
     /// A launch without a profile failed because `provider`'s default
     /// account is not signed in.
     fn launch_auth_failed(&self, provider: &str);
@@ -194,6 +197,15 @@ impl ExecutorService {
         let was = self
             .was_enabled
             .swap(enabled, std::sync::atomic::Ordering::SeqCst);
+        if !was && enabled {
+            // A backend may bind right away: report what is cheap to know
+            // now and observe the providers fully, not at the next periodic
+            // refresh.
+            self.deps.report.prime();
+            let report = self.deps.report.clone();
+            // caller-binding: allow — the executor service's report refresh on enable
+            tokio::spawn(async move { report.refresh().await });
+        }
         if was && !enabled {
             tracing::info!("executor: remote agents disabled; closing live executor links");
             if let Some(links) = self.links.get().and_then(std::sync::Weak::upgrade) {
@@ -741,6 +753,7 @@ impl MachineReport for DaemonReport {
 
     fn refresh(&self) -> intent_core::BoxFuture<'_, ()> {
         Box::pin(async move {
+            self.prime();
             let _single = self.refreshing.lock().await;
             let seen = lock(&self.auth_failures).clone();
             let mut providers = self.services.executor_provider_capabilities(&seen).await;
@@ -759,6 +772,16 @@ impl MachineReport for DaemonReport {
                 cache.2 = routes.tc_address;
             }
         })
+    }
+
+    /// The full report can take minutes (sign-in probes, model listing
+    /// through provider adapters); until the first one lands, report what
+    /// each provider's launch resolution says.
+    fn prime(&self) {
+        let mut cache = lock(&self.cache);
+        if cache.0.is_empty() {
+            cache.0 = self.services.executor_provider_launch_statuses();
+        }
     }
 
     fn launch_auth_failed(&self, provider: &str) {

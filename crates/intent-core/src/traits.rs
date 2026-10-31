@@ -53,7 +53,8 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// Whether `client.hello` advertises `remoteMachines: 1`: this daemon
     /// is a backend that can place agents on exposed machines, which needs
-    /// `experimental.remoteAgents` on and node mode off. `false` by default.
+    /// the remote feature, `experimental.remoteAgents` on and node mode off.
+    /// `false` by default.
     fn remote_machines_capability(&self) -> bool {
         false
     }

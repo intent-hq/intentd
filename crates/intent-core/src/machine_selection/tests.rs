@@ -738,3 +738,66 @@ fn help_caps_models_machines_and_bytes() {
     assert!(listed < 8 && listed > 0, "{listed}");
     assert!(text.contains(&format!("- … {} more not shown", 8 - listed)));
 }
+
+#[test]
+fn a_requested_model_matches_its_listed_id_or_an_alias_of_it() {
+    for (listed, requested, expected) in [
+        ("claude-opus-4-1", "claude-opus-4-1", true),
+        ("claude-opus-4-1", "Claude-Opus-4-1", true),
+        ("claude-opus-4-1", "opus", true),
+        ("claude-opus-4-1", "opus-4-1", true),
+        ("claude-opus-4-1", "opus-4", true),
+        ("claude-opus-4-1", "sonnet", false),
+        ("claude-opus-4-1", "opus-4-5", false),
+        ("gpt-5-codex", "gpt-5", true),
+        ("gpt-5", "gpt-5-codex", false),
+        ("gpt-5", "", false),
+    ] {
+        assert_eq!(
+            model_listed(listed, requested),
+            expected,
+            "{listed} / {requested}"
+        );
+    }
+}
+
+/// A machine's welcome right after remote agents were turned on carries no
+/// providers yet; placement asks for a fresh report instead of refusing.
+#[tokio::test]
+async fn a_report_without_providers_is_refreshed() {
+    let fake = Fake::new(vec![machine("early", Some(report(MAC, FRESH, vec![])))])
+        .on_refresh("early", Ok(report(MAC, NOW, claude(&["opus"]))));
+    let placement = remote();
+    assert_eq!(
+        select(&fake, request(&placement, Some("opus")))
+            .await
+            .unwrap(),
+        ["early"]
+    );
+    assert_eq!(fake.refreshed(), ["early"]);
+}
+
+/// A reachable machine that is slow to report keeps its cached report: an
+/// empty one gives a retryable `model-unavailable` with status unknown, a
+/// usable one still takes the agent.
+#[tokio::test]
+async fn a_slow_report_keeps_the_cached_one_and_is_retryable() {
+    let fake = Fake::new(vec![machine("early", Some(report(MAC, FRESH, vec![])))])
+        .on_refresh("early", Err(RefreshFailure::Slow));
+    let placement = remote();
+    let failure = model_failure(select(&fake, request(&placement, None)).await);
+    assert!(failure.retryable);
+    assert_eq!(failure.machines[0].status, ProviderStatus::Unknown);
+
+    let fake = Fake::new(vec![machine(
+        "stale",
+        Some(report(MAC, STALE, claude(&["opus"]))),
+    )])
+    .on_refresh("stale", Err(RefreshFailure::Slow));
+    assert_eq!(
+        select(&fake, request(&placement, Some("opus")))
+            .await
+            .unwrap(),
+        ["stale"]
+    );
+}

@@ -14,12 +14,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use intent_core::machine_selection::{
+    exposed_machines_help, select_machines, PlacementMachines, PlacementRequest, RefreshFailure,
+};
+use intent_core::machines::ExposedMachine;
+use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{LaunchCommand, LaunchProfileEnv};
 use intent_core::placement::{
-    AgentPlacement, PlacementCheckout, PlacementTarget, PlatformAvailability,
+    AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
+    PlacementUnavailableReason, PlatformAvailability,
 };
 use intent_core::remote_launch::{
-    EffectiveIsolation, RemoteAgentRecord, RemoteLaunchRequest, RemotePlacementView,
+    EffectiveIsolation, RemoteAgentRecord, RemoteLaunchNeeds, RemoteLaunchRequest,
+    RemotePlacementView,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote};
@@ -103,64 +110,130 @@ async fn machines_availability(svc: &Services) -> Result<PlatformAvailability> {
     Ok(PlatformAvailability::new(supported, available, now))
 }
 
-/// The discovery text: the exposed machines, their platforms, and how to
-/// place an agent on one.
+/// The exposed machines as placement sees them: the stored rows with
+/// their last reports, refreshed on demand over the machine's link.
+struct ExposedMachines<'a> {
+    svc: &'a Services,
+    feature: &'a crate::RemoteFeature,
+}
+
+/// What a failed refresh means for placement: a version gap, a revoked
+/// credential, a report that did not come in time over a live link, or
+/// anything else (no route, a closed link) as unreachable.
+fn refresh_failure(error: Error) -> RefreshFailure {
+    match error {
+        Error::MachineUpdateRequired(update) => RefreshFailure::UpdateRequired(update),
+        ref timeout
+            if intent_transport::node_link::error_code(timeout)
+                == Some(intent_transport::node_link::codes::TIMEOUT) =>
+        {
+            RefreshFailure::Slow
+        }
+        Error::RemoteMachine(failure)
+            if failure.data.get("code").and_then(serde_json::Value::as_str)
+                == Some(crate::connect::MACHINE_REVOKED) =>
+        {
+            RefreshFailure::Revoked
+        }
+        _ => RefreshFailure::Unreachable,
+    }
+}
+
+impl PlacementMachines for ExposedMachines<'_> {
+    /// The stored rows, each report's running count raised to the agents
+    /// this backend has attached there since (the report can be up to an
+    /// hour old).
+    fn machines(&self) -> BoxFuture<'_, Result<Vec<ExposedMachine>>> {
+        Box::pin(async move {
+            let mut rows = self.svc.store().list_exposed_machines().await?;
+            for row in &mut rows {
+                let attached = self
+                    .feature
+                    .running_node(&row.id)
+                    .map_or(0, |node| u32::try_from(node.running()).unwrap_or(u32::MAX));
+                if let Some(capabilities) = row.capabilities.as_mut() {
+                    let running = &mut capabilities.capacity.running_agents;
+                    *running = (*running).max(attached);
+                }
+            }
+            Ok(rows)
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        machine_id: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<MachineCapabilities, RefreshFailure>> {
+        Box::pin(async move {
+            let node = self
+                .feature
+                .node(self.svc, machine_id)
+                .await
+                .map_err(refresh_failure)?;
+            node.refresh_capabilities().await.map_err(refresh_failure)
+        })
+    }
+}
+
+/// The discovery text: the exposed machines with their providers, models
+/// and sign-in, and how to place an agent on one.
 async fn help_text(svc: &Services) -> Option<String> {
     if !svc.experimental_remote_agents_enabled() {
         return None;
     }
     let rows = svc.store().list_exposed_machines().await.ok()?;
-    if rows.is_empty() {
-        return None;
-    }
     let feature = svc.remote_feature();
-    let machines: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            let connected = feature
-                .as_ref()
-                .and_then(|feature| feature.running_node(&row.id))
-                .is_some_and(|node| node.status().connected);
-            let platform = row
-                .platform
-                .map_or_else(|| "unknown platform".to_owned(), |p| p.to_string());
-            let state = if connected {
-                "connected".to_owned()
-            } else {
-                row.state.as_str().to_owned()
-            };
-            format!(
-                "\"{}\" (nodeId `{}`, {platform}, {state})",
-                row.name, row.id
-            )
-        })
-        .collect();
-    Some(format!(
-        "Remote placement (experimental): exposed machines: {}.\n\
-         To run an agent on one, pass `placement: {{ target: \"remote\", nodeId }}` (or `os` / `arch` instead of `nodeId`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, {{ create: {{ placement }} }})`. A placement no machine can take fails with `placement-unavailable`, listing what is available.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (account folders such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` must exist on the machine, `~` meaning the machine's home), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree).",
-        machines.join(", ")
-    ))
+    exposed_machines_help(&rows, &|id| {
+        feature
+            .and_then(|feature| feature.running_node(id))
+            .is_some_and(|node| node.status().connected)
+    })
 }
 
-/// The exposed machine a placement names, or the first whose cached
-/// platform matches it.
-async fn choose_machine(
+/// The refusal when no chosen machine could be reached at admission: its
+/// version gap or revocation for a single candidate, else
+/// `machine-unreachable`.
+async fn connect_failure(
     svc: &Services,
     placement: &AgentPlacement,
-) -> Result<Option<intent_core::machines::ExposedMachine>> {
-    let rows = svc.store().list_exposed_machines().await?;
-    if let Some(node_id) = &placement.node_id {
-        return Ok(rows.into_iter().find(|row| row.id == *node_id));
+    mut failures: Vec<(ExposedMachine, Error)>,
+) -> Result<Error> {
+    let availability = machines_availability(svc).await?;
+    let offline = PlatformAvailability::new(
+        availability.supported_platforms,
+        Vec::new(),
+        intent_core::now_iso(),
+    );
+    if failures.len() == 1 {
+        let (row, error) = failures.remove(0);
+        let reason = match refresh_failure(error) {
+            RefreshFailure::UpdateRequired(update) => {
+                return Ok(Error::MachineUpdateRequired(update));
+            }
+            RefreshFailure::Revoked => PlacementUnavailableReason::MachineRevoked,
+            RefreshFailure::Unreachable | RefreshFailure::Slow => {
+                PlacementUnavailableReason::MachineUnreachable
+            }
+        };
+        return Ok(Error::PlacementUnavailable(Box::new(
+            offline.machine_unavailable(
+                placement.clone(),
+                reason,
+                MachineRef {
+                    node_id: row.id,
+                    name: row.name,
+                },
+                None,
+            ),
+        )));
     }
-    Ok(rows.into_iter().find(|row| {
-        !matches!(
-            row.state,
-            RemoteMachineState::Revoked | RemoteMachineState::UpdateRequired
-        ) && row
-            .platform
-            .is_some_and(|platform| placement.matches_platform(platform))
-    }))
+    let failure = offline.unavailable(placement.clone());
+    Ok(Error::PlacementUnavailable(Box::new(
+        PlacementUnavailable {
+            reason: PlacementUnavailableReason::MachineUnreachable,
+            ..failure
+        },
+    )))
 }
 
 impl RemoteLaunchPort for RemoteLaunch {
@@ -177,44 +250,46 @@ impl RemoteLaunchPort for RemoteLaunch {
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
         placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
-            if let Some(node_id) = &placement.node_id {
-                // No exposed machine has that id: nothing matches.
-                if svc.store().get_exposed_machine(node_id).await?.is_none() {
-                    return Err(unavailable(
-                        placement,
-                        PlatformAvailability::none(intent_core::now_iso()),
-                    ));
+            let Some(feature) = svc
+                .remote_feature()
+                .filter(|_| svc.experimental_remote_agents_enabled())
+            else {
+                return Err(unavailable(
+                    placement,
+                    PlatformAvailability::none(intent_core::now_iso()),
+                ));
+            };
+            let source = ExposedMachines { svc, feature };
+            let request = PlacementRequest {
+                placement,
+                provider: &needs.provider,
+                model: needs.model.as_deref(),
+                with_profile: needs.with_profile,
+            };
+            let candidates =
+                select_machines(&source, request, time::OffsetDateTime::now_utc()).await?;
+            // Connect on demand, best candidate first.
+            let mut failures = Vec::new();
+            let mut chosen = None;
+            for row in candidates {
+                let node = feature.node(svc, &row.id).await?;
+                match node.connect().await {
+                    Ok(()) => {
+                        chosen = Some((row, node));
+                        break;
+                    }
+                    Err(error) => failures.push((row, error)),
                 }
             }
-            let (Some(feature), Some(row)) = (
-                svc.remote_feature()
-                    .filter(|_| svc.experimental_remote_agents_enabled()),
-                choose_machine(svc, placement).await?,
-            ) else {
-                return Err(unavailable(placement, machines_availability(svc).await?));
+            let Some((row, node)) = chosen else {
+                return Err(connect_failure(svc, placement, failures).await?);
             };
-            let node = feature.node(svc, &row.id).await?;
-            // Connect on demand; an unreachable machine can take nothing now.
-            if node.connect().await.is_err() {
-                let cached = machines_availability(svc).await?;
-                let offline = PlatformAvailability::new(
-                    cached.supported_platforms,
-                    Vec::new(),
-                    intent_core::now_iso(),
-                );
-                return Err(unavailable(placement, offline));
-            }
             let status = node.status();
-            let availability = node.availability();
-            let platform = availability
-                .available_platforms
-                .iter()
-                .copied()
-                .find(|platform| placement.matches_platform(*platform));
-            let Some(platform) = platform else {
-                return Err(unavailable(placement, availability));
+            let Some(platform) = status.platform.or(row.platform) else {
+                return Err(unavailable(placement, node.availability()));
             };
             let checkout = workspace_checkout(svc, workspace_id).await?;
             let base_commit = blocking(move || node_git::head_commit(&checkout)).await?;
@@ -235,6 +310,10 @@ impl RemoteLaunchPort for RemoteLaunch {
                 base_commit,
             })
         })
+    }
+
+    fn manages_machines(&self) -> bool {
+        true
     }
 
     fn launch<'a>(

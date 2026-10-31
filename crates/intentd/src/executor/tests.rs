@@ -216,6 +216,7 @@ impl MachineLaunch for FixedLaunch {
 /// failures, after which its provider reports `auth-failed`.
 struct FixedReport {
     refreshes: std::sync::atomic::AtomicUsize,
+    primes: std::sync::atomic::AtomicUsize,
     auth_failures: Mutex<Vec<String>>,
 }
 
@@ -241,6 +242,10 @@ impl MachineReport for FixedReport {
         self.refreshes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {})
+    }
+    fn prime(&self) {
+        self.primes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn launch_auth_failed(&self, provider: &str) {
         lock(&self.auth_failures).push(provider.to_owned());
@@ -311,6 +316,7 @@ impl Running {
     ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
+            primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
         });
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1335,5 +1341,40 @@ async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
         .await
         .unwrap();
     assert_eq!(unknown, StopOutcome::NotRunning);
+    node.stop().await;
+}
+
+/// Turning `remoteAgents.enabled` on fills the provider list with what is
+/// cheap to know before anything else (so a backend binding right away
+/// sees the providers) and starts a full report, instead of waiting for
+/// the periodic refresh; turning it off does neither.
+#[tokio::test]
+async fn enabling_remote_agents_primes_and_refreshes_the_report() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    node.enabled.store(false, Ordering::SeqCst);
+    node.service.on_settings_changed().await;
+    let primes = node.report.primes.load(Ordering::SeqCst);
+    let refreshes = node.report.refreshes.load(Ordering::SeqCst);
+
+    node.enabled.store(true, Ordering::SeqCst);
+    node.service.on_settings_changed().await;
+    assert_eq!(
+        node.report.primes.load(Ordering::SeqCst),
+        primes + 1,
+        "primed before returning"
+    );
+    tokio::time::timeout(wait(), async {
+        while node.report.refreshes.load(Ordering::SeqCst) == refreshes {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a full report starts");
+
+    // Already on: a settings change elsewhere does not prime again.
+    node.service.on_settings_changed().await;
+    assert_eq!(node.report.primes.load(Ordering::SeqCst), primes + 1);
     node.stop().await;
 }

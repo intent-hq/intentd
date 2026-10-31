@@ -600,3 +600,216 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         "dirty on head\n"
     );
 }
+
+/// A backend `intentd serve` on `data_dir` with a seeded workspace on
+/// `repo`; its guard, WSS port, pinned client config and workspace id.
+async fn start_backend(
+    data_dir: &Path,
+    repo: &Path,
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
+    std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
+    let ws_id = seed_workspace(data_dir, repo).await;
+    common::enable_ws_api(data_dir);
+    let mut serve = common::hermetic_serve_command(data_dir);
+    serve
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(data_dir.join("head.log")).unwrap(),
+        ));
+    common::hermetic_fixture_identity(&mut serve, data_dir);
+    let guard = common::DaemonGuard::process_only(
+        common::spawn_guarded(&mut serve).expect("spawn intentd serve"),
+    );
+    let status = common::await_wss_status(&data_dir.join("intentd.sock")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    (guard, port, cfg, ws_id)
+}
+
+/// `remoteMachines.add` params for `machine`, named `name`.
+fn add_params(machine: &Machine, name: &str) -> Value {
+    json!({
+        "machineId": machine.daemon_id,
+        "name": name,
+        "hosts": ["127.0.0.1"],
+        "port": machine.port,
+        "fingerprint": machine.fingerprint,
+        "credentialId": machine.credential_id,
+        "token": machine.token,
+    })
+}
+
+/// Placement across two exposed machines over WSS: the `remoteMachines`
+/// capability follows `experimental.remoteAgents`; a named machine takes
+/// the agent; a model no machine lists is `model-unavailable` naming each
+/// machine's models and sign-in status; an unknown `nodeId` is
+/// `machine-unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_chooses_among_exposed_machines() {
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping placement e2e: node not on PATH");
+        return;
+    }
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping placement e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-place-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let hello = json!({ "clientId": "placement-e2e", "name": "Placement E2E" });
+    let off = ok(&mut rpc_ws, 1, "client.hello", hello.clone()).await;
+    assert!(
+        off["server"]["capabilities"]
+            .get("remoteMachines")
+            .is_none(),
+        "{off}"
+    );
+    ok(
+        &mut rpc_ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "experimental.remoteAgents", "value": true }] }),
+    )
+    .await;
+    let mut fresh = connect(port, cfg.clone()).await;
+    let on = ok(&mut fresh, 1, "client.hello", hello).await;
+    assert_eq!(on["server"]["capabilities"]["remoteMachines"], 1, "{on}");
+
+    let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let mut machines = Vec::new();
+    for (i, name) in ["Machine A", "Machine B"].into_iter().enumerate() {
+        let dir = scratch.path().join(format!("node-{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let machine = start_machine(&dir, &backend_id).await;
+        let id = 4 + i64::try_from(i).unwrap();
+        ok(
+            &mut rpc_ws,
+            id,
+            "remoteMachines.add",
+            add_params(&machine, name),
+        )
+        .await;
+        machines.push(machine);
+    }
+    let b_id = machines[1].daemon_id.clone();
+
+    // A named machine takes the agent, never another one.
+    let create = |name: &str, model: &str, placement: Value| {
+        json!({
+            "workspaceId": ws_id, "name": name, "model": model, "provider": "mock",
+            "placement": placement,
+        })
+    };
+    // A machine's first report can take a while after remote agents were
+    // turned on; its refusal is retryable until then.
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 100;
+    let created = loop {
+        id += 1;
+        let response = rpc(
+            &mut rpc_ws,
+            id,
+            "agent.create",
+            create(
+                "On B",
+                "default",
+                json!({ "target": "remote", "nodeId": b_id }),
+            ),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert_eq!(response["error"]["data"]["retryable"], true, "{response}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "machine B never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine observes its providers (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(created["agent"]["nodeId"], b_id.as_str(), "{created}");
+    assert_eq!(created["agent"]["nodeName"], "Machine B", "{created}");
+
+    // Unplaced, either machine can take it.
+    let any = ok(
+        &mut rpc_ws,
+        11,
+        "agent.create",
+        create("Anywhere", "default", json!({ "target": "remote" })),
+    )
+    .await;
+    let chosen = any["agent"]["nodeId"].as_str().unwrap().to_owned();
+    assert!(
+        machines.iter().any(|machine| machine.daemon_id == chosen),
+        "{any}"
+    );
+
+    // A model no machine lists: refused before anything is created.
+    let missing = rpc(
+        &mut rpc_ws,
+        12,
+        "agent.create",
+        create("Missing", "no-such-model", json!({ "target": "remote" })),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    let data = &missing["error"]["data"];
+    assert_eq!(data["code"], "model-unavailable", "{missing}");
+    assert_eq!(data["provider"], "mock");
+    assert_eq!(data["model"], "no-such-model");
+    let listed = data["machines"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{missing}");
+    for machine in listed {
+        assert!(machine["status"].is_string(), "{machine}");
+        assert!(machine["models"].is_array(), "{machine}");
+        assert!(machine["observedAt"].is_string(), "{machine}");
+    }
+    let message = missing["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("isn't available on Machine A") && message.contains("Machine B"),
+        "{message}"
+    );
+
+    // An unknown machine.
+    let unknown = rpc(
+        &mut rpc_ws,
+        13,
+        "agent.create",
+        create(
+            "Unknown",
+            "default",
+            json!({ "target": "remote", "nodeId": "no-such-machine" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        unknown["error"]["data"]["code"], "placement-unavailable",
+        "{unknown}"
+    );
+    assert_eq!(
+        unknown["error"]["data"]["reason"], "machine-unknown",
+        "{unknown}"
+    );
+    assert_eq!(
+        unknown["error"]["data"]["nodeId"], "no-such-machine",
+        "{unknown}"
+    );
+
+    for machine in &machines {
+        assert!(!missing.to_string().contains(&machine.token));
+    }
+}

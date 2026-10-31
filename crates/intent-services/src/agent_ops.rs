@@ -5394,8 +5394,13 @@ impl Services {
             .await?;
         if let Some(placement) = plan.placement.take() {
             plan.remote = Some(
-                self.admit_remote_agent(&workspace_id, &plan.provider, &placement)
-                    .await?,
+                self.admit_remote_agent(
+                    &workspace_id,
+                    &plan.provider,
+                    plan.model.as_deref(),
+                    &placement,
+                )
+                .await?,
             );
         }
         let remote = plan.remote.clone();
@@ -5413,19 +5418,28 @@ impl Services {
     /// written: the documented subset only, a provider selection whose
     /// profile environment resolves (a missing or unselectable profile fails
     /// here, never falling back to the node's own login; the overlay itself
-    /// is resolved again when the agent starts), then the node's platform
-    /// and capacity.
+    /// is resolved again when the agent starts), then a machine that runs
+    /// the platform, offers the provider and `model` and has capacity.
     async fn admit_remote_agent(
         &self,
         workspace_id: &WorkspaceId,
         provider: &str,
+        model: Option<&str>,
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
         placement.check_remote_supported()?;
-        self.resolve_remote_profile_env(provider).await?;
+        let profile = self.resolve_remote_profile_env(provider).await?;
+        let needs = intent_core::remote_launch::RemoteLaunchNeeds {
+            provider: crate::provider_profiles::parse_profile_ref(provider)
+                .map_or(provider, |(base, _)| base)
+                .to_owned(),
+            // The `"default"` sentinel asks for the provider's default.
+            model: model.filter(|model| *model != "default").map(str::to_owned),
+            with_profile: profile.is_some(),
+        };
         self.ports
             .remote_launch()
-            .admit(self, workspace_id, placement)
+            .admit(self, workspace_id, placement, &needs)
             .await
     }
 

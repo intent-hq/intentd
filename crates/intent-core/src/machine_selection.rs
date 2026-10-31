@@ -34,6 +34,9 @@ pub enum RefreshFailure {
     Revoked,
     /// The machine and this backend share no link protocol version.
     UpdateRequired(Box<MachineUpdateRequired>),
+    /// The machine is reachable but did not report in time (its first
+    /// report can take a while); its cached report, if any, is used.
+    Slow,
 }
 
 /// The backend's view of its exposed machines.
@@ -74,8 +77,8 @@ pub fn report_is_stale(observed_at: Option<&str>, now: OffsetDateTime) -> bool {
 /// installed, the machine's own sign-in usable (unless a profile is
 /// selected), model listed and free capacity; ordered by fewest running
 /// agents, then most recently used. Machines without a report, with one
-/// older than [`REPORT_MAX_AGE`] or last seen needing an update are
-/// refreshed first. `placement.nodeId` names the only candidate.
+/// listing no providers yet or older than [`REPORT_MAX_AGE`], or last seen
+/// needing an update are refreshed first. `placement.nodeId` names the only candidate.
 ///
 /// # Errors
 ///
@@ -83,7 +86,9 @@ pub fn report_is_stale(observed_at: Option<&str>, now: OffsetDateTime) -> bool {
 /// model; [`Error::MachineUpdateRequired`] for a version gap;
 /// [`Error::PlacementUnavailable`] otherwise (`unsupported-platform`,
 /// `no-capacity`, `machine-unknown`, `machine-revoked`,
-/// `machine-unreachable`); the source's own error when it cannot list.
+/// `machine-unreachable`); the source's own error when it cannot list. A
+/// machine that answers too slowly keeps its cached report, and a refusal
+/// it decides is retryable.
 pub async fn select_machines(
     source: &dyn PlacementMachines,
     request: PlacementRequest<'_>,
@@ -139,11 +144,17 @@ pub async fn select_machines(
     // Refresh what placement cannot decide on, keeping the failures.
     let mut reported = Vec::new();
     let mut failed: Vec<(ExposedMachine, RefreshFailure)> = Vec::new();
+    let mut slow = false;
     for mut row in candidates {
         let maybe_matches = row
             .platform
             .is_none_or(|platform| placement.matches_platform(platform));
-        let must_refresh = row.capabilities.is_none()
+        // A report without providers was sent before the machine observed
+        // them (its welcome right after remote agents were turned on).
+        let must_refresh = row
+            .capabilities
+            .as_ref()
+            .is_none_or(|caps| caps.providers.is_empty())
             || row.state == RemoteMachineState::UpdateRequired
             || report_is_stale(row.observed_at.as_deref(), now);
         if maybe_matches && must_refresh {
@@ -156,6 +167,7 @@ pub async fn select_machines(
                         row.state = RemoteMachineState::Disconnected;
                     }
                 }
+                Err(RefreshFailure::Slow) => slow = true,
                 Err(failure) => {
                     failed.push((row, failure));
                     continue;
@@ -186,7 +198,8 @@ pub async fn select_machines(
         .filter(|row| offers(row, &request))
         .collect();
     if offering.is_empty() {
-        let retryable = !failed.is_empty()
+        let retryable = slow
+            || !failed.is_empty()
             || matching.iter().any(|row| {
                 provider_of(row, request.provider).is_some_and(|provider| provider.models_stale)
             });
@@ -341,10 +354,34 @@ fn provider_usable(status: ProviderStatus, with_profile: bool) -> bool {
 fn offers(row: &ExposedMachine, request: &PlacementRequest<'_>) -> bool {
     provider_of(row, request.provider).is_some_and(|provider| {
         provider_usable(provider.status, request.with_profile)
-            && request
-                .model
-                .is_none_or(|model| provider.models.iter().any(|listed| listed == model))
+            && request.model.is_none_or(|model| {
+                provider
+                    .models
+                    .iter()
+                    .any(|listed| model_listed(listed, model))
+            })
     })
+}
+
+/// Whether `requested` names the listed model id: the same id ignoring
+/// case, or its words in order within the id, as provider aliases do
+/// (`opus` and `opus-4-1` name `claude-opus-4-1`).
+#[must_use]
+pub fn model_listed(listed: &str, requested: &str) -> bool {
+    if listed.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    let words = |id: &str| -> Vec<String> {
+        id.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let (listed, requested) = (words(listed), words(requested));
+    !requested.is_empty()
+        && listed
+            .windows(requested.len())
+            .any(|window| window == requested.as_slice())
 }
 
 fn machine_models(row: &ExposedMachine, provider: &str) -> Option<MachineModels> {
@@ -353,7 +390,22 @@ fn machine_models(row: &ExposedMachine, provider: &str) -> Option<MachineModels>
         node_id: row.id.clone(),
         name: row.name.clone(),
         platform: row.platform?,
-        status: offered.map_or(ProviderStatus::CliMissing, |provider| provider.status),
+        // A report listing no providers at all predates the machine's
+        // first look at them.
+        status: offered.map_or_else(
+            || {
+                if row
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.providers.is_empty())
+                {
+                    ProviderStatus::Unknown
+                } else {
+                    ProviderStatus::CliMissing
+                }
+            },
+            |provider| provider.status,
+        ),
         models: offered
             .map(|provider| provider.models.clone())
             .unwrap_or_default(),

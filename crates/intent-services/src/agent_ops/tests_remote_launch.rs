@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use intent_core::placement::{AgentPlacement, PlatformAvailability};
 use intent_core::remote_launch::{
-    EffectiveIsolation, RemoteLaunchRequest, RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY,
+    EffectiveIsolation, RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView,
+    REMOTE_PLACEMENT_METADATA_KEY,
 };
 use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, BoxFuture, Error, WorkspaceId};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 #[derive(Default)]
 struct FakeRemote {
     launched: Mutex<Vec<RemoteLaunchRequest>>,
+    needs: Mutex<Vec<RemoteLaunchNeeds>>,
     fail_launch: bool,
 }
 
@@ -56,7 +58,9 @@ impl RemoteLaunchPort for FakeRemote {
         _svc: &'a Services,
         _workspace_id: &'a WorkspaceId,
         placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, intent_core::Result<RemotePlacementView>> {
+        self.needs.lock().unwrap().push(needs.clone());
         Box::pin(async move { Ok(view(placement)) })
     }
 
@@ -139,6 +143,16 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
     assert!(
         notice.contains("Uncommitted changes in the workspace are not carried"),
         "{notice}"
+    );
+
+    // Placement sees the provider and model, and that no profile is sent.
+    assert_eq!(
+        remote.needs.lock().unwrap().clone(),
+        [RemoteLaunchNeeds {
+            provider: "auggie".into(),
+            model: Some("sonnet4.5".into()),
+            with_profile: false,
+        }]
     );
 
     let id = AgentId::from(agent["id"].as_str().unwrap());
@@ -238,6 +252,7 @@ async fn unsupported_placements_are_refused_before_any_effect() {
         .admit_remote_agent(
             &ws,
             "claude-code@work",
+            None,
             &placement(json!({"target": "remote"})),
         )
         .await;
@@ -268,10 +283,25 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
     .expect("create profile");
     let reference = created["profile"]["providerRef"].as_str().unwrap();
     let view = svc
-        .admit_remote_agent(&ws, reference, &placement(json!({"target": "remote"})))
+        .admit_remote_agent(
+            &ws,
+            reference,
+            Some("gpt-5"),
+            &placement(json!({"target": "remote"})),
+        )
         .await
         .expect("a resolvable profile is admitted");
     assert_eq!(view.node_id, "node-1");
+    // The machines report the base provider; the profile's environment is
+    // sent, so their own sign-in does not apply.
+    assert_eq!(
+        remote.needs.lock().unwrap().clone(),
+        [RemoteLaunchNeeds {
+            provider: "codex".into(),
+            model: Some("gpt-5".into()),
+            with_profile: true,
+        }]
+    );
 }
 
 /// A launch that fails after the agent exists leaves it placed (so it can
@@ -463,4 +493,22 @@ async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
     svc.agent_send_message_op(id.clone(), "look".into(), None, Some(json!([])), None, None)
         .await
         .unwrap();
+}
+
+/// The `"default"` model sentinel asks the machines for no particular
+/// model.
+#[tokio::test]
+async fn the_default_model_sentinel_requests_no_model() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    svc.admit_remote_agent(
+        &ws,
+        "auggie",
+        Some("default"),
+        &placement(json!({"target": "remote"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(remote.needs.lock().unwrap()[0].model, None);
 }

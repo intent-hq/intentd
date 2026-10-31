@@ -347,6 +347,7 @@ impl crate::feature_ports::RemoteLaunchPort for RemoteRuntimes {
         _svc: &'a Services,
         _workspace_id: &'a WorkspaceId,
         _placement: &'a intent_core::placement::AgentPlacement,
+        _needs: &'a intent_core::remote_launch::RemoteLaunchNeeds,
     ) -> BoxFuture<'a, intent_core::Result<intent_core::remote_launch::RemotePlacementView>> {
         Box::pin(async { Ok(remote_view()) })
     }
