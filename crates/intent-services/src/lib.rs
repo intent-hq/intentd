@@ -19090,6 +19090,10 @@ impl WorkspaceApi for Services {
         self.node_mode
     }
 
+    fn remote_machines_capability(&self) -> bool {
+        !self.node_mode && self.effective_settings().experimental.remote_agents
+    }
+
     fn desktop_agent_call(
         &self,
         workspace: WorkspaceId,

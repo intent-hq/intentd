@@ -133,6 +133,33 @@ pub(crate) fn server_json(
     server
 }
 
+/// Add the capabilities that depend on the running daemon to a successful
+/// hello `frame`: `startupStatus: 1` when the full composition tracks
+/// startup, `remoteMachines: 1` when this backend places agents on exposed
+/// machines (`experimental.remoteAgents` on, not node mode).
+pub(crate) fn with_runtime_capabilities(
+    frame: Option<String>,
+    startup_status: bool,
+    remote_machines: bool,
+) -> Option<String> {
+    if !startup_status && !remote_machines {
+        return frame;
+    }
+    frame.map(|frame| {
+        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
+        if value.get("result").is_some() {
+            let capabilities = &mut value["result"]["server"]["capabilities"];
+            if startup_status {
+                capabilities["startupStatus"] = json!(1);
+            }
+            if remote_machines {
+                capabilities["remoteMachines"] = json!(1);
+            }
+        }
+        value.to_string()
+    })
+}
+
 /// A deliberately compiled test host can exercise the real negotiation path.
 /// This signal supplies compatibility only, never source or recipient authority.
 fn connection_server_json(is_local: bool, version: &str) -> Value {

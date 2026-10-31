@@ -991,18 +991,11 @@ async fn process_captured_frame(
                 )
                 .await;
                 bound = outcome.bound;
-                if control.and_then(|c| c.startup_status()).is_some() {
-                    outcome.frame.map(|frame| {
-                        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
-                        if value.get("result").is_some() {
-                            value["result"]["server"]["capabilities"]["startupStatus"] =
-                                serde_json::json!(1);
-                        }
-                        value.to_string()
-                    })
-                } else {
-                    outcome.frame
-                }
+                client::with_runtime_capabilities(
+                    outcome.frame,
+                    control.and_then(|c| c.startup_status()).is_some(),
+                    api.remote_machines_capability(),
+                )
             })
             .await;
             // REV-2: bind the hello'd identity onto the registry entry; the
