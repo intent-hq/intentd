@@ -100,14 +100,15 @@ pub(super) struct PendingAck {
 }
 
 impl PendingAck {
-    /// Wait until the stop is applied, then build its `stopAck`.
-    pub(super) async fn ack(self) -> LinkFrame {
-        let outcome = self.wait.wait().await;
-        LinkFrame::StopAck {
+    /// Wait until the stop is applied, then build its `stopAck`; `None`
+    /// when it may not be acknowledged (the exit record was not journaled).
+    pub(super) async fn ack(self) -> Option<LinkFrame> {
+        let outcome = self.wait.wait().await?;
+        Some(LinkFrame::StopAck {
             stop_id: self.stop_id,
             agent_id: self.agent_id,
             outcome,
-        }
+        })
     }
 }
 
@@ -241,10 +242,11 @@ pub(super) async fn serve_link(
                         let link = link.clone();
                         // caller-binding: allow — acknowledges one applied stop on its link
                         tokio::spawn(async move {
-                            let ack = pending.ack().await;
-                            // A link that closed meanwhile loses the ack; the
-                            // backend resends the stop on its next link.
-                            let _ = link.send(&ack).await;
+                            // No ack, or a link that closed meanwhile: the
+                            // backend resends the stop.
+                            if let Some(ack) = pending.ack().await {
+                                let _ = link.send(&ack).await;
+                            }
                         });
                     }
                     Applied::Done | Applied::Stale => {}

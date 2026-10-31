@@ -316,10 +316,10 @@ async fn a_current_stop_yields_an_acknowledgement_for_its_own_id() {
     };
     assert_eq!(
         pending.ack().await,
-        LinkFrame::StopAck {
+        Some(LinkFrame::StopAck {
             stop_id,
             agent_id: AgentId::from("ghost"),
             outcome: StopOutcome::NotRunning,
-        }
+        })
     );
 }

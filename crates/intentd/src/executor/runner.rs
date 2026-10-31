@@ -169,7 +169,17 @@ struct State {
     /// Agents that left `agents` (their process tree is gone and their slot
     /// free) whose exit record is not journaled yet, so a stop arriving in
     /// that window still waits for the record.
-    exiting: HashMap<AgentId, watch::Receiver<bool>>,
+    exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
+}
+
+/// Whether an agent's exit record reached the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitRecord {
+    /// Not appended yet.
+    Pending,
+    Journaled,
+    /// The append failed, or the pump ended without one: it never will be.
+    Lost,
 }
 
 /// What [`Runner::stop`] leaves to wait for before the stop may be
@@ -180,25 +190,32 @@ pub(super) enum StopWait {
     /// Resolves with `outcome` once the agent's exit record is journaled.
     Pending {
         outcome: StopOutcome,
-        journaled: watch::Receiver<bool>,
+        journaled: watch::Receiver<ExitRecord>,
     },
 }
 
 impl StopWait {
     /// Wait until the stop is applied: the agent's process tree is gone, its
-    /// shared slot is free and its exit record is journaled.
-    pub(super) async fn wait(self) -> StopOutcome {
+    /// shared slot is free and its exit record is journaled. `None` when the
+    /// exit record could not be journaled: the stop must not be
+    /// acknowledged (the backend resends it, and the resend finds the agent
+    /// not running).
+    pub(super) async fn wait(self) -> Option<StopOutcome> {
         match self {
-            Self::NotRunning => StopOutcome::NotRunning,
+            Self::NotRunning => Some(StopOutcome::NotRunning),
             Self::Pending {
                 outcome,
                 mut journaled,
-            } => {
-                // A closed channel means the pump is gone: nothing more is
-                // journaled for the agent.
-                let _ = journaled.wait_for(|done| *done).await;
-                outcome
-            }
+            } => match journaled
+                .wait_for(|state| *state != ExitRecord::Pending)
+                .await
+                .map(|state| *state)
+            {
+                Ok(ExitRecord::Journaled) => Some(outcome),
+                // A closed channel without a settled state: the pump is
+                // gone and never journaled the exit.
+                Ok(ExitRecord::Pending | ExitRecord::Lost) | Err(_) => None,
+            },
         }
     }
 }
@@ -217,8 +234,8 @@ struct Agent {
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
-    /// Turns true once the agent's exit record is journaled.
-    journaled: watch::Receiver<bool>,
+    /// Whether the agent's exit record reached the journal.
+    journaled: watch::Receiver<ExitRecord>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
     /// Whether a turn is running; refuses a second one.
     busy: Mutex<bool>,
@@ -663,7 +680,7 @@ impl Runner {
         }
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
-        let (journaled_tx, journaled_rx) = watch::channel(false);
+        let (journaled_tx, journaled_rx) = watch::channel(ExitRecord::Pending);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let agent = Arc::new(Agent {
@@ -736,7 +753,7 @@ impl Runner {
         (activity, redactor): (ActivityTracker, Arc<Redactor>),
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
-        journaled: watch::Sender<bool>,
+        journaled: watch::Sender<ExitRecord>,
     ) {
         let mut turn: Option<String> = None;
         loop {
@@ -777,26 +794,41 @@ impl Runner {
                 else => break,
             };
             let exit = matches!(body, JournalBody::Exited { .. });
-            self.append(JournalEntry {
-                agent_id: agent_id.clone(),
-                workspace_id: workspace_id.clone(),
-                turn_id,
-                recorded_at: intent_core::now_iso(),
-                body,
-            })
-            .await;
+            let appended = self
+                .append(JournalEntry {
+                    agent_id: agent_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    turn_id,
+                    recorded_at: intent_core::now_iso(),
+                    body,
+                })
+                .await
+                .is_some();
             if exit {
-                self.exit_journaled(&agent_id, &journaled);
+                let state = if appended {
+                    ExitRecord::Journaled
+                } else {
+                    ExitRecord::Lost
+                };
+                self.exit_settled(&agent_id, &journaled, state);
             }
         }
-        // However the pump ends, nothing more is journaled for the agent.
-        self.exit_journaled(&agent_id, &journaled);
+        // The pump ended without settling the exit: it never will be.
+        if *journaled.borrow() == ExitRecord::Pending {
+            self.exit_settled(&agent_id, &journaled, ExitRecord::Lost);
+        }
     }
 
-    /// The agent's exit record is journaled (or never will be): release its
-    /// stop waits and forget it as exiting.
-    fn exit_journaled(&self, agent_id: &AgentId, journaled: &watch::Sender<bool>) {
-        journaled.send_replace(true);
+    /// The agent's exit record is journaled, or never will be: release its
+    /// stop waits with `state` and forget it as exiting, so a later stop
+    /// finds it not running.
+    fn exit_settled(
+        &self,
+        agent_id: &AgentId,
+        journaled: &watch::Sender<ExitRecord>,
+        state: ExitRecord,
+    ) {
+        journaled.send_replace(state);
         let mut state = lock(&self.inner.state);
         if state
             .exiting

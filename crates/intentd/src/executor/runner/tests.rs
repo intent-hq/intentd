@@ -313,7 +313,7 @@ async fn node_runner_stop_wait_resolves_only_once_the_agent_is_gone() {
     let repeat = h.runner.stop(&AgentId::from("a1"));
     assert_eq!(
         tokio::time::timeout(wait(), first.wait()).await.unwrap(),
-        StopOutcome::Stopped
+        Some(StopOutcome::Stopped)
     );
     // No polling: everything is already true when the wait resolves.
     assert!(gone(agent), "provider {agent} still running");
@@ -322,7 +322,7 @@ async fn node_runner_stop_wait_resolves_only_once_the_agent_is_gone() {
     assert!(lock(&h.admission.running).is_empty(), "slot not released");
     assert_eq!(
         tokio::time::timeout(wait(), repeat.wait()).await.unwrap(),
-        StopOutcome::Stopped
+        Some(StopOutcome::Stopped)
     );
     // Once gone, a stop for the agent (or for one never launched) reports
     // that it is not running, at once.
@@ -334,11 +334,119 @@ async fn node_runner_stop_wait_resolves_only_once_the_agent_is_gone() {
             )
             .await
             .unwrap(),
-            StopOutcome::NotRunning,
+            Some(StopOutcome::NotRunning),
             "{id}"
         );
     }
     wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+/// A `stopped` acknowledgement promises the exit record is journaled, so
+/// when that append fails the wait settles without an outcome (no ack; the
+/// backend resends). The agent is still torn down, and a later stop finds
+/// it not running.
+#[cfg(unix)]
+#[tokio::test]
+async fn node_runner_stop_wait_has_no_outcome_when_the_exit_record_is_not_journaled() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use intent_core::node_link::StopOutcome;
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "start", started("a1")).await;
+    let (agent, child) = agent_pids(&h.storage, "a1").await;
+    let journal_dir = h.storage.journal_dir();
+    let writable = std::fs::metadata(&journal_dir).unwrap().permissions();
+    std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let outcome = tokio::time::timeout(wait(), h.runner.stop(&AgentId::from("a1")).wait())
+        .await
+        .unwrap();
+    std::fs::set_permissions(&journal_dir, writable).unwrap();
+    assert_eq!(outcome, None, "no exit record, so no stopped ack");
+    assert!(gone(agent) && gone(child), "the agent is still torn down");
+    assert!(lock(&h.admission.running).is_empty());
+    assert_eq!(
+        tokio::time::timeout(wait(), h.runner.stop(&AgentId::from("a1")).wait())
+            .await
+            .unwrap(),
+        Some(StopOutcome::NotRunning)
+    );
+}
+
+/// Only a journaled exit releases a successful stop wait: a lost exit
+/// record, or a channel closed before the exit settled, gives no outcome.
+#[tokio::test]
+async fn a_stop_wait_succeeds_only_on_a_journaled_exit() {
+    use intent_core::node_link::StopOutcome;
+    let pending = |journaled| StopWait::Pending {
+        outcome: StopOutcome::Stopped,
+        journaled,
+    };
+    let (tx, rx) = watch::channel(ExitRecord::Pending);
+    let wait = tokio::spawn(pending(rx).wait());
+    tx.send_replace(ExitRecord::Lost);
+    assert_eq!(wait.await.unwrap(), None, "a lost exit record");
+
+    let (tx, rx) = watch::channel(ExitRecord::Pending);
+    let wait = tokio::spawn(pending(rx).wait());
+    drop(tx);
+    assert_eq!(wait.await.unwrap(), None, "closed before the exit settled");
+
+    let (tx, rx) = watch::channel(ExitRecord::Pending);
+    let wait = tokio::spawn(pending(rx).wait());
+    tx.send_replace(ExitRecord::Journaled);
+    assert_eq!(wait.await.unwrap(), Some(StopOutcome::Stopped));
+}
+
+/// A journal pump that ends without an exit record settles the agent's
+/// exit as lost (never journaled) and forgets it as exiting, so its stop
+/// waits get no outcome and a later stop finds it not running.
+#[tokio::test]
+async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
+    use intent_core::node_link::StopOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
+    let runner = Runner::new(RunnerConfig {
+        admission: Arc::new(CountAdmission {
+            cap: 1,
+            running: Mutex::new(Vec::new()),
+        }),
+        launch: Arc::new(FixtureLaunch(ProviderLaunch {
+            config: ProviderConfig {
+                ..*intent_providers::find_provider(PROVIDER).unwrap()
+            },
+            binary: None,
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            extra_env: BTreeMap::new(),
+        })),
+        checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),
+        journal: Journal::open(&storage.journal_dir()).unwrap(),
+        mcp_bridge_exe: std::env::current_exe().unwrap(),
+        home: None,
+        auth_failed: Arc::new(|_: &str| {}),
+    });
+    let id = AgentId::from("a1");
+    let (journaled, settled) = watch::channel(ExitRecord::Pending);
+    lock(&runner.inner.state)
+        .exiting
+        .insert(id.clone(), settled.clone());
+    let (notes_tx, notes) = mpsc::unbounded_channel();
+    let (marks_tx, marks) = mpsc::unbounded_channel();
+    drop((notes_tx, marks_tx));
+    runner
+        .clone()
+        .pump(
+            (id.clone(), WorkspaceId::from("ws-1")),
+            (ActivityTracker::new(), Arc::new(Redactor::default())),
+            notes,
+            marks,
+            journaled,
+        )
+        .await;
+    assert_eq!(*settled.borrow(), ExitRecord::Lost);
+    assert!(!lock(&runner.inner.state).exiting.contains_key(&id));
+    assert_eq!(runner.stop(&id).wait().await, Some(StopOutcome::NotRunning));
 }
 
 /// A stop arriving while the agent is still being set up waits for it to be
@@ -354,7 +462,7 @@ async fn node_runner_stop_wait_covers_an_agent_stopped_during_setup() {
     let outcome = tokio::time::timeout(wait(), h.runner.stop(&AgentId::from("a1")).wait())
         .await
         .unwrap();
-    assert_eq!(outcome, StopOutcome::Stopped);
+    assert_eq!(outcome, Some(StopOutcome::Stopped));
     assert!(gone(agent) && gone(child));
     assert!(lock(&h.admission.running).is_empty());
 }
