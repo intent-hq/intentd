@@ -147,7 +147,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());

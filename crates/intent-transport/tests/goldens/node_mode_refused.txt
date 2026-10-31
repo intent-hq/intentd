@@ -334,6 +334,10 @@ search.fileNames
 search.inFiles
 search.messages
 search.notes
+secret.dismiss
+secret.forget
+secret.list
+secret.provide
 sentry.assignIssue
 sentry.authStatus
 sentry.getIssue

@@ -206,7 +206,7 @@ async fn port_setting_crud() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -287,7 +287,7 @@ async fn port_change_restarts_listener() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -352,7 +352,7 @@ async fn port_bind_failure_friendly_error() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -442,7 +442,7 @@ async fn setup_uds(
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());

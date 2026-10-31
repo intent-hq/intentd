@@ -5,7 +5,7 @@ use serde_json::json;
 pub(super) async fn start_roster() -> (Server, Services) {
     let (_, bus, store, settings, dir) = make_services(None, None).await;
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_settings_registry(settings.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone());

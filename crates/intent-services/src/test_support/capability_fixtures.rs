@@ -82,7 +82,7 @@ pub async fn fixture(tmp: &TempDb) -> Fixture {
         .expect("collaborator");
     let workspaces_root = tmp.path.parent().expect("temp db dir").join("workspaces");
     Fixture {
-        services: Services::new(store).with_workspaces_root(workspaces_root),
+        services: Services::new_isolated(store).with_workspaces_root(workspaces_root),
         ws,
         other_ws,
         primary,
@@ -157,7 +157,7 @@ pub mod host_role {
             .unwrap();
         let root = tmp.path.parent().unwrap().join("workspaces");
         (
-            Services::new(store).with_workspaces_root(root),
+            Services::new_isolated(store).with_workspaces_root(root),
             owner.id,
             member.id,
         )

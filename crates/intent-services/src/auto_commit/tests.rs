@@ -321,8 +321,8 @@ async fn repository_only_workspace_auto_commits_via_repository_path() {
     ws.repository_path = Some(repo.dir.to_string_lossy().to_string());
     store.insert_workspace(&ws).await.expect("insert ws");
     std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
-    let svc =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
 
     let agent = session("agent-r1", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
@@ -434,7 +434,7 @@ async fn clean_tree_is_silent_skip() {
     let ws_id = WorkspaceId::new();
     let ws = workspace_with_repo(&ws_id, &repo);
     store.insert_workspace(&ws).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let agent = session("agent-c1", &ws_id, None, false, "X", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     let event = idle_event(&ws_id, "agent-c1", "end_turn");
@@ -1115,7 +1115,7 @@ async fn no_changes_skips_generation_and_commit() {
     store.insert_workspace(&ws).await.unwrap();
     // No dirty files — the CLI should not be spawned.
     let (_bin_dir, bin) = fake_auggie("nochanges", "exit 99");
-    let svc = Services::new(store).with_auggie_bin(bin);
+    let svc = Services::new_isolated(store).with_auggie_bin(bin);
     let agent = session("agent-n1", &ws_id, None, false, "X", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     let event = idle_event(&ws_id, "agent-n1", "end_turn");

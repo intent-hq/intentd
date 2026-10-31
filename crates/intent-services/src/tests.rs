@@ -15,6 +15,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod auto_archive_workspace;
+mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;
 mod orphan_flag_race;
@@ -22,6 +23,7 @@ pub(crate) mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
+mod workspace_auto_archive_disabled;
 pub(crate) mod workspace_delete;
 mod workspace_label;
 
@@ -99,7 +101,7 @@ pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, Note
         .insert_note(&note(&ws, "n1", content))
         .await
         .expect("note");
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
     (tmp, services, ws, id)
 }
 
@@ -117,7 +119,7 @@ async fn resolve_principal_credential_admits_active_and_rejects_revoked() {
         .insert_principal_credential(&primary.id, &hash)
         .await
         .expect("insert");
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
 
     assert_eq!(
         services
@@ -181,7 +183,7 @@ async fn resolve_principal_credential_rejects_revoke_landing_mid_resolution() {
         .insert_principal_credential(&primary.id, &hash)
         .await
         .expect("insert");
-    let services = Services::new(store.clone());
+    let services = Services::new_isolated(store.clone());
 
     // The sole write-pool connection: any resolve parks on its touch/UPDATE.
     let mut held = store.write_pool().acquire().await.expect("hold write conn");
@@ -236,7 +238,7 @@ async fn resolve_principal_credential_rejects_revoke_landing_mid_resolution() {
 async fn settings_revision_gate_orders_mutation_before_snapshot() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
     let gate = services.settings_revision_gate();
     let held = gate.write().await;
 
@@ -397,7 +399,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     // Hermetic root: the get/list enrichment probes the workspaces root for
     // `cowSupported`, and tests must never touch `~/intent/workspaces`.
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     // workspace.get
     let got = svc.get_workspace(ws.clone()).await.expect("get");
@@ -613,7 +615,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         .expect("archived session");
 
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     // Full list: tokenUsage never present; agentSummary only on active rows.
     let list = svc
@@ -773,6 +775,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     );
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
     row.label = Some("Customer escalations for later".to_string());
+    row.auto_archive_disabled = true;
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(
@@ -898,7 +901,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         .get_primary_principal()
         .await
         .expect("primary principal");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let caller = intent_core::Caller::Wire {
         principal_id: primary.id,
         host_role: intent_core::HostRole::Owner,
@@ -1215,7 +1218,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
     }
 
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     let list = svc
         .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
@@ -1336,7 +1339,7 @@ async fn workspace_list_keeps_unfinished_root_prs_ahead_of_merged_active() {
         .expect("git root");
 
     let root = tempfile::tempdir().expect("workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     for rows in [
         svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
@@ -1499,7 +1502,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
     }
 
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     let list = svc
         .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
@@ -1549,7 +1552,7 @@ async fn workspace_disk_usage_op_maps_cache_states() {
         .await
         .expect("ws bare");
 
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     // First call arms the walk: refreshing true, field omitted (absent, not null).
     let first = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
@@ -1695,7 +1698,7 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
     }
 
     // Spot-check the expected counts and the services-side helper.
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let s1 = svc.cheap_task_stats(&ws1).await.expect("ws1 stats");
     assert_eq!((s1.total, s1.completed, s1.in_progress), (4, 1, 2));
     let s2 = svc.cheap_task_stats(&ws2).await.expect("ws2 stats");
@@ -1813,7 +1816,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         .await
         .expect("corrupt session projection");
 
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let mut gets = std::collections::HashMap::new();
     for workspace_id in [healthy.clone(), bad_task.clone(), bad_session.clone()] {
         let row = svc
@@ -1887,7 +1890,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let root = WorkspacesRoot::new();
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
@@ -1970,7 +1973,7 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     store.insert_workspace(&archived).await.unwrap();
 
     let root = WorkspacesRoot::new();
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
     let unread = store
         .workspaces_with_unread_top_level_sessions()
         .await
@@ -2242,7 +2245,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         .await
         .expect("ws5 root");
 
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let assert_merged = |list: &[Workspace], path: &str| {
         let detail = path == "workspace.get";
@@ -2462,7 +2465,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
         .await
         .expect("control ws");
 
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let full = svc
         .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
@@ -2730,7 +2733,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         repro_d.push((label, ws));
     }
 
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
     let full = svc
         .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
         .await
@@ -3077,7 +3080,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         store.insert_pr_monitor(&m).await.expect("monitor");
     }
 
-    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     for (list, path) in [
         (
@@ -3186,7 +3189,7 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
         .await
         .unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let v = svc
         .cross_workspace_list_siblings(caller.clone(), false)
         .await
@@ -3274,7 +3277,7 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
         store.insert_workspace(&w).await.unwrap();
     }
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let v = svc
         .cross_workspace_list_siblings(caller.clone(), false)
         .await
@@ -3355,7 +3358,7 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
         store.insert_workspace(&w).await.unwrap();
     }
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     let list_ids = |v: serde_json::Value| {
         let mut ids: Vec<String> = v
@@ -3416,7 +3419,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
     w.repository_owner = Some("intent-hq".to_string());
     w.repository_name = Some("intent".to_string());
     store.insert_workspace(&w).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let err = svc
         .cross_workspace_list_siblings(caller.clone(), false)
         .await
@@ -3474,7 +3477,7 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
         .await
         .unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     // Same-repo sibling read: full shape with numbered content + line count.
     let v = svc
@@ -4106,7 +4109,7 @@ where
 async fn content_write_snapshot_is_visible_with_its_rev() {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
-    let other_svc = Services::new(other.clone());
+    let other_svc = Services::new_isolated(other.clone());
 
     let assert_rev1_has_snapshot = || async {
         let current = other.get_note(&ws, &id).await.expect("get note");
@@ -4193,7 +4196,7 @@ async fn surgical_write_races_user_save_in<T>(
     op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
 ) -> (T, Note) {
     let other = Store::open(&tmp.path).await.expect("open second store");
-    let other_svc = Services::new(other.clone());
+    let other_svc = Services::new_isolated(other.clone());
 
     // The sole write-pool connection: the surgical write blocks on acquire.
     let held = svc
@@ -4772,7 +4775,7 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
 async fn convert_blocks_racing_real_user_save_converts_once() {
     let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
     let (tmp, svc, ws, id) = setup_versioned(base).await;
-    let other = Services::new(Store::open(&tmp.path).await.expect("open second store"));
+    let other = Services::new_isolated(Store::open(&tmp.path).await.expect("open second store"));
 
     let held = svc
         .store
@@ -4857,7 +4860,7 @@ async fn convert_blocks_racing_real_user_save_converts_once() {
 async fn note_create_snapshot_is_visible_with_the_row() {
     let (tmp, svc, ws, _seed) = setup("seed").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
-    let other_svc = Services::new(other.clone());
+    let other_svc = Services::new_isolated(other.clone());
 
     let mut create = svc.create_note(
         ws.clone(),
@@ -4953,7 +4956,7 @@ async fn metadata_write_races_user_save(
 ) -> Note {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
-    let other_svc = Services::new(other.clone());
+    let other_svc = Services::new_isolated(other.clone());
 
     let held = svc
         .store
@@ -5340,7 +5343,7 @@ async fn update_note_metadata_arm_returns_committed_rev() {
 async fn update_note_metadata_arm_snapshot_carries_concurrent_content() {
     let (tmp, svc, ws, id) = setup_versioned("abc").await;
     let other = Store::open(&tmp.path).await.expect("open second store");
-    let other_svc = Services::new(other.clone());
+    let other_svc = Services::new_isolated(other.clone());
 
     let held = svc
         .store
@@ -5462,7 +5465,7 @@ async fn update_note_metadata_skipped_carries_no_rev() {
         .insert_note(&note(&ws, "spec", "body"))
         .await
         .expect("note");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let skipped = svc
         .update_note_metadata(
             ws,
@@ -5488,7 +5491,7 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
         .insert_note(&note(&ws, "spec", "body"))
         .await
         .expect("note");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let spec = NoteId::from("spec");
 
     // Title-only on spec → skipped, title unchanged.
@@ -5598,7 +5601,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
         })
         .await
         .expect("session");
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
 
     // Crossing into `complete` on ANOTHER task records the pair.
     svc.task_update_note_status(
@@ -5809,7 +5812,7 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
     store.insert_comment(&ws, &c1).await.expect("insert c1");
     store.insert_comment(&ws, &c2).await.expect("insert c2");
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     assert_eq!(
         svc.store()
             .list_comments(&parent_id)
@@ -5949,7 +5952,7 @@ async fn read_asset_reads_base64_from_assets_root() {
     let root = root_guard.path().to_path_buf();
     std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
     std::fs::write(root.join(&ws.0).join("img.png"), b"hello").expect("write asset");
-    let svc = Services::new(store).with_assets_root(root.clone());
+    let svc = Services::new_isolated(store).with_assets_root(root.clone());
 
     let r = svc
         .read_asset(ws, "workspace-asset://host/img.png".into())
@@ -6153,7 +6156,7 @@ async fn task_list_and_get_project_workspace_tasks() {
     plain.parent_id = Some(NoteId::from("spec"));
     store.insert_note(&plain).await.unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     // task.list returns every task note (cancelled, unlinked, and subtask
     // included) with the `specLinked` flag, plus the stats aggregate — still
@@ -6261,7 +6264,7 @@ async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
         store.insert_note(&tn).await.unwrap();
     }
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let result = svc.task_list(ws, None).await.expect("task.list");
     let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, vec!["task-a", "task-sub"]);
@@ -6322,7 +6325,7 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     plain.parent_id = Some(NoteId::from("spec"));
     store.insert_note(&plain).await.unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     // Round-trip with dedup: c dependsOn [a, b, a] → [a, b].
     let r = svc
@@ -6591,7 +6594,7 @@ async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
         .await
         .unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     // child dependsOn parent → ancestor rejection, relationship named.
     let err = svc
@@ -6723,7 +6726,7 @@ async fn note_reads_project_unmet_depends_on() {
         .await
         .unwrap();
 
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     svc.task_set_relations(
         ws.clone(),
         NoteId::from("task-c"),
@@ -6900,7 +6903,7 @@ async fn remove_agent_from_all_tasks_strips_id_only_from_matching_tasks() {
         .await
         .unwrap();
 
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let r = svc
         .remove_agent_from_all_tasks(ws.clone(), victim.clone())
         .await
@@ -7801,7 +7804,7 @@ async fn create_note_with_task_block_auto_converts() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     let result = svc
         .create_note(
@@ -9723,7 +9726,7 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
         .insert_comment(&ws_a, &seeded_a)
         .await
         .expect("seed ws_a comment");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
 
     // ws_b, using its own same-`note_id` note, probes with ws_a's commentId.
     // The reply must not be created and no cross-workspace parent must leak.
@@ -9806,7 +9809,7 @@ async fn event_setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    (tmp, Services::new(store), ws)
+    (tmp, Services::new_isolated(store), ws)
 }
 
 #[intent_test_macros::daemon_test]
@@ -10432,7 +10435,7 @@ mod change_event_parity {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let mut services = Services::new(store.clone())
+        let mut services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         if let Some(park) = park {
@@ -17217,7 +17220,7 @@ mod mcp_callback {
             .await
             .expect("note");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store).with_event_bus(bus.clone());
 
         // Subscribe before the call; un-batched → immediate single-event batch.
         let mut sub = bus.subscribe(SubscriptionFilter {
@@ -17327,7 +17330,7 @@ mod mcp_callback {
         };
         store.insert_agent_session(&session).await.expect("session");
 
-        let services = Services::new(store.clone());
+        let services = Services::new_isolated(store.clone());
         let api: Arc<dyn WorkspaceApi> = Arc::new(services);
         let server = WorkspaceMcpServer::new(api.clone(), ws.clone())
             .with_caller_agent_id(Some(agent_id.clone()));
@@ -17370,7 +17373,7 @@ mod mcp_callback {
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
         let registry = services.turn_attachments();
         let agent_id = AgentId::from_string("agent-proposer");
         let chief = intent_core::WorkspaceId::chief();
@@ -17440,7 +17443,7 @@ mod mcp_callback {
     async fn proposal_show_without_caller_does_not_register() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
         let registry = services.turn_attachments();
         let chief = intent_core::WorkspaceId::chief();
 
@@ -17496,7 +17499,7 @@ mod mcp_callback {
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
         let registry = services.turn_attachments();
         let agent_id = AgentId::from_string("agent-discarder");
         let chief = intent_core::WorkspaceId::chief();
@@ -17556,7 +17559,7 @@ mod mcp_callback {
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
         let registry = services.turn_attachments();
         let agent_id = AgentId::from_string("agent-returner");
         let chief = intent_core::WorkspaceId::chief();
@@ -17604,7 +17607,7 @@ mod mcp_callback {
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
         let registry = services.turn_attachments();
         let agent_id = AgentId::from_string("agent-multi");
         let chief = intent_core::WorkspaceId::chief();
@@ -17665,7 +17668,8 @@ mod mcp_callback {
         store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
         store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
         let root = super::WorkspacesRoot::new();
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         let registry = services.turn_attachments();
         let agent_id = AgentId::from_string("agent-bulk");
         let chief = intent_core::WorkspaceId::chief();
@@ -17736,7 +17740,7 @@ mod drafts_events {
         let agent = AgentId::from_string("agent-1");
 
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store).with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter {
             workspace_id: Some(ws.0.clone()),
             ..Default::default()
@@ -17817,7 +17821,7 @@ mod drafts_events {
         let agent = AgentId::from_string("agent-1");
 
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store).with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter {
             workspace_id: Some(ws.0.clone()),
             ..Default::default()
@@ -17968,7 +17972,7 @@ pub(crate) mod pr {
             ws.pr_number = Some(42);
         }
         store.insert_workspace(&ws).await.expect("ws");
-        let services = Services::new(store).with_source_control(forge);
+        let services = Services::new_isolated(store).with_source_control(forge);
         (tmp, services, ws_id)
     }
 
@@ -19378,7 +19382,7 @@ pub(crate) mod pr {
         ws.updated_at = now_iso();
         store.insert_workspace(&ws).await.expect("ws");
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_event_bus(bus)
             .with_source_control(Arc::new(forge));
         (tmp, svc, ws_id)
@@ -20079,7 +20083,7 @@ pub(crate) mod pr {
         ws.worktree_path = Some(work.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.expect("ws");
 
-        let svc = Services::new(store).with_source_control(Arc::new(forge));
+        let svc = Services::new_isolated(store).with_source_control(Arc::new(forge));
         (tmp, work_dir, bare_dir, svc, ws_id, work)
     }
 
@@ -20215,7 +20219,7 @@ pub(crate) mod pr {
         let empty_dir = crate::tests::test_tempdir("intentd-ac-empty-");
         ws.worktree_path = Some(empty_dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+        let svc = Services::new_isolated(store).with_source_control(Arc::new(StubForge::default()));
 
         let res = svc
             .accept_changes_execute(ws_id, json!({ "action": "create-pr" }))
@@ -20265,7 +20269,7 @@ pub(crate) mod pr {
         ws.branch = "feature".into();
         ws.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
+        let svc = Services::new_isolated(store).with_source_control(Arc::new(StubForge::default()));
 
         let st = svc
             .accept_changes_add_remote(ws_id, "https://github.com/o/r.git".into())
@@ -20930,7 +20934,7 @@ pub(crate) mod pr {
         ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
         store.insert_workspace(&ws).await.unwrap();
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         (tmp, svc, ws)
     }
 
@@ -21984,7 +21988,7 @@ pub(crate) mod pr {
             .unwrap();
         let bus = crate::EventBus::new(store.clone());
         let wsroot = super::WorkspacesRoot::new();
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_event_bus(bus)
             .with_workspaces_root(wsroot.path().to_path_buf())
             .with_source_control(forge);
@@ -23295,7 +23299,7 @@ pub(crate) mod pr {
             rate_limit_reset: Some(u64::MAX / 2),
             ..Default::default()
         });
-        let svc = Services::new(store).with_source_control(sc.clone());
+        let svc = Services::new_isolated(store).with_source_control(sc.clone());
 
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(
@@ -23334,7 +23338,7 @@ pub(crate) mod pr {
             rate_limit_limit: Some(5_000),
             ..Default::default()
         });
-        let svc = Services::new(store).with_source_control(sc.clone());
+        let svc = Services::new_isolated(store).with_source_control(sc.clone());
 
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
@@ -23455,7 +23459,7 @@ pub(crate) mod pr {
             rate_limit_reset: Some(u64::MAX / 2),
             ..Default::default()
         });
-        let svc = Services::new(store).with_source_control(sc.clone());
+        let svc = Services::new_isolated(store).with_source_control(sc.clone());
 
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(
@@ -23528,7 +23532,7 @@ pub(crate) mod pr {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = super::WorkspacesRoot::new();
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_source_control(Arc::new(forge));
         (tmp, ws_root, services)
@@ -23847,7 +23851,7 @@ mod file_tracking {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (tmp, Services::new(store), ws)
+        (tmp, Services::new_isolated(store), ws)
     }
 
     #[intent_test_macros::daemon_test]
@@ -23957,7 +23961,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         // A new agent-authored file with an unstaged audit row.
         std::fs::write(repo.dir.join("x.txt"), "hi\n").unwrap();
@@ -24036,7 +24040,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let result = svc
             .file_tracking_load_commits(ws_id, Some(10), None, None)
@@ -24066,7 +24070,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
 
@@ -24098,7 +24102,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
 
@@ -24129,7 +24133,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         std::fs::write(repo.dir.join("seed.txt"), "seed changed\n").unwrap();
 
@@ -24155,7 +24159,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
         assert!(repo.dir.join("new.txt").exists());
@@ -24179,7 +24183,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         // Clean tracked path (seed.txt is committed, unchanged) + missing
         // untracked path (nope.txt was never created).
@@ -24210,7 +24214,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let expect_discard_all = |v: serde_json::Value| {
             let svc = &svc;
@@ -24249,7 +24253,7 @@ mod file_tracking {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
-        (tmp, Services::new(store), ws_id)
+        (tmp, Services::new_isolated(store), ws_id)
     }
 
     /// Agent-initiated `git.agentCommit` with no `files` commits only the
@@ -25135,7 +25139,7 @@ mod file_tracking {
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let secondary = init_git_repo();
         let row = svc
             .git_root_register(
@@ -27175,7 +27179,7 @@ mod file_tracking {
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         ws.is_remote = true;
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let root = git_root_row(&ws_id, &secondary.dir);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
@@ -27233,7 +27237,7 @@ mod file_tracking {
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        let svc = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         let mut sub = bus.subscribe(crate::SubscriptionFilter {
             workspace_id: Some(ws_id.0.clone()),
             ..Default::default()
@@ -28177,7 +28181,7 @@ mod metrics {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (tmp, Services::new(store), ws)
+        (tmp, Services::new_isolated(store), ws)
     }
 
     fn change(
@@ -28375,7 +28379,7 @@ mod usage_stats_recording {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (tmp, Services::new(store), ws)
+        (tmp, Services::new_isolated(store), ws)
     }
 
     fn change(
@@ -28689,7 +28693,7 @@ mod search {
         // `path` is transient (never persisted); `worktree_path` round-trips.
         ws.worktree_path = Some(dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.expect("ws");
-        (tmp, Services::new(store), ws_id)
+        (tmp, Services::new_isolated(store), ws_id)
     }
 
     #[intent_test_macros::daemon_test]
@@ -28736,7 +28740,7 @@ mod search {
         let store = Store::open(&tmp.path).await.unwrap();
         let ws_id = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws_id)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let r = svc
             .search_in_files(ws_id, "x".into(), None, Some("srch-1".into()))
             .await
@@ -28749,7 +28753,7 @@ mod search {
     async fn cancel_unknown_is_noop_success() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let r = svc.search_cancel("srch-unknown".into()).await.unwrap();
         assert_eq!(r, serde_json::json!({ "ok": true }));
     }
@@ -28856,7 +28860,7 @@ mod search_adapters {
             ],
         )
         .await;
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let r = svc
             .search_messages(
                 Some(ws),
@@ -28890,7 +28894,7 @@ mod search_adapters {
             ],
         )
         .await;
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let r = svc
             .search_messages(
                 Some(ws),
@@ -28927,7 +28931,7 @@ mod search_adapters {
             })
             .await
             .expect("event");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let r = svc
             .search_events("alpha".into(), Some(ws), None, Some("srch-e".into()))
             .await
@@ -28954,7 +28958,7 @@ mod search_adapters {
             .insert_note(&note(&ws2, "n-3", "no match"))
             .await
             .expect("n3");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         // No workspaceId param — global search.
         let r = svc
             .search_notes(
@@ -28982,7 +28986,7 @@ mod search_adapters {
         body.title = "Plain title".into();
         body.tags = vec!["tagonly".into()];
         store.insert_note(&body).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         for query in ["CAFÉ run", "run checklist", "tagonly", "café:(checkl"] {
             let result = svc
                 .search_notes(query.into(), None, None, None, true, None)
@@ -29017,7 +29021,7 @@ mod search_adapters {
             .execute(store.write_pool())
             .await
             .unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         assert!(svc
             .search_notes("needle".into(), None, None, None, true, None)
             .await
@@ -29027,7 +29031,7 @@ mod search_adapters {
     #[intent_test_macros::daemon_test]
     async fn notes_search_validates_typed_scope_and_limit_before_empty_queries() {
         let (_tmp, store, _) = store_with_ws().await;
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         assert!(matches!(
             svc.search_notes(String::new(), None, None, Some(-1), true, None)
                 .await,
@@ -29070,7 +29074,7 @@ mod search_adapters {
                 store.insert_note(&row).await.unwrap();
             }
         }
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let ranked = svc
             .search_notes(
                 "identicalterm".into(),
@@ -29164,7 +29168,7 @@ mod search_adapters {
                 }],
             }),
         };
-        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let svc = Services::new_isolated(store).with_context_engine(std::sync::Arc::new(engine));
         let r = svc
             .search_codebase(ws, "widget".into(), Some("srch-eng".into()))
             .await
@@ -29202,7 +29206,7 @@ mod search_adapters {
             },
             result: Err(()),
         };
-        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let svc = Services::new_isolated(store).with_context_engine(std::sync::Arc::new(engine));
         let r = svc
             .search_codebase(ws, "main".into(), Some("srch-c".into()))
             .await
@@ -29242,7 +29246,7 @@ mod search_adapters {
             },
             result: Err(()),
         };
-        let svc = Services::new(store).with_context_engine(std::sync::Arc::new(engine));
+        let svc = Services::new_isolated(store).with_context_engine(std::sync::Arc::new(engine));
         let r = svc
             .search_codebase(ws, "main".into(), Some("srch-deg".into()))
             .await
@@ -29269,7 +29273,7 @@ mod search_adapters {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         StreamHarness {
             _tmp: tmp,
             store,
@@ -29415,7 +29419,7 @@ mod rules {
         let mut ws = workspace(&ws_id);
         ws.worktree_path = Some(dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.expect("ws");
-        let svc = Services::new(store.clone());
+        let svc = Services::new_isolated(store.clone());
         (tmp, store, svc, ws_id)
     }
 
@@ -29932,7 +29936,7 @@ mod rules {
         w.worktree_path = Some(tree.0.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        let svc = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         // Global event: subscribe without a workspace filter.
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
@@ -30876,7 +30880,7 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf());
 
         svc.create_workspace(
             WorkspaceCreate {
@@ -30913,7 +30917,8 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf());
 
         // repositoryPath under the workspaces root (non-git → provisioning is
         // skipped and the path reaches the hook unchanged).
@@ -30992,7 +30997,7 @@ mod known_repo {
                 serde_json::json!(custom.path().join("worktrees").to_string_lossy()),
             )])
             .expect("apply worktreesLocation");
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(registry);
 
@@ -31023,7 +31028,7 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf());
 
         let create = |path: Option<&str>, name: Option<&str>| WorkspaceCreate {
             repository_path: path.map(str::to_string),
@@ -31089,7 +31094,8 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf());
 
         // Helper: init a git repo with an origin remote and an initial commit.
         let make_repo = |remote_url: &str| -> TempRepo {
@@ -31342,7 +31348,7 @@ mod known_repo {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
         let bus = crate::events::bus::EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
 
@@ -31531,7 +31537,7 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = crate::events::bus::EventBus::new(store.clone());
-        let svc = Services::new(store.clone()).with_event_bus(bus);
+        let svc = Services::new_isolated(store.clone()).with_event_bus(bus);
         let id = WorkspaceId::from_string("backfill-path-race-test".to_string());
         let path_a = repo_a.path().to_string_lossy().into_owned();
         let path_b = repo_b.path().to_string_lossy().into_owned();
@@ -31686,7 +31692,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, head_sha, head_branch) = seed_repo("intentd-wtprov-repo");
         let root = unique_dir("intentd-wtprov-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -31741,7 +31747,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let repo_dir = unique_dir("intentd-newrepo-src");
         let root = unique_dir("intentd-newrepo-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -31807,7 +31813,7 @@ mod worktree_provisioning {
         let file = parent.0.join("not-a-dir");
         std::fs::write(&file, "plain file\n").unwrap();
         let root = unique_dir("intentd-newrepo-fail-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         let err = svc
             .create_workspace(
@@ -31843,7 +31849,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, head_sha, _) = seed_repo("intentd-newrepo-noop");
         let root = unique_dir("intentd-newrepo-noop-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -31901,7 +31907,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let repo_dir = unique_dir("intentd-newrepo-del-src");
         let root = unique_dir("intentd-newrepo-del-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -31970,7 +31976,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-spoof-del-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         // `<any-parent>/<wsId>/<repo>` outside the workspaces root.
         let ws_id = WorkspaceId::new();
@@ -32035,7 +32041,7 @@ mod worktree_provisioning {
             commit_all(&repo, "feat: later");
         }
         let root = unique_dir("intentd-newrepo-baseref-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -32079,7 +32085,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let repo_dir = unique_dir("intentd-newrepo-absent");
         let root = unique_dir("intentd-newrepo-absent-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         for is_new_repo in [None, Some(false)] {
             let ws = svc
@@ -32111,7 +32117,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-newrepo-noparam-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         for repository_path in [None, Some(String::new())] {
             let err = svc
@@ -32157,7 +32163,7 @@ mod worktree_provisioning {
             .expect("git init");
         assert!(out.status.success(), "git init failed");
         let root = unique_dir("intentd-newrepo-halfinit-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -32203,7 +32209,7 @@ mod worktree_provisioning {
                 serde_json::json!(enabled),
             )])
             .expect("set cowIsolation");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root)
             .with_settings_registry(registry);
         (svc, config_dir)
@@ -32234,7 +32240,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-cowcap-root");
-        let svc = Services::new(store); // no .with_workspaces_root()
+        let svc = Services::new_isolated(store); // no .with_workspaces_root()
 
         let result = {
             let _lock = ENV_WS_DIR_LOCK.lock().await;
@@ -32259,7 +32265,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-syscap-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let caps = svc.system_capabilities().await.expect("capabilities");
         let obj = caps.as_object().expect("result is an object");
@@ -32278,6 +32284,11 @@ mod worktree_provisioning {
             Some(&serde_json::json!(1)),
             "workspace labels are advertised as exact integer 1: {caps}"
         );
+        assert_eq!(
+            obj.get("workspaceAutoArchiveOptOut"),
+            Some(&serde_json::json!(1)),
+            "the auto-archive opt-out is advertised as exact integer 1: {caps}"
+        );
     }
 
     /// `unsloth.status` (monorepo#878 follow-up): with no `AgentManager`
@@ -32289,7 +32300,7 @@ mod worktree_provisioning {
         use intent_core::WorkspaceApi;
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let status = svc.unsloth_status().await.expect("status");
         assert_eq!(status, serde_json::json!({ "running": false }));
@@ -32302,7 +32313,7 @@ mod worktree_provisioning {
         use intent_core::WorkspaceApi;
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let result = svc.unsloth_stop().await.expect("stop");
         assert_eq!(result, serde_json::json!({ "stopped": false }));
@@ -32475,7 +32486,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdel-repo");
         let root = unique_dir("intentd-cowdel-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         // Standalone clone at <root>/<wsId>/<slug> standing in for a CoW
         // checkout, on a branch that also exists (same name) in the source.
@@ -33123,7 +33134,7 @@ mod worktree_provisioning {
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
         let root = unique_dir("intentd-wtslug-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(registry);
 
@@ -33173,7 +33184,7 @@ mod worktree_provisioning {
             .expect("set default provider");
         let (repo_dir, _, head_branch) = seed_repo("intentd-initpin-repo");
         let root = unique_dir("intentd-initpin-root");
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(registry.clone());
 
@@ -33226,7 +33237,7 @@ mod worktree_provisioning {
             )])
             .expect("set prefix");
         let root = unique_dir("intentd-wtexpl-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(registry);
 
@@ -33261,7 +33272,7 @@ mod worktree_provisioning {
         std::fs::write(repo_dir.0.join("b.txt"), "y\n").unwrap();
         commit_all(&repo, "feat: second");
         let root = unique_dir("intentd-wtbase-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33294,7 +33305,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-wtbad-repo");
         let root = unique_dir("intentd-wtbad-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let err = svc
             .create_workspace(
@@ -33320,7 +33331,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-wtskip-repo");
         let root = unique_dir("intentd-wtskip-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33379,7 +33390,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtdel-repo");
         let root = unique_dir("intentd-wtdel-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33443,7 +33454,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtdelex-repo");
         let root = unique_dir("intentd-wtdelex-root");
-        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store.clone()).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33492,7 +33503,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-wtdelskip-repo");
         let root = unique_dir("intentd-wtdelskip-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33527,7 +33538,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idslug-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33565,7 +33576,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idrecycle-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33617,7 +33628,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-iddir-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33649,7 +33660,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idrand-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33685,7 +33696,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-wsjson-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -33739,7 +33750,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleempty-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33787,7 +33798,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlenone-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33818,7 +33829,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlewsp-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33849,7 +33860,7 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleexpl-root");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -33980,7 +33991,7 @@ pub(crate) mod setup_lifecycle_events {
         let root = unique_dir("intentd-setupev-agentfail-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
         // The workspace row lands in `workspace`; the agent row insert is the
@@ -34158,7 +34169,7 @@ pub(crate) mod setup_lifecycle_events {
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let states = WorkspaceSetupStates::default();
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_workspace_setup_states(states.clone());
 
@@ -34224,7 +34235,7 @@ mod file_ops_service {
         let mut session = crate::test_support::fixtures::session(&caller, &ws);
         session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
         store.insert_agent_session(&session).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let root = svc
             .git_root_register(
                 ws.clone(),
@@ -34413,7 +34424,7 @@ mod file_ops_service {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let written = svc
             .file_write(
@@ -34469,7 +34480,7 @@ mod file_ops_service {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         // Base64 placement (data: URL prefix tolerated).
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"attached bytes");
@@ -34592,7 +34603,7 @@ mod file_ops_service {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let placed = svc
             .file_place_attachment(
@@ -34658,7 +34669,7 @@ mod file_ops_service {
         let mut w2 = workspace(&other_ws);
         w2.worktree_path = Some(other_dir.to_string_lossy().into_owned());
         store.insert_workspace(&w2).await.expect("other ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
         let attachments = |root: &std::path::Path| -> Vec<String> {
@@ -34886,7 +34897,7 @@ mod file_ops_service {
         // service stack replays it.
         drop(svc);
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let after_restart = svc
             .file_place_attachment(
                 ws.clone(),
@@ -34962,7 +34973,7 @@ mod file_ops_service {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = std::sync::Arc::new(Services::new(store));
+        let svc = std::sync::Arc::new(Services::new_isolated(store));
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"racing bytes");
         let mut handles = Vec::new();
@@ -35041,7 +35052,7 @@ mod file_ops_service {
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         let placed = svc
             .file_place_attachment(
@@ -35168,7 +35179,7 @@ mod file_ops_service {
         std::fs::create_dir_all(dir.join(".intent/attachments")).unwrap();
         std::fs::write(dir.join(".intent/attachments/ok.txt"), b"ok").unwrap();
 
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
 
         // Copy path: escaping stored_path → ACCESS_DENIED, file untouched.
         let got = svc
@@ -35276,7 +35287,7 @@ mod file_ops_service {
         let expect_sandbox = matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
-        let mut svc = Services::new(store.clone())
+        let mut svc = Services::new_isolated(store.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
         svc.workspaces_root = Some(workspaces_root);
 
@@ -35636,7 +35647,8 @@ mod linear {
     async fn svc(fail: bool) -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store).with_linear_engine(Arc::new(StubLinear { fail }));
+        let services =
+            Services::new_isolated(store).with_linear_engine(Arc::new(StubLinear { fail }));
         (tmp, services)
     }
 
@@ -35948,7 +35960,8 @@ mod sentry {
     async fn svc(fail: bool) -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store).with_sentry_engine(Arc::new(StubSentry { fail }));
+        let services =
+            Services::new_isolated(store).with_sentry_engine(Arc::new(StubSentry { fail }));
         (tmp, services)
     }
 
@@ -36209,7 +36222,7 @@ mod heal_stale_agent_sessions {
             .await
             .expect("error");
 
-        let services = Services::new(store.clone());
+        let services = Services::new_isolated(store.clone());
         let healed = services
             .heal_stale_agent_sessions()
             .await
@@ -36298,7 +36311,7 @@ mod initial_agent_orchestration {
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(test_registry_with_default_provider(&tmp))
             .with_event_bus(bus.clone());
@@ -36384,7 +36397,7 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-idem-1".to_string());
@@ -36439,7 +36452,7 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-no-prompt-idem-1".to_string());
@@ -36499,7 +36512,7 @@ mod initial_agent_orchestration {
             let tmp = TempDb::new();
             let store = Store::open(&tmp.path).await.expect("open store");
             let ws_root = WorkspacesRoot::new();
-            let services = Services::new(store.clone())
+            let services = Services::new_isolated(store.clone())
                 .with_workspaces_root(ws_root.path().to_path_buf())
                 .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -36584,7 +36597,7 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
 
@@ -36737,7 +36750,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -36811,7 +36824,7 @@ mod clone_orchestration {
         gh.repository_name = Some("widget".to_string());
         store.insert_workspace(&gh).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus);
 
@@ -36902,7 +36915,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -36943,7 +36956,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37032,7 +37045,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37098,7 +37111,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37169,7 +37182,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37210,7 +37223,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37250,7 +37263,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37289,7 +37302,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37339,7 +37352,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37460,7 +37473,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37507,7 +37520,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37553,7 +37566,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37599,7 +37612,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37643,7 +37656,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -37686,7 +37699,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37732,7 +37745,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
@@ -37801,7 +37814,7 @@ mod clone_orchestration {
                 serde_json::json!(true),
             )])
             .expect("set cowIsolation");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(registry)
             .with_event_bus(bus.clone());
@@ -37862,7 +37875,7 @@ mod clone_orchestration {
                 serde_json::json!("relative/not-absolute"),
             )])
             .expect("apply worktreesLocation");
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_settings_registry(registry)
             .with_event_bus(bus.clone());
@@ -37907,7 +37920,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -38005,7 +38018,7 @@ mod repo_warm_cache {
     async fn services_with_root(root: &TempDir) -> (Services, TempDb) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new_isolated(store).with_workspaces_root(root.0.clone());
         (svc, tmp)
     }
 
@@ -38263,7 +38276,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     // Hermetic root: the change-emit path enriches the workspace (including
     // the `cowSupported` root probe); tests must never touch `~/intent/workspaces`.
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     let sess1 = intent_core::AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -38435,7 +38448,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
 
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let ts = now_iso();
 
     let sess = intent_core::AgentSession {
@@ -38529,7 +38542,7 @@ async fn scan_all_token_usage_pauses_between_workspaces() {
         store.insert_workspace(&workspace(id)).await.expect("ws");
     }
     let root = tempfile::tempdir().expect("temp workspaces root");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
 
     let start = std::time::Instant::now();
     svc.scan_all_token_usage().await;
@@ -38644,7 +38657,7 @@ mod last_activity_events {
             .await
             .expect("seed workspace");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
@@ -40057,7 +40070,7 @@ mod turn_end_unread_gate {
             .insert_workspace(&workspace(&ws))
             .await
             .expect("seed workspace");
-        let services = Services::new(store.clone());
+        let services = Services::new_isolated(store.clone());
         Harness {
             _tmp: tmp,
             store,
@@ -40284,7 +40297,7 @@ mod idle_workspace_archived_stamp {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("temp store");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
             store,
@@ -40446,7 +40459,7 @@ mod turn_token_usage {
             .await
             .expect("seed workspace");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         Harness {
             tmp,
             store,
@@ -40633,7 +40646,7 @@ mod turn_token_usage {
             .unwrap();
         h.store.close().await;
         let reopened = Store::open(&h.tmp.path).await.unwrap();
-        let services = Services::new(reopened.clone());
+        let services = Services::new_isolated(reopened.clone());
         assert!(services.scan_workspace_token_usage(&h.ws).await.unwrap());
         let usage = reopened
             .get_workspace(&h.ws)
@@ -40723,7 +40736,7 @@ mod turn_token_usage {
         assert!(!h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
         h.store.close().await;
         let reopened = Store::open(&h.tmp.path).await.unwrap();
-        let services = Services::new(reopened.clone());
+        let services = Services::new_isolated(reopened.clone());
         assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
         assert_eq!(
             reopened
@@ -42107,7 +42120,7 @@ mod turn_token_usage {
             )])
             .expect("seed default provider");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_event_bus(bus.clone())
             .with_settings_registry(registry);
 
@@ -42729,7 +42742,7 @@ mod default_provider_self_heal {
         let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-        let services = Services::new(store).with_settings_registry(registry);
+        let services = Services::new_isolated(store).with_settings_registry(registry);
         (tmp, services)
     }
 
@@ -43070,7 +43083,7 @@ mod provider_switch_reresolves_default_model {
         let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-        let services = Services::new(store).with_settings_registry(registry);
+        let services = Services::new_isolated(store).with_settings_registry(registry);
         services
             .settings_registry()
             .expect("registry wired")
@@ -43260,7 +43273,7 @@ mod provider_switch_reresolves_default_model {
         let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-        let svc = Services::new(store).with_settings_registry(registry);
+        let svc = Services::new_isolated(store).with_settings_registry(registry);
 
         let result = switch_to(&svc, "grok").await;
         let applied = result["applied"].as_array().expect("applied array");
@@ -43280,7 +43293,7 @@ mod provider_switch_reresolves_default_model {
         let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-        let svc = Services::new(store).with_settings_registry(registry);
+        let svc = Services::new_isolated(store).with_settings_registry(registry);
         svc.settings_registry()
             .expect("registry wired")
             .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
@@ -43456,7 +43469,7 @@ mod worktrees_location {
             )])
             .expect("apply worktreesLocation");
 
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(registry.clone());
 
@@ -43533,7 +43546,7 @@ mod worktrees_location {
             )])
             .expect("apply worktreesLocation");
 
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(registry);
 
@@ -43589,7 +43602,7 @@ mod worktrees_location {
             )])
             .expect("apply worktreesLocation");
 
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(registry);
 
@@ -43656,7 +43669,7 @@ mod delete_grace_window {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
@@ -43865,14 +43878,15 @@ mod delete_grace_window {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf());
         svc.schedule_workspace_delete(ws.clone(), 60_000)
             .await
             .expect("schedule");
         drop(svc);
 
         // "Restarted" daemon: fresh Services over the same store.
-        let svc2 = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc2 = Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf());
         let got = svc2.get_workspace(ws.clone()).await.expect("survives");
         assert_eq!(got.pending_delete_at, None, "pending state dropped");
         assert!(
@@ -44144,7 +44158,7 @@ mod bulk_delete_pool_pressure {
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = WorkspacesRoot::new();
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_workspaces_root(root.path().to_path_buf())
             .with_event_bus(bus.clone());
 
@@ -44319,7 +44333,7 @@ mod agent_delete_grace_window {
             .expect("session");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store)
+        let services = Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
@@ -44677,14 +44691,15 @@ mod agent_delete_grace_window {
             .await
             .expect("session");
         let ws_root = WorkspacesRoot::new();
-        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc = Services::new_isolated(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf());
         svc.agent_schedule_delete_op(agent.clone(), None, 60_000)
             .await
             .expect("schedule");
         drop(svc);
 
         // "Restarted" daemon: fresh Services over the same store.
-        let svc2 = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let svc2 = Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf());
         let got = svc2
             .agent_get_op(agent.clone(), None)
             .await
@@ -44819,7 +44834,7 @@ mod harness_versioning {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let registry = test_registry_with_default_provider(&tmp);
-        let services = Services::new(store).with_settings_registry(registry);
+        let services = Services::new_isolated(store).with_settings_registry(registry);
         (tmp, services, ws)
     }
 
@@ -45134,7 +45149,7 @@ mod context_usage_projection {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let registry = test_registry_with_default_provider(&tmp);
-        let services = Services::new(store).with_settings_registry(registry);
+        let services = Services::new_isolated(store).with_settings_registry(registry);
         (tmp, services, ws)
     }
 
@@ -45241,7 +45256,8 @@ mod agent_summary_excludes_deleted {
         // Hermetic root: enrichment probes the workspaces root for
         // `cowSupported`, and tests must never touch `~/intent/workspaces`.
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
         let active_id = AgentId::new();
         let mut active = session(&active_id, &ws_id);
@@ -45289,7 +45305,8 @@ mod agent_summary_excludes_deleted {
             .await
             .expect("seed workspace");
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
         let active_id = AgentId::new();
         let mut active = session(&active_id, &ws_id);
@@ -45395,7 +45412,7 @@ mod derived_workspace_unread {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let mut services = Services::new(store.clone())
+        let mut services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         if let Some(park) = attention_write_park {
@@ -46396,7 +46413,7 @@ mod local_changes {
         ws.worktree_path = worktree.map(|p| p.to_string_lossy().into_owned());
         tweak(&mut ws);
         store.insert_workspace(&ws).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         (tmp, svc, ws)
     }
 

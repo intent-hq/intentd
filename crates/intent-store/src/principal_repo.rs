@@ -1642,6 +1642,35 @@ impl Store {
         id: &WorkspaceId,
         archived_at: &str,
     ) -> Result<ArchivedGuestSweep> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, false)
+            .await?
+            .ok_or_else(|| Error::Internal("manual archive refused".into()))
+    }
+
+    /// The automatic-sweep variant of [`Self::archive_workspace_detaching_guests`]:
+    /// reads `auto_archive_disabled` inside the same `BEGIN IMMEDIATE`
+    /// transaction as the flip and returns `Ok(None)` (nothing written) when
+    /// the workspace opted out, so an opt-out committed after the sweep's
+    /// last read can never be overtaken by the archive.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::archive_workspace_detaching_guests`].
+    pub async fn archive_workspace_detaching_guests_unless_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<Option<ArchivedGuestSweep>> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, true)
+            .await
+    }
+
+    async fn archive_workspace_detaching_guests_inner(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+        respect_auto_archive_opt_out: bool,
+    ) -> Result<Option<ArchivedGuestSweep>> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
             .write_pool()
@@ -1653,7 +1682,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("archive workspace begin failed: {e}")))?;
 
-        let body_result: Result<ArchivedGuestSweep> = async {
+        let body_result: Result<Option<ArchivedGuestSweep>> = async {
             let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
                 .bind(&id.0).fetch_optional(&mut *conn).await
                 .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
@@ -1666,6 +1695,19 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("read archive status failed: {e}")))?;
             if retired == Some(true) {
                 return Err(Error::WorkspaceRetired { workspace_id: id.0.clone() });
+            }
+            if respect_auto_archive_opt_out {
+                let opted_out: Option<bool> =
+                    sqlx::query_scalar("SELECT auto_archive_disabled <> 0 FROM workspace WHERE id=?")
+                        .bind(&id.0)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("read auto-archive opt-out failed: {e}"))
+                        })?;
+                if opted_out == Some(true) {
+                    return Ok(None);
+                }
             }
             if archived == Some(false) {
                 lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
@@ -1733,11 +1775,11 @@ impl Store {
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|e| Error::Internal(format!("archive member count failed: {e}")))?;
-            Ok(ArchivedGuestSweep {
+            Ok(Some(ArchivedGuestSweep {
                 removed_collaborators,
                 revoked_invites: revoked.rows_affected(),
                 member_count: u64::try_from(remaining).unwrap_or(0),
-            })
+            }))
         }
         .await;
 

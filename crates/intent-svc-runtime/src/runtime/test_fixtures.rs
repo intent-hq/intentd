@@ -111,7 +111,8 @@ pub(crate) mod host_role {
             .unwrap();
         let root = tmp.path.parent().unwrap().join("workspaces");
         (
-            crate::test_runtime::with_runtime(Services::new(store)).with_workspaces_root(root),
+            crate::test_runtime::with_runtime(Services::new_isolated(store))
+                .with_workspaces_root(root),
             owner.id,
             member.id,
         )

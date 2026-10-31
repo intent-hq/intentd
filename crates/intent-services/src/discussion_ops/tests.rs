@@ -45,7 +45,7 @@ async fn discussion_history_is_filtered_from_agent_event_queries_before_paging()
             .await
             .unwrap();
     }
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let caller = Caller::Agent {
         agent_id: AgentId::new(),
     };
@@ -175,7 +175,7 @@ async fn discussion_agent_subscription_admission_rejects_exact_wildcard_and_mixe
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let agent = AgentId::new();
     for types in [
         vec!["discussion:message".into()],
@@ -226,7 +226,7 @@ async fn discussion_requires_humans_and_current_membership() {
     guest.is_primary = false;
     guest.login = Some("member".into());
     store.upsert_principal(&guest).await.unwrap();
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     for caller in [
         Caller::Daemon,
         Caller::Agent {
@@ -321,7 +321,7 @@ async fn conversation_fixture() -> (TempDb, Services, WorkspaceId, Vec<intent_co
         }
         people.push(p);
     }
-    (tmp, Services::new(store), ws, people)
+    (tmp, Services::new_isolated(store), ws, people)
 }
 
 fn recipients(ids: &[PrincipalId]) -> DiscussionTarget {
@@ -1120,7 +1120,7 @@ async fn discussion_reaction_concurrency_and_send_retry_keep_viewer_state() {
     ];
     versions.sort_unstable();
     assert_eq!(versions, vec![3, 4]);
-    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    let reopened = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     for (person, selected) in [(1, false), (2, true), (3, true)] {
         let history = with_caller(
             human(&p[person].id),

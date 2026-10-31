@@ -940,6 +940,13 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
      and use your judgment for routine choices first; report completed or progressing \
      work with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's `secret.*` frame (PROTOCOL
+/// §5.56): secrets belong to the top-level agent that asked the user.
+pub(super) const SUB_AGENT_SECRET_DENIED: &str =
+    "ws.secret is only available to top-level agents — a sub-agent cannot ask the user for \
+     secrets or use another agent's secrets. Report the need to your parent with \
+     ws.agent.reportToParent so it can request the secret and run the command itself";
+
 /// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
     "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
@@ -981,6 +988,9 @@ async fn workspace_host_dispatch(
     // a misleading "disabled in settings").
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
+    }
+    if is_sub_agent && method.starts_with("secret.") {
+        return Err(format!("host: {SUB_AGENT_SECRET_DENIED}"));
     }
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));

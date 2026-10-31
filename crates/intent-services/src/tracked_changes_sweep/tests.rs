@@ -89,7 +89,7 @@ async fn svc_for(worktree: Option<&Path>) -> (TempDb, Services, WorkspaceId) {
     let mut ws = workspace(&id);
     ws.worktree_path = worktree.map(|p| p.to_string_lossy().to_string());
     store.insert_workspace(&ws).await.unwrap();
-    (tmp, Services::new(store), id)
+    (tmp, Services::new_isolated(store), id)
 }
 
 async fn track(svc: &Services, ws: &WorkspaceId, path: &str, stage: &str) {

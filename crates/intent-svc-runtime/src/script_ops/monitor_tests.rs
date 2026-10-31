@@ -1389,7 +1389,7 @@ async fn monitor_transfer_round_trip_preserves_deadline_outbox_and_reimport_fenc
                 row
             );
         }
-        let services = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         services.script_manager().recover_monitors().await.unwrap();
         assert!(store.script_monitor(&h.ws, &row.monitor_id).await.is_err());
         let jobs = store.script_notification_jobs().await.unwrap();

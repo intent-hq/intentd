@@ -4,7 +4,7 @@
 # invoked directly. Requested gate targets run together in one root make when
 # this checkout is that submodule, so their shared prerequisite ordering and
 # command-line variables (RESUME=1,
-# GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=..., E='<filterset>') reach the root make through
+# GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=..., E='<filterset>', COUNT=N, LOAD=1) reach the root make through
 # MAKEFLAGS. In a standalone clone the same targets exit 2 and name the
 # monorepo command. Unknown targets keep make's ordinary "No rule" failure.
 #
@@ -13,7 +13,7 @@
 # skipping suites that need CI-only tooling (scripts/release-scripts-local.py).
 
 MONOREPO_ROOT := ../..
-FORWARDED_TARGETS := check test test-changed test-select gate list-tests coverage-changed fmt clippy check-windows lint-sources
+FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows lint-sources
 
 # Forward only to the intent monorepo: an unrelated Makefile two levels up
 # must not be mistaken for it, so ../../.gitmodules has to name this path.
@@ -30,7 +30,7 @@ help:
 	@echo "Requested targets run together in 'make -C $(MONOREPO_ROOT) <targets>' in the monorepo's"
 	@echo "packages/intentd submodule ($(MONOREPO_ROOT)/Makefile exists and $(MONOREPO_ROOT)/.gitmodules"
 	@echo "names packages/intentd); RESUME=1, GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=... and"
-	@echo "E='<nextest filterset>' (test-select) pass through."
+	@echo "E='<nextest filterset>' (test-select, test-stress) and COUNT=N LOAD=1 (test-stress) pass through."
 	@echo "In a standalone clone the targets exit 2 and name the monorepo command."
 	@echo ""
 	@echo "Local target: test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"

@@ -783,7 +783,7 @@ async fn queue_merge_restored_alias_is_not_duplicated_by_frozen_draining_overlay
     svc.freeze_shutdown_drains();
     svc.persist_shutdown_drains().await;
     drop(guard);
-    let restarted = Services::new(svc.store.clone());
+    let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     let rows = restarted.queue_snapshot(&agent);
     assert_eq!(rows.len(), 1);
@@ -838,7 +838,7 @@ async fn queue_merge_post_archive_human_append_wakes_without_rewriting_queued_at
         "fresh appended human input must release the archive park"
     );
     svc.persist_queue_snapshot(&agent).await;
-    let restarted = Services::new(svc.store.clone());
+    let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     assert!(restarted.has_user_origin_ready_since(&agent, archived_at));
     assert_eq!(
@@ -945,7 +945,7 @@ async fn queue_merge_archive_signal_survives_handback_and_ignores_retry_and_auto
             .unwrap();
         assert!(!svc.has_user_origin_ready_since(&agent, "2003-01-01T00:00:00Z"));
         svc.persist_queue_snapshot(&agent).await;
-        let restarted = Services::new(svc.store.clone());
+        let restarted = Services::new_isolated(svc.store.clone());
         restarted.rehydrate_agent_queues().await.unwrap();
         assert!(restarted.has_user_origin_ready_since(&agent, "2001-01-01T00:00:00Z"));
         assert!(!restarted.has_user_origin_ready_since(&agent, "2003-01-01T00:00:00Z"));

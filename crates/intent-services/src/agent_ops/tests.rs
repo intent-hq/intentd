@@ -118,7 +118,7 @@ pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store).with_settings_registry(registry);
+    let services = Services::new_isolated(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -143,17 +143,17 @@ async fn setup_with_task_graph(
     registry
         .apply(&[("agentFeatures.taskGraph".into(), json!(enabled))])
         .expect("set taskGraph");
-    let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
+    let services = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
     (tmp, services, ws, registry, config_dir)
 }
 
-async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
+pub(super) async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store).with_settings_registry(registry);
+    let services = Services::new_isolated(store).with_settings_registry(registry);
     let bus = EventBus::new(services.store().clone());
     let services = services.with_event_bus(bus.clone());
     (tmp, services, ws, bus)
@@ -1353,7 +1353,7 @@ async fn startup_heal_prunes_watches_for_retired_or_missing_parent() {
     let (live, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let retired = create_agent(&svc, &ws, "Retired").await;
         let deleted = create_agent(&svc, &ws, "Deleted").await;
         let live = create_agent(&svc, &ws, "Live").await;
@@ -1383,7 +1383,7 @@ async fn startup_heal_prunes_watches_for_retired_or_missing_parent() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -1407,7 +1407,7 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let retired = create_agent(&svc, &ws, "Retired").await;
         let deleted = create_agent(&svc, &ws, "Deleted").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -1442,7 +1442,7 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
     } // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
         .await
@@ -3004,7 +3004,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     let (caller, t1, t2) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let caller = create_agent(&svc, &chief_ws, "Chief").await;
         let t1 = create_agent(&svc, &ws, "Target1").await;
         let t2 = create_agent(&svc, &ws, "Target2").await;
@@ -3056,7 +3056,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     s2.status = intent_core::AgentStatus::Completed;
     s2.completion_report = Some("two".into());
     store.update_agent_session(&ws, &s2).await.expect("mark t2");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&chief_ws)
@@ -3275,7 +3275,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3292,7 +3292,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
     }; // old Services dropped — simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -3328,7 +3328,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3357,7 +3357,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
         .update_agent_session(&ws, &s)
         .await
         .expect("mark child");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -3403,7 +3403,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
     let (gone_parent, live_parent) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let gone_parent = create_agent(&svc, &ws, "GoneParent").await;
         let live_parent = create_agent(&svc, &ws, "LiveParent").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -3442,7 +3442,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
         .update_agent_session(&ws, &s)
         .await
         .expect("mark parent deleted");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -3470,7 +3470,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3496,7 +3496,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -3526,7 +3526,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
+        let svc = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -3591,7 +3591,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     // historical completion on either, and the re-armed watch stays armed.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -4306,7 +4306,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
+        let svc = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -4369,7 +4369,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     // stable durable delivery and atomic watch retirement are idempotent.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -4401,7 +4401,7 @@ async fn restart_reconcile_skips_already_delivered_failure() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         let baseline = parent_message_count(&svc, &parent).await;
@@ -4458,7 +4458,7 @@ async fn restart_reconcile_skips_already_delivered_failure() {
     // not re-deliver on either, and the re-armed watch stays armed.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -5427,7 +5427,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
             .insert_workspace(&workspace(&target_ws))
             .await
             .expect("workspace");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let chief = create_agent(&svc, &WorkspaceId::chief(), "Chief thread").await;
         let target = create_agent(&svc, &target_ws, "Remote target").await;
         svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
@@ -5467,7 +5467,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     assert_eq!(
         restarted
             .heal_completion_watches_on_startup()
@@ -14456,7 +14456,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::runtime_config::SupervisePark::default());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_settings_registry(test_registry_with_default_provider(&tmp))
         .with_queue_mutation_gate_park(Arc::clone(&park));
     let id = create_agent(&svc, &ws, "Shared").await;
@@ -18964,8 +18964,8 @@ async fn summary_reports_counts_and_last_response() {
 async fn get_models_returns_empty_list_when_cli_unavailable() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let svc =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     let res = svc.agent_get_models_op().await.expect("models");
     let models = res["models"].as_array().unwrap();
     assert!(models.is_empty(), "no static fallback: {models:?}");
@@ -20024,7 +20024,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let subscriber = create_agent(&svc, &ws, "Watcher").await;
         let other = create_agent(&svc, &ws, "Worker").await;
         // `file:*` — agent event types are rejected for agent subscribers
@@ -20071,7 +20071,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     // "Restart": fresh Services over the same database.
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus.clone());
+    let svc = Services::new_isolated(store).with_event_bus(bus.clone());
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -20143,7 +20143,7 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let subscriber = create_agent(&svc, &ws, "Watcher").await;
         svc.agent_subscribe(
             ws.clone(),
@@ -20184,7 +20184,7 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus);
+    let svc = Services::new_isolated(store).with_event_bus(bus);
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -21211,7 +21211,7 @@ async fn workspace_delete_cleans_up_event_subscriptions() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_event_bus(bus)
         .with_workspaces_root(tmp.path.with_extension("workspaces"));
     let other_ws = WorkspaceId::new();
@@ -21289,7 +21289,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
             .await
             .expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let chief_sub = create_agent(&svc, &chief, "Chief").await;
         svc.agent_subscribe(
             gone_ws.clone(),
@@ -21320,7 +21320,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
     // "Restart": fresh Services over the same database.
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus);
+    let svc = Services::new_isolated(store).with_event_bus(bus);
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -22685,7 +22685,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         (parent, child)
@@ -22715,7 +22715,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
             .await
             .expect("seed row");
     }
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -26691,7 +26691,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = FakeRuntime::install(Services::new(store));
+        let svc = FakeRuntime::install(Services::new_isolated(store));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26723,7 +26723,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = FakeRuntime::install(Services::new(store));
+    let restarted = FakeRuntime::install(Services::new_isolated(store));
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -26807,7 +26807,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_pr_monitor(&svc, &ws, &child, 99).await;
@@ -26839,7 +26839,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -27017,7 +27017,7 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store).with_completion_classify_park(park.clone());
+    let svc = Services::new_isolated(store).with_completion_classify_park(park.clone());
     let a = create_agent(&svc, &ws, "A").await;
     let b = create_agent(&svc, &ws, "B").await;
     let c = create_agent(&svc, &ws, "C").await;
@@ -27096,7 +27096,7 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store).with_completion_claim_park(park.clone());
+    let svc = Services::new_isolated(store).with_completion_claim_park(park.clone());
     let a = create_agent(&svc, &ws, "A").await;
     let b = create_agent(&svc, &ws, "B").await;
 
@@ -27199,7 +27199,7 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
     let flip_park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_completion_claim_park(park.clone())
         .with_completion_flip_take_park(flip_park.clone());
     let a = create_agent(&svc, &ws, "A").await;
@@ -27773,7 +27773,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
     let ws = WorkspaceId::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let b = create_agent(&svc, &ws, "B").await;
     let c = create_agent(&svc, &ws, "C").await;
 
@@ -27803,7 +27803,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
         .await
         .expect("open durable-phase store");
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
         id: "watch-1643".to_string(),
         parent_workspace_id: ws.clone(),
@@ -27960,7 +27960,7 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
     let (a, b, c) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let a = create_agent(&svc, &ws, "A").await;
         let b = create_agent(&svc, &ws, "B").await;
         let c = create_agent(&svc, &ws, "C").await;
@@ -27980,7 +27980,7 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -28016,7 +28016,7 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
     let (p, b, c) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let p = create_agent(&svc, &ws, "P").await;
         let b = create_agent(&svc, &ws, "B").await;
         let c = create_agent(&svc, &ws, "C").await;
@@ -28057,7 +28057,7 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     // Startup order: groups rehydrate FIRST (watch registry still empty —
     // the durable classification reads the persisted watch rows).
     let loaded = restarted
@@ -29423,7 +29423,7 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
     let (p, b) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let p = create_agent(&svc, &ws, "P").await;
         let b = create_agent(&svc, &ws, "B").await;
         svc.app_agents_wait_op(
@@ -29462,7 +29462,7 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
         .await
@@ -29494,7 +29494,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_pr_monitor(&svc, &ws, &child, 77).await;
@@ -29523,7 +29523,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -30298,7 +30298,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     let (watcher, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let watcher = create_agent(&svc, &ws, "Watcher").await;
         let target = create_agent(&svc, &ws, "Target").await;
         // Registered while the target is still un-run (guard passes), then
@@ -30323,7 +30323,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -34052,7 +34052,7 @@ async fn setup_with_manager_on(
     let bus = EventBus::new(store.clone());
     let registry = test_registry_with_default_provider(&tmp);
     let services = configure(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_settings_registry(registry)
             .with_event_bus(bus.clone()),
     );
@@ -35894,7 +35894,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
 
     // Restart: both entries rehydrate with their turn ids intact.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
     let front = restarted.dequeue_message(&id).expect("dequeue requeued");
@@ -35971,7 +35971,7 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
 
     // Fresh Services over the same store = a daemon restart (empty in-memory map).
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
 
@@ -36016,7 +36016,7 @@ async fn rehydrate_preserves_live_map() {
     // Rehydrating over a Services that already holds a live queue for the
     // agent keeps the live (newer) queue rather than clobbering it.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     restarted
         .agent_queue_message_op(id.clone(), "live".into(), None, None, None)
         .await
@@ -36280,7 +36280,7 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 
     // Fresh Services over the same store = a daemon restart.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
 
@@ -39478,7 +39478,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     let (caller, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let caller = create_agent(&svc, &ws, "Caller").await;
         let target = create_agent(&svc, &ws, "Target").await;
         link_task_note(&svc, &ws, &target, "Stalled task", "in_progress").await;
@@ -39518,7 +39518,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
         .expect("target session");
     s.status = intent_core::AgentStatus::Completed;
     store.update_agent_session(&ws, &s).await.expect("mark");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
@@ -40023,7 +40023,7 @@ fn question_blocks() -> serde_json::Value {
 /// proposal-resource block whose embedded proposal identifies as
 /// `proposal_id` (the shape the §7.1 turn-end drain appends for
 /// `ws.app.proposal.show` / `proposeSibling`).
-fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
+pub(super) fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
     let proposal = json!({
         "kind": "settings-change",
         "applyToolCallId": proposal_id,
@@ -43025,7 +43025,7 @@ async fn interrupt_enqueue_orders_ahead_of_normal_and_persists() {
     // Ordering + marker survive restart.
     svc.publish_queue_updated(&id).await;
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     restarted.rehydrate_agent_queues().await.expect("rehydrate");
     let front = restarted.dequeue_message(&id).expect("dequeue");
     assert_eq!(front.content, "int-1");
@@ -43924,7 +43924,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -43947,7 +43947,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
         .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
         .await
         .expect("mark child retired");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -43984,7 +43984,7 @@ async fn group_rehydration_settles_retired_child() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         let gid = svc.get_or_create_delegation_group(&ws, &parent);
@@ -44033,7 +44033,7 @@ async fn group_rehydration_settles_retired_child() {
         .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
         .await
         .expect("mark child retired");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
@@ -44596,7 +44596,7 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     let (watcher, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let watcher = create_agent(&svc, &ws, "Watcher").await;
         let target = create_agent(&svc, &ws, "Target").await;
         svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
@@ -44606,7 +44606,7 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -48728,7 +48728,7 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     svc.register_completion_watch(
@@ -48791,7 +48791,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let children = vec![
             create_agent(&svc, &ws, "One").await,
@@ -48862,7 +48862,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
             .execute(svc.store().write_pool())
             .await
             .unwrap();
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
         let recovery = restarted.prepare_startup_completion_recovery().await;
         assert!(restarted
             .store()
@@ -48896,7 +48896,7 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = FakeRuntime::install(Services::new(store));
+        let svc = FakeRuntime::install(Services::new_isolated(store));
         let original = create_agent(&svc, &ws, "Original").await;
         let newcomer = create_agent(&svc, &ws, "Newcomer").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -48920,7 +48920,9 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
             .update_agent_session(&ws, &session)
             .await
             .unwrap();
-        let restarted = FakeRuntime::install(Services::new(Store::open(&tmp.path).await.unwrap()));
+        let restarted = FakeRuntime::install(Services::new_isolated(
+            Store::open(&tmp.path).await.unwrap(),
+        ));
         let recovery = restarted.prepare_startup_completion_recovery().await;
         restarted
             .agent_watch_op(ws.clone(), newcomer.clone(), child.clone())
@@ -49019,7 +49021,7 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let mut children = vec![
         create_agent(&svc, &ws, "One").await,
@@ -49046,7 +49048,7 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     }
     wait_for_persisted_watches(&svc, 2).await;
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let restarted = Services::new(Store::open(&tmp.path).await.unwrap())
+    let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap())
         .with_completion_claim_park(park.clone());
     let recovery = restarted.prepare_startup_completion_recovery().await;
     let (stop, stopping) = tokio::sync::watch::channel(false);
@@ -49096,7 +49098,7 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         link_task_note(&svc, &ws, &child, "Unfinished task", "in_progress").await;
@@ -49128,7 +49130,7 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
                 .status,
             intent_core::AgentStatus::Completed
         );
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
         let recovery = restarted.prepare_startup_completion_recovery().await;
         let (_stop, stopping) = tokio::sync::watch::channel(false);
         restarted
@@ -49269,7 +49271,7 @@ async fn shutdown_admission_stops_retry_and_preserves_durable_watch() {
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
 
     // Restart wiring can still recover the watch and deliver its stable wake.
-    let restarted = Services::new(svc.store().clone());
+    let restarted = Services::new_isolated(svc.store().clone());
     restarted
         .heal_completion_watches_on_startup()
         .await
@@ -49387,7 +49389,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
             .is_some(),
         "unadmitted recovery stays pending for the next boot"
     );
-    let restarted = Services::new(svc.store.clone());
+    let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     assert!(
         restarted.queue_snapshot(&agent).is_empty(),
@@ -49665,4 +49667,38 @@ async fn task_push_assignment_cleanup_publishes_complete_metadata() {
         .is_none());
     assert!(events[0].data["note"].get("content").is_none());
     bus.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn models_list_codex_reports_warning_kind_only_for_known_causes() {
+    use crate::model_catalog::ModelWarningKind;
+    for (kind, wire) in [
+        (Some(ModelWarningKind::CliMissing), Some("cli-missing")),
+        (
+            Some(ModelWarningKind::PrerequisiteMissing),
+            Some("prerequisite-missing"),
+        ),
+        (None, None),
+    ] {
+        let (_t, svc, _ws) = setup().await;
+        svc.models_catalog.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: "codex catalog unavailable".into(),
+                kind,
+            },
+        );
+        let res = svc
+            .models_list_op(Some("codex".to_string()), false)
+            .await
+            .expect("models.list codex");
+        assert_eq!(res["providerId"], "codex");
+        assert_eq!(res["source"], "static");
+        assert_eq!(res["warning"], "codex catalog unavailable", "{res}");
+        assert_eq!(
+            res.get("warningKind").and_then(serde_json::Value::as_str),
+            wire,
+            "{res}"
+        );
+    }
 }

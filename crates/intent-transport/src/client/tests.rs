@@ -34,6 +34,26 @@ impl WorkspaceApi for RecordingApi {
     }
 }
 
+/// [`super::handle`] with an unreserved claim — what a detached guard's
+/// claim is — for tests about the hello itself rather than its reservation.
+async fn handle(
+    req: ClientRequest,
+    api: &dyn WorkspaceApi,
+    client_id: &mut Option<ClientId>,
+    is_local: bool,
+    version: &str,
+) -> HelloOutcome {
+    super::handle(
+        req,
+        api,
+        client_id,
+        is_local,
+        version,
+        HelloClaim::unreserved,
+    )
+    .await
+}
+
 fn parsed(outcome: HelloOutcome) -> Value {
     serde_json::from_str(&outcome.frame.expect("a response frame")).unwrap()
 }
@@ -102,7 +122,8 @@ async fn mints_client_id_when_omitted() {
     let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     let bound = outcome
         .bound
-        .clone()
+        .as_ref()
+        .map(|c| c.identity().clone())
         .expect("a successful hello binds an identity");
     let resp = parsed(outcome);
     let cid = resp["result"]["clientId"].as_str().unwrap();
@@ -184,6 +205,11 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
         assert_eq!(server["capabilities"]["prWorkspaceLookup"], json!(1));
         assert_eq!(server["capabilities"]["agentWorkers"], json!(1));
         assert_eq!(server["capabilities"]["workspaceLabels"], json!(1));
+        assert_eq!(server["capabilities"]["secretRequests"], json!(1));
+        assert_eq!(
+            server["capabilities"]["workspaceAutoArchiveOptOut"],
+            json!(1)
+        );
         for capability in [
             "repositoryContext",
             "repositorySelection",
@@ -258,7 +284,11 @@ async fn host_identification_is_parsed_persisted_and_bound() {
         device_kind: Some("laptop".to_string()),
     };
     let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
-    let bound = outcome.bound.clone().expect("bound identity");
+    let bound = outcome
+        .bound
+        .as_ref()
+        .map(|c| c.identity().clone())
+        .expect("bound identity");
     assert_eq!(bound.host, expected);
     let last = api.last.lock().unwrap().clone().unwrap();
     assert_eq!(last.0, "cli-host");
@@ -272,7 +302,11 @@ async fn host_identification_is_parsed_persisted_and_bound() {
     }))
     .unwrap();
     let outcome = handle(partial, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
-    let bound = outcome.bound.clone().expect("bound identity");
+    let bound = outcome
+        .bound
+        .as_ref()
+        .map(|c| c.identity().clone())
+        .expect("bound identity");
     assert_eq!(
         bound.host,
         ClientHostInfo {
@@ -319,7 +353,11 @@ async fn notification_has_no_response_but_sets_binding() {
     let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     assert!(outcome.frame.is_none());
     assert_eq!(binding.as_ref().unwrap().0, "cli-9b21");
-    let bound = outcome.bound.expect("notification hello still binds");
+    let bound = outcome
+        .bound
+        .as_ref()
+        .map(ClaimedHello::identity)
+        .expect("notification hello still binds");
     assert_eq!(bound.client_id.as_str(), "cli-9b21");
     assert!(bound.browser_exec());
 }
@@ -381,7 +419,11 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
         ),
     )
     .await;
-    let bound = guest.bound.clone().expect("a successful hello binds");
+    let bound = guest
+        .bound
+        .as_ref()
+        .map(|c| c.identity().clone())
+        .expect("a successful hello binds");
     let guest = parsed(guest);
     assert_eq!(guest["result"]["clientId"], json!("p-guest:cli-owner"));
     assert_eq!(
@@ -539,4 +581,380 @@ fn monitor_test_host_support_requires_explicit_opt_in() {
         enabled, ordinary,
         "test support changes no other host claims"
     );
+}
+
+/// Records `rehome_superseded_browser_tabs` calls (intent-hq/intent#8045) and
+/// optionally fails them.
+#[derive(Default)]
+struct RehomeApi {
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+    fail: bool,
+    /// The durable host role `principal_host_role` reports (`None` ⇒ error).
+    role: Option<intent_core::HostRole>,
+}
+
+impl WorkspaceApi for RehomeApi {
+    fn upsert_client(
+        &self,
+        _client_id: ClientId,
+        _name: Option<String>,
+        _capabilities: Option<Value>,
+        _host: ClientHostInfo,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn principal_host_role(
+        &self,
+        _principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<intent_core::HostRole>> {
+        let role = self.role;
+        Box::pin(
+            async move { role.ok_or_else(|| intent_core::Error::NotFound("principal".into())) },
+        )
+    }
+
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((client_id.0, superseded.into_iter().map(|c| c.0).collect()));
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(intent_core::Error::Internal("rehome exploded".into()))
+            } else {
+                Ok(1)
+            }
+        })
+    }
+}
+
+fn wire_caller(principal: &str, is_administrator: bool) -> Caller {
+    Caller::Wire {
+        principal_id: PrincipalId::from_string(principal),
+        host_role: if is_administrator {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        },
+    }
+}
+
+fn hello_as(client_id: &str) -> ClientRequest {
+    classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "client.hello",
+        "params": { "clientId": client_id, "capabilities": { "browserExec": true } }
+    }))
+    .unwrap()
+}
+
+/// A device whose id other backends prefixed twice re-hellos as the
+/// administrator: the tabs of both earlier ids are offered for rehome, most
+/// recent first, so they move to the current id.
+#[tokio::test]
+async fn administrator_hello_rehomes_tabs_from_every_superseded_suffix() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(wire_caller("p-owner", true)),
+            handle(
+                hello_as("aaccc21a:4d61d017:60420340"),
+                &api,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        out["result"]["clientId"],
+        json!("aaccc21a:4d61d017:60420340")
+    );
+    assert_eq!(
+        *api.calls.lock().unwrap(),
+        vec![(
+            "aaccc21a:4d61d017:60420340".to_string(),
+            vec!["4d61d017:60420340".to_string(), "60420340".to_string()],
+        )]
+    );
+}
+
+/// A plain (unprefixed) id has no earlier ids, so no rehome is attempted.
+#[tokio::test]
+async fn unprefixed_hello_attempts_no_rehome() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let _ = handle(
+        hello_as("60420340"),
+        &api,
+        &mut binding,
+        true,
+        TEST_DAEMON_VERSION,
+    )
+    .await;
+    assert!(api.calls.lock().unwrap().is_empty());
+}
+
+/// Multiplayer safety: a collaborator presenting another member's raw id
+/// resolves to `{principal}:{raw}`, but may not act as `{raw}`, so the other
+/// member's tabs are never offered for rehome. Its own namespaced earlier id
+/// (`{principal}:{raw}` under a further `{principal}:` prefix) is.
+#[tokio::test]
+async fn collaborator_hello_never_rehomes_ids_outside_its_namespace() {
+    let api = RehomeApi::default();
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(wire_caller("p-guest", false)),
+            handle(
+                hello_as("cli-owner"),
+                &api,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(out["result"]["clientId"], json!("p-guest:cli-owner"));
+    assert!(
+        api.calls.lock().unwrap().is_empty(),
+        "the owner's raw id is not the guest's to rehome"
+    );
+
+    let mut binding = None;
+    let _ = with_request_context(
+        true,
+        Some(wire_caller("p-other", false)),
+        handle(
+            hello_as("p-guest:cli-owner"),
+            &api,
+            &mut binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
+    )
+    .await;
+    assert!(
+        api.calls.lock().unwrap().is_empty(),
+        "another guest's namespaced id is not p-other's to rehome"
+    );
+
+    assert_eq!(
+        with_request_context(true, Some(wire_caller("p-guest", false)), async {
+            superseded_client_ids(&ClientId::from_string("p-guest:x:p-guest:dev"))
+        })
+        .await,
+        vec![ClientId::from_string("p-guest:dev")],
+        "only ids inside the caller's own namespace qualify"
+    );
+}
+
+/// A failed rehome is logged and never fails the hello.
+#[tokio::test]
+async fn failed_rehome_does_not_fail_the_hello() {
+    let api = RehomeApi {
+        fail: true,
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let out = handle(
+        hello_as("4d61d017:60420340"),
+        &api,
+        &mut binding,
+        true,
+        TEST_DAEMON_VERSION,
+    )
+    .await;
+    assert!(out.bound.is_some());
+    let out = parsed(out);
+    assert_eq!(out["result"]["clientId"], json!("4d61d017:60420340"));
+    assert_eq!(binding.unwrap().as_str(), "4d61d017:60420340");
+    assert_eq!(api.calls.lock().unwrap().len(), 1);
+}
+
+/// Rehoming is browser management: a collaborator whose connection still
+/// carries a member snapshot but who has since been demoted to guest keeps
+/// its namespace, yet its hello offers nothing for rehome (and still
+/// succeeds); with current member authority its own namespaced earlier id
+/// is offered.
+#[tokio::test]
+async fn demoted_collaborator_hello_rehomes_nothing_but_still_succeeds() {
+    let member_snapshot = Caller::Wire {
+        principal_id: PrincipalId::from_string("p-mem"),
+        host_role: intent_core::HostRole::Member,
+    };
+    let demoted = RehomeApi {
+        role: Some(intent_core::HostRole::Guest),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(member_snapshot.clone()),
+            handle(
+                hello_as("p-mem:x:p-mem:dev"),
+                &demoted,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(out["result"]["clientId"], json!("p-mem:x:p-mem:dev"));
+    assert!(demoted.calls.lock().unwrap().is_empty());
+
+    let member = RehomeApi {
+        role: Some(intent_core::HostRole::Member),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let _ = with_request_context(
+        true,
+        Some(member_snapshot),
+        handle(
+            hello_as("p-mem:x:p-mem:dev"),
+            &member,
+            &mut binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
+    )
+    .await;
+    assert_eq!(
+        *member.calls.lock().unwrap(),
+        vec![(
+            "p-mem:x:p-mem:dev".to_string(),
+            vec!["p-mem:dev".to_string()]
+        )]
+    );
+}
+
+/// Records whether the hello's id was already active in `registry` when the
+/// client row was persisted; fails the upsert when `fail` is set.
+#[derive(Default)]
+struct ReservationProbeApi {
+    registry: crate::reverse::PrimaryReverseRegistry,
+    active_during_upsert: Mutex<Option<(String, bool)>>,
+    fail: bool,
+}
+
+impl WorkspaceApi for ReservationProbeApi {
+    fn upsert_client(
+        &self,
+        client_id: ClientId,
+        _name: Option<String>,
+        _capabilities: Option<Value>,
+        _host: ClientHostInfo,
+    ) -> BoxFuture<'_, Result<()>> {
+        let active = self.registry.client_active(&client_id);
+        *self.active_during_upsert.lock().unwrap() = Some((client_id.0, active));
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(intent_core::Error::Internal("store down".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+fn registered_guard(api: &ReservationProbeApi) -> crate::reverse::PrimaryReverseGuard {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    api.registry.register(
+        crate::reverse::ReverseChannel::new(tx),
+        crate::reverse::ReverseTransport::Wss,
+    )
+}
+
+/// intent-hq/intent#8045: `handle` claims the id it resolved — presented or
+/// server-generated — before persisting the client row, and the identity it
+/// returns for binding is that claim's, so the persisted, replied, reserved
+/// and bound ids are one value.
+#[tokio::test]
+async fn hello_claims_its_resolved_id_before_persisting_and_binds_it() {
+    for params in [json!({ "clientId": "cli-7f3a" }), json!({})] {
+        let api = ReservationProbeApi::default();
+        let guard = registered_guard(&api);
+        let mut binding = None;
+        let req = classify(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": params
+        }))
+        .unwrap();
+        let outcome = super::handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION, |id| {
+            guard.claim_hello(id)
+        })
+        .await;
+        let Some(ClaimedHello::Reserved(hello)) = outcome.bound.as_ref() else {
+            panic!("a registered guard's hello completes reserved ({params})");
+        };
+        let bound = hello.client_id().clone();
+        let (persisted, active) = api.active_during_upsert.lock().unwrap().clone().unwrap();
+        assert!(active, "{persisted} reserved before its row is persisted");
+        assert_eq!(persisted, bound.as_str());
+        assert_eq!(binding.as_ref(), Some(&bound));
+        let resp = parsed(outcome);
+        assert_eq!(resp["result"]["clientId"], json!(bound.as_str()));
+    }
+}
+
+/// A hello that fails after claiming its id drops the claim, so the id is
+/// not left active and nothing is returned to bind.
+#[tokio::test]
+async fn failed_hello_releases_its_claim() {
+    let api = ReservationProbeApi {
+        fail: true,
+        ..ReservationProbeApi::default()
+    };
+    let guard = registered_guard(&api);
+    let mut binding = None;
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "client.hello",
+        "params": { "clientId": "cli-7f3a" }
+    }))
+    .unwrap();
+    let outcome = super::handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION, |id| {
+        guard.claim_hello(id)
+    })
+    .await;
+    assert!(outcome.bound.is_none());
+    assert!(parsed(outcome).get("error").is_some());
+    let (persisted, active) = api.active_during_upsert.lock().unwrap().clone().unwrap();
+    assert!(active, "claimed before the failed upsert");
+    assert!(
+        !api.registry
+            .client_active(&ClientId::from_string(persisted)),
+        "the failed hello released its claim"
+    );
+    assert_eq!(guard.bound_client_id(), None);
+}
+
+/// A hello rejected before resolving an id (an invalid `clientId`) never
+/// claims one.
+#[tokio::test]
+async fn invalid_hello_claims_nothing() {
+    let api = ReservationProbeApi::default();
+    let mut binding = None;
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": { "clientId": 7 }
+    }))
+    .unwrap();
+    let outcome = super::handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION, |_| {
+        panic!("an invalid hello must not claim an id")
+    })
+    .await;
+    assert!(outcome.bound.is_none());
+    assert!(api.active_during_upsert.lock().unwrap().is_none());
 }

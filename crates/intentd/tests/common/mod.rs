@@ -335,7 +335,7 @@ fn retained_dir_report(test: &str, original: &Path, retained: &Path) -> String {
 ///
 /// In-process integration tests must chain
 /// `.with_workspaces_root(root.path().to_path_buf())` onto every
-/// `Services::new(...)` so tests never resolve the real `~/intent/workspaces`.
+/// `Services::new_isolated(...)` so tests never resolve the real `~/intent/workspaces`.
 /// The returned `TempDir` guard must be held for the full test lifetime: it
 /// removes the tree on drop (including on panic), so dropping it early would
 /// let the services layer recreate — and leak — the root. Set
@@ -349,7 +349,7 @@ pub fn hermetic_workspaces_root() -> tempfile::TempDir {
 /// provider fallback, so in-process tests that create/delegate agents without
 /// an explicit provider or model must chain
 /// `.with_settings_registry(common::registry_with_default_provider(dir))`
-/// onto `Services::new(...)` to have a configured default to resolve to. The
+/// onto `Services::new_isolated(...)` to have a configured default to resolve to. The
 /// `providers.paths` override points auggie at a deterministic executable so
 /// availability checks (`agent.delegate`) pass without the real binary on
 /// the test host.

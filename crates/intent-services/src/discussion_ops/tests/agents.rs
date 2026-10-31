@@ -319,7 +319,7 @@ async fn discussion_agent_retry_partial_handoff_and_restart_never_redispatch() {
         .execute(svc.store.write_pool())
         .await
         .unwrap();
-    let restored = Services::new(svc.store.clone());
+    let restored = Services::new_isolated(svc.store.clone());
     assert_eq!(restored.rehydrate_agent_queues().await.unwrap(), 2);
     assert_eq!(restored.queue_snapshot(&a).len(), 1);
     assert_eq!(restored.queue_snapshot(&b).len(), 1);
@@ -353,7 +353,7 @@ async fn discussion_agent_retry_partial_handoff_and_restart_never_redispatch() {
     restored.agent_queues.lock().unwrap().clear();
     restored.store.replace_agent_queue(&a, &[]).await.unwrap();
     restored.store.replace_agent_queue(&b, &[]).await.unwrap();
-    let after = Services::new(restored.store.clone());
+    let after = Services::new_isolated(restored.store.clone());
     assert_eq!(after.rehydrate_agent_queues().await.unwrap(), 0);
     with_caller(
         human(&people[1].id),
@@ -611,7 +611,7 @@ async fn discussion_activity_restart_stops_working_and_retains_queued() {
     svc.set_discussion_activity(&active.turn_id, "working", None)
         .await;
     sqlx::query("INSERT INTO interrupted_agent(agent_id,workspace_id,prev_status,interrupted_at,resolution) VALUES(?,?,'active',?,'pending')").bind(a.as_str()).bind(ws.as_str()).bind(intent_core::now_iso()).execute(svc.store.write_pool()).await.unwrap();
-    let svc = Services::new(svc.store.clone());
+    let svc = Services::new_isolated(svc.store.clone());
     svc.rehydrate_agent_queues().await.unwrap();
     let resolution: String =
         sqlx::query_scalar("SELECT resolution FROM interrupted_agent WHERE agent_id=?")
@@ -819,7 +819,7 @@ async fn discussion_retry_outbox_restores_the_same_attempt_after_restart() {
     assert!(changed);
     assert_eq!(retry.activity.attempt, 2);
     // Crash after atomic Retry, before queue adoption.
-    let restored = Services::new(svc.store.clone());
+    let restored = Services::new_isolated(svc.store.clone());
     assert_eq!(restored.rehydrate_agent_queues().await.unwrap(), 1);
     assert_eq!(restored.queue_snapshot(&a)[0]["turnId"], retry.turn_id);
     let repeated = with_caller(
@@ -923,7 +923,7 @@ async fn discussion_agent_reactions_are_granted_bound_idempotent_and_never_wake(
     assert_eq!(first.reactions[0].reactors[0].principal_id, None);
     assert_eq!(svc.queue_snapshot(&a), queue_before);
     assert!(svc.queue_snapshot(&b).is_empty());
-    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    let reopened = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     let history = with_caller(
         as_agent(&a),
         reopened.discussion_history_op(&ws, "default", None, None, 50),

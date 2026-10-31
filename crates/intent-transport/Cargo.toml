@@ -1,6 +1,6 @@
 [package]
 name = "intent-transport"
-version = "0.11.71"
+version = "0.11.87"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -13,9 +13,9 @@ default = []
 repository-test-fixtures = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.71" }
-intent-services = { path = "../intent-services", version = "0.11.71" }
-intent-git = { path = "../intent-git", version = "0.11.71" }
+intent-core = { path = "../intent-core", version = "0.11.87" }
+intent-services = { path = "../intent-services", version = "0.11.87" }
+intent-git = { path = "../intent-git", version = "0.11.87" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -56,7 +56,12 @@ ctor = "1.0.10"
 # `intent_store::Store`. `intent-store` depends only on `intent-core`, so this
 # dev-only edge introduces no cycle; the normal-build dependency direction
 # (transport → services only) is unchanged.
-intent-store = { path = "../intent-store", version = "0.11.71" }
+intent-store = { path = "../intent-store", version = "0.11.87" }
+# Test `Services` are built with `Services::new_isolated` (per-instance scratch
+# secrets, never the developer's ~/intent), which exists only with this
+# test-only feature; a per-crate `cargo test -p intent-transport` must not
+# depend on workspace feature unification to see it.
+intent-services = { path = "../intent-services", version = "0.11.87", features = ["repository-test-fixtures"] }
 
 [lints]
 workspace = true

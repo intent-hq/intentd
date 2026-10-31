@@ -36,6 +36,7 @@ pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
 pub(crate) mod script;
+pub(crate) mod secret;
 pub(crate) mod task;
 pub(crate) mod terminal;
 pub(crate) mod workspace;
@@ -71,9 +72,12 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 #[must_use]
 pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
     let forced;
-    let features = if is_sub_agent && features.structured_questions {
+    let features = if (is_sub_agent && (features.structured_questions || features.secret_requests))
+        || (features.secret_requests && !features.host_exec)
+    {
         forced = AgentFeaturesSettings {
-            structured_questions: false,
+            structured_questions: features.structured_questions && !is_sub_agent,
+            secret_requests: features.secret_requests && features.host_exec && !is_sub_agent,
             ..features.clone()
         };
         &forced
@@ -104,6 +108,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     if features.host_exec {
         fragments.push(host::PRELUDE);
     }
+    if features.secret_requests {
+        fragments.push(secret::PRELUDE);
+    }
     if features.background_hooks {
         fragments.push(hook::PRELUDE);
     }
@@ -131,6 +138,16 @@ pub fn prelude_for_workspace(
     is_sub_agent: bool,
     workspace_id: &WorkspaceId,
 ) -> String {
+    let chief_features;
+    let features = if workspace_id.is_chief() && features.secret_requests {
+        chief_features = AgentFeaturesSettings {
+            secret_requests: false,
+            ..features.clone()
+        };
+        &chief_features
+    } else {
+        features
+    };
     let mut prelude = prelude_for_bridge(features, is_sub_agent);
     if workspace_id.is_chief() {
         prelude.push_str(app::mcp::PRELUDE);
@@ -378,9 +395,25 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("host.") {
-        return host::dispatch(api, workspace_id, rest, args)
+        let secrets = secret_requests_effective(features, is_sub_agent, workspace_id);
+        return host::dispatch(api, workspace_id, caller_agent_id, secrets, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("secret.") {
+        if !secret_requests_effective(features, is_sub_agent, workspace_id) {
+            return Err(format!("host: {}", secret::SECRET_REQUESTS_UNAVAILABLE));
+        }
+        return secret::dispatch(
+            api,
+            workspace_id,
+            caller_agent_id,
+            turn_attachments,
+            rest,
+            args,
+        )
+        .await
+        .map(Some);
     }
     if let Some(rest) = method.strip_prefix("hook.") {
         return hook::dispatch(api, workspace_id, caller_agent_id, rest, args)
@@ -424,6 +457,18 @@ pub(crate) async fn try_dispatch(
         .await;
     }
     Ok(None)
+}
+
+/// Whether agent secret requests (PROTOCOL §5.56) are available to this
+/// caller: the `secretRequests` toggle with `hostExec` (the only way to use a
+/// secret), a top-level caller, and a non-chief workspace (whose tool
+/// description has no `ws.host.*` surface).
+pub(crate) fn secret_requests_effective(
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    workspace_id: &WorkspaceId,
+) -> bool {
+    features.secret_requests && features.host_exec && !is_sub_agent && !workspace_id.is_chief()
 }
 
 /// Pull a required string field from a JS `args` object, surfacing the same

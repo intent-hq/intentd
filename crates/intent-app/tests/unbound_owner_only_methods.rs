@@ -121,7 +121,7 @@ async fn fixture() -> Fixture {
         })
         .await
         .expect("insert workspace");
-    let services = intent_app::compose(Services::new(store))
+    let services = intent_app::compose(Services::new_isolated(store))
         .with_workspaces_root(dir.path().join("workspaces"))
         .with_assets_root(dir.path().join("assets"));
     Fixture { services, ws, dir }

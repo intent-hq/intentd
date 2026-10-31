@@ -2648,7 +2648,7 @@ async fn cmd_serve_owned(
     let auto_retire_loop = orchestration.spawn(|| services.spawn_auto_retire_loop());
     // Automatic archive (PROTOCOL §5.1): shortly after startup and then
     // hourly, archive workspaces idle longer than
-    // `workspace.autoArchiveIdleAfterDays` (read live; default 7, 0 = off).
+    // `workspace.autoArchiveIdleAfterDays` (read live; default 0 = off).
     // Aborted on clean shutdown.
     let auto_archive_loop = orchestration.spawn(|| services.spawn_auto_archive_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
@@ -8543,7 +8543,7 @@ mod tests {
         let path = dir.path().join("store.db");
         let store = intent_store::Store::open(&path).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         let hub = services.mcp_hub();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -8716,7 +8716,7 @@ for line in sys.stdin:
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new_isolated(store));
         let server = WsApiServer::new_insecure(
             api,
             bus,
@@ -8768,7 +8768,7 @@ for line in sys.stdin:
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.db")).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(Services::new_isolated(store));
         let server = WsApiServer::new_insecure(
             api,
             bus,
@@ -8844,7 +8844,7 @@ for line in sys.stdin:
             .execute(store.write_pool())
             .await
             .unwrap();
-        let services = Services::new(store.clone());
+        let services = Services::new_isolated(store.clone());
         let startup: intent_core::Result<()> = async {
             restore_startup_queues(&services).await?;
             // Models the first request after listeners are allowed to start:

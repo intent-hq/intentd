@@ -1465,6 +1465,111 @@ async fn auto_purge_skips_a_folder_with_uncommitted_changes_until_it_is_clean() 
     assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
 }
 
+/// Commit `name` on top of `HEAD` in the repository at `dir`, returning it.
+fn commit_in(dir: &std::path::Path, name: &str) -> git2::Oid {
+    let repo = git2::Repository::open(dir).expect("open repo");
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    std::fs::write(dir.join(name), "work\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(name)).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, name, &tree, &parents)
+        .unwrap()
+}
+
+/// An archived workspace whose nested repository holds commits on no remote
+/// ref is skipped; a merged PR for an older commit (new work since) still
+/// skips it; a merged PR covering the nested `HEAD` lets the purge run —
+/// the commits survive on the forge.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_lets_a_merged_pr_cover_nested_unpushed_commits() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    let primary = git2::Repository::open(&wt).expect("open worktree");
+    let exclude = primary.commondir().join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    std::fs::write(&exclude, "packages/\n").unwrap();
+
+    let nested = wt.join("packages").join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    git2::Repository::init(&nested).expect("init nested");
+    let base = commit_in(&nested, "base.txt");
+    git2::Repository::open(&nested)
+        .unwrap()
+        .reference("refs/remotes/origin/main", base, true, "base")
+        .unwrap();
+    let merged = commit_in(&nested, "feature.txt");
+
+    let mut root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: ws.id.clone(),
+        path: nested.to_str().unwrap().into(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: intent_core::now_iso(),
+        updated_at: intent_core::now_iso(),
+    };
+    f.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register nested root");
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    let merged_pr = |head: git2::Oid| {
+        serde_json::from_value::<intent_core::PullRequestInfo>(serde_json::json!({
+            "id": "PR_9",
+            "number": 9,
+            "url": "https://github.com/o/sub/pull/9",
+            "title": "feat: sub",
+            "status": "Merged",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "headSha": head.to_string(),
+        }))
+        .expect("pr record")
+    };
+    let sweep = || f.svc.sweep_auto_retire_after(Some(7), days_from_now(8));
+
+    let report = sweep().await;
+    assert_eq!((report.retired, report.skipped), (0, 1), "{report:?}");
+
+    let head = commit_in(&nested, "follow-up.txt");
+    root.pull_requests = Some(vec![merged_pr(merged)]);
+    f.store
+        .update_workspace_git_root_pr(&root)
+        .await
+        .expect("store merged PR");
+    let report = sweep().await;
+    assert_eq!(
+        (report.retired, report.skipped),
+        (0, 1),
+        "a commit after the merge is not covered: {report:?}"
+    );
+    assert!(nested.join("follow-up.txt").is_file());
+
+    root.pull_requests = Some(vec![merged_pr(head)]);
+    f.store
+        .update_workspace_git_root_pr(&root)
+        .await
+        .expect("store merged PR");
+    let report = sweep().await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+}
+
 /// The sweep reads the renamed setting live: `workspace.purgeArchivedAfterDays
 /// = 7` turns it on without a restart.
 #[intent_test_macros::daemon_test]
