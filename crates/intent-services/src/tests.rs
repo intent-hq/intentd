@@ -24,6 +24,9 @@ mod skill_list;
 mod task_list_latency;
 mod task_push;
 mod workspace_auto_archive_disabled;
+// Budgets are debug-profile future sizes measured on x86_64 Linux (CI).
+#[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+mod workspace_create_future_size;
 pub(crate) mod workspace_delete;
 mod workspace_label;
 
