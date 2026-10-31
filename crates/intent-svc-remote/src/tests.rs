@@ -1003,7 +1003,7 @@ mod node_mode {
         let mut fake = FakeNode::start().await;
         let config = json!({
             "nodeId": NODE,
-            "endpoint": format!("wss://{}", fake.listener.local_addr()),
+            "endpoint": format!("wss://{}", fake.local_addr()),
             "certificateSha256": fake.certificate.fingerprint256,
             "token": token().expose(),
         });
@@ -1020,7 +1020,7 @@ mod node_mode {
         );
         let accepted = tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
-            fake.listener.accept(),
+            fake.accepted.recv(),
         )
         .await;
         assert!(accepted.is_err(), "the node is never dialed");

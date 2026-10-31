@@ -116,7 +116,18 @@ pub(crate) struct ExecutorService {
     was_enabled: std::sync::atomic::AtomicBool,
     /// Follows settings changes (daemon only).
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Test seam: `revoked()` signals the first sender once it has taken
+    /// the backend out, then waits on the receiver before registering its
+    /// stop.
+    #[cfg(test)]
+    revoke_pause: Mutex<Option<RevokePause>>,
 }
+
+#[cfg(test)]
+type RevokePause = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -156,6 +167,8 @@ impl ExecutorService {
             links: OnceLock::new(),
             was_enabled,
             watcher: Mutex::new(None),
+            #[cfg(test)]
+            revoke_pause: Mutex::new(None),
         });
         // caller-binding: allow — the executor service's own connection worker
         let worker = tokio::spawn(serve_connections(Arc::downgrade(&service), rx, revocations));
@@ -193,15 +206,23 @@ impl ExecutorService {
 
     /// Stop every backend's agents (the daemon is stopping).
     pub(crate) async fn shutdown(&self) {
-        for task in [
+        let tasks: Vec<_> = [
             lock(&self.worker).take(),
             lock(&self.refresher).take(),
             lock(&self.watcher).take(),
         ]
         .into_iter()
         .flatten()
-        {
+        .collect();
+        // Abort, then wait until each task has actually stopped: a poll
+        // already running on another thread finishes first, so a worker
+        // midway through `revoked()` has registered its stop before the
+        // collections below are drained.
+        for task in &tasks {
             task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
         }
         let backends: Vec<Backend> = lock(&self.backends).drain().map(|(_, b)| b).collect();
         for backend in backends {
@@ -360,6 +381,14 @@ impl ExecutorService {
     /// as a tracked task, so a shutdown racing it still waits for it.
     fn revoked(&self, credential: &ExecutorCredentialId) {
         let backend = lock(&self.backends).remove(credential);
+        #[cfg(test)]
+        if backend.is_some() {
+            let pause = lock(&self.revoke_pause).take();
+            if let Some((removed, resume)) = pause {
+                let _ = removed.send(());
+                let _ = resume.recv();
+            }
+        }
         if let Some(backend) = backend {
             tracing::info!("executor: credential revoked; stopping its agents");
             let mut stopping = lock(&self.stopping);

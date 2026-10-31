@@ -1092,3 +1092,43 @@ async fn a_session_applies_no_frame_while_remote_agents_are_disabled() {
     assert_eq!(replay_complete(&mut fresh).await, NodeCounter(0));
     node.stop().await;
 }
+
+/// On a multi-thread runtime a shutdown can land while the worker is
+/// between taking a revoked backend out of the service and registering
+/// its stop: shutdown must wait for the worker, so it still joins that
+/// stop before returning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_a_revocation_paused_between_removal_and_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, _dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let (removed_tx, removed) = std::sync::mpsc::sync_channel(1);
+    let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
+    *node.service.revoke_pause.lock().unwrap() = Some((removed_tx, resume_rx));
+    node.api.revoked.lock().unwrap().insert(id.clone());
+    node.api.revocations.send(id.clone()).unwrap();
+    tokio::task::spawn_blocking(move || removed.recv().unwrap())
+        .await
+        .unwrap();
+    let shutdown = {
+        let service = node.service.clone();
+        tokio::spawn(async move { service.shutdown().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown returned while the worker was still registering a stop"
+    );
+    resume.send(()).unwrap();
+    tokio::time::timeout(wait(), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with the revoked backend's agents still running"
+    );
+    node.stop().await;
+}

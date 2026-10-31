@@ -1997,7 +1997,10 @@ async fn cmd_serve_owned(
             ws_options.base_port,
         );
         ws_options.base_port = desired;
-        #[cfg_attr(not(unix), allow(unused_mut))]
+        #[cfg_attr(
+            not(unix),
+            expect(unused_mut, reason = "the executor link is installed on Unix only")
+        )]
         let mut server = WsApiServer::new_startup(
             bootstrap.dispatch.clone(),
             tls_cert.as_ref(),
