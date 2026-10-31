@@ -60,12 +60,21 @@ fn denied(_: impl std::fmt::Debug) -> Error {
 fn changed_command() -> Error {
     Error::InvalidParams("Selection command already claimed".into())
 }
-/// Why a frame was refused at capture. Invalid input keeps its own message
-/// (a malformed remote name is not a changed command); every other entry
-/// failure stays the uniform unavailable refusal.
+fn invalid_remote_name() -> Error {
+    Error::InvalidParams("Invalid repository remote name".into())
+}
+/// Why a frame was refused at capture. Only the two caller-input refusals are
+/// distinct; every other failure converts to the uniform unavailable refusal,
+/// so no callee's error text can reach the wire through this path.
 enum EntryError {
     Unavailable,
-    InvalidParams(String),
+    ChangedCommand,
+    InvalidRemoteName,
+}
+impl From<Error> for EntryError {
+    fn from(_: Error) -> Self {
+        Self::Unavailable
+    }
 }
 
 pub(crate) struct Capacity {
@@ -497,8 +506,9 @@ impl Request {
         {
             return Err(unavailable());
         }
-        match &request.entry_error {
-            Some(EntryError::InvalidParams(message)) => Err(Error::InvalidParams(message.clone())),
+        match request.entry_error {
+            Some(EntryError::ChangedCommand) => Err(changed_command()),
+            Some(EntryError::InvalidRemoteName) => Err(invalid_remote_name()),
             Some(EntryError::Unavailable) => Err(unavailable()),
             None => Ok(request),
         }
@@ -586,22 +596,22 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             if let Some(op) =
                 record.filter(|o| o.query == frame.query() && o.published.load(Ordering::Acquire))
             {
-                let claim = (|| {
+                let claim = (|| -> std::result::Result<(), EntryError> {
                     op.disclosure_current()?;
+                    // Malformed input is refused before the lane is taken, so
+                    // it neither waits for nor blocks the operation's request.
+                    if command.as_ref().is_some_and(|command| !command.valid()) {
+                        return Err(EntryError::InvalidRemoteName);
+                    }
                     op.active
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .map_err(denied)?;
                     owns_lane = true;
                     if let Some(command) = command {
-                        if !command.valid() {
-                            return Err(Error::InvalidParams(
-                                "Invalid repository remote name".into(),
-                            ));
-                        }
                         let mut p = op.progress.lock().map_err(denied)?;
                         if let Some(old) = &p.command {
                             if old != &command {
-                                return Err(changed_command());
+                                return Err(EntryError::ChangedCommand);
                             }
                             op.observe_budget()?;
                         } else {
@@ -615,10 +625,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                     Ok(())
                 })();
                 if let Err(e) = claim {
-                    entry_error = Some(match e {
-                        Error::InvalidParams(message) => EntryError::InvalidParams(message),
-                        _ => EntryError::Unavailable,
-                    });
+                    entry_error = Some(e);
                 }
                 target = Some(op);
             } else if !matches!(frame, Frame::Release(_)) {
