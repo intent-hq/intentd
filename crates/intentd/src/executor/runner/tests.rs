@@ -69,6 +69,9 @@ struct Harness {
     admission: Arc<CountAdmission>,
     storage: Arc<Storage>,
     checkouts: Arc<crate::executor::checkout::PlainCheckouts>,
+    /// The providers whose default account failed to authenticate, in
+    /// report order.
+    auth_failures: Arc<Mutex<Vec<String>>>,
     /// The node user's home a profile's `~` expands against.
     home: PathBuf,
     _dir: tempfile::TempDir,
@@ -102,6 +105,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         cap: max_agents,
         running: Mutex::new(Vec::new()),
     });
+    let auth_failures = Arc::new(Mutex::new(Vec::new()));
     let runner = Runner::new(RunnerConfig {
         admission: admission.clone(),
         launch: Arc::new(FixtureLaunch(ProviderLaunch {
@@ -115,6 +119,10 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         journal,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         home: Some(dir.path().join("home")),
+        auth_failed: {
+            let auth_failures = auth_failures.clone();
+            Arc::new(move |provider: &str| lock(&auth_failures).push(provider.to_owned()))
+        },
     });
     let home = dir.path().join("home");
     Some(Harness {
@@ -122,6 +130,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         admission,
         storage,
         checkouts,
+        auth_failures,
         home,
         _dir: dir,
     })
@@ -1259,5 +1268,77 @@ fn the_redactor_keeps_resource_and_location_keys() {
             Some(1),
             "{secret}"
         );
+    }
+}
+
+/// A launch without a profile whose provider refuses `session/new` as not
+/// signed in reports the provider's default account as failed; a profile
+/// launch's failure says nothing about the default account, and neither
+/// does a setup failure that is not about authentication.
+#[tokio::test]
+async fn node_runner_reports_default_account_auth_failures_at_setup() {
+    for (args, profile, reported) in [
+        (&["--auth-required-setup"][..], false, true),
+        (&["--auth-required-setup"][..], true, false),
+        (&["--fail-setup-echo", "HOME"][..], false, false),
+    ] {
+        let Some(h) = harness(1, args) else {
+            return;
+        };
+        let command = if profile {
+            launch_with_profile("a1", &json!([{ "key": "SHORT_FLAG", "value": "1" }]))
+        } else {
+            launch("a1")
+        };
+        h.runner.launch(command).await;
+        let all = wait_for(&h.runner, "exit", exited("a1")).await;
+        assert!(exit_error(find(&all, exited("a1"))).is_some(), "{args:?}");
+        let expected: Vec<String> = if reported {
+            vec![PROVIDER.to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            *lock(&h.auth_failures),
+            expected,
+            "{args:?} profile={profile}"
+        );
+    }
+}
+
+/// A turn the provider refuses as not signed in reports the default
+/// account as failed, unless the agent runs under a profile.
+#[tokio::test]
+async fn node_runner_reports_default_account_auth_failures_on_a_turn() {
+    for (profile, prompt, reported) in [
+        (false, "auth-required", true),
+        (true, "auth-required", false),
+        (false, "echo-env HOME", false),
+    ] {
+        let Some(h) = harness(1, &[]) else { return };
+        let command = if profile {
+            launch_with_profile("a1", &json!([{ "key": "SHORT_FLAG", "value": "1" }]))
+        } else {
+            launch("a1")
+        };
+        h.runner.launch(command).await;
+        h.runner
+            .prompt(&AgentId::from("a1"), "t1".into(), text(prompt))
+            .await;
+        let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+        let (_, error) = turn_end(find(&all, turn_ended("a1", "t1")));
+        assert!(error.is_some(), "{prompt}: the turn failed");
+        let expected: Vec<String> = if reported {
+            vec![PROVIDER.to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            *lock(&h.auth_failures),
+            expected,
+            "{prompt} profile={profile}"
+        );
+        h.runner.stop(&AgentId::from("a1"));
+        wait_for(&h.runner, "exit", exited("a1")).await;
     }
 }

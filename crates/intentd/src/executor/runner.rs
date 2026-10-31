@@ -120,7 +120,14 @@ pub(super) struct RunnerConfig {
     /// The executable providers run as `mcp-bridge` to reach an agent's
     /// workspace MCP server.
     pub mcp_bridge_exe: PathBuf,
+    /// Told the provider when a launch without a profile fails to
+    /// authenticate.
+    pub auth_failed: AuthFailed,
 }
+
+/// Told a provider id when that provider's default account (a launch
+/// without a profile) failed to authenticate.
+pub(crate) type AuthFailed = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The node's agents. Cloning shares them.
 #[derive(Clone)]
@@ -134,6 +141,7 @@ struct Inner {
     checkouts: Arc<dyn Checkouts>,
     home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
+    auth_failed: AuthFailed,
     /// The newest bound link; agents forward control-plane calls on it.
     head: HeadLink,
     journal: Arc<Mutex<Journal>>,
@@ -186,6 +194,22 @@ struct Agent {
     redactor: Arc<Redactor>,
     /// An npx launch's working directory, kept while the agent runs.
     npx_launch_dir: Mutex<Option<NpxLaunchDir>>,
+    /// For a launch without a profile: its provider and whom to tell when
+    /// the provider's default account fails to authenticate. A profile's
+    /// account says nothing about the default one.
+    default_account: Option<(String, AuthFailed)>,
+}
+
+impl Agent {
+    /// Report a setup or turn failure that is the provider refusing the
+    /// default account as not signed in.
+    fn note_auth_failure(&self, error: &intent_acp::AcpError) {
+        if let Some((provider, auth_failed)) = &self.default_account {
+            if intent_services::provider_auth::is_auth_required(error) {
+                auth_failed(provider);
+            }
+        }
+    }
 }
 
 /// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
@@ -436,6 +460,7 @@ impl Runner {
                 checkouts: config.checkouts,
                 home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
+                auth_failed: config.auth_failed,
                 head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
@@ -622,6 +647,12 @@ impl Runner {
             activity: ActivityTracker::new(),
             redactor: Arc::new(Redactor::new(profile.as_ref())),
             npx_launch_dir: Mutex::new(None),
+            default_account: profile.is_none().then(|| {
+                (
+                    intent_providers::base_provider_id(&provider).to_owned(),
+                    self.inner.auth_failed.clone(),
+                )
+            }),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
         state.workspaces.insert(agent_id, workspace_id);
@@ -916,7 +947,10 @@ impl Runner {
         let session = tokio::select! {
             result = setup => match result {
                 Ok(session) => session,
-                Err(error) => return Outcome::StartFailed(error.to_string()),
+                Err(error) => {
+                    agent.note_auth_failure(&error);
+                    return Outcome::StartFailed(error.to_string());
+                }
             },
             status = child.wait() => return Outcome::Exited(status.ok().and_then(|s| s.code())),
             _ = &mut *stop => return Outcome::Stopped,
@@ -1164,7 +1198,10 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
                 .unwrap_or_else(|| "end_turn".to_owned()),
             None,
         ),
-        Err(error) => failed(format!("{}: {error}", codes::TURN)),
+        Err(error) => {
+            agent.note_auth_failure(&error);
+            failed(format!("{}: {error}", codes::TURN))
+        }
     }
 }
 
