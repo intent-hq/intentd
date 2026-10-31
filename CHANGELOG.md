@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.93] - 2026-10-31
+
+### 🚀 Features
+
+- *(pr-monitor)* Name the head commit in every PR monitor checklist ([#2889](https://github.com/intent-hq/intentd/pull/2889))
+- *(acp)* Add ws.app.workspaces.search for the Assistant workspace ([#2874](https://github.com/intent-hq/intentd/pull/2874))
+
+### 🐛 Bug Fixes
+
+- *(settings)* Mark which settings chat cards may change (proposable) ([#2886](https://github.com/intent-hq/intentd/pull/2886))
+
+### 📚 Documentation
+
+- *(guide)* Note Disable auto-archive shows only while auto-archive is on ([#2868](https://github.com/intent-hq/intentd/pull/2868))
+- *(browser)* Describe the idle hidden-tab rate as throttled and uneven ([#2869](https://github.com/intent-hq/intentd/pull/2869))
+
+### 🧪 Testing
+
+- *(runtime)* Wait for running before the shutdown sweep in shutdown_pty_sessions_stops_scripts_and_kills_all_ptys ([#2876](https://github.com/intent-hq/intentd/pull/2876))
+- *(services)* Wait for saved completion watches in idle_three_cycle_does_not_defer ([#2885](https://github.com/intent-hq/intentd/pull/2885))
+- *(intentd)* Share the id-correlating UDS reply reader across e2e helpers ([#2881](https://github.com/intent-hq/intentd/pull/2881))
+
+
 ## [0.11.92] - 2026-10-31
 
 ### 🐛 Bug Fixes

@@ -1240,10 +1240,27 @@ impl SettingDefinition {
         if self.sensitive {
             m.insert("sensitive".into(), json!(true));
         }
+        // Always present (unlike the presence-detected flags above): a client
+        // reads its absence as an older daemon, not as "proposable".
+        m.insert("proposable".into(), json!(self.proposable()));
         if let Some(impact) = self.token_impact {
             m.insert("tokenImpact".into(), json!(impact));
         }
         Value::Object(m)
+    }
+
+    /// Whether an Assistant chat settings-change card may change this setting
+    /// (`proposable` on the wire, §5.12). Secrets, read-only keys and the
+    /// security-relevant families in [`PROPOSAL_EXCLUDED_PREFIXES`] /
+    /// [`PROPOSAL_EXCLUDED_PATHS`] are never proposable; clients refuse a card
+    /// change to a daemon setting unless this flag is `true`.
+    pub(crate) fn proposable(&self) -> bool {
+        !self.sensitive
+            && !self.read_only
+            && !PROPOSAL_EXCLUDED_PATHS.contains(&self.path)
+            && !PROPOSAL_EXCLUDED_PREFIXES
+                .iter()
+                .any(|prefix| self.path.starts_with(prefix))
     }
 
     /// Attach an approximate token-impact annotation (`tokenImpact` on the
@@ -1322,6 +1339,37 @@ impl SettingDefinition {
         Ok(())
     }
 }
+
+/// Setting families an Assistant chat card must never change, even though
+/// they are neither sensitive nor read-only: the listener, auth and tunnel
+/// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
+/// credential routing (`sourceControl.`), and account companions of stored
+/// secrets (`accounts.`). Users change these in Settings.
+const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &["server.", "sharing.", "sourceControl.", "accounts."];
+
+/// Individual settings an Assistant chat card must never change: the primary
+/// identity key, the Git SSH key, executables the daemon runs (provider CLIs,
+/// auggie, the terminal shell), data/workspace locations, the command
+/// permission rules, the prompt rules injected into every agent's system
+/// prompt, and opaque client/daemon state blobs.
+const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
+    "identity.provider",
+    "userRules",
+    "workspaceRules",
+    "workspace.sshKeyPath",
+    "providers.paths",
+    "context.auggiePath",
+    "workspace.defaultShell",
+    "storage.dataDir",
+    "workspaces.root",
+    "workspace.worktreesLocation",
+    "permissions.rules",
+    "quickActions.providerSettings",
+    "repos.known",
+    "workspace.changeHistory",
+    "workspaceInitializer.state",
+    "hardwareConsole.state",
+];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
 pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
@@ -4368,6 +4416,155 @@ mod tests {
         assert_eq!(def.category, "linear");
         assert!(matches!(def.ty, SettingType::String));
         assert!(def.default_value.is_none());
+    }
+
+    /// Every setting an Assistant chat card may change, pinned so that adding
+    /// a daemon setting is a reviewed decision: a new non-sensitive setting is
+    /// proposable by default and lands in this list, unless it belongs in
+    /// `PROPOSAL_EXCLUDED_PREFIXES` / `PROPOSAL_EXCLUDED_PATHS` because it
+    /// controls access, credentials, executables, locations or opaque state.
+    /// Clients apply any proposable path through `settings.update`, so this
+    /// list is also the set chat cards must be able to apply.
+    #[test]
+    fn proposable_settings_are_pinned() {
+        let expected: &[&str] = &[
+            "providers.enabled",
+            "providers.fastMode",
+            "model.default",
+            "model.defaultProvider",
+            "model.providerDefaults",
+            "model.defaultReasoningEffort",
+            "quickActions.defaultModel",
+            "quickActions.typeOverrides",
+            "quickActions.defaultReasoningEffort",
+            "quickActions.typeReasoningEffortOverrides",
+            "specialists.default",
+            "workspace.branchPrefix",
+            "git.autoCommit",
+            "workspace.cowIsolation",
+            "workspace.autoArchiveIdleAfterDays",
+            "workspace.purgeArchivedAfterDays",
+            "mcp.enableUserServers",
+            "mcp.disabledServers",
+            "notifications.enabled",
+            "notifications.soundEnabled",
+            "notifications.soundOnlyWhenUnfocused",
+            "notifications.volume",
+            "rtk.enabled",
+            "voice.provider",
+            "voice.language",
+            "voice.openai.model",
+            "voice.workspaceVocabulary.maxTerms",
+            "voice.vocabulary",
+            "context.enabled",
+            "context.allowIndexing",
+            "logging.level",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "agents.acpNodeMaxOldSpaceMb",
+            "agents.maxConcurrentAdapters",
+            "agents.maxTopLevelAgents",
+            "agents.idleReapMinutes",
+            "agents.reportToParentDebounceSeconds",
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+            "agents.resumeInterruptedOnStart",
+            "events.streamRetentionHours",
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+            "workspaceApi.maxOutputChars",
+            "workspaceApi.toonOutput",
+            "agentFeatures.backgroundHooks",
+            "agentFeatures.hostExec",
+            "agentFeatures.scripts",
+            "agentFeatures.terminalAccess",
+            "agentFeatures.browserAutomation",
+            "agentFeatures.desktopControl",
+            "agentFeatures.richChatBlocks",
+            "agentFeatures.structuredQuestions",
+            "agentFeatures.secretRequests",
+            "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
+            "agentFeatures.prMonitor",
+            "agentFeatures.taskGraph",
+            "agentFeatures.peerAgents",
+            "agentFeatures.mcpTools",
+            "prMonitor.maxPerAgent",
+            "prMonitor.debounceSeconds",
+            "prMonitor.pollSeconds",
+            "prMonitor.hourlyRequestBudget",
+            "prMonitor.quotaSharePercent",
+            "prCache.maxAgeSeconds",
+            "updates.checkOnIdle",
+            "updates.idleCheckIntervalMinutes",
+            "updates.idleGraceSeconds",
+        ];
+        let actual: Vec<&str> = definitions()
+            .iter()
+            .filter(|def| def.proposable())
+            .map(|def| def.path)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "classify the new or changed setting: add it to this list if a chat \
+             card may change it, or to PROPOSAL_EXCLUDED_PATHS / \
+             PROPOSAL_EXCLUDED_PREFIXES if it is security-relevant"
+        );
+    }
+
+    /// Sensitive, read-only and excluded settings are never proposable, and
+    /// the wire definition always carries the flag so a client can tell a
+    /// refusal apart from an older daemon that omits it.
+    #[test]
+    fn proposable_flag_is_on_the_wire_and_excludes_security_relevant_settings() {
+        for def in definitions() {
+            let wire = def.definition_json();
+            assert_eq!(
+                wire.get("proposable"),
+                Some(&json!(def.proposable())),
+                "{} must always carry proposable",
+                def.path
+            );
+            if def.sensitive || def.read_only {
+                assert!(!def.proposable(), "{} must not be proposable", def.path);
+            }
+        }
+        for path in [
+            "server.port",
+            "server.bindAddress",
+            "server.auth.enabled",
+            "server.auth.token",
+            "server.originAllowList",
+            "sharing.maxGuestConnections",
+            "sourceControl.github.apiBaseUrl",
+            "sourceControl.github.exposeGitCredentialToChildren",
+            "accounts.sentry.organization",
+            "identity.provider",
+            "workspace.sshKeyPath",
+            "workspace.defaultShell",
+            "providers.paths",
+            "context.auggiePath",
+            "storage.dataDir",
+            "permissions.rules",
+            "userRules",
+            "workspaceRules",
+            "specialists.dir",
+            "linear.token",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.proposable(), "{path} must not be proposable");
+            assert_eq!(def.definition_json()["proposable"], json!(false), "{path}");
+        }
+        for path in [
+            "agentFeatures.hostExec",
+            "prMonitor.pollSeconds",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "workspace.purgeArchivedAfterDays",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.definition_json()["proposable"], json!(true), "{path}");
+        }
     }
 
     /// `accounts.sentry.token` must be sensitive so `settings.update` persists

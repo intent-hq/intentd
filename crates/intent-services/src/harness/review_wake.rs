@@ -54,8 +54,19 @@ pub(crate) fn checks_completed(total: i64, passed: i64, failed: i64, skipped: &[
     line
 }
 
-pub(crate) fn checklist(r: &Value, ready: bool) -> String {
+/// The "where it stands now" checklist. `head` is the commit this read's
+/// check results belong to: a wake can sit in the queue past a push, so the
+/// row lets an agent tell a stale report from one about its latest commit
+/// (intentd#2875). Empty or absent renders as unknown.
+pub(crate) fn checklist(r: &Value, head: Option<&str>, ready: bool) -> String {
     let mut lines = vec![format!("state: {}", text(&r["state"]))];
+    lines.push(match head.filter(|h| !h.is_empty()) {
+        Some(head) => {
+            let short: String = head.chars().take(8).collect();
+            format!("head: {short} (checks below are for this commit)")
+        }
+        None => "head: unknown (cannot tell which commit the checks below are for)".into(),
+    });
     let a = &r["approvals"];
     lines.push(match a["needed"].as_i64() {
         Some(needed) => format!(
@@ -275,6 +286,7 @@ mod tests {
         assert!(!mr.contains("github.com"));
         let checklist = checklist(
             &serde_json::json!({"state":"open","approvals":{},"checks":{},"threads":{}}),
+            None,
             false,
         );
         let wake = changed(
@@ -287,7 +299,19 @@ mod tests {
         );
         assert!(wake.contains("Where the MR stands now:"));
         assert!(wake.contains("checks: unknown"));
+        assert!(
+            wake.contains("- head: unknown (cannot tell which commit the checks below are for)")
+        );
         assert!(wake.contains("unresolved threads: unknown"));
         assert!(!wake.contains("0 passed"));
+        let known_head = super::checklist(
+            &serde_json::json!({"state":"open","approvals":{},"checks":{},"threads":{}}),
+            Some("7ad538b0c1d2e3f4"),
+            false,
+        );
+        assert_eq!(
+            known_head.lines().nth(1),
+            Some("- head: 7ad538b0 (checks below are for this commit)")
+        );
     }
 }

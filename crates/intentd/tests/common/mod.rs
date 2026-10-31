@@ -12,6 +12,8 @@
 pub mod claude_npx;
 #[cfg(unix)]
 pub mod codex_npx;
+#[cfg(unix)]
+pub mod uds_exchange;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

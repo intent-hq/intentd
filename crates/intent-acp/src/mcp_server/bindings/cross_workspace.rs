@@ -118,7 +118,7 @@ async fn search(
     Ok(result)
 }
 
-fn parse_search(args: &Value) -> Result<CrossWorkspaceSearch, String> {
+pub(crate) fn parse_search(args: &Value) -> Result<CrossWorkspaceSearch, String> {
     let query = match args.get("query") {
         None | Some(Value::Null) => None,
         Some(Value::String(q)) => Some(q.trim().to_string()).filter(|q| !q.is_empty()),

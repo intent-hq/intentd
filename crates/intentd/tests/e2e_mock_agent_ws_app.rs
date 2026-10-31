@@ -2,7 +2,8 @@
 //!
 //! Drives real MCP tool invocations through the `workspace_api` tool with the
 //! mock-acp-agent.mjs fixture, asserting:
-//! - ws.app.workspaces.list returns user workspaces (never __chief__)
+//! - ws.app.workspaces.list returns user workspaces (never __chief__), and
+//!   ws.app.workspaces.search finds one by title
 //! - ws.app.agents.list returns agent metadata
 //! - ws.app.proposal.show persists application/vnd.intent.proposal+json resource
 //! - Non-chief workspace agents are gated from ws.app.*
@@ -118,7 +119,8 @@ async fn chief_agent_ws_app_workspaces_list() {
     // Call ws.app.workspaces.list via MCP
     let js = r"
         const result = await ws.app.workspaces.list({});
-        return { workspaces: result };
+        const found = await ws.app.workspaces.search('indigo');
+        return { workspaces: result, found };
     ";
 
     let behavior = json!({
@@ -227,6 +229,14 @@ async fn chief_agent_ws_app_workspaces_list() {
             .any(|w| w["id"] == json!(CHIEF_WORKSPACE_ID)),
         "Expected __chief__ to be excluded from list"
     );
+    // ws.app.workspaces.search reaches the daemon through the same bridge.
+    let found = output_json["found"]["matches"]
+        .as_array()
+        .expect("search matches");
+    assert_eq!(found.len(), 1, "{}", output_json["found"]);
+    assert_eq!(found[0]["id"], json!(ws2.as_str()));
+    assert_eq!(found[0]["matchedOn"], json!(["title"]));
+    assert!(found[0]["markdownLink"].is_string(), "{}", found[0]);
 
     manager.shutdown().await;
 }

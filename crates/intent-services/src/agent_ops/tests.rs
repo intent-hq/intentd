@@ -27338,6 +27338,22 @@ async fn idle_three_cycle_does_not_defer() {
         .expect("B watches C");
     svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
         .expect("C watches A");
+    // Wait for the three watch rows to persist (the upsert is spawned); the
+    // durable classification below reads them (intent#8148).
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list persisted watches");
+        if rows.len() == 3 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "watch rows persisted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     for id in [&a, &b, &c] {
         assert!(
