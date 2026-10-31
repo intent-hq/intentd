@@ -468,3 +468,64 @@ fn collect_bind_interfaces_loopback_first_no_duplicates() {
         assert!(seen.insert(*ip), "duplicate address in {ifaces:?}");
     }
 }
+
+#[tokio::test]
+async fn machine_routes_match_the_pairing_payload_and_never_carry_the_token() {
+    use intent_core::machines::MachineRoutesSource as _;
+    let tmpdir = temp_data_dir("machine-routes");
+    let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("owner-token-xyz")));
+    let provider: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
+        port: Some(5181),
+        bind_addresses: Some(vec![
+            "10.1.2.3".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        ]),
+        tc_address: Some("tc-abc".into()),
+        data_dir: tmpdir.path().to_path_buf(),
+        token_store: store,
+        host_environment: host_environment(None),
+    });
+    let pairing = pairing_info_json(provider.as_ref()).await.unwrap();
+    let routes = MachineRoutesResolver::new(provider)
+        .machine_routes()
+        .await
+        .unwrap();
+    assert_eq!(routes.name, "Build Server 01");
+    assert_eq!(routes.port, 5181);
+    assert_eq!(routes.hosts, ["10.1.2.3"], "loopback is never advertised");
+    assert_eq!(json!(routes.hosts), pairing["localIps"]);
+    assert_eq!(routes.tc_address.as_deref(), Some("tc-abc"));
+    assert_eq!(json!(routes.fingerprint), pairing["certFingerprint"]);
+    assert!(!format!("{routes:?}").contains("owner-token-xyz"));
+}
+
+#[tokio::test]
+async fn machine_routes_need_a_running_listener_and_fall_back_to_the_hostname() {
+    use intent_core::machines::MachineRoutesSource as _;
+    let tmpdir = temp_data_dir("machine-routes-down");
+    let mut env = host_environment(None);
+    env.pretty_hostname = "  ".into();
+    let provider = |port| -> Arc<dyn ServerPairingInfo> {
+        Arc::new(MockPairingInfo {
+            port,
+            bind_addresses: Some(vec!["10.1.2.3".parse().unwrap()]),
+            tc_address: None,
+            data_dir: tmpdir.path().to_path_buf(),
+            token_store: crate::AsyncTokenStore::new(Arc::new(MemoryStore::with("t"))),
+            host_environment: env.clone(),
+        })
+    };
+    let down = MachineRoutesResolver::new(provider(None))
+        .machine_routes()
+        .await;
+    assert!(
+        matches!(down, Err(intent_core::Error::ListenerDown)),
+        "{down:?}"
+    );
+    let up = MachineRoutesResolver::new(provider(Some(7000)))
+        .machine_routes()
+        .await
+        .unwrap();
+    assert_eq!(up.name, "build-01");
+    assert_eq!(up.tc_address, None);
+}

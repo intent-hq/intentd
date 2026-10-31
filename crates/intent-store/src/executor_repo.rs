@@ -97,6 +97,38 @@ fn resting(state: RemoteMachineState) -> Result<()> {
     Ok(())
 }
 
+/// Internal state key of [`Store::daemon_id`]; never a public setting.
+const DAEMON_ID_KEY: &str = "executor.daemonId";
+
+impl Store {
+    /// This daemon's stable id for daemon-to-daemon remote agents: the
+    /// machine's `daemonId` in `executor.mint` (the `nodeId` a backend binds
+    /// to). Minted on first use and kept in the `settings` state table, so
+    /// it survives restarts; concurrent first reads agree.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt stored value.
+    pub async fn daemon_id(&self) -> Result<String> {
+        let candidate = serde_json::Value::String(uuid::Uuid::new_v4().to_string()).to_string();
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
+            .bind(DAEMON_ID_KEY)
+            .bind(&candidate)
+            .execute(self.write_pool())
+            .await
+            .map_err(db)?;
+        let raw: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(DAEMON_ID_KEY)
+            .fetch_one(self.write_pool())
+            .await
+            .map_err(db)?;
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::String(id)) if !id.is_empty() => Ok(id),
+            _ => Err(db("corrupt daemon id")),
+        }
+    }
+}
+
 impl Store {
     /// Record a newly minted executor credential, keyed by `token_hash`
     /// (hex SHA-256 of the token, never the token itself). Minting again for

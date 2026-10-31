@@ -227,6 +227,21 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: failure.message(),
             data: Some(failure.data()),
         },
+        // A remote-agents setting is off: -32602 with
+        // `data.code: "remote-agents-disabled"`.
+        ref e @ Error::RemoteAgentsDisabled { .. } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "remote-agents-disabled" })),
+        },
+        // The WSS listener is stopped (`executor.mint` has no routes to
+        // report): -32603 with `data.code: "listener-down"`, as on
+        // `pairing.getInfo`.
+        ref e @ Error::ListenerDown => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "listener-down" })),
+        },
         ref e @ Error::ProviderProfile(ref failure) => RpcErr {
             code: e.code(),
             message: failure.message.clone(),
@@ -1429,6 +1444,18 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Daemon-to-daemon executor credentials (nodes.md "Machine methods:
+        // executor credentials"): owner-only, daemon-global. The services
+        // recheck the owner role; the minted token is in the result only.
+        "executor.mint" => api
+            .executor_mint(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "executor.list" => api.executor_list().await.map_err(domain_to_rpc),
+        "executor.revoke" => api
+            .executor_revoke(require_str_param(params, "credentialId")?)
+            .await
+            .map_err(domain_to_rpc),
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)

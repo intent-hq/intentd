@@ -62,6 +62,7 @@ mod agent_wake;
 mod agent_workers;
 mod auto_archive;
 mod auto_retire;
+mod executor_ops;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -1281,6 +1282,12 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    /// Where the executor link can be dialed (`executor.mint`), attached by
+    /// the composition root; the transport owns the listener.
+    machine_routes: Arc<OnceLock<Arc<dyn intent_core::machines::MachineRoutesSource>>>,
+    /// Live status of executor credentials (`executor.list`), attached by
+    /// the executor link; unset reads every credential as disconnected.
+    executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
     discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
@@ -1814,6 +1821,8 @@ impl Services {
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
             .0,
+            machine_routes: Arc::new(OnceLock::new()),
+            executor_liveness: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
@@ -5086,6 +5095,26 @@ impl Services {
     /// [`attach_server_control`](Self::attach_server_control).
     pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
         let _ = self.invite_links.set(builder);
+    }
+
+    /// Attach where this machine's executor link can be dialed, for
+    /// `executor.mint` (daemon-to-daemon remote agents). Idempotent like
+    /// [`attach_invite_link_builder`](Self::attach_invite_link_builder).
+    pub fn attach_machine_routes(
+        &self,
+        routes: Arc<dyn intent_core::machines::MachineRoutesSource>,
+    ) {
+        let _ = self.machine_routes.set(routes);
+    }
+
+    /// Attach the executor link's live credential status, for
+    /// `executor.list`. Idempotent; without it every credential reads as
+    /// disconnected with no running agents.
+    pub fn attach_executor_liveness(
+        &self,
+        liveness: Arc<dyn intent_core::machines::ExecutorLiveness>,
+    ) {
+        let _ = self.executor_liveness.set(liveness);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -34604,6 +34633,18 @@ impl WorkspaceApi for Services {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
         Some(self.principal_revocations.subscribe())
+    }
+
+    fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.executor_mint_op(params))
+    }
+
+    fn executor_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.executor_list_op())
+    }
+
+    fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.executor_revoke_op(&credential_id).await })
     }
 
     // Presence (multiplayer w5) — see `presence`.

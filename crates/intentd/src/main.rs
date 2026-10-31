@@ -2898,6 +2898,10 @@ async fn cmd_serve_owned(
     // (multiplayer w4): the same envelope the create fast path resolves.
     if let Some(provider) = pairing_info.clone() {
         services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider.clone(),
+        )));
+        // `executor.mint` reports the same listener routes and fingerprint.
+        services.attach_machine_routes(Arc::new(intent_transport::MachineRoutesResolver::new(
             provider,
         )));
     }

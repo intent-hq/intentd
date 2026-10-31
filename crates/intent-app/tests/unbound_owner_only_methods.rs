@@ -209,6 +209,12 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "desktop.setPermission",
             json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
         ),
+        ("executor.list", json!({})),
+        (
+            "executor.mint",
+            json!({ "backendId": "backend-1", "backendName": "Backend" }),
+        ),
+        ("executor.revoke", json!({ "credentialId": "missing" })),
         ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
         ("file-tracking.getChanges", json!({ "workspaceId": ws })),
         ("file-tracking.loadCommits", json!({ "workspaceId": ws })),
