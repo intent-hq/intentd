@@ -159,7 +159,7 @@ Namespaces (index — full signatures in API below):
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
-  ws.crossWorkspace.* — read sibling-workspace notes
+  ws.crossWorkspace.* — search + read sibling workspaces
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state
   ws.mr.* — pr aliases
@@ -348,6 +348,7 @@ API:
   ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
+  ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
 
   ws.file.read(path) → string  // Read an actual project file relative to workspace root. Do not use this for notes/spec content; use `ws.note.read()` for workspace notes. Paths outside the workspace are rejected.
   ws.file.write(path, content) → { ok, path, size }  // Writes/creates a file inside the workspace and records attribution.
@@ -442,7 +443,7 @@ Namespaces (index — full signatures in API below):
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
   ws.mcp.* — external MCP tools
-  ws.crossWorkspace.* — read sibling-workspace notes
+  ws.crossWorkspace.* — search + read sibling workspaces
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state
   ws.mr.* — pr aliases
@@ -656,6 +657,7 @@ API:
   ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
+  ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
 
   ws.file.read(path) → string  // Read an actual project file relative to workspace root. Do not use this for notes/spec content; use `ws.note.read()` for workspace notes. Paths outside the workspace are rejected.
   ws.file.write(path, content) → { ok, path, size }  // Writes/creates a file inside the workspace and records attribution.

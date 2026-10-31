@@ -390,3 +390,44 @@ async fn transfer_round_trip_keeps_pruned_and_git_root_links_with_their_times() 
     assert_eq!(after, before);
     assert_eq!(linked(&dest, KEY).await, [("ws-a".to_string(), false)]);
 }
+
+#[tokio::test]
+async fn links_for_workspaces_reads_only_the_scoped_workspaces_newest_first() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let a = WorkspaceId("ws-a".into());
+    let b = WorkspaceId("ws-b".into());
+    let c = WorkspaceId("ws-c".into());
+    let mut ws_a = sample_workspace(&a, "A", false);
+    ws_a.pr_url = Some(PR.into());
+    store.insert_workspace(&ws_a).await.expect("insert a");
+    tick().await;
+    let mut ws_b = sample_workspace(&b, "B", false);
+    ws_b.pull_requests = Some(vec![pr("https://github.com/intent-hq/intent/pull/12")]);
+    store.insert_workspace(&ws_b).await.expect("insert b");
+    let mut ws_c = sample_workspace(&c, "C", false);
+    ws_c.pr_url = Some(PR.into());
+    store.insert_workspace(&ws_c).await.expect("insert c");
+
+    let links = store
+        .list_pull_request_links_for_workspaces(&[a.clone(), b.clone()])
+        .await
+        .expect("links");
+    let got: Vec<(&str, &str)> = links
+        .iter()
+        .map(|l| (l.pr_key.as_str(), l.workspace_id.0.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("github.com/intent-hq/intent/pull/12", "ws-b"),
+            (KEY, "ws-a")
+        ]
+    );
+    assert!(links.iter().all(|l| !l.linked_at.is_empty()));
+    assert!(store
+        .list_pull_request_links_for_workspaces(&[])
+        .await
+        .expect("empty scope")
+        .is_empty());
+}

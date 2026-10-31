@@ -225,6 +225,7 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "crossWorkspace.listNotes",
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
+    "crossWorkspace.search",
     "discussion.conversations",
     "discussion.list",
     "event.agentActivity",

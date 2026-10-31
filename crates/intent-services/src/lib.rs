@@ -88,6 +88,7 @@ mod completion_interception_tests;
 mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
+mod cross_workspace_search;
 mod delete_grace;
 mod delivery_tasks;
 mod desktop;
@@ -21047,28 +21048,11 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let current = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(Error::NotFound(_)) => {
-                    return Err(Error::Internal("Current workspace not found".to_string()));
-                }
-                Err(e) => return Err(e),
-            };
-            if !has_repository_identity(&current) {
-                return Err(Error::Internal(
-                    "Current workspace is not associated with a repository".to_string(),
-                ));
-            }
-            let mut all = store
-                .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
-                .await?;
-            self.retain_member_workspaces(&mut all).await?;
-            let siblings: Vec<serde_json::Value> = all
+            let siblings: Vec<serde_json::Value> = self
+                .cross_workspace_siblings(&workspace_id, include_retired)
+                .await?
                 .into_iter()
-                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -21082,6 +21066,14 @@ impl WorkspaceApi for Services {
                 .collect();
             Ok(serde_json::Value::Array(siblings))
         })
+    }
+
+    fn cross_workspace_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: intent_core::CrossWorkspaceSearch,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.cross_workspace_search_op(workspace_id, search))
     }
 
     fn cross_workspace_list_notes(
