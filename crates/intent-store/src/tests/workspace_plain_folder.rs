@@ -87,3 +87,59 @@ async fn plain_folder_is_insert_only_and_survives_reopen() {
     let row = listed.iter().find(|w| w.id == id).expect("listed");
     assert!(row.plain_folder, "kept on list rows");
 }
+
+/// `plain_folder_paths` lists live and archived plain folders and keeps a
+/// deleted plain folder via its tombstone (`0178`); git rows and their
+/// tombstones contribute nothing.
+#[tokio::test]
+async fn plain_folder_paths_include_deleted_plain_folders() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let plain_row = |id: &WorkspaceId, path: &str| {
+        let mut ws = sample_workspace(id, "plain", false);
+        ws.plain_folder = true;
+        ws.branch = String::new();
+        ws.worktree_path = None;
+        ws.repository_path = Some(path.to_string());
+        ws
+    };
+    let live = WorkspaceId::new();
+    let archived = WorkspaceId::new();
+    let deleted = WorkspaceId::new();
+    let git = WorkspaceId::new();
+    store
+        .insert_workspace(&plain_row(&live, "/u/live"))
+        .await
+        .expect("live");
+    store
+        .insert_workspace(&plain_row(&archived, "/u/archived"))
+        .await
+        .expect("archived");
+    store
+        .archive_workspace_detaching_guests(&archived, &intent_core::now_iso())
+        .await
+        .expect("archive");
+    store
+        .insert_workspace(&plain_row(&deleted, "/u/deleted"))
+        .await
+        .expect("deleted");
+    let mut git_row = sample_workspace(&git, "git", false);
+    git_row.repository_path = Some("/u/repo".to_string());
+    store.insert_workspace(&git_row).await.expect("git");
+    store
+        .delete_workspace(&deleted)
+        .await
+        .expect("delete plain");
+    store.delete_workspace(&git).await.expect("delete git");
+
+    let mut paths = store.plain_folder_paths().await.expect("paths");
+    paths.sort();
+    assert_eq!(paths, vec!["/u/archived", "/u/deleted", "/u/live"]);
+    let tombstone: Option<String> =
+        sqlx::query_scalar("SELECT plain_folder_path FROM deleted_workspace_id WHERE id = ?")
+            .bind(&git.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("git tombstone");
+    assert_eq!(tombstone, None, "a git tombstone records no folder");
+}

@@ -106,6 +106,80 @@ impl PlainFolderTarget {
     }
 }
 
+/// The folders every path-based cleanup sweep must keep (PROTOCOL §5.1
+/// "Plain-folder workspaces": the folder is never deleted, moved or modified
+/// by Intent). Loaded from the store — live, archived and retired
+/// plain-folder rows plus deleted ones remembered on their tombstone — so it
+/// covers a retried delete whose row is gone and another workspace whose
+/// id-derived `<root>/<id>` candidate points at a plain folder
+/// (intent-hq/intent#6229).
+///
+/// Every removal of an id-derived directory goes through
+/// [`PlainFolderGuard::removable`]; a sweep whose guard could not be loaded
+/// removes nothing (fail closed).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlainFolderGuard {
+    folders: Vec<PathBuf>,
+}
+
+impl PlainFolderGuard {
+    /// Load the guard from the store.
+    ///
+    /// # Errors
+    ///
+    /// The store error; callers then skip their sweep.
+    pub(crate) async fn load(store: &intent_store::Store) -> Result<Self> {
+        Ok(Self::from_paths(store.plain_folder_paths().await?))
+    }
+
+    /// A guard over `paths` (absolute folder paths).
+    pub(crate) fn from_paths<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        Self {
+            folders: paths
+                .into_iter()
+                .filter(|p| !p.as_ref().as_os_str().is_empty())
+                .map(|p| resolved(p.as_ref()))
+                .collect(),
+        }
+    }
+
+    /// The resolved folders, to extend a loaded guard.
+    pub(crate) fn into_folders(self) -> Vec<PathBuf> {
+        self.folders
+    }
+
+    /// Whether `dir` overlaps a plain folder: it is one, holds one, or lies
+    /// inside one. Paths are compared canonically (symlinks resolved) when
+    /// they exist, else lexically.
+    pub(crate) fn protects(&self, dir: &Path) -> bool {
+        let dir = resolved(dir);
+        self.folders
+            .iter()
+            .any(|folder| folder.starts_with(&dir) || dir.starts_with(folder))
+    }
+
+    /// Fail-closed removal check for a sweep that loaded `guard`: `false`
+    /// (keep `dir`, logged) when the guard could not be loaded or `dir`
+    /// overlaps a plain folder.
+    pub(crate) fn removable(guard: &Result<Self>, dir: &Path, sweep: &'static str) -> bool {
+        match guard {
+            Ok(guard) if !guard.protects(dir) => true,
+            Ok(_) => {
+                tracing::info!(sweep, dir = %dir.display(), "keeping a directory that overlaps a plain-folder workspace");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(sweep, dir = %dir.display(), error = %e, "plain-folder lookup failed; keeping the directory");
+                false
+            }
+        }
+    }
+}
+
 fn rejected(reason: PlainFolderPathReason, path: &Path, repository_root: Option<&Path>) -> Error {
     Error::PlainFolderPathRejected(Box::new(PlainFolderPathRejection {
         reason,
@@ -131,8 +205,29 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 /// Canonical form when the path exists, else its lexical normal form.
-pub(crate) fn comparable(path: &Path) -> PathBuf {
+fn comparable(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexically(path))
+}
+
+/// `path` with `.`/`..` resolved lexically and symlinks resolved in its
+/// nearest existing ancestor, so an alias of a folder (or of a directory
+/// that does not exist yet under it) compares equal to the folder.
+fn resolved(path: &Path) -> PathBuf {
+    let path = normalize_lexically(path);
+    let mut existing = path.as_path();
+    let mut missing = Vec::new();
+    while std::fs::canonicalize(existing).is_err() {
+        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+            return path;
+        };
+        missing.push(name.to_os_string());
+        existing = parent;
+    }
+    let mut out = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for name in missing.into_iter().rev() {
+        out.push(name);
+    }
+    out
 }
 
 /// Nearest ancestor of `dir` (inclusive) holding a `.git` entry — a
@@ -428,5 +523,71 @@ mod tests {
         // A sibling sharing the name prefix is outside.
         let sibling = tmp.path().join("workspaces-notes");
         resolve_target(&sibling, &roots).expect("sibling is outside the root");
+    }
+
+    /// The guard keeps a candidate that is the plain folder, holds it, or
+    /// lies inside it; leaves unrelated and prefix-sibling directories
+    /// removable; resolves `..` and symlink aliases; and fails closed when
+    /// the plain-folder lookup failed.
+    #[test]
+    fn guard_protects_overlapping_directories_and_fails_closed() {
+        let tmp = crate::test_support::test_tempdir("intentd-plain-guard-");
+        let folder = tmp.path().join("docs").join("my-notes");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let guard = PlainFolderGuard::from_paths([&folder]);
+
+        assert!(guard.protects(&folder), "the folder itself");
+        assert!(guard.protects(&tmp.path().join("docs")), "an ancestor");
+        assert!(
+            guard.protects(&folder.join("ws-id")),
+            "a missing dir inside"
+        );
+        assert!(
+            guard.protects(
+                &tmp.path()
+                    .join("docs")
+                    .join("x")
+                    .join("..")
+                    .join("my-notes")
+            ),
+            "a `..` alias"
+        );
+        assert!(
+            !guard.protects(&tmp.path().join("docs").join("my-notes-2")),
+            "prefix sibling"
+        );
+        assert!(!guard.protects(&tmp.path().join("other")), "unrelated");
+
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(tmp.path().join("docs"), &link).expect("symlink");
+            assert!(
+                guard.protects(&link.join("my-notes")),
+                "a symlinked alias of the folder"
+            );
+            assert!(
+                guard.protects(&link.join("my-notes").join("ws-id")),
+                "inside via a symlink"
+            );
+            let via_link = PlainFolderGuard::from_paths([link.join("my-notes")]);
+            assert!(
+                via_link.protects(&folder),
+                "a folder recorded through a symlink"
+            );
+        }
+
+        let ok: Result<PlainFolderGuard> = Ok(guard);
+        assert!(!PlainFolderGuard::removable(&ok, &folder, "test"));
+        assert!(PlainFolderGuard::removable(
+            &ok,
+            &tmp.path().join("other"),
+            "test"
+        ));
+        let failed: Result<PlainFolderGuard> = Err(Error::Internal("db down".into()));
+        assert!(
+            !PlainFolderGuard::removable(&failed, &tmp.path().join("other"), "test"),
+            "a failed lookup keeps every directory"
+        );
     }
 }

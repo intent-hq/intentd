@@ -13893,7 +13893,14 @@ fn cleanup_detached_worktree(trash: &Path) -> bool {
 /// `remove_dir`s the (empty-only) parent workspace dir. Best-effort
 /// throughout: per-entry failures are logged and never abort the sweep. A
 /// missing root is a silent no-op. Returns the number of trash dirs removed.
+#[cfg(test)]
 fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
+    sweep_orphaned_worktree_trash_keeping(root, &|_| false)
+}
+
+/// [`sweep_orphaned_worktree_trash`] that leaves every workspace dir for
+/// which `keep` is true untouched (plain folders, §5.1).
+fn sweep_orphaned_worktree_trash_keeping(root: &Path, keep: &dyn Fn(&Path) -> bool) -> usize {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
@@ -13932,6 +13939,9 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
             }
         }
         let ws_dir = ws_entry.path();
+        if keep(&ws_dir) {
+            continue;
+        }
         let children = match std::fs::read_dir(&ws_dir) {
             Ok(children) => children,
             Err(e) => {
@@ -14036,11 +14046,20 @@ impl Services {
     pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
         let root = self.workspaces_root.clone();
         let location = self.configured_worktrees_location();
+        // Never inside a plain folder (§5.1); a failed lookup skips the sweep.
+        let plain_guard = match plain_folder::PlainFolderGuard::load(&self.store).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(error = %e, "orphaned trash sweep: plain-folder lookup failed; skipped");
+                return 0;
+            }
+        };
         let task = tokio::task::spawn_blocking(move || {
             let root = root.unwrap_or_else(default_workspaces_root);
-            let mut removed = sweep_orphaned_worktree_trash(&root);
+            let keep = |dir: &Path| plain_guard.protects(dir);
+            let mut removed = sweep_orphaned_worktree_trash_keeping(&root, &keep);
             if let Some(location) = location.filter(|l| *l != root) {
-                removed += sweep_orphaned_worktree_trash(&location);
+                removed += sweep_orphaned_worktree_trash_keeping(&location, &keep);
             }
             removed
         })
@@ -18738,6 +18757,24 @@ impl Services {
                 known_completion &=
                     matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
                 let recreated = recreated_observation.ok();
+                // Plain folders (§5.1 "Plain-folder workspaces") are never
+                // deleted. The `<parent>/<id>` candidates are derived from
+                // the id and the roots alone (intent-hq/intent#6229), so a
+                // later root or location change can point one at a plain
+                // folder — this workspace's, a deleted one's (tombstone) or
+                // another workspace's. Any candidate overlapping one is kept;
+                // if the lookup fails, every candidate is kept (fail closed).
+                let plain_guard = plain_folder::PlainFolderGuard::load(&store_bg)
+                    .await
+                    .map(|guard| match ws_for_cleanup_plain_folder.as_deref() {
+                        Some(own) => {
+                            let mut paths = vec![own.to_path_buf()];
+                            paths.extend(guard.into_folders());
+                            plain_folder::PlainFolderGuard::from_paths(paths)
+                        }
+                        None => guard,
+                    });
+                known_completion &= plain_guard.is_ok();
                 // A plain-folder row (§5.1) never reaches the checkout
                 // cleanup: its folder is `repositoryPath` and is the user's.
                 let ws_for_cleanup = ws_for_cleanup.filter(|w| !w.plain_folder);
@@ -18829,7 +18866,14 @@ impl Services {
                                 // intent-hq/monorepo#2611): never provisioned
                                 // by the daemon, never deleted with the
                                 // workspace.
-                                if is_standalone && !checkout_owned {
+                                if !plain_folder::PlainFolderGuard::removable(
+                                    &plain_guard,
+                                    &wt_locked,
+                                    "workspace.delete checkout",
+                                ) {
+                                    // Overlaps a plain folder (or the lookup
+                                    // failed): never detached or removed.
+                                } else if is_standalone && !checkout_owned {
                                     tracing::debug!(
                                         workspace = %ws_cleanup.id.as_str(),
                                         checkout = %wt_locked.display(),
@@ -18933,15 +18977,6 @@ impl Services {
                     .filter(|p| !p.is_empty())
                     .and_then(|wt_path| Path::new(wt_path).parent())
                     .map(Path::to_path_buf);
-                // Plain folder (§5.1 "Plain-folder workspaces"): the folder
-                // is the user's and is never deleted. A candidate that is the
-                // folder, holds it or lies inside it is skipped — the
-                // `<parent>/<id>` candidates are derived from the id and the
-                // roots alone (intent-hq/intent#6229), so a later root or
-                // location change can point one at the user's folder.
-                let plain_folder_bg = ws_for_cleanup_plain_folder
-                    .as_deref()
-                    .map(plain_folder::comparable);
                 for dir in workspace_dir_candidates(
                     &id_bg,
                     sweep_worktree_path,
@@ -18951,16 +18986,12 @@ impl Services {
                     if recreated_parent.as_deref() == Some(dir.as_path()) {
                         continue;
                     }
-                    if let Some(folder) = plain_folder_bg.as_deref() {
-                        let candidate = plain_folder::comparable(&dir);
-                        if folder.starts_with(&candidate) || candidate.starts_with(folder) {
-                            tracing::debug!(
-                                workspace = %id_bg.as_str(),
-                                dir = %dir.display(),
-                                "workspace.delete: candidate overlaps the plain folder; keeping it"
-                            );
-                            continue;
-                        }
+                    if !plain_folder::PlainFolderGuard::removable(
+                        &plain_guard,
+                        &dir,
+                        "workspace.delete",
+                    ) {
+                        continue;
                     }
                     // Shared parallel removal helper; `NotFound` is already
                     // folded into `Ok` there.
@@ -24965,6 +24996,9 @@ impl WorkspaceApi for Services {
             // surfaces a `NotFound` at the trait layer instead of silently
             // sweeping a random directory.
             let ws = store.get_workspace(&id).await?;
+            // Never inside a plain folder (§5.1); fail closed on a failed
+            // lookup.
+            let plain_guard = plain_folder::PlainFolderGuard::load(&store).await;
             // Best-effort recursive delete of the daemon-owned cache directory
             // (`<parent>/<id>/cache`). The parent candidates cover the
             // persisted worktree's parent (the location in force at create
@@ -24979,6 +25013,13 @@ impl WorkspaceApi for Services {
                 worktrees_location.as_deref(),
             ) {
                 let cache_dir = dir.join("cache");
+                if !plain_folder::PlainFolderGuard::removable(
+                    &plain_guard,
+                    &cache_dir,
+                    "workspace.cleanup",
+                ) {
+                    continue;
+                }
                 let cache_task =
                     tokio::task::spawn_blocking(move || {
                         match std::fs::remove_dir_all(&cache_dir) {

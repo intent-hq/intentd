@@ -547,6 +547,10 @@ impl Services {
                 })
                 .await;
         }
+        // Never a plain folder (§5.1 "Plain-folder workspaces"): an
+        // id-derived candidate overlapping any plain folder is kept, and
+        // every candidate is kept when the lookup fails (fail closed).
+        let plain_guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await;
         // Sweep only candidates that canonically resolve inside a managed
         // root: a `<root>/<id>` that is a symlink to elsewhere is skipped.
         let dirs: Vec<PathBuf> = workspace_dir_candidates(
@@ -560,6 +564,9 @@ impl Services {
             std::iter::once(workspaces_root.as_path())
                 .chain(worktrees_location.as_deref())
                 .any(|root| resolve_within_root(dir, root).is_some())
+        })
+        .filter(|dir| {
+            crate::plain_folder::PlainFolderGuard::removable(&plain_guard, dir, "workspace.retire")
         })
         .collect();
         let id = ws.id.clone();

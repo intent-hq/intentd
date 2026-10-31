@@ -474,3 +474,250 @@ async fn duplicate_is_refused_and_keeps_the_plain_folder() {
         }
     }
 }
+
+/// Services whose boot root is `root` over `store`.
+fn services_at(store: &Store, root: &Path) -> Services {
+    Services::new_isolated(store.clone()).with_workspaces_root(root.to_path_buf())
+}
+
+/// A row without a checkout (no `worktreePath`), so its delete sweeps
+/// `<root>/<id>` only.
+fn git_less_row(id: &WorkspaceId) -> Workspace {
+    let ts = intent_core::now_iso();
+    Workspace {
+        id: id.clone(),
+        title: "Other".to_string(),
+        branch: "main".to_string(),
+        created_at: ts.clone(),
+        updated_at: ts,
+        ..Default::default()
+    }
+}
+
+/// A repeated `workspace.delete` after the plain row is gone (the row read
+/// is `NotFound`) still keeps the folder: the deleted plain folder is
+/// remembered on the delete tombstone (PR review). The second delete runs on
+/// a fresh `Services` (a drained task set admits no new sweep) with a
+/// `worktreesLocation` canary that must be swept, proving the sweep ran.
+#[intent_test_macros::daemon_test]
+async fn repeated_delete_keeps_a_plain_folder_at_a_candidate() {
+    let h = Harness::new().await;
+    let id = WorkspaceId::from("my-notes");
+    let folder = h.parent().join(id.as_str());
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    h.store
+        .insert_workspace(&plain_row(&id, &folder))
+        .await
+        .expect("insert");
+    let before = snapshot(&folder);
+    let first = services_at(&h.store, h.parent());
+    first.delete_workspace(id.clone()).await.expect("delete");
+    first.store_tasks.drain_finite().await;
+    assert_untouched(&folder, &before, "first delete");
+
+    let location = test_tempdir("intentd-plain-safety-canary-");
+    let canary = location.path().join(id.as_str());
+    std::fs::create_dir_all(canary.join(".workspace")).expect("canary");
+    let registry = Arc::new(
+        SettingsRegistry::load(h.root.join("plain-safety-repeat.config.toml")).expect("registry"),
+    );
+    registry
+        .apply(&[(
+            "workspace.worktreesLocation".to_string(),
+            serde_json::json!(location.path().to_string_lossy()),
+        )])
+        .expect("apply worktreesLocation");
+    let second = services_at(&h.store, h.parent()).with_settings_registry(registry);
+    second
+        .delete_workspace(id.clone())
+        .await
+        .expect("delete again");
+    second.store_tasks.drain_finite().await;
+    assert!(!canary.exists(), "the repeated delete's sweep ran");
+    assert_untouched(&folder, &before, "repeated delete");
+}
+
+/// Deleting ANOTHER workspace whose id matches a plain folder's name (after
+/// a root change) keeps that plain folder — live or already deleted.
+#[intent_test_macros::daemon_test]
+async fn deleting_another_workspace_keeps_a_plain_folder_at_its_candidate() {
+    for plain_deleted_first in [false, true] {
+        let h = Harness::new().await;
+        let other = WorkspaceId::from("my-notes");
+        let folder = h.parent().join(other.as_str());
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+        let plain = WorkspaceId::from("plain-owner");
+        h.store
+            .insert_workspace(&plain_row(&plain, &folder))
+            .await
+            .expect("insert plain");
+        if plain_deleted_first {
+            h.svc
+                .delete_workspace(plain.clone())
+                .await
+                .expect("delete plain");
+            h.svc.store_tasks.drain_finite().await;
+        }
+        h.store
+            .insert_workspace(&git_less_row(&other))
+            .await
+            .expect("insert other");
+        let svc = services_at(&h.store, h.parent());
+        let before = snapshot(&folder);
+        svc.delete_workspace(other.clone())
+            .await
+            .expect("delete other");
+        svc.store_tasks.drain_finite().await;
+        assert!(
+            h.store.get_workspace(&other).await.is_err(),
+            "other deleted"
+        );
+        assert_untouched(
+            &folder,
+            &before,
+            &format!("other delete, plain_deleted_first={plain_deleted_first}"),
+        );
+    }
+}
+
+/// Both overlap directions: a candidate inside the plain folder (the plain
+/// folder is the boot root's own directory) is kept as well.
+#[intent_test_macros::daemon_test]
+async fn delete_sweep_keeps_a_candidate_inside_a_plain_folder() {
+    let h = Harness::new().await;
+    let folder = h.parent().to_path_buf();
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    let id = WorkspaceId::from("inner-dir");
+    std::fs::create_dir_all(folder.join(id.as_str())).expect("user subfolder");
+    std::fs::write(folder.join(id.as_str()).join("keep.txt"), b"keep").expect("file");
+    h.store
+        .insert_workspace(&plain_row(&id, &folder))
+        .await
+        .expect("insert");
+    let svc = services_at(&h.store, &folder);
+    let before = snapshot(&folder);
+    svc.delete_workspace(id.clone()).await.expect("delete");
+    svc.store_tasks.drain_finite().await;
+    assert_untouched(&folder, &before, "candidate inside the plain folder");
+}
+
+/// `workspace.cleanup` removes `<candidate>/cache`: never inside a plain
+/// folder that sits at a candidate.
+#[intent_test_macros::daemon_test]
+async fn cleanup_keeps_the_cache_dir_of_a_plain_folder_at_a_candidate() {
+    let h = Harness::new().await;
+    let id = WorkspaceId::from("my-notes");
+    let folder = h.parent().join(id.as_str());
+    std::fs::create_dir_all(folder.join("cache")).expect("user cache dir");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    std::fs::write(folder.join("cache").join("photo.jpg"), b"jpg").expect("file");
+    h.store
+        .insert_workspace(&plain_row(&id, &folder))
+        .await
+        .expect("insert");
+    let svc = services_at(&h.store, h.parent());
+    let before = snapshot(&folder);
+    svc.cleanup_workspace(id.clone()).await.expect("cleanup");
+    assert_untouched(&folder, &before, "workspace.cleanup");
+}
+
+/// Purging a GIT workspace whose `<location>/<id>` candidate is a plain
+/// folder (after a `worktreesLocation` change) keeps that plain folder; the
+/// git workspace's own checkout is still removed.
+#[intent_test_macros::daemon_test]
+async fn purging_a_git_workspace_keeps_a_plain_folder_at_its_candidate() {
+    let f = crate::test_support::retire_workspace::fixture().await;
+    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
+    let wt = PathBuf::from(git_ws.worktree_path.clone().expect("worktree"));
+    let location = test_tempdir("intentd-plain-safety-loc-");
+    let folder = location.path().join(git_ws.id.as_str());
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    f.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &folder))
+        .await
+        .expect("insert plain");
+    let registry = Arc::new(
+        SettingsRegistry::load(f.root.join("plain-safety-retire.config.toml")).expect("registry"),
+    );
+    registry
+        .apply(&[(
+            "workspace.worktreesLocation".to_string(),
+            serde_json::json!(location.path().to_string_lossy()),
+        )])
+        .expect("apply worktreesLocation");
+    let svc = f.svc.clone().with_settings_registry(registry);
+    let before = snapshot(&folder);
+    svc.archive_workspace(git_ws.id.clone(), None)
+        .await
+        .expect("archive");
+    let retired = svc
+        .retire_workspace(git_ws.id.clone(), None)
+        .await
+        .expect("retire the git workspace");
+    assert_eq!(retired.status, WorkspaceStatus::Retired);
+    svc.store_tasks.drain_finite().await;
+    assert!(!wt.exists(), "the git checkout is still purged");
+    assert_untouched(
+        &folder,
+        &before,
+        "git purge with a plain folder at a candidate",
+    );
+}
+
+/// The startup orphaned-trash sweep never enters a plain folder sitting at
+/// `<root>/<x>`, even one holding a `*.deleting-*` directory.
+#[intent_test_macros::daemon_test]
+async fn orphaned_trash_sweep_keeps_a_plain_folder_under_the_root() {
+    let h = Harness::new().await;
+    let folder = h.parent().join("my-notes");
+    std::fs::create_dir_all(folder.join("draft.deleting-1")).expect("lookalike");
+    std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+    std::fs::write(folder.join("draft.deleting-1").join("x.txt"), b"x").expect("file");
+    h.store
+        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &folder))
+        .await
+        .expect("insert");
+    let svc = services_at(&h.store, h.parent());
+    let before = snapshot(&folder);
+    assert_eq!(svc.sweep_orphaned_worktree_trash().await, 0);
+    assert_untouched(&folder, &before, "orphaned trash sweep");
+}
+
+/// Symlinked alias: the plain folder is recorded through a symlink and the
+/// sweep candidate is the real path (and vice versa) — still kept.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn delete_sweep_keeps_a_plain_folder_reached_through_a_symlink() {
+    for folder_via_link in [true, false] {
+        let h = Harness::new().await;
+        let real_parent = h.parent().join("real");
+        std::fs::create_dir_all(&real_parent).expect("real parent");
+        let link_parent = h.parent().join("link");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).expect("symlink");
+        let id = WorkspaceId::from("my-notes");
+        let folder = real_parent.join(id.as_str());
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
+        let (recorded, root) = if folder_via_link {
+            (link_parent.join(id.as_str()), real_parent.clone())
+        } else {
+            (folder.clone(), link_parent.clone())
+        };
+        h.store
+            .insert_workspace(&plain_row(&id, &recorded))
+            .await
+            .expect("insert");
+        let svc = services_at(&h.store, &root);
+        let before = snapshot(&folder);
+        svc.delete_workspace(id.clone()).await.expect("delete");
+        svc.store_tasks.drain_finite().await;
+        assert_untouched(
+            &folder,
+            &before,
+            &format!("symlink alias, folder_via_link={folder_via_link}"),
+        );
+    }
+}

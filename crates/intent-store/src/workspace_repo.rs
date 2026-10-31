@@ -1302,6 +1302,17 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
+            // A plain-folder row's folder outlives the row on the tombstone
+            // (migration 0178), read in the same transaction as the delete.
+            let plain_folder_path: Option<String> = sqlx::query_scalar(
+                "SELECT repository_path FROM workspace \
+                 WHERE id = ? AND plain_folder = 1 AND repository_path != ''",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read plain folder path failed: {e}")))?
+            .flatten();
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
@@ -1311,10 +1322,12 @@ impl Store {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
             sqlx::query(
-                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at, plain_folder_path) \
+                 VALUES (?, ?, ?)",
             )
             .bind(&id.0)
             .bind(now_iso())
+            .bind(plain_folder_path)
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("record deleted workspace id failed: {e}")))?;
@@ -1327,6 +1340,27 @@ impl Store {
         self.browser_tab_displayed
             .forget_all(tab_ids.iter().map(String::as_str));
         Ok(())
+    }
+
+    /// The folder of every plain-folder workspace the store knows (PROTOCOL
+    /// §5.1 "Plain-folder workspaces"): live, archived and retired rows plus
+    /// deleted ones remembered on their tombstone. Path-based cleanup sweeps
+    /// never remove a directory overlapping one of these.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; callers
+    /// then skip the sweep (fail closed).
+    pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT repository_path FROM workspace \
+             WHERE plain_folder = 1 AND repository_path IS NOT NULL AND repository_path != '' \
+             UNION SELECT plain_folder_path FROM deleted_workspace_id \
+             WHERE plain_folder_path IS NOT NULL AND plain_folder_path != ''",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("plain folder paths lookup failed: {e}")))
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
