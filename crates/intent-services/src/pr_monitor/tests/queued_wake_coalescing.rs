@@ -278,10 +278,13 @@ async fn a_change_that_fully_reverted_keeps_the_queued_update_and_its_correction
     assert!(content(&wakes[1]).contains("head is now aaaaaaaa"));
 }
 
-/// The queue primitive itself: only a pristine, undelivered entry whose
-/// metadata the caller confirms is removed, and nothing else moves.
+/// The swap used by change wakes: only a pristine, undelivered entry whose
+/// metadata the caller confirms is replaced, and the removal and the new
+/// tail entry land in ONE step, so the durable queue never holds neither
+/// (review finding on #2897: a separate remove-then-deliver could lose both
+/// on a failed delivery or a restart in between).
 #[intent_test_macros::daemon_test]
-async fn remove_pending_wake_touches_only_an_undelivered_matching_entry() {
+async fn replace_pending_wake_at_tail_swaps_in_one_step() {
     let (_db, _root, svc, _forge, _ws, owner) = setup().await;
     let wake = json!({"type": "pr_monitor_wake", "monitorId": "m", "reason": "changed"});
     let queue = |metadata: Option<Value>, origin| {
@@ -301,28 +304,48 @@ async fn remove_pending_wake_touches_only_an_undelivered_matching_entry() {
     let entry = queue(Some(wake.clone()), intent_core::MessageOrigin::Automatic);
     let user = queue(Some(wake.clone()), intent_core::MessageOrigin::User);
     let other = queue(None, intent_core::MessageOrigin::Automatic);
+    let swap = |id: &str, check: &dyn Fn(&Value) -> bool| {
+        svc.replace_pending_wake_at_tail(&owner, id, "new", &wake, check)
+    };
 
-    assert!(!svc.remove_pending_wake(&owner, &entry.id, |_| false));
-    assert!(!svc.remove_pending_wake(&owner, "missing", is_wake));
-    assert!(!svc.remove_pending_wake(&owner, &user.id, is_wake));
-    assert!(!svc.remove_pending_wake(&owner, &other.id, is_wake));
-    assert!(svc.remove_pending_wake(&owner, &entry.id, is_wake));
+    assert!(swap(&entry.id, &|_| false).is_none());
+    assert!(swap("missing", &is_wake).is_none());
+    assert!(swap(&user.id, &is_wake).is_none());
+    assert!(swap(&other.id, &is_wake).is_none());
+    assert_eq!(svc.queue_snapshot(&owner).len(), 3, "nothing moved");
+
+    let replaced = swap(&entry.id, &is_wake).expect("swapped");
+    assert_ne!(replaced.id, entry.id);
     let ids: Vec<_> = svc
         .queue_snapshot(&owner)
         .into_iter()
         .map(|row| row["id"].clone())
         .collect();
-    assert_eq!(ids, vec![json!(user.id), json!(other.id)]);
+    assert_eq!(
+        ids,
+        vec![json!(user.id), json!(other.id), json!(replaced.id)]
+    );
 
-    // Popped for delivery: never removed.
-    let again = queue(Some(wake), intent_core::MessageOrigin::Automatic);
-    while let Some((popped, draining)) = svc.dequeue_message_draining(&owner) {
-        if popped.id == again.id {
-            assert!(!svc.remove_pending_wake(&owner, &again.id, is_wake));
-            drop(draining);
-            break;
+    // One write-through carries both halves of the swap.
+    svc.persist_queue_snapshot(&owner).await;
+    let rows = svc.store().load_all_agent_queues().await.unwrap();
+    let durable: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+    assert!(durable.contains(&replaced.id), "{durable:?}");
+    assert!(!durable.contains(&entry.id), "{durable:?}");
+
+    // Popped for delivery: never replaced, nothing appended.
+    let (popped, _draining) = loop {
+        let (popped, draining) = svc.dequeue_message_draining(&owner).expect("pop");
+        if popped.id == replaced.id {
+            break (popped, draining);
         }
-    }
+    };
+    assert!(swap(&popped.id, &is_wake).is_none());
+    assert_eq!(
+        svc.queue_snapshot(&owner).len(),
+        1,
+        "only the draining entry"
+    );
 }
 
 /// The in-place rewrite used by the final wake: same guards as removal,

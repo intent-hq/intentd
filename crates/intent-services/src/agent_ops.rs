@@ -17389,8 +17389,9 @@ impl Services {
     /// the live queue and NOT popped for delivery (a draining entry is being
     /// processed, and may already be in the transcript), with no user origin,
     /// edit, hold, merge, retry, attachment or prepend state, and metadata
-    /// `supersedes` confirms. Shared by [`Services::remove_pending_wake`]
-    /// and [`Services::rewrite_pending_wake`]; callers hold the drain lock
+    /// `supersedes` confirms. Shared by
+    /// [`Services::replace_pending_wake_at_tail`] and
+    /// [`Services::rewrite_pending_wake`]; callers hold the drain lock
     /// and the queue lock, so the check and the mutation are one step.
     fn replaceable_pending_wake(
         queue: &[QueuedMessage],
@@ -17425,46 +17426,63 @@ impl Services {
             .then_some(index)
     }
 
-    /// Remove a still-UNDELIVERED automatic wake from the agent's queue
-    /// (see [`Services::replaceable_pending_wake`] for which entries
-    /// qualify). The PR monitor uses this for a newer CHANGE update: the
-    /// older queued one is removed and the newer one joins the back of the
-    /// queue (or starts a turn) through the ordinary delivery path, so the
-    /// owner never reads the stale one. A concurrent pop either takes the
-    /// entry first (this returns `false`) or never sees it.
+    /// Replace a still-UNDELIVERED automatic wake (see
+    /// [`Services::replaceable_pending_wake`] for which entries qualify)
+    /// with a NEW entry at the back of the queue, in one step: the old entry
+    /// is removed and the new one appended under the same drain and queue
+    /// locks, so no pop, snapshot or write-through ever sees neither. The
+    /// PR monitor uses this for a newer CHANGE update, so the owner never
+    /// reads the stale one and the replacement waits behind work queued
+    /// after it.
     ///
-    /// Returns whether the entry was removed. The caller publishes
-    /// `agent:queue:updated` (which also writes the queue through).
-    pub(crate) fn remove_pending_wake(
+    /// The new entry carries `content` (with the same sender attribution a
+    /// queued wake delivery adds) and `message_metadata`, automatic origin.
+    /// Returns it, or `None` when nothing qualified and nothing changed.
+    /// The caller publishes `agent:queue:updated` (one write-through of the
+    /// swapped queue) and kicks the drain in case the owner went idle.
+    pub(crate) fn replace_pending_wake_at_tail(
         &self,
         agent_id: &AgentId,
         message_id: &str,
+        content: &str,
+        message_metadata: &Value,
         supersedes: impl FnOnce(&Value) -> bool,
-    ) -> bool {
+    ) -> Option<QueuedMessage> {
+        let mut content = content.to_string();
+        annotate_sender_attribution(&mut content, Some(message_metadata));
         let draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
-        let mut live = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let Some(queue) = live.get_mut(agent_id) else {
-            return false;
-        };
-        let draining = draining
-            .get(agent_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let Some(index) = Self::replaceable_pending_wake(queue, draining, message_id, supersedes)
-        else {
-            return false;
-        };
-        queue.remove(index);
-        if queue.is_empty() {
-            live.remove(agent_id);
+        {
+            let mut live = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = live.get_mut(agent_id)?;
+            let in_flight = draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let index = Self::replaceable_pending_wake(queue, in_flight, message_id, supersedes)?;
+            queue.remove(index);
         }
-        true
+        // Still under the drain lock: no pop can run between the removal
+        // and the append.
+        let (queued, _) = self.enqueue_message_with_id_locked(
+            agent_id,
+            None,
+            content,
+            None,
+            None,
+            Some(message_metadata.clone()),
+            None,
+            false,
+            MessageOrigin::Automatic,
+            &draining,
+            None,
+        );
+        Some(queued)
     }
 
     /// Rewrite a still-UNDELIVERED automatic wake IN PLACE (see

@@ -494,14 +494,14 @@ pub(crate) type PrMonitorQueuedWakes = Arc<Mutex<HashMap<PrMonitorId, QueuedPrMo
 enum QueuedWakeReplacement {
     /// Nothing replaced: deliver the wake as rendered, keeping both.
     None,
-    /// The queued entry was removed; deliver `message` (it joins the back
-    /// of the queue), which reports from `reported_baseline`.
-    Requeue {
-        message: String,
+    /// The queued entry was swapped, in one queue step, for this wake at
+    /// the back of the queue as entry `message_id`, which reports from
+    /// `reported_baseline`.
+    Requeued {
+        message_id: String,
         reported_baseline: Option<String>,
     },
-    /// The final wake was written into the queued entry's place; nothing
-    /// left to deliver.
+    /// The final wake was written into the queued entry's place.
     InPlace,
 }
 
@@ -4827,8 +4827,8 @@ impl Services {
     /// wake is still waiting, undelivered, in the owner's queue
     /// ([`Services::replace_queued_pr_monitor_wake`]):
     ///
-    /// - a newer `changed` wake removes it and joins the BACK of the queue
-    ///   through the ordinary delivery path;
+    /// - a newer `changed` wake takes its place at the BACK of the queue, in
+    ///   one queue step, so a failure or restart never leaves neither;
     /// - the `completed` (merged/closed) wake takes over its PLACE in the
     ///   queue, so the final update is not delayed behind work queued after
     ///   the older one.
@@ -4848,15 +4848,18 @@ impl Services {
         snapshot: &PrMonitorSnapshot,
         wake: CoalescibleWake,
     ) {
-        let (message, reported_baseline) = match self
+        let queued = match self
             .replace_queued_pr_monitor_wake(after, snapshot, wake)
             .await
         {
-            QueuedWakeReplacement::None => (message.to_string(), before.baseline_snapshot.clone()),
-            QueuedWakeReplacement::Requeue {
-                message,
+            QueuedWakeReplacement::None => self
+                .wake_pr_monitor_owner(after, message, wake.reason())
+                .await
+                .map(|id| (id, before.baseline_snapshot.clone())),
+            QueuedWakeReplacement::Requeued {
+                message_id,
                 reported_baseline,
-            } => (message, reported_baseline),
+            } => Some((message_id, reported_baseline)),
             QueuedWakeReplacement::InPlace => {
                 // The final wake now sits in the queue; same terminal
                 // backstop as the ordinary completed delivery.
@@ -4865,12 +4868,9 @@ impl Services {
                 return;
             }
         };
-        let queued = self
-            .wake_pr_monitor_owner(after, &message, wake.reason())
-            .await;
         let mut wakes = self.pr_monitor_queued_wakes.lock().unwrap();
         match (wake, queued) {
-            (CoalescibleWake::Changed, Some(message_id)) => {
+            (CoalescibleWake::Changed, Some((message_id, reported_baseline))) => {
                 wakes.insert(
                     after.monitor_id.clone(),
                     QueuedPrMonitorWake {
@@ -4887,9 +4887,10 @@ impl Services {
     }
 
     /// Replace the monitor's still-queued `changed` wake with this one,
-    /// re-rendered against the queued wake's baseline: `changed` removes the
-    /// queued entry and hands the caller the message to deliver (it joins
-    /// the back of the queue); `completed` rewrites the queued entry in
+    /// re-rendered against the queued wake's baseline: `changed` swaps the
+    /// queued entry for a new one at the back of the queue in one queue step
+    /// ([`Services::replace_pending_wake_at_tail`]), so no failure or restart
+    /// can leave neither queued; `completed` rewrites the queued entry in
     /// place.
     ///
     /// The replacement reports `diff(reported_baseline, snapshot)` — every
@@ -4942,21 +4943,25 @@ impl Services {
                 && queued.get("resource").is_none()
                 && queued.get("monitorAvailability").is_none()
         };
+        let paused_until = self.sweep_rate_limit_paused_until();
+        let metadata = pr_monitor_wake_metadata(monitor, wake.reason(), paused_until.as_deref());
         let replacement = match wake {
             CoalescibleWake::Changed => {
-                if !self.remove_pending_wake(&monitor.agent_id, &prior.message_id, is_queued_change)
-                {
+                let Some(queued) = self.replace_pending_wake_at_tail(
+                    &monitor.agent_id,
+                    &prior.message_id,
+                    &message,
+                    &metadata,
+                    is_queued_change,
+                ) else {
                     return QueuedWakeReplacement::None;
-                }
-                QueuedWakeReplacement::Requeue {
-                    message,
+                };
+                QueuedWakeReplacement::Requeued {
+                    message_id: queued.id,
                     reported_baseline: prior.reported_baseline,
                 }
             }
             CoalescibleWake::Completed => {
-                let paused_until = self.sweep_rate_limit_paused_until();
-                let metadata =
-                    pr_monitor_wake_metadata(monitor, wake.reason(), paused_until.as_deref());
                 if !self.rewrite_pending_wake(
                     &monitor.agent_id,
                     &prior.message_id,
@@ -4969,7 +4974,15 @@ impl Services {
                 QueuedWakeReplacement::InPlace
             }
         };
+        // One write-through of the swapped queue.
         self.publish_queue_updated(&monitor.agent_id).await;
+        // The owner may have gone idle since the old entry was queued; the
+        // drain's own busy/archived/retired gates make this a no-op otherwise.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(monitor.agent_id.clone(), monitor.workspace_id.clone())
+                .await;
+        }
         tracing::debug!(
             monitor = %monitor.monitor_id.0,
             agent = %monitor.agent_id.0,
