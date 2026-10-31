@@ -1,7 +1,9 @@
-//! Remote launch end to end: a real `intentd serve` head (WSS, the
-//! experimental switch on, `remote-node.json` configured) and a second real
-//! `intentd serve` as the machine (remote agents on, an executor credential
-//! minted for the head), both on loopback. An agent created over WSS with a
+//! Remote launch end to end: a real `intentd serve` backend (WSS,
+//! `experimental.remoteAgents` on) and a second real `intentd serve` as the
+//! machine (remote agents on), both on loopback. The machine mints an
+//! executor credential for the backend's id (`remoteMachines.backendInfo`)
+//! and the backend adds it with `remoteMachines.add`, as the frontend relays
+//! it. An agent created over WSS with a
 //! remote placement is launched on the node on its first message: the node
 //! fetches the workspace's last commit over `git-remote-intent` into its own
 //! worktree, runs the provider (the `node-test-agent.mjs` fixture), streams
@@ -32,9 +34,6 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::common;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
-/// The head id the machine's executor credential is minted for; the head's
-/// node registration is pre-enrolled under it.
-const HEAD_ID: &str = "head-e2e";
 
 fn wait() -> Duration {
     common::test_timeout(Duration::from_secs(60))
@@ -197,24 +196,19 @@ fn try_rev(dir: &Path, name: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn write_private(path: &Path, value: &Value) {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::write(path, value.to_string()).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-}
-
 /// The machine: a regular `intentd serve` running the fixture provider as
-/// `mock`, with remote agents on and an executor credential minted for
-/// [`HEAD_ID`].
+/// `mock`, with remote agents on and an executor credential minted for the
+/// backend `backend_id`.
 struct Machine {
     _daemon: common::DaemonGuard,
     port: u16,
     fingerprint: String,
     daemon_id: String,
+    credential_id: String,
     token: String,
 }
 
-async fn start_machine(dir: &Path) -> Machine {
+async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
     let fixture = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -251,7 +245,7 @@ async fn start_machine(dir: &Path) -> Machine {
         &mut ws,
         2,
         "executor.mint",
-        json!({ "backendId": HEAD_ID, "backendName": "E2E head" }),
+        json!({ "backendId": backend_id, "backendName": "E2E head" }),
     )
     .await;
     Machine {
@@ -259,67 +253,9 @@ async fn start_machine(dir: &Path) -> Machine {
         port,
         fingerprint,
         daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
+        credential_id: minted["credentialId"].as_str().unwrap().to_owned(),
         token: minted["token"].as_str().unwrap().to_owned(),
     }
-}
-
-/// Register the machine in the head's store under [`HEAD_ID`] (the head id
-/// the machine's credential names), as the connector would on first use.
-async fn enroll_machine(data_dir: &Path, machine: &Machine, endpoint: &str) {
-    use intent_core::nodes::{
-        LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
-        NodeRecord, NodeState,
-    };
-    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
-        .await
-        .expect("open head store");
-    let record = NodeRecord {
-        id: machine.daemon_id.clone(),
-        head_id: HEAD_ID.into(),
-        node_identity: machine.daemon_id.clone(),
-        name: "E2E node".into(),
-        kind: NodeKind::Static,
-        os: NodeOs::Linux,
-        arch: NodeArch::X86_64,
-        state: NodeState::Offline,
-        draining: false,
-        capacity: NodeCapacity {
-            max_agents: 0,
-            reserved_agents: 0,
-            memory_budget_bytes: 0,
-            used_memory_bytes: 0,
-            exclusive_reserved: false,
-        },
-        version: String::new(),
-        endpoint: Some(format!("{endpoint}/node")),
-        // Stored as the connector normalizes it: lowercase hex, no colons.
-        certificate_sha256: Some(
-            machine
-                .fingerprint
-                .chars()
-                .filter(|c| *c != ':')
-                .map(|c| c.to_ascii_lowercase())
-                .collect(),
-        ),
-        last_seen_at: None,
-    };
-    let lease = NodeLease {
-        owner: LeaseOwner {
-            head_id: HEAD_ID.into(),
-            node_id: machine.daemon_id.clone(),
-            node_identity: machine.daemon_id.clone(),
-            lease_id: uuid::Uuid::new_v4().to_string(),
-            incarnation: uuid::Uuid::new_v4().to_string(),
-        },
-        state: LeaseState::Acquiring,
-        created_at: intent_core::now_iso(),
-        last_seen_at: None,
-        ack_seq: NodeCounter(0),
-        link_generation: NodeCounter(0),
-        release_requested: false,
-        fence: None,
-    };
-    store.enroll_node(&record, &lease).await.expect("enroll");
 }
 
 /// Send `content` to the agent, wait for its turn to end, and return its
@@ -397,26 +333,9 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     // Uncommitted on head: never carried to the node.
     std::fs::write(repo.join("README.md"), "dirty on head\n").unwrap();
 
-    let node_dir = scratch.path().join("node");
-    std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine(&node_dir).await;
-    let node_id = machine.daemon_id.clone();
-    let endpoint = format!("wss://127.0.0.1:{}", machine.port);
-
     let data_dir = scratch.path().join("head");
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace(&data_dir, &repo).await;
-    enroll_machine(&data_dir, &machine, &endpoint).await;
-    write_private(
-        &data_dir.join("remote-node.json"),
-        &json!({
-            "nodeId": node_id,
-            "name": "E2E node",
-            "endpoint": endpoint,
-            "certificateSha256": machine.fingerprint,
-            "token": machine.token,
-        }),
-    );
     common::enable_ws_api(&data_dir);
     let mut serve = common::hermetic_serve_command(&data_dir);
     serve
@@ -424,7 +343,6 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_EXPERIMENTAL_REMOTE_LAUNCH", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(scratch.path().join("head.log")).unwrap(),
@@ -453,6 +371,39 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             "{capability} must not be advertised: {capabilities}"
         );
     }
+    ok(
+        &mut rpc_ws,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "experimental.remoteAgents", "value": true }] }),
+    )
+    .await;
+    let backend = ok(&mut rpc_ws, 4, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+
+    // Expose the machine to this backend, as the frontend relays it: mint on
+    // the machine, then add on the backend, which probes before saving.
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    let node_id = machine.daemon_id.clone();
+    let added = ok(
+        &mut rpc_ws,
+        5,
+        "remoteMachines.add",
+        json!({
+            "machineId": node_id,
+            "name": "E2E node",
+            "hosts": ["127.0.0.1"],
+            "port": machine.port,
+            "fingerprint": machine.fingerprint,
+            "credentialId": machine.credential_id,
+            "token": machine.token,
+        }),
+    )
+    .await;
+    assert_eq!(added["machine"]["id"], node_id.as_str(), "{added}");
+    assert!(!added.to_string().contains(&machine.token));
 
     let mut events = connect(port, cfg.clone()).await;
     ok(
@@ -463,8 +414,8 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     )
     .await;
 
-    // The node binds asynchronously after head starts: until then the
-    // placement is unavailable.
+    // The backend connects to the machine on demand at placement; retry
+    // while that first connect is still in flight.
     let create = json!({
         "workspaceId": ws_id,
         "name": "Remote",
@@ -486,7 +437,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "node never bound: {response}"
+            "the machine never took the placement: {response}"
         );
         // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
         tokio::time::sleep(Duration::from_millis(200)).await;

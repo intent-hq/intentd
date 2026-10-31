@@ -2560,20 +2560,10 @@ async fn cmd_serve_owned(
             services_export_sweep.sweep_stale_export_staging().await;
         })
     });
-    // Dial the execution node configured in `<data_dir>/remote-node.json`,
-    // if there is one; without the file nothing starts.
-    let services_remote = services.clone();
-    let remote_data_dir = config.data_dir.clone();
-    // The outbound head connector is orchestration: off in node mode.
-    orchestration.spawn(|| {
-        intent_core::spawn_daemon(async move {
-            match services_remote.start_remote_node(&remote_data_dir).await {
-                Ok(true) => tracing::info!("remote node: connector started"),
-                Ok(false) => {}
-                Err(error) => tracing::warn!(%error, "remote node: connector not started"),
-            }
-        })
-    });
+    // Exposed machines (daemon-to-daemon remote agents) are dialed on
+    // demand; hand the feature the tailcat binary for their tailcat routes.
+    // Node mode never starts a connector.
+    services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();

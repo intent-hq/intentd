@@ -1248,6 +1248,27 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         svc: &'a Services,
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>>;
+
+    /// `remoteMachines.<method>` with `params`, after the services checked
+    /// the caller is the owner. A daemon without the remote feature has no
+    /// exposed machines to manage.
+    ///
+    /// # Errors
+    ///
+    /// As documented for the method; [`Error::Unsupported`] by default.
+    fn remote_machines<'a>(
+        &'a self,
+        svc: &'a Services,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        let _ = (svc, params);
+        Box::pin(async move {
+            Err(Error::Unsupported(format!(
+                "remoteMachines.{method}: this daemon cannot use exposed machines"
+            )))
+        })
+    }
 }
 
 /// The remote-launch port of a daemon with no execution node: nothing is

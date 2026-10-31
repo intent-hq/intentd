@@ -1,4 +1,4 @@
-//! The remote-launch feature port: admission against the configured node,
+//! The remote-launch feature port: admission against the exposed machines,
 //! placing a created agent on it (its `base` ref and its record on the
 //! lease), and the runtime that starts it there on its first turn.
 //!
@@ -26,11 +26,12 @@ use intent_git::node_git::{self, AgentRemote};
 use intent_services::feature_api::feature_ports::{RemoteLaunchPort, RemoteRuntime};
 use intent_services::feature_api::Services;
 
+use intent_core::machines::RemoteMachineState;
+
 use crate::RemoteServicesExt as _;
 
-/// The remote-launch port of the feature. Without a running connector
-/// (no configured node, or the experimental switch off) it behaves like the
-/// unavailable port.
+/// The remote-launch port of the feature. With no exposed machine, or
+/// `experimental.remoteAgents` off, it behaves like the unavailable port.
 #[derive(Default)]
 pub struct RemoteLaunch;
 
@@ -51,7 +52,7 @@ fn unavailable(placement: &AgentPlacement, availability: PlatformAvailability) -
 
 fn no_node() -> Error {
     Error::InvalidParams(
-        "node-unavailable: this daemon has no execution node configured for remote agents".into(),
+        "node-unavailable: this daemon has no remote feature for exposed machines".into(),
     )
 }
 
@@ -70,51 +71,105 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
         .map_err(|e| Error::Internal(format!("remote launch task failed: {e}")))?
 }
 
-/// The discovery text: the node, its platforms, and how to place an agent.
-fn help_text(node: &crate::RemoteNode) -> String {
-    let status = node.status();
-    let availability = node.availability();
-    let list = |platforms: &[intent_core::placement::AgentPlatform]| {
-        if platforms.is_empty() {
-            "none".to_owned()
-        } else {
-            platforms
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+/// The exposed machines' cached platforms: supported once a machine has
+/// reported what it runs; available when its last report has a free slot
+/// and it is neither revoked nor in need of an update. Nothing while
+/// `experimental.remoteAgents` is off.
+async fn machines_availability(svc: &Services) -> Result<PlatformAvailability> {
+    let now = intent_core::now_iso();
+    if !svc.experimental_remote_agents_enabled() {
+        return Ok(PlatformAvailability::none(now));
+    }
+    let mut supported = Vec::new();
+    let mut available = Vec::new();
+    for row in svc.store().list_exposed_machines().await? {
+        let Some(platform) = row.platform else {
+            continue;
+        };
+        if !supported.contains(&platform) {
+            supported.push(platform);
         }
-    };
-    let supported = if status.platform.is_some() {
-        list(&availability.supported_platforms)
-    } else {
-        "unknown until the node first connects".to_owned()
-    };
-    format!(
-        "Remote placement (experimental): execution node \"{name}\" (nodeId `{id}`) is {state}; platforms: {supported}; available now: {available} ({running} of {max} agents running).\n\
-         To run an agent there, pass `placement: {{ target: \"remote\" }}` (optionally `os`, `arch`, `nodeId`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, {{ create: {{ placement }} }})`. A placement that no node can take fails with `placement-unavailable`, listing what is available.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (account folders such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` must exist on the node, `~` meaning the node's home), or with the node's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). It has no workspace tools yet.",
-        name = status.node_name,
-        id = status.node_id,
-        state = if status.connected { "connected" } else { "offline" },
-        available = list(&availability.available_platforms),
-        running = node.running(),
-        max = status.max_agents,
-    )
+        let usable = !matches!(
+            row.state,
+            RemoteMachineState::Revoked | RemoteMachineState::UpdateRequired
+        ) && row
+            .capabilities
+            .as_ref()
+            .is_none_or(|caps| caps.capacity.running_agents < caps.capacity.agent_cap);
+        if usable && !available.contains(&platform) {
+            available.push(platform);
+        }
+    }
+    Ok(PlatformAvailability::new(supported, available, now))
+}
+
+/// The discovery text: the exposed machines, their platforms, and how to
+/// place an agent on one.
+async fn help_text(svc: &Services) -> Option<String> {
+    if !svc.experimental_remote_agents_enabled() {
+        return None;
+    }
+    let rows = svc.store().list_exposed_machines().await.ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let feature = svc.remote_feature();
+    let machines: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let connected = feature
+                .as_ref()
+                .and_then(|feature| feature.running_node(&row.id))
+                .is_some_and(|node| node.status().connected);
+            let platform = row
+                .platform
+                .map_or_else(|| "unknown platform".to_owned(), |p| p.to_string());
+            let state = if connected {
+                "connected".to_owned()
+            } else {
+                row.state.as_str().to_owned()
+            };
+            format!(
+                "\"{}\" (nodeId `{}`, {platform}, {state})",
+                row.name, row.id
+            )
+        })
+        .collect();
+    Some(format!(
+        "Remote placement (experimental): exposed machines: {}.\n\
+         To run an agent on one, pass `placement: {{ target: \"remote\", nodeId }}` (or `os` / `arch` instead of `nodeId`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, {{ create: {{ placement }} }})`. A placement no machine can take fails with `placement-unavailable`, listing what is available.\n\
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (account folders such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` must exist on the machine, `~` meaning the machine's home), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree).",
+        machines.join(", ")
+    ))
+}
+
+/// The exposed machine a placement names, or the first whose cached
+/// platform matches it.
+async fn choose_machine(
+    svc: &Services,
+    placement: &AgentPlacement,
+) -> Result<Option<intent_core::machines::ExposedMachine>> {
+    let rows = svc.store().list_exposed_machines().await?;
+    if let Some(node_id) = &placement.node_id {
+        return Ok(rows.into_iter().find(|row| row.id == *node_id));
+    }
+    Ok(rows.into_iter().find(|row| {
+        !matches!(
+            row.state,
+            RemoteMachineState::Revoked | RemoteMachineState::UpdateRequired
+        ) && row
+            .platform
+            .is_some_and(|platform| placement.matches_platform(platform))
+    }))
 }
 
 impl RemoteLaunchPort for RemoteLaunch {
     fn placements<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>> {
-        Box::pin(async move {
-            Ok(svc.remote_node().map_or_else(
-                || PlatformAvailability::none(intent_core::now_iso()),
-                |node| node.availability(),
-            ))
-        })
+        Box::pin(machines_availability(svc))
     }
 
     fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>> {
-        Box::pin(async move { svc.remote_node().map(|node| help_text(&node)) })
+        Box::pin(help_text(svc))
     }
 
     fn admit<'a>(
@@ -124,24 +179,34 @@ impl RemoteLaunchPort for RemoteLaunch {
         placement: &'a AgentPlacement,
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
-            let Some(node) = svc.remote_node() else {
-                return Err(unavailable(
-                    placement,
-                    PlatformAvailability::none(intent_core::now_iso()),
-                ));
-            };
-            let status = node.status();
-            if placement
-                .node_id
-                .as_ref()
-                .is_some_and(|id| *id != status.node_id)
-            {
-                // No configured node has that id: nothing matches.
-                return Err(unavailable(
-                    placement,
-                    PlatformAvailability::none(intent_core::now_iso()),
-                ));
+            if let Some(node_id) = &placement.node_id {
+                // No exposed machine has that id: nothing matches.
+                if svc.store().get_exposed_machine(node_id).await?.is_none() {
+                    return Err(unavailable(
+                        placement,
+                        PlatformAvailability::none(intent_core::now_iso()),
+                    ));
+                }
             }
+            let (Some(feature), Some(row)) = (
+                svc.remote_feature()
+                    .filter(|_| svc.experimental_remote_agents_enabled()),
+                choose_machine(svc, placement).await?,
+            ) else {
+                return Err(unavailable(placement, machines_availability(svc).await?));
+            };
+            let node = feature.node(svc, &row.id).await?;
+            // Connect on demand; an unreachable machine can take nothing now.
+            if node.connect().await.is_err() {
+                let cached = machines_availability(svc).await?;
+                let offline = PlatformAvailability::new(
+                    cached.supported_platforms,
+                    Vec::new(),
+                    intent_core::now_iso(),
+                );
+                return Err(unavailable(placement, offline));
+            }
+            let status = node.status();
             let availability = node.availability();
             let platform = availability
                 .available_platforms
@@ -206,7 +271,6 @@ impl RemoteLaunchPort for RemoteLaunch {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>> {
         Box::pin(async move {
-            let node = svc.remote_node().ok_or_else(no_node)?;
             let record = svc
                 .store()
                 .get_remote_agent(agent_id)
@@ -216,8 +280,13 @@ impl RemoteLaunchPort for RemoteLaunch {
                         "node-agent-unplaced: agent {agent_id} was not placed on the execution node"
                     ))
                 })?;
+            let feature = svc.remote_feature().ok_or_else(no_node)?;
+            // Held until the runtime is attached, so a replacement or removal
+            // of the machine either sees this agent or happens first.
+            let _lifecycle = feature.lifecycle(&record.node_id).await;
+            let node = feature.node_locked(svc, &record.node_id).await?;
             let status = node.status();
-            if record.node_id != status.node_id || record.lease_id != status.lease_id {
+            if record.lease_id != status.lease_id {
                 return Err(Error::InvalidParams(format!(
                     "node-agent-unplaced: agent {agent_id} runs under a lease this daemon no longer holds"
                 )));
@@ -255,6 +324,18 @@ impl RemoteLaunchPort for RemoteLaunch {
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)
+        })
+    }
+
+    fn remote_machines<'a>(
+        &'a self,
+        svc: &'a Services,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let feature = svc.remote_feature().ok_or_else(no_node)?;
+            crate::methods::call(feature, svc, method, params).await
         })
     }
 }

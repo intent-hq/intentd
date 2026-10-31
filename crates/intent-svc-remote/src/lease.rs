@@ -1,6 +1,11 @@
-//! Head's durable side of the node binding: the node's registration, its
-//! live lease, the link generation (advanced before every dial) and the
-//! journal ack (persisted before it is sent).
+//! Head's durable side of a machine binding: the exposed machine's
+//! registration, the live lease of its current executor credential, the
+//! link generation (advanced before every dial) and the journal ack
+//! (persisted before it is sent).
+//!
+//! The head id is this daemon's id ([`Store::daemon_id`]), the backend id
+//! the machine minted the credential for. Each credential gets its own
+//! lease, so a re-added machine starts a fresh journal.
 
 use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
 use intent_core::nodes::{
@@ -10,9 +15,83 @@ use intent_core::nodes::{
 use intent_core::{now_iso, Error, Result};
 use intent_store::Store;
 
-use crate::config::HeadNodeConfig;
+use crate::machine::MachineTarget;
 
-/// The configured node's durable lease, as head sees it.
+/// The hello of a probe: binds `owner`'s binding at `generation` with no
+/// journal acked yet (a new credential's journal is empty).
+pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHello {
+    LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
+        binding: LeaseBinding {
+            head_id: owner.head_id.clone(),
+            node_id: owner.node_id.clone(),
+            lease_id: owner.lease_id.clone(),
+            generation,
+        },
+        acked_seq: NodeCounter(0),
+    }
+}
+
+/// A new lease owner on machine `machine_id` for this backend.
+pub(crate) async fn new_owner(store: &Store, machine_id: &str) -> Result<LeaseOwner> {
+    Ok(LeaseOwner {
+        head_id: store.daemon_id().await?,
+        node_id: machine_id.to_owned(),
+        node_identity: machine_id.to_owned(),
+        lease_id: uuid::Uuid::new_v4().to_string(),
+        incarnation: uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+/// Durably start `owner`'s lease on `target` after a probe bound it at
+/// `generation`, ending any earlier lease on the machine.
+pub(crate) async fn record_new_lease(
+    store: &Store,
+    target: &MachineTarget,
+    owner: &LeaseOwner,
+    generation: NodeCounter,
+) -> Result<()> {
+    // The platform, capacity and version are filled in by each welcome.
+    let record = NodeRecord {
+        id: target.id.clone(),
+        head_id: owner.head_id.clone(),
+        node_identity: owner.node_identity.clone(),
+        name: target.name.clone(),
+        kind: NodeKind::Static,
+        os: NodeOs::Linux,
+        arch: NodeArch::X86_64,
+        state: NodeState::Offline,
+        draining: false,
+        capacity: NodeCapacity {
+            max_agents: 0,
+            reserved_agents: 0,
+            memory_budget_bytes: 0,
+            used_memory_bytes: 0,
+            exclusive_reserved: false,
+        },
+        version: String::new(),
+        endpoint: target
+            .direct_routes()
+            .first()
+            .map(|route| format!("{}/node", route.endpoint.url)),
+        certificate_sha256: Some(target.certificate_sha256.clone()),
+        last_seen_at: None,
+    };
+    let lease = NodeLease {
+        owner: owner.clone(),
+        state: LeaseState::Acquiring,
+        created_at: now_iso(),
+        last_seen_at: None,
+        ack_seq: NodeCounter(0),
+        link_generation: NodeCounter(0),
+        release_requested: false,
+        fence: None,
+    };
+    store.renew_machine_lease(&record, &lease, generation).await
+}
+
+/// An exposed machine's durable lease, as head sees it.
 #[derive(Clone)]
 pub(crate) struct HeadLease {
     store: Store,
@@ -27,78 +106,27 @@ impl HeadLease {
         &self.store
     }
 
-    /// Find this head's live lease on the configured node, registering the
-    /// node and a new lease on first use. The head id is this installation's
-    /// existing one, or a new random id when it has registered no node yet.
-    pub(crate) async fn open(store: Store, config: &HeadNodeConfig) -> Result<Self> {
-        if let Some(node) = store.find_execution_node(&config.node_id).await? {
-            let lease = store
-                .list_owned_node_leases(&node.head_id)
-                .await?
-                .into_iter()
-                .find(|lease| lease.owner.node_id == node.id && !lease.state.is_terminal())
-                .ok_or_else(|| {
-                    Error::InvalidParams(format!(
-                        "remote-node-lease-ended: the lease on node {} has ended; give the node a new nodeId to bind it again",
-                        node.id
-                    ))
-                })?;
-            return Ok(Self {
-                store,
-                owner: lease.owner,
-                #[cfg(test)]
-                fail_ack_writes: std::sync::Arc::default(),
-            });
-        }
-        let head_id = match store.node_head_id().await? {
-            Some(head_id) => head_id,
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        // The platform, capacity and version are unknown until the node's
-        // first welcome; the node stays offline until then.
-        let record = NodeRecord {
-            id: config.node_id.clone(),
-            head_id: head_id.clone(),
-            node_identity: config.node_id.clone(),
-            name: config.name.clone(),
-            kind: NodeKind::Static,
-            os: NodeOs::Linux,
-            arch: NodeArch::X86_64,
-            state: NodeState::Offline,
-            draining: false,
-            capacity: NodeCapacity {
-                max_agents: 0,
-                reserved_agents: 0,
-                memory_budget_bytes: 0,
-                used_memory_bytes: 0,
-                exclusive_reserved: false,
-            },
-            version: String::new(),
-            endpoint: Some(format!("{}/node", config.endpoint.url)),
-            certificate_sha256: Some(config.certificate_sha256.clone()),
-            last_seen_at: None,
-        };
-        let owner = LeaseOwner {
-            head_id,
-            node_id: config.node_id.clone(),
-            node_identity: config.node_id.clone(),
-            lease_id: uuid::Uuid::new_v4().to_string(),
-            incarnation: uuid::Uuid::new_v4().to_string(),
-        };
-        let lease = NodeLease {
-            owner: owner.clone(),
-            state: LeaseState::Acquiring,
-            created_at: now_iso(),
-            last_seen_at: None,
-            ack_seq: NodeCounter(0),
-            link_generation: NodeCounter(0),
-            release_requested: false,
-            fence: None,
-        };
-        store.enroll_node(&record, &lease).await?;
+    /// This backend's live lease on machine `machine_id`.
+    ///
+    /// # Errors
+    ///
+    /// `remote-node-lease-ended` when the machine has no live lease (it was
+    /// removed, or its credential replaced).
+    pub(crate) async fn open(store: Store, machine_id: &str) -> Result<Self> {
+        let head_id = store.daemon_id().await?;
+        let lease = store
+            .list_owned_node_leases(&head_id)
+            .await?
+            .into_iter()
+            .find(|lease| lease.owner.node_id == machine_id && !lease.state.is_terminal())
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "remote-node-lease-ended: this backend holds no live lease on machine {machine_id}; add it again"
+                ))
+            })?;
         Ok(Self {
             store,
-            owner,
+            owner: lease.owner,
             #[cfg(test)]
             fail_ack_writes: std::sync::Arc::default(),
         })

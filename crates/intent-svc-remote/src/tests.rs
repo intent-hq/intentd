@@ -1,36 +1,48 @@
-//! The connector and the remote runtime against a fake machine serving the
-//! executor link on a real daemon WSS listener.
+//! The connector, the remote runtime and `remoteMachines.*` against a
+//! machine served in process: a real machine `Services` and store behind the
+//! daemon's WSS listener with the executor link installed (the admission
+//! path of `/node/link` and `/node/git`), and a test executor host that
+//! hands every admitted connection to the test.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 use intent_acp::session::{ActivityTracker, ContentBlock, StopReason};
 use intent_acp::AcpError;
 use intent_core::agent_runtime::AgentRuntime;
 use intent_core::machines::ExecutorCredential;
-use intent_core::node_link::{BindDecision, LeaseBinding};
 use intent_core::node_link::{
-    JournalBody, JournalRecord, LinkFrame, LinkHello, LinkOutcome, LinkWelcome,
+    JournalBody, JournalRecord, LaunchCommand, LinkFrame, LinkHello, LinkOutcome, LinkWelcome,
+    MachineCapabilities, StopId, StopOutcome,
 };
-use intent_core::nodes::{LeaseFence, LeaseFenceKind, LeaseState, NodeArch, NodeCounter, NodeOs};
+use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
-use intent_core::{AgentId, WorkspaceId};
-use intent_core::{BoxFuture, ExecutorCredentialId, HostRole, PrincipalId, WorkspaceApi};
+use intent_core::{
+    with_caller, AgentId, Caller, ExecutorCredentialId, WorkspaceApi as _, WorkspaceId,
+};
+use intent_services::feature_api::settings::InMemorySecretStore;
 use intent_services::feature_api::tests::TempDb;
+use intent_services::feature_api::{EventBus, Services, SettingsRegistry};
 use intent_store::Store;
 use intent_transport::node_link::{
-    ExecutorHost, ExecutorLinks, ExecutorToken, LinkEvent, LinkEvents, NodeConnection, NodeLink,
+    Backoff, ExecutorHost, ExecutorLinks, GitConnection, LinkEvent, LinkEvents, NodeConnection,
+    NodeLink,
 };
-use intent_transport::{generate_certificate, TlsCertificate};
+use intent_transport::{
+    generate_certificate, hash_token, AsyncTokenStore, TlsCertificate, TokenStore, WsApiServer,
+    WsOptions,
+};
 
-use crate::config::HeadNodeConfig;
+use crate::connect::ConnectTuning;
 use crate::connector::{RemoteNode, Tuning};
-use intent_transport::node_link::Backoff;
+use crate::machine::MachineTarget;
+use crate::RemoteServicesExt as _;
 
-const NODE: &str = "node-1";
+mod launch;
+mod methods;
 
 fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))
@@ -44,89 +56,38 @@ fn tuning() -> Tuning {
         turn_poll: Duration::from_millis(20),
         permanent_retry: Duration::from_millis(50),
         backoff: Backoff::new(Duration::from_millis(10), Duration::from_millis(50)),
+        idle_timeout: Duration::from_secs(600),
+        idle_check: Duration::from_millis(20),
+        capabilities_timeout: wait(),
+        stop_resend: Backoff::new(Duration::from_millis(150), Duration::from_millis(600)),
+        remove_timeout: wait(),
+        connect: ConnectTuning {
+            attempt: Duration::from_millis(500),
+            total: wait(),
+        },
         fail_ack_writes: Arc::default(),
+        before_publish: crate::connector::BeforePublish::default(),
     }
 }
 
-fn token() -> ExecutorToken {
-    ExecutorToken::new("t".repeat(40)).unwrap()
-}
-
-/// What the fake machine welcomes a bind with.
-type WelcomeFn = Arc<dyn Fn(&LinkHello) -> LinkWelcome + Send + Sync>;
-
-fn welcome() -> WelcomeFn {
-    welcome_running(Vec::new())
-}
-
-/// A welcome reporting `running` as the node's running agents.
-fn welcome_running(running: Vec<AgentId>) -> WelcomeFn {
-    Arc::new(move |_| LinkWelcome {
-        protocol: 0,
-        node_id: String::new(),
-        running_agents: running.clone(),
-        capabilities: intent_core::node_link::MachineCapabilities::new(
-            AgentPlatform {
-                os: NodeOs::Macos,
-                arch: NodeArch::Aarch64,
-            },
-            "node-test",
-            2,
-            "2026-10-30T00:00:00Z",
-        ),
-        hosts: Vec::new(),
-        tc_address: None,
-    })
-}
-
-/// The fake machine's store seams: one executor credential for [`token`],
-/// bound per the store's generation rule (any head may own it).
-struct MachineApi {
-    principal: PrincipalId,
-    credential: ExecutorCredential,
-    binding: std::sync::Mutex<Option<LeaseBinding>>,
-}
-
-impl WorkspaceApi for MachineApi {
-    fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
-        Box::pin(async move { Ok(self.principal.clone()) })
-    }
-
-    fn principal_host_role(
-        &self,
-        _id: PrincipalId,
-    ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
-        Box::pin(async { Ok(HostRole::Member) })
-    }
-
-    fn resolve_executor_credential(
-        &self,
-        token_hash: String,
-    ) -> BoxFuture<'_, intent_core::Result<Option<ExecutorCredential>>> {
-        let known = intent_transport::auth::hash_token(token().expose());
-        Box::pin(async move { Ok((token_hash == known).then(|| self.credential.clone())) })
-    }
-
-    fn bind_executor(
-        &self,
-        _credential_id: ExecutorCredentialId,
-        node_id: String,
-        offered: LeaseBinding,
-    ) -> BoxFuture<'_, intent_core::Result<BindDecision>> {
-        Box::pin(async move {
-            let mut binding = self.binding.lock().unwrap();
-            let decision = LeaseBinding::decide(&node_id, binding.as_ref(), &offered);
-            if decision == BindDecision::Accept {
-                *binding = Some(offered);
-            }
-            Ok(decision)
-        })
-    }
+/// A machine report: macOS on Apple silicon with two agent slots.
+fn capabilities(running: u32) -> MachineCapabilities {
+    let mut capabilities = MachineCapabilities::new(
+        AgentPlatform {
+            os: NodeOs::Macos,
+            arch: NodeArch::Aarch64,
+        },
+        "machine-test",
+        2,
+        "2026-10-30T00:00:00Z",
+    );
+    capabilities.capacity.running_agents = running;
+    capabilities
 }
 
 struct OwnerToken;
 
-impl intent_transport::TokenStore for OwnerToken {
+impl TokenStore for OwnerToken {
     fn load_token(&self) -> Option<String> {
         Some("o".repeat(64))
     }
@@ -135,117 +96,143 @@ impl intent_transport::TokenStore for OwnerToken {
     }
 }
 
-/// Hands every admitted connection to the test.
+/// The machine's executor service stand-in: reports a fixed welcome and
+/// hands every admitted connection to the test.
 struct Host {
-    welcome: WelcomeFn,
-    accepted: tokio::sync::mpsc::UnboundedSender<NodeConnection>,
-    /// Cleared when the fake is dropped, so the machine admits nothing
-    /// while its listener stops.
-    up: Arc<std::sync::atomic::AtomicBool>,
+    node_id: String,
+    running: Mutex<Vec<AgentId>>,
+    hosts: Mutex<Vec<String>>,
+    tc_address: Mutex<Option<String>>,
+    accepted: mpsc::UnboundedSender<NodeConnection>,
 }
 
 impl ExecutorHost for Host {
     fn enabled(&self) -> bool {
-        self.up.load(std::sync::atomic::Ordering::SeqCst)
+        true
     }
     fn node_id(&self) -> String {
-        NODE.into()
+        self.node_id.clone()
     }
-    fn welcome(&self, _credential: &ExecutorCredential, hello: &LinkHello) -> LinkWelcome {
-        (self.welcome)(hello)
+    fn welcome(&self, _credential: &ExecutorCredential, _hello: &LinkHello) -> LinkWelcome {
+        LinkWelcome {
+            protocol: 0,
+            node_id: String::new(),
+            running_agents: self.running.lock().unwrap().clone(),
+            capabilities: capabilities(0),
+            hosts: self.hosts.lock().unwrap().clone(),
+            tc_address: self.tc_address.lock().unwrap().clone(),
+        }
     }
     fn accept(&self, _credential: ExecutorCredential, connection: NodeConnection) {
         let _ = self.accepted.send(connection);
     }
 }
 
-/// A machine that hands every admitted link to the test.
-struct FakeNode {
-    server: intent_transport::WsApiServer,
-    up: Arc<std::sync::atomic::AtomicBool>,
+/// A machine serving the executor link in process.
+struct Machine {
+    server: WsApiServer,
     port: u16,
     certificate: TlsCertificate,
-    accepted: tokio::sync::mpsc::UnboundedReceiver<NodeConnection>,
-    git: Vec<intent_transport::node_link::GitConnection>,
-    _dir: tempfile::TempDir,
+    services: Arc<Services>,
+    host: Arc<Host>,
+    /// The credential minted for the backend, and its token.
+    credential: ExecutorCredential,
+    token: String,
+    accepted: mpsc::UnboundedReceiver<NodeConnection>,
+    git: Vec<GitConnection>,
+    _tmp: TempDb,
 }
 
-impl FakeNode {
-    async fn start() -> Self {
-        Self::start_at("127.0.0.1:0".parse().unwrap()).await
+impl Machine {
+    /// A machine that minted a credential for `backend_id`, listening on
+    /// `port` (`0` for any).
+    async fn start(backend_id: &str, port: u16) -> Self {
+        Self::start_on([127, 0, 0, 1], backend_id, port).await
     }
 
-    async fn start_at(address: SocketAddr) -> Self {
-        Self::start_with(address, welcome()).await
-    }
-
-    async fn start_with(address: SocketAddr, welcome: WelcomeFn) -> Self {
+    /// A machine listening only on loopback address `ip`.
+    async fn start_on(ip: [u8; 4], backend_id: &str, port: u16) -> Self {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let services = Arc::new(Services::new(store.clone()));
+        let token = "e".repeat(64);
+        let credential = Self::mint(&store, backend_id, &token).await;
         let certificate =
             generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        Self::serve(certificate, address, welcome).await
-    }
-
-    /// Serve on `address` with `certificate` (a node coming up where head
-    /// already dials).
-    async fn start_on(certificate: TlsCertificate, address: SocketAddr) -> Self {
-        Self::serve(certificate, address, welcome()).await
-    }
-
-    async fn serve(certificate: TlsCertificate, address: SocketAddr, welcome: WelcomeFn) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let bus =
-            intent_services::EventBus::new(Store::open(&dir.path().join("bus.db")).await.unwrap());
-        let api = Arc::new(MachineApi {
-            principal: PrincipalId::new(),
-            credential: ExecutorCredential {
-                id: ExecutorCredentialId::new(),
-                backend_id: "backend".into(),
-                backend_name: "Backend".into(),
-                backend_fingerprint: None,
-                created_at: "2026-10-30T00:00:00Z".into(),
-                last_used_at: None,
-                revoked_at: None,
-            },
-            binding: std::sync::Mutex::new(None),
-        });
-        let tokens = Arc::new(intent_transport::AsyncTokenStore::new(Arc::new(OwnerToken)));
-        let options = intent_transport::WsOptions {
-            base_port: address.port(),
-            ..intent_transport::WsOptions::default()
-        };
-        let mut server =
-            intent_transport::WsApiServer::new(api, bus, &certificate, &tokens, options, None)
-                .unwrap();
-        let (tx, accepted) = tokio::sync::mpsc::unbounded_channel();
-        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        server.install_executor_links(ExecutorLinks::new(Arc::new(Host {
-            welcome,
+        let (tx, accepted) = mpsc::unbounded_channel();
+        let host = Arc::new(Host {
+            node_id: store.daemon_id().await.unwrap(),
+            running: Mutex::new(Vec::new()),
+            hosts: Mutex::new(vec!["127.0.0.1".into()]),
+            tc_address: Mutex::new(None),
             accepted: tx,
-            up: up.clone(),
-        })));
+        });
+        let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
+        let mut server = WsApiServer::new(
+            services.clone(),
+            EventBus::new(store),
+            &certificate,
+            &tokens,
+            WsOptions {
+                bind_addresses: vec![std::net::IpAddr::from(ip)],
+                base_port: port,
+                ..WsOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        server.install_executor_links(ExecutorLinks::new(host.clone()));
         let port = server.start().await.unwrap();
-        assert!(address.port() == 0 || port == address.port());
         Self {
             server,
-            up,
             port,
             certificate,
+            services,
+            host,
+            credential,
+            token,
             accepted,
             git: Vec::new(),
-            _dir: dir,
+            _tmp: tmp,
         }
     }
 
-    fn local_addr(&self) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.port))
+    async fn mint(store: &Store, backend_id: &str, token: &str) -> ExecutorCredential {
+        let credential = ExecutorCredential {
+            id: ExecutorCredentialId::new(),
+            backend_id: backend_id.into(),
+            backend_name: "Backend".into(),
+            backend_fingerprint: None,
+            created_at: intent_core::now_iso(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        store
+            .insert_executor_credential(&credential, &hash_token(token))
+            .await
+            .unwrap();
+        credential
     }
 
-    fn config(&self) -> HeadNodeConfig {
-        config_for(self.local_addr(), &self.certificate)
+    fn id(&self) -> String {
+        self.host.node_id.clone()
+    }
+
+    /// The `remoteMachines.add` params the frontend would relay.
+    fn add_params(&self) -> Value {
+        json!({
+            "machineId": self.id(),
+            "name": "Test machine",
+            "hosts": ["127.0.0.1"],
+            "port": self.port,
+            "fingerprint": self.certificate.fingerprint256,
+            "credentialId": self.credential.id,
+            "token": self.token,
+        })
     }
 
     /// The next link. Head's git connections, dialed right after each
-    /// bind, are kept in `git` (the fake serves no git).
+    /// bind, are kept in `git` (the test serves no git).
     async fn accept(&mut self) -> NodeEnd {
         loop {
             match tokio::time::timeout(wait(), self.accepted.recv()).await {
@@ -265,34 +252,54 @@ impl FakeNode {
             }
         }
     }
-}
 
-fn config_for(address: SocketAddr, certificate: &TlsCertificate) -> HeadNodeConfig {
-    HeadNodeConfig::parse(
-        json!({
-            "nodeId": NODE,
-            "name": "Test node",
-            "endpoint": format!("wss://{address}"),
-            "certificateSha256": certificate.fingerprint256,
-            "token": token().expose(),
+    /// No new link is bound for `within`.
+    async fn no_link(&mut self, within: Duration) {
+        let found = tokio::time::timeout(intentd_test_support::test_timeout(within), async {
+            loop {
+                match self.accepted.recv().await {
+                    Some(NodeConnection::Link { hello, .. }) => return hello,
+                    Some(NodeConnection::Git(git)) => self.git.push(git),
+                    None => std::future::pending::<()>().await,
+                }
+            }
         })
-        .to_string()
-        .as_bytes(),
-    )
-    .unwrap()
-}
+        .await;
+        if let Ok(hello) = found {
+            panic!(
+                "no link expected, got one at generation {}",
+                hello.binding.generation.0
+            );
+        }
+    }
 
-impl Drop for FakeNode {
-    /// The machine goes away: refuse new links at once, then stop the
-    /// listener (which closes its executor links).
-    fn drop(&mut self) {
-        self.up.store(false, std::sync::atomic::Ordering::SeqCst);
-        let server = self.server.clone();
-        tokio::spawn(async move { server.stop().await });
+    async fn stop(&self) {
+        self.server.stop().await;
+    }
+
+    async fn restart(&mut self) {
+        let port = self.server.start().await.unwrap();
+        assert_eq!(port, self.port, "the machine comes back on its port");
+    }
+
+    async fn revoke(&self) {
+        with_caller(
+            Caller::Daemon,
+            self.services
+                .executor_revoke(self.credential.id.to_string()),
+        )
+        .await
+        .unwrap();
     }
 }
 
-/// The node's end of one bound link.
+/// A port nothing listens on.
+fn free_port() -> u16 {
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    reserved.local_addr().unwrap().port()
+}
+
+/// The machine's end of one bound link.
 struct NodeEnd {
     link: NodeLink,
     events: LinkEvents,
@@ -342,6 +349,38 @@ impl NodeEnd {
             _ => None,
         })
         .await;
+    }
+
+    /// The id of the next stop head sends for `agent`, skipping other
+    /// frames.
+    async fn stop_for(&mut self, agent: &AgentId) -> StopId {
+        self.expect(|frame| match frame {
+            LinkFrame::Stop { agent_id, stop_id } if agent_id == *agent => Some(stop_id),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Acknowledge stop `stop_id` for `agent`.
+    async fn ack_stop(&self, stop_id: StopId, agent: &AgentId, outcome: StopOutcome) {
+        self.link
+            .send(&LinkFrame::StopAck {
+                stop_id,
+                agent_id: agent.clone(),
+                outcome,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Answer head's next capabilities request with `capabilities`.
+    async fn answer_capabilities(&mut self, capabilities: MachineCapabilities) {
+        self.expect(|frame| matches!(frame, LinkFrame::Capabilities).then_some(()))
+            .await;
+        self.link
+            .send(&LinkFrame::CapabilitiesReply { capabilities })
+            .await
+            .unwrap();
     }
 
     /// Wait until head closes the link.
@@ -408,29 +447,114 @@ fn exited(seq: u64, agent: &AgentId) -> JournalRecord {
     }
 }
 
-struct Head {
+/// The backend: services with the remote feature registered,
+/// `experimental.remoteAgents` on, an in-memory secret store and an event
+/// bus.
+struct Backend {
+    services: Services,
+    bus: EventBus,
+    _config: tempfile::TempDir,
     _tmp: TempDb,
-    store: Store,
 }
 
-impl Head {
+impl Backend {
     async fn new() -> Self {
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.unwrap();
-        Self { _tmp: tmp, store }
+        Self::with_tuning(tuning()).await
     }
 
-    async fn start(&self, config: HeadNodeConfig) -> RemoteNode {
-        RemoteNode::start_with(self.store.clone(), config, tuning(), None)
+    async fn with_tuning(tuning: Tuning) -> Self {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let registry = Arc::new(SettingsRegistry::load(config.path().join("config.toml")).unwrap());
+        registry
+            .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
+            .unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = crate::register(
+            Services::new(store)
+                .with_settings_registry(registry)
+                .with_secret_store(Arc::new(InMemorySecretStore::default()))
+                .with_event_bus(bus.clone()),
+        );
+        *crate::lock(&services.remote_feature().unwrap().tuning) = Some(tuning);
+        Self {
+            services,
+            bus,
+            _config: config,
+            _tmp: tmp,
+        }
+    }
+
+    fn store(&self) -> &Store {
+        self.services.store()
+    }
+
+    async fn id(&self) -> String {
+        self.store().daemon_id().await.unwrap()
+    }
+
+    /// A machine that minted a credential for this backend.
+    async fn machine(&self) -> Machine {
+        Machine::start(&self.id().await, free_port()).await
+    }
+
+    async fn call(&self, method: &'static str, params: Value) -> intent_core::Result<Value> {
+        with_caller(
+            Caller::Daemon,
+            self.services.remote_machines(method, params),
+        )
+        .await
+    }
+
+    /// Expose `machine` (consuming the probe's link) and return its
+    /// connector.
+    async fn expose(&self, machine: &mut Machine) -> RemoteNode {
+        self.call("add", machine.add_params()).await.expect("add");
+        machine.accept().await.closed_by_head().await;
+        self.node(&machine.id()).await
+    }
+
+    async fn node(&self, id: &str) -> RemoteNode {
+        self.services
+            .remote_feature()
+            .unwrap()
+            .node(&self.services, id)
             .await
             .unwrap()
     }
 
+    async fn target(&self, machine: &Machine) -> MachineTarget {
+        let row = self
+            .store()
+            .get_exposed_machine(&machine.id())
+            .await
+            .unwrap()
+            .unwrap();
+        MachineTarget::new(&row, &machine.token, None).unwrap()
+    }
+
+    /// A connector to `machine` with `tuning` that answers no machine
+    /// request and announces nothing.
+    async fn bare_with(&self, machine: &Machine, tuning: Tuning) -> RemoteNode {
+        RemoteNode::start(
+            self.store().clone(),
+            self.target(machine).await,
+            tuning,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn bare(&self, machine: &Machine) -> RemoteNode {
+        self.bare_with(machine, tuning()).await
+    }
+
     async fn persisted_ack(&self, node: &RemoteNode) -> NodeCounter {
         let lease_id = node.status().lease_id;
-        let head_id = self.store.node_head_id().await.unwrap().unwrap();
-        self.store
-            .list_owned_node_leases(&head_id)
+        self.store()
+            .list_owned_node_leases(&self.id().await)
             .await
             .unwrap()
             .into_iter()
@@ -438,6 +562,16 @@ impl Head {
             .unwrap()
             .ack_seq
     }
+}
+
+/// An exposed machine and a bare connector to it (the feature's own
+/// connector is shut down).
+async fn exposed() -> (Machine, Backend, RemoteNode) {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await.shutdown();
+    let node = backend.bare(&machine).await;
+    (machine, backend, node)
 }
 
 /// The text of each notification the runtime has received so far.
@@ -468,15 +602,39 @@ fn text_prompt(text: &str) -> Vec<ContentBlock> {
     vec![serde_json::from_value(json!({"type": "text", "text": text})).unwrap()]
 }
 
+/// Wait until `node` has bound the link the machine accepted. A prompt
+/// waits only the (short, test) link-loss grace for a link, so a test that
+/// prompts right after the machine accepts must first let the bind land.
+async fn bound(node: &RemoteNode) {
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().current_link().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connector publishes the bound link");
+}
+
+/// Wait until `node` reports no link.
+async fn disconnected(node: &RemoteNode) {
+    tokio::time::timeout(wait(), async {
+        while node.status().connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connector reports the disconnect");
+}
+
 #[tokio::test]
 async fn ingests_in_order_and_acks_the_highest_contiguous_sequence() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
-    let mut link = fake.accept().await;
-    assert_eq!(link.hello.acked_seq, NodeCounter(0));
+    let (mut machine, backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
+    let mut link = machine.accept().await;
+    assert_eq!(link.hello.acked_seq, NodeCounter(0));
+    assert_eq!(link.hello.binding.head_id, backend.id().await);
+    assert_eq!(link.hello.binding.node_id, machine.id());
 
     link.replay_complete(0).await;
     for (seq, text) in [(1, "one"), (2, "two"), (3, "three")] {
@@ -485,7 +643,7 @@ async fn ingests_in_order_and_acks_the_highest_contiguous_sequence() {
     link.acked(3).await;
     assert_eq!(texts(&runtime, 3).await, ["one", "two", "three"]);
     assert_eq!(node.ingested(), NodeCounter(3));
-    assert_eq!(head.persisted_ack(&node).await, NodeCounter(3));
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(3));
 
     let status = node.status();
     assert!(status.connected);
@@ -502,20 +660,19 @@ async fn ingests_in_order_and_acks_the_highest_contiguous_sequence() {
 
 #[tokio::test]
 async fn a_reconnect_replays_from_the_last_ack_without_duplicates() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
 
-    let mut first = fake.accept().await;
+    let mut first = machine.accept().await;
     first.replay_complete(0).await;
     first.journal(note(1, &agent, "one")).await;
     first.journal(note(2, &agent, "two")).await;
     first.acked(2).await;
     first.link.close();
 
-    let mut second = fake.accept().await;
+    // A live agent: the lost link is redialed.
+    let mut second = machine.accept().await;
     assert_eq!(
         second.hello.acked_seq,
         NodeCounter(2),
@@ -536,13 +693,11 @@ async fn a_reconnect_replays_from_the_last_ack_without_duplicates() {
 }
 
 #[tokio::test]
-async fn a_restarted_head_resumes_from_the_persisted_ack() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+async fn a_restarted_backend_resumes_from_the_persisted_ack() {
+    let (mut machine, backend, node) = exposed().await;
     let agent = AgentId::new();
     let _runtime = node.attach(&agent, &workspace());
-    let mut first = fake.accept().await;
+    let mut first = machine.accept().await;
     first.replay_complete(0).await;
     first.journal(note(1, &agent, "one")).await;
     first.journal(note(2, &agent, "two")).await;
@@ -550,8 +705,9 @@ async fn a_restarted_head_resumes_from_the_persisted_ack() {
     node.shutdown();
     first.closed_by_head().await;
 
-    let restarted = head.start(fake.config()).await;
-    let second = fake.accept().await;
+    let restarted = backend.bare(&machine).await;
+    restarted.connect().await.unwrap();
+    let second = machine.accept().await;
     assert_eq!(second.hello.acked_seq, NodeCounter(2));
     assert_eq!(second.hello.binding.head_id, first.hello.binding.head_id);
     assert_eq!(second.hello.binding.lease_id, first.hello.binding.lease_id);
@@ -562,19 +718,17 @@ async fn a_restarted_head_resumes_from_the_persisted_ack() {
 
 #[tokio::test]
 async fn a_live_gap_rebinds_and_resumes_from_the_last_ack() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
 
-    let mut first = fake.accept().await;
+    let mut first = machine.accept().await;
     first.replay_complete(0).await;
     first.journal(note(1, &agent, "one")).await;
     first.journal(note(3, &agent, "three")).await;
     first.closed_by_head().await;
 
-    let mut second = fake.accept().await;
+    let mut second = machine.accept().await;
     assert_eq!(second.hello.acked_seq, NodeCounter(1));
     second.journal(note(2, &agent, "two")).await;
     second.journal(note(3, &agent, "three")).await;
@@ -586,12 +740,10 @@ async fn a_live_gap_rebinds_and_resumes_from_the_last_ack() {
 
 #[tokio::test]
 async fn a_gap_in_the_replay_is_taken_as_records_the_node_no_longer_has() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
     link.journal(note(4, &agent, "four")).await;
     link.replay_complete(4).await;
     link.acked(4).await;
@@ -603,12 +755,10 @@ async fn a_gap_in_the_replay_is_taken_as_records_the_node_no_longer_has() {
 
 #[tokio::test]
 async fn records_of_agents_not_attached_here_are_acked_and_dropped() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
     link.replay_complete(0).await;
     link.journal(note(1, &AgentId::new(), "stranger")).await;
     let mut other_workspace = note(2, &agent, "elsewhere");
@@ -622,13 +772,12 @@ async fn records_of_agents_not_attached_here_are_acked_and_dropped() {
 
 #[tokio::test]
 async fn a_prompt_completes_with_its_turn_end() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
     link.replay_complete(0).await;
+    bound(&node).await;
 
     assert!(runtime.is_alive());
     assert_eq!(runtime.spawned_pid(), None);
@@ -689,13 +838,12 @@ async fn a_prompt_completes_with_its_turn_end() {
 
 #[tokio::test]
 async fn a_failed_turn_and_an_exit_fail_the_prompt() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
     link.replay_complete(0).await;
+    bound(&node).await;
 
     let spawn_prompt = |runtime: Arc<crate::RemoteAgentRuntime>| {
         tokio::spawn(async move {
@@ -737,12 +885,11 @@ async fn a_failed_turn_and_an_exit_fail_the_prompt() {
 
 #[tokio::test]
 async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
+    bound(&node).await;
     let prompt = {
         let runtime = runtime.clone();
         tokio::spawn(async move {
@@ -752,8 +899,8 @@ async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
     };
     link.expect(|frame| matches!(frame, LinkFrame::Prompt { .. }).then_some(()))
         .await;
-    // The node goes away and does not come back.
-    drop(fake);
+    // The machine goes away and does not come back.
+    machine.stop().await;
     link.link.close();
     match tokio::time::timeout(wait(), prompt).await.unwrap().unwrap() {
         Err(AcpError::Transport(message)) => {
@@ -761,7 +908,7 @@ async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
         }
         other => panic!("expected a link-loss error, got {other:?}"),
     }
-    assert!(runtime.is_alive(), "the agent may still run on the node");
+    assert!(runtime.is_alive(), "the agent may still run on the machine");
     assert!(matches!(
         runtime.cancel("s").await,
         Err(AcpError::Transport(_))
@@ -771,13 +918,11 @@ async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
 
 #[tokio::test]
 async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
-    // Reserve a port with nothing listening yet.
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reserved.local_addr().unwrap();
-    drop(reserved);
-    let certificate = generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-    let head = Head::new().await;
-    let node = head.start(config_for(address, &certificate)).await;
+    let backend = Backend::new().await;
+    let mut machine = Machine::start(&backend.id().await, free_port()).await;
+    backend.expose(&mut machine).await.shutdown();
+    machine.stop().await;
+    let node = backend.bare(&machine).await;
 
     let early = AgentId::new();
     let runtime = node.attach(&early, &workspace());
@@ -785,13 +930,21 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     runtime.stop().await;
     assert!(!runtime.is_alive());
 
-    let mut fake = FakeNode::start_on(certificate, address).await;
-    let mut link = fake.accept().await;
-    link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id, .. } if agent_id == early => Some(()),
-        _ => None,
+    // The pending stop keeps the connector redialing until it is sent.
+    machine.restart().await;
+    let mut link = machine.accept().await;
+    let early_stop = link.stop_for(&early).await;
+    // The machine confirms it; until then the stop stays queued and would be
+    // sent again.
+    link.ack_stop(early_stop, &early, StopOutcome::Stopped)
+        .await;
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().has_pending_stops() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
-    .await;
+    .await
+    .expect("the machine's ack confirms the stop");
 
     // Stopped agents' records are no longer delivered.
     link.replay_complete(0).await;
@@ -813,11 +966,10 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
 }
 
 #[tokio::test]
-async fn node_requests_are_answered_as_unsupported() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
-    let link = fake.accept().await;
+async fn machine_requests_are_answered_as_unsupported_without_services() {
+    let (mut machine, _backend, node) = exposed().await;
+    node.connect().await.unwrap();
+    let link = machine.accept().await;
     let outcome = link
         .link
         .call(AgentId::new(), "note.list", json!({}), wait())
@@ -834,197 +986,26 @@ async fn node_requests_are_answered_as_unsupported() {
 }
 
 #[tokio::test]
-async fn a_node_whose_lease_ended_is_not_bound_again() {
-    let fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+async fn a_machine_whose_lease_ended_is_not_bound_again() {
+    let (machine, backend, node) = exposed().await;
     node.shutdown();
-    let head_id = head.store.node_head_id().await.unwrap().unwrap();
-    let lease = head.store.list_owned_node_leases(&head_id).await.unwrap()[0]
-        .owner
-        .clone();
-    head.store.request_node_lease_release(&lease).await.unwrap();
-    head.store
-        .finish_node_lease(
-            &lease,
-            LeaseState::Released,
-            LeaseFence {
-                kind: LeaseFenceKind::ProcessesStopped,
-                recorded_at: intent_core::now_iso(),
-            },
-        )
+    backend
+        .store()
+        .end_machine_leases(&machine.id(), &backend.id().await)
         .await
         .unwrap();
-    let error = RemoteNode::start_with(head.store.clone(), fake.config(), tuning(), None)
-        .await
-        .unwrap_err();
+    let error = RemoteNode::start(
+        backend.store().clone(),
+        backend.target(&machine).await,
+        tuning(),
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(
         error.to_string().contains("remote-node-lease-ended"),
         "{error}"
     );
-}
-
-mod config {
-    use super::*;
-
-    fn raw(token: &str) -> Value {
-        json!({
-            "nodeId": "build-box",
-            "endpoint": "wss://10.0.0.5:7443/",
-            "certificateSha256": "AB:".repeat(31) + "AB",
-            "token": token,
-        })
-    }
-
-    #[test]
-    fn a_valid_configuration_parses() {
-        let config = HeadNodeConfig::parse(raw(&"s".repeat(32)).to_string().as_bytes()).unwrap();
-        assert_eq!(config.node_id, "build-box");
-        assert_eq!(config.name, "build-box", "the name defaults to the node id");
-        assert_eq!(config.endpoint.url, "wss://10.0.0.5:7443");
-        assert_eq!(config.certificate_sha256, "ab".repeat(32));
-        assert!(!format!("{config:?}").contains(&"s".repeat(32)));
-    }
-
-    #[test]
-    fn errors_never_quote_the_token() {
-        let secret = "SECRET-".repeat(6);
-        let cases = [
-            json!({"nodeId": "n", "endpoint": "wss://h:1", "certificateSha256": "ab".repeat(32), "token": secret, "extra": secret}),
-            json!({"nodeId": "n", "endpoint": "https://h:1", "certificateSha256": "ab".repeat(32), "token": secret}),
-            json!({"nodeId": "n", "endpoint": "wss://h:1", "certificateSha256": "nope", "token": secret}),
-            json!({"nodeId": "bad id", "endpoint": "wss://h:1", "certificateSha256": "ab".repeat(32), "token": secret}),
-            json!({"nodeId": "n", "endpoint": "wss://user@h:1", "certificateSha256": "ab".repeat(32), "token": secret}),
-            json!({"nodeId": "n", "endpoint": "wss://h:1", "certificateSha256": "ab".repeat(32), "token": 42}),
-        ];
-        for case in cases {
-            let error = HeadNodeConfig::parse(case.to_string().as_bytes()).unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("remote-node-config"), "{message}");
-            assert!(!message.contains("SECRET"), "{message}");
-        }
-        let error = HeadNodeConfig::parse(raw("short").to_string().as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("32 printable"));
-    }
-
-    #[test]
-    fn a_missing_file_is_no_configuration() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            HeadNodeConfig::read_if_present(&dir.path().join(crate::CONFIG_FILE))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_file_must_be_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::CONFIG_FILE);
-        std::fs::write(&path, raw(&"s".repeat(32)).to_string()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let error = HeadNodeConfig::read_if_present(&path).unwrap_err();
-        assert!(error.to_string().contains("chmod 600"), "{error}");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(HeadNodeConfig::read_if_present(&path).unwrap().is_some());
-    }
-}
-
-#[cfg(unix)]
-mod services {
-    use super::*;
-    use crate::RemoteServicesExt as _;
-    use intent_services::feature_api::Services;
-
-    #[tokio::test]
-    async fn the_connector_starts_only_with_a_configuration() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.unwrap();
-        let services = crate::register(Services::new(store));
-        let data = tempfile::tempdir().unwrap();
-        assert!(!services.start_remote_node(data.path()).await.unwrap());
-        assert!(services.remote_node().is_none());
-
-        let mut fake = FakeNode::start().await;
-        let config = json!({
-            "nodeId": NODE,
-            "endpoint": format!("wss://{}", fake.local_addr()),
-            "certificateSha256": fake.certificate.fingerprint256,
-            "token": token().expose(),
-        });
-        let path = data.path().join(crate::CONFIG_FILE);
-        std::fs::write(&path, config.to_string()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(
-            !crate::experimental_enabled(),
-            "tests run without {}",
-            crate::EXPERIMENTAL_ENV
-        );
-        assert!(
-            !services.start_remote_node(data.path()).await.unwrap(),
-            "remote agents stay off without the experimental switch"
-        );
-        assert!(services.remote_node().is_none());
-        assert!(crate::start_configured(&services, data.path())
-            .await
-            .unwrap());
-        assert!(
-            !crate::start_configured(&services, data.path())
-                .await
-                .unwrap(),
-            "one connector at a time"
-        );
-        let link = fake.accept().await;
-        assert_eq!(link.hello.binding.node_id, NODE);
-        let node = services.remote_node().expect("connector registered");
-        assert_eq!(node.status().node_name, NODE);
-        node.shutdown();
-    }
-}
-
-#[cfg(unix)]
-mod node_mode {
-    use super::*;
-    use crate::RemoteServicesExt as _;
-    use intent_services::feature_api::Services;
-
-    /// A configured head restarted in node mode never starts the outbound
-    /// connector, so no remote agent can dispatch forwarded calls into it.
-    #[tokio::test]
-    async fn node_mode_never_starts_the_head_connector() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.unwrap();
-        let services = crate::register(Services::new(store).with_node_mode(true));
-        let data = tempfile::tempdir().unwrap();
-        let mut fake = FakeNode::start().await;
-        let config = json!({
-            "nodeId": NODE,
-            "endpoint": format!("wss://{}", fake.local_addr()),
-            "certificateSha256": fake.certificate.fingerprint256,
-            "token": token().expose(),
-        });
-        let path = data.path().join(crate::CONFIG_FILE);
-        std::fs::write(&path, config.to_string()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(!crate::start_configured(&services, data.path())
-            .await
-            .unwrap());
-        assert!(!services.start_remote_node(data.path()).await.unwrap());
-        assert!(
-            services.remote_node().is_none(),
-            "no connector in node mode"
-        );
-        let accepted = tokio::time::timeout(
-            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
-            fake.accepted.recv(),
-        )
-        .await;
-        assert!(accepted.is_err(), "the node is never dialed");
-    }
 }
 
 /// The runtime fits the agent manager's runtime slot: the same associated
@@ -1048,12 +1029,11 @@ fn the_remote_runtime_is_an_agent_manager_runtime() {
 
 #[tokio::test]
 async fn stopping_the_agent_fails_a_waiting_prompt() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
-    let node = head.start(fake.config()).await;
+    let (mut machine, _backend, node) = exposed().await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
-    let mut link = fake.accept().await;
+    let mut link = machine.accept().await;
+    bound(&node).await;
     let prompt = {
         let runtime = runtime.clone();
         tokio::spawn(async move {
@@ -1080,21 +1060,13 @@ async fn stopping_the_agent_fails_a_waiting_prompt() {
 
 #[tokio::test]
 async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reserved.local_addr().unwrap();
-    drop(reserved);
-    let certificate = generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-    let head = Head::new().await;
+    let backend = Backend::new().await;
+    let mut machine = Machine::start(&backend.id().await, free_port()).await;
+    backend.expose(&mut machine).await.shutdown();
+    machine.stop().await;
     let mut slow = tuning();
     slow.link_loss_grace = wait();
-    let node = RemoteNode::start_with(
-        head.store.clone(),
-        config_for(address, &certificate),
-        slow,
-        None,
-    )
-    .await
-    .unwrap();
+    let node = backend.bare_with(&machine, slow).await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
     let prompt = {
@@ -1120,8 +1092,8 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
         other => panic!("expected a stopped error, got {other:?}"),
     }
 
-    let mut fake = FakeNode::start_on(certificate, address).await;
-    let mut link = fake.accept().await;
+    machine.restart().await;
+    let mut link = machine.accept().await;
     link.expect(|frame| match frame {
         LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
         LinkFrame::Prompt { .. } => panic!("a stopped agent's prompt is never sent"),
@@ -1133,17 +1105,15 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
 
 #[tokio::test]
 async fn a_rebind_never_acks_more_than_head_persisted() {
-    let mut fake = FakeNode::start().await;
-    let head = Head::new().await;
+    let (mut machine, backend, bare) = exposed().await;
+    bare.shutdown();
     let flaky = tuning();
     let fail = flaky.fail_ack_writes.clone();
-    let node = RemoteNode::start_with(head.store.clone(), fake.config(), flaky, None)
-        .await
-        .unwrap();
+    let node = backend.bare_with(&machine, flaky).await;
     let agent = AgentId::new();
     let runtime = node.attach(&agent, &workspace());
 
-    let first = fake.accept().await;
+    let first = machine.accept().await;
     fail.store(true, std::sync::atomic::Ordering::SeqCst);
     first.replay_complete(0).await;
     first.journal(note(1, &agent, "one")).await;
@@ -1159,11 +1129,11 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
     first.link.close();
 
     // The writes still fail: the rebind offers only the saved ack, so the
-    // node keeps records 1 and 2.
-    let mut second = fake.accept().await;
+    // machine keeps records 1 and 2.
+    let mut second = machine.accept().await;
     assert_eq!(second.hello.acked_seq, NodeCounter(0));
     assert!(second.hello.binding.generation > first.hello.binding.generation);
-    assert_eq!(head.persisted_ack(&node).await, NodeCounter(0));
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(0));
 
     // Persistence recovers: the replay is deduplicated and the ack advances.
     fail.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1173,713 +1143,363 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
     second.replay_complete(3).await;
     second.acked(3).await;
     assert_eq!(texts(&runtime, 1).await, ["three"]);
-    assert_eq!(head.persisted_ack(&node).await, NodeCounter(3));
+    assert_eq!(backend.persisted_ack(&node).await, NodeCounter(3));
     second.link.close();
-    let third = fake.accept().await;
+    let third = machine.accept().await;
     assert_eq!(third.hello.acked_seq, NodeCounter(3));
     node.shutdown();
 }
 
-/// The remote-launch port against a fake node: admission, placing an agent,
-/// its first-turn launch, the projected placement, and bind-time claims.
-mod launch {
-    use std::path::Path;
-    use std::process::Command;
-
-    use intent_core::placement::{AgentPlacement, PlacementUnavailableReason};
-    use intent_core::remote_launch::{
-        EffectiveIsolation, RemoteLaunchRequest, RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY,
-    };
-    use intent_core::{Error, Workspace};
-    use intent_git::node_git::{self, AgentRemote, GitService};
-    use intent_services::feature_api::feature_ports::RemoteLaunchPort;
-    use intent_services::feature_api::Services;
-    use intent_transport::node_link::NodeGitAccess;
-
+/// On-demand connect, idle disconnect and reconnect while agents are live.
+mod on_demand {
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git {args:?}: {output:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    }
-
-    /// Head services with the remote feature, a workspace on a one-commit
-    /// repository, and the connector bound to `fake`.
-    struct Fixture {
-        services: Services,
-        node: RemoteNode,
-        repo: tempfile::TempDir,
-        base: String,
-        _tmp: TempDb,
-    }
-
-    impl Fixture {
-        async fn start(fake: &mut FakeNode) -> (Self, NodeEnd) {
-            let tmp = TempDb::new();
-            let store = Store::open(&tmp.path).await.unwrap();
-            let services = crate::register(Services::new(store.clone()));
-            let repo = tempfile::tempdir().unwrap();
-            git(repo.path(), &["init", "--quiet"]);
-            std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
-            git(repo.path(), &["add", "README.md"]);
-            git(repo.path(), &["commit", "--quiet", "-m", "base"]);
-            let base = git(repo.path(), &["rev-parse", "HEAD"]);
-            let now = intent_core::now_iso();
-            store
-                .insert_workspace(&Workspace {
-                    id: workspace(),
-                    title: "Remote".into(),
-                    branch: "main".into(),
-                    repository_path: Some(repo.path().to_string_lossy().into_owned()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            let calls = crate::rpc::HeadCalls::new(services.clone());
-            let node = RemoteNode::start_with(store, fake.config(), tuning(), Some(calls))
-                .await
-                .unwrap();
-            crate::install_node(&services, node.clone());
-            let link = fake.accept().await;
-            link.replay_complete(0).await;
-            let fixture = Self {
-                services,
-                node,
-                repo,
-                base,
-                _tmp: tmp,
-            };
-            fixture.connected().await;
-            (fixture, link)
-        }
-
-        async fn connected(&self) {
-            tokio::time::timeout(wait(), async {
-                while !self.node.status().connected {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("the link binds");
-        }
-
-        fn port(&self) -> &dyn RemoteLaunchPort {
-            self.services.feature_remote_launch_port()
-        }
-
-        /// A created agent, placed on the node with `view`.
-        async fn agent(&self, view: &RemotePlacementView) -> AgentId {
-            self.agent_with(view, "mock").await
-        }
-
-        /// A created agent of `provider`, placed on the node with `view`.
-        async fn agent_with(&self, view: &RemotePlacementView, provider: &str) -> AgentId {
-            let agent = AgentId::new();
-            let now = intent_core::now_iso();
-            sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', ?, ?, ?)")
-                .bind(agent.as_str())
-                .bind(workspace().as_str())
-                .bind(provider)
-                .bind(&now)
-                .bind(&now)
-                .execute(self.services.store().write_pool())
-                .await
-                .unwrap();
-            self.services
-                .store()
-                .set_agent_session_metadata_key_json(
-                    &workspace(),
-                    &agent,
-                    REMOTE_PLACEMENT_METADATA_KEY,
-                    &serde_json::to_string(view).unwrap(),
-                    &now,
-                )
-                .await
-                .unwrap();
-            agent
-        }
-
-        async fn view(&self, agent: &AgentId) -> RemotePlacementView {
-            let session = self
-                .services
-                .store()
-                .get_agent_session(agent)
-                .await
-                .unwrap();
-            RemotePlacementView::from_metadata(session.metadata.as_ref()).unwrap()
-        }
-
-        async fn admit(&self, placement: &str) -> intent_core::Result<RemotePlacementView> {
-            let placement: AgentPlacement = serde_json::from_str(placement).unwrap();
-            self.port()
-                .admit(&self.services, &workspace(), &placement)
-                .await
-        }
-
-        async fn placed(&self) -> (AgentId, RemotePlacementView) {
-            let view = self.admit(r#"{"target":"remote"}"#).await.unwrap();
-            let agent = self.agent(&view).await;
-            self.port()
-                .launch(
-                    &self.services,
-                    RemoteLaunchRequest {
-                        workspace_id: workspace(),
-                        agent_id: agent.clone(),
-                        view: view.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-            (agent, view)
-        }
-    }
-
-    fn unavailable(
-        result: intent_core::Result<RemotePlacementView>,
-    ) -> intent_core::placement::PlacementUnavailable {
-        match result {
-            Err(Error::PlacementUnavailable(failure)) => *failure,
-            other => panic!("expected placement-unavailable, got {other:?}"),
-        }
+    fn quick_idle() -> Tuning {
+        let mut tuning = tuning();
+        tuning.idle_timeout = Duration::from_millis(300);
+        tuning
     }
 
     #[tokio::test]
-    async fn admission_matches_the_nodes_platform_and_capacity() {
-        let mut fake = FakeNode::start().await;
-        let (f, _link) = Fixture::start(&mut fake).await;
-
-        let view = f
-            .admit(r#"{"target":"remote","os":"macos","arch":"aarch64"}"#)
-            .await
-            .unwrap();
-        assert_eq!(view.node_id, NODE);
-        assert_eq!(view.node_name, "Test node");
-        assert_eq!(view.lease_id, f.node.status().lease_id);
-        assert_eq!(view.base_commit, f.base);
-        assert_eq!(view.effective_isolation, EffectiveIsolation::Pending);
-        assert_eq!(
-            serde_json::to_value(&view.placement).unwrap(),
-            json!({"target":"remote","checkout":"isolated","os":"macos","arch":"aarch64","nodeId":NODE})
-        );
-
-        let linux = unavailable(f.admit(r#"{"os":"linux"}"#).await);
-        assert_eq!(
-            linux.reason,
-            PlacementUnavailableReason::UnsupportedPlatform
-        );
-        assert_eq!(
-            linux.message(),
-            "Unsupported linux; available: macos/aarch64; supported: macos/aarch64"
-        );
-        let elsewhere = unavailable(f.admit(r#"{"nodeId":"other-node"}"#).await);
-        assert_eq!(
-            elsewhere.reason,
-            PlacementUnavailableReason::UnsupportedPlatform
-        );
-
-        // Both of the node's slots taken: retryable no-capacity.
-        let _one = f.node.attach(&AgentId::new(), &workspace());
-        let _two = f.node.attach(&AgentId::new(), &workspace());
-        let full = unavailable(f.admit(r#"{"target":"remote"}"#).await);
-        assert_eq!(full.reason, PlacementUnavailableReason::NoCapacity);
-        assert_eq!(full.data()["retryable"], true);
-        assert_eq!(
-            full.data()["supportedPlatforms"],
-            json!([{"os":"macos","arch":"aarch64"}])
-        );
-
-        let help = f.port().placement_help(&f.services).await.unwrap();
-        assert!(help.contains("\"Test node\""), "{help}");
-        assert!(help.contains("platforms: macos/aarch64"), "{help}");
-        assert!(
-            help.contains("available now: none (2 of 2 agents running)"),
-            "{help}"
-        );
-        assert!(
-            help.contains("uncommitted changes are not carried"),
-            "{help}"
-        );
-        f.node.shutdown();
+    async fn nothing_is_dialed_until_the_machine_is_needed() {
+        let (mut machine, _backend, node) = exposed().await;
+        machine.no_link(Duration::from_millis(300)).await;
+        assert!(!node.status().connected);
+        node.connect().await.unwrap();
+        let link = machine.accept().await;
+        assert!(node.status().connected);
+        assert_eq!(link.hello.acked_seq, NodeCounter(0));
+        node.shutdown();
     }
 
     #[tokio::test]
-    async fn an_offline_node_admits_nothing() {
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        f.node.shutdown();
-        drop(link);
+    async fn an_idle_link_is_closed_and_not_redialed() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let node = backend.bare_with(&machine, quick_idle()).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        link.closed_by_head().await;
+        disconnected(&node).await;
+        machine.no_link(Duration::from_millis(500)).await;
+
+        // Needed again: it connects again.
+        node.connect().await.unwrap();
+        let again = machine.accept().await;
+        assert!(again.hello.binding.generation > link.hello.binding.generation);
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_live_agent_keeps_the_link_until_it_exits() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let node = backend.bare_with(&machine, quick_idle()).await;
+        let agent = AgentId::new();
+        let _runtime = node.attach(&agent, &workspace());
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        // timing-guard: three idle windows pass while the agent is live
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!link.link.is_closed(), "a live agent holds the link");
+        assert!(node.status().connected);
+
+        link.journal(exited(1, &agent)).await;
+        link.closed_by_head().await;
+        machine.no_link(Duration::from_millis(500)).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_lost_link_without_live_agents_is_not_redialed() {
+        let (mut machine, _backend, node) = exposed().await;
+        node.connect().await.unwrap();
+        let link = machine.accept().await;
+        link.link.close();
+        disconnected(&node).await;
+        machine.no_link(Duration::from_millis(500)).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_lost_link_with_a_live_agent_is_redialed_and_replayed() {
+        let (mut machine, _backend, node) = exposed().await;
+        let agent = AgentId::new();
+        let runtime = node.attach(&agent, &workspace());
+        let mut first = machine.accept().await;
+        first.replay_complete(0).await;
+        first.journal(note(1, &agent, "before")).await;
+        first.acked(1).await;
+        // The machine drops off and comes back.
+        machine.stop().await;
+        machine.restart().await;
+        let mut second = machine.accept().await;
+        assert_eq!(second.hello.acked_seq, NodeCounter(1));
+        second.journal(note(2, &agent, "after")).await;
+        second.replay_complete(2).await;
+        second.acked(2).await;
+        assert_eq!(texts(&runtime, 2).await, ["before", "after"]);
+        node.shutdown();
+    }
+}
+
+/// Stop acknowledgement (nodeProtocol 7): a stop stays queued, and is
+/// resent with its id, until the machine acks that id.
+mod stop_acks {
+    use super::*;
+    use intentd_test_support::test_timeout;
+
+    fn launch_of(agent: &AgentId) -> LaunchCommand {
+        LaunchCommand {
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            provider: "codex".into(),
+            model: None,
+            base_commit: "0".repeat(40),
+            repo_key: "repo".into(),
+            agent_features: serde_json::json!({}),
+            is_sub_agent: false,
+            profile_env: None,
+        }
+    }
+
+    async fn confirmed(node: &RemoteNode) {
         tokio::time::timeout(wait(), async {
-            while f.node.status().connected {
+            while node.shared_ref().has_pending_stops() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
-        let offline = unavailable(f.admit(r#"{"target":"remote"}"#).await);
-        assert_eq!(offline.reason, PlacementUnavailableReason::NoCapacity);
-        assert!(offline.availability.available_platforms.is_empty());
+        .expect("the stop is confirmed");
     }
 
-    /// Placing an agent records it on the lease and writes its base ref; its
-    /// first runtime sends the launch with that commit and the repository's
-    /// cache key; `Started` then marks its checkout isolated.
-    #[tokio::test]
-    async fn a_placed_agent_launches_on_its_first_runtime() {
-        let mut fake = FakeNode::start().await;
-        let (f, mut link) = Fixture::start(&mut fake).await;
-        let (agent, view) = f.placed().await;
-        let record = f
-            .services
-            .store()
-            .get_remote_agent(&agent)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.lease_id, view.lease_id);
-        let base_ref = AgentRemote::new(workspace().as_str(), agent.as_str())
-            .unwrap()
-            .ref_name(intent_git::hub::AgentRef::Base);
-        assert_eq!(git(f.repo.path(), &["rev-parse", &base_ref]), f.base);
-
-        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
-        let launch = link
-            .expect(|frame| match frame {
-                LinkFrame::Launch(command) => Some(command),
-                _ => None,
-            })
-            .await;
-        assert_eq!(launch.agent_id, agent);
-        assert_eq!(launch.provider, "mock");
-        // No profile selected: nothing is sent and the node uses its own
-        // provider login.
-        assert_eq!(launch.profile_env, None);
-        assert_eq!(launch.base_commit, f.base);
-        assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
-        // The node gates the agent's workspace API with its session's
-        // captured features (review of intentd#2786).
-        let session = f.services.store().get_agent_session(&agent).await.unwrap();
-        assert_eq!(
-            launch.agent_features,
-            serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
-        );
-        assert!(!launch.is_sub_agent);
-        assert!(runtime.is_alive());
-
-        link.journal(JournalRecord {
-            seq: NodeCounter(1),
-            agent_id: agent.clone(),
-            workspace_id: workspace(),
-            turn_id: None,
-            recorded_at: intent_core::now_iso(),
-            body: JournalBody::Started {
-                base_commit: f.base.clone(),
-            },
-        })
-        .await;
-        link.acked(1).await;
-        let placed = f.view(&agent).await;
-        assert_eq!(placed.effective_isolation, EffectiveIsolation::Isolated);
-        assert_eq!(placed.placement_error, None);
-        f.node.shutdown();
-    }
-
-    /// An agent of a saved provider profile starts on the node with the
-    /// profile's environment: the base provider id, and the overlay with
-    /// account directories as typed (the node expands `~`).
-    #[tokio::test]
-    async fn a_profile_agent_launches_with_the_profiles_environment() {
-        use intent_core::WorkspaceApi as _;
-        let mut fake = FakeNode::start().await;
-        let (f, mut link) = Fixture::start(&mut fake).await;
-        let created = intent_core::caller::with_caller(
-            intent_core::caller::Caller::Daemon,
-            f.services.provider_profiles_create(json!({
-                "baseProviderId": "codex",
-                "name": "Work",
-                "env": [
-                    { "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" },
-                    { "key": "CODEX_ACCESS_TOKEN", "kind": "set", "value": "canary-head-secret" },
-                    { "key": "OPENAI_BASE_URL", "kind": "unset" },
-                ],
-            })),
-        )
-        .await
-        .expect("create profile");
-        let reference = created["profile"]["providerRef"].as_str().unwrap();
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let agent = f.agent_with(&view, reference).await;
-        f.port()
-            .launch(
-                &f.services,
-                RemoteLaunchRequest {
-                    workspace_id: workspace(),
-                    agent_id: agent.clone(),
-                    view,
-                },
-            )
-            .await
-            .unwrap();
-        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
-        let launch = link
-            .expect(|frame| match frame {
-                LinkFrame::Launch(command) => Some(command),
-                _ => None,
-            })
-            .await;
-        assert_eq!(launch.provider, "codex");
-        let wire = launch.profile_env.expect("the profile's overlay").0;
-        assert_eq!(wire["providerRef"], reference);
-        assert_eq!(
-            wire["env"],
-            json!([
-                { "key": "CODEX_HOME", "value": "~/.codex-work" },
-                { "key": "CODEX_ACCESS_TOKEN", "value": "canary-head-secret" },
-                { "key": "OPENAI_BASE_URL", "value": null },
-            ])
-        );
-        assert!(runtime.is_alive());
-        f.node.shutdown();
-    }
-
-    /// A selected profile that no longer resolves fails the start: nothing
-    /// is sent, so the node never runs it on its own login.
-    #[tokio::test]
-    async fn an_unresolved_profile_fails_the_start_without_launching() {
-        let mut fake = FakeNode::start().await;
-        let (f, mut link) = Fixture::start(&mut fake).await;
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let agent = f.agent_with(&view, "codex@gone").await;
-        f.port()
-            .launch(
-                &f.services,
-                RemoteLaunchRequest {
-                    workspace_id: workspace(),
-                    agent_id: agent.clone(),
-                    view,
-                },
-            )
-            .await
-            .unwrap();
-        let Err(error) = f.port().runtime(&f.services, &agent).await else {
-            panic!("an unresolved profile must fail the start");
-        };
-        assert!(
-            matches!(&error, Error::ProviderProfile(failure)
-                if failure.data["code"] == "provider-profile-replacement-required"),
-            "{error:?}"
-        );
-        assert!(
-            tokio::time::timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(200)),
-                link.expect(|frame| match frame {
-                    LinkFrame::Launch(command) => Some(command),
-                    _ => None,
-                })
-            )
-            .await
-            .is_err(),
-            "no launch is sent for an unresolved profile"
-        );
-        f.node.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_start_failure_is_the_agents_placement_error() {
-        let mut fake = FakeNode::start().await;
-        let (f, mut link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
-        link.journal(JournalRecord {
-            seq: NodeCounter(1),
-            agent_id: agent.clone(),
-            workspace_id: workspace(),
-            turn_id: None,
-            recorded_at: intent_core::now_iso(),
-            body: JournalBody::Exited {
-                exit_code: None,
-                error: Some("node-provider-unavailable: provider \"mock\" is not configured on this node (configured: codex)".into()),
-                failure: None,
-            },
-        })
-        .await;
-        link.acked(1).await;
-        let view = f.view(&agent).await;
-        assert_eq!(view.effective_isolation, EffectiveIsolation::Pending);
-        let error = view.placement_error.unwrap();
-        assert_eq!(error.code, "node-provider-unavailable");
-        assert!(
-            error.detail.contains("not configured on this node"),
-            "{}",
-            error.detail
-        );
-        assert!(!runtime.is_alive());
-        f.node.shutdown();
-    }
-
-    #[tokio::test]
-    async fn an_agent_never_placed_has_no_remote_runtime() {
-        let mut fake = FakeNode::start().await;
-        let (f, _link) = Fixture::start(&mut fake).await;
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let unplaced = f.agent(&view).await;
-        let result = f.port().runtime(&f.services, &unplaced).await;
-        assert!(
-            matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("node-agent-unplaced")),
-            "{:?}",
-            result.err()
-        );
-        f.node.shutdown();
-    }
-
-    /// At bind, an agent the node runs that head has no record of is
-    /// stopped; one head placed keeps running, and its output reaches the
-    /// runtime head later takes for it, with no second launch.
-    #[tokio::test]
-    async fn binding_stops_unclaimed_agents_and_keeps_claimed_ones() {
-        let mut first = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut first).await;
-        let (claimed, _) = f.placed().await;
-        let config = f.node.status();
-        f.node.shutdown();
-        drop(link);
-        drop(first);
-
-        // A head restart: a new connector on the same store.
-        let stray = AgentId::new();
-        let mut fake = FakeNode::start_with(
-            "127.0.0.1:0".parse().unwrap(),
-            welcome_running(vec![claimed.clone(), stray.clone()]),
-        )
-        .await;
-        let node =
-            RemoteNode::start_with(f.services.store().clone(), fake.config(), tuning(), None)
-                .await
-                .unwrap();
-        assert_eq!(node.status().lease_id, config.lease_id);
-        crate::install_node(&f.services, node.clone());
-        let mut link = fake.accept().await;
-        let stopped = link
-            .expect(|frame| match frame {
-                LinkFrame::Stop { agent_id, .. } => Some(agent_id),
-                _ => None,
-            })
-            .await;
-        assert_eq!(stopped, stray);
+    /// A live agent's link, bound and replayed.
+    async fn live(
+        machine: &mut Machine,
+        node: &RemoteNode,
+    ) -> (AgentId, Arc<crate::RemoteAgentRuntime>, NodeEnd) {
+        let agent = AgentId::new();
+        let runtime = node.attach(&agent, &workspace());
+        let link = machine.accept().await;
         link.replay_complete(0).await;
-        link.journal(note(1, &claimed, "still working")).await;
-        link.acked(1).await;
-        let runtime = f.port().runtime(&f.services, &claimed).await.unwrap();
-        let notes = runtime.notifications();
-        let received = tokio::time::timeout(wait(), async { notes.lock().await.recv().await })
+        bound(node).await;
+        (agent, runtime, link)
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_confirmed_only_by_its_own_ack() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+
+        // Neither a capabilities reply, an exit record, another stop's ack
+        // nor this stop's id for another agent confirms it.
+        link.link
+            .send(&LinkFrame::CapabilitiesReply {
+                capabilities: capabilities(0),
+            })
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(
-            received.params["update"]["content"]["text"],
-            "still working"
-        );
+        link.journal(exited(1, &agent)).await;
+        link.ack_stop(StopId::new_v4(), &agent, StopOutcome::Stopped)
+            .await;
+        link.ack_stop(stop_id, &AgentId::new(), StopOutcome::Stopped)
+            .await;
+        // timing-guard: the wrong acks have been read by head
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.shared_ref().has_pending_stops());
+
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
         node.shutdown();
     }
 
-    /// Head serves an agent's refs only on the current binding and only for
-    /// an agent recorded on that binding's lease.
     #[tokio::test]
-    async fn git_sessions_are_confined_to_the_leases_agents() {
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let unplaced = f.agent(&view).await;
-        let access = crate::git::HeadGitAccess::new(f.node.shared());
-        let binding = link.hello.binding.clone();
-        let remote =
-            |agent: &AgentId| AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
-
-        let path = access.repository(&binding, &remote(&agent)).await.unwrap();
-        assert_eq!(path, f.repo.path());
-        assert!(matches!(
-            access.repository(&binding, &remote(&unplaced)).await,
-            Err(Error::Forbidden(_))
-        ));
-        let other_workspace = AgentRemote::new("ws-other", agent.as_str()).unwrap();
-        assert!(matches!(
-            access.repository(&binding, &other_workspace).await,
-            Err(Error::Forbidden(_))
-        ));
-        let mut stale = binding.clone();
-        stale.generation = NodeCounter(binding.generation.0 - 1);
-        assert!(access.repository(&stale, &remote(&agent)).await.is_err());
-        let _ = GitService::UploadPack;
-        f.node.shutdown();
+    async fn an_unacked_stop_is_resent_with_the_same_id() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let first = link.stop_for(&agent).await;
+        let again = link.stop_for(&agent).await;
+        assert_eq!(again, first, "a resend keeps the stop id");
+        link.ack_stop(first, &agent, StopOutcome::NotRunning).await;
+        confirmed(&node).await;
+        node.shutdown();
     }
 
-    /// Forward one `workspace_api` frame for `agent` over the node's link.
-    async fn forward(link: &NodeEnd, agent: &AgentId, method: &str, args: Value) -> LinkOutcome {
-        link.link
-            .call(
-                agent.clone(),
-                intent_core::remote_launch::workspace_api::CALL_METHOD,
-                json!({ "method": method, "args": args }),
-                wait(),
-            )
-            .await
-            .unwrap()
-    }
-
-    fn refused(outcome: LinkOutcome) -> intent_core::node_link::LinkRpcError {
-        match outcome {
-            LinkOutcome::Err(error) => error,
-            LinkOutcome::Ok(value) => panic!("expected a refusal, got {value}"),
-        }
-    }
-
-    /// A placed agent's forwarded frame runs on head as that agent, in its
-    /// workspace.
     #[tokio::test]
-    async fn a_lease_agents_forwarded_call_runs_on_head_as_the_agent() {
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        let created = match forward(
-            &link,
-            &agent,
-            "note.create",
-            json!({ "title": "From the node", "content": "remote body" }),
-        )
-        .await
-        {
-            LinkOutcome::Ok(value) => value,
-            LinkOutcome::Err(error) => panic!("forwarded call failed: {error:?}"),
+    async fn an_older_ack_never_confirms_a_newer_stop() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let older = link.stop_for(&agent).await;
+        link.ack_stop(older, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
+
+        // The agent runs again and is stopped again: a new stop id.
+        let again = node.attach(&agent, &workspace());
+        again.stop().await;
+        let newer = link.stop_for(&agent).await;
+        assert_ne!(newer, older);
+        // A late duplicate ack of the older stop confirms nothing.
+        link.ack_stop(older, &agent, StopOutcome::NotRunning).await;
+        // timing-guard: the late ack has been read by head
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.shared_ref().has_pending_stops());
+        link.ack_stop(newer, &agent, StopOutcome::Stopped).await;
+        confirmed(&node).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queued_stops_go_out_first_after_a_reconnect_with_their_ids() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        // The launch below waits for the machine to come back.
+        let mut slow = tuning();
+        slow.link_loss_grace = wait();
+        let node = backend.bare_with(&machine, slow).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // The machine drops off before acking; the agent never shows in a
+        // welcome, which is no confirmation either.
+        machine.stop().await;
+        disconnected(&node).await;
+        assert!(node.shared_ref().has_pending_stops());
+
+        let other = AgentId::new();
+        let launching = {
+            let node = node.clone();
+            let command = launch_of(&other);
+            // The launched runtime is kept: dropping it would stop the agent.
+            tokio::spawn(async move { node.launch(command).await })
         };
-        let notes = f.services.store().list_notes(&workspace()).await.unwrap();
-        let note = notes
-            .iter()
-            .find(|note| note.title == "From the node")
-            .unwrap_or_else(|| panic!("note created on head: {created}"));
-        assert_eq!(created["id"], json!(note.id.as_str()), "{created}");
-        f.node.shutdown();
-    }
-
-    /// Head refuses what the node must not get: an agent not on the lease,
-    /// a frame head does not forward (even if the node sends it), a
-    /// malformed call and an unknown link method.
-    #[tokio::test]
-    async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let unplaced = f.agent(&view).await;
-
-        let other = refused(forward(&link, &unplaced, "note.list", json!({})).await);
-        assert!(other.message.starts_with("node-agent-denied"), "{other:?}");
-        let unknown = refused(forward(&link, &AgentId::new(), "note.list", json!({})).await);
-        assert!(
-            unknown.message.starts_with("node-agent-denied"),
-            "{unknown:?}"
-        );
-
-        for method in ["script.list", "file.read", "hook.list", "workspace.info"] {
-            let error = refused(forward(&link, &agent, method, json!({})).await);
-            assert!(
-                error.message.starts_with("remote-agent-unsupported"),
-                "{method}: {error:?}"
-            );
-        }
-        let malformed = refused(
-            link.link
-                .call(
-                    agent.clone(),
-                    intent_core::remote_launch::workspace_api::CALL_METHOD,
-                    json!({ "args": {} }),
-                    wait(),
-                )
-                .await
-                .unwrap(),
-        );
-        assert_eq!(malformed.code, -32602, "{malformed:?}");
-        let method = refused(
-            link.link
-                .call(agent.clone(), "note.list", json!({}), wait())
-                .await
-                .unwrap(),
-        );
-        assert_eq!(method.code, -32601, "{method:?}");
-        assert!(f
-            .services
-            .store()
-            .list_notes(&workspace())
-            .await
-            .unwrap()
-            .is_empty());
-        f.node.shutdown();
-    }
-
-    /// A request that arrived on a replaced binding is refused.
-    #[tokio::test]
-    async fn a_forwarded_call_on_a_replaced_binding_is_refused() {
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        let calls = crate::rpc::HeadCalls::new(f.services.clone());
-        let shared = f.node.shared();
-        let current = link.hello.binding.clone();
-        let mut stale = current.clone();
-        stale.generation = NodeCounter(current.generation.0 - 1);
-        let request = intent_core::node_link::LinkRequest {
-            request_id: uuid::Uuid::new_v4(),
-            agent_id: agent.clone(),
-            method: intent_core::remote_launch::workspace_api::CALL_METHOD.into(),
-            params: json!({ "method": "note.list", "args": {} }),
-            timeout_ms: 5_000,
-        };
-        for current in [Some(&current), None] {
-            let error = refused(calls.outcome(&shared, current, &stale, &request).await);
-            assert!(error.message.starts_with("node-link-stale"), "{error:?}");
-        }
-        let fresh = calls
-            .outcome(&shared, Some(&current), &current, &request)
+        machine.restart().await;
+        let mut link = machine.accept().await;
+        let first = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop { agent_id, stop_id } => Some((agent_id, stop_id)),
+                LinkFrame::Launch(_) | LinkFrame::Prompt { .. } => {
+                    panic!("a launch went out before the queued stop")
+                }
+                _ => None,
+            })
             .await;
-        assert!(matches!(fresh, LinkOutcome::Ok(_)), "{fresh:?}");
-        f.node.shutdown();
+        assert_eq!(first, (agent.clone(), stop_id), "resent with its id");
+        link.ack_stop(stop_id, &agent, StopOutcome::NotRunning)
+            .await;
+        confirmed(&node).await;
+        link.expect(|frame| matches!(frame, LinkFrame::Launch(_)).then_some(()))
+            .await;
+        let _launched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        node.shutdown();
     }
 
-    /// Review of intentd#2786: the node reads the workspace's auto-commit
-    /// policy before an agent-initiated commit; head answers it only for a
-    /// lease agent, from the workspace's own setting.
+    /// A lost ack and its resend must never stop a newer process: the agent
+    /// is not launched again until its stop is acknowledged.
     #[tokio::test]
-    async fn the_commit_policy_is_the_workspaces_and_only_for_lease_agents() {
-        use intent_core::remote_launch::workspace_api::COMMIT_POLICY_METHOD;
-        let mut fake = FakeNode::start().await;
-        let (f, link) = Fixture::start(&mut fake).await;
-        let (agent, _) = f.placed().await;
-        for enabled in [false, true] {
-            f.services
-                .store()
-                .set_workspace_auto_commit(&workspace(), enabled)
-                .await
-                .unwrap();
-            match forward(&link, &agent, COMMIT_POLICY_METHOD, Value::Null).await {
-                LinkOutcome::Ok(value) => assert_eq!(value, json!({ "autoCommit": enabled })),
-                LinkOutcome::Err(error) => panic!("policy read failed: {error:?}"),
-            }
-        }
-        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
-        let unplaced = f.agent(&view).await;
-        let denied = refused(forward(&link, &unplaced, COMMIT_POLICY_METHOD, Value::Null).await);
-        assert!(
-            denied.message.starts_with("node-agent-denied"),
-            "{denied:?}"
-        );
-        f.node.shutdown();
+    async fn a_launch_waits_for_its_agents_unconfirmed_stop() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // The ack is lost. The agent is launched again meanwhile.
+        let launching = {
+            let node = node.clone();
+            let command = launch_of(&agent);
+            // The launched runtime is kept: dropping it would stop the agent.
+            tokio::spawn(async move { node.launch(command).await })
+        };
+        let resent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop { agent_id, stop_id } if agent_id == agent => Some(stop_id),
+                LinkFrame::Launch(_) => panic!("launched behind an unconfirmed stop"),
+                _ => None,
+            })
+            .await;
+        assert_eq!(resent, stop_id);
+        assert!(!launching.is_finished(), "the launch waits for the ack");
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            LinkFrame::Stop { .. } => panic!("a resend raced the launch"),
+            _ => None,
+        })
+        .await;
+        let _launched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // No resend follows the ack: the new process is never stopped.
+        let late = tokio::time::timeout(test_timeout(Duration::from_millis(800)), async {
+            link.expect(|frame| matches!(frame, LinkFrame::Stop { .. }).then_some(()))
+                .await;
+        })
+        .await;
+        assert!(late.is_err(), "the confirmed stop is not sent again");
+        node.shutdown();
+    }
+
+    /// Review of intentd#2872: a stop queued while a bind is between
+    /// sending the queued stops and publishing the link must still go out
+    /// on that link, without a reconnect.
+    #[tokio::test]
+    async fn a_stop_queued_during_a_bind_goes_out_on_that_link() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let late = AgentId::new();
+        let mut hooked = tuning();
+        let queued = late.clone();
+        hooked.before_publish = crate::connector::BeforePublish(Some(Arc::new(
+            move |shared: &Arc<crate::connector::Shared>| shared.request_stop(&queued),
+        )));
+        let node = backend.bare_with(&machine, hooked).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        let stop_id = link.stop_for(&late).await;
+        link.ack_stop(stop_id, &late, StopOutcome::NotRunning).await;
+        confirmed(&node).await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_queued_stop_keeps_the_link_up() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let mut quick = tuning();
+        quick.idle_timeout = Duration::from_millis(300);
+        let node = backend.bare_with(&machine, quick).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        // timing-guard: three idle windows pass while the stop is unacked
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!link.link.is_closed(), "a queued stop holds the link");
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.closed_by_head().await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_credential_drops_the_queue() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (_agent, runtime, _link) = live(&mut machine, &node).await;
+        machine.stop().await;
+        disconnected(&node).await;
+        runtime.stop().await;
+        assert!(node.shared_ref().has_pending_stops());
+        // Revocation stops the binding's agents on the machine: the queued
+        // stop is moot and dropped once the machine refuses the credential.
+        machine.revoke().await;
+        machine.restart().await;
+        confirmed(&node).await;
+        node.shutdown();
     }
 }
