@@ -47,6 +47,8 @@ struct MachineApi {
     credentials: HashMap<String, ExecutorCredential>,
     binds: Mutex<HashMap<ExecutorCredentialId, LeaseBinding>>,
     revocations: broadcast::Sender<ExecutorCredentialId>,
+    /// Revoked in the store, whether or not the feed carried it.
+    revoked: Mutex<std::collections::HashSet<ExecutorCredentialId>>,
 }
 
 impl MachineApi {
@@ -74,7 +76,18 @@ impl MachineApi {
             ]),
             binds: Mutex::new(HashMap::new()),
             revocations: broadcast::channel(16).0,
+            revoked: Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// The credentials still active in the store.
+    fn active(&self) -> std::collections::HashSet<ExecutorCredentialId> {
+        let revoked = self.revoked.lock().unwrap();
+        self.credentials
+            .values()
+            .map(|c| c.id.clone())
+            .filter(|id| !revoked.contains(id))
+            .collect()
     }
 
     fn credential(&self, token: &str) -> ExecutorCredential {
@@ -289,6 +302,13 @@ impl Running {
                 launch: Arc::new(FixedLaunch(providers)),
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
+                active_credentials: {
+                    let api = api.clone();
+                    Arc::new(move || {
+                        let api = api.clone();
+                        Box::pin(async move { Ok(api.active()) })
+                    })
+                },
             },
             api.subscribe_executor_revocations(),
             |storage, _cache| checkout::PlainCheckouts::new(storage),
@@ -911,4 +931,85 @@ fn the_slot_is_disabled_until_the_service_is_installed() {
         slot.status(&ExecutorCredentialId::new()),
         ExecutorLiveStatus::default()
     );
+}
+
+/// Starts a backend with one running fixture agent; returns the service,
+/// its admission, the backend's credential and its dialed link.
+async fn running_agent(
+    dir: &std::path::Path,
+) -> Option<(
+    Running,
+    Arc<CountAdmission>,
+    ExecutorCredentialId,
+    DialedLink,
+)> {
+    let providers = fixture_providers()?;
+    let admission = CountAdmission::new(4);
+    let node = Running::start_with(dir, MachineApi::new(), admission.clone(), providers).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+    let id = node.api.credential(&token()).id;
+    Some((node, admission, id, dialed))
+}
+
+async fn wait_released(admission: &CountAdmission) {
+    let deadline = tokio::time::Instant::now() + wait();
+    while !admission.running.lock().unwrap().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "agents still run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A revocation the feed dropped (the receiver lagged) is not lost: the
+/// service re-reads the active credentials and stops the revoked backend.
+#[tokio::test]
+async fn a_lagged_revocation_feed_still_stops_revoked_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, _dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    node.api.revoked.lock().unwrap().insert(id.clone());
+    // Overflow the feed before the service reads it: the revocation itself
+    // is among the dropped messages.
+    let _ = node.api.revocations.send(id.clone());
+    for _ in 0..40 {
+        let _ = node.api.revocations.send(ExecutorCredentialId::new());
+    }
+    wait_released(&admission).await;
+    assert_eq!(node.service.status(&id), ExecutorLiveStatus::default());
+    node.stop().await;
+}
+
+/// A daemon shutdown racing a revocation still stops the revoked
+/// backend's agents.
+#[tokio::test]
+async fn shutdown_during_a_revocation_still_stops_its_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, _dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    node.api.revoked.lock().unwrap().insert(id.clone());
+    node.api.revocations.send(id.clone()).unwrap();
+    // Shut down as soon as the revocation has taken the backend out of the
+    // service, while its agents are still being stopped.
+    let deadline = tokio::time::Instant::now() + wait();
+    while node.service.status(&id) != ExecutorLiveStatus::default() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    node.service.shutdown().await;
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with the revoked backend's agents still running"
+    );
+    node.stop().await;
 }

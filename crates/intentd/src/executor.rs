@@ -70,7 +70,19 @@ pub(crate) struct ExecutorDeps {
     /// The intentd executable: the `git-remote-intent` helper and the
     /// agents' `mcp-bridge`.
     pub executable: PathBuf,
+    /// The credentials still active in the store, read when the
+    /// revocation feed lagged and may have dropped a revocation.
+    pub active_credentials: ActiveCredentials,
 }
+
+/// Reads the active executor credentials.
+pub(crate) type ActiveCredentials = Arc<
+    dyn Fn() -> intent_core::BoxFuture<
+            'static,
+            intent_core::Result<std::collections::HashSet<ExecutorCredentialId>>,
+        > + Send
+        + Sync,
+>;
 
 /// Builds a backend's checkouts from its storage and git cache.
 type MakeCheckouts = fn(Arc<Storage>, CheckoutCache) -> Arc<dyn checkout::Checkouts>;
@@ -94,6 +106,9 @@ pub(crate) struct ExecutorService {
     accepted: mpsc::UnboundedSender<(ExecutorCredential, NodeConnection)>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Revoked backends being stopped; shutdown waits for them, so a
+    /// backend taken out of `backends` is never abandoned half-stopped.
+    stopping: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -129,6 +144,7 @@ impl ExecutorService {
             accepted: tx,
             worker: Mutex::new(None),
             refresher: Mutex::new(None),
+            stopping: Mutex::new(Vec::new()),
         });
         // caller-binding: allow — the executor service's own connection worker
         let worker = tokio::spawn(serve_connections(Arc::downgrade(&service), rx, revocations));
@@ -147,6 +163,10 @@ impl ExecutorService {
         let backends: Vec<Backend> = lock(&self.backends).drain().map(|(_, b)| b).collect();
         for backend in backends {
             stop_backend(backend).await;
+        }
+        let stopping = std::mem::take(&mut *lock(&self.stopping));
+        for task in stopping {
+            let _ = task.await;
         }
     }
 
@@ -292,12 +312,33 @@ impl ExecutorService {
         }
     }
 
-    /// Stop a revoked backend's agents and close its links.
-    async fn revoked(&self, credential: &ExecutorCredentialId) {
+    /// Stop a revoked backend's agents and close its links. The stop runs
+    /// as a tracked task, so a shutdown racing it still waits for it.
+    fn revoked(&self, credential: &ExecutorCredentialId) {
         let backend = lock(&self.backends).remove(credential);
         if let Some(backend) = backend {
             tracing::info!("executor: credential revoked; stopping its agents");
-            stop_backend(backend).await;
+            let mut stopping = lock(&self.stopping);
+            stopping.retain(|task| !task.is_finished());
+            // caller-binding: allow — stops one revoked backend's agents; shutdown joins it
+            stopping.push(tokio::spawn(stop_backend(backend)));
+        }
+    }
+
+    /// The revocation feed lagged: stop every backend whose credential is
+    /// no longer active. If the store cannot say, stop them all (a
+    /// still-valid backend simply binds again).
+    async fn reconcile(&self) {
+        let active = (self.deps.active_credentials)().await;
+        let open: Vec<ExecutorCredentialId> = lock(&self.backends).keys().cloned().collect();
+        for id in open {
+            let keep = match &active {
+                Ok(active) => active.contains(&id),
+                Err(_) => false,
+            };
+            if !keep {
+                self.revoked(&id);
+            }
         }
     }
 }
@@ -343,9 +384,14 @@ async fn serve_connections(
             } => match revoked {
                 Ok(id) => {
                     let Some(service) = service.upgrade() else { return };
-                    service.revoked(&id).await;
+                    service.revoked(&id);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // Revocations were dropped; re-read which credentials are
+                // still active.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(service) = service.upgrade() else { return };
+                    service.reconcile().await;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => revocations = None,
             },
         }
@@ -642,6 +688,20 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             launch: Arc::new(SettingsLaunch(parts.settings.clone())),
             report: report.clone(),
             executable,
+            active_credentials: {
+                let store = parts.services.store().clone();
+                Arc::new(move || {
+                    let store = store.clone();
+                    Box::pin(async move {
+                        Ok(store
+                            .list_active_executor_credentials()
+                            .await?
+                            .into_iter()
+                            .map(|credential| credential.id)
+                            .collect())
+                    })
+                })
+            },
         },
         parts.services.subscribe_executor_revocations(),
     ) {
