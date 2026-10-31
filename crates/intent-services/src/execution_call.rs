@@ -30,7 +30,9 @@ impl Services {
         &'a self,
         future: impl Future<Output = Result<T>> + Send + 'a,
     ) -> BoxFuture<'a, Result<T>> {
-        #[cfg(test)]
+        // Test-only: lets `src/tests/workspace_create_future_size.rs` see the
+        // inner future, which the box below hides from `size_of_val`.
+        #[cfg(all(test, debug_assertions, target_os = "linux", target_arch = "x86_64"))]
         LAST_INNER_FUTURE_SIZE.set(std::mem::size_of_val(&future));
         // Box the caller's future once, up front. Moved into the `async move`
         // block as-is, it is held both as a captured upvar and inside the
@@ -63,17 +65,18 @@ impl Services {
     }
 }
 
-#[cfg(test)]
+// Gated like its only reader, `tests::workspace_create_future_size`.
+#[cfg(all(test, debug_assertions, target_os = "linux", target_arch = "x86_64"))]
 thread_local! {
     static LAST_INNER_FUTURE_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Size of the inner future handed to the most recent
-/// [`Services::execution_call`] on this thread. The wrapper boxes it, so
-/// `size_of_val` on the returned future no longer sees it.
-#[cfg(test)]
-pub(crate) fn last_inner_future_size() -> usize {
-    LAST_INNER_FUTURE_SIZE.get()
+/// Take (and reset to 0) the size of the inner future handed to the most
+/// recent [`Services::execution_call`] on this thread. The wrapper boxes it,
+/// so `size_of_val` on the returned future no longer sees it.
+#[cfg(all(test, debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn take_last_inner_future_size() -> usize {
+    LAST_INNER_FUTURE_SIZE.take()
 }
 
 /// Test seam: [`forge_error`] for feature-crate tests.

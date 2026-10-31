@@ -23,8 +23,9 @@
 //! happened) measured on `x86_64` Linux plus headroom. Release builds and
 //! other targets lay futures out differently, so the module only builds for
 //! debug `x86_64` Linux (gated in `tests.rs`), the platform CI runs.
-//! Re-measure: run `make test-select E='test(/future_size/)'` with a budget
-//! lowered to 0; the failure message prints every size.
+//! Re-measure on an `x86_64` Linux host (elsewhere the module is compiled
+//! out): run `make test-select E='test(/future_size/)'` with a budget lowered
+//! to 0; the failure message prints every size.
 //!
 //! Stored size is only half of the stack story: each inline await also costs
 //! poll-frame stack that `size_of_val` cannot see (see `crate::stack_frame`).
@@ -53,10 +54,17 @@ async fn workspace_create_future_size_stays_within_budget() {
 
     // Never polled: only the generated state-machine layouts are measured. No
     // `repositoryCheckout`, so building the future has no side effects.
+    // Clear any size recorded by setup so only this call is measured.
+    crate::execution_call::take_last_inner_future_size();
     let create = services.create_workspace(WorkspaceCreate::default(), Some("future-size".into()));
     let wrapper = std::mem::size_of_val(&*create);
-    let block = crate::execution_call::last_inner_future_size();
+    let block = crate::execution_call::take_last_inner_future_size();
     drop(create);
+    assert!(
+        block > 0,
+        "create_workspace no longer hands its create block to Services::execution_call when \
+         called, so the block size was not recorded; update this test to measure the block"
+    );
     let input = std::mem::size_of::<WorkspaceCreate>();
 
     let measured = [
