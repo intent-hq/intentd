@@ -1388,47 +1388,67 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
     Some(out)
 }
 
+/// The continuation line the `ws.agent.delegate` entry gets with the
+/// remote-placement discovery text, which joins `ws.agent.create`.
+pub(crate) const DELEGATE_PLACEMENT_POINTER: &str =
+    "`placement` works here as in `ws.agent.create`, whose entry lists the machines.";
+
 /// Splice `help` (the remote-placement discovery text, one or more lines)
-/// into `base` as continuation lines of the `ws.agent.create` doc entry, so
-/// a bridge whose daemon has a configured execution node advertises its
-/// platforms. Lines are indented 4 so `[agentFeatures]` pruning and the
-/// condensed rendering treat them as part of that entry. Returns `base`
-/// unchanged when the anchor is absent.
+/// into `base` as continuation lines of the `ws.agent.create` doc entry, and
+/// [`DELEGATE_PLACEMENT_POINTER`] into the `ws.agent.delegate` entry, so a
+/// bridge whose daemon can place agents on exposed machines lists them.
+/// Lines are indented 4 so `[agentFeatures]` pruning and the condensed
+/// rendering treat them as part of that entry. Returns `base` unchanged
+/// when the `ws.agent.create` anchor is absent.
 pub(crate) fn inject_remote_placement_help(base: &str, help: &str) -> String {
-    let mut block = String::with_capacity(help.len() + 64);
-    for line in help.lines() {
+    let Some(with_create) = inject_into_entry(base, "ws.agent.create(", help) else {
+        return base.to_owned();
+    };
+    inject_into_entry(
+        &with_create,
+        "ws.agent.delegate(",
+        DELEGATE_PLACEMENT_POINTER,
+    )
+    .unwrap_or(with_create)
+}
+
+/// Append `text` as continuation lines of the doc entry starting with
+/// `anchor`; `None` when no entry does.
+fn inject_into_entry(base: &str, anchor: &str, text: &str) -> Option<String> {
+    let mut block = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
         block.push_str("    ");
         block.push_str(line.trim());
         block.push('\n');
     }
     let mut out = String::with_capacity(base.len() + block.len());
-    let mut in_create = false;
+    let mut in_entry = false;
     let mut inserted = false;
     for line in base.lines() {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         let is_continuation = indent >= 4 && !trimmed.is_empty();
-        if in_create && !is_continuation && !inserted {
+        if in_entry && !is_continuation && !inserted {
             out.push_str(&block);
             inserted = true;
         }
         if indent == 2 && trimmed.starts_with("ws.") {
-            in_create = trimmed.starts_with("ws.agent.create(");
+            in_entry = trimmed.starts_with(anchor);
         }
         out.push_str(line);
         out.push('\n');
     }
-    if in_create && !inserted {
+    if in_entry && !inserted {
         out.push_str(&block);
         inserted = true;
     }
     if !inserted {
-        return base.to_owned();
+        return None;
     }
     if !base.ends_with('\n') {
         out.pop();
     }
-    out
+    Some(out)
 }
 
 /// Render the injected continuation block: one header line plus one line per
@@ -4083,12 +4103,46 @@ mod script_recipe_tests {
             lines[injected + 2].starts_with("  ws."),
             "the next entry follows"
         );
-        assert_eq!(full.len(), base.len() + help.len() + 1 + 2 * 4);
+        let delegate = lines
+            .iter()
+            .position(|l| l.starts_with("  ws.agent.delegate("))
+            .unwrap();
+        let pointer = lines
+            .iter()
+            .position(|l| {
+                *l == format!(
+                    "    {}",
+                    crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER
+                )
+            })
+            .unwrap();
+        assert!(pointer > delegate);
+        assert!(lines[delegate + 1..pointer]
+            .iter()
+            .all(|l| l.starts_with("    ")));
+        assert!(
+            lines[pointer + 1].starts_with("  ws."),
+            "the next entry follows"
+        );
+        assert_eq!(
+            full.len(),
+            base.len()
+                + help.len()
+                + 1
+                + 2 * 4
+                + crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER.len()
+                + 4
+                + 1
+        );
 
         let condensed =
             crate::mcp_server::tools::condensed_workspace_api_description(false, &features, &[]);
         let condensed_full =
             crate::mcp_server::tools::inject_remote_placement_help(&condensed, help);
         assert!(condensed_full.contains("    Remote placement (experimental)"));
+        assert!(condensed_full.contains(&format!(
+            "    {}",
+            crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER
+        )));
     }
 }

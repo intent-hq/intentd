@@ -17,6 +17,7 @@ intent-git = { path = "../intent-git", version = "0.11.87" }
 intent-providers = { path = "../intent-providers", version = "0.11.87" }
 git2 = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -27,6 +28,7 @@ libc = { workspace = true }
 [dev-dependencies]
 intent-services = { path = "../intent-services", version = "0.11.87", features = ["test-hooks"] }
 intentd-test-support = { path = "../intentd-test-support" }
+socket2 = "0.6"
 sqlx = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

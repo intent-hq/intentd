@@ -75,6 +75,34 @@ pub(crate) fn model_ids(response: &Value) -> Vec<String> {
 }
 
 impl Services {
+    /// Every enabled provider this build knows with its status from launch
+    /// resolution alone: no sign-in probe and no model listing, so it is
+    /// cheap. Models are empty and marked stale until a full report
+    /// ([`Self::executor_provider_capabilities`]) replaces it.
+    #[must_use]
+    pub fn executor_provider_launch_statuses(&self) -> Vec<ProviderCapability> {
+        let settings = self.effective_settings();
+        intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|provider| {
+                !crate::agent_ops::provider_is_disabled(
+                    provider.id,
+                    settings.providers.enabled.as_ref(),
+                )
+            })
+            .map(|provider| ProviderCapability {
+                id: provider.id.to_owned(),
+                visible: intent_providers::gated_reason_with_env(provider, &|var| {
+                    std::env::var_os(var).is_some()
+                })
+                .is_none(),
+                status: launch_status(&resolve_provider_launch(provider.id, &settings)),
+                models: Vec::new(),
+                models_stale: true,
+            })
+            .collect()
+    }
+
     /// Every enabled provider this build knows, with its status and (for a
     /// launchable one) its models from `models.list`. A launchable
     /// provider's status is its default account's cached sign-in probe, or
@@ -244,6 +272,35 @@ mod tests {
                 provider_status(ProviderStatus::Unknown, sign_in, Some(failed)),
                 expected,
                 "{sign_in:?}"
+            );
+        }
+    }
+
+    /// The cheap provider list names every enabled provider with its launch
+    /// status only: no models yet, marked stale.
+    #[tokio::test]
+    async fn launch_statuses_list_every_enabled_provider_without_models() {
+        let dir = crate::test_support::test_tempdir("launch-statuses");
+        let store = intent_store::Store::open(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+        let providers = svc.executor_provider_launch_statuses();
+        assert!(
+            providers.iter().any(|p| p.id == "claude-code"),
+            "{providers:?}"
+        );
+        for provider in &providers {
+            assert!(provider.models.is_empty(), "{provider:?}");
+            assert!(provider.models_stale, "{provider:?}");
+            assert!(
+                !matches!(
+                    provider.status,
+                    ProviderStatus::SignedIn
+                        | ProviderStatus::SignedOut
+                        | ProviderStatus::AuthFailed
+                ),
+                "no sign-in is probed: {provider:?}"
             );
         }
     }

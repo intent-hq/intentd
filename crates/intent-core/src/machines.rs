@@ -79,6 +79,9 @@ impl ModelUnavailable {
     /// signed-in); it has: sonnet, haiku.` with one sentence per machine.
     #[must_use]
     pub fn message(&self) -> String {
+        if self.model.is_empty() {
+            return self.provider_message();
+        }
         if self.machines.is_empty() {
             return format!(
                 "Model \"{}\" ({}) isn't available: no machine is exposed to this backend.",
@@ -88,6 +91,30 @@ impl ModelUnavailable {
         self.machines
             .iter()
             .map(|machine| self.sentence(machine))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The message when no model was requested: the provider itself is not
+    /// usable on any candidate.
+    fn provider_message(&self) -> String {
+        if self.machines.is_empty() {
+            return format!(
+                "Provider \"{}\" isn't available: no machine is exposed to this backend.",
+                self.provider
+            );
+        }
+        self.machines
+            .iter()
+            .map(|machine| {
+                format!(
+                    "Provider \"{}\" can't start on {} ({}, status: {}).",
+                    self.provider,
+                    machine.name,
+                    machine.platform,
+                    status_name(machine.status),
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -125,7 +152,8 @@ impl ModelUnavailable {
     }
 }
 
-fn status_name(status: ProviderStatus) -> &'static str {
+/// The wire name of a provider status.
+pub(crate) fn status_name(status: ProviderStatus) -> &'static str {
     match status {
         ProviderStatus::SignedIn => "signed-in",
         ProviderStatus::SignedOut => "signed-out",

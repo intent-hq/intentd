@@ -33,6 +33,7 @@ pub mod git_remote_url;
 pub mod host_membership;
 pub mod human_author;
 pub mod ids;
+pub mod machine_selection;
 pub mod machines;
 pub mod model;
 pub mod native_review;

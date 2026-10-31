@@ -155,3 +155,80 @@ async fn daemon_mode_changes_only_over_the_local_socket() {
         assert!(read.is_ok(), "reads stay open: {read:?}");
     }
 }
+
+/// A remote-launch port that places agents on exposed machines; every
+/// other method is the unavailable port's.
+struct MachinePort(crate::feature_ports::UnavailableRemoteLaunch);
+
+impl crate::feature_ports::RemoteLaunchPort for MachinePort {
+    fn placements<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> intent_core::BoxFuture<'a, Result<intent_core::placement::PlatformAvailability>> {
+        self.0.placements(svc)
+    }
+    fn placement_help<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> intent_core::BoxFuture<'a, Option<String>> {
+        self.0.placement_help(svc)
+    }
+    fn admit<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a intent_core::WorkspaceId,
+        placement: &'a intent_core::placement::AgentPlacement,
+        needs: &'a intent_core::remote_launch::RemoteLaunchNeeds,
+    ) -> intent_core::BoxFuture<'a, Result<intent_core::remote_launch::RemotePlacementView>> {
+        self.0.admit(svc, workspace_id, placement, needs)
+    }
+    fn launch<'a>(
+        &'a self,
+        svc: &'a Services,
+        request: intent_core::remote_launch::RemoteLaunchRequest,
+    ) -> intent_core::BoxFuture<'a, Result<()>> {
+        self.0.launch(svc, request)
+    }
+    fn runtime<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a intent_core::AgentId,
+    ) -> intent_core::BoxFuture<'a, Result<Arc<crate::feature_ports::RemoteRuntime>>> {
+        self.0.runtime(svc, agent_id)
+    }
+    fn manages_machines(&self) -> bool {
+        true
+    }
+}
+
+/// `remoteMachines: 1` is advertised only by a backend with the remote
+/// feature and `experimental.remoteAgents` on, never in node mode.
+#[tokio::test]
+async fn remote_machines_capability_needs_the_feature_and_the_setting_outside_node_mode() {
+    for node_mode in [false, true] {
+        let dir = crate::test_support::test_tempdir("remote-machines-capability");
+        let (svc, registry) = services(&dir, node_mode, Some(false)).await;
+        registry
+            .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
+            .unwrap();
+        assert!(
+            !svc.remote_machines_capability(),
+            "no remote feature: the backend methods are missing"
+        );
+        let svc = Arc::try_unwrap(svc)
+            .ok()
+            .expect("sole owner")
+            .with_remote_launch_port(Arc::new(MachinePort(
+                crate::feature_ports::UnavailableRemoteLaunch,
+            )));
+        assert_eq!(
+            svc.remote_machines_capability(),
+            !node_mode,
+            "node mode {node_mode}"
+        );
+        registry
+            .apply(&[("experimental.remoteAgents".to_owned(), json!(false))])
+            .unwrap();
+        assert!(!svc.remote_machines_capability(), "off with the setting");
+    }
+}

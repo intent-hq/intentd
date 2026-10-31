@@ -7,7 +7,8 @@ use std::process::Command;
 
 use intent_core::placement::{AgentPlacement, PlacementUnavailableReason};
 use intent_core::remote_launch::{
-    EffectiveIsolation, RemoteLaunchRequest, RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY,
+    EffectiveIsolation, RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView,
+    REMOTE_PLACEMENT_METADATA_KEY,
 };
 use intent_core::{Error, Workspace};
 use intent_git::node_git::{self, AgentRemote, GitService};
@@ -144,8 +145,12 @@ impl Fixture {
 
     async fn admit(&self, placement: &str) -> intent_core::Result<RemotePlacementView> {
         let placement: AgentPlacement = serde_json::from_str(placement).unwrap();
+        let needs = RemoteLaunchNeeds {
+            provider: "mock".into(),
+            ..RemoteLaunchNeeds::default()
+        };
         self.port()
-            .admit(&self.services, &workspace(), &placement)
+            .admit(&self.services, &workspace(), &placement, &needs)
             .await
     }
 
@@ -205,16 +210,22 @@ async fn admission_matches_the_machines_platform_and_capacity() {
         "Unsupported linux; available: macos/aarch64; supported: macos/aarch64"
     );
     let elsewhere = unavailable(f.admit(r#"{"nodeId":"other-node"}"#).await);
+    assert_eq!(elsewhere.reason, PlacementUnavailableReason::MachineUnknown);
     assert_eq!(
-        elsewhere.reason,
-        PlacementUnavailableReason::UnsupportedPlatform
+        elsewhere.message(),
+        "No machine other-node is exposed to this backend"
     );
 
-    // Both of the node's slots taken: retryable no-capacity.
+    // Both of the node's slots taken by this backend's agents (newer than
+    // the machine's report): retryable no-capacity naming the limit.
     let _one = f.node.attach(&AgentId::new(), &workspace());
     let _two = f.node.attach(&AgentId::new(), &workspace());
     let full = unavailable(f.admit(r#"{"target":"remote"}"#).await);
     assert_eq!(full.reason, PlacementUnavailableReason::NoCapacity);
+    assert_eq!(
+        full.message(),
+        "No capacity on Test machine: 2 of 2 agents running"
+    );
     assert_eq!(full.data()["retryable"], true);
     assert_eq!(
         full.data()["supportedPlatforms"],
@@ -241,7 +252,12 @@ async fn an_unreachable_machine_admits_nothing() {
     link.link.close();
     disconnected(&f.node).await;
     let offline = unavailable(f.admit(r#"{"target":"remote"}"#).await);
-    assert_eq!(offline.reason, PlacementUnavailableReason::NoCapacity);
+    assert_eq!(
+        offline.reason,
+        PlacementUnavailableReason::MachineUnreachable
+    );
+    assert_eq!(offline.message(), "Test machine is unreachable");
+    assert_eq!(offline.data()["retryable"], true);
     assert!(offline.availability.available_platforms.is_empty());
 }
 
