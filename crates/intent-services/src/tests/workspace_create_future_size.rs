@@ -36,13 +36,14 @@ use intent_store::Store;
 use super::{TempDb, WorkspacesRoot};
 use crate::Services;
 
-/// The create block (measured `17_744` bytes; `WorkspaceCreate` is `1_200`).
-/// Headroom stays below one `WorkspaceCreate` so a stray rebinding or clone
-/// of the request inside the block trips it.
-const CREATE_BLOCK_BUDGET: usize = 18 * 1024;
+/// The create block (measured `7_680` bytes since its large awaits are built
+/// off-frame by `boxed_await`, down from `17_744`; `WorkspaceCreate` is
+/// `1_200`). Headroom stays below one `WorkspaceCreate` so a stray rebinding
+/// or clone of the request inside the block trips it.
+const CREATE_BLOCK_BUDGET: usize = 8 * 1024;
 /// The `execution_call` wrapper around it (measured `2_544` bytes): holds the
 /// create block behind one `Box::pin`. Holding it inline again grows this by
-/// about `2 * 17_744`.
+/// about `2 * 7_680`.
 const EXECUTION_CALL_WRAPPER_BUDGET: usize = 4 * 1024;
 
 #[tokio::test]
