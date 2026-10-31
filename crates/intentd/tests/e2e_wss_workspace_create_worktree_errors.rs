@@ -202,6 +202,7 @@ async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data
     );
 }
 
+#[track_caller]
 fn git(path: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)

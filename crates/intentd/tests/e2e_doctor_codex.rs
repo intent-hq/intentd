@@ -261,6 +261,7 @@ impl Fixture {
         (status.success(), stdout)
     }
 
+    #[track_caller]
     fn doctor_command(&self, live: bool) -> Command {
         // Check production discovery before any adapter could execute. If a host
         // install outranks a fixture, fail rather than touching that installation.
@@ -284,6 +285,7 @@ impl Fixture {
         command
     }
 
+    #[track_caller]
     fn run(&self, live: bool) -> String {
         let (success, stdout) = self.run_command(self.doctor_command(live));
         assert!(
@@ -303,6 +305,7 @@ impl Fixture {
             .collect()
     }
 
+    #[track_caller]
     fn assert_version_only(&self) {
         let events = self.events();
         assert!(!events.is_empty(), "installed CLI version must be measured");
@@ -403,6 +406,7 @@ fn ordinary_warning_fixture() -> Fixture {
     fixture
 }
 
+#[track_caller]
 fn assert_ordinary_warning(stderr: &str) {
     assert!(stderr.contains("WARN"));
     assert!(stderr.contains("must be absolute and executable"));

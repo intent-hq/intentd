@@ -559,6 +559,7 @@ fn spawn_guarded(cmd: &mut Command) -> GuardedChild {
 }
 
 /// Whether `pid` still names a process (signal 0 probe), zombies included.
+#[track_caller]
 fn alive(pid: u32) -> bool {
     match kill(Pid::from_raw(pid.cast_signed()), None) {
         Ok(()) => true,
@@ -572,6 +573,7 @@ fn alive(pid: u32) -> bool {
 /// process a child subreaper (plain `cargo test` runs every test in one
 /// process), a killed orphan is re-parented to it and stays a zombie nobody
 /// else reaps — so reap it here if it is ours.
+#[track_caller]
 fn gone(pid: u32) -> bool {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     match waitpid(Pid::from_raw(pid.cast_signed()), Some(WaitPidFlag::WNOHANG)) {
@@ -605,6 +607,7 @@ fn wait_until(what: &str, timeout: Duration, cond: impl FnMut() -> bool) {
 /// that must stay under a fixed production timer (a 30s crash backoff, the
 /// 30s manifest timeout). Mark each call site
 /// `// fixed-deadline: allow — stays under <timer>`.
+#[track_caller]
 fn wait_until_within(what: &str, window: Duration, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
@@ -632,6 +635,7 @@ fn wait_exit(child: &mut GuardedChild, timeout: Duration) -> ExitStatus {
 
 /// [`wait_exit`] for exactly `window`, never stretched; see
 /// [`wait_until_within`].
+#[track_caller]
 fn wait_exit_within(child: &mut GuardedChild, window: Duration) -> ExitStatus {
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
@@ -801,6 +805,7 @@ fn wait_helpers_stretch_with_the_timeout_multiplier() {
     );
 }
 
+#[track_caller]
 fn send_signal(child: &Child, signal: &str) {
     let status = Command::new("kill")
         .arg(format!("-{signal}"))
@@ -3942,6 +3947,7 @@ esac
     BackgroundFixture { paths }
 }
 
+#[track_caller]
 fn background_call(dir: &Path, base_url: &str, args: &[&str]) -> std::process::Output {
     let mut cmd = sitter_command(dir, base_url);
     cmd.args(args)
@@ -4127,6 +4133,7 @@ esac
 
 // The CLI may reject a request before opening the private socket. That must
 // fail the assertion with its output, never leave this fixture blocked in join.
+#[track_caller]
 fn serve_stop_eof(
     listener: &std::os::unix::net::UnixListener,
     finished: &std::sync::mpsc::Receiver<()>,

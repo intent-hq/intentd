@@ -164,6 +164,7 @@ impl MockAgent {
 }
 
 /// Parse one prompt-script step object (exactly one recognized key).
+#[track_caller]
 fn parse_step(v: &Value) -> Step {
     if let Some(p) = v.get("update") {
         Step::Update(p.clone())
@@ -191,6 +192,7 @@ fn parse_step(v: &Value) -> Step {
 
 /// Load and parse a fixture, substituting `${ROOT}` (session worktree) and
 /// `${BIG}` (an oversized stderr line) tokens.
+#[track_caller]
 fn load_script(name: &str, root: &str) -> Script {
     let path = fixtures_dir().join(name);
     let raw = std::fs::read_to_string(&path)
@@ -533,6 +535,7 @@ async fn recv_note(rx: &mut mpsc::UnboundedReceiver<IncomingNotification>) -> In
 }
 
 /// Assert a notification is an agent message chunk and return its text.
+#[track_caller]
 fn chunk_text(note: &IncomingNotification) -> String {
     match session::map_notification(note) {
         Some(MappedUpdate::Chunk {
