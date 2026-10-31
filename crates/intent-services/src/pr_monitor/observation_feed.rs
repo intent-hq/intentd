@@ -10,7 +10,11 @@
 //! in the monitor card, and the agent would not be woken.
 //!
 //! The feed remembers the PR signature each monitored PR had when the
-//! monitor last read it ([`ObservationFeed::record_poll`]). Any other fresh
+//! monitor sweep last read it ([`ObservationFeed::record_poll`]). Only the
+//! sweep advances it, because only the sweep polls every sibling monitor on
+//! a PR; registration and check-now update one monitor, so they only seed a
+//! missing baseline and otherwise observe ([`ObservationFeed::seed_or_observe`]).
+//! Any other fresh
 //! read whose signature differs ([`ObservationFeed::observe`]) marks the PR
 //! changed; the due-sweep polls marked PRs ahead of their idle interval and
 //! the loop is kicked so that happens immediately. A mark is taken when the
@@ -79,6 +83,20 @@ impl ObservationFeed {
             return false;
         };
         seen.differs_from(&Signature::of(pr)) && self.changed.insert(key)
+    }
+
+    /// A read that updates only ONE monitor on the PR (registration,
+    /// check-now). With no baseline yet it seeds one, so a fresh monitor is
+    /// covered before its first sweep poll. With a baseline it must not
+    /// advance it — sibling monitors (other workspaces) on the PR were not
+    /// updated — so it is an observation: it marks the PR when it moved and
+    /// returns whether that mark is new.
+    pub(crate) fn seed_or_observe(&mut self, key: PrKey, pr: &PullRequest) -> bool {
+        if self.seen.contains_key(&key) {
+            return self.observe(key, pr);
+        }
+        self.record_poll(key, pr);
+        false
     }
 
     /// Whether `key` is marked changed.
@@ -185,6 +203,21 @@ mod tests {
         feed.take(&key(1));
         feed.record_poll(key(1), &pr(PrState::Merged, false, Some("a")));
         assert!(!feed.observe(key(1), &pr(PrState::Merged, false, Some("a"))));
+    }
+
+    #[test]
+    fn a_single_monitor_read_seeds_but_never_advances_the_baseline() {
+        let mut feed = ObservationFeed::default();
+        assert!(!feed.seed_or_observe(key(1), &pr(PrState::Open, false, Some("a"))));
+        assert!(!feed.is_changed(&key(1)));
+        // Seeded: a later merge seen elsewhere marks.
+        assert!(feed.observe(key(1), &pr(PrState::Merged, false, Some("a"))));
+        feed.take(&key(1));
+        // A check-now that reads the merge marks for the siblings and leaves
+        // the baseline at open, so the next fresh read still disagrees.
+        assert!(feed.seed_or_observe(key(1), &pr(PrState::Merged, false, Some("a"))));
+        feed.take(&key(1));
+        assert!(feed.observe(key(1), &pr(PrState::Merged, false, Some("a"))));
     }
 
     #[test]

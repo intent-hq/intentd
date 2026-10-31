@@ -2384,13 +2384,19 @@ impl Services {
         }
     }
 
-    /// Record a monitor-path read outside the sweep (registration,
-    /// check-now) as the feed's baseline for the PR.
-    fn record_monitor_read(&self, repo_ref: &RepoRef, pr: &PullRequest) {
-        self.pr_monitor_feed
+    /// [`Self::observe_pr_record`] for a read that updates one monitor only
+    /// (registration, check-now): seeds a missing baseline, otherwise
+    /// observes ([`ObservationFeed::seed_or_observe`]).
+    fn seed_or_observe_pr_record(&self, repo_ref: &RepoRef, pr: &PullRequest) {
+        let key = pr_key_for(repo_ref, pr.number.cast_signed());
+        if self
+            .pr_monitor_feed
             .lock()
             .unwrap()
-            .record_poll(pr_key_for(repo_ref, pr.number.cast_signed()), pr);
+            .seed_or_observe(key, pr)
+        {
+            self.pr_monitor_kick.notify_one();
+        }
     }
 
     /// Project a monitor observation into existing same-head workspace/root
@@ -2958,7 +2964,10 @@ impl Services {
             .await
         {
             Ok(entry) => {
-                self.record_monitor_read(repo_ref, &entry.pr);
+                // Seeds the feed baseline for a new PR; on a PR other monitors
+                // already watch, only the sweep may advance it (it polls every
+                // sibling), so this read is an observation.
+                self.seed_or_observe_pr_record(repo_ref, &entry.pr);
                 self.project_monitor_queue(repo_ref, &entry).await;
                 Ok(Some(entry.snapshot.materialize(None)))
             }
@@ -3583,7 +3592,9 @@ impl Services {
         .await
         {
             Ok(entry) => {
-                self.record_monitor_read(&repo_ref, &entry.pr);
+                // A check-now polls only this monitor, so it must not advance
+                // the baseline its sibling monitors (other workspaces) rely on.
+                self.seed_or_observe_pr_record(&repo_ref, &entry.pr);
                 self.project_monitor_queue(&repo_ref, &entry).await;
                 entry.snapshot
             }
