@@ -79,7 +79,7 @@ struct Harness {
     root: PathBuf,
     store: Store,
     svc: Services,
-    _parent: tempfile::TempDir,
+    parent_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -98,12 +98,12 @@ impl Harness {
             root,
             store,
             svc,
-            _parent: test_tempdir("intentd-plain-safety-"),
+            parent_dir: test_tempdir("intentd-plain-safety-"),
         }
     }
 
     fn parent(&self) -> &Path {
-        self._parent.path()
+        self.parent_dir.path()
     }
 
     /// Create a plain-folder workspace for `variant` with the sentinel (and,
