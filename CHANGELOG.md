@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.91] - 2026-10-31
+
+### 🧪 Testing
+
+- Report caller lines from assertion helpers and lint for track_caller ([#2850](https://github.com/intent-hq/intentd/pull/2850))
+- *(intentd)* Correlate the shutdown reaper's UDS reply by id ([#2870](https://github.com/intent-hq/intentd/pull/2870))
+
+
 ## [0.11.90] - 2026-10-31
 
 ### 🚀 Features
