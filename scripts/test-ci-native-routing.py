@@ -42,7 +42,7 @@ REQUIRED = {
     "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_QUEUE_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
-PR_METADATA = {"pr-title", "conflict-markers"}
+PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
