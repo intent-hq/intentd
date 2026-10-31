@@ -55,6 +55,9 @@ pub(crate) trait MachineReport: Send + Sync {
     fn routes(&self) -> (Vec<String>, Option<String>);
     /// Observe the providers and routes again.
     fn refresh(&self) -> intent_core::BoxFuture<'_, ()>;
+    /// A launch without a profile failed because `provider`'s default
+    /// account is not signed in.
+    fn launch_auth_failed(&self, provider: &str);
 }
 
 /// What the executor service is built from.
@@ -294,6 +297,10 @@ impl ExecutorService {
             journal,
             home: machine_home(),
             mcp_bridge_exe: self.deps.executable.clone(),
+            auth_failed: {
+                let report = self.deps.report.clone();
+                Arc::new(move |provider: &str| report.launch_auth_failed(provider))
+            },
         });
         Ok(Backend {
             runner,
@@ -676,13 +683,50 @@ impl MachineLaunch for SettingsLaunch {
 const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The daemon's [`MachineReport`]: its provider capabilities (launch
-/// resolution plus `models.list`) and its listener's routes, cached.
+/// resolution, `models.list` and sign-in probes) and its listener's routes,
+/// cached.
 pub(crate) struct DaemonReport {
     services: intent_services::Services,
     routes: Option<Arc<dyn intent_core::machines::MachineRoutesSource>>,
     cache: Mutex<(Vec<ProviderCapability>, Vec<String>, Option<String>)>,
+    /// When each provider's default account last failed a launch, until a
+    /// refresh's newer conclusive sign-in probe clears it.
+    auth_failures: Mutex<HashMap<String, std::time::Instant>>,
     /// Single-flights refreshes.
     refreshing: tokio::sync::Mutex<()>,
+}
+
+/// Report `id` as `auth-failed`, unless it cannot launch at all.
+fn mark_auth_failed(providers: &mut [ProviderCapability], id: &str) {
+    use intent_core::node_link::ProviderStatus;
+    for provider in providers.iter_mut().filter(|p| p.id == id) {
+        if !matches!(
+            provider.status,
+            ProviderStatus::CliMissing | ProviderStatus::PrerequisiteMissing
+        ) {
+            provider.status = ProviderStatus::AuthFailed;
+        }
+    }
+}
+
+/// After a refresh built `providers` from the failures in `seen`: forget
+/// each failure the refresh cleared, and report as failed every one that
+/// arrived while it ran.
+fn settle_auth_failures(
+    providers: &mut [ProviderCapability],
+    failures: &mut HashMap<String, std::time::Instant>,
+    seen: &HashMap<String, std::time::Instant>,
+) {
+    use intent_core::node_link::ProviderStatus;
+    failures.retain(|id, at| {
+        if seen.get(id) != Some(at) {
+            mark_auth_failed(providers, id);
+            return true;
+        }
+        providers
+            .iter()
+            .any(|p| p.id == *id && p.status == ProviderStatus::AuthFailed)
+    });
 }
 
 impl MachineReport for DaemonReport {
@@ -698,18 +742,31 @@ impl MachineReport for DaemonReport {
     fn refresh(&self) -> intent_core::BoxFuture<'_, ()> {
         Box::pin(async move {
             let _single = self.refreshing.lock().await;
-            let providers = self.services.executor_provider_capabilities().await;
+            let seen = lock(&self.auth_failures).clone();
+            let mut providers = self.services.executor_provider_capabilities(&seen).await;
             let routes = match &self.routes {
                 Some(source) => source.machine_routes().await.ok(),
                 None => None,
             };
+            // Failures before cache: the order `launch_auth_failed` takes.
+            let mut failures = lock(&self.auth_failures);
+            settle_auth_failures(&mut providers, &mut failures, &seen);
             let mut cache = lock(&self.cache);
+            drop(failures);
             cache.0 = providers;
             if let Some(routes) = routes {
                 cache.1 = routes.hosts;
                 cache.2 = routes.tc_address;
             }
         })
+    }
+
+    fn launch_auth_failed(&self, provider: &str) {
+        let mut failures = lock(&self.auth_failures);
+        failures.insert(provider.to_owned(), std::time::Instant::now());
+        let mut cache = lock(&self.cache);
+        drop(failures);
+        mark_auth_failed(&mut cache.0, provider);
     }
 }
 
@@ -747,6 +804,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
         services: parts.services.clone(),
         routes: parts.routes,
         cache: Mutex::new((Vec::new(), Vec::new(), None)),
+        auth_failures: Mutex::new(HashMap::new()),
         refreshing: tokio::sync::Mutex::new(()),
     });
     let enabled: Arc<dyn Fn() -> bool + Send + Sync> = {

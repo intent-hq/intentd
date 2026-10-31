@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities,
+    MachineCapabilities, StopId,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -231,6 +231,7 @@ impl Shared {
         for agent_id in agents {
             link.send(&LinkFrame::Stop {
                 agent_id: agent_id.clone(),
+                stop_id: StopId::new_v4(),
             })
             .await?;
         }
@@ -976,6 +977,7 @@ async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
                 tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
                 let stop = LinkFrame::Stop {
                     agent_id: agent_id.clone(),
+                    stop_id: StopId::new_v4(),
                 };
                 if link.send(&stop).await.is_err() {
                     return;

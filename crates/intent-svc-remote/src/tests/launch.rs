@@ -472,7 +472,7 @@ async fn binding_stops_unclaimed_agents_and_keeps_claimed_ones() {
     let mut link = machine.accept().await;
     let stopped = link
         .expect(|frame| match frame {
-            LinkFrame::Stop { agent_id } => Some(agent_id),
+            LinkFrame::Stop { agent_id, .. } => Some(agent_id),
             _ => None,
         })
         .await;

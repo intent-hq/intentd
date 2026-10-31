@@ -380,7 +380,7 @@ async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
         result = &mut remove => panic!("removed before the machine confirmed the stop: {result:?}"),
         () = async {
             link.expect(|frame| match frame {
-                LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+                LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
                 _ => None,
             })
             .await;
@@ -720,7 +720,7 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
     let mut link = machine.accept().await;
     link.replay_complete(0).await;
     link.expect(|frame| match frame {
-        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        LinkFrame::Stop { agent_id, .. } if agent_id == agent => Some(()),
         _ => None,
     })
     .await;

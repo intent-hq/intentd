@@ -27,6 +27,7 @@ use intent_acp::{
 };
 use intent_core::node_link::{
     ExitFailure, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
+    StopOutcome,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -120,7 +121,14 @@ pub(super) struct RunnerConfig {
     /// The executable providers run as `mcp-bridge` to reach an agent's
     /// workspace MCP server.
     pub mcp_bridge_exe: PathBuf,
+    /// Told the provider when a launch without a profile fails to
+    /// authenticate.
+    pub auth_failed: AuthFailed,
 }
+
+/// Told a provider id when that provider's default account (a launch
+/// without a profile) failed to authenticate.
+pub(crate) type AuthFailed = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The node's agents. Cloning shares them.
 #[derive(Clone)]
@@ -134,6 +142,7 @@ struct Inner {
     checkouts: Arc<dyn Checkouts>,
     home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
+    auth_failed: AuthFailed,
     /// The newest bound link; agents forward control-plane calls on it.
     head: HeadLink,
     journal: Arc<Mutex<Journal>>,
@@ -157,6 +166,58 @@ struct State {
     /// The workspace of every agent launched since start, so a prompt for an
     /// agent that has exited can still be answered with a journal record.
     workspaces: HashMap<AgentId, WorkspaceId>,
+    /// Agents that left `agents` (their process tree is gone and their slot
+    /// free) whose exit record is not journaled yet, so a stop arriving in
+    /// that window still waits for the record.
+    exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
+}
+
+/// Whether an agent's exit record reached the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitRecord {
+    /// Not appended yet.
+    Pending,
+    Journaled,
+    /// The append failed, or the pump ended without one: it never will be.
+    Lost,
+}
+
+/// What [`Runner::stop`] leaves to wait for before the stop may be
+/// acknowledged.
+pub(super) enum StopWait {
+    /// No agent with that id runs or is exiting.
+    NotRunning,
+    /// Resolves with `outcome` once the agent's exit record is journaled.
+    Pending {
+        outcome: StopOutcome,
+        journaled: watch::Receiver<ExitRecord>,
+    },
+}
+
+impl StopWait {
+    /// Wait until the stop is applied: the agent's process tree is gone, its
+    /// shared slot is free and its exit record is journaled. `None` when the
+    /// exit record could not be journaled: the stop must not be
+    /// acknowledged (the backend resends it, and the resend finds the agent
+    /// not running).
+    pub(super) async fn wait(self) -> Option<StopOutcome> {
+        match self {
+            Self::NotRunning => Some(StopOutcome::NotRunning),
+            Self::Pending {
+                outcome,
+                mut journaled,
+            } => match journaled
+                .wait_for(|state| *state != ExitRecord::Pending)
+                .await
+                .map(|state| *state)
+            {
+                Ok(ExitRecord::Journaled) => Some(outcome),
+                // A closed channel without a settled state: the pump is
+                // gone and never journaled the exit.
+                Ok(ExitRecord::Pending | ExitRecord::Lost) | Err(_) => None,
+            },
+        }
+    }
 }
 
 struct Agent {
@@ -173,6 +234,8 @@ struct Agent {
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Whether the agent's exit record reached the journal.
+    journaled: watch::Receiver<ExitRecord>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
     /// Whether a turn is running; refuses a second one.
     busy: Mutex<bool>,
@@ -186,6 +249,22 @@ struct Agent {
     redactor: Arc<Redactor>,
     /// An npx launch's working directory, kept while the agent runs.
     npx_launch_dir: Mutex<Option<NpxLaunchDir>>,
+    /// For a launch without a profile: its provider and whom to tell when
+    /// the provider's default account fails to authenticate. A profile's
+    /// account says nothing about the default one.
+    default_account: Option<(String, AuthFailed)>,
+}
+
+impl Agent {
+    /// Report a setup or turn failure that is the provider refusing the
+    /// default account as not signed in.
+    fn note_auth_failure(&self, error: &intent_acp::AcpError) {
+        if let Some((provider, auth_failed)) = &self.default_account {
+            if intent_services::provider_auth::is_auth_required(error) {
+                auth_failed(provider);
+            }
+        }
+    }
 }
 
 /// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
@@ -436,6 +515,7 @@ impl Runner {
                 checkouts: config.checkouts,
                 home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
+                auth_failed: config.auth_failed,
                 head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
@@ -600,6 +680,7 @@ impl Runner {
         }
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
+        let (journaled_tx, journaled_rx) = watch::channel(ExitRecord::Pending);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let agent = Arc::new(Agent {
@@ -614,6 +695,7 @@ impl Runner {
             worktree: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
             stop: Mutex::new(Some(stop_tx)),
+            journaled: journaled_rx,
             ready: ready_rx,
             busy: Mutex::new(false),
             descendants: Arc::new(Mutex::new(Vec::new())),
@@ -622,6 +704,12 @@ impl Runner {
             activity: ActivityTracker::new(),
             redactor: Arc::new(Redactor::new(profile.as_ref())),
             npx_launch_dir: Mutex::new(None),
+            default_account: profile.is_none().then(|| {
+                (
+                    intent_providers::base_provider_id(&provider).to_owned(),
+                    self.inner.auth_failed.clone(),
+                )
+            }),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
         state.workspaces.insert(agent_id, workspace_id);
@@ -632,6 +720,7 @@ impl Runner {
             (agent.activity.clone(), agent.redactor.clone()),
             notes_rx,
             marks_rx,
+            journaled_tx,
         ));
         {
             let mut pumps = lock(&self.inner.pumps);
@@ -664,6 +753,7 @@ impl Runner {
         (activity, redactor): (ActivityTracker, Arc<Redactor>),
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
+        journaled: watch::Sender<ExitRecord>,
     ) {
         let mut turn: Option<String> = None;
         loop {
@@ -703,14 +793,49 @@ impl Runner {
                 },
                 else => break,
             };
-            self.append(JournalEntry {
-                agent_id: agent_id.clone(),
-                workspace_id: workspace_id.clone(),
-                turn_id,
-                recorded_at: intent_core::now_iso(),
-                body,
-            })
-            .await;
+            let exit = matches!(body, JournalBody::Exited { .. });
+            let appended = self
+                .append(JournalEntry {
+                    agent_id: agent_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    turn_id,
+                    recorded_at: intent_core::now_iso(),
+                    body,
+                })
+                .await
+                .is_some();
+            if exit {
+                let state = if appended {
+                    ExitRecord::Journaled
+                } else {
+                    ExitRecord::Lost
+                };
+                self.exit_settled(&agent_id, &journaled, state);
+            }
+        }
+        // The pump ended without settling the exit: it never will be.
+        if *journaled.borrow() == ExitRecord::Pending {
+            self.exit_settled(&agent_id, &journaled, ExitRecord::Lost);
+        }
+    }
+
+    /// The agent's exit record is journaled, or never will be: release its
+    /// stop waits with `state` and forget it as exiting, so a later stop
+    /// finds it not running.
+    fn exit_settled(
+        &self,
+        agent_id: &AgentId,
+        journaled: &watch::Sender<ExitRecord>,
+        state: ExitRecord,
+    ) {
+        journaled.send_replace(state);
+        let mut state = lock(&self.inner.state);
+        if state
+            .exiting
+            .get(agent_id)
+            .is_some_and(|waiting| waiting.same_channel(&journaled.subscribe()))
+        {
+            state.exiting.remove(agent_id);
         }
     }
 
@@ -834,6 +959,9 @@ impl Runner {
             {
                 state.agents.remove(&agent.id);
                 self.inner.admission.release(&agent.id);
+                state
+                    .exiting
+                    .insert(agent.id.clone(), agent.journaled.clone());
             }
         }
         let _ = agent.marks.send(Mark::Exited { exit_code, error });
@@ -916,7 +1044,10 @@ impl Runner {
         let session = tokio::select! {
             result = setup => match result {
                 Ok(session) => session,
-                Err(error) => return Outcome::StartFailed(error.to_string()),
+                Err(error) => {
+                    agent.note_auth_failure(&error);
+                    return Outcome::StartFailed(error.to_string());
+                }
             },
             status = child.wait() => return Outcome::Exited(status.ok().and_then(|s| s.code())),
             _ = &mut *stop => return Outcome::Stopped,
@@ -1066,12 +1197,30 @@ impl Runner {
     }
 
     /// Stop the agent's provider process tree. Its exit is journaled.
-    pub(super) fn stop(&self, agent_id: &AgentId) {
-        let agent = lock(&self.inner.state).agents.get(agent_id).cloned();
-        if let Some(agent) = agent {
+    ///
+    /// The returned wait resolves once the stop is applied: `stopped` when
+    /// the agent was running (or being set up), after its process tree is
+    /// killed, its shared slot freed and its exit record journaled;
+    /// `not-running` when no such agent runs, once any exit record still
+    /// being written for it is journaled. Repeating a stop is harmless.
+    pub(super) fn stop(&self, agent_id: &AgentId) -> StopWait {
+        let state = lock(&self.inner.state);
+        if let Some(agent) = state.agents.get(agent_id).cloned() {
+            drop(state);
             if let Some(stop) = lock(&agent.stop).take() {
                 let _ = stop.send(());
             }
+            return StopWait::Pending {
+                outcome: StopOutcome::Stopped,
+                journaled: agent.journaled.clone(),
+            };
+        }
+        match state.exiting.get(agent_id) {
+            Some(journaled) => StopWait::Pending {
+                outcome: StopOutcome::NotRunning,
+                journaled: journaled.clone(),
+            },
+            None => StopWait::NotRunning,
         }
     }
 
@@ -1164,7 +1313,10 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
                 .unwrap_or_else(|| "end_turn".to_owned()),
             None,
         ),
-        Err(error) => failed(format!("{}: {error}", codes::TURN)),
+        Err(error) => {
+            agent.note_auth_failure(&error);
+            failed(format!("{}: {error}", codes::TURN))
+        }
     }
 }
 

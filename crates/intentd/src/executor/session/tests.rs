@@ -66,6 +66,7 @@ fn harness() -> Harness {
         journal,
         home: None,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
+        auth_failed: Arc::new(|_: &str| {}),
     });
     Harness { runner, _dir: dir }
 }
@@ -169,8 +170,11 @@ async fn queued_frames_of_a_replaced_generation_have_no_effect() {
         apply(&h.runner, &old, OPEN, launch("old")).await,
         Applied::Stale
     );
+    // A replaced session's stop is dropped unacknowledged: the backend
+    // resends it on its current link.
     let stop = LinkFrame::Stop {
         agent_id: AgentId::from("a1"),
+        stop_id: intent_core::node_link::StopId::new_v4(),
     };
     assert_eq!(apply(&h.runner, &old, OPEN, stop).await, Applied::Stale);
 
@@ -288,4 +292,34 @@ fn admission_needs_an_open_link_and_no_newer_generation() {
     assert_eq!(admit(Some(&one), &two, false), Admission::Current);
     assert_eq!(admit(Some(&two), &one, false), Admission::Replaced);
     assert_eq!(admit(Some(&one), &one, true), Admission::Replaced);
+}
+
+/// The current session answers a stop with a pending acknowledgement for
+/// that stop id; an agent the machine is not running is acknowledged as
+/// not running at once.
+#[tokio::test]
+async fn a_current_stop_yields_an_acknowledgement_for_its_own_id() {
+    use intent_core::node_link::{StopId, StopOutcome};
+    let h = harness();
+    let current = binding(1, "lease-1");
+    assert_eq!(
+        adopt(&h.runner, &current, NodeCounter(0), OPEN).await,
+        Adopted::Ready
+    );
+    let stop_id = StopId::new_v4();
+    let frame = LinkFrame::Stop {
+        agent_id: AgentId::from("ghost"),
+        stop_id,
+    };
+    let Applied::Stopping(pending) = apply(&h.runner, &current, OPEN, frame).await else {
+        panic!("a current stop is acknowledged");
+    };
+    assert_eq!(
+        pending.ack().await,
+        Some(LinkFrame::StopAck {
+            stop_id,
+            agent_id: AgentId::from("ghost"),
+            outcome: StopOutcome::NotRunning,
+        })
+    );
 }

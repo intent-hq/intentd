@@ -212,17 +212,24 @@ impl MachineLaunch for FixedLaunch {
     }
 }
 
-/// A fixed report; counts refreshes.
+/// A fixed report; counts refreshes and records default-account auth
+/// failures, after which its provider reports `auth-failed`.
 struct FixedReport {
     refreshes: std::sync::atomic::AtomicUsize,
+    auth_failures: Mutex<Vec<String>>,
 }
 
 impl MachineReport for FixedReport {
     fn providers(&self) -> Vec<ProviderCapability> {
+        let failed = lock(&self.auth_failures).iter().any(|p| p == "mock");
         vec![ProviderCapability {
             id: "mock".into(),
             visible: true,
-            status: ProviderStatus::Unknown,
+            status: if failed {
+                ProviderStatus::AuthFailed
+            } else {
+                ProviderStatus::Unknown
+            },
             models: vec!["mock-model".into()],
             models_stale: false,
         }]
@@ -235,17 +242,29 @@ impl MachineReport for FixedReport {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {})
     }
+    fn launch_auth_failed(&self, provider: &str) {
+        lock(&self.auth_failures).push(provider.to_owned());
+    }
 }
 
 /// The fixture agent as the `mock` provider, when `node` is on PATH.
 fn fixture_providers() -> Option<BTreeMap<String, ProviderLaunch>> {
+    fixture_providers_with(&[])
+}
+
+/// [`fixture_providers`], the fixture run with `args`.
+fn fixture_providers_with(args: &[&str]) -> Option<BTreeMap<String, ProviderLaunch>> {
     let node = intent_providers::resolve_on_path("node")?;
     let script = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
     );
-    let base_args: &'static [&'static str] =
-        Box::leak(vec![&*Box::leak(script.into_boxed_str())].into_boxed_slice());
+    let mut base_args = vec![&*Box::leak(script.into_boxed_str())];
+    base_args.extend(
+        args.iter()
+            .map(|a| &*Box::leak((*a).to_owned().into_boxed_str())),
+    );
+    let base_args: &'static [&'static str] = Box::leak(base_args.into_boxed_slice());
     Some(BTreeMap::from([(
         "mock".to_owned(),
         ProviderLaunch {
@@ -292,6 +311,7 @@ impl Running {
     ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
+            auth_failures: Mutex::new(Vec::new()),
         });
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         // Agents work in plain directories here: no backend serves git. The
@@ -896,6 +916,49 @@ async fn executor_answers_a_capabilities_request_with_a_fresh_report() {
     node.stop().await;
 }
 
+/// A remote launch without a profile that the provider refuses as not
+/// signed in is reported to the machine report, so the next capabilities
+/// reply says `auth-failed`.
+#[tokio::test]
+async fn a_default_account_auth_failure_reaches_the_capabilities_report() {
+    let Some(providers) = fixture_providers_with(&["--auth-required-setup"]) else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        CountAdmission::new(3),
+        providers,
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    loop {
+        let record = next_record(&mut dialed).await;
+        if matches!(record.body, JournalBody::Exited { .. }) {
+            break;
+        }
+    }
+    assert_eq!(*lock(&node.report.auth_failures), ["mock"]);
+    dialed.link.send(&LinkFrame::Capabilities).await.unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                assert_eq!(capabilities.providers[0].status, ProviderStatus::AuthFailed);
+                break;
+            }
+            Some(LinkFrame::Journal(_)) => {}
+            other => panic!("expected a capabilities reply, got {other:?}"),
+        }
+    }
+    node.stop().await;
+}
+
 /// Revoking a credential stops its backend's agents here and forgets its
 /// live state.
 #[tokio::test]
@@ -1130,5 +1193,147 @@ async fn shutdown_waits_for_a_revocation_paused_between_removal_and_registration
         admission.running.lock().unwrap().is_empty(),
         "shutdown returned with the revoked backend's agents still running"
     );
+    node.stop().await;
+}
+
+fn capability(id: &str, status: ProviderStatus) -> ProviderCapability {
+    ProviderCapability {
+        id: id.into(),
+        visible: true,
+        status,
+        models: Vec::new(),
+        models_stale: false,
+    }
+}
+
+/// A default-account failure shows at once, except on a provider that
+/// cannot launch: the installation is the more useful thing to report.
+#[test]
+fn an_auth_failure_marks_only_a_launchable_provider() {
+    let mut providers = vec![
+        capability("claude-code", ProviderStatus::SignedIn),
+        capability("codex", ProviderStatus::CliMissing),
+        capability("pi", ProviderStatus::PrerequisiteMissing),
+    ];
+    for id in ["claude-code", "codex", "pi", "absent"] {
+        mark_auth_failed(&mut providers, id);
+    }
+    let statuses: Vec<_> = providers.iter().map(|p| p.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            ProviderStatus::AuthFailed,
+            ProviderStatus::CliMissing,
+            ProviderStatus::PrerequisiteMissing,
+        ]
+    );
+}
+
+/// A refresh forgets the failures its probes cleared, keeps the ones it
+/// still reports, and marks the ones that arrived while it ran.
+#[test]
+fn a_refresh_settles_the_failures_it_saw_and_keeps_newer_ones() {
+    let then = std::time::Instant::now();
+    let later = then + Duration::from_secs(1);
+    let seen = HashMap::from([
+        ("claude-code".to_owned(), then),
+        ("codex".to_owned(), then),
+        ("opencode".to_owned(), then),
+    ]);
+    let mut failures = HashMap::from([
+        // Cleared by a newer conclusive probe.
+        ("claude-code".to_owned(), then),
+        // Still failed.
+        ("codex".to_owned(), then),
+        // Failed again while the refresh ran.
+        ("opencode".to_owned(), later),
+        // Failed for the first time while the refresh ran.
+        ("grok".to_owned(), later),
+    ]);
+    let mut providers = vec![
+        capability("claude-code", ProviderStatus::SignedIn),
+        capability("codex", ProviderStatus::AuthFailed),
+        capability("opencode", ProviderStatus::SignedIn),
+        capability("grok", ProviderStatus::Unknown),
+    ];
+    settle_auth_failures(&mut providers, &mut failures, &seen);
+    let mut kept: Vec<_> = failures.keys().cloned().collect();
+    kept.sort();
+    assert_eq!(kept, ["codex", "grok", "opencode"]);
+    let statuses: Vec<_> = providers.iter().map(|p| p.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            ProviderStatus::SignedIn,
+            ProviderStatus::AuthFailed,
+            ProviderStatus::AuthFailed,
+            ProviderStatus::AuthFailed,
+        ]
+    );
+}
+
+/// End to end over the daemon's WSS listener: the backend's stop is
+/// acknowledged `stopped` only once the agent's process tree is gone and
+/// its shared slot is free; repeating the same stop id, or stopping an
+/// agent that is not running, is acknowledged `notRunning`.
+#[tokio::test]
+async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
+    use intent_core::node_link::{StopId, StopOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let pid_file = dir
+        .path()
+        .join("executor")
+        .join(&id.0)
+        .join("agents")
+        .join("a1")
+        .join("work")
+        .join("agent.pid");
+    let pids: serde_json::Value = {
+        let deadline = tokio::time::Instant::now() + wait();
+        loop {
+            if let Some(pids) = std::fs::read(&pid_file)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                break pids;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let pid = |key: &str| i32::try_from(pids[key].as_i64().unwrap()).unwrap();
+    let stop_id = StopId::new_v4();
+    let outcome = dialed
+        .link
+        .stop(AgentId::from("a1"), stop_id, wait())
+        .await
+        .unwrap();
+    assert_eq!(outcome, StopOutcome::Stopped);
+    // Already true when the acknowledgement arrives: no polling.
+    assert!(process_gone(pid("agent")), "the provider still runs");
+    assert!(process_gone(pid("child")), "its helper still runs");
+    assert!(admission.running.lock().unwrap().is_empty(), "slot held");
+    assert_eq!(node.service.status(&id).running_agents, 0);
+
+    // A resend of the same stop is idempotent.
+    let again = dialed
+        .link
+        .stop(AgentId::from("a1"), stop_id, wait())
+        .await
+        .unwrap();
+    assert_eq!(again, StopOutcome::NotRunning);
+    let unknown = dialed
+        .link
+        .stop(AgentId::from("never-launched"), StopId::new_v4(), wait())
+        .await
+        .unwrap();
+    assert_eq!(unknown, StopOutcome::NotRunning);
     node.stop().await;
 }
