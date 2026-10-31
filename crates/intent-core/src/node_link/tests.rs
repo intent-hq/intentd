@@ -85,10 +85,13 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_starts_at_protocol_6() {
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 6, max: 6 });
-    ensure_protocol(6).unwrap();
-    for peer in [0, 4, 5, NODE_LINK_PROTOCOLS.max + 1] {
+fn the_daemon_to_daemon_link_speaks_protocol_7_only() {
+    // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
+    // send `stopAck`, so it never links: a backend must not take a stop as
+    // confirmed by a machine that cannot confirm it.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 7 });
+    ensure_protocol(7).unwrap();
+    for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
         assert!(matches!(
             ensure_protocol(peer),
             Err(Error::InvalidParams(m)) if m.starts_with("node-link-version-mismatch")
@@ -339,6 +342,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "journal",
             "replayComplete",
             "request",
+            "stopAck",
             "welcome"
         ]
     );
@@ -366,7 +370,7 @@ fn every_frame() -> Vec<LinkFrame> {
             acked_seq: NodeCounter(10),
         }),
         LinkFrame::Welcome(LinkWelcome {
-            protocol: 6,
+            protocol: 7,
             node_id: "node-1".into(),
             running_agents: vec![agent_id.clone()],
             capabilities: capabilities(),
@@ -400,6 +404,17 @@ fn every_frame() -> Vec<LinkFrame> {
         },
         LinkFrame::Stop {
             agent_id: agent_id.clone(),
+            stop_id: request_id,
+        },
+        LinkFrame::StopAck {
+            stop_id: request_id,
+            agent_id: agent_id.clone(),
+            outcome: StopOutcome::Stopped,
+        },
+        LinkFrame::StopAck {
+            stop_id: request_id,
+            agent_id: agent_id.clone(),
+            outcome: StopOutcome::NotRunning,
         },
         LinkFrame::Journal(record(
             11,
@@ -470,8 +485,9 @@ fn frames_are_routed_to_their_lane() {
     assert_eq!(
         lanes,
         [
-            Control, Control, Control, Control, Control, Control, Control, Control, Journal,
-            Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control, Control
+            Control, Control, Control, Control, Control, Control, Control, Control, Control,
+            Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
+            Control
         ]
     );
 }
@@ -505,6 +521,58 @@ fn frame_wire_shapes_are_tagged_camel_case() {
         journal["body"],
         json!({ "kind": "turnEnded", "stopReason": "cancelled" })
     );
+}
+
+#[test]
+fn stop_and_stop_ack_wire_shapes() {
+    let agent_id = AgentId::new();
+    let stop_id = StopId::new_v4();
+    assert_eq!(
+        serde_json::to_value(LinkFrame::Stop {
+            agent_id: agent_id.clone(),
+            stop_id,
+        })
+        .unwrap(),
+        json!({ "type": "stop", "agentId": agent_id.0, "stopId": stop_id.to_string() })
+    );
+    for (outcome, wire) in [
+        (StopOutcome::Stopped, "stopped"),
+        (StopOutcome::NotRunning, "not-running"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(LinkFrame::StopAck {
+                stop_id,
+                agent_id: agent_id.clone(),
+                outcome,
+            })
+            .unwrap(),
+            json!({
+                "type": "stopAck",
+                "stopId": stop_id.to_string(),
+                "agentId": agent_id.0,
+                "outcome": wire,
+            })
+        );
+    }
+    // Protocol 7 requires the stop id: a stop without one is malformed.
+    assert!(LinkFrame::decode(
+        json!({ "type": "stop", "agentId": agent_id.0 })
+            .to_string()
+            .as_bytes()
+    )
+    .is_err());
+    assert!(LinkFrame::decode(
+        json!({ "type": "stop", "agentId": agent_id.0, "stopId": "not-a-uuid" })
+            .to_string()
+            .as_bytes()
+    )
+    .is_err());
+    assert!(LinkFrame::decode(
+        json!({ "type": "stopAck", "stopId": stop_id.to_string(), "agentId": agent_id.0, "outcome": "notRunning" })
+            .to_string()
+            .as_bytes()
+    )
+    .is_err());
 }
 
 #[test]
@@ -621,7 +689,7 @@ fn executor_frames_match_the_documented_wire_shapes() {
 
     let welcome = serde_json::to_value(&every_frame()[1]).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["protocol"], 6);
+    assert_eq!(welcome["protocol"], 7);
     assert_eq!(welcome["hosts"], json!(["192.168.1.20"]));
     assert_eq!(welcome["tcAddress"], "mac-mini.tc");
     let mut no_tailcat = welcome.clone();

@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use intent_core::node_link::{
-    LeaseBinding, LinkFrame, LinkId, LinkOutcome, LinkRequest, LinkRpcError,
+    LeaseBinding, LinkFrame, LinkId, LinkOutcome, LinkRequest, LinkRpcError, StopId, StopOutcome,
 };
 use intent_core::{AgentId, Error, Result};
 
@@ -71,6 +71,9 @@ struct Inner {
     out: mpsc::Sender<Outbound>,
     urgent: mpsc::Sender<Message>,
     pending: Mutex<HashMap<LinkId, oneshot::Sender<LinkOutcome>>>,
+    /// Stops waiting for their acknowledgement, by stop id: the agent the
+    /// stop is for and every caller waiting on that id.
+    stops: Mutex<HashMap<StopId, PendingStop>>,
     inbound: Mutex<HashMap<LinkId, watch::Sender<bool>>>,
     close: watch::Sender<bool>,
     /// The close frame to send when the link shuts, if not a plain close.
@@ -88,6 +91,7 @@ impl Inner {
     fn shut(&self) {
         self.close.send_replace(true);
         lock(&self.pending).clear();
+        lock(&self.stops).clear();
         for (_, cancel) in lock(&self.inbound).drain() {
             cancel.send_replace(true);
         }
@@ -136,6 +140,31 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn closed_error() -> Error {
     Error::Internal(codes::CLOSED.into())
+}
+
+/// The callers waiting for one stop's acknowledgement.
+struct PendingStop {
+    agent_id: AgentId,
+    waiters: Vec<oneshot::Sender<StopOutcome>>,
+}
+
+/// Withdraws a [`NodeLink::stop`] caller's waiter when it gives up (timeout,
+/// closure, or the future is dropped), keeping other callers on the id.
+struct StopGuard<'a> {
+    inner: &'a Inner,
+    stop_id: StopId,
+}
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        let mut stops = lock(&self.inner.stops);
+        if let Some(pending) = stops.get_mut(&self.stop_id) {
+            pending.waiters.retain(|waiter| !waiter.is_closed());
+            if pending.waiters.is_empty() {
+                stops.remove(&self.stop_id);
+            }
+        }
+    }
 }
 
 /// One established, authenticated link. Cloning shares the link.
@@ -317,6 +346,7 @@ impl NodeLink {
             out,
             urgent,
             pending: Mutex::new(HashMap::new()),
+            stops: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             close,
             close_frame: Mutex::new(None),
@@ -406,6 +436,58 @@ impl NodeLink {
             }
             () = super::wait_true(&mut close) => Err(closed_error()),
         }
+    }
+
+    /// Backend side: ask the machine to stop `agent_id` and wait up to
+    /// `timeout` for the `stopAck` carrying `stop_id`. Only that
+    /// acknowledgement confirms the stop: an ack for another stop id (an
+    /// older stop of the same agent, say) never does, and acks for ids
+    /// nobody waits on are ignored. Concurrent calls with the same
+    /// `stop_id` each send the stop and all resolve on its first ack. On a
+    /// timeout nothing is remembered: the stop stays unconfirmed, and the
+    /// caller resends it with the same `stop_id`, on this link or after a
+    /// reconnect.
+    ///
+    /// # Errors
+    ///
+    /// `node-link-timeout` after `timeout`; `node-link-closed` when the link
+    /// closes first.
+    pub async fn stop(
+        &self,
+        agent_id: AgentId,
+        stop_id: StopId,
+        timeout: Duration,
+    ) -> Result<StopOutcome> {
+        if self.is_closed() {
+            return Err(closed_error());
+        }
+        let (tx, rx) = oneshot::channel();
+        lock(&self.inner.stops)
+            .entry(stop_id)
+            .or_insert_with(|| PendingStop {
+                agent_id: agent_id.clone(),
+                waiters: Vec::new(),
+            })
+            .waiters
+            .push(tx);
+        let _guard = StopGuard {
+            inner: &self.inner,
+            stop_id,
+        };
+        // Closing between the check above and the registration cleared
+        // the table without this waiter: fail now rather than at the
+        // timeout.
+        if self.is_closed() {
+            return Err(closed_error());
+        }
+        let frame = LinkFrame::Stop { agent_id, stop_id };
+        let exchange = async {
+            self.send_any(&frame, None).await?;
+            rx.await.map_err(|_| closed_error())
+        };
+        tokio::time::timeout(timeout, exchange)
+            .await
+            .map_err(|_| Error::Internal(codes::TIMEOUT.into()))?
     }
 
     /// Call `method` on the peer for `agent_id` and wait up to `timeout`
@@ -593,6 +675,30 @@ async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<I
         } => {
             if let Some(tx) = lock(&inner.pending).remove(&request_id) {
                 let _ = tx.send(outcome);
+            }
+            true
+        }
+        LinkFrame::StopAck {
+            stop_id,
+            agent_id,
+            outcome,
+        } => {
+            let mut stops = lock(&inner.stops);
+            match stops.get(&stop_id) {
+                Some(pending) if pending.agent_id == agent_id => {
+                    if let Some(pending) = stops.remove(&stop_id) {
+                        for waiter in pending.waiters {
+                            let _ = waiter.send(outcome);
+                        }
+                    }
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        code = codes::PROTOCOL,
+                        "node link: stop acknowledgement names another agent; ignored"
+                    );
+                }
+                None => tracing::debug!("node link: acknowledgement for an unknown stop; ignored"),
             }
             true
         }

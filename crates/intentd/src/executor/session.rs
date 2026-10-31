@@ -11,13 +11,14 @@
 //! acknowledge nothing, and cannot move the journal back to its lease.
 
 use intent_core::node_link::{
-    LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError, MachineCapabilities,
+    LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError, MachineCapabilities, StopId,
 };
 use intent_core::nodes::NodeCounter;
+use intent_core::AgentId;
 use intent_core::BoxFuture;
 use intent_transport::node_link::{LinkEvent, LinkEvents, NodeLink};
 
-use super::runner::Runner;
+use super::runner::{Runner, StopWait};
 
 /// JSON-RPC "method not found": the node serves no head-to-node requests yet.
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -86,7 +87,47 @@ enum Applied {
     Stale,
     /// The frame was invalid for this link; close it.
     Close,
+    /// A stop was applied for the current session: send its
+    /// acknowledgement once [`PendingAck::ack`] resolves.
+    Stopping(PendingAck),
 }
+
+/// The acknowledgement owed for one stop, sent once the stop is applied.
+pub(super) struct PendingAck {
+    stop_id: StopId,
+    agent_id: AgentId,
+    wait: StopWait,
+}
+
+impl PendingAck {
+    /// Wait until the stop is applied, then build its `stopAck`; `None`
+    /// when it may not be acknowledged (the exit record was not journaled).
+    pub(super) async fn ack(self) -> Option<LinkFrame> {
+        let outcome = self.wait.wait().await?;
+        Some(LinkFrame::StopAck {
+            stop_id: self.stop_id,
+            agent_id: self.agent_id,
+            outcome,
+        })
+    }
+}
+
+impl std::fmt::Debug for PendingAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAck")
+            .field("stop_id", &self.stop_id)
+            .field("agent_id", &self.agent_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PendingAck {
+    fn eq(&self, other: &Self) -> bool {
+        (self.stop_id, &self.agent_id) == (other.stop_id, &other.agent_id)
+    }
+}
+
+impl Eq for PendingAck {}
 
 /// Apply one control or journal frame for `binding`'s session.
 async fn apply(
@@ -108,7 +149,17 @@ async fn apply(
             prompt,
         } => runner.prompt(&agent_id, turn_id, prompt).await,
         LinkFrame::Cancel { agent_id } => runner.cancel(&agent_id).await,
-        LinkFrame::Stop { agent_id } => runner.stop(&agent_id),
+        LinkFrame::Stop { agent_id, stop_id } => {
+            // Under the gate, so a replaced session stops nothing; the
+            // acknowledgement waits outside it, so a slow teardown holds up
+            // no other frame.
+            let wait = runner.stop(&agent_id);
+            return Applied::Stopping(PendingAck {
+                stop_id,
+                agent_id,
+                wait,
+            });
+        }
         LinkFrame::Ack { seq } => {
             if let Err(error) = runner
                 .with_journal(move |journal| journal.acknowledge(seq))
@@ -185,8 +236,20 @@ pub(super) async fn serve_link(
                 });
             }
             LinkEvent::Frame(frame) => {
-                if apply(&runner, &binding, || link.is_closed(), frame).await == Applied::Close {
-                    link.close();
+                match apply(&runner, &binding, || link.is_closed(), frame).await {
+                    Applied::Close => link.close(),
+                    Applied::Stopping(pending) => {
+                        let link = link.clone();
+                        // caller-binding: allow — acknowledges one applied stop on its link
+                        tokio::spawn(async move {
+                            // No ack, or a link that closed meanwhile: the
+                            // backend resends the stop.
+                            if let Some(ack) = pending.ack().await {
+                                let _ = link.send(&ack).await;
+                            }
+                        });
+                    }
+                    Applied::Done | Applied::Stale => {}
                 }
             }
             LinkEvent::Request(request) => {

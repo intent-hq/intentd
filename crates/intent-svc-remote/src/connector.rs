@@ -159,6 +159,7 @@ impl Shared {
         for agent_id in agents {
             let frame = LinkFrame::Stop {
                 agent_id: agent_id.clone(),
+                stop_id: intent_core::node_link::StopId::new_v4(),
             };
             if link.send(&frame).await.is_err() {
                 return;
@@ -583,6 +584,7 @@ async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
                 tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
                 let stop = LinkFrame::Stop {
                     agent_id: agent_id.clone(),
+                    stop_id: intent_core::node_link::StopId::new_v4(),
                 };
                 if link.send(&stop).await.is_err() {
                     return;
