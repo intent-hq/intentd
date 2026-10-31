@@ -3513,6 +3513,77 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     );
 }
 
+/// Plain-folder create rejections (§5.1 "Plain-folder workspaces") carry the
+/// documented machine-readable `error.data`.
+#[test]
+fn plain_folder_errors_map_to_machine_readable_codes() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderInvalidParams(
+        "isNewRepo cannot be combined with plainFolder".to_string(),
+    ));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(rpc.data, Some(serde_json::json!({ "code": "invalid-params" })));
+    assert!(rpc.message.contains("isNewRepo"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+        intent_core::PlainFolderPathRejection {
+            reason: intent_core::PlainFolderPathReason::InsideGitRepo,
+            path: "/home/u/repo/docs".to_string(),
+            repository_root: Some("/home/u/repo".to_string()),
+        },
+    )));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-path-rejected",
+            "reason": "inside-git-repo",
+            "path": "/home/u/repo/docs",
+            "repositoryRoot": "/home/u/repo",
+        }))
+    );
+    assert!(rpc.message.contains("/home/u/repo"), "{}", rpc.message);
+
+    for (reason, wire) in [
+        (intent_core::PlainFolderPathReason::InsideWorkspacesRoot, "inside-workspaces-root"),
+        (intent_core::PlainFolderPathReason::NotADirectory, "not-a-directory"),
+        (intent_core::PlainFolderPathReason::ParentMissing, "parent-missing"),
+    ] {
+        let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+            intent_core::PlainFolderPathRejection {
+                reason,
+                path: "/p".to_string(),
+                repository_root: None,
+            },
+        )));
+        assert_eq!(
+            rpc.data,
+            Some(serde_json::json!({
+                "code": "plain-folder-path-rejected", "reason": wire, "path": "/p",
+            })),
+            "{wire}"
+        );
+    }
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): the key is refused
+/// with `-32602 { code: "invalid-params" }`.
+#[tokio::test]
+async fn workspace_update_rejects_plain_folder() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.update","params":{"workspaceId":"ws-1","plainFolder":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("invalid-params"));
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("plainFolder")),
+        "{v}"
+    );
+}
+
 /// `workspace.archive` and `workspace.unarchive` return the updated
 /// `workspace` record (§5.1) — a `{success:true}` shape would force a
 /// follow-up `workspace.get` on the FE. The `archived` flag flips through

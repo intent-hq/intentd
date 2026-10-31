@@ -53,6 +53,21 @@ pub enum Error {
         checkout_mode: Option<crate::model::CheckoutMode>,
     },
 
+    /// A `workspace.create { plainFolder: true }` request-shape rejection
+    /// (§5.1 "Plain-folder workspaces"): a git-only option, a pr-kind
+    /// context link, or a missing `repositoryPath`. Same `-32602` and message
+    /// shape as [`Error::InvalidParams`], plus the documented
+    /// `error.data = { code: "invalid-params" }`.
+    #[error("invalid params: {0}")]
+    PlainFolderInvalidParams(String),
+
+    /// `workspace.create { plainFolder: true }` named a path that cannot hold
+    /// a plain folder (§5.1). Raised before any side effect. Surfaces as
+    /// `-32602` with `error.data = { code: "plain-folder-path-rejected",
+    /// reason, path, repositoryRoot? }`. Boxed to keep [`Error`] small.
+    #[error("{}", .0.message())]
+    PlainFolderPathRejected(Box<PlainFolderPathRejection>),
+
     /// A §5.56 secret-request call failed for a typed reason
     /// (`secret-request-unknown`, `invalid-params`, `secret-unavailable`).
     /// Surfaces as `-32602` with `error.data = { code }`. The message names
@@ -598,6 +613,8 @@ impl Error {
             | Error::NotFound(_)
             | Error::WorkspaceRetired { .. }
             | Error::RetireUnsupported { .. }
+            | Error::PlainFolderInvalidParams(_)
+            | Error::PlainFolderPathRejected(_)
             | Error::SecretRequest { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
@@ -632,6 +649,68 @@ impl Error {
             Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),
+        }
+    }
+}
+
+/// Why a plain-folder create path was refused (§5.1 `reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainFolderPathReason {
+    /// The folder (or, for a new folder, its parent) is a git repository or
+    /// inside one.
+    InsideGitRepo,
+    /// The path is the daemon workspaces root or inside it.
+    InsideWorkspacesRoot,
+    /// The path exists and is not a directory.
+    NotADirectory,
+    /// The path does not exist and neither does its parent.
+    ParentMissing,
+}
+
+impl PlainFolderPathReason {
+    /// Wire `error.data.reason` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsideGitRepo => "inside-git-repo",
+            Self::InsideWorkspacesRoot => "inside-workspaces-root",
+            Self::NotADirectory => "not-a-directory",
+            Self::ParentMissing => "parent-missing",
+        }
+    }
+}
+
+/// Payload of [`Error::PlainFolderPathRejected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainFolderPathRejection {
+    pub reason: PlainFolderPathReason,
+    /// The requested (tilde-expanded) `repositoryPath`.
+    pub path: String,
+    /// Top level of the enclosing repository, for `InsideGitRepo` only.
+    pub repository_root: Option<String>,
+}
+
+impl PlainFolderPathRejection {
+    /// Human-readable `error.message`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self.reason {
+            PlainFolderPathReason::InsideGitRepo => format!(
+                "{} is inside the git repository {}; choose a folder outside any git repository or create a git workspace",
+                self.path,
+                self.repository_root.as_deref().unwrap_or("(unknown)")
+            ),
+            PlainFolderPathReason::InsideWorkspacesRoot => format!(
+                "{} is inside the Intent workspaces folder; choose a folder outside it",
+                self.path
+            ),
+            PlainFolderPathReason::NotADirectory => {
+                format!("{} exists and is not a folder", self.path)
+            }
+            PlainFolderPathReason::ParentMissing => format!(
+                "{} does not exist and neither does its parent folder",
+                self.path
+            ),
         }
     }
 }

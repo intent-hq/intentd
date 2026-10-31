@@ -739,7 +739,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map_or(Value::Null, |s| Value::String(s.to_string()));
-            Ok(json!({
+            let mut out = json!({
                 "id": w.id.as_str(),
                 "title": if title.is_empty() { "(untitled)" } else { title },
                 "hasTitle": has_title,
@@ -750,7 +750,14 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
                 "repositoryName": w.repository_name,
                 "tags": w.tags,
                 "setupStatus": setup_status,
-            }))
+            });
+            // A plain-folder workspace has no branch (§5.1): omit the key.
+            if w.plain_folder {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("branch");
+                }
+            }
+            Ok(out)
         }
         Err(Error::NotFound(_)) => Ok(json!({
             "id": ws.as_str(),

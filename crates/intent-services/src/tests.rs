@@ -31,6 +31,7 @@ mod workspace_create_future_size;
 mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -781,6 +782,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
     row.label = Some("Customer escalations for later".to_string());
     row.auto_archive_disabled = true;
+    row.plain_folder = true;
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(

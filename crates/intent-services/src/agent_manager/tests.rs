@@ -19625,6 +19625,29 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     assert_eq!(resolved.cwd, std::env::temp_dir());
 }
 
+/// A plain-folder workspace (§5.1) has no worktree and no branch: its agents
+/// spawn in the user's folder at `repository_path`.
+#[tokio::test]
+async fn resolve_spawn_uses_the_plain_folder() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
+    let folder_guard = test_tempdir("intentd-rs-plain-");
+    let folder = folder_guard.path().to_path_buf();
+    let workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-plain"),
+        title: "WS".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(folder.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
+        .expect("plain folder resolves");
+    assert_eq!(resolved.cwd, folder, "cwd is the plain folder");
+}
+
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
 /// direct-mode row missing `worktree_path`, intent-hq/monorepo#2611)
 /// resolves its spawn cwd to the repository folder — never the temp dir.

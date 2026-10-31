@@ -27,7 +27,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity, retired_at, label, auto_archive_disabled";
+    browser_client_id, last_content_activity, retired_at, label, auto_archive_disabled, plain_folder";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -263,7 +263,7 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -304,6 +304,7 @@ impl Store {
             .bind(&ws.retired_at)
             .bind(&ws.label)
             .bind(i64::from(ws.auto_archive_disabled))
+            .bind(i64::from(ws.plain_folder))
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -372,6 +373,8 @@ impl Store {
     /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
     /// Likewise `auto_archive_disabled` moves only through
     /// [`Self::set_workspace_auto_archive_disabled`].
+    /// `plain_folder` is insert-only: no update path ever writes it (§5.1
+    /// "Plain-folder workspaces").
     ///
     /// # Errors
     ///
@@ -2084,6 +2087,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
         label: col(row, "label")?,
         auto_archive_disabled: col::<i64>(row, "auto_archive_disabled")? != 0,
+        plain_folder: col::<i64>(row, "plain_folder")? != 0,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
         // wait/script/background flags, `cowSupported`, `diskUsage`,

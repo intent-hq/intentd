@@ -62,6 +62,7 @@ mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
 mod auto_archive;
+mod plain_folder;
 mod auto_retire;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
@@ -21558,6 +21559,11 @@ impl WorkspaceApi for Services {
         mut input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        // Plain-folder request shape (§5.1): refused before the native
+        // checkout preparation or any other step can run.
+        if let Err(e) = plain_folder::validate_create_shape(&input) {
+            return Box::pin(async move { Err(e) });
+        }
         let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
@@ -21675,6 +21681,28 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
+                    // Plain-folder path (§5.1 "Plain-folder workspaces"):
+                    // read-only classification against the workspaces root
+                    // and any configured worktrees location, before any side
+                    // effect. A new folder is created only right before the
+                    // row insert.
+                    let plain_target = if plain_folder::requested(&input) {
+                        let mut roots = vec![workspaces_root
+                            .clone()
+                            .unwrap_or_else(default_workspaces_root)];
+                        let location = worktrees_location.trim();
+                        if !location.is_empty() {
+                            roots.push(PathBuf::from(intent_core::expand_tilde_string(location)));
+                        }
+                        let path = input.repository_path.as_deref().map(PathBuf::from).ok_or_else(|| {
+                            Error::PlainFolderInvalidParams(
+                                "repositoryPath is required when plainFolder is true".into(),
+                            )
+                        })?;
+                        Some(plain_folder::resolve_target(&path, &roots)?)
+                    } else {
+                        None
+                    };
                     // Unified provisioning progress (PROTOCOL §5.1): a
                     // client-supplied `progressId` arms a per-create reporter
                     // that echoes the id on every `git:clone:*` frame,
@@ -22509,9 +22537,11 @@ impl WorkspaceApi for Services {
                     // pair (`generateWorkspaceSlug`) — under the optional
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
-                    let branch_auto_generated =
-                        input.branch.as_deref().is_none_or(str::is_empty);
-                    let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
+                    let branch_auto_generated = plain_target.is_none()
+                        && input.branch.as_deref().is_none_or(str::is_empty);
+                    // A plain folder has no git branch: empty, omitted on the
+                    // wire (§5.1).
+                    let branch = if plain_target.is_some() { String::new() } else if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
                         let slug = planned_initial_agent
                             .as_ref()
                             .and_then(|(_, prompt, _)| prompt.as_deref())
@@ -22627,6 +22657,7 @@ impl WorkspaceApi for Services {
                         // Validated pre-insert above; an empty list persists
                         // as absent so the wire shape omits it (§5.1).
                         context_links: input.context_links.filter(|l| !l.is_empty()),
+                        plain_folder: plain_target.is_some(),
                         // `activity` is derived (§9.9) and the card aggregates
                         // are computed on the list/get emit path only.
                         ..Default::default()
@@ -23056,7 +23087,7 @@ impl WorkspaceApi for Services {
                                 }
                             }
                         }
-                    } else if let Some(repo_dir) = repo_dir {
+                    } else if let Some(repo_dir) = repo_dir.filter(|_| !ws.plain_folder) {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {
                                 let repo_name = known_repo_name(
@@ -23408,13 +23439,27 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
+                    // Plain folder (§5.1): the only filesystem side effect is
+                    // creating a requested new folder, right before the row.
+                    let created_plain_folder = match &plain_target {
+                        Some(target) => target.materialize()?,
+                        None => false,
+                    };
                     if let Some(checkout) = &native_checkout {
                         boxed_await(|| checkout.insert(ws.clone(), global_auto_commit)).await?;
-                    } else {
-                        boxed_await(|| {
-                            store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        })
-                        .await?;
+                    } else if let Err(e) = boxed_await(|| {
+                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                    })
+                    .await
+                    {
+                        // Undo only the folder this create made, and only
+                        // while it is still empty.
+                        if let (true, Some(plain_folder::PlainFolderTarget::New(path))) =
+                            (created_plain_folder, plain_target.as_ref())
+                        {
+                            let _ = std::fs::remove_dir(path);
+                        }
+                        return Err(e);
                     }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
@@ -23457,11 +23502,13 @@ impl WorkspaceApi for Services {
                     if !registry_roots.contains(&boot_root) {
                         registry_roots.push(boot_root.clone());
                     }
+                    // A plain folder is not a repository: never registered.
                     let repo_path = ws
                         .repository_path
                         .as_deref()
+                        .filter(|_| !ws.plain_folder)
                         .filter(|p| !p.is_empty())
-                        .or(ws.path.as_deref())
+                        .or(ws.path.as_deref().filter(|_| !ws.plain_folder))
                         .filter(|p| !p.is_empty())
                         .filter(|p| {
                             !is_workspace_owned_checkout(
@@ -23520,7 +23567,9 @@ impl WorkspaceApi for Services {
                     if let Some(checkout) = &native_checkout {
                         boxed_await(|| checkout.current()).await?;
                     }
-                    let setup_worktree = if ws.skip_worktree {
+                    // Plain folders run no setup script (§5.1): the folder is
+                    // the user's, not a provisioned checkout.
+                    let setup_worktree = if ws.skip_worktree || ws.plain_folder {
                         None
                     } else {
                         crate::git_ops::worktree_path(&ws)

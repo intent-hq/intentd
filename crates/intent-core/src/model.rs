@@ -338,6 +338,10 @@ pub enum WorkspaceDisplayStatus {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub title: String,
+    /// The workspace's working branch. Empty — and then omitted on the wire —
+    /// only for plain-folder workspaces (§5.1 "Plain-folder workspaces"),
+    /// which have no git branch; every git create path names a branch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
@@ -367,6 +371,15 @@ pub struct Workspace {
     /// { autoArchiveDisabled }` (owner-only). Omitted (not `false`) while off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_archive_disabled: bool,
+    /// Plain-folder workspace (§5.1 "Plain-folder workspaces"): the workspace
+    /// works directly in the ordinary, non-git folder at `repositoryPath`
+    /// with no checkout and no forge. Set only by `workspace.create
+    /// { plainFolder: true }` and never changed afterwards (it stays `true`
+    /// if a `.git` later appears); it is the single source of truth for the
+    /// mode — never infer it from `worktreePath`, `checkoutMode` or
+    /// `skipWorktree`. Omitted (not `false`) on every other workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain_folder: bool,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -678,6 +691,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "statusImageAssetId",
     "label",
     "autoArchiveDisabled",
+    "plainFolder",
     "activity",
     "attention",
     "createdAt",
@@ -1499,6 +1513,13 @@ pub struct WorkspaceCreate {
     /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
     /// an existing git repo is a no-op.
     pub is_new_repo: Option<bool>,
+    /// Plain-folder mode (§5.1 "Plain-folder workspaces"): `true` creates a
+    /// workspace that works directly in the non-git folder named by
+    /// `repositoryPath` — an existing folder (row only) or a new one (the
+    /// daemon creates that one directory, no `.git`). Refused with git-only
+    /// options or a path the folder cannot live at. `false` / absent keeps
+    /// the legacy behavior exactly.
+    pub plain_folder: Option<bool>,
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
@@ -1682,6 +1703,17 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_present_field"
     )]
     pub auto_archive_disabled: Option<bool>,
+    /// `Workspace.plainFolder` is create-only (§5.1 "Plain-folder
+    /// workspaces"): any `plainFolder` key on an update fails
+    /// deserialization (`-32602`, `error.data.code = "invalid-params"`), so
+    /// nothing is written. Never set on a successful parse and never
+    /// serialized, so `workspace:updated` carries no `plainFolder` change.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "reject_plain_folder_update"
+    )]
+    pub plain_folder: Option<serde::de::IgnoredAny>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1754,6 +1786,19 @@ pub struct WorkspaceUpdate {
     pub attention: Option<WorkspaceAttention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): reject the key
+/// whatever its value.
+fn reject_plain_folder_update<'de, D>(
+    _deserializer: D,
+) -> std::result::Result<Option<serde::de::IgnoredAny>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "plainFolder is set only by workspace.create and cannot be changed",
+    ))
 }
 
 /// A field that is optional but, when present, must hold a non-null `T`:

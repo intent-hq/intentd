@@ -263,6 +263,31 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 data: Some(data),
             }
         }
+        // Plain-folder create shape rejection (§5.1 "Plain-folder
+        // workspaces"): -32602 with `data = { code: "invalid-params" }`.
+        ref e @ Error::PlainFolderInvalidParams(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "invalid-params" })),
+        },
+        // Plain-folder create path rejection (§5.1): -32602 with
+        // `data = { code: "plain-folder-path-rejected", reason, path,
+        // repositoryRoot? }`.
+        ref e @ Error::PlainFolderPathRejected(ref rejection) => {
+            let mut data = json!({
+                "code": "plain-folder-path-rejected",
+                "reason": rejection.reason.as_str(),
+                "path": rejection.path,
+            });
+            if let Some(root) = &rejection.repository_root {
+                data["repositoryRoot"] = json!(root);
+            }
+            RpcErr {
+                code: e.code(),
+                message: e.to_string(),
+                data: Some(data),
+            }
+        }
         // Opportunistic warm rejected because one is already in flight:
         // -32603 with machine-readable `data = { code: "warm-in-flight",
         // owner, repo }` naming the repo currently being warmed, so the FE

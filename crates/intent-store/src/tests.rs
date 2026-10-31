@@ -23,6 +23,7 @@ mod script_initialization;
 mod script_monitors;
 mod sharing;
 mod workspace_auto_archive_disabled;
+mod workspace_plain_folder;
 mod workspace_delete;
 mod workspace_label;
 mod workspace_retired;
