@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +25,8 @@ fn certificate() -> TlsCertificate {
     generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
 }
 
-fn token(text: &str) -> LeaseToken {
-    LeaseToken::new(format!("{text}{}", "x".repeat(32))).unwrap()
+fn token(text: &str) -> ExecutorToken {
+    ExecutorToken::new(format!("{text}{}", "x".repeat(32))).unwrap()
 }
 
 fn binding(generation: u64) -> LeaseBinding {
@@ -48,8 +47,8 @@ fn hello(binding: LeaseBinding) -> LinkHello {
     }
 }
 
-fn welcome() -> WelcomeFn {
-    Arc::new(|_| LinkWelcome {
+fn welcome() -> LinkWelcome {
+    LinkWelcome {
         protocol: 0,
         node_id: String::new(),
         running_agents: vec![],
@@ -64,42 +63,154 @@ fn welcome() -> WelcomeFn {
         ),
         hosts: Vec::new(),
         tc_address: None,
-    })
+    }
 }
 
+/// The executor service stand-in: hands every admitted connection to the
+/// test.
+struct TestHost {
+    accepted: tokio::sync::mpsc::UnboundedSender<NodeConnection>,
+}
+
+impl ExecutorHost for TestHost {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn node_id(&self) -> String {
+        NODE.into()
+    }
+    fn welcome(
+        &self,
+        _credential: &intent_core::machines::ExecutorCredential,
+        _hello: &LinkHello,
+    ) -> LinkWelcome {
+        welcome()
+    }
+    fn accept(
+        &self,
+        _credential: intent_core::machines::ExecutorCredential,
+        connection: NodeConnection,
+    ) {
+        let _ = self.accepted.send(connection);
+    }
+}
+
+/// A machine serving the executor link on the daemon's WSS listener, with
+/// one executor credential minted for [`HEAD`]. Its bindings live in the
+/// machine API, so they survive [`Node::restart`].
 struct Node {
-    listener: NodeListener,
+    server: crate::WsApiServer,
+    port: u16,
     certificate: TlsCertificate,
-    token: LeaseToken,
+    api: Arc<executor::MachineApi>,
+    credential: intent_core::ExecutorCredentialId,
+    accepted: tokio::sync::mpsc::UnboundedReceiver<NodeConnection>,
+    token: ExecutorToken,
     dir: tempfile::TempDir,
 }
 
 impl Node {
-    async fn start(token: LeaseToken) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let certificate = certificate();
-        let listener = bind_node(&dir, &certificate, &token, "127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+    async fn start(token: ExecutorToken) -> Self {
+        Self::start_with(token, 0, Tuning::default()).await
+    }
+
+    async fn start_with(token: ExecutorToken, port: u16, tuning: Tuning) -> Self {
+        let api = Arc::new(executor::MachineApi::new());
+        let credential = api.add(token.expose(), executor::credential(HEAD)).id;
+        Self::serve(
+            api,
+            credential,
+            certificate(),
+            token,
+            port,
+            tuning,
+            tempfile::tempdir().unwrap(),
+        )
+        .await
+    }
+
+    async fn serve(
+        api: Arc<executor::MachineApi>,
+        credential: intent_core::ExecutorCredentialId,
+        certificate: TlsCertificate,
+        token: ExecutorToken,
+        port: u16,
+        tuning: Tuning,
+        dir: tempfile::TempDir,
+    ) -> Self {
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let tokens = Arc::new(crate::AsyncTokenStore::new(Arc::new(executor::OwnerToken)));
+        let options = crate::WsOptions {
+            base_port: port,
+            ..crate::WsOptions::default()
+        };
+        let mut server = crate::WsApiServer::new(
+            api.clone() as Arc<dyn intent_core::WorkspaceApi>,
+            bus,
+            &certificate,
+            &tokens,
+            options,
+            None,
+        )
+        .unwrap();
+        let (tx, accepted) = tokio::sync::mpsc::unbounded_channel();
+        server.install_executor_links(ExecutorLinks::with_tuning(
+            Arc::new(TestHost { accepted: tx }),
+            tuning,
+        ));
+        let port = server.start().await.unwrap();
         Self {
-            listener,
+            server,
+            port,
             certificate,
+            api,
+            credential,
+            accepted,
             token,
             dir,
         }
     }
 
+    /// Stop the listener and serve the same machine (credential, bindings,
+    /// certificate) on a fresh port.
+    async fn restart(self) -> Self {
+        self.server.stop().await;
+        Self::serve(
+            self.api,
+            self.credential,
+            self.certificate,
+            self.token,
+            0,
+            Tuning::default(),
+            self.dir,
+        )
+        .await
+    }
+
+    fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
     fn endpoint(&self) -> NodeEndpoint {
         NodeEndpoint {
-            url: format!("wss://{}", self.listener.local_addr()),
+            url: format!("wss://{}", self.address()),
             pin: CertificatePin::parse(&self.certificate.fingerprint256).unwrap(),
             token: self.token.clone(),
             tailcat: None,
         }
     }
 
+    /// The credential's persisted binding.
+    fn binding(&self) -> Option<LeaseBinding> {
+        self.api.binding_of(&self.credential)
+    }
+
     async fn accept_link(&mut self) -> (NodeLink, LinkEvents, LinkHello) {
-        match tokio::time::timeout(wait(), self.listener.accept()).await {
+        match tokio::time::timeout(wait(), self.accepted.recv()).await {
             Ok(Some(NodeConnection::Link {
                 link,
                 events,
@@ -110,7 +221,7 @@ impl Node {
     }
 
     async fn accept_git(&mut self) -> GitConnection {
-        match tokio::time::timeout(wait(), self.listener.accept()).await {
+        match tokio::time::timeout(wait(), self.accepted.recv()).await {
             Ok(Some(NodeConnection::Git(git))) => git,
             other => panic!("expected a git connection, got {other:?}"),
         }
@@ -120,32 +231,13 @@ impl Node {
         assert!(
             tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_millis(300)),
-                self.listener.accept(),
+                self.accepted.recv(),
             )
             .await
             .is_err(),
             "no connection may be admitted"
         );
     }
-}
-
-async fn bind_node(
-    dir: &tempfile::TempDir,
-    certificate: &TlsCertificate,
-    token: &LeaseToken,
-    address: SocketAddr,
-) -> Result<NodeListener, intent_core::Error> {
-    NodeListener::bind(
-        address,
-        NodeListenerConfig {
-            node_id: NODE.into(),
-            token: token.clone(),
-            binding_file: BindingFile::new(dir.path().join("binding.json")),
-            certificate: certificate.clone(),
-        },
-        welcome(),
-    )
-    .await
 }
 
 fn code(error: &intent_core::Error) -> &str {
@@ -168,7 +260,7 @@ async fn binds_and_exchanges_frames() {
     let (node_link, mut node_events, node_hello) = node.accept_link().await;
     assert_eq!(node_hello.binding, binding(1));
     assert_eq!(node_link.binding(), &binding(1));
-    assert_eq!(node.listener.binding(), Some(binding(1)));
+    assert_eq!(node.binding(), Some(binding(1)));
 
     let agent_id = AgentId::new();
     dialed
@@ -224,7 +316,7 @@ async fn wrong_pin_is_rejected_before_the_token_is_sent() {
     assert_eq!(code(&error), codes::CERTIFICATE_MISMATCH);
     assert!(!is_retryable(&error));
     node.nothing_admitted().await;
-    assert_eq!(node.listener.binding(), None);
+    assert_eq!(node.binding(), None);
 }
 
 #[tokio::test]
@@ -238,7 +330,7 @@ async fn wrong_token_is_rejected() {
     let error = dial_git(&endpoint, &binding(1)).await.unwrap_err();
     assert_eq!(code(&error), codes::UNAUTHORIZED);
     node.nothing_admitted().await;
-    assert_eq!(node.listener.binding(), None);
+    assert_eq!(node.binding(), None);
 }
 
 #[tokio::test]
@@ -258,44 +350,24 @@ async fn lower_or_equal_generation_is_rejected() {
         assert!(is_retryable(&error));
     }
     node.nothing_admitted().await;
-    assert_eq!(node.listener.binding(), Some(binding(5)));
+    assert_eq!(node.binding(), Some(binding(5)));
 }
 
 #[tokio::test]
 async fn generation_survives_a_node_restart() {
     let node = Node::start(token("t")).await;
     let _link = dial(&node, 7).await;
-    let address = node.listener.local_addr();
-    let Node {
-        listener,
-        certificate,
-        token,
-        dir,
-    } = node;
-    drop(listener);
-    let persisted = BindingFile::new(dir.path().join("binding.json"))
-        .load()
-        .unwrap();
-    assert_eq!(persisted, Some(binding(7)));
-
-    let listener = bind_node(&dir, &certificate, &token, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    assert_ne!(listener.local_addr(), address);
-    let mut node = Node {
-        listener,
-        certificate,
-        token,
-        dir,
-    };
-    assert_eq!(node.listener.binding(), Some(binding(7)));
+    let address = node.address();
+    let mut node = node.restart().await;
+    assert_ne!(node.address(), address);
+    assert_eq!(node.binding(), Some(binding(7)));
     let error = dial_link(&node.endpoint(), hello(binding(7)))
         .await
         .unwrap_err();
     assert_eq!(code(&error), codes::STALE);
     let _newer = dial(&node, 8).await;
     let _ = node.accept_link().await;
-    assert_eq!(node.listener.binding(), Some(binding(8)));
+    assert_eq!(node.binding(), Some(binding(8)));
 }
 
 #[tokio::test]
@@ -319,7 +391,7 @@ async fn another_head_or_node_is_rejected() {
         .unwrap_err();
     assert_eq!(code(&error), codes::WRONG_NODE);
     node.nothing_admitted().await;
-    assert_eq!(node.listener.binding(), Some(binding(1)));
+    assert_eq!(node.binding(), Some(binding(1)));
 }
 
 #[tokio::test]
@@ -337,7 +409,7 @@ async fn protocol_mismatch_is_rejected() {
         .to_string()
         .contains(&format!("node speaks {}", NODE_LINK_PROTOCOLS.max)));
     node.nothing_admitted().await;
-    assert_eq!(node.listener.binding(), None);
+    assert_eq!(node.binding(), None);
 }
 
 #[tokio::test]
@@ -442,15 +514,17 @@ fn echo_requests(mut events: LinkEvents) {
     });
 }
 
+/// The machine forwards requests to the backend; a backend-initiated
+/// request is outside the executor frame list and closes the link (see
+/// `frames_outside_the_executor_list_close_the_link`).
 #[tokio::test]
-async fn rpc_round_trips_in_both_directions() {
+async fn rpc_round_trips_from_the_machine_to_the_backend() {
     let mut node = Node::start(token("t")).await;
     let head = dial(&node, 1).await;
     let (node_link, node_events, _) = node.accept_link().await;
     echo_requests(node_events);
     echo_requests(head.events);
-    let outcome = head
-        .link
+    let outcome = node_link
         .call(AgentId::new(), "agent.status", json!({}), wait())
         .await
         .unwrap();
@@ -468,15 +542,15 @@ async fn rpc_round_trips_in_both_directions() {
 #[tokio::test]
 async fn incoming_request_carries_the_link_binding() {
     let mut node = Node::start(token("t")).await;
-    let head = dial(&node, 4).await;
-    let (_node_link, mut node_events, _) = node.accept_link().await;
+    let mut head = dial(&node, 4).await;
+    let (node_link, _node_events, _) = node.accept_link().await;
     let agent_id = AgentId::new();
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         let agent_id = agent_id.clone();
         tokio::spawn(async move { link.call(agent_id, "x", json!(null), wait()).await })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head.events.recv())
         .await
         .unwrap()
     else {
@@ -493,10 +567,10 @@ async fn incoming_request_carries_the_link_binding() {
 #[tokio::test]
 async fn timed_out_call_cancels_the_peer_request() {
     let mut node = Node::start(token("t")).await;
-    let head = dial(&node, 1).await;
-    let (_node_link, mut node_events, _) = node.accept_link().await;
+    let mut head = dial(&node, 1).await;
+    let (node_link, _node_events, _) = node.accept_link().await;
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         tokio::spawn(async move {
             link.call(
                 AgentId::new(),
@@ -507,7 +581,7 @@ async fn timed_out_call_cancels_the_peer_request() {
             .await
         })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head.events.recv())
         .await
         .unwrap()
     else {
@@ -526,13 +600,13 @@ async fn timed_out_call_cancels_the_peer_request() {
 #[tokio::test]
 async fn dropping_a_call_cancels_the_peer_request() {
     let mut node = Node::start(token("t")).await;
-    let head = dial(&node, 1).await;
-    let (_node_link, mut node_events, _) = node.accept_link().await;
+    let mut head = dial(&node, 1).await;
+    let (node_link, _node_events, _) = node.accept_link().await;
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         tokio::spawn(async move { link.call(AgentId::new(), "slow", json!({}), wait()).await })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head.events.recv())
         .await
         .unwrap()
     else {
@@ -548,14 +622,14 @@ async fn dropping_a_call_cancels_the_peer_request() {
 async fn dropped_request_answers_with_an_error() {
     let mut node = Node::start(token("t")).await;
     let head = dial(&node, 1).await;
-    let (_node_link, mut node_events, _) = node.accept_link().await;
+    let (node_link, _node_events, _) = node.accept_link().await;
+    let mut head_events = head.events;
     tokio::spawn(async move {
-        while let Some(event) = node_events.recv().await {
+        while let Some(event) = head_events.recv().await {
             drop(event);
         }
     });
-    let outcome = head
-        .link
+    let outcome = node_link
         .call(AgentId::new(), "x", json!({}), wait())
         .await
         .unwrap();
@@ -569,18 +643,19 @@ async fn dropped_request_answers_with_an_error() {
 async fn closing_the_link_fails_pending_calls_and_cancels_requests() {
     let mut node = Node::start(token("t")).await;
     let head = dial(&node, 1).await;
-    let (node_link, mut node_events, _) = node.accept_link().await;
+    let (node_link, node_events, _) = node.accept_link().await;
+    let mut head_events = head.events;
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         tokio::spawn(async move { link.call(AgentId::new(), "slow", json!({}), wait()).await })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head_events.recv())
         .await
         .unwrap()
     else {
         panic!("expected a request");
     };
-    node_link.close();
+    head.link.close();
     tokio::time::timeout(wait(), request.cancelled())
         .await
         .unwrap();
@@ -590,11 +665,11 @@ async fn closing_the_link_fails_pending_calls_and_cancels_requests() {
         .unwrap()
         .unwrap_err();
     assert_eq!(code(&error), codes::CLOSED);
-    tokio::time::timeout(wait(), head.link.closed())
+    tokio::time::timeout(wait(), node_link.closed())
         .await
         .unwrap();
-    let mut head_events = head.events;
-    assert!(tokio::time::timeout(wait(), head_events.recv())
+    let mut node_events = node_events;
+    assert!(tokio::time::timeout(wait(), node_events.recv())
         .await
         .unwrap()
         .is_none());
@@ -619,7 +694,6 @@ async fn heartbeats_keep_an_idle_link_open() {
 
 #[tokio::test]
 async fn reconnects_with_backoff_once_the_node_is_up() {
-    let dir = tempfile::tempdir().unwrap();
     let certificate = certificate();
     let token = token("t");
     let address = {
@@ -647,22 +721,27 @@ async fn reconnects_with_backoff_once_the_node_is_up() {
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!dial.is_finished());
-    let mut listener = bind_node(&dir, &certificate, &token, address)
-        .await
-        .unwrap();
+    let api = Arc::new(executor::MachineApi::new());
+    let credential = api.add(token.expose(), executor::credential(HEAD)).id;
+    let mut node = Node::serve(
+        api,
+        credential,
+        certificate,
+        token,
+        address.port(),
+        Tuning::default(),
+        tempfile::tempdir().unwrap(),
+    )
+    .await;
+    assert_eq!(node.port, address.port());
     let dialed = tokio::time::timeout(wait(), dial)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert!(generations.load(std::sync::atomic::Ordering::SeqCst) > 1);
-    assert_eq!(listener.binding(), Some(dialed.link.binding().clone()));
-    let Some(NodeConnection::Link { .. }) = tokio::time::timeout(wait(), listener.accept())
-        .await
-        .unwrap()
-    else {
-        panic!("expected the link");
-    };
+    assert_eq!(node.binding(), Some(dialed.link.binding().clone()));
+    let _ = node.accept_link().await;
 }
 
 #[tokio::test]
@@ -766,14 +845,12 @@ fn certificate_pin_parses_both_hex_forms() {
 }
 
 #[test]
-fn lease_token_rejects_short_or_unprintable_values_and_hides_itself() {
-    assert!(LeaseToken::new("short").is_err());
-    assert!(LeaseToken::new(format!("{} with space", "x".repeat(32))).is_err());
-    let generated = LeaseToken::generate().unwrap();
-    assert_eq!(generated.expose().len(), 64);
-    assert!(generated.matches(generated.expose()));
-    assert!(!generated.matches("nope"));
-    assert_eq!(format!("{generated:?}"), "LeaseToken([redacted])");
+fn executor_token_rejects_short_or_unprintable_values_and_hides_itself() {
+    assert!(ExecutorToken::new("short").is_err());
+    assert!(ExecutorToken::new(format!("{} with space", "x".repeat(32))).is_err());
+    let token = ExecutorToken::new("e".repeat(64)).unwrap();
+    assert_eq!(token.expose().len(), 64);
+    assert_eq!(format!("{token:?}"), "ExecutorToken([redacted])");
 }
 
 #[test]
@@ -788,38 +865,9 @@ fn rejection_reasons_never_echo_peer_text() {
 }
 
 #[tokio::test]
-async fn corrupt_binding_file_refuses_to_start() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("binding.json"), b"{not json").unwrap();
-    let error = bind_node(
-        &dir,
-        &certificate(),
-        &token("t"),
-        "127.0.0.1:0".parse().unwrap(),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(code(&error), codes::BINDING_STORE);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn binding_file_is_private() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let node = Node::start(token("t")).await;
-    let _link = dial(&node, 1).await;
-    let mode = std::fs::metadata(node.dir.path().join("binding.json"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
-}
-
-#[tokio::test]
 async fn endpoint_must_be_wss_without_credentials() {
     let node = Node::start(token("t")).await;
-    let address = node.listener.local_addr();
+    let address = node.address();
     for url in [
         format!("ws://{address}"),
         format!("https://{address}"),
@@ -960,9 +1008,9 @@ async fn canary_secret_never_reaches_trace_level_log_outputs() {
     let mut node = Node::start(token(canary)).await;
     let good = node.endpoint();
     let head = dial_link(&good, hello(binding(1))).await.unwrap();
-    let (_node_link, node_events, _) = node.accept_link().await;
-    echo_requests(node_events);
-    head.link
+    let (node_link, _node_events, _) = node.accept_link().await;
+    echo_requests(head.events);
+    node_link
         .call(AgentId::new(), "x", json!({}), wait())
         .await
         .unwrap();
@@ -1046,23 +1094,6 @@ async fn rebind_closes_a_git_connection_with_a_full_receive_queue() {
 }
 
 /// Dropping the listener does not retire established git connections.
-#[tokio::test]
-async fn dropping_the_listener_keeps_git_connections_open() {
-    let mut node = Node::start(token("t")).await;
-    let _link = dial(&node, 1).await;
-    let _ = node.accept_link().await;
-    let mut head_git = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
-    let node_git = node.accept_git().await;
-    drop(node.listener);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!node_git.is_closed());
-    node_git.send(b"still here".to_vec()).await.unwrap();
-    assert_eq!(
-        tokio::time::timeout(wait(), head_git.recv()).await.unwrap(),
-        Some(b"still here".to_vec())
-    );
-}
-
 fn small_queues() -> Tuning {
     Tuning {
         outbound_queue: 2,
@@ -1073,28 +1104,7 @@ fn small_queues() -> Tuning {
 
 /// A node with tiny queues and the head link dialed with tiny queues.
 async fn tuned_pair() -> (Node, DialedLink, NodeLink, LinkEvents) {
-    let dir = tempfile::tempdir().unwrap();
-    let certificate = certificate();
-    let token = token("t");
-    let listener = NodeListener::bind_with(
-        "127.0.0.1:0".parse().unwrap(),
-        NodeListenerConfig {
-            node_id: NODE.into(),
-            token: token.clone(),
-            binding_file: BindingFile::new(dir.path().join("binding.json")),
-            certificate: certificate.clone(),
-        },
-        welcome(),
-        small_queues(),
-    )
-    .await
-    .unwrap();
-    let mut node = Node {
-        listener,
-        certificate,
-        token,
-        dir,
-    };
+    let mut node = Node::start_with(token("t"), 0, small_queues()).await;
     let head = dial_link_with(&node.endpoint(), hello(binding(1)), small_queues())
         .await
         .unwrap();
@@ -1163,9 +1173,10 @@ async fn closing_releases_a_call_blocked_on_a_full_outbound_queue() {
 
 #[tokio::test]
 async fn cancellation_is_not_lost_behind_a_full_outbound_queue() {
-    let (_node, head, _node_link, mut node_events) = tuned_pair().await;
+    let (_node, head, node_link, _node_events) = tuned_pair().await;
+    let mut head_events = head.events;
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         tokio::spawn(async move {
             link.call(
                 AgentId::new(),
@@ -1176,21 +1187,21 @@ async fn cancellation_is_not_lost_behind_a_full_outbound_queue() {
             .await
         })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head_events.recv())
         .await
         .unwrap()
     else {
         panic!("expected a request");
     };
-    let _flood = saturate(head.link.clone());
+    let _flood = saturate(node_link.clone());
     let error = tokio::time::timeout(wait(), call)
         .await
         .unwrap()
         .unwrap()
         .unwrap_err();
     assert_eq!(code(&error), codes::TIMEOUT);
-    assert!(!head.link.is_closed());
-    drain(node_events);
+    assert!(!node_link.is_closed());
+    drain(head_events);
     tokio::time::timeout(wait(), request.cancelled())
         .await
         .unwrap();
@@ -1198,22 +1209,23 @@ async fn cancellation_is_not_lost_behind_a_full_outbound_queue() {
 
 #[tokio::test]
 async fn dropped_request_reply_is_not_lost_behind_a_full_outbound_queue() {
-    let (_node, head, node_link, mut node_events) = tuned_pair().await;
+    let (_node, head, node_link, node_events) = tuned_pair().await;
+    let mut head_events = head.events;
     let call = {
-        let link = head.link.clone();
+        let link = node_link.clone();
         tokio::spawn(async move { link.call(AgentId::new(), "x", json!({}), wait()).await })
     };
-    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), head_events.recv())
         .await
         .unwrap()
     else {
         panic!("expected a request");
     };
-    let _flood = saturate(node_link.clone());
+    let _flood = saturate(head.link.clone());
     saturated().await;
     drop(request);
-    assert!(!node_link.is_closed());
-    drain(head.events);
+    assert!(!head.link.is_closed());
+    drain(node_events);
     let outcome = tokio::time::timeout(wait(), call)
         .await
         .unwrap()

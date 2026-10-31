@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use intent_core::{Error, Result};
-use intent_transport::node_link::{CertificatePin, LeaseToken, NodeEndpoint};
+use intent_transport::node_link::{CertificatePin, ExecutorToken, NodeEndpoint};
 
 /// File name of the configuration in the daemon's data directory.
 pub const CONFIG_FILE: &str = "remote-node.json";
@@ -128,7 +128,7 @@ impl HeadNodeConfig {
             .filter(|c| *c != ':')
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        let token = LeaseToken::new(raw.token)
+        let token = ExecutorToken::new(raw.token)
             .map_err(|_| invalid("token must be at least 32 printable ASCII bytes"))?;
         let name = raw
             .name

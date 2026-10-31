@@ -2,7 +2,6 @@
 //! received, and an old session adopting late, must not touch the runner or
 //! the journal once a newer generation has bound.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +11,42 @@ use intent_core::{AgentId, WorkspaceId};
 use intent_nodes::journal::Journal;
 
 use super::*;
-use crate::node::runner::RunnerConfig;
-use crate::node::storage::Storage;
+use crate::executor::runner::{
+    Admission as SharedLimits, MachineLaunch, ProviderLaunch, RunnerConfig,
+};
+use intent_core::node_link::MachineCapacity;
+use intent_core::placement::CapacityRefusal;
+
+/// Limits that never bind.
+struct Unlimited;
+
+impl SharedLimits for Unlimited {
+    fn try_admit(&self, _agent_id: &AgentId) -> Result<(), CapacityRefusal> {
+        Ok(())
+    }
+    fn release(&self, _agent_id: &AgentId) {}
+    fn capacity(&self) -> MachineCapacity {
+        MachineCapacity {
+            running_agents: 0,
+            agent_cap: 1,
+            charged_memory_bytes: 0,
+            memory_budget_bytes: None,
+        }
+    }
+}
+
+/// No provider is available.
+struct NoProviders;
+
+impl MachineLaunch for NoProviders {
+    fn resolve(&self, _provider: &str) -> Result<ProviderLaunch, String> {
+        Err("not installed".into())
+    }
+    fn policy(&self) -> PermissionPolicy {
+        PermissionPolicy::DenyAll
+    }
+}
+use crate::executor::storage::Storage;
 
 struct Harness {
     runner: Runner,
@@ -24,13 +57,12 @@ struct Harness {
 /// exit, which makes a launch's side effect observable without processes.
 fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Arc::new(Storage::open(&dir.path().join("node")).unwrap());
+    let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
     let runner = Runner::new(RunnerConfig {
-        max_agents: 1,
-        policy: PermissionPolicy::DenyAll,
-        providers: BTreeMap::new(),
-        checkouts: crate::node::checkout::PlainCheckouts::new(storage),
+        admission: Arc::new(Unlimited),
+        launch: Arc::new(NoProviders),
+        checkouts: crate::executor::checkout::PlainCheckouts::new(storage),
         journal,
         home: None,
         mcp_bridge_exe: std::env::current_exe().unwrap(),

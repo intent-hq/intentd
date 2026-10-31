@@ -18,7 +18,7 @@ use intent_core::{Error, Result};
 
 use super::link::Tuning;
 use super::pin::{self, CertificatePin, PIN_MISMATCH};
-use super::{codes, GitConnection, LeaseToken, LinkEvents, NodeLink, GIT_PATH, LINK_PATH};
+use super::{codes, ExecutorToken, GitConnection, LinkEvents, NodeLink, GIT_PATH, LINK_PATH};
 
 /// Bound on connecting, the TLS and WebSocket handshakes and the bind
 /// exchange.
@@ -40,7 +40,7 @@ pub(super) const HEADER_GENERATION: &str = "x-intent-generation";
 pub struct NodeEndpoint {
     pub url: String,
     pub pin: CertificatePin,
-    pub token: LeaseToken,
+    pub token: ExecutorToken,
     pub tailcat: Option<TailcatRoute>,
 }
 
@@ -57,7 +57,7 @@ pub struct TailcatRoute {
 impl NodeEndpoint {
     /// A direct route to `wss://host:port`.
     #[must_use]
-    pub fn direct(url: impl Into<String>, pin: CertificatePin, token: LeaseToken) -> Self {
+    pub fn direct(url: impl Into<String>, pin: CertificatePin, token: ExecutorToken) -> Self {
         Self {
             url: url.into(),
             pin,
@@ -72,7 +72,7 @@ impl NodeEndpoint {
         route: TailcatRoute,
         port: u16,
         pin: CertificatePin,
-        token: LeaseToken,
+        token: ExecutorToken,
     ) -> Self {
         Self {
             url: format!("wss://localhost:{port}"),

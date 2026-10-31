@@ -1,6 +1,6 @@
-//! One bound link from head: replay the journal after head's acknowledged
-//! sequence, then stream new records live, and turn head's control frames
-//! into runner calls.
+//! One bound link from the backend: replay the journal after the backend's
+//! acknowledged sequence, then stream new records live, turn the backend's
+//! control frames into runner calls, and answer capabilities requests.
 //!
 //! When head binds a newer generation, the listener closes the older link,
 //! but its session may still hold frames it already received, or be about
@@ -10,8 +10,11 @@
 //! generation holds the gate. A replaced session can launch, stop or
 //! acknowledge nothing, and cannot move the journal back to its lease.
 
-use intent_core::node_link::{LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError};
+use intent_core::node_link::{
+    LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError, MachineCapabilities,
+};
 use intent_core::nodes::NodeCounter;
+use intent_core::BoxFuture;
 use intent_transport::node_link::{LinkEvent, LinkEvents, NodeLink};
 
 use super::runner::Runner;
@@ -123,12 +126,17 @@ async fn apply(
     Applied::Done
 }
 
+/// A fresh capabilities report, for [`LinkFrame::Capabilities`].
+pub(super) type Report =
+    std::sync::Arc<dyn Fn() -> BoxFuture<'static, MachineCapabilities> + Send + Sync>;
+
 /// Serve `link` until it closes.
 pub(super) async fn serve_link(
     runner: Runner,
     link: NodeLink,
     mut events: LinkEvents,
     hello: LinkHello,
+    report: Report,
 ) {
     let binding = hello.binding;
     let acked = hello.acked_seq;
@@ -155,6 +163,19 @@ pub(super) async fn serve_link(
     };
     while let Some(event) = events.recv().await {
         match event {
+            // A read-only report; it neither needs the link gate nor waits
+            // in line with control frames.
+            LinkEvent::Frame(LinkFrame::Capabilities) => {
+                let link = link.clone();
+                let report = report.clone();
+                // caller-binding: allow — answers one capabilities request on its link
+                tokio::spawn(async move {
+                    let capabilities = report().await;
+                    let _ = link
+                        .send(&LinkFrame::CapabilitiesReply { capabilities })
+                        .await;
+                });
+            }
             LinkEvent::Frame(frame) => {
                 if apply(&runner, &binding, || link.is_closed(), frame).await == Applied::Close {
                     link.close();

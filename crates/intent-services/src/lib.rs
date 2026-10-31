@@ -62,6 +62,7 @@ mod agent_wake;
 mod agent_workers;
 mod auto_archive;
 mod auto_retire;
+mod executor_capabilities;
 mod executor_ops;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
@@ -334,8 +335,9 @@ pub mod auggie_discovery {
 }
 
 pub use agent_manager::{
-    compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    AgentMemorySnapshot, BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
+    compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
+    resolve_provider_launch, AgentManager, AgentMemorySnapshot, BusEventSink, ProcessRegistry,
+    ProcessSample, ProviderLaunchSpec, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via

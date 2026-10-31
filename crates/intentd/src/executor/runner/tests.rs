@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
-use crate::node::storage::Storage;
+use crate::executor::storage::Storage;
 
 const PROVIDER: &str = "mock";
 
@@ -15,10 +15,60 @@ fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(20))
 }
 
+/// The machine's shared limits as a plain counter, standing in for the
+/// daemon's process registry.
+struct CountAdmission {
+    cap: u32,
+    running: Mutex<Vec<AgentId>>,
+}
+
+impl Admission for CountAdmission {
+    fn try_admit(&self, agent_id: &AgentId) -> Result<(), CapacityRefusal> {
+        let mut running = lock(&self.running);
+        let used = u32::try_from(running.len()).unwrap();
+        if used >= self.cap {
+            return Err(CapacityRefusal::Count {
+                running_agents: used,
+                agent_cap: self.cap,
+            });
+        }
+        running.push(agent_id.clone());
+        Ok(())
+    }
+    fn release(&self, agent_id: &AgentId) {
+        lock(&self.running).retain(|id| id != agent_id);
+    }
+    fn capacity(&self) -> MachineCapacity {
+        MachineCapacity {
+            running_agents: u32::try_from(lock(&self.running).len()).unwrap(),
+            agent_cap: self.cap,
+            charged_memory_bytes: 0,
+            memory_budget_bytes: None,
+        }
+    }
+}
+
+/// Only the fixture provider resolves.
+struct FixtureLaunch(ProviderLaunch);
+
+impl MachineLaunch for FixtureLaunch {
+    fn resolve(&self, provider: &str) -> Result<ProviderLaunch, String> {
+        if provider == PROVIDER {
+            Ok(self.0.clone())
+        } else {
+            Err("not installed".into())
+        }
+    }
+    fn policy(&self) -> PermissionPolicy {
+        PermissionPolicy::AllowAll
+    }
+}
+
 struct Harness {
     runner: Runner,
+    admission: Arc<CountAdmission>,
     storage: Arc<Storage>,
-    checkouts: Arc<crate::node::checkout::PlainCheckouts>,
+    checkouts: Arc<crate::executor::checkout::PlainCheckouts>,
     /// The node user's home a profile's `~` expands against.
     home: PathBuf,
     _dir: tempfile::TempDir,
@@ -45,19 +95,22 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         ..*intent_providers::find_provider(PROVIDER).unwrap()
     };
     let dir = tempfile::tempdir().unwrap();
-    let storage = Arc::new(Storage::open(&dir.path().join("node")).unwrap());
+    let storage = Arc::new(Storage::open(&dir.path().join("node"), None).unwrap());
     let journal = Journal::open(&storage.journal_dir()).unwrap();
-    let checkouts = crate::node::checkout::PlainCheckouts::new(storage.clone());
+    let checkouts = crate::executor::checkout::PlainCheckouts::new(storage.clone());
+    let admission = Arc::new(CountAdmission {
+        cap: max_agents,
+        running: Mutex::new(Vec::new()),
+    });
     let runner = Runner::new(RunnerConfig {
-        max_agents,
-        policy: PermissionPolicy::AllowAll,
-        providers: BTreeMap::from([(
-            PROVIDER.to_owned(),
-            ProviderLaunch {
-                config,
-                binary: node,
-            },
-        )]),
+        admission: admission.clone(),
+        launch: Arc::new(FixtureLaunch(ProviderLaunch {
+            config,
+            binary: Some(node),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            extra_env: BTreeMap::new(),
+        })),
         checkouts: checkouts.clone(),
         journal,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
@@ -66,6 +119,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
     let home = dir.path().join("home");
     Some(Harness {
         runner,
+        admission,
         storage,
         checkouts,
         home,
@@ -246,9 +300,14 @@ async fn node_runner_enforces_capacity_and_frees_the_slot_on_exit() {
     assert!(error.starts_with(codes::CAPACITY), "{error}");
     assert!(error.contains("1 of 1"), "{error}");
     assert_eq!(h.runner.running(), vec![AgentId::from("a1")]);
+    assert_eq!(h.runner.capacity().running_agents, 1);
 
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "first exit", exited("a1")).await;
+    assert!(
+        lock(&h.admission.running).is_empty(),
+        "the exit gave the shared slot back"
+    );
     h.runner.launch(launch("a3")).await;
     h.runner
         .prompt(&AgentId::from("a3"), "t1".into(), text("hi"))
@@ -262,6 +321,37 @@ async fn node_runner_enforces_capacity_and_frees_the_slot_on_exit() {
     assert!(h.runner.running().is_empty());
 }
 
+/// A launch the shared limits deny is refused at once with the structured
+/// `node-capacity` failure the backend relays as `placement-unavailable`.
+#[tokio::test]
+async fn node_runner_refuses_over_the_shared_limits_with_the_structured_reason() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.admission
+        .try_admit(&AgentId::from("a-local-agent"))
+        .unwrap();
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "capacity refusal", exited("a1")).await;
+    match &find(&all, exited("a1")).body {
+        JournalBody::Exited {
+            error: Some(error),
+            failure: Some(failure),
+            ..
+        } => {
+            assert!(error.starts_with(codes::CAPACITY), "{error}");
+            assert_eq!(failure.code, codes::CAPACITY);
+            assert_eq!(
+                failure.data,
+                Some(CapacityRefusal::Count {
+                    running_agents: 1,
+                    agent_cap: 1,
+                })
+            );
+        }
+        other => panic!("expected a structured refusal, got {other:?}"),
+    }
+    assert!(h.runner.running().is_empty(), "the refusal was not queued");
+}
+
 #[tokio::test]
 async fn node_runner_refuses_an_unconfigured_provider_by_name() {
     let Some(h) = harness(2, &[]) else { return };
@@ -272,8 +362,12 @@ async fn node_runner_refuses_an_unconfigured_provider_by_name() {
     let error = exit_error(find(&all, exited("a1"))).unwrap();
     assert!(error.starts_with(codes::PROVIDER), "{error}");
     assert!(error.contains("\"codex\""), "{error}");
-    assert!(error.contains("configured: mock"), "{error}");
+    assert!(error.contains("not installed"), "{error}");
     assert!(h.runner.running().is_empty());
+    assert!(
+        lock(&h.admission.running).is_empty(),
+        "a refused provider holds no shared slot"
+    );
 }
 
 #[tokio::test]

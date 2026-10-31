@@ -48,7 +48,7 @@ fn racing_token() -> String {
     "g".repeat(64)
 }
 
-fn credential(backend: &str) -> ExecutorCredential {
+pub(super) fn credential(backend: &str) -> ExecutorCredential {
     ExecutorCredential {
         id: ExecutorCredentialId::new(),
         backend_id: backend.into(),
@@ -60,7 +60,7 @@ fn credential(backend: &str) -> ExecutorCredential {
     }
 }
 
-struct OwnerToken;
+pub(super) struct OwnerToken;
 
 impl TokenStore for OwnerToken {
     fn load_token(&self) -> Option<String> {
@@ -72,7 +72,7 @@ impl TokenStore for OwnerToken {
 }
 
 /// The daemon's executor seams, in memory, with the store's bind rules.
-struct MachineApi {
+pub(super) struct MachineApi {
     principal: PrincipalId,
     member_hash: String,
     by_hash: Mutex<HashMap<String, ExecutorCredential>>,
@@ -83,7 +83,7 @@ struct MachineApi {
 }
 
 impl MachineApi {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             principal: PrincipalId::new(),
             member_hash: crate::auth::hash_token(&member_token()),
@@ -95,7 +95,7 @@ impl MachineApi {
         }
     }
 
-    fn add(&self, token: &str, credential: ExecutorCredential) -> ExecutorCredential {
+    pub(super) fn add(&self, token: &str, credential: ExecutorCredential) -> ExecutorCredential {
         self.by_hash
             .lock()
             .unwrap()
@@ -103,7 +103,7 @@ impl MachineApi {
         credential
     }
 
-    fn revoke(&self, id: &ExecutorCredentialId) {
+    pub(super) fn revoke(&self, id: &ExecutorCredentialId) {
         for credential in self.by_hash.lock().unwrap().values_mut() {
             if &credential.id == id {
                 credential.revoked_at = Some("2026-10-30T01:00:00Z".into());
@@ -112,7 +112,7 @@ impl MachineApi {
         let _ = self.revocations.send(id.clone());
     }
 
-    fn binding_of(&self, id: &ExecutorCredentialId) -> Option<LeaseBinding> {
+    pub(super) fn binding_of(&self, id: &ExecutorCredentialId) -> Option<LeaseBinding> {
         self.binds.lock().unwrap().get(id).cloned()
     }
 }
@@ -205,7 +205,8 @@ impl ExecutorHost for Host {
         MACHINE.into()
     }
     fn welcome(&self, _credential: &ExecutorCredential, hello: &LinkHello) -> LinkWelcome {
-        let mut welcome = (welcome())(hello);
+        let _ = hello;
+        let mut welcome = welcome();
         welcome.hosts = vec!["10.0.0.7".into()];
         welcome
     }
@@ -292,7 +293,7 @@ impl Machine {
         NodeEndpoint {
             url: format!("wss://127.0.0.1:{}", self.port),
             pin: CertificatePin::parse(&self.certificate.fingerprint256).unwrap(),
-            token: LeaseToken::new(token).unwrap(),
+            token: ExecutorToken::new(token).unwrap(),
             tailcat: None,
         }
     }
@@ -966,7 +967,7 @@ async fn the_dialer_reaches_the_machine_through_a_tailcat_pipe_with_the_same_pin
         address: "tcmachine1".into(),
     };
     let pin = CertificatePin::parse(&machine.certificate.fingerprint256).unwrap();
-    let token = LeaseToken::new(executor_token()).unwrap();
+    let token = ExecutorToken::new(executor_token()).unwrap();
     let endpoint = NodeEndpoint::via_tailcat(route.clone(), machine.port, pin, token.clone());
     let binding = machine_binding(BACKEND, 1);
     let dialed = dial_link(&endpoint, hello(binding.clone())).await.unwrap();

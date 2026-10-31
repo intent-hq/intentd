@@ -1,6 +1,7 @@
 //! Remote launch end to end: a real `intentd serve` head (WSS, the
-//! experimental switch on, `remote-node.json` configured) and a real
-//! `intentd node` process on loopback. An agent created over WSS with a
+//! experimental switch on, `remote-node.json` configured) and a second real
+//! `intentd serve` as the machine (remote agents on, an executor credential
+//! minted for the head), both on loopback. An agent created over WSS with a
 //! remote placement is launched on the node on its first message: the node
 //! fetches the workspace's last commit over `git-remote-intent` into its own
 //! worktree, runs the provider (the `node-test-agent.mjs` fixture), streams
@@ -13,14 +14,12 @@
 
 #![cfg(unix)]
 
-use std::io::BufRead as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intentd_test_support::GuardedChild;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -33,8 +32,9 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::common;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
-const NODE_ID: &str = "node-e2e";
-const NODE_TOKEN: &str = "node-e2e-lease-token-0123456789abcdef";
+/// The head id the machine's executor credential is minted for; the head's
+/// node registration is pre-enrolled under it.
+const HEAD_ID: &str = "head-e2e";
 
 fn wait() -> Duration {
     common::test_timeout(Duration::from_secs(60))
@@ -203,48 +203,123 @@ fn write_private(path: &Path, value: &Value) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-/// Start `intentd node` with the fixture provider; return it with its
-/// listen address and certificate pin (its first stdout line).
-fn start_node(dir: &Path, node_bin: &Path) -> (GuardedChild, String, String) {
+/// The machine: a regular `intentd serve` running the fixture provider as
+/// `mock`, with remote agents on and an executor credential minted for
+/// [`HEAD_ID`].
+struct Machine {
+    _daemon: common::DaemonGuard,
+    port: u16,
+    fingerprint: String,
+    daemon_id: String,
+    token: String,
+}
+
+async fn start_machine(dir: &Path) -> Machine {
     let fixture = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
     );
-    let config = dir.join("node.json");
-    write_private(
-        &config,
-        &json!({
-            "nodeId": NODE_ID,
-            "listen": "127.0.0.1:0",
-            "token": NODE_TOKEN,
-            "maxAgents": 2,
-            "permission": "allowAll",
-            "providers": { "mock": { "binary": node_bin, "args": [fixture] } },
-        }),
+    std::fs::create_dir_all(dir.join("workspaces")).unwrap();
+    common::enable_ws_api(dir);
+    let mut serve = common::hermetic_serve_command(dir);
+    serve
+        .env("INTENTD_DATA_DIR", dir)
+        .env("INTENTD_WORKSPACES_DIR", dir.join("workspaces"))
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("MOCK_AGENT_SCRIPT_PATH", &fixture)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(dir.join("machine.log")).unwrap(),
+        ));
+    common::hermetic_fixture_identity(&mut serve, dir);
+    let daemon = common::DaemonGuard::process_only(
+        common::spawn_guarded(&mut serve).expect("spawn the machine's intentd serve"),
     );
-    let log = std::fs::File::create(dir.join("node.log")).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    command
-        .arg("node")
-        .arg("--config")
-        .arg(&config)
-        .arg("--root")
-        .arg(dir.join("root"))
-        .env_remove("INTENTD_DATA_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(log));
-    let mut child = GuardedChild::spawn(&mut command).expect("spawn intentd node");
-    let stdout = child.stdout.take().unwrap();
-    let mut line = String::new();
-    std::io::BufReader::new(stdout)
-        .read_line(&mut line)
-        .expect("node prints its address");
-    let started: Value = serde_json::from_str(&line).expect("node start line is JSON");
-    (
-        child,
-        started["address"].as_str().unwrap().to_owned(),
-        started["certificateSha256"].as_str().unwrap().to_owned(),
+    let status = common::await_wss_status(&dir.join("intentd.sock")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let fingerprint = status["result"]["fingerprint"].as_str().unwrap().to_owned();
+    let mut ws = connect(port, client_config(&fingerprint)).await;
+    ok(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "remoteAgents.enabled", "value": true }] }),
     )
+    .await;
+    let minted = ok(
+        &mut ws,
+        2,
+        "executor.mint",
+        json!({ "backendId": HEAD_ID, "backendName": "E2E head" }),
+    )
+    .await;
+    Machine {
+        _daemon: daemon,
+        port,
+        fingerprint,
+        daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
+        token: minted["token"].as_str().unwrap().to_owned(),
+    }
+}
+
+/// Register the machine in the head's store under [`HEAD_ID`] (the head id
+/// the machine's credential names), as the connector would on first use.
+async fn enroll_machine(data_dir: &Path, machine: &Machine, endpoint: &str) {
+    use intent_core::nodes::{
+        LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
+        NodeRecord, NodeState,
+    };
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open head store");
+    let record = NodeRecord {
+        id: machine.daemon_id.clone(),
+        head_id: HEAD_ID.into(),
+        node_identity: machine.daemon_id.clone(),
+        name: "E2E node".into(),
+        kind: NodeKind::Static,
+        os: NodeOs::Linux,
+        arch: NodeArch::X86_64,
+        state: NodeState::Offline,
+        draining: false,
+        capacity: NodeCapacity {
+            max_agents: 0,
+            reserved_agents: 0,
+            memory_budget_bytes: 0,
+            used_memory_bytes: 0,
+            exclusive_reserved: false,
+        },
+        version: String::new(),
+        endpoint: Some(format!("{endpoint}/node")),
+        // Stored as the connector normalizes it: lowercase hex, no colons.
+        certificate_sha256: Some(
+            machine
+                .fingerprint
+                .chars()
+                .filter(|c| *c != ':')
+                .map(|c| c.to_ascii_lowercase())
+                .collect(),
+        ),
+        last_seen_at: None,
+    };
+    let lease = NodeLease {
+        owner: LeaseOwner {
+            head_id: HEAD_ID.into(),
+            node_id: machine.daemon_id.clone(),
+            node_identity: machine.daemon_id.clone(),
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        },
+        state: LeaseState::Acquiring,
+        created_at: intent_core::now_iso(),
+        last_seen_at: None,
+        ack_seq: NodeCounter(0),
+        link_generation: NodeCounter(0),
+        release_requested: false,
+        fence: None,
+    };
+    store.enroll_node(&record, &lease).await.expect("enroll");
 }
 
 /// Send `content` to the agent, wait for its turn to end, and return its
@@ -303,10 +378,10 @@ async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
-    let Some(node_bin) = intent_providers::resolve_on_path("node") else {
+    if intent_providers::resolve_on_path("node").is_none() {
         eprintln!("skipping remote launch e2e: node not on PATH");
         return;
-    };
+    }
     if intent_providers::resolve_on_path("git").is_none() {
         eprintln!("skipping remote launch e2e: git not on PATH");
         return;
@@ -324,19 +399,22 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
 
     let node_dir = scratch.path().join("node");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let (_node, address, pin) = start_node(&node_dir, &node_bin);
+    let machine = start_machine(&node_dir).await;
+    let node_id = machine.daemon_id.clone();
+    let endpoint = format!("wss://127.0.0.1:{}", machine.port);
 
     let data_dir = scratch.path().join("head");
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace(&data_dir, &repo).await;
+    enroll_machine(&data_dir, &machine, &endpoint).await;
     write_private(
         &data_dir.join("remote-node.json"),
         &json!({
-            "nodeId": NODE_ID,
+            "nodeId": node_id,
             "name": "E2E node",
-            "endpoint": format!("wss://{address}"),
-            "certificateSha256": pin,
-            "token": NODE_TOKEN,
+            "endpoint": endpoint,
+            "certificateSha256": machine.fingerprint,
+            "token": machine.token,
         }),
     );
     common::enable_ws_api(&data_dir);
@@ -410,16 +488,16 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             tokio::time::Instant::now() < deadline,
             "node never bound: {response}"
         );
-        // timing-guard: poll interval while the separate node process binds to head (no event exposes it)
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let agent = &created["agent"];
     let agent_id = agent["id"].as_str().unwrap().to_owned();
-    assert_eq!(agent["nodeId"], NODE_ID);
+    assert_eq!(agent["nodeId"], node_id.as_str());
     assert_eq!(agent["nodeName"], "E2E node");
     assert_eq!(agent["effectiveIsolation"], "pending");
     assert_eq!(agent["placement"]["target"], "remote");
-    assert_eq!(agent["placement"]["nodeId"], NODE_ID);
+    assert_eq!(agent["placement"]["nodeId"], node_id.as_str());
     assert!(
         created["notice"]
             .as_str()
@@ -539,7 +617,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
                 return wip;
             }
-            // timing-guard: poll interval for the node process's git push to land the ref (no event exposes it)
+            // timing-guard: poll interval for the machine's git push to land the ref (no event exposes it)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })

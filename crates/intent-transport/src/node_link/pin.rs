@@ -11,8 +11,6 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use intent_core::Result;
 
-use crate::TlsCertificate;
-
 /// rustls error text that marks a pin mismatch, so the dialer can report
 /// `node-link-certificate-mismatch` instead of a generic TLS failure.
 pub(super) const PIN_MISMATCH: &str = "node-link-certificate-mismatch";
@@ -23,7 +21,7 @@ pub struct CertificatePin([u8; 32]);
 
 impl CertificatePin {
     /// Parse 64 hex digits, optionally colon-separated (the
-    /// [`TlsCertificate::fingerprint256`] form), in either case.
+    /// [`crate::TlsCertificate::fingerprint256`] form), in either case.
     ///
     /// # Errors
     ///
@@ -118,24 +116,4 @@ pub(super) fn client_config(pin: CertificatePin) -> Result<rustls::ClientConfig>
             .with_custom_certificate_verifier(Arc::new(PinVerifier { pin, provider }))
             .with_no_client_auth(),
     )
-}
-
-/// The node's server config for its own certificate.
-pub(super) fn server_config(certificate: &TlsCertificate) -> Result<rustls::ServerConfig> {
-    let invalid = || super::config("node TLS certificate or key is invalid");
-    let certs = rustls_pemfile::certs(&mut certificate.cert.as_bytes())
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|_| invalid())?;
-    if certs.is_empty() {
-        return Err(invalid());
-    }
-    let key = rustls_pemfile::private_key(&mut certificate.key.as_bytes())
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
-    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| invalid())?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|_| invalid())
 }

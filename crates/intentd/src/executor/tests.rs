@@ -1,0 +1,914 @@
+//! The executor service end to end over a real link on the daemon's WSS
+//! listener: the backend (the test) dials with the certificate pin and an
+//! executor credential, binds, launches, reads the journal stream,
+//! acknowledges and re-binds.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use tokio::sync::broadcast;
+
+use intent_acp::PermissionPolicy;
+use intent_core::machines::ExecutorCredential;
+use intent_core::node_link::{
+    BindDecision, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, LinkFrame, LinkHello,
+    MachineCapacity, ProviderStatus, NODE_LINK_PROTOCOLS,
+};
+use intent_core::nodes::NodeCounter;
+use intent_core::placement::CapacityRefusal;
+use intent_core::{AgentId, BoxFuture, HostRole, PrincipalId, WorkspaceApi, WorkspaceId};
+use intent_transport::node_link::{
+    dial_link, CertificatePin, DialedLink, ExecutorLinks, ExecutorToken, LinkEvent, NodeEndpoint,
+};
+
+use super::*;
+
+const NODE_ID: &str = "node-1";
+const HEAD: &str = "head-1";
+const OTHER_HEAD: &str = "head-2";
+
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
+
+fn token() -> String {
+    "k".repeat(48)
+}
+
+fn other_token() -> String {
+    "q".repeat(48)
+}
+
+/// This daemon's store seams, in memory: two executor credentials, one per
+/// backend, bound by the store's generation rule.
+struct MachineApi {
+    principal: PrincipalId,
+    credentials: HashMap<String, ExecutorCredential>,
+    binds: Mutex<HashMap<ExecutorCredentialId, LeaseBinding>>,
+    revocations: broadcast::Sender<ExecutorCredentialId>,
+}
+
+impl MachineApi {
+    fn new() -> Arc<Self> {
+        let credential = |backend: &str| ExecutorCredential {
+            id: ExecutorCredentialId::new(),
+            backend_id: backend.into(),
+            backend_name: "Backend".into(),
+            backend_fingerprint: None,
+            created_at: "2026-10-31T00:00:00Z".into(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        Arc::new(Self {
+            principal: PrincipalId::new(),
+            credentials: HashMap::from([
+                (
+                    intent_transport::auth::hash_token(&token()),
+                    credential(HEAD),
+                ),
+                (
+                    intent_transport::auth::hash_token(&other_token()),
+                    credential(OTHER_HEAD),
+                ),
+            ]),
+            binds: Mutex::new(HashMap::new()),
+            revocations: broadcast::channel(16).0,
+        })
+    }
+
+    fn credential(&self, token: &str) -> ExecutorCredential {
+        self.credentials[&intent_transport::auth::hash_token(token)].clone()
+    }
+}
+
+impl WorkspaceApi for MachineApi {
+    fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
+        Box::pin(async move { Ok(self.principal.clone()) })
+    }
+
+    fn principal_host_role(
+        &self,
+        _id: PrincipalId,
+    ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+        Box::pin(async { Ok(HostRole::Member) })
+    }
+
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, intent_core::Result<Option<ExecutorCredential>>> {
+        Box::pin(async move { Ok(self.credentials.get(&token_hash).cloned()) })
+    }
+
+    fn bind_executor(
+        &self,
+        credential_id: ExecutorCredentialId,
+        node_id: String,
+        offered: LeaseBinding,
+    ) -> BoxFuture<'_, intent_core::Result<BindDecision>> {
+        Box::pin(async move {
+            let credential = self
+                .credentials
+                .values()
+                .find(|c| c.id == credential_id)
+                .cloned()
+                .ok_or_else(|| intent_core::Error::NotFound("executor credential".into()))?;
+            if offered.node_id == node_id && offered.head_id != credential.backend_id {
+                return Ok(BindDecision::OtherHead);
+            }
+            let mut binds = self.binds.lock().unwrap();
+            let decision = LeaseBinding::decide(&node_id, binds.get(&credential_id), &offered);
+            if decision == BindDecision::Accept {
+                binds.insert(credential_id, offered);
+            }
+            Ok(decision)
+        })
+    }
+
+    fn subscribe_executor_revocations(&self) -> Option<broadcast::Receiver<ExecutorCredentialId>> {
+        Some(self.revocations.subscribe())
+    }
+}
+
+struct OwnerToken;
+
+impl intent_transport::TokenStore for OwnerToken {
+    fn load_token(&self) -> Option<String> {
+        Some("o".repeat(64))
+    }
+    fn store_token(&self, _token: &str) -> intent_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// The machine's shared limits as a plain counter: what the test admits as
+/// "local" agents counts against remote launches too.
+struct CountAdmission {
+    cap: u32,
+    running: Mutex<Vec<AgentId>>,
+}
+
+impl CountAdmission {
+    fn new(cap: u32) -> Arc<Self> {
+        Arc::new(Self {
+            cap,
+            running: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl Admission for CountAdmission {
+    fn try_admit(&self, agent_id: &AgentId) -> Result<(), CapacityRefusal> {
+        let mut running = self.running.lock().unwrap();
+        let used = u32::try_from(running.len()).unwrap();
+        if used >= self.cap {
+            return Err(CapacityRefusal::Count {
+                running_agents: used,
+                agent_cap: self.cap,
+            });
+        }
+        running.push(agent_id.clone());
+        Ok(())
+    }
+    fn release(&self, agent_id: &AgentId) {
+        self.running.lock().unwrap().retain(|id| id != agent_id);
+    }
+    fn capacity(&self) -> MachineCapacity {
+        MachineCapacity {
+            running_agents: u32::try_from(self.running.lock().unwrap().len()).unwrap(),
+            agent_cap: self.cap,
+            charged_memory_bytes: 0,
+            memory_budget_bytes: None,
+        }
+    }
+}
+
+/// Providers by id; anything else is "not installed".
+struct FixedLaunch(BTreeMap<String, ProviderLaunch>);
+
+impl MachineLaunch for FixedLaunch {
+    fn resolve(&self, provider: &str) -> Result<ProviderLaunch, String> {
+        self.0
+            .get(provider)
+            .cloned()
+            .ok_or_else(|| "not installed".to_owned())
+    }
+    fn policy(&self) -> PermissionPolicy {
+        PermissionPolicy::AllowAll
+    }
+}
+
+/// A fixed report; counts refreshes.
+struct FixedReport {
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+
+impl MachineReport for FixedReport {
+    fn providers(&self) -> Vec<ProviderCapability> {
+        vec![ProviderCapability {
+            id: "mock".into(),
+            visible: true,
+            status: ProviderStatus::Unknown,
+            models: vec!["mock-model".into()],
+            models_stale: false,
+        }]
+    }
+    fn routes(&self) -> (Vec<String>, Option<String>) {
+        (vec!["10.0.0.7".into()], Some("tc-machine".into()))
+    }
+    fn refresh(&self) -> intent_core::BoxFuture<'_, ()> {
+        self.refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+/// The fixture agent as the `mock` provider, when `node` is on PATH.
+fn fixture_providers() -> Option<BTreeMap<String, ProviderLaunch>> {
+    let node = intent_providers::resolve_on_path("node")?;
+    let script = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let base_args: &'static [&'static str] =
+        Box::leak(vec![&*Box::leak(script.into_boxed_str())].into_boxed_slice());
+    Some(BTreeMap::from([(
+        "mock".to_owned(),
+        ProviderLaunch {
+            config: intent_providers::ProviderConfig {
+                base_args,
+                ..*intent_providers::find_provider("mock").unwrap()
+            },
+            binary: Some(node),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            extra_env: BTreeMap::new(),
+        },
+    )]))
+}
+
+/// A daemon serving the executor link, with the executor service installed.
+struct Running {
+    server: intent_transport::WsApiServer,
+    service: Arc<ExecutorService>,
+    api: Arc<MachineApi>,
+    report: Arc<FixedReport>,
+    endpoint: NodeEndpoint,
+    _bus_dir: tempfile::TempDir,
+}
+
+impl Running {
+    async fn start(data_dir: &std::path::Path, cap: u32) -> Self {
+        Self::start_with(
+            data_dir,
+            MachineApi::new(),
+            CountAdmission::new(cap),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    async fn start_with(
+        data_dir: &std::path::Path,
+        api: Arc<MachineApi>,
+        admission: Arc<CountAdmission>,
+        providers: BTreeMap<String, ProviderLaunch>,
+    ) -> Self {
+        let report = Arc::new(FixedReport {
+            refreshes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Agents work in plain directories here: no backend serves git. The
+        // git checkout path is covered by the e2e tests.
+        let service = ExecutorService::start_with_checkouts(
+            ExecutorDeps {
+                data_dir: data_dir.to_owned(),
+                node_id: NODE_ID.into(),
+                enabled: Arc::new(|| true),
+                admission,
+                launch: Arc::new(FixedLaunch(providers)),
+                report: report.clone(),
+                executable: std::env::current_exe().unwrap(),
+            },
+            api.subscribe_executor_revocations(),
+            |storage, _cache| checkout::PlainCheckouts::new(storage),
+        )
+        .unwrap();
+        let bus_dir = tempfile::tempdir().unwrap();
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&bus_dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let certificate = intent_transport::generate_certificate(vec!["127.0.0.1".into()]).unwrap();
+        let tokens = Arc::new(intent_transport::AsyncTokenStore::new(Arc::new(OwnerToken)));
+        let options = intent_transport::WsOptions {
+            base_port: 0,
+            ..intent_transport::WsOptions::default()
+        };
+        let mut server = intent_transport::WsApiServer::new(
+            api.clone(),
+            bus,
+            &certificate,
+            &tokens,
+            options,
+            None,
+        )
+        .unwrap();
+        server.install_executor_links(ExecutorLinks::new(service.clone()));
+        let port = server.start().await.unwrap();
+        let endpoint = NodeEndpoint {
+            url: format!("wss://127.0.0.1:{port}"),
+            pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
+            token: ExecutorToken::new(token()).unwrap(),
+            tailcat: None,
+        };
+        Self {
+            server,
+            service,
+            api,
+            report,
+            endpoint,
+            _bus_dir: bus_dir,
+        }
+    }
+
+    fn endpoint_for(&self, token: &str) -> NodeEndpoint {
+        NodeEndpoint {
+            token: ExecutorToken::new(token).unwrap(),
+            ..self.endpoint.clone()
+        }
+    }
+
+    async fn stop(self) -> Arc<MachineApi> {
+        self.server.stop().await;
+        self.service.shutdown().await;
+        self.api
+    }
+}
+
+fn hello(generation: u64, lease: &str, acked: u64) -> LinkHello {
+    hello_from(HEAD, generation, lease, acked)
+}
+
+fn hello_from(head: &str, generation: u64, lease: &str, acked: u64) -> LinkHello {
+    LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "test".into(),
+        binding: LeaseBinding {
+            head_id: head.into(),
+            node_id: NODE_ID.into(),
+            lease_id: lease.into(),
+            generation: NodeCounter(generation),
+        },
+        acked_seq: NodeCounter(acked),
+    }
+}
+
+fn launch_of(id: &str, provider: &str) -> LinkFrame {
+    LinkFrame::Launch(LaunchCommand {
+        agent_id: AgentId::from(id),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: provider.into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        profile_env: None,
+        agent_features: serde_json::json!({}),
+        is_sub_agent: false,
+    })
+}
+
+/// A launch the machine refuses without spawning anything (no such
+/// provider), which journals exactly one exit record.
+fn refused_launch(id: &str) -> LinkFrame {
+    launch_of(id, "codex")
+}
+
+async fn next_frame(dialed: &mut DialedLink) -> Option<LinkFrame> {
+    loop {
+        match tokio::time::timeout(wait(), dialed.events.recv())
+            .await
+            .expect("timed out waiting for a frame")
+        {
+            Some(LinkEvent::Frame(frame)) => return Some(frame),
+            Some(LinkEvent::Request(_)) => {}
+            None => return None,
+        }
+    }
+}
+
+async fn next_record(dialed: &mut DialedLink) -> JournalRecord {
+    match next_frame(dialed).await {
+        Some(LinkFrame::Journal(record)) => record,
+        other => panic!("expected a journal record, got {other:?}"),
+    }
+}
+
+async fn replay_complete(dialed: &mut DialedLink) -> NodeCounter {
+    match next_frame(dialed).await {
+        Some(LinkFrame::ReplayComplete { through_seq }) => through_seq,
+        other => panic!("expected replay complete, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn executor_binds_reports_capabilities_and_streams_launch_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(dialed.welcome.node_id, NODE_ID);
+    assert_eq!(dialed.welcome.capabilities.capacity.agent_cap, 3);
+    assert_eq!(dialed.welcome.capabilities.providers[0].id, "mock");
+    assert_eq!(
+        dialed.welcome.capabilities.providers[0].models,
+        ["mock-model"]
+    );
+    assert_eq!(dialed.welcome.hosts, ["10.0.0.7"]);
+    assert_eq!(dialed.welcome.tc_address.as_deref(), Some("tc-machine"));
+    assert_eq!(
+        dialed.welcome.capabilities.platform,
+        host_platform().unwrap()
+    );
+    assert!(dialed.welcome.running_agents.is_empty());
+    assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
+
+    dialed.link.send(&refused_launch("a1")).await.unwrap();
+    let record = next_record(&mut dialed).await;
+    assert_eq!(record.seq, NodeCounter(1));
+    assert_eq!(record.agent_id, AgentId::from("a1"));
+    assert!(
+        matches!(&record.body, JournalBody::Exited { error: Some(e), .. }
+            if e.starts_with(runner::codes::PROVIDER)),
+        "{record:?}"
+    );
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn executor_replays_unacknowledged_records_after_rebind_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    for id in ["a1", "a2", "a3"] {
+        first.link.send(&refused_launch(id)).await.unwrap();
+    }
+    for seq in 1..=3 {
+        assert_eq!(next_record(&mut first).await.seq, NodeCounter(seq));
+    }
+    first
+        .link
+        .send(&LinkFrame::Ack {
+            seq: NodeCounter(1),
+        })
+        .await
+        .unwrap();
+
+    // A newer generation replaces the link; head says it ingested 2.
+    let mut second = dial_link(&node.endpoint, hello(2, "lease-1", 2))
+        .await
+        .unwrap();
+    assert!(next_frame(&mut first).await.is_none(), "older link closed");
+    assert_eq!(next_record(&mut second).await.seq, NodeCounter(3));
+    assert_eq!(replay_complete(&mut second).await, NodeCounter(3));
+    // An older generation can no longer bind.
+    assert!(dial_link(&node.endpoint, hello(2, "lease-1", 0))
+        .await
+        .is_err());
+    let api = node.stop().await;
+
+    // The unacknowledged record survives a daemon restart.
+    let node = Running::start_with(dir.path(), api, CountAdmission::new(2), BTreeMap::new()).await;
+    let mut third = dial_link(&node.endpoint, hello(3, "lease-1", 2))
+        .await
+        .unwrap();
+    let replayed = next_record(&mut third).await;
+    assert_eq!(replayed.seq, NodeCounter(3));
+    assert_eq!(replayed.agent_id, AgentId::from("a3"));
+    assert_eq!(replay_complete(&mut third).await, NodeCounter(3));
+    third
+        .link
+        .send(&LinkFrame::Ack {
+            seq: NodeCounter(3),
+        })
+        .await
+        .unwrap();
+    // New records continue the sequence.
+    third.link.send(&refused_launch("a4")).await.unwrap();
+    assert_eq!(next_record(&mut third).await.seq, NodeCounter(4));
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn executor_refuses_a_link_that_acknowledges_unwritten_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 7))
+        .await
+        .unwrap();
+    assert!(next_frame(&mut dialed).await.is_none());
+
+    // A good link still works afterwards.
+    let mut dialed = dial_link(&node.endpoint, hello(2, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
+    // So does a bad acknowledgement on a live link: it is closed.
+    dialed
+        .link
+        .send(&LinkFrame::Ack {
+            seq: NodeCounter(9),
+        })
+        .await
+        .unwrap();
+    assert!(next_frame(&mut dialed).await.is_none());
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn executor_restarts_the_sequence_for_a_new_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    first.link.send(&refused_launch("a1")).await.unwrap();
+    assert_eq!(next_record(&mut first).await.seq, NodeCounter(1));
+
+    let mut second = dial_link(&node.endpoint, hello(2, "lease-2", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut second).await, NodeCounter(0));
+    second.link.send(&refused_launch("a2")).await.unwrap();
+    let record = next_record(&mut second).await;
+    assert_eq!(
+        (record.seq, record.agent_id),
+        (NodeCounter(1), AgentId::from("a2"))
+    );
+    node.stop().await;
+}
+
+/// Requests run only from the machine to the backend: a backend-initiated
+/// request is outside the executor frame list and closes the link.
+#[tokio::test]
+async fn executor_closes_a_link_on_a_backend_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    let dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    let error = dialed
+        .link
+        .call(
+            AgentId::from("a1"),
+            "workspace.read",
+            serde_json::json!({}),
+            wait(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        intent_transport::node_link::error_code(&error),
+        Some(intent_transport::node_link::codes::CLOSED),
+        "{error}"
+    );
+    node.stop().await;
+}
+
+/// Launches that keep arriving on a live link while the node shuts down
+/// are either stopped by that shutdown or refused: every agent that left a
+/// record has its exit journaled, and no provider process survives.
+#[tokio::test]
+async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let api = MachineApi::new();
+    let root = dir
+        .path()
+        .join("executor")
+        .join(&api.credential(&token()).id.0);
+    let node = Running::start_with(dir.path(), api, CountAdmission::new(8), providers).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let launch = |id: String| {
+        LinkFrame::Launch(LaunchCommand {
+            agent_id: AgentId::from(id),
+            workspace_id: WorkspaceId::from("ws-1"),
+            provider: "mock".into(),
+            model: None,
+            base_commit: "base".into(),
+            repo_key: "repo".into(),
+            profile_env: None,
+            agent_features: serde_json::json!({}),
+            is_sub_agent: false,
+        })
+    };
+    dialed.link.send(&launch("a0".into())).await.unwrap();
+    dialed
+        .link
+        .send(&LinkFrame::Prompt {
+            agent_id: AgentId::from("a0"),
+            turn_id: "t1".into(),
+            prompt: vec![serde_json::json!({ "type": "text", "text": "many" })],
+        })
+        .await
+        .unwrap();
+    // Shut down while a0's burst is being journaled (after its Started).
+    let mut first = next_record(&mut dialed).await;
+    if matches!(first.body, JournalBody::Started { .. }) {
+        first = next_record(&mut dialed).await;
+    }
+    assert!(matches!(first.body, JournalBody::Notification { .. }));
+    let stopping = tokio::spawn(node.stop());
+    for i in 1..=20 {
+        if dialed.link.send(&launch(format!("late{i}"))).await.is_err() {
+            break;
+        }
+    }
+    stopping.await.unwrap();
+
+    let journal = Journal::open(&root.join("journal")).unwrap();
+    let records = journal.records_after(NodeCounter(0)).unwrap();
+    let mut agents: Vec<&str> = records.iter().map(|r| r.agent_id.0.as_str()).collect();
+    agents.sort_unstable();
+    agents.dedup();
+    assert!(agents.contains(&"a0"), "{records:#?}");
+    for agent in agents {
+        let exits = records
+            .iter()
+            .filter(|r| r.agent_id.0 == agent && matches!(r.body, JournalBody::Exited { .. }))
+            .count();
+        assert_eq!(exits, 1, "{agent}: {records:#?}");
+    }
+    for entry in std::fs::read_dir(root.join("agents")).unwrap() {
+        let pid_file = entry.unwrap().path().join("work").join("agent.pid");
+        let Ok(bytes) = std::fs::read(&pid_file) else {
+            continue;
+        };
+        let pids: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in ["agent", "child"] {
+            let pid = i32::try_from(pids[key].as_i64().unwrap()).unwrap();
+            let deadline = tokio::time::Instant::now() + wait();
+            while !process_gone(pid) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{} {key} {pid} survived shutdown",
+                    pid_file.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Whether `pid` has exited (a zombie awaiting its reaper counts).
+fn process_gone(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+    }
+}
+
+#[test]
+fn executor_platform_is_linux_or_macos_on_x86_64_or_aarch64() {
+    assert_eq!(
+        platform_of("linux", "x86_64").unwrap(),
+        AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64
+        }
+    );
+    assert_eq!(
+        platform_of("macos", "aarch64").unwrap(),
+        AgentPlatform {
+            os: NodeOs::Macos,
+            arch: NodeArch::Aarch64
+        }
+    );
+    assert!(platform_of("windows", "x86_64").is_err());
+    assert!(platform_of("linux", "riscv64").is_err());
+}
+
+/// Each backend (credential) has its own storage, journal and sequence
+/// under `<data_dir>/executor/<credentialId>/`.
+#[tokio::test]
+async fn each_credential_gets_its_own_storage_and_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 4).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    first.link.send(&refused_launch("a1")).await.unwrap();
+    first.link.send(&refused_launch("a2")).await.unwrap();
+    assert_eq!(next_record(&mut first).await.seq, NodeCounter(1));
+    assert_eq!(next_record(&mut first).await.seq, NodeCounter(2));
+
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-1", 0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay_complete(&mut other).await,
+        NodeCounter(0),
+        "the other backend sees none of the first one's records"
+    );
+    other.link.send(&refused_launch("b1")).await.unwrap();
+    let record = next_record(&mut other).await;
+    assert_eq!(
+        (record.seq, record.agent_id),
+        (NodeCounter(1), AgentId::from("b1"))
+    );
+    for token in [token(), other_token()] {
+        let root = dir
+            .path()
+            .join("executor")
+            .join(&node.api.credential(&token).id.0);
+        assert!(root.join("journal").is_dir(), "{}", root.display());
+    }
+    // A credential bound to one backend cannot be used by another.
+    assert!(
+        dial_link(&node.endpoint, hello_from(OTHER_HEAD, 9, "lease-1", 0))
+            .await
+            .is_err()
+    );
+    node.stop().await;
+}
+
+/// Remote agents of every backend and the machine's own local agents share
+/// one set of limits; a launch over them is refused at once with the
+/// structured `node-capacity` failure, never queued.
+#[tokio::test]
+async fn local_and_remote_agents_share_the_limits_and_over_limit_launches_are_refused() {
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(2);
+    // A local agent of this machine holds one of the two slots.
+    admission.try_admit(&AgentId::from("local-agent")).unwrap();
+    let node =
+        Running::start_with(dir.path(), MachineApi::new(), admission.clone(), providers).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    assert_eq!(first.welcome.capabilities.capacity.running_agents, 1);
+    first.link.send(&launch_of("a1", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut first).await.body,
+        JournalBody::Started { .. }
+    ));
+
+    // The other backend finds the machine full.
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-1", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+    assert_eq!(other.welcome.capabilities.capacity.running_agents, 2);
+    other.link.send(&launch_of("b1", "mock")).await.unwrap();
+    let refusal = next_record(&mut other).await;
+    match &refusal.body {
+        JournalBody::Exited {
+            error: Some(error),
+            failure: Some(failure),
+            ..
+        } => {
+            assert!(error.starts_with(runner::codes::CAPACITY), "{error}");
+            assert_eq!(
+                failure.data,
+                Some(CapacityRefusal::Count {
+                    running_agents: 2,
+                    agent_cap: 2,
+                })
+            );
+        }
+        other => panic!("expected a capacity refusal, got {other:?}"),
+    }
+    assert_eq!(
+        node.service.status(&node.api.credential(&other_token()).id),
+        ExecutorLiveStatus {
+            connected: true,
+            running_agents: 0,
+        },
+        "nothing was queued for the refused backend"
+    );
+    assert_eq!(
+        node.service
+            .status(&node.api.credential(&token()).id)
+            .running_agents,
+        1
+    );
+
+    // The local agent exits: the freed slot admits the other backend.
+    admission.release(&AgentId::from("local-agent"));
+    other.link.send(&launch_of("b2", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut other).await.body,
+        JournalBody::Started { .. }
+    ));
+    node.stop().await;
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "stopping the service released every remote slot"
+    );
+}
+
+/// A capabilities request refreshes the report and answers with the
+/// shared limits and providers.
+#[tokio::test]
+async fn executor_answers_a_capabilities_request_with_a_fresh_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&LinkFrame::Capabilities).await.unwrap();
+    match next_frame(&mut dialed).await {
+        Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+            assert_eq!(capabilities.capacity.agent_cap, 3);
+            assert_eq!(capabilities.providers[0].models, ["mock-model"]);
+        }
+        other => panic!("expected a capabilities reply, got {other:?}"),
+    }
+    assert_eq!(
+        node.report
+            .refreshes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    node.stop().await;
+}
+
+/// Revoking a credential stops its backend's agents here and forgets its
+/// live state.
+#[tokio::test]
+async fn revoking_a_credential_stops_its_backends_agents() {
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node =
+        Running::start_with(dir.path(), MachineApi::new(), admission.clone(), providers).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+    let id = node.api.credential(&token()).id;
+    assert_eq!(node.service.status(&id).running_agents, 1);
+    node.api.revocations.send(id.clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while !admission.running.lock().unwrap().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "agents still run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(node.service.status(&id), ExecutorLiveStatus::default());
+    node.stop().await;
+}
+
+/// Before the service is installed (the listener starts before the store
+/// is ready) the slot reports the executor link as disabled.
+#[test]
+fn the_slot_is_disabled_until_the_service_is_installed() {
+    let slot = ExecutorSlot::default();
+    assert!(!slot.enabled());
+    assert!(slot.service().is_none());
+    assert_eq!(
+        slot.status(&ExecutorCredentialId::new()),
+        ExecutorLiveStatus::default()
+    );
+}
