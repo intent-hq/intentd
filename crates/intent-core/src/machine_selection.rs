@@ -167,7 +167,8 @@ pub async fn select_machines(
                         row.state = RemoteMachineState::Disconnected;
                     }
                 }
-                Err(RefreshFailure::Slow) => slow = true,
+                // Slow with a cached report: decide on that report.
+                Err(RefreshFailure::Slow) if row.capabilities.is_some() => slow = true,
                 Err(failure) => {
                     failed.push((row, failure));
                     continue;
@@ -295,9 +296,11 @@ fn no_platform(
         RefreshFailure::UpdateRequired(update) => Some(update.clone()),
         _ => None,
     });
+    // A machine that has not reported yet and is slow to is, for now, as
+    // retryable as one that cannot be reached.
     let unreachable = failed
         .iter()
-        .find(|(_, failure)| *failure == RefreshFailure::Unreachable);
+        .find(|(_, failure)| matches!(failure, RefreshFailure::Unreachable | RefreshFailure::Slow));
     let revoked = failed
         .iter()
         .find(|(_, failure)| *failure == RefreshFailure::Revoked);

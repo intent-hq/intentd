@@ -801,3 +801,26 @@ async fn a_slow_report_keeps_the_cached_one_and_is_retryable() {
         ["stale"]
     );
 }
+
+/// A machine with no report yet that is slow to send one is not taken as
+/// unsupported: the refusal names it and is retryable.
+#[tokio::test]
+async fn a_slow_machine_without_a_report_is_a_retryable_refusal() {
+    let fake = Fake::new(vec![machine("new", None)]).on_refresh("new", Err(RefreshFailure::Slow));
+    let unnamed = remote();
+    let failure = placement_failure(select(&fake, request(&unnamed, None)).await);
+    assert_eq!(
+        failure.reason,
+        PlacementUnavailableReason::MachineUnreachable
+    );
+    assert_eq!(failure.data()["retryable"], true);
+
+    let named = on(&remote(), "new");
+    let failure = placement_failure(select(&fake, request(&named, None)).await);
+    assert_eq!(
+        failure.reason,
+        PlacementUnavailableReason::MachineUnreachable
+    );
+    assert_eq!(failure.data()["nodeId"], "new");
+    assert_eq!(failure.data()["retryable"], true);
+}
