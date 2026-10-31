@@ -1702,6 +1702,54 @@ impl ProcessRegistry {
         );
     }
 
+    /// Admit a remote (executor) agent against the same slot cap and memory
+    /// budget as local spawns, or refuse it at once: a remote launch is never
+    /// queued and never evicts a local process, so the backend's model decides
+    /// what to do next. The admitted entry is marked active, so no local spawn
+    /// or reap evicts it; [`Self::deregister`] releases it. The budget's
+    /// refusal wins when both limits bind, as in [`Self::acquire`].
+    ///
+    /// # Errors
+    ///
+    /// The [`CapacityRefusal`](intent_core::placement::CapacityRefusal) that
+    /// denied the launch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn try_admit(
+        &self,
+        agent_id: &AgentId,
+    ) -> std::result::Result<(), intent_core::placement::CapacityRefusal> {
+        use intent_core::placement::CapacityRefusal;
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(denial) = self.budget_denies(&mut inner) {
+            let budget = self.memory.get().map_or(0, |b| b.budget_bytes);
+            return Err(CapacityRefusal::Memory {
+                charged_memory_bytes: denial.charged,
+                memory_budget_bytes: budget,
+            });
+        }
+        let used = inner.entries.len();
+        if used >= self.cap {
+            return Err(CapacityRefusal::Count {
+                running_agents: u32::try_from(used).unwrap_or(u32::MAX),
+                agent_cap: u32::try_from(self.cap).unwrap_or(u32::MAX),
+            });
+        }
+        self.budget_adjust(&mut inner, 1);
+        let kill: KillFn = Arc::new(|| Box::pin(async {}));
+        inner.entries.insert(
+            agent_id.clone(),
+            ProcessEntry {
+                last_active_ms: now_ms(),
+                is_active: true,
+                kill,
+            },
+        );
+        Ok(())
+    }
+
     /// Remove a process and wake the next queued spawn, if any. When a waiter is
     /// resumed, logs + emits `agent:process:resumed` via the event callback.
     ///
@@ -14220,6 +14268,29 @@ fn resolve_spawn(
         }
     }
 
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+        resolve_launch_binaries(&provider, &provider_id, settings)?;
+    Ok(ResolvedSpawn {
+        provider,
+        selection,
+        model,
+        reasoning_effort,
+        cwd,
+        provider_binary,
+        extra_env,
+        npx_fallback_binary,
+        npx_fallback_package,
+        unsloth_endpoint,
+    })
+}
+
+/// The executable a provider launches with, by `resolve_spawn`'s precedence:
+/// `(provider_binary, npx_fallback_binary, npx_fallback_package)`.
+fn resolve_launch_binaries(
+    provider: &ProviderConfig,
+    provider_id: &str,
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, Option<&'static str>)> {
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
@@ -14228,27 +14299,16 @@ fn resolve_spawn(
     // directly in place of the pinned npx spawn (monorepo#4352); otherwise
     // any override is ignored. Tests use `test_support::provider_installed`.
     if provider.npx_only_package.is_some() {
-        let explicit_path = read_provider_path_setting(settings, &provider_id);
+        let explicit_path = read_provider_path_setting(settings, provider_id);
         if let Some(binary) =
-            intent_providers::resolve_npx_only_override(&provider, explicit_path.as_deref())
+            intent_providers::resolve_npx_only_override(provider, explicit_path.as_deref())
         {
             tracing::info!(
                 provider_id = provider_id,
                 binary = ?binary,
                 "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
-            return Ok(ResolvedSpawn {
-                selection: selection.clone(),
-                provider,
-                model,
-                reasoning_effort,
-                cwd,
-                provider_binary: Some(binary),
-                extra_env,
-                npx_fallback_binary: None,
-                npx_fallback_package: None,
-                unsloth_endpoint,
-            });
+            return Ok((Some(binary), None, None));
         }
         let npx = if provider.id == "codex" {
             intent_providers::find_codex_npx()
@@ -14266,19 +14326,8 @@ fn resolve_spawn(
             )
             .then(|| std::path::PathBuf::from("npx"))
         });
-        let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
-        return Ok(ResolvedSpawn {
-            selection: selection.clone(),
-            provider,
-            model,
-            reasoning_effort,
-            cwd,
-            provider_binary: None,
-            extra_env,
-            npx_fallback_binary: Some(npx_binary),
-            npx_fallback_package: Some(npx_package),
-            unsloth_endpoint,
-        });
+        let (npx_binary, npx_package) = resolve_npx_only(provider, npx)?;
+        return Ok((None, Some(npx_binary), Some(npx_package)));
     }
 
     // Resolve provider binary using the precedence: setting → native
@@ -14292,7 +14341,7 @@ fn resolve_spawn(
     let explicit_path = read_provider_path_setting(settings, binary_provider_id);
     let (provider_binary, npx_fallback_binary, npx_fallback_package) =
         match intent_providers::discover::resolve_fallback_launch(
-            &provider,
+            provider,
             explicit_path.as_deref(),
         ) {
             intent_providers::discover::ProviderLaunch::Local(binary) => {
@@ -14306,17 +14355,71 @@ fn resolve_spawn(
             intent_providers::discover::ProviderLaunch::Bare { .. } => (None, None, None),
         };
 
-    Ok(ResolvedSpawn {
+    Ok((provider_binary, npx_fallback_binary, npx_fallback_package))
+}
+
+/// How this machine launches a provider for a remote (executor) agent: the
+/// same configuration and executable a local agent of that provider spawns
+/// with (`providers.paths` override → installed binary → npx).
+#[derive(Debug, Clone)]
+pub struct ProviderLaunchSpec {
+    pub provider: ProviderConfig,
+    pub provider_binary: Option<PathBuf>,
+    pub npx_fallback_binary: Option<PathBuf>,
+    pub npx_fallback_package: Option<&'static str>,
+    pub extra_env: BTreeMap<String, String>,
+}
+
+/// Resolve `provider_id` (a base provider or a profile of one) the way a
+/// local spawn does, for a remote agent.
+///
+/// # Errors
+///
+/// `NotFound` for a provider this build does not know (or a disabled one);
+/// the npx-only resolution's `InvalidInput` when npx is missing.
+pub fn resolve_provider_launch(
+    provider_id: &str,
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Result<ProviderLaunchSpec> {
+    let provider_id = intent_providers::base_provider_id(provider_id);
+    let mut extra_env = BTreeMap::new();
+    if provider_id == "mock" {
+        let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").map_err(|_| {
+            Error::NotFound("mock provider requires MOCK_AGENT_SCRIPT_PATH".to_string())
+        })?;
+        // Bounded to the mock (E2E-only) path, as in `resolve_spawn`.
+        let script: &'static str = Box::leak(script.into_boxed_str());
+        let base_args: &'static [&'static str] = Box::leak(vec![script].into_boxed_slice());
+        if let Ok(behavior) = std::env::var("MOCK_AGENT_BEHAVIOR") {
+            extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+        }
+        let base = intent_providers::find_provider("mock")
+            .ok_or_else(|| Error::NotFound("mock provider missing from registry".to_string()))?;
+        return Ok(ProviderLaunchSpec {
+            provider: ProviderConfig {
+                command: "node",
+                base_args,
+                ..*base
+            },
+            provider_binary: None,
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            extra_env,
+        });
+    }
+    let provider = *intent_providers::find_provider(provider_id)
+        .filter(|p| {
+            !crate::agent_ops::provider_is_disabled(p.id, settings.providers.enabled.as_ref())
+        })
+        .ok_or_else(|| Error::NotFound(format!("provider {provider_id:?}")))?;
+    let (provider_binary, npx_fallback_binary, npx_fallback_package) =
+        resolve_launch_binaries(&provider, provider_id, settings)?;
+    Ok(ProviderLaunchSpec {
         provider,
-        selection,
-        model,
-        reasoning_effort,
-        cwd,
         provider_binary,
-        extra_env,
         npx_fallback_binary,
         npx_fallback_package,
-        unsloth_endpoint,
+        extra_env,
     })
 }
 

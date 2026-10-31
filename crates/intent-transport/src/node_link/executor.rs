@@ -28,7 +28,7 @@ use intent_core::{Error, ExecutorCredentialId, Result, WorkspaceApi};
 use super::dial::{HANDSHAKE_TIMEOUT, HEADER_GENERATION, HEADER_HEAD, HEADER_LEASE, HEADER_NODE};
 use super::git::GitCloser;
 use super::link::Tuning;
-use super::{codes, GitConnection, NodeConnection, NodeLink};
+use super::{codes, GitConnection, LinkEvents, NodeLink};
 
 #[cfg(doc)]
 use super::{GIT_PATH, LINK_PATH};
@@ -39,6 +39,20 @@ pub const REVOKED_CLOSE_CODE: u16 = 1008;
 pub const REVOKED_CLOSE_REASON: &str = "credential revoked";
 /// Close code when the listener stops.
 const GOING_AWAY: u16 = 1001;
+
+/// An admitted executor connection.
+#[derive(Debug)]
+pub enum NodeConnection {
+    /// The backend bound with a newer generation. Any older link of the
+    /// same credential has been closed.
+    Link {
+        link: NodeLink,
+        events: LinkEvents,
+        hello: LinkHello,
+    },
+    /// A git connection for the credential's current binding.
+    Git(GitConnection),
+}
 
 /// What the daemon's executor service provides to the listener. Until one
 /// is installed the listener answers `/node/*` with `404`.

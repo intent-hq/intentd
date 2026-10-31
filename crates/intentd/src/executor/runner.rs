@@ -1,6 +1,8 @@
-//! Runs head's agents on the node: an in-memory capacity counter, provider
-//! processes started with `intent_acp::spawn_provider` and driven over the
-//! local ACP client, and a journal record for everything head must see.
+//! Runs one backend's remote agents on this machine: admission against the
+//! machine's shared agent limits, provider processes started with
+//! `intent_acp::spawn_provider` (resolved like a local agent's) and driven
+//! over the local ACP client, and a journal record for everything the
+//! backend must see.
 //!
 //! Head learns about an agent only through the journal: provider
 //! `session/update` notifications, turn ends and process exits (including a
@@ -17,13 +19,17 @@ use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use intent_acp::session::ActivityTracker;
+use intent_acp::NpxLaunchDir;
 use intent_acp::{
     ClientRequestHandler, Connection, ConnectionHooks, EventSink, FileService,
     IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, ProfileEnv,
     SinkEvent, SpawnOptions,
 };
-use intent_core::node_link::{JournalBody, JournalRecord, LaunchCommand, LeaseBinding};
+use intent_core::node_link::{
+    ExitFailure, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
+};
 use intent_core::nodes::NodeCounter;
+use intent_core::placement::CapacityRefusal;
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
@@ -33,9 +39,9 @@ use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
 pub(super) mod codes {
-    /// The node is running `maxAgents` agents already.
+    /// The machine's shared agent limits (count or memory) deny the launch.
     pub const CAPACITY: &str = "node-capacity";
-    /// The provider is not configured on this node.
+    /// The provider is not available on this machine.
     pub const PROVIDER: &str = "node-provider-unavailable";
     /// The provider process could not be started or set up.
     pub const START: &str = "node-agent-start-failed";
@@ -69,19 +75,43 @@ const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
 /// queued records (each one fsync'd) to be journaled.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
-/// A provider the node may launch: its registry entry (with any configured
-/// argument override) and the configured executable.
+/// How this machine launches a provider: its registry entry, the executable
+/// a local agent of it would spawn (or the npx package), and extra
+/// environment.
 #[derive(Debug, Clone)]
-pub(super) struct ProviderLaunch {
+pub(crate) struct ProviderLaunch {
     pub config: ProviderConfig,
-    pub binary: PathBuf,
+    pub binary: Option<PathBuf>,
+    pub npx_fallback_binary: Option<PathBuf>,
+    pub npx_fallback_package: Option<&'static str>,
+    pub extra_env: BTreeMap<String, String>,
+}
+
+/// The machine's shared agent limits, which local agents count against
+/// too. A launch they deny is refused, never queued.
+pub(crate) trait Admission: Send + Sync {
+    /// Take a slot for `agent_id`, or say which limit denies it.
+    fn try_admit(&self, agent_id: &AgentId) -> Result<(), CapacityRefusal>;
+    /// Give `agent_id`'s slot back.
+    fn release(&self, agent_id: &AgentId);
+    /// The limits and their use, for the capabilities report.
+    fn capacity(&self) -> MachineCapacity;
+}
+
+/// What a launch reads from the machine's settings when it starts.
+pub(crate) trait MachineLaunch: Send + Sync {
+    /// Resolve `provider` as a local spawn would. The error is a short
+    /// reason, never a path or setting value.
+    fn resolve(&self, provider: &str) -> Result<ProviderLaunch, String>;
+    /// `remoteAgents.permission`: how provider permission prompts are
+    /// answered.
+    fn policy(&self) -> PermissionPolicy;
 }
 
 /// What the runner needs.
 pub(super) struct RunnerConfig {
-    pub max_agents: u32,
-    pub policy: PermissionPolicy,
-    pub providers: BTreeMap<String, ProviderLaunch>,
+    pub admission: Arc<dyn Admission>,
+    pub launch: Arc<dyn MachineLaunch>,
     pub checkouts: Arc<dyn Checkouts>,
     pub journal: Journal,
     /// The node user's home: a leading `~` in a profile's account directory
@@ -99,9 +129,8 @@ pub(super) struct Runner {
 }
 
 struct Inner {
-    max_agents: usize,
-    policy: PermissionPolicy,
-    providers: BTreeMap<String, ProviderLaunch>,
+    admission: Arc<dyn Admission>,
+    launch: Arc<dyn MachineLaunch>,
     checkouts: Arc<dyn Checkouts>,
     home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
@@ -155,6 +184,8 @@ struct Agent {
     run_marker: String,
     /// Scrubs the profile's secret values from what the agent journals.
     redactor: Arc<Redactor>,
+    /// An npx launch's working directory, kept while the agent runs.
+    npx_launch_dir: Mutex<Option<NpxLaunchDir>>,
 }
 
 /// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
@@ -400,9 +431,8 @@ impl Runner {
         let last = config.journal.last_seq();
         Self {
             inner: Arc::new(Inner {
-                max_agents: config.max_agents as usize,
-                policy: config.policy,
-                providers: config.providers,
+                admission: config.admission,
+                launch: config.launch,
                 checkouts: config.checkouts,
                 home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
@@ -416,8 +446,10 @@ impl Runner {
         }
     }
 
-    pub(super) fn max_agents(&self) -> u32 {
-        u32::try_from(self.inner.max_agents).unwrap_or(u32::MAX)
+    /// The machine's shared limits and their use.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> MachineCapacity {
+        self.inner.admission.capacity()
     }
 
     /// The agents running or starting, for the welcome.
@@ -481,13 +513,23 @@ impl Runner {
     /// frames that caused them; a failed start is journaled as the agent's
     /// exit with an error code.
     pub(super) async fn launch(&self, command: LaunchCommand) {
-        if let Some(refusal) = self.begin_launch(command) {
+        // Provider discovery reads the filesystem; keep it off the runtime.
+        let launch = self.inner.launch.clone();
+        let provider = command.provider.clone();
+        let resolved = tokio::task::spawn_blocking(move || launch.resolve(&provider))
+            .await
+            .unwrap_or_else(|_| Err("provider resolution failed".to_owned()));
+        if let Some(refusal) = self.begin_launch(command, resolved) {
             self.append(refusal).await;
         }
     }
 
     /// Admit and start a launch, or return the refusal to journal.
-    fn begin_launch(&self, command: LaunchCommand) -> Option<JournalEntry> {
+    fn begin_launch(
+        &self,
+        command: LaunchCommand,
+        resolved: Result<ProviderLaunch, String>,
+    ) -> Option<JournalEntry> {
         let LaunchCommand {
             agent_id,
             workspace_id,
@@ -499,7 +541,7 @@ impl Runner {
             agent_features,
             is_sub_agent,
         } = command;
-        let exited = |error: String| JournalEntry {
+        let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
             agent_id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
             turn_id: None,
@@ -507,9 +549,10 @@ impl Runner {
             body: JournalBody::Exited {
                 exit_code: None,
                 error: Some(error),
-                failure: None,
+                failure,
             },
         };
+        let exited = |error: String| refused(error, None);
         let mut state = lock(&self.inner.state);
         if state.closing {
             drop(state);
@@ -524,23 +567,15 @@ impl Runner {
             tracing::warn!(agent = %agent_id, "node: launch for an agent that is already running");
             return None;
         }
-        if state.agents.len() >= self.inner.max_agents {
-            let running = state.agents.len();
-            drop(state);
-            return Some(exited(format!(
-                "{}: this node is running {running} of {} agents",
-                codes::CAPACITY,
-                self.inner.max_agents
-            )));
-        }
-        let Some(launch) = self.inner.providers.get(&provider).cloned() else {
-            drop(state);
-            let configured: Vec<&str> = self.inner.providers.keys().map(String::as_str).collect();
-            return Some(exited(format!(
-                "{}: provider {provider:?} is not configured on this node (configured: {})",
-                codes::PROVIDER,
-                configured.join(", ")
-            )));
+        let launch = match resolved {
+            Ok(launch) => launch,
+            Err(reason) => {
+                drop(state);
+                return Some(exited(format!(
+                    "{}: provider {provider:?} is not available on this machine ({reason})",
+                    codes::PROVIDER
+                )));
+            }
         };
         let profile = match profile_env
             .map(|wire| self.node_profile(&wire.0))
@@ -552,6 +587,17 @@ impl Runner {
                 return Some(exited(format!("{}: {error}", codes::PROFILE)));
             }
         };
+        // Last, so nothing above holds a slot it then gives back.
+        if let Err(limit) = self.inner.admission.try_admit(&agent_id) {
+            drop(state);
+            return Some(refused(
+                format!("{}: {limit}", codes::CAPACITY),
+                Some(ExitFailure {
+                    code: codes::CAPACITY.to_owned(),
+                    data: Some(limit),
+                }),
+            ));
+        }
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
@@ -575,6 +621,7 @@ impl Runner {
             marks: marks_tx,
             activity: ActivityTracker::new(),
             redactor: Arc::new(Redactor::new(profile.as_ref())),
+            npx_launch_dir: Mutex::new(None),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
         state.workspaces.insert(agent_id, workspace_id);
@@ -786,6 +833,7 @@ impl Runner {
                 .is_some_and(|current| Arc::ptr_eq(current, &agent))
             {
                 state.agents.remove(&agent.id);
+                self.inner.admission.release(&agent.id);
             }
         }
         let _ = agent.marks.send(Mark::Exited { exit_code, error });
@@ -808,16 +856,20 @@ impl Runner {
         };
         let mut options = SpawnOptions::new(&launch.config);
         options.cwd = Some(&cwd);
-        options.provider_binary = Some(&launch.binary);
+        options.provider_binary = launch.binary.as_deref();
+        options.npx_fallback_binary = launch.npx_fallback_binary.as_deref();
+        options.npx_fallback_package = launch.npx_fallback_package;
         options.model = model;
         options.profile_env = profile;
+        options.extra_env.clone_from(&launch.extra_env);
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
-        // A configured binary launches directly, never through npx, so there
-        // is no npx launch directory to keep alive.
-        let (child, connection, _npx_launch_dir) = spawned.into_parts();
+        let (child, connection, npx_launch_dir) = spawned.into_parts();
+        // An npx launch runs from its launch directory; keep it until the
+        // agent is gone.
+        *lock(&agent.npx_launch_dir) = npx_launch_dir;
         let connection = Arc::new(connection);
         let handler = ClientRequestHandler::new(
             agent.workspace_id.clone(),
@@ -825,7 +877,7 @@ impl Runner {
             agent.id.0.clone(),
             FileService::new(&cwd),
             Arc::new(PermissionRegistry::new()),
-            self.inner.policy,
+            self.inner.launch.policy(),
             Arc::new(NodeSink),
         );
         let serving = connection.clone();

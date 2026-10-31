@@ -1,27 +1,24 @@
-//! The private head-to-node link for remote agent launch: a WSS connection
-//! authenticated by a pinned server certificate (head side) and a per-lease
-//! bearer token (node side), carrying [`LinkFrame`]s for control, journal and
-//! request/response RPC, plus a second authenticated connection for git
-//! traffic.
+//! The private backend-to-machine link for remote agent launch: a WSS
+//! connection authenticated by a pinned server certificate (backend side)
+//! and an executor credential (machine side), carrying [`LinkFrame`]s for
+//! control, journal and request/response RPC, plus a second authenticated
+//! connection for git traffic.
 //!
-//! Head dials the node. TLS, including the certificate pin, is verified
-//! before any HTTP byte (and so the token) is written. The node checks the
-//! token before upgrading, then accepts the head's [`LeaseBinding`] only if
-//! its generation is newer than the persisted one; the older connection,
-//! and any git connection of an older generation, is closed.
+//! The backend dials the machine. TLS, including the certificate pin, is
+//! verified before any HTTP byte (and so the token) is written. The machine
+//! checks the credential before upgrading, then accepts the backend's
+//! [`LeaseBinding`] only if its generation is newer than the persisted one;
+//! the older connection, and any git connection of an older generation, is
+//! closed.
 //!
 //! Error text is fixed per failure kind and never carries the token, the
 //! endpoint's credentials or a peer-supplied string, so link errors and logs
 //! are safe to surface.
 //!
-//! Daemon-to-daemon remote agents serve the same link on the daemon's own
-//! WSS listener ([`ExecutorLinks`], admitted by executor credentials and
-//! bound per credential). The separate node listener ([`NodeListener`]),
-//! its certificate, [`BindingFile`] and [`LeaseToken`] remain only for
-//! `intentd node` and are removed together with it when the runner moves
-//! into the daemon.
+//! The machine serves the link on the daemon's own WSS listener
+//! ([`ExecutorLinks`], admitted by executor credentials and bound per
+//! credential).
 
-mod binding_file;
 mod dial;
 mod executor;
 mod git;
@@ -29,16 +26,16 @@ mod git;
 mod git_helper;
 mod git_session;
 mod link;
-mod listener;
 mod pin;
 mod reconnect;
 mod secret;
 
-pub use binding_file::BindingFile;
 pub(crate) use dial::socket_config;
 pub use dial::{dial_git, dial_link, DialedLink, NodeEndpoint, TailcatRoute};
 pub(crate) use executor::ExecutorRoute;
-pub use executor::{ExecutorHost, ExecutorLinks, REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON};
+pub use executor::{
+    ExecutorHost, ExecutorLinks, NodeConnection, REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON,
+};
 pub use git::{GitConnection, GitSender};
 #[cfg(unix)]
 pub use git_helper::run_git_remote_helper;
@@ -50,10 +47,9 @@ pub use git_session::{
 };
 pub use intent_core::node_link::*;
 pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink};
-pub use listener::{NodeConnection, NodeListener, NodeListenerConfig, WelcomeFn};
 pub use pin::CertificatePin;
 pub use reconnect::{dial_with_backoff, Backoff};
-pub use secret::LeaseToken;
+pub use secret::ExecutorToken;
 
 use intent_core::Error;
 

@@ -1,7 +1,8 @@
-//! Agent refs over the node link, end to end: head serves git sessions on
-//! a real pinned-TLS git connection, the node fetches and pushes through the
-//! intentd binary running as `git-remote-intent`, and head confines every
-//! session to the refs of agents on the node's lease.
+//! Agent refs over the executor link, end to end: head serves git sessions
+//! on a real pinned-TLS git connection to a machine's daemon listener
+//! (`/node/git`), the machine fetches and pushes through the intentd binary
+//! running as `git-remote-intent`, and head confines every session to the
+//! refs of agents on the machine's lease.
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
@@ -10,16 +11,21 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::node_link::{LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS};
+use intent_core::machines::ExecutorCredential;
+use intent_core::node_link::{
+    BindDecision, LeaseBinding, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS,
+};
 use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
-use intent_core::{BoxFuture, Error, Result};
+use intent_core::{
+    BoxFuture, Error, ExecutorCredentialId, HostRole, PrincipalId, Result, WorkspaceApi,
+};
 use intent_git::hub::AgentRef;
 use intent_git::node_git::{AgentRemote, CheckoutCache, NodeGit, HELPER_NAME, SOCKET_ENV};
 use intent_transport::generate_certificate;
 use intent_transport::node_link::{
-    dial_git, dial_link, serve_git, serve_helpers, BindingFile, CertificatePin, LeaseToken,
-    NodeConnection, NodeEndpoint, NodeGitAccess, NodeGitSessions, NodeListener, NodeListenerConfig,
+    dial_git, dial_link, serve_git, serve_helpers, CertificatePin, ExecutorHost, ExecutorLinks,
+    ExecutorToken, NodeConnection, NodeEndpoint, NodeGitAccess, NodeGitSessions,
 };
 
 use crate::common::test_tempdir_in;
@@ -89,6 +95,94 @@ impl NodeGitAccess for Lease {
     }
 }
 
+const EXECUTOR_TOKEN: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// The machine's store seams: one executor credential, bound by the
+/// store's generation rule.
+struct MachineApi {
+    principal: PrincipalId,
+    credential: ExecutorCredential,
+    binding: std::sync::Mutex<Option<LeaseBinding>>,
+}
+
+impl WorkspaceApi for MachineApi {
+    fn primary_principal_id(&self) -> BoxFuture<'_, Result<PrincipalId>> {
+        Box::pin(async move { Ok(self.principal.clone()) })
+    }
+
+    fn principal_host_role(&self, _id: PrincipalId) -> BoxFuture<'_, Result<HostRole>> {
+        Box::pin(async { Ok(HostRole::Member) })
+    }
+
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<ExecutorCredential>>> {
+        let known = intent_transport::auth::hash_token(EXECUTOR_TOKEN);
+        Box::pin(async move { Ok((token_hash == known).then(|| self.credential.clone())) })
+    }
+
+    fn bind_executor(
+        &self,
+        _credential_id: ExecutorCredentialId,
+        node_id: String,
+        offered: LeaseBinding,
+    ) -> BoxFuture<'_, Result<BindDecision>> {
+        Box::pin(async move {
+            let mut binding = self.binding.lock().unwrap();
+            let decision = LeaseBinding::decide(&node_id, binding.as_ref(), &offered);
+            if decision == BindDecision::Accept {
+                *binding = Some(offered);
+            }
+            Ok(decision)
+        })
+    }
+}
+
+struct OwnerToken;
+
+impl intent_transport::TokenStore for OwnerToken {
+    fn load_token(&self) -> Option<String> {
+        Some("o".repeat(64))
+    }
+    fn store_token(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Hands every admitted connection to the test.
+struct Host(tokio::sync::mpsc::UnboundedSender<NodeConnection>);
+
+impl ExecutorHost for Host {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn node_id(&self) -> String {
+        "node-1".into()
+    }
+    fn welcome(&self, _credential: &ExecutorCredential, _hello: &LinkHello) -> LinkWelcome {
+        LinkWelcome {
+            protocol: 0,
+            node_id: String::new(),
+            running_agents: vec![],
+            capabilities: intent_core::node_link::MachineCapabilities::new(
+                AgentPlatform {
+                    os: NodeOs::Linux,
+                    arch: NodeArch::X86_64,
+                },
+                "test",
+                2,
+                "2026-10-30T00:00:00Z",
+            ),
+            hosts: Vec::new(),
+            tc_address: None,
+        }
+    }
+    fn accept(&self, _credential: ExecutorCredential, connection: NodeConnection) {
+        let _ = self.0.send(connection);
+    }
+}
+
 struct Fixture {
     head: tempfile::TempDir,
     node: tempfile::TempDir,
@@ -128,42 +222,49 @@ impl Fixture {
             );
         }
 
-        // The node's listener; head dials the link, then the git connection.
+        // The machine's daemon listener; head dials the link, then the git
+        // connection.
         let node = test_tempdir_in("/tmp", "node-git-node");
         let certificate =
             generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        let token = LeaseToken::new(format!("token-{}", "x".repeat(32))).unwrap();
-        let mut listener = NodeListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            NodeListenerConfig {
-                node_id: "node-1".into(),
-                token: token.clone(),
-                binding_file: BindingFile::new(node.path().join("binding.json")),
-                certificate: certificate.clone(),
+        let api = Arc::new(MachineApi {
+            principal: PrincipalId::new(),
+            credential: ExecutorCredential {
+                id: ExecutorCredentialId::new(),
+                backend_id: "head-1".into(),
+                backend_name: "Head".into(),
+                backend_fingerprint: None,
+                created_at: "2026-10-31T00:00:00Z".into(),
+                last_used_at: None,
+                revoked_at: None,
             },
-            Arc::new(|_| LinkWelcome {
-                protocol: 0,
-                node_id: String::new(),
-                running_agents: vec![],
-                capabilities: intent_core::node_link::MachineCapabilities::new(
-                    AgentPlatform {
-                        os: NodeOs::Linux,
-                        arch: NodeArch::X86_64,
-                    },
-                    "test",
-                    2,
-                    "2026-10-30T00:00:00Z",
-                ),
-                hosts: Vec::new(),
-                tc_address: None,
-            }),
+            binding: std::sync::Mutex::new(None),
+        });
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&node.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let tokens = Arc::new(intent_transport::AsyncTokenStore::new(Arc::new(OwnerToken)));
+        let mut server = intent_transport::WsApiServer::new(
+            api,
+            bus,
+            &certificate,
+            &tokens,
+            intent_transport::WsOptions {
+                base_port: 0,
+                ..intent_transport::WsOptions::default()
+            },
+            None,
         )
-        .await
         .unwrap();
+        let (tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        server.install_executor_links(ExecutorLinks::new(Arc::new(Host(tx))));
+        let port = server.start().await.unwrap();
         let endpoint = NodeEndpoint {
-            url: format!("wss://{}", listener.local_addr()),
+            url: format!("wss://127.0.0.1:{port}"),
             pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
-            token,
+            token: ExecutorToken::new(EXECUTOR_TOKEN).unwrap(),
             tailcat: None,
         };
         let binding = LeaseBinding {
@@ -183,14 +284,13 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let node_link = tokio::time::timeout(wait(), listener.accept())
+        let node_link = tokio::time::timeout(wait(), accepted.recv())
             .await
             .unwrap()
             .unwrap();
         let head_git = dial_git(&endpoint, &binding).await.unwrap();
-        let Some(NodeConnection::Git(node_git)) = tokio::time::timeout(wait(), listener.accept())
-            .await
-            .unwrap()
+        let Some(NodeConnection::Git(node_git)) =
+            tokio::time::timeout(wait(), accepted.recv()).await.unwrap()
         else {
             panic!("expected the git connection");
         };
@@ -226,7 +326,7 @@ impl Fixture {
             base,
             _tasks: vec![serving, helpers],
             _link: link,
-            _node_link: Box::new((listener, node_link)),
+            _node_link: Box::new((server, node_link, accepted)),
         }
     }
 

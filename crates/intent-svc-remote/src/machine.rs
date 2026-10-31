@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use intent_core::machines::ExposedMachine;
 use intent_core::{Error, Result};
-use intent_transport::node_link::{CertificatePin, LeaseToken, NodeEndpoint, TailcatRoute};
+use intent_transport::node_link::{CertificatePin, ExecutorToken, NodeEndpoint, TailcatRoute};
 
 /// One way to reach the machine, with the label errors name it by.
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub(crate) struct MachineTarget {
     pub pin: CertificatePin,
     /// The pin as 64 lowercase hex digits.
     pub certificate_sha256: String,
-    pub token: LeaseToken,
+    pub token: ExecutorToken,
     /// The sitter-shipped tailcat binary; without it the tailcat route is
     /// not tried.
     pub tailcat_bin: Option<PathBuf>,
@@ -90,7 +90,7 @@ impl MachineTarget {
     ) -> Result<Self> {
         let pin = CertificatePin::parse(fingerprint)
             .map_err(|_| invalid("fingerprint must be a SHA-256 in hex"))?;
-        let token = LeaseToken::new(token.to_owned())
+        let token = ExecutorToken::new(token.to_owned())
             .map_err(|_| invalid("token must be at least 32 printable ASCII bytes"))?;
         Ok(Self {
             id: id.to_owned(),
