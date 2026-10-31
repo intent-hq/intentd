@@ -201,7 +201,7 @@ impl ExecutorLinks {
                 }
                 let id = credential.id.clone();
                 self.host.accept(credential, NodeConnection::Git(git));
-                watch_revocation(self, id, revocations, async move { closer.closed().await }).await;
+                watch_revocation(self, id, revocations, async move { closer.closed().await });
             }
             ExecutorRoute::Link => {
                 let bound = tokio::time::timeout(
@@ -249,8 +249,7 @@ impl ExecutorLinks {
                         hello,
                     },
                 );
-                watch_revocation(self, id, revocations, async move { watched.closed().await })
-                    .await;
+                watch_revocation(self, id, revocations, async move { watched.closed().await });
             }
         }
     }
@@ -269,13 +268,13 @@ impl ExecutorLinks {
         let hello = loop {
             match socket.next().await {
                 // Decode errors quote the peer's bytes; report a fixed code.
-                Some(Ok(Message::Binary(bytes))) => match LinkFrame::decode(&bytes) {
-                    Ok(LinkFrame::Hello(hello)) => break hello,
-                    _ => {
-                        reject(socket, codes::PROTOCOL).await;
-                        return Err(super::protocol("expected hello"));
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Ok(LinkFrame::Hello(hello)) = LinkFrame::decode(&bytes) {
+                        break hello;
                     }
-                },
+                    reject(socket, codes::PROTOCOL).await;
+                    return Err(super::protocol("expected hello"));
+                }
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 _ => return Err(super::unavailable()),
             }
@@ -341,7 +340,7 @@ impl ExecutorLinks {
 
 /// Close `id`'s connections when it is revoked, until `closed` resolves. A
 /// lagged or closed feed fails closed.
-async fn watch_revocation(
+fn watch_revocation(
     links: Arc<ExecutorLinks>,
     id: ExecutorCredentialId,
     revocations: Option<broadcast::Receiver<ExecutorCredentialId>>,
