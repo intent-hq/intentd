@@ -200,14 +200,19 @@ A failed local server start or restart reports `error` with `lastError`. Fix its
 
 ## Mac update availability
 
-Mac update availability can differ by architecture. Intel Macs stay on their last
-compatible available release in the selected update channel when a newer release
-has no Intel build. Older Apple Silicon apps may also remain on an earlier
-compatible release; manually installing a current Apple Silicon build lets them
-receive newer releases. Do not
-suggest an Apple Silicon build for an Intel Mac.
+Current Intent desktop releases for macOS support **Apple Silicon only**; new Intel
+Mac builds are no longer published. Existing beta and stable installations discover
+native Apple Silicon updates automatically through the standard Mac feed. These
+channels receive a release only after it is promoted to the respective channel.
 
-<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
+Alpha builds that used the temporary ARM-specific feed need a one-time reinstall
+of the Apple Silicon build to return to the standard feed. That temporary feed
+never reached beta or stable.
+
+Intel Macs are unsupported. Do not suggest an Apple Silicon installer for an Intel
+Mac or promise new Intel releases.
+
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/cloudlands-fe/.github/workflows/{release-alpha.yml,promote-beta.yml,release-stable.yml}. -->
 
 ## Anonymous update statistics
 
