@@ -38,6 +38,36 @@ fn set(server: &Server, path: &str, body: Value, next: Option<&str>) {
         .unwrap()
         .insert(path.into(), next.unwrap_or_default().into());
 }
+/// Failure-path report for a stalled owner `settings.update`
+/// (intent-hq/intent#8252): which settings lock it could be queued behind.
+/// Read-only: a revision-gate try-lock and the public credential-gate read.
+async fn settings_stall_report(h: &Harness) -> String {
+    let gate = h.services.settings_revision_gate();
+    let revision = if gate.try_write().is_ok() {
+        "free"
+    } else if gate.try_read().is_ok() {
+        "read-held"
+    } else {
+        "write-held"
+    };
+    let server = h.server.as_ref().unwrap();
+    let started = std::time::Instant::now();
+    let credential = match tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        h.services.own_gitlab_token(&server.host),
+    )
+    .await
+    {
+        Ok(_) => format!("acquired in {:?}", started.elapsed()),
+        Err(_) => "not acquired (held, or its secret read stalled)".into(),
+    };
+    format!(
+        "settings stall probe: revision gate {revision}; gitlab credential gate {credential}; provider requests active={} completed={} routed={}",
+        server.state.active.load(Ordering::SeqCst),
+        server.state.completed.load(Ordering::SeqCst),
+        server.count()
+    )
+}
 async fn capture(client: &mut Client) -> Value {
     ready(
         &client
@@ -117,7 +147,16 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
             // generation. Equality of the final settings cannot revive this lease.
             let mut owner = h.uds().await;
             for client_id in ["changed-client", "client"] {
-                success(&owner.rpc("settings.update", json!({"changes":[{"path":"sourceControl.gitlab.oauthClientId","value":client_id}]})).await);
+                let updated = owner
+                    .try_rpc_probed(
+                        "settings.update",
+                        json!({"changes":[{"path":"sourceControl.gitlab.oauthClientId","value":client_id}]}),
+                        acquire(),
+                        || settings_stall_report(&h),
+                    )
+                    .await
+                    .unwrap_or_else(|stall| panic!("remote={remote} before_first={heal_before_first_page} {stall}"));
+                success(&updated);
             }
             let before = server.count();
             let refused = client
@@ -164,6 +203,47 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
             h.finish().await;
         }
     }
+}
+
+/// The #8252 stall diagnostic names a held settings lock. Holding the revision
+/// gate parks `settings.update` after it took the credential gate, so the
+/// report must show both instead of a bare `Elapsed`.
+#[intent_test_macros::daemon_test]
+async fn checkout_settings_update_stall_report_names_held_gates() {
+    let h = Harness::with_workspace(false).await;
+    let mut owner = h.uds().await;
+    let held = h.services.settings_revision_gate().write_owned().await;
+    let stall = owner
+        .try_rpc_probed(
+            "settings.update",
+            json!({"changes":[{"path":"sourceControl.gitlab.oauthClientId","value":"changed-client"}]}),
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            || settings_stall_report(&h),
+        )
+        .await
+        .expect_err("a held revision gate must stall settings.update");
+    eprintln!("forced stall report: {stall}");
+    assert!(
+        stall.contains("no reply to settings.update id 1"),
+        "{stall}"
+    );
+    assert!(stall.contains("revision gate write-held"), "{stall}");
+    assert!(
+        stall.contains("gitlab credential gate not acquired"),
+        "{stall}"
+    );
+    assert!(stall.contains("provider requests active=0"), "{stall}");
+    drop(held);
+    // Nothing arrived before the stall, so the original reply is still whole.
+    let reply = loop {
+        let frame = owner.next().await;
+        if frame["id"] == 1 {
+            break frame;
+        }
+    };
+    success(&reply);
+    owner.close().await;
+    h.finish().await;
 }
 
 #[intent_test_macros::daemon_test]
