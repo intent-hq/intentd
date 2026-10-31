@@ -75,6 +75,8 @@ enum WorkspaceVariant {
     #[default]
     Titled,
     AutoTitled,
+    /// A plain-folder workspace (§5.1): no branch, no worktree.
+    PlainFolder,
     NotFound,
 }
 
@@ -82,6 +84,18 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
     let (title, worktree) = match variant {
         WorkspaceVariant::Titled => ("Hello".to_string(), Some("/tmp/hello".to_string())),
         WorkspaceVariant::AutoTitled => (id.to_string(), None),
+        WorkspaceVariant::PlainFolder => {
+            return Workspace {
+                id: WorkspaceId::from_string(id),
+                title: "Notes".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                repository_path: Some("/tmp/notes".to_string()),
+                repository_name: Some("notes".to_string()),
+                plain_folder: true,
+                ..Default::default()
+            };
+        }
         WorkspaceVariant::NotFound => unreachable!(),
     };
     Workspace {
@@ -581,6 +595,20 @@ async fn workspace_details_returns_reference_shape() {
     assert_eq!(v["tags"], json!(["red"]));
     // No setup record (the trait default): `unknown`, optional fields omitted.
     assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
+}
+
+/// A plain-folder workspace has no branch (§5.1): `details()` omits the key,
+/// while a git workspace keeps it (see `workspace_details_returns_reference_shape`).
+#[tokio::test]
+async fn workspace_details_omits_branch_for_plain_folders() {
+    let (srv, api) = server();
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert!(v.get("branch").is_none(), "branch omitted: {v}");
+    assert_eq!(v["title"], json!("Notes"));
+    assert_eq!(v["repositoryName"], json!("notes"));
 }
 
 #[tokio::test]

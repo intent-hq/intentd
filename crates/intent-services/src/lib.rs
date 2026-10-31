@@ -63,6 +63,7 @@ mod agent_wake;
 mod agent_workers;
 mod auto_archive;
 mod auto_retire;
+mod plain_folder;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -13892,7 +13893,14 @@ fn cleanup_detached_worktree(trash: &Path) -> bool {
 /// `remove_dir`s the (empty-only) parent workspace dir. Best-effort
 /// throughout: per-entry failures are logged and never abort the sweep. A
 /// missing root is a silent no-op. Returns the number of trash dirs removed.
+#[cfg(test)]
 fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
+    sweep_orphaned_worktree_trash_keeping(root, &|_| false)
+}
+
+/// [`sweep_orphaned_worktree_trash`] that leaves every workspace dir for
+/// which `keep` is true untouched (plain folders, §5.1).
+fn sweep_orphaned_worktree_trash_keeping(root: &Path, keep: &dyn Fn(&Path) -> bool) -> usize {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
@@ -13931,6 +13939,9 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
             }
         }
         let ws_dir = ws_entry.path();
+        if keep(&ws_dir) {
+            continue;
+        }
         let children = match std::fs::read_dir(&ws_dir) {
             Ok(children) => children,
             Err(e) => {
@@ -14035,11 +14046,20 @@ impl Services {
     pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
         let root = self.workspaces_root.clone();
         let location = self.configured_worktrees_location();
+        // Never inside a plain folder (§5.1); a failed lookup skips the sweep.
+        let plain_guard = match plain_folder::PlainFolderGuard::load(&self.store).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(error = %e, "orphaned trash sweep: plain-folder lookup failed; skipped");
+                return 0;
+            }
+        };
         let task = tokio::task::spawn_blocking(move || {
             let root = root.unwrap_or_else(default_workspaces_root);
-            let mut removed = sweep_orphaned_worktree_trash(&root);
+            let keep = |dir: &Path| plain_guard.protects(dir);
+            let mut removed = sweep_orphaned_worktree_trash_keeping(&root, &keep);
             if let Some(location) = location.filter(|l| *l != root) {
-                removed += sweep_orphaned_worktree_trash(&location);
+                removed += sweep_orphaned_worktree_trash_keeping(&location, &keep);
             }
             removed
         })
@@ -18631,6 +18651,13 @@ impl Services {
             let mut known_completion =
                 matches!(&workspace_observation, Ok(_) | Err(Error::NotFound(_)));
             let ws_for_cleanup = workspace_observation.ok();
+            // The plain folder the background sweep must never touch.
+            let ws_for_cleanup_plain_folder = ws_for_cleanup
+                .as_ref()
+                .filter(|w| w.plain_folder)
+                .and_then(|w| w.repository_path.as_deref())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
             let branch_observation = store.workspace_branch_auto_generated(&id).await;
             known_completion &= matches!(&branch_observation, Ok(_) | Err(Error::NotFound(_)));
             let branch_auto_generated = branch_observation.unwrap_or(false);
@@ -18730,6 +18757,27 @@ impl Services {
                 known_completion &=
                     matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
                 let recreated = recreated_observation.ok();
+                // Plain folders (§5.1 "Plain-folder workspaces") are never
+                // deleted. The `<parent>/<id>` candidates are derived from
+                // the id and the roots alone (intent-hq/intent#6229), so a
+                // later root or location change can point one at a plain
+                // folder — this workspace's, a deleted one's (tombstone) or
+                // another workspace's. Any candidate overlapping one is kept;
+                // if the lookup fails, every candidate is kept (fail closed).
+                let plain_guard = plain_folder::PlainFolderGuard::load(&store_bg)
+                    .await
+                    .map(|guard| match ws_for_cleanup_plain_folder.as_deref() {
+                        Some(own) => {
+                            let mut paths = vec![own.to_path_buf()];
+                            paths.extend(guard.into_folders());
+                            plain_folder::PlainFolderGuard::from_paths(paths)
+                        }
+                        None => guard,
+                    });
+                known_completion &= plain_guard.is_ok();
+                // A plain-folder row (§5.1) never reaches the checkout
+                // cleanup: its folder is `repositoryPath` and is the user's.
+                let ws_for_cleanup = ws_for_cleanup.filter(|w| !w.plain_folder);
                 let deleted_worktree_path = ws_for_cleanup
                     .as_ref()
                     .and_then(|w| w.worktree_path.clone());
@@ -18818,7 +18866,14 @@ impl Services {
                                 // intent-hq/monorepo#2611): never provisioned
                                 // by the daemon, never deleted with the
                                 // workspace.
-                                if is_standalone && !checkout_owned {
+                                if !plain_folder::PlainFolderGuard::removable(
+                                    &plain_guard,
+                                    &wt_locked,
+                                    "workspace.delete checkout",
+                                ) {
+                                    // Overlaps a plain folder (or the lookup
+                                    // failed): never detached or removed.
+                                } else if is_standalone && !checkout_owned {
                                     tracing::debug!(
                                         workspace = %ws_cleanup.id.as_str(),
                                         checkout = %wt_locked.display(),
@@ -18929,6 +18984,13 @@ impl Services {
                     worktrees_location_bg.as_deref(),
                 ) {
                     if recreated_parent.as_deref() == Some(dir.as_path()) {
+                        continue;
+                    }
+                    if !plain_folder::PlainFolderGuard::removable(
+                        &plain_guard,
+                        &dir,
+                        "workspace.delete",
+                    ) {
                         continue;
                     }
                     // Shared parallel removal helper; `NotFound` is already
@@ -21567,6 +21629,11 @@ impl WorkspaceApi for Services {
         mut input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        // Plain-folder request shape (§5.1): refused before the native
+        // checkout preparation or any other step can run.
+        if let Err(e) = plain_folder::validate_create_shape(&input) {
+            return Box::pin(async move { Err(e) });
+        }
         let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
@@ -21684,6 +21751,28 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
+                    // Plain-folder path (§5.1 "Plain-folder workspaces"):
+                    // read-only classification against the workspaces root
+                    // and any configured worktrees location, before any side
+                    // effect. A new folder is created only right before the
+                    // row insert.
+                    let plain_target = if plain_folder::requested(&input) {
+                        let mut roots = vec![workspaces_root
+                            .clone()
+                            .unwrap_or_else(default_workspaces_root)];
+                        let location = worktrees_location.trim();
+                        if !location.is_empty() {
+                            roots.push(PathBuf::from(intent_core::expand_tilde_string(location)));
+                        }
+                        let path = input.repository_path.as_deref().map(PathBuf::from).ok_or_else(|| {
+                            Error::PlainFolderInvalidParams(
+                                "repositoryPath is required when plainFolder is true".into(),
+                            )
+                        })?;
+                        Some(plain_folder::resolve_target(&path, &roots)?)
+                    } else {
+                        None
+                    };
                     // Unified provisioning progress (PROTOCOL §5.1): a
                     // client-supplied `progressId` arms a per-create reporter
                     // that echoes the id on every `git:clone:*` frame,
@@ -22518,9 +22607,11 @@ impl WorkspaceApi for Services {
                     // pair (`generateWorkspaceSlug`) — under the optional
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
-                    let branch_auto_generated =
-                        input.branch.as_deref().is_none_or(str::is_empty);
-                    let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
+                    let branch_auto_generated = plain_target.is_none()
+                        && input.branch.as_deref().is_none_or(str::is_empty);
+                    // A plain folder has no git branch: empty, omitted on the
+                    // wire (§5.1).
+                    let branch = if plain_target.is_some() { String::new() } else if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
                         let slug = planned_initial_agent
                             .as_ref()
                             .and_then(|(_, prompt, _)| prompt.as_deref())
@@ -22636,6 +22727,7 @@ impl WorkspaceApi for Services {
                         // Validated pre-insert above; an empty list persists
                         // as absent so the wire shape omits it (§5.1).
                         context_links: input.context_links.filter(|l| !l.is_empty()),
+                        plain_folder: plain_target.is_some(),
                         // `activity` is derived (§9.9) and the card aggregates
                         // are computed on the list/get emit path only.
                         ..Default::default()
@@ -22654,6 +22746,16 @@ impl WorkspaceApi for Services {
                     // supplying their own `worktreePath`, and repository paths
                     // that are not a local git repo (registry-only rows keep
                     // the prior behavior).
+                    // Plain folder (§5.1): the folder at `repositoryPath` is
+                    // the only location. Caller-supplied `path` (which would
+                    // outrank it for the agent cwd) and blank git fields that
+                    // passed the shape check never persist.
+                    if ws.plain_folder {
+                        ws.path = None;
+                        ws.worktree_path = None;
+                        ws.base_ref = None;
+                        ws.base_commit_sha = None;
+                    }
                     let has_worktree = ws
                         .worktree_path
                         .as_deref()
@@ -23065,7 +23167,7 @@ impl WorkspaceApi for Services {
                                 }
                             }
                         }
-                    } else if let Some(repo_dir) = repo_dir {
+                    } else if let Some(repo_dir) = repo_dir.filter(|_| !ws.plain_folder) {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {
                                 let repo_name = known_repo_name(
@@ -23417,13 +23519,27 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
+                    // Plain folder (§5.1): the only filesystem side effect is
+                    // creating a requested new folder, right before the row.
+                    let created_plain_folder = match &plain_target {
+                        Some(target) => target.materialize()?,
+                        None => false,
+                    };
                     if let Some(checkout) = &native_checkout {
                         boxed_await(|| checkout.insert(ws.clone(), global_auto_commit)).await?;
-                    } else {
-                        boxed_await(|| {
-                            store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        })
-                        .await?;
+                    } else if let Err(e) = boxed_await(|| {
+                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                    })
+                    .await
+                    {
+                        // Undo only the folder this create made, and only
+                        // while it is still empty.
+                        if let (true, Some(plain_folder::PlainFolderTarget::New(path))) =
+                            (created_plain_folder, plain_target.as_ref())
+                        {
+                            let _ = std::fs::remove_dir(path);
+                        }
+                        return Err(e);
                     }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
@@ -23466,11 +23582,13 @@ impl WorkspaceApi for Services {
                     if !registry_roots.contains(&boot_root) {
                         registry_roots.push(boot_root.clone());
                     }
+                    // A plain folder is not a repository: never registered.
                     let repo_path = ws
                         .repository_path
                         .as_deref()
+                        .filter(|_| !ws.plain_folder)
                         .filter(|p| !p.is_empty())
-                        .or(ws.path.as_deref())
+                        .or(ws.path.as_deref().filter(|_| !ws.plain_folder))
                         .filter(|p| !p.is_empty())
                         .filter(|p| {
                             !is_workspace_owned_checkout(
@@ -23529,7 +23647,9 @@ impl WorkspaceApi for Services {
                     if let Some(checkout) = &native_checkout {
                         boxed_await(|| checkout.current()).await?;
                     }
-                    let setup_worktree = if ws.skip_worktree {
+                    // Plain folders run no setup script (§5.1): the folder is
+                    // the user's, not a provisioned checkout.
+                    let setup_worktree = if ws.skip_worktree || ws.plain_folder {
                         None
                     } else {
                         crate::git_ops::worktree_path(&ws)
@@ -24309,6 +24429,15 @@ impl WorkspaceApi for Services {
                 &worktrees_location,
             )?;
             let source = store.get_workspace(&id).await?;
+            // Plain folder (§5.1 "Plain-folder workspaces"): duplicate is
+            // git-only. Refused before anything is provisioned — a copy
+            // would point a second row at the user's folder, and a `.git`
+            // that appeared later would get a worktree added to it.
+            if source.plain_folder {
+                return Err(Error::PlainFolderUnsupported {
+                    operation: "workspace.duplicate",
+                });
+            }
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
             // Retries stay bounded so a wildly saturated slug space fails fast
@@ -24876,6 +25005,9 @@ impl WorkspaceApi for Services {
             // surfaces a `NotFound` at the trait layer instead of silently
             // sweeping a random directory.
             let ws = store.get_workspace(&id).await?;
+            // Never inside a plain folder (§5.1); fail closed on a failed
+            // lookup.
+            let plain_guard = plain_folder::PlainFolderGuard::load(&store).await;
             // Best-effort recursive delete of the daemon-owned cache directory
             // (`<parent>/<id>/cache`). The parent candidates cover the
             // persisted worktree's parent (the location in force at create
@@ -24890,6 +25022,13 @@ impl WorkspaceApi for Services {
                 worktrees_location.as_deref(),
             ) {
                 let cache_dir = dir.join("cache");
+                if !plain_folder::PlainFolderGuard::removable(
+                    &plain_guard,
+                    &cache_dir,
+                    "workspace.cleanup",
+                ) {
+                    continue;
+                }
                 let cache_task =
                     tokio::task::spawn_blocking(move || {
                         match std::fs::remove_dir_all(&cache_dir) {

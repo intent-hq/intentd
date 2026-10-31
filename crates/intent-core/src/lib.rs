@@ -88,8 +88,8 @@ pub use clock::{
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{
-    CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, ProviderProfileFailure,
-    Result,
+    CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, PlainFolderPathReason,
+    PlainFolderPathRejection, ProviderProfileFailure, Result,
 };
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
