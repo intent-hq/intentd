@@ -2494,6 +2494,7 @@ dependencies = [
  "intentd-test-support",
  "libc",
  "serde_json",
+ "socket2",
  "sqlx",
  "tempfile",
  "time",

@@ -150,17 +150,24 @@ struct Machine {
     token: String,
     accepted: mpsc::UnboundedReceiver<NodeConnection>,
     git: Vec<GitConnection>,
+    /// The loopback address the machine listens on.
+    ip: [u8; 4],
+    /// While stopped: the machine's port, bound but not listening, so
+    /// connections are refused and no other socket can take the port
+    /// before [`Machine::restart`].
+    held: std::sync::Mutex<Option<socket2::Socket>>,
     _tmp: TempDb,
 }
 
 impl Machine {
-    /// A machine that minted a credential for `backend_id`, listening on
-    /// `port` (`0` for any).
-    async fn start(backend_id: &str, port: u16) -> Self {
-        Self::start_on([127, 0, 0, 1], backend_id, port).await
+    /// A machine that minted a credential for `backend_id`, listening on a
+    /// port the system assigns.
+    async fn start(backend_id: &str) -> Self {
+        Self::start_on([127, 0, 0, 1], backend_id, 0).await
     }
 
-    /// A machine listening only on loopback address `ip`.
+    /// A machine listening only on loopback address `ip`, on `port` (`0`
+    /// for one the system assigns, kept across restarts).
     async fn start_on(ip: [u8; 4], backend_id: &str, port: u16) -> Self {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
@@ -192,7 +199,15 @@ impl Machine {
         )
         .unwrap();
         server.install_executor_links(ExecutorLinks::new(host.clone()));
-        let port = server.start().await.unwrap();
+        // Port 0 is chosen and bound in one step, so no other socket can
+        // take it in between; later starts reuse the assigned port. An
+        // explicit port is bound as given.
+        let port = if port == 0 {
+            server.start_with_port_assignment(|_| Ok(())).await
+        } else {
+            server.start().await
+        }
+        .unwrap();
         Self {
             server,
             port,
@@ -203,6 +218,8 @@ impl Machine {
             token,
             accepted,
             git: Vec::new(),
+            ip,
+            held: std::sync::Mutex::new(None),
             _tmp: tmp,
         }
     }
@@ -283,11 +300,17 @@ impl Machine {
         }
     }
 
+    /// Stop listening, keeping the port: connections are refused as by a
+    /// machine that is down, and the port stays this machine's.
     async fn stop(&self) {
         self.server.stop().await;
+        let held = hold_port(self.ip, self.port);
+        *self.held.lock().unwrap() = Some(held);
     }
 
     async fn restart(&mut self) {
+        // Released right before the listener binds it again.
+        drop(self.held.lock().unwrap().take());
         let port = self.server.start().await.unwrap();
         assert_eq!(port, self.port, "the machine comes back on its port");
     }
@@ -303,10 +326,22 @@ impl Machine {
     }
 }
 
-/// A port nothing listens on.
-fn free_port() -> u16 {
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    reserved.local_addr().unwrap().port()
+/// `ip:port` bound without listening: connections to it are refused, and
+/// no other socket can bind or connect from it until it is dropped.
+fn hold_port(ip: [u8; 4], port: u16) -> socket2::Socket {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    // The stopped listener's closed connections may linger in TIME_WAIT.
+    socket.set_reuse_address(true).unwrap();
+    let address = std::net::SocketAddr::from((ip, port));
+    socket
+        .bind(&address.into())
+        .unwrap_or_else(|error| panic!("hold the stopped machine's port {address}: {error}"));
+    socket
 }
 
 /// The machine's end of one bound link.
@@ -506,7 +541,7 @@ impl Backend {
 
     /// A machine that minted a credential for this backend.
     async fn machine(&self) -> Machine {
-        Machine::start(&self.id().await, free_port()).await
+        Machine::start(&self.id().await).await
     }
 
     async fn call(&self, method: &'static str, params: Value) -> intent_core::Result<Value> {
@@ -929,7 +964,7 @@ async fn a_turn_fails_when_the_link_stays_down_past_the_grace() {
 #[tokio::test]
 async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     let backend = Backend::new().await;
-    let mut machine = Machine::start(&backend.id().await, free_port()).await;
+    let mut machine = Machine::start(&backend.id().await).await;
     backend.expose(&mut machine).await.shutdown();
     machine.stop().await;
     let node = backend.bare(&machine).await;
@@ -1071,7 +1106,7 @@ async fn stopping_the_agent_fails_a_waiting_prompt() {
 #[tokio::test]
 async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
     let backend = Backend::new().await;
-    let mut machine = Machine::start(&backend.id().await, free_port()).await;
+    let mut machine = Machine::start(&backend.id().await).await;
     backend.expose(&mut machine).await.shutdown();
     machine.stop().await;
     let mut slow = tuning();
