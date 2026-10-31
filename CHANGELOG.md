@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.88] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(selection)* Report invalid remote names with the right error ([#2854](https://github.com/intent-hq/intentd/pull/2854))
+
+### 📚 Documentation
+
+- *(guide)* Mention the Assistant sidebar New chat action ([#2836](https://github.com/intent-hq/intentd/pull/2836))
+
+
 ## [0.11.87] - 2026-10-31
 
 ### 🔧 Refactor
