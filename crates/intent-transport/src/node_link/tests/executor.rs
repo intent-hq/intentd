@@ -709,6 +709,60 @@ async fn node_mode_keeps_the_executor_link_and_refuses_invite_and_tunnel() {
     );
 }
 
+/// Startup hand-off: before dispatch is ready `/invite` and `/tunnel` reach
+/// only the bootstrap seat (503), and once node-mode services are installed
+/// they are refused (403). Readiness is read once per upgrade, so no upgrade
+/// sees "not node mode" from one read and "ready" from another.
+#[tokio::test]
+async fn node_mode_startup_handoff_never_opens_invite_or_tunnel() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = EventBus::new(
+        intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap(),
+    );
+    let api = Arc::new(MachineApi::new());
+    api.node_mode.store(true, Ordering::SeqCst);
+    let certificate = certificate();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
+    let dispatch = crate::startup::StartupDispatch::new(intent_core::startup::StartupStatus::new());
+    let server = WsApiServer::new_startup(
+        dispatch.clone(),
+        Some(&certificate),
+        Some(&tokens),
+        WsOptions {
+            base_port: 0,
+            ..WsOptions::default()
+        },
+    )
+    .unwrap();
+    let port = server.start().await.unwrap();
+    let owner = bearer(&owner_token());
+    let headers = [("authorization", owner.as_str())];
+    for path in ["/invite", "/tunnel"] {
+        let (status, _) = upgrade_tls(port, &certificate, path, &headers).await;
+        assert_eq!(
+            status, 503,
+            "{path} before ready reaches only the bootstrap seat"
+        );
+    }
+    assert!(dispatch.install(crate::startup::ReadyServices {
+        api: api.clone(),
+        bus,
+        rpc_limiter: crate::RpcLimiter::new(0),
+        reverse_registry: Arc::new(crate::PrimaryReverseRegistry::default()),
+        server_pairing_info: None,
+        control: None,
+    }));
+    for path in ["/invite", "/tunnel"] {
+        let (status, _) = upgrade_tls(port, &certificate, path, &headers).await;
+        assert_eq!(status, 403, "{path} once ready in node mode");
+    }
+    let (status, _) = upgrade_tls(port, &certificate, "/ws", &headers).await;
+    assert_eq!(status, 101, "/ws still opens once ready");
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn insecure_mode_never_skips_the_executor_token() {
     let machine = Machine::start(Mode::Insecure).await;
