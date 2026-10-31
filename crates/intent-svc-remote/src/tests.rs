@@ -908,7 +908,7 @@ mod node_mode {
             "no connector in node mode"
         );
         let accepted = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
             fake.listener.accept(),
         )
         .await;
