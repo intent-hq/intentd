@@ -1934,3 +1934,104 @@ async fn failed_reorder_response_read_changes_nothing() {
     assert_eq!(ev["data"]["change"], "created");
     assert_eq!(ev["data"]["revision"], revision + 1);
 }
+
+#[intent_test_macros::daemon_test]
+async fn folder_path_values_are_read_back_as_stored_and_everything_else_stays_masked() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "claude-code",
+            "Work",
+            json!([
+                { "key": "claude_config_dir", "kind": "set", "value": "~/.claude-work" },
+                { "key": "ANTHROPIC_API_KEY", "kind": "set", "value": SECRET },
+                { "key": "CODEX_HOME", "kind": "set", "value": "/accounts/codex" },
+                { "key": "OTHER_DIR", "kind": "set", "value": "/accounts/other" },
+            ]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        created["profile"]["env"],
+        json!([
+            { "key": "claude_config_dir", "kind": "set", "value": "~/.claude-work" },
+            { "key": "ANTHROPIC_API_KEY", "kind": "set", "value": MASK },
+            { "key": "CODEX_HOME", "kind": "set", "value": "/accounts/codex" },
+            { "key": "OTHER_DIR", "kind": "set", "value": MASK },
+        ])
+    );
+    assert!(!created.to_string().contains(SECRET));
+
+    let codex = fx
+        .create(
+            "codex",
+            "Work",
+            json!([
+                { "key": "Codex_Home", "kind": "set", "value": "~" },
+                { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+            ]),
+        )
+        .await;
+    assert_eq!(
+        codex["profile"]["env"],
+        json!([
+            { "key": "Codex_Home", "kind": "set", "value": "~" },
+            { "key": "OPENAI_API_KEY", "kind": "set", "value": MASK },
+        ])
+    );
+
+    // Update: a kept folder value and a new one both read back as stored.
+    let updated = fx
+        .svc
+        .provider_profiles_update_impl(
+            id.clone(),
+            json!({ "env": [
+                { "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-team" },
+                { "key": "ANTHROPIC_API_KEY", "kind": "keep" },
+                { "key": "CODEX_HOME", "kind": "keep" },
+            ] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated["profile"]["env"],
+        json!([
+            { "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-team" },
+            { "key": "ANTHROPIC_API_KEY", "kind": "set", "value": MASK },
+            { "key": "CODEX_HOME", "kind": "set", "value": "/accounts/codex" },
+        ])
+    );
+
+    // List reads the same unexpanded values; the secret never appears.
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    let rows = list["profiles"].as_array().unwrap();
+    let row = rows.iter().find(|p| p["id"] == id.as_str()).unwrap();
+    assert_eq!(row["env"], updated["profile"]["env"]);
+    let codex_row = rows
+        .iter()
+        .find(|p| p["baseProviderId"] == "codex")
+        .unwrap();
+    assert_eq!(codex_row["env"], codex["profile"]["env"]);
+    assert!(!list.to_string().contains(SECRET));
+}
+
+#[test]
+fn folder_path_keys_match_only_the_two_account_variables_ignoring_case() {
+    for key in [
+        "CLAUDE_CONFIG_DIR",
+        "claude_config_dir",
+        "CODEX_HOME",
+        "codex_home",
+    ] {
+        assert!(is_folder_path_key(key), "{key}");
+    }
+    for key in [
+        "HOME",
+        "CODEX_HOMES",
+        "CLAUDE_CONFIG",
+        "XDG_CONFIG_HOME",
+        "OPENAI_API_KEY",
+    ] {
+        assert!(!is_folder_path_key(key), "{key}");
+    }
+}

@@ -268,12 +268,15 @@ impl StoredEnv {
         }
     }
 
+    /// The wire read form: a non-empty `set` value is [`MASK`] except for
+    /// the account-folder variables ([`is_folder_path_key`]), whose saved
+    /// value is returned as stored (a leading `~` is not expanded).
     fn masked_json(&self) -> Value {
         match self {
             Self::Set { key, value } => json!({
                 "key": key,
                 "kind": "set",
-                "value": if value.is_empty() { "" } else { MASK },
+                "value": if value.is_empty() || is_folder_path_key(key) { value.as_str() } else { MASK },
             }),
             Self::Unset { key } => json!({ "key": key, "kind": "unset" }),
         }
@@ -502,6 +505,16 @@ fn is_valid_key(key: &str) -> bool {
 /// Account-directory variables whose leading `~` the daemon expands.
 const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
+/// Whether `key` names an account folder (`CLAUDE_CONFIG_DIR` or
+/// `CODEX_HOME`, ignoring ASCII case). Reads return these values unmasked:
+/// a folder path is not a credential. Launch-log redaction still covers
+/// them through `ProfileEnv::secret_values`.
+fn is_folder_path_key(key: &str) -> bool {
+    TILDE_EXPANDED_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
+}
+
 /// Expand a leading `~` in an account-directory value at resolution time:
 /// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
 /// ASCII case), a value of exactly `~` or
@@ -512,10 +525,7 @@ pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) ->
     let Some(home) = home.and_then(Path::to_str) else {
         return value.to_owned();
     };
-    if !TILDE_EXPANDED_KEYS
-        .iter()
-        .any(|k| k.eq_ignore_ascii_case(key))
-    {
+    if !is_folder_path_key(key) {
         return value.to_owned();
     }
     match value.strip_prefix('~') {
@@ -1000,7 +1010,7 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
     })
 }
 
-/// The wire `DefaultConfig` of one base provider (masked; no values).
+/// The wire `DefaultConfig` of one base provider (masked except folder paths).
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
     json!({
         "baseProviderId": base,
