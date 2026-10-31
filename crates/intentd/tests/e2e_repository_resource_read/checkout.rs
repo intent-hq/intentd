@@ -42,16 +42,19 @@ fn set(server: &Server, path: &str, body: Value, next: Option<&str>) {
 /// (intent-hq/intent#8252), taken once at the timeout. Strictly read-only:
 /// revision-gate try-locks (released at once) and the fake provider's counters.
 /// The GitLab credential gate has no read-only probe; `settings.update` takes
-/// it before the revision gate, so a free revision gate means the update is
-/// parked earlier (credential gate or worker start) or after its last lock.
+/// it before the revision gate, so a revision gate available for writing means
+/// the update is parked earlier (credential gate or worker start) or after its
+/// last lock.
 fn settings_stall_report(h: &Harness) -> String {
     let gate = h.services.settings_revision_gate();
+    // Availability, not ownership: Tokio's RwLock is fair, so a queued writer
+    // also refuses try_read while readers still hold the gate.
     let revision = if gate.try_write().is_ok() {
-        "free"
+        "available for read and write"
     } else if gate.try_read().is_ok() {
-        "read-held"
+        "read-available, write-unavailable"
     } else {
-        "write-held"
+        "unavailable for read and write (write-held, or read-held with a writer queued)"
     };
     let server = h.server.as_ref().unwrap();
     format!(
@@ -200,7 +203,7 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
 
 /// The #8252 stall diagnostic names a held settings lock instead of a bare
 /// `Elapsed`: holding the revision gate parks `settings.update`, and the
-/// sample must report it write-held with no provider request in flight.
+/// sample must report it unavailable with no provider request in flight.
 #[intent_test_macros::daemon_test]
 async fn checkout_settings_update_stall_report_names_held_gates() {
     let h = Harness::with_workspace(false).await;
@@ -220,7 +223,10 @@ async fn checkout_settings_update_stall_report_names_held_gates() {
         stall.contains("no reply to settings.update id 1"),
         "{stall}"
     );
-    assert!(stall.contains("revision gate write-held"), "{stall}");
+    assert!(
+        stall.contains("revision gate unavailable for read and write"),
+        "{stall}"
+    );
     assert!(stall.contains("provider requests active=0"), "{stall}");
     drop(held);
     // Nothing arrived before the stall, so the original reply is still whole.
