@@ -156,15 +156,14 @@ impl PlainFolderGuard {
             if path.as_os_str().is_empty() {
                 continue;
             }
-            match resolved(path) {
-                Some(folder) => guard.folders.push(folder),
-                None => {
-                    tracing::warn!(
-                        folder = %path.display(),
-                        "plain-folder path cannot be resolved; path-based cleanup is paused"
-                    );
-                    guard.unresolved = true;
-                }
+            if let Some(folder) = resolved(path) {
+                guard.folders.push(folder);
+            } else {
+                tracing::warn!(
+                    folder = %path.display(),
+                    "plain-folder path cannot be resolved; path-based cleanup is paused"
+                );
+                guard.unresolved = true;
             }
         }
         guard
