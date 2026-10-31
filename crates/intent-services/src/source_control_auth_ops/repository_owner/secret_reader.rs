@@ -497,6 +497,17 @@ pub(crate) enum RepositoryChildPolicyState {
     Indeterminate,
 }
 
+/// Outcome of one non-waiting background observation of captured metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeReviewObservation {
+    /// The captured facts are unchanged.
+    Current,
+    /// The captured facts changed; the operation must retire.
+    Changed,
+    /// Another reader or writer holds the metadata; observe again later.
+    Busy,
+}
+
 /// Past local metadata, never credential presence, permission or a context revision.
 /// Retain the original allocations; no getter loads secrets or consults a new owner.
 pub(crate) struct RepositoryConnectionFacts {
@@ -594,19 +605,29 @@ impl RepositoryConnectionFacts {
     /// acquired worker and R stage/disclosure fence. The action compares and
     /// consumes only prebuilt ownership; no I/O, await, refetch or queue inside.
     /// False must refuse. This metadata comparison supplies no native grant.
+    ///
+    /// The shared native-review gate excludes this operation's own background
+    /// monitor observation, which reads the same optional locks; without it the
+    /// monitor could make this non-waiting check refuse an unchanged connection.
     pub(crate) fn with_native_review_current(
         facts: &Self,
         transfer: impl FnOnce(bool) -> Result<()> + Send,
     ) -> Result<()> {
-        RepositoryReadEligibility::with_output(&[], Some(facts), transfer)
+        let turn = facts.gate.native_review_turn();
+        RepositoryReadEligibility::with_output_turn(&[], Some(facts), Some(turn), transfer)
     }
 
     /// Observe only the originally captured metadata for background retirement.
     /// This supplies no authority or consuming admission. Call with no outer
     /// settings, R, Store, worktree, progress, credential or output lock held.
-    /// Blocking observation keeps the original config/descriptor/directory/proof
-    /// order; a captured missing attachment can never adopt a later installation.
-    pub(crate) fn native_review_metadata_current(&self) -> Result<bool> {
+    /// Never waits: a consuming check holding the native-review gate, or any
+    /// holder of the config/descriptor/directory/proof locks, yields `Busy` and
+    /// the caller retries on its next tick. A captured missing attachment can
+    /// never adopt a later installation; poison is an error.
+    pub(crate) fn native_review_monitor_observation(&self) -> Result<NativeReviewObservation> {
+        let Some(_turn) = self.gate.try_native_review_turn() else {
+            return Ok(NativeReviewObservation::Busy);
+        };
         let settings = match self.attachment {
             RepositoryAttachmentState::Unattached | RepositoryAttachmentState::BoundaryMissing => {
                 None
@@ -617,9 +638,19 @@ impl RepositoryConnectionFacts {
                 .settings
                 .get(),
         };
-        let current =
-            Self::observe_captured(&self.gate, &self.directory, self.owner.as_ref(), settings)?;
-        Ok(self.same_facts(&current))
+        Ok(
+            match Self::observe_captured_with(
+                &self.gate,
+                &self.directory,
+                self.owner.as_ref(),
+                settings,
+                false,
+            )? {
+                None => NativeReviewObservation::Busy,
+                Some(current) if self.same_facts(&current) => NativeReviewObservation::Current,
+                Some(_) => NativeReviewObservation::Changed,
+            },
+        )
     }
 
     fn retained_owner(&self) -> Option<&Arc<RepositoryOwner>> {
@@ -680,50 +711,74 @@ impl RepositoryConnectionFacts {
         owner: Option<&Arc<RepositoryOwner>>,
         settings: Option<&super::adoption::SettingsAttachment>,
     ) -> Result<Self> {
+        Self::observe_captured_with(gate, directory, owner, settings, true)?
+            .ok_or(Error::Indeterminate)
+    }
+
+    /// Same ranked config/descriptor/directory/proof order either way. Without
+    /// `blocking`, any busy lock returns `Ok(None)` instead of waiting.
+    fn observe_captured_with(
+        gate: &GitlabCredentialGate,
+        directory: &Arc<crate::repository_credentials::RepositoryConnectionDirectory>,
+        owner: Option<&Arc<RepositoryOwner>>,
+        settings: Option<&super::adoption::SettingsAttachment>,
+        blocking: bool,
+    ) -> Result<Option<Self>> {
         if owner
             .as_ref()
             .is_some_and(|owner| !Arc::ptr_eq(&owner.directory, directory))
         {
             return Err(Error::BoundaryMismatch);
         }
-        let config = settings
-            .map(|s| s.config.lock().map_err(|_| Error::Indeterminate))
-            .transpose()?;
-        let descriptor = owner
-            .as_ref()
-            .map(|o| o.descriptor.lock().map_err(|_| Error::Indeterminate))
-            .transpose()?;
-        directory.with_connection_metadata(|metadata| {
-            let proof = owner
-                .as_ref()
-                .map(|o| {
-                    o.evidence
-                        .published
-                        .lock()
-                        .map_err(|_| Error::Indeterminate)
-                })
-                .transpose()?;
-            // A one-time attachment may have appeared while waiting for these
-            // metadata locks. Never combine a captured absence with its later state.
-            if gate.repository.get().map(Arc::as_ptr) != owner.map(Arc::as_ptr)
-                || owner.and_then(|o| o.settings.get()).map(std::ptr::from_ref)
-                    != settings.map(std::ptr::from_ref)
-            {
-                return Err(Error::Unverified);
-            }
-            Ok(Self::from_held(
-                gate,
-                directory,
-                owner,
-                settings,
-                ConnectionFactsView {
-                    config: config.as_deref(),
-                    descriptor: descriptor.as_deref().and_then(Option::as_ref),
-                    proof: proof.as_deref().and_then(Option::as_deref),
-                    metadata,
-                },
-            ))
-        })
+        let config = match settings {
+            Some(s) => match observation_lock(&s.config, blocking)? {
+                Some(guard) => Some(guard),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let descriptor = match owner {
+            Some(o) => match observation_lock(&o.descriptor, blocking)? {
+                Some(guard) => Some(guard),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let inspect =
+            |metadata: crate::repository_credentials::read::RepositoryConnectionMetadata<'_>| {
+                let proof = match owner {
+                    Some(o) => match observation_lock(&o.evidence.published, blocking)? {
+                        Some(guard) => Some(guard),
+                        None => return Ok(None),
+                    },
+                    None => None,
+                };
+                // A one-time attachment may have appeared while waiting for these
+                // metadata locks. Never combine a captured absence with its later state.
+                if gate.repository.get().map(Arc::as_ptr) != owner.map(Arc::as_ptr)
+                    || owner.and_then(|o| o.settings.get()).map(std::ptr::from_ref)
+                        != settings.map(std::ptr::from_ref)
+                {
+                    return Err(Error::Unverified);
+                }
+                Ok(Some(Self::from_held(
+                    gate,
+                    directory,
+                    owner,
+                    settings,
+                    ConnectionFactsView {
+                        config: config.as_deref(),
+                        descriptor: descriptor.as_deref().and_then(Option::as_ref),
+                        proof: proof.as_deref().and_then(Option::as_deref),
+                        metadata,
+                    },
+                )))
+            };
+        if blocking {
+            directory.with_connection_metadata(inspect)
+        } else {
+            Ok(directory.try_with_connection_metadata(inspect)?.flatten())
+        }
     }
 
     fn from_held(
@@ -1185,6 +1240,19 @@ impl RepositoryReadEligibility {
         optional: Option<&RepositoryConnectionFacts>,
         transfer: impl FnOnce(bool) -> Result<()> + Send,
     ) -> Result<()> {
+        Self::with_output_turn(originals, optional, None, transfer)
+    }
+
+    /// `turn` is passed only with no required originals, so every lock taken
+    /// under it is a non-waiting optional try-lock. It ends once the metadata
+    /// guards are held, before any comparison or the caller's transfer runs.
+    fn with_output_turn(
+        originals: &[&Self],
+        optional: Option<&RepositoryConnectionFacts>,
+        turn: Option<super::NativeReviewTurn>,
+        transfer: impl FnOnce(bool) -> Result<()> + Send,
+    ) -> Result<()> {
+        debug_assert!(turn.is_none() || originals.is_empty());
         let optional = optional.filter(|facts| facts.retained_owner().is_some());
         let mut owners = originals
             .iter()
@@ -1232,6 +1300,7 @@ impl RepositoryReadEligibility {
                 .zip(&required)
                 .map(|(owner, required)| output_lock(&owner.evidence.published, *required))
                 .collect::<Result<Vec<_>>>()?;
+            drop(turn);
             for ((original, index), selected) in originals.iter().zip(indices).zip(selected) {
                 original.check_source(
                     settings[index],
@@ -1478,6 +1547,22 @@ fn output_lock<T>(
         mutex.lock().map(Some).map_err(|_| Error::Indeterminate)
     } else {
         Ok(mutex.try_lock().ok())
+    }
+}
+
+/// Background observation lock: blocking, or `Ok(None)` while busy. Poison is
+/// an error either way, unlike the optional output path.
+fn observation_lock<T>(
+    mutex: &Mutex<T>,
+    blocking: bool,
+) -> Result<Option<std::sync::MutexGuard<'_, T>>> {
+    if blocking {
+        return mutex.lock().map(Some).map_err(|_| Error::Indeterminate);
+    }
+    match mutex.try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(Error::Indeterminate),
     }
 }
 

@@ -52,7 +52,7 @@ impl Fixture {
         let row: AgentSession = serde_json::from_value(value).unwrap();
         store.insert_agent_session(&row).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         Self {
             dir,

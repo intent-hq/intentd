@@ -307,8 +307,16 @@ pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
     fences: Vec<JoinHandle<()>>,
     setup: crate::provider_setup::Connection,
-    /// The server-bound hello used to refresh browser hosting on a live upgrade.
-    pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
+    /// The last successful hello's identity, paired with the reservation
+    /// that keeps its `clientId` reported active
+    /// ([`crate::reverse::PrimaryReverseRegistry::client_active`]) for the
+    /// connection's whole life, bound or not (intent-hq/intent#8045). Both
+    /// bind paths — the hello and a later live role upgrade (`ws.rs`
+    /// `RoleChanged`) — bind from it, so a guest connection a role change
+    /// binds is never treated as an absent host by the superseded-id tab
+    /// rehome, and a connection without a successful hello has nothing to
+    /// bind with.
+    pub(crate) hello: Option<crate::reverse::HelloBinding>,
     /// The connection's presence identity (multiplayer w5); dropping it with
     /// the registry publishes the offline transition and releases every
     /// `note.presence` lease — declared after `subs` so the forwarders'
@@ -329,6 +337,28 @@ impl Drop for ConnSubs {
 }
 
 impl ConnSubs {
+    /// Reconcile browser hosting after a live role change (`ws.rs`
+    /// `RoleChanged`): record the channel's member authority, then an allowed
+    /// connection rebinds the reserved identity of its last successful hello
+    /// ([`Self::hello`]) — a connection without one stays unbound — and a
+    /// disallowed one withdraws hosting.
+    pub(crate) fn apply_browser_authority(
+        &self,
+        reverse: &ReverseChannel,
+        guard: &PrimaryReverseGuard,
+        allowed: bool,
+    ) {
+        reverse.set_browser_member(allowed);
+        if allowed {
+            if let Some(hello) = &self.hello {
+                guard.bind(hello);
+            }
+        } else {
+            guard.unbind();
+        }
+        guard.refresh_devices();
+    }
+
     /// The real committed removal event bypasses bulk delivery only for raw
     /// subscriptions that requested it. Every other event producer is stopped.
     pub(crate) fn removal_control(&self, event: &intent_core::Event) -> Vec<String> {
@@ -952,6 +982,12 @@ async fn process_captured_frame(
                     client_id,
                     is_local,
                     hello_version(control),
+                    // Mark the resolved id active before the hello persists
+                    // its client row (intent-hq/intent#8045), and for the
+                    // connection's life once it succeeds: a concurrent
+                    // superseded-id rehome then never moves this host,
+                    // whether it binds now or after a later role change.
+                    |id| reverse_guard.claim_hello(id),
                 )
                 .await;
                 bound = outcome.bound;
@@ -972,20 +1008,29 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
-            let ordinary_source = bound.as_ref().and_then(|identity| {
+            let ordinary_source = bound.as_ref().and_then(|claimed| {
                 let principal = crate::context::current_caller()?.principal_id()?.clone();
-                reverse_guard.prepare_ordinary_monitor_source(identity.client_id.clone(), principal)
+                reverse_guard.prepare_ordinary_monitor_source(
+                    claimed.identity().client_id.clone(),
+                    principal,
+                )
             });
-            if let Some(identity) = bound {
+            if let Some(claimed) = bound {
                 reverse
                     .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
                 if let Some(principal) = crate::context::current_caller()
                     .and_then(|caller| caller.principal_id().cloned())
                 {
-                    reverse_guard.bind_device(identity.clone(), principal);
+                    reverse_guard.bind_device(claimed.identity().clone(), principal);
                 }
-                subs.hello_identity = Some(identity.clone());
-                reverse_guard.bind(identity);
+                // A successful hello keeps its reservation, paired with the
+                // identity, until the connection closes or hellos again; the
+                // previous hello's binding is released only after this bind.
+                // A detached guard (registry shutting down) reserves nothing.
+                if let crate::reverse::ClaimedHello::Reserved(hello) = claimed {
+                    reverse_guard.bind(&hello);
+                    subs.hello = Some(hello);
+                }
             }
             // Multiplayer w5: a hello'd connection is online for its
             // principal. Best-effort — a refusal (no wire caller) only

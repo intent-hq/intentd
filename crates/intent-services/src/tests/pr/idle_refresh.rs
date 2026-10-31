@@ -235,7 +235,7 @@ async fn idle_refresh_skips_unconfigured_source_control_and_archived_workspaces(
     ws.repository_owner = Some("o".into());
     ws.repository_name = Some("r".into());
     store.insert_workspace(&ws).await.unwrap();
-    let unconfigured = Services::new(store.clone());
+    let unconfigured = Services::new_isolated(store.clone());
     unconfigured.refresh_prs_on_agent_idle(&ws_id).await;
     assert_eq!(
         unconfigured
@@ -251,7 +251,7 @@ async fn idle_refresh_skips_unconfigured_source_control_and_archived_workspaces(
         discover: true,
         ..Default::default()
     });
-    let svc = Services::new(store).with_source_control(forge.clone());
+    let svc = Services::new_isolated(store).with_source_control(forge.clone());
     sqlx::query("UPDATE workspace SET archived = 1 WHERE id = ?")
         .bind(&ws_id.0)
         .execute(svc.store().write_pool())
@@ -292,7 +292,7 @@ async fn shutdown_drains_an_in_flight_idle_refresh() {
         ..Default::default()
     });
     let bus = crate::EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_source_control(forge.clone());
     let task = svc.spawn_idle_pr_refresh_loop();
@@ -362,7 +362,7 @@ async fn refresh_setup_shared(
     ws.updated_at = now_iso();
     store.insert_workspace(&ws).await.expect("ws");
     let bus = crate::EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_event_bus(bus)
         .with_source_control(forge);
     (tmp, svc, ws_id)

@@ -2193,16 +2193,16 @@ async fn native_review_background_lock_contention_preserves_original_until_real_
     let q = command(&f, &p, Stage::Commit);
     let c = s.concrete(&f).await;
     let op = c.review.feed.lock().unwrap().records[&q.review.operation_id].clone();
-    let baseline = Arc::strong_count(&op.metadata);
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let facts = op.metadata.provider.clone();
     let holder =
         std::thread::spawn(move || facts.hold_native_review_metadata_for_test(entered, released));
     waiting.await.unwrap();
-    // Wait for the actual monitor to retain its original metadata for the blocking
-    // observation. The real config lock is held; no synthetic admission is used.
-    wait_until(|| Arc::strong_count(&op.metadata) > baseline).await;
+    // Wait for the actual monitor to complete an observation that started
+    // while the real config lock is held; it defers instead of retiring.
+    let ticks = join_monitor(&op).await;
+    wait_until(|| op.metadata.monitor_ticks.load(Ordering::Acquire) > ticks).await;
     let mut consumed = 0;
     assert!(op
         .metadata
@@ -2215,7 +2215,8 @@ async fn native_review_background_lock_contention_preserves_original_until_real_
     assert!(op.write_current().is_ok());
     release.send(()).unwrap();
     holder.join().unwrap();
-    wait_until(|| Arc::strong_count(&op.metadata) == baseline).await;
+    let ticks = join_monitor(&op).await;
+    wait_until(|| op.metadata.monitor_ticks.load(Ordering::Acquire) > ticks).await;
     assert!(op.write_current().is_ok());
     let result = s
         .request(&f.services, Frame::Execute(q.clone()))
@@ -3317,19 +3318,29 @@ async fn native_review_companion_unmarked_commit_and_direct_service_are_not_pred
     .await;
 }
 
+/// Wait until no monitor sharing `op`'s metadata is mid-observation, then
+/// return the completed-observation count.
+async fn join_monitor(op: &Operation) -> usize {
+    wait_until(|| op.metadata.monitor_inflight.load(Ordering::Acquire) == 0).await;
+    op.metadata.monitor_ticks.load(Ordering::Acquire)
+}
+
 async fn companion_advance_and_join_monitor(op: &Operation, duration: Duration, observers: usize) {
-    let baseline = Arc::strong_count(&op.metadata);
     let (entered, waiting) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let facts = op.metadata.provider.clone();
     let holder =
         std::thread::spawn(move || facts.hold_native_review_metadata_for_test(entered, released));
     waiting.await.unwrap();
+    // With the paused clock each sleeping monitor ticks once per advance.
+    let baseline = join_monitor(op).await;
     tokio::time::advance(duration).await;
-    wait_until(|| Arc::strong_count(&op.metadata) >= baseline + observers).await;
+    // Every monitor sharing this metadata has observed (and deferred on) the
+    // contended state after the advance.
+    wait_until(|| op.metadata.monitor_ticks.load(Ordering::Acquire) >= baseline + observers).await;
     release.send(()).unwrap();
     holder.join().unwrap();
-    wait_until(|| Arc::strong_count(&op.metadata) == baseline).await;
+    join_monitor(op).await;
 }
 
 #[intent_test_macros::daemon_test]

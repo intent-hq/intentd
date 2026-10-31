@@ -102,7 +102,7 @@ impl Harness {
         let root = WorkspacesRoot::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp))
             .with_event_bus(bus)
             .with_workspaces_root(root.path().to_path_buf());

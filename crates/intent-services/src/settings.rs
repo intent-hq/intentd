@@ -1705,7 +1705,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     providers_active.read_only = true;
-    let mut definitions = vec![
+    vec![
         // --- Group A: providers / agents -----------------------------------
         providers_active,
         object(
@@ -1843,11 +1843,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             false,
         ),
-        // Whole days; 0 turns the idle auto-archive sweep off.
+        // Whole days; 0 (the default) turns the idle auto-archive sweep off.
         number(
             AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
             "Auto-archive idle workspaces (days)",
-            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders (0 = off)",
+            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders, and workspaces with uncommitted changes or unpushed commits are skipped (0 = off, the default)",
             "workspace",
             Some(0.0),
             None,
@@ -2556,6 +2556,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~180 tokens/session"),
         boolean(
+            "agentFeatures.secretRequests",
+            "Secret requests",
+            "Let top-level agents ask you for secrets (ws.secret.*) that Intent holds in memory and passes only to that agent's ws.host.exec calls; needs Host exec; applies to new sessions only",
+            "agentFeatures",
+            false,
+        )
+        .with_token_impact("~260 tokens/session"),
+        boolean(
             "agentFeatures.attentionRequests",
             "Attention requests",
             "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
@@ -2712,17 +2720,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             &["regular", "node"],
             "regular",
         ),
-    ];
-    definitions.extend(
-        intent_providers::ACP_PROVIDERS
-            .iter()
-            .filter_map(|provider| {
-                provider.access_token().map(|token| {
-                    secret(token.setting_path, token.label, token.guidance, "providers")
-                })
-            }),
-    );
-    definitions
+    ]
 }
 
 /// The effective `workspace.branchPrefix` (default empty) — prepended to
@@ -2822,8 +2820,8 @@ const WHOLE_DAY_PATHS: [&str; 2] = [
 ];
 
 /// The effective `workspace.autoArchiveIdleAfterDays` setting: `Some(days)`
-/// when the idle auto-archive sweep is on (the default, 7), `None` when it
-/// is `0` — read live from the settings snapshot at each sweep.
+/// when the idle auto-archive sweep is on, `None` when it is `0` (the
+/// default, off) — read live from the settings snapshot at each sweep.
 #[must_use]
 pub fn auto_archive_idle_after_days(settings: &SettingsFile) -> Option<u32> {
     Some(settings.workspace.auto_archive_idle_after_days).filter(|days| *days > 0)
@@ -3611,16 +3609,6 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
-            if intent_providers::ACP_PROVIDERS
-                .iter()
-                .filter_map(intent_providers::ProviderConfig::access_token)
-                .any(|token| token.setting_path == path)
-                && value.as_str().is_some_and(|token| token.trim().is_empty())
-            {
-                return Err(Error::InvalidParams(format!(
-                    "{path}: token must not be blank; use settings.reset to remove it"
-                )));
-            }
             let value = if path == "sharing.machineName" {
                 let name = value.as_str().expect("string validated above");
                 json!(
@@ -4092,100 +4080,6 @@ async fn join_all_pinned<T>(
 
 #[cfg(test)]
 mod tests {
-    #[intent_test_macros::daemon_test]
-    async fn provider_access_tokens_store_replace_remove_and_redact() {
-        let dir = crate::test_support::test_tempdir("provider-token-settings");
-        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
-        let registry = SettingsRegistry::load(dir.path().join("config.toml")).unwrap();
-        let raw = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(raw.clone());
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-        raw.store("unrelated.apiKey", "existing-api-key").unwrap();
-        for path in [
-            "providers.claude-code.accessToken",
-            "providers.codex.accessToken",
-        ] {
-            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
-            let missing = svc
-                .update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
-                .await;
-            assert!(matches!(missing, Err(Error::InvalidParams(_))));
-            for token in ["synthetic-original-token", "synthetic-replacement-token"] {
-                let applied = svc
-                    .update(&json!([{ "path": path, "value": token }]))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    applied,
-                    vec![json!({"path":path,"value":REDACTED_PLACEHOLDER})]
-                );
-                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
-                assert_eq!(store.get_setting(path).await.unwrap(), None);
-                assert_eq!(registry.get(path), None);
-                let read = svc.get(path).await.unwrap();
-                assert_eq!(read["value"], REDACTED_PLACEHOLDER);
-                assert_eq!(read["definition"]["sensitive"], true);
-                let list = svc.list().await.unwrap();
-                assert!(!list.to_string().contains(token));
-                assert_eq!(
-                    list["settings"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|s| s["path"] == path)
-                        .unwrap()["value"],
-                    REDACTED_PLACEHOLDER
-                );
-                svc.update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
-                    .await
-                    .unwrap();
-                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
-            }
-            for invalid in [
-                Value::Null,
-                json!(42),
-                json!(""),
-                json!("  \n\t"),
-                json!({"token":"synthetic-invalid"}),
-            ] {
-                assert!(matches!(
-                    svc.update(&json!([{ "path": path, "value": invalid }]))
-                        .await,
-                    Err(Error::InvalidParams(_))
-                ));
-                assert_eq!(
-                    raw.load(path).unwrap().as_deref(),
-                    Some("synthetic-replacement-token")
-                );
-            }
-            svc.reset(path).await.unwrap();
-            assert_eq!(raw.load(path).unwrap(), None);
-            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
-            svc.reset(path).await.unwrap();
-        }
-        assert_eq!(
-            raw.load("unrelated.apiKey").unwrap().as_deref(),
-            Some("existing-api-key")
-        );
-        for path in [
-            "providers.auggie.accessToken",
-            "providers.unknown.accessToken",
-            "providers.claude.accessToken",
-        ] {
-            assert!(matches!(svc.get(path).await, Err(Error::InvalidParams(_))));
-            assert!(matches!(
-                svc.update(&json!([{ "path": path, "value": "synthetic-unsupported" }]))
-                    .await,
-                Err(Error::InvalidParams(_))
-            ));
-            assert!(matches!(
-                svc.reset(path).await,
-                Err(Error::InvalidParams(_))
-            ));
-            assert_eq!(raw.load(path).unwrap(), None);
-        }
-    }
-
     use super::*;
 
     #[intent_test_macros::daemon_test]
@@ -4305,7 +4199,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
         let bus = crate::EventBus::new(store.clone());
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let mut events = bus.subscribe(SubscriptionFilter {
@@ -4378,7 +4272,7 @@ mod tests {
             std::fs::write(&path, seed).unwrap();
             let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
             let bus = crate::EventBus::new(store.clone());
-            let services = crate::Services::new(store)
+            let services = crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus.clone());
             let mut events = bus.subscribe(SubscriptionFilter {
@@ -5297,7 +5191,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         ));
-        let mut services = crate::Services::new(store).with_settings_registry(registry);
+        let mut services = crate::Services::new_isolated(store).with_settings_registry(registry);
         services.secrets = secrets.clone();
         let writer = services.clone();
         let update = intent_core::spawn_daemon(async move {
@@ -5462,7 +5356,7 @@ mod tests {
             release: Mutex::new(rx),
             once: std::sync::atomic::AtomicBool::new(true),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(secrets)
             .with_settings_registry(registry)
             .with_event_bus(bus);
@@ -5846,7 +5740,7 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let (tx, rx) = std::sync::mpsc::channel();
         let mut release = ReleaseWrite(Some(tx));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_secret_store(Arc::new(RejectThenParkRollback {
                 inner: raw.clone(),
@@ -5926,7 +5820,7 @@ mod tests {
             .pin("notifications.volume", json!(0.5), "TEST_PIN")
             .unwrap();
         let raw = Arc::new(CountWrites(std::sync::atomic::AtomicUsize::new(0)));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(raw.clone())
             .with_settings_registry(registry);
         for entry in [
@@ -7187,16 +7081,16 @@ mod tests {
     }
 
     /// `workspace.autoArchiveIdleAfterDays` (PROTOCOL §5.12) is a whole
-    /// number of days with default 7; `0` turns the sweep off.
+    /// number of days with default `0` (off).
     #[test]
-    fn auto_archive_catalog_entry_defaults_to_seven_and_allows_zero() {
+    fn auto_archive_catalog_entry_defaults_to_off_and_allows_zero() {
         let def = find_definition(AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH)
             .expect("workspace.autoArchiveIdleAfterDays missing from catalog");
         assert!(!def.sensitive);
         assert!(!def.read_only);
         assert_eq!(def.category, "workspace");
         assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
-        assert_eq!(def.default_value, Some(json!(7.0)));
+        assert_eq!(def.default_value, Some(json!(0.0)));
         assert!(KNOWN_PATHS.contains(&AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH));
         for ok in [json!(0), json!(1), json!(7), json!(30.0)] {
             def.validate(&ok)
@@ -7207,6 +7101,12 @@ mod tests {
         }
 
         let mut settings = SettingsFile::default();
+        assert_eq!(
+            auto_archive_idle_after_days(&settings),
+            None,
+            "off by default"
+        );
+        settings.workspace.auto_archive_idle_after_days = 7;
         assert_eq!(auto_archive_idle_after_days(&settings), Some(7));
         settings.workspace.auto_archive_idle_after_days = 0;
         assert_eq!(auto_archive_idle_after_days(&settings), None);
@@ -7316,9 +7216,10 @@ mod tests {
         remove_temp_settings_files(&tmp, &config_path);
     }
 
-    /// The auto-archive setting round-trips: absent reads 7 with `default`
-    /// origin, `0` persists and turns it off, negatives and fractions
-    /// reject, and `settings.reset` returns to 7.
+    /// The auto-archive setting round-trips: absent reads `0` (off) with
+    /// `default` origin, a positive window persists and turns it on, `0`
+    /// persists and turns it off, negatives and fractions reject, and
+    /// `settings.reset` returns to off.
     #[tokio::test]
     async fn auto_archive_setting_round_trips_via_registry() {
         let (tmp, config_path) = temp_settings_service_paths("autoarchive");
@@ -7331,13 +7232,21 @@ mod tests {
         let path = AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH;
 
         let got = svc.get(path).await.expect("get");
-        assert_eq!(got["value"], json!(7.0));
+        assert_eq!(got["value"], json!(0.0));
         assert_eq!(got["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None,
+            "off by default"
+        );
+
+        svc.update(&json!([{ "path": path, "value": 7 }]))
+            .await
+            .expect("7 turns auto-archive on");
         assert_eq!(
             auto_archive_idle_after_days(&registry.snapshot().effective),
             Some(7)
         );
-
         svc.update(&json!([{ "path": path, "value": 0 }]))
             .await
             .expect("0 turns auto-archive off");
@@ -7370,7 +7279,7 @@ mod tests {
         assert_eq!(reset["origin"], json!("default"));
         assert_eq!(
             auto_archive_idle_after_days(&registry.snapshot().effective),
-            Some(7)
+            None
         );
 
         remove_temp_settings_files(&tmp, &config_path);
@@ -7689,6 +7598,7 @@ mod tests {
             ("agentFeatures.desktopControl", true),
             ("agentFeatures.richChatBlocks", true),
             ("agentFeatures.structuredQuestions", true),
+            ("agentFeatures.secretRequests", false),
             ("agentFeatures.attentionRequests", true),
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
@@ -7792,6 +7702,7 @@ mod tests {
             ("agentFeatures.desktopControl", "~50 tokens/session"),
             ("agentFeatures.richChatBlocks", "~310 tokens/session"),
             ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+            ("agentFeatures.secretRequests", "~260 tokens/session"),
             ("agentFeatures.attentionRequests", "~340 tokens/session"),
             ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
             ("agentFeatures.prMonitor", "~290 tokens/session"),
@@ -9664,7 +9575,7 @@ mod rollback_order_tests {
             newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
             write_order: Mutex::new(Vec::new()),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry)
             .with_secret_store(secrets.clone())
             .with_event_bus(bus);
@@ -9814,7 +9725,7 @@ mod rollback_order_tests {
         ] {
             raw.store(account, value).unwrap();
         }
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(RejectSecondSecret {
                 raw: raw.clone(),
                 reject_rollback: true,
@@ -9898,7 +9809,7 @@ mod rollback_order_tests {
         .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(ParkFailure {
                 raw: raw.clone(),
                 entered: entered.clone(),
@@ -10203,7 +10114,7 @@ mod rollback_order_tests {
         )
         .unwrap();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(raw.clone()))
                 .with_event_bus(bus)
@@ -10368,7 +10279,7 @@ mod rollback_order_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(PausedRollbackStore {
                     raw,
@@ -10491,7 +10402,7 @@ mod port_assignment_publication_tests {
                     event_types: vec!["settings:changed".into()],
                     ..Default::default()
                 });
-                let services = crate::Services::new(store)
+                let services = crate::Services::new_isolated(store)
                     .with_settings_registry(registry.clone())
                     .with_event_bus(bus);
                 let control = Arc::new(AssignPort {
@@ -10560,7 +10471,7 @@ mod port_assignment_publication_tests {
             event_types: vec!["settings:changed".into()],
             ..Default::default()
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus);
         let control = Arc::new(AssignPort {
@@ -10623,7 +10534,7 @@ mod port_assignment_publication_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus)
                 .with_secret_store(Arc::new(PausedRollbackStore {

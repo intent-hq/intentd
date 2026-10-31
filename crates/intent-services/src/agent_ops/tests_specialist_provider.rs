@@ -45,7 +45,7 @@ pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
         "pinned",
         "codingAgent: auggie\nmodel: pinned-model\naliases: [\"pin-alias\"]\nreasoningEffort: low\nmodelOptions: [{\"provider\":\"auggie\",\"model\":\"pinned-model\",\"reasoningEffort\":\"high\"}]\n",
     );
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_settings_registry(Arc::new(
             crate::SettingsRegistry::load(root.join("config.toml")).expect("registry"),
         ))

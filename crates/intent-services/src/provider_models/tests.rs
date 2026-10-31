@@ -2535,3 +2535,43 @@ command = "must-not-run"
     assert!(parsed.get("mcp_servers").is_none());
     assert!(parsed.get("hooks").is_none());
 }
+
+#[test]
+fn unresolvable_adapter_is_a_prerequisite_failure_with_unchanged_text() {
+    for provider in ["codex", "claude-code"] {
+        let err = super::adapter_unavailable(provider);
+        assert_eq!(
+            err.kind,
+            Some(crate::model_catalog::ModelWarningKind::PrerequisiteMissing),
+            "{provider}"
+        );
+        assert_eq!(
+            err.reason,
+            crate::complete_ops::missing_one_shot_adapter_message(provider)
+        );
+    }
+}
+
+#[test]
+fn catalog_unavailable_from_plain_text_has_no_kind() {
+    let err = super::CatalogUnavailable::from("model probe timed out");
+    assert_eq!(err.kind, None);
+    let fetch = super::ProviderModelsFetch::from_unavailable("codex", err);
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("codex: model probe timed out")
+    );
+    assert_eq!(fetch.warning_kind, None);
+    let fetch = super::ProviderModelsFetch::from_unavailable(
+        "codex",
+        super::CatalogUnavailable {
+            reason: "Install codex".into(),
+            kind: Some(crate::model_catalog::ModelWarningKind::CliMissing),
+        },
+    );
+    assert_eq!(fetch.warning.as_deref(), Some("codex: Install codex"));
+    assert_eq!(
+        fetch.warning_kind,
+        Some(crate::model_catalog::ModelWarningKind::CliMissing)
+    );
+}

@@ -72,6 +72,46 @@ pub fn local_changes(worktree_path: &Path) -> Result<LocalChanges> {
     })
 }
 
+/// Whether the repository's `HEAD` commit equals, or is an ancestor of, any
+/// commit in `heads` (full hex object ids) — i.e. every commit `HEAD` reaches
+/// is also reached by one of them. The auto-archive sweep uses it to tell a
+/// squash-merged PR's pruned-branch commits from new local work.
+///
+/// An unborn `HEAD`, a malformed id or one whose commit is not in the
+/// repository never covers (the caller fails safe).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` when `worktree_path` is not a git repository or
+/// the ancestry walk fails.
+pub fn head_reached_by(worktree_path: &Path, heads: &[String]) -> Result<bool> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let Some(head) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .map(|c| c.id())
+    else {
+        return Ok(false);
+    };
+    for candidate in heads {
+        let candidate = candidate.trim();
+        let Ok(oid) = Oid::from_str(candidate) else {
+            continue;
+        };
+        // `Oid::from_str` zero-pads a short prefix; only a full-length id
+        // (two hex digits per byte) of a commit present locally can vouch
+        // for `HEAD`.
+        if candidate.len() != oid.as_bytes().len() * 2 || repo.find_commit(oid).is_err() {
+            continue;
+        }
+        if oid == head || repo.graph_descendant_of(oid, head).map_err(map_git_err)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Every `refs/remotes/*` ref: whether any exists, plus the commit OIDs they
 /// resolve to. A ref that cannot be resolved (a dangling `origin/HEAD` symref
 /// after its target branch was deleted) still counts as existing but hides
@@ -151,6 +191,60 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn head_oid(worktree: &Path) -> String {
+        Repository::open(worktree)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `HEAD` is covered by an equal or descendant commit, never by an
+    /// ancestor (new work after it), a short prefix, an unknown id or
+    /// garbage; an empty list covers nothing.
+    #[test]
+    fn head_reached_by_requires_head_in_the_candidate_history() {
+        let dir = init_repo("local-changes-reached-by");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let older = head_oid(dir.path());
+        add_empty_commits(dir.path(), 1);
+        let head = head_oid(dir.path());
+        add_empty_commits(dir.path(), 1);
+        let newer = head_oid(dir.path());
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.set_head_detached(Oid::from_str(&head).unwrap())
+            .unwrap();
+
+        let reached = |c: &[&str]| {
+            let c: Vec<String> = c.iter().map(|s| (*s).to_string()).collect();
+            head_reached_by(dir.path(), &c).unwrap()
+        };
+        assert!(reached(&[&head]), "equal");
+        assert!(reached(&[&head.to_ascii_uppercase()]), "case-insensitive");
+        assert!(reached(&[&newer]), "pushed further before the merge");
+        assert!(!reached(&[&older]), "HEAD has commits past it");
+        assert!(!reached(&[&head[..12]]), "short prefix");
+        assert!(
+            !reached(&["0123456789abcdef0123456789abcdef01234567"]),
+            "unknown"
+        );
+        assert!(!reached(&["not-a-sha"]));
+        assert!(!reached(&[]));
+        assert!(reached(&["not-a-sha", &older, &newer]), "any candidate");
+    }
+
+    #[test]
+    fn head_reached_by_unborn_head_is_never_covered() {
+        let dir = init_repo("local-changes-reached-by-unborn");
+        assert!(!head_reached_by(
+            dir.path(),
+            &["0123456789abcdef0123456789abcdef01234567".into()]
+        )
+        .unwrap());
     }
 
     #[test]

@@ -73,7 +73,7 @@ async fn fixture(tmp: &TempDb) -> Fixture {
             .unwrap();
     }
     Fixture {
-        svc: Services::new(store),
+        svc: Services::new_isolated(store),
         ws,
         owner: owner.id,
         inherited,

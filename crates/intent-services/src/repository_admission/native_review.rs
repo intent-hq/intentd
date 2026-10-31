@@ -24,7 +24,9 @@ use crate::repository_credentials::{
     RepositoryCredentialError as CredentialError, RepositoryCredentialUse as Use,
 };
 use crate::settings_registry::SettingsSnapshot;
-use crate::source_control_auth_ops::repository_owner::RepositoryConnectionFacts;
+use crate::source_control_auth_ops::repository_owner::{
+    NativeReviewObservation, RepositoryConnectionFacts,
+};
 use intent_core::caller::{with_caller, with_wire_credential, WireCredential};
 use intent_core::repository_request::{
     NativeReviewBoundQuery as Bound, NativeReviewChoice as Choice,
@@ -1011,6 +1013,12 @@ struct CapturedMetadata {
     authority: RepositoryAuthoritySnapshot,
     provider: Arc<RepositoryConnectionFacts>,
     settings: Option<(Arc<crate::SettingsRegistry>, Arc<SettingsSnapshot>)>,
+    /// Completed and in-flight background monitor observations, for test
+    /// synchronization.
+    #[cfg(test)]
+    monitor_ticks: AtomicUsize,
+    #[cfg(test)]
+    monitor_inflight: AtomicUsize,
 }
 impl CapturedMetadata {
     async fn validate(&self, execution: bool) -> Result<Arc<Connection>> {
@@ -2256,6 +2264,10 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             .settings_registry
             .as_ref()
             .map(|s| (s.clone(), s.snapshot())),
+        #[cfg(test)]
+        monitor_ticks: AtomicUsize::new(0),
+        #[cfg(test)]
+        monitor_inflight: AtomicUsize::new(0),
     });
     if let Some(parent) = &r.predecessor {
         companion_observe!(r.probe, Metadata, parent.metadata.validate(true).await)?;
@@ -2743,20 +2755,35 @@ fn monitor(op: &Arc<Operation>) {
                 op.retire();
             } else {
                 let metadata = op.metadata.clone();
+                #[cfg(test)]
+                op.metadata.monitor_inflight.fetch_add(1, Ordering::AcqRel);
                 // One observation per retained operation, awaited to real completion.
                 // The original record permits remain held by `op` throughout. No R
-                // fence or settings guard crosses into the blocking P observation.
+                // fence or settings guard crosses into the P observation, which never
+                // waits: busy metadata (including a stage check holding the shared
+                // native-review gate) only defers to the next tick, so this monitor
+                // can no longer make a concurrent non-waiting stage check refuse.
                 let current = tokio::task::spawn_blocking(move || {
                     metadata.with_settings(|| Ok(()))?;
                     metadata
                         .provider
-                        .native_review_metadata_current()
+                        .native_review_monitor_observation()
                         .map_err(local)
                 })
                 .await;
-                if !matches!(current, Ok(Ok(true))) {
+                if !matches!(
+                    current,
+                    Ok(Ok(
+                        NativeReviewObservation::Current | NativeReviewObservation::Busy
+                    ))
+                ) {
                     op.retire();
                     tracing::debug!(operation = %op.id, phase = "monitor-metadata", "native review admission refused");
+                }
+                #[cfg(test)]
+                {
+                    op.metadata.monitor_ticks.fetch_add(1, Ordering::AcqRel);
+                    op.metadata.monitor_inflight.fetch_sub(1, Ordering::AcqRel);
                 }
             }
             let expired = op.disclosure_current().is_err();

@@ -855,6 +855,15 @@ fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     v
 }
 
+/// The `[agentFeatures]` a hook run sees: the live settings, with agent
+/// secret requests (PROTOCOL §5.56) always off. Secrets are transient,
+/// held for the agent's own interactive work, so a background hook can
+/// neither request nor use one (`ws.secret` and `secretEnv` are absent).
+fn hook_agent_features(mut live: AgentFeaturesSettings) -> AgentFeaturesSettings {
+    live.secret_requests = false;
+    live
+}
+
 /// The background hook service (`hook.*`), on [`Services`].
 pub(crate) trait HookServicesExt {
     async fn hook_owner_is_sub_agent(&self, agent_id: &AgentId) -> bool;
@@ -965,7 +974,7 @@ impl HookServicesExt for Services {
                     .into(),
             ));
         }
-        let agent_features = self.effective_settings().agent_features;
+        let agent_features = hook_agent_features(self.effective_settings().agent_features);
         if !agent_features.background_hooks {
             return Err(Error::InvalidParams(
                 "hook.schedule: disabled in settings (agentFeatures.backgroundHooks = false)"
@@ -1834,7 +1843,7 @@ impl HookServicesExt for Services {
         // daemon restarts, so the current effective `[agentFeatures]` gate is
         // the same one a newly created session's bridge would capture. The
         // owner's sub-agent status is likewise re-derived per run.
-        let agent_features = self.effective_settings().agent_features;
+        let agent_features = hook_agent_features(self.effective_settings().agent_features);
         let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
         let evaluation = async {
             #[cfg(test)]
@@ -2482,6 +2491,35 @@ mod tests {
     use super::*;
     use intent_services::feature_api::events::EventBus;
 
+    /// Hook runs never get agent secret requests (PROTOCOL §5.56), whatever
+    /// the live setting: no `ws.secret` in the prelude, every other toggle
+    /// passed through unchanged.
+    #[test]
+    fn hook_runs_never_get_secret_requests() {
+        let live = AgentFeaturesSettings {
+            secret_requests: true,
+            ..AgentFeaturesSettings::default()
+        };
+        let hook = hook_agent_features(live.clone());
+        assert!(!hook.secret_requests);
+        assert_eq!(
+            hook,
+            AgentFeaturesSettings {
+                secret_requests: false,
+                ..live.clone()
+            }
+        );
+        let workspace = WorkspaceId::from_string("ws-hook");
+        assert!(
+            intent_acp::bindings_prelude_for_workspace(&live, false, &workspace)
+                .contains("ws.secret = {")
+        );
+        assert!(
+            !intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace)
+                .contains("ws.secret = {")
+        );
+    }
+
     struct TempDb {
         path: PathBuf,
     }
@@ -2601,7 +2639,7 @@ mod tests {
             .expect("agent");
         let bus = EventBus::new(store.clone());
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = crate::test_runtime::with_runtime(Services::new(store))
+        let services = crate::test_runtime::with_runtime(Services::new_isolated(store))
             .with_event_bus(bus)
             .with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws, owner)
@@ -3791,7 +3829,9 @@ mod tests {
         // the dispatch wins (owner woken, dispatch counted), but a perpetual
         // fire at/after `expiresAt` expires instead of rescheduling.
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "perp-exp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -3826,7 +3866,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -3838,6 +3882,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
@@ -4224,7 +4269,8 @@ mod tests {
             .unwrap()
             .unwrap();
         mgr.shutdown().await;
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
@@ -4347,7 +4393,8 @@ mod tests {
             .unwrap();
         mgr.shutdown().await;
         drop(draining);
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
@@ -4437,7 +4484,8 @@ mod tests {
             timely,
             "shutdown must cancel evaluation before waiting out the hook budget"
         );
-        let restarted = crate::test_runtime::with_runtime(Services::new(svc.store().clone()));
+        let restarted =
+            crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
         restarted.rehydrate_agent_queues().await.unwrap();
         assert_eq!(
             restarted.queue_snapshot_for_test(&owner)[0]["id"],
@@ -6740,7 +6788,7 @@ mod tests {
         store.insert_agent_session(&session).await.expect("agent");
         let bus = EventBus::new(store.clone());
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let svc = crate::test_runtime::with_runtime(Services::new(store))
+        let svc = crate::test_runtime::with_runtime(Services::new_isolated(store))
             .with_event_bus(bus.clone())
             .with_workspaces_root(root.path().to_path_buf());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
@@ -7501,7 +7549,9 @@ mod tests {
         // the skew is stored before the note flips to "go", so the script's
         // continue always lands after the deadline "passed".
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "exp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -7534,10 +7584,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        // The run is in flight (state persists to `running` before the script
-        // starts; the note gate keeps it there). Now pass the deadline, then
-        // release the script — the continue lands strictly after expiry.
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7549,6 +7600,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
@@ -7571,7 +7623,9 @@ mod tests {
         // Same clock choreography as the continue variant above, but the
         // released run returns a dispatch — which wins over the passed TTL.
         let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut svc = svc.with_hook_clock_skew(skew.clone());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mut gate = note(&ws, "disp-gate", "wait");
         svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
@@ -7606,10 +7660,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        // Running persisted ⇒ the pre-run expiry guard already passed. Pass
-        // the deadline, then release the script — its dispatch lands
-        // strictly after expiry and must still win.
-        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        // Running is persisted before the final expiry guard. Wait until
+        // evaluation has passed that guard before moving the clock.
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
+            .await
+            .expect("hook evaluation entered");
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
         svc.store()
@@ -7621,6 +7676,7 @@ mod tests {
             )
             .await
             .unwrap();
+        park.release.notify_one();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;

@@ -3868,8 +3868,8 @@ mod tests {
             .await
             .expect("ws");
         let bus = EventBus::new(store.clone());
-        let services =
-            crate::test_runtime::with_runtime(Services::new(store)).with_event_bus(bus.clone());
+        let services = crate::test_runtime::with_runtime(Services::new_isolated(store))
+            .with_event_bus(bus.clone());
         Harness {
             tmp,
             services,
@@ -4373,7 +4373,8 @@ mod tests {
 
         // Simulate a daemon restart: a fresh Services over the same store has
         // an empty registry until the boot-time hydration runs.
-        let svc2 = crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
+        let svc2 =
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
         let listed = svc2.script_list(h.ws.clone()).await.expect("list");
         assert!(
             listed["scripts"].as_array().expect("array").is_empty(),
@@ -4427,9 +4428,10 @@ mod tests {
         h.services.shutdown_pty_sessions().await;
 
         let park = Arc::new(SupervisePark::default());
-        h.services = crate::test_runtime::with_runtime(Services::new(h.services.store().clone()))
-            .with_event_bus(h.bus.clone())
-            .with_script_supervise_park(park.clone());
+        h.services =
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()))
+                .with_event_bus(h.bus.clone())
+                .with_script_supervise_park(park.clone());
         let mut sub = subscribe(&h);
         assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
         let starting = h
@@ -4515,7 +4517,7 @@ mod tests {
                 .await
                 .unwrap();
             let park = Arc::new(SupervisePark::default());
-            h.services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+            h.services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
                 .with_event_bus(h.bus.clone())
                 .with_script_mark_running_park(park.clone());
             assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
@@ -4599,7 +4601,7 @@ mod tests {
                 "restoring={restoring}, user_stop={user_stop}, shutdown_first={shutdown_first}"
             );
 
-            h.services = crate::test_runtime::with_runtime(Services::new(store))
+            h.services = crate::test_runtime::with_runtime(Services::new_isolated(store))
                 .with_event_bus(h.bus.clone());
             let mut sub = subscribe(&h);
             assert_eq!(h.services.hydrate_scripts().await.expect("next boot"), 1);
@@ -4650,7 +4652,8 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        h.services = crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
+        h.services =
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
         assert_eq!(h.services.hydrate_scripts().await.expect("hydrate"), 1);
         let state = h.services.script_status(h.ws.clone(), id).await.unwrap();
         assert_eq!(state["status"], "idle", "user stop respected: {state}");
@@ -4683,7 +4686,7 @@ mod tests {
                 .set_script_was_running(h.ws.as_str(), &id, true)
                 .await
                 .unwrap();
-            h.services = crate::test_runtime::with_runtime(Services::new(store.clone()))
+            h.services = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
                 .with_event_bus(h.bus.clone());
             if spawn_failure {
                 h.services.pty().kill_all_sync();
@@ -4734,7 +4737,7 @@ mod tests {
         // Simulate a daemon death (no stop ran): a fresh Services over the
         // same store hydrates the marker as `previouslyRunning: true`.
         let store = h.services.store().clone();
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc2
             .script_status(h.ws.clone(), id.clone())
@@ -4744,7 +4747,7 @@ mod tests {
         assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
 
         // The marker survives another restart untouched.
-        let svc3 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc3
             .script_status(h.ws.clone(), id.clone())
@@ -4765,7 +4768,7 @@ mod tests {
                 .is_empty(),
             "stop clears the marker"
         );
-        let svc4 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc4 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc4.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc4.script_status(h.ws.clone(), id).await.expect("status");
         assert!(
@@ -4829,7 +4832,7 @@ mod tests {
             "marker durable once running is observable"
         );
 
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc2
             .script_status(h.ws.clone(), id.clone())
@@ -4858,7 +4861,7 @@ mod tests {
 
         let store = h.services.store().clone();
         let bus2 = EventBus::new(store.clone());
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
             .with_event_bus(bus2.clone());
         let mut sub2 = bus2.subscribe(SubscriptionFilter {
             event_types: vec!["script:*".to_string()],
@@ -4985,7 +4988,7 @@ mod tests {
         };
 
         // Simulate a daemon death (no stop ran).
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
         lost(
             &svc2
@@ -4998,7 +5001,7 @@ mod tests {
 
         // Stable across another restart: the marker is untouched until the
         // script is started or stopped.
-        let svc3 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
         lost(
             &svc3
@@ -5038,7 +5041,7 @@ mod tests {
                 .is_empty(),
             "dismiss durably clears the marker"
         );
-        let svc4 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc4 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc4.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc4
             .script_status(h.ws.clone(), id.clone())
@@ -5060,7 +5063,7 @@ mod tests {
             .await
             .expect("teardown stop of the original run");
         let store2 = h.services.store().clone();
-        let svc5 = crate::test_runtime::with_runtime(Services::new(store2.clone()));
+        let svc5 = crate::test_runtime::with_runtime(Services::new_isolated(store2.clone()));
         store2
             .set_script_was_running(h.ws.as_str(), &id, true)
             .await
@@ -5132,7 +5135,7 @@ mod tests {
             .await
             .expect("arm marker");
         let bus2 = EventBus::new(store.clone());
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
             .with_event_bus(bus2.clone());
         let mut sub2 = bus2.subscribe(SubscriptionFilter {
             event_types: vec!["script:*".to_string()],
@@ -5169,7 +5172,7 @@ mod tests {
         );
 
         // Archived commands are loaded only on known-ID access after boot.
-        let svc3 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 0);
         assert!(svc3.script_list(h.ws.clone()).await.unwrap()["scripts"]
             .as_array()
@@ -5207,7 +5210,7 @@ mod tests {
             .await
             .expect("arm marker");
         let bus2 = EventBus::new(store.clone());
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store.clone()))
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()))
             .with_event_bus(bus2.clone());
         let mut sub2 = bus2.subscribe(SubscriptionFilter {
             event_types: vec!["script:*".to_string()],
@@ -5224,7 +5227,7 @@ mod tests {
             vec![(h.ws.as_str().to_string(), id.clone())],
             "service semantics unchanged: the marker survives a launch failure"
         );
-        let svc3 = crate::test_runtime::with_runtime(Services::new(store.clone()));
+        let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));
         assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
         assert_eq!(st["status"], "idle", "{st}");
@@ -5450,7 +5453,8 @@ mod tests {
             .await
             .expect("remove");
 
-        let svc2 = crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
+        let svc2 =
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
         assert_eq!(
             svc2.hydrate_scripts().await.expect("hydrate"),
             0,
@@ -6852,7 +6856,7 @@ mod tests {
             "was_running marker survives graceful shutdown for script.run: {markers:?}"
         );
 
-        let svc2 = crate::test_runtime::with_runtime(Services::new(store));
+        let svc2 = crate::test_runtime::with_runtime(Services::new_isolated(store));
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc2
             .script_status(h.ws.clone(), id.clone())
@@ -7691,7 +7695,7 @@ mod tests {
         assert_eq!(live["updatedAt"], json!(persisted.updated_at));
 
         let restarted =
-            crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
         assert_eq!(restarted.hydrate_scripts().await.unwrap(), 2);
         let hydrated = restarted.script_list(h.ws.clone()).await.unwrap();
         let restored = hydrated["scripts"]
@@ -7815,7 +7819,7 @@ mod tests {
         let live = h.services.script_list(h.ws.clone()).await.unwrap();
         let persisted = h.services.store().list_all_scripts().await.unwrap();
         let restarted =
-            crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
+            crate::test_runtime::with_runtime(Services::new_isolated(h.services.store().clone()));
         restarted.hydrate_scripts().await.unwrap();
         let restored = restarted.script_list(h.ws.clone()).await.unwrap();
         if first_remove {

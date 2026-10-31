@@ -128,6 +128,20 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
+**Frame rate during agent use.** While you act on a tab you own, it draws at full
+frame rate (requestAnimationFrame, CSS animations, timers) even when it is hidden or
+the app window is minimized or covered. Content actions on it (`evaluate`,
+`screenshot`, `snapshot`, `getAccessibilityTree`, `navigate`, `focusTab`,
+`startSession`, and the `startCapture` / `captureStep` / `startTrace` session steps)
+keep it at full rate for as long as they run and for 30 s
+after your last action; after that an idle hidden tab drops back to a throttled rate
+(about 1 frame per second) to save battery. So animation, flicker and timing measured
+inside one `evaluate`, or across calls a few seconds apart, are real. After a longer
+gap, the first frames of the next action can still be throttled: send a cheap action
+first (e.g. `evaluate` of `1`). A trace or capture whose steps are more than 30 s apart
+is throttled in between, so keep its start and stop close together. Tabs you do not
+own keep the browser's normal throttling.
+
 **Capture ops and workspace visibility.** Layout-only actions (`openTab` hidden or
 visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …) do not need
 the workspace to be open/visible in the app: they apply their effects to the
@@ -184,6 +198,7 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
 - `{ action: "focusTab", tabId? }` - Focus/remount a visible tab (fails on a hidden tab — use showTab)
+- `{ action: "previewHtml", html, width?, appearance? }` - Check a self-contained `ws-block:html` visual before showing it, in an invisible window with the app sandbox, fonts and themes (no tab, server or focus change). `width` is CSS pixels, 320 to 1600 (default 800; about 390 for phones). `appearance` is `"light"` (default) or `"dark"`. As a single action, `r.result` has `assetUrl`, `width`, `height`, `contentHeight`, `truncated` (full-height PNG capped at 8000px), `appearance` and `consoleMessages` (`[{ level, message }]`); view it with `return await ws.note.readAsset(r.result.assetUrl)`. Without `assetUrl`, the result keeps `base64` and `mimeType`. Frontends without this action report it as unsupported.
 
 ## Capture Actions (for debugging)
 - `{ action: "snapshot", workspaceId, name?, reload?, waitFor? }` - Quick point-in-time capture

@@ -561,7 +561,7 @@ async fn removed_member_cannot_reuse_admitted_role_or_reconnect_credential() {
             .unwrap(),
         None
     );
-    let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+    let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
     assert_eq!(
         restarted.resolve_principal_credential(hash).await.unwrap(),
         None

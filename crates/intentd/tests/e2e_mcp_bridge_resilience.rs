@@ -83,7 +83,7 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.clone())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());

@@ -93,7 +93,7 @@ mod registration_tests {
     #[tokio::test]
     async fn register_installs_one_runtime_feature_shared_by_clones() {
         let tmp = TempDb::new();
-        let bare = Services::new(intent_store::Store::open(&tmp.path).await.unwrap());
+        let bare = Services::new_isolated(intent_store::Store::open(&tmp.path).await.unwrap());
         assert!(bare.unregistered_feature_ports().contains(&"runtime"));
         let svc = with_runtime(bare);
         assert!(!svc.unregistered_feature_ports().contains(&"runtime"));

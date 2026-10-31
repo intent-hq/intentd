@@ -106,7 +106,7 @@ async fn uds_git_write_ops_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -400,7 +400,7 @@ async fn uds_git_write_ops_wave_b_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -582,7 +582,7 @@ async fn uds_git_read_ops_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -749,7 +749,7 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -850,7 +850,7 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -954,7 +954,7 @@ async fn uds_git_commit_details_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1082,7 +1082,7 @@ async fn uds_git_branch_status_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1246,7 +1246,7 @@ async fn uds_git_get_branches_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1391,7 +1391,7 @@ async fn uds_git_pull_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1519,7 +1519,7 @@ async fn uds_git_read_ops_extensions_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {

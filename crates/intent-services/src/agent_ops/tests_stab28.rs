@@ -18,7 +18,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    let services = Services::new_isolated(store);
     (tmp, services, ws)
 }
 

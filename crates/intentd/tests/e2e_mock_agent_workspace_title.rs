@@ -63,7 +63,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());

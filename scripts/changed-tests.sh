@@ -26,9 +26,12 @@
 # queue's coverage-e2e / coverage-all jobs use, with the same env and the same
 # auggie_context_e2e exclusion (see scripts/coverage-e2e.sh):
 #   INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest <plan>
-#       [--build-jobs N] [--test-threads N] -E 'not test(/^auggie_context_e2e::/)'
+#       [--build-jobs N] [--test-threads N] --no-tests=warn
+#       -E 'not test(/^auggie_context_e2e::/)'
 # (a plan that carries its own -E has the exclusion ANDed into it, since
-# nextest ORs repeated -E flags).
+# nextest ORs repeated -E flags). --no-tests=warn: a changed test file whose
+# every test is #[ignore] selects zero runnable tests, which nextest otherwise
+# fails as "no tests to run" (exit 4; coverage-changed on intentd#2787).
 # No `cargo llvm-cov clean`, no report: the point is executing the changed
 # tests under instrumentation (intent-hq/intentd#1947), not a coverage number.
 # --instrumented cannot be combined with --runner (usage error).
@@ -53,6 +56,9 @@
 #   crates/intent-core/ (src/** or   also every crate depending on intent-core,
 #     <anything else>)               directly or transitively, as for src/**
 #                                    (dependencies read from crates/*/Cargo.toml)
+#   crates/intent-js/ (src/** or     also --lib of every crate depending on
+#     <anything else>)               intent-js directly that has a src/lib.rs
+#                                    (its library unit tests only)
 #   a glob in .config/e2e-test-map.txt
 #                                    also the end-to-end modules it maps to:
 #                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
@@ -75,7 +81,8 @@
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are
-# propagated in full only from intent-core (intentd#2698); otherwise only from
+# propagated in full only from intent-core (intentd#2698), and as library unit
+# tests only from intent-js to its direct dependents; otherwise only from
 # intent-services to its feature crates and intent-app, from a feature crate
 # to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
 # own tests plus any mapped end-to-end or library unit-test modules; the full
@@ -202,6 +209,20 @@ cd "$repo_root"
 # them would run the full suite for most changes.
 rdeps_roots="intent-core"
 
+# intent-js is the host() bridge every ws.* call from a workspace_api or hook
+# script crosses, and the crates that call it test their bindings and hooks
+# in their library unit tests (intent-acp's tests_wsapi*, intent-svc-runtime's
+# hook_manager). A change to it (as for intent-core, src or any other
+# non-test file) also selects the library unit tests (--lib) of each crate
+# depending on it directly that has a testable src/lib.rs, but not their
+# integration tests, binaries or own dependents: those reach intentd's
+# end-to-end suites, and the bridge's end-to-end modules are named in the
+# end-to-end map instead. intentd#2811 changed only intent-js/src, passed PR
+# CI and failed in the merge queue. A crate that starts calling the bridge
+# must depend on intent-js, so it is covered without a map entry. The direct
+# edges are the ones check-rdeps-parity.py compares with cargo metadata.
+lib_rdeps_roots="intent-js"
+
 # Prints "<dependent>\t<dependency>" for each dependency between workspace
 # crates declared in crates/*/Cargo.toml: any [dependencies],
 # [dev-dependencies] or [build-dependencies] table, target-specific ones
@@ -274,6 +295,16 @@ workspace_edges() {
         printf '%s\t%s\n' "$crate" "$dep"
     done <"$manifest"
   done
+}
+
+# Prints the workspace crates depending on crate $1 directly, one per line,
+# from the workspace_edges records in $2.
+direct_dependents() {
+  local root=$1 edges=$2 dependent dependency
+  while IFS=$'\t' read -r dependent dependency; do
+    [[ -z "$dependent" || "$dependency" != "$root" || "$dependent" == "$root" ]] ||
+      printf '%s\n' "$dependent"
+  done <<<"$edges"
 }
 
 # Prints the workspace crates depending on crate $1, directly or
@@ -732,19 +763,26 @@ while IFS= read -r note; do
   [[ -z "$note" ]] || log "$note"
 done <<<"$e2e_notes"
 
+# Succeeds when the $mapped records select crate $1's src or every target (a
+# src or other non-test file of the crate changed): a propagation root then
+# selects its dependents.
+root_changed() {
+  local rec_crate rec_kind
+  while IFS=$'\t' read -r rec_crate rec_kind _; do
+    [[ "$rec_crate" != "$1" || ("$rec_kind" != src && "$rec_kind" != all) ]] || return 0
+  done <<<"$mapped"
+  return 1
+}
+
+# Propagated roots (full and lib-only): their dependents are selected, so no
+# "downstream crates are not selected" note is printed for them.
 rdeps_propagated=""
 # Dependents of a propagated root: their own dependents are selected too, so
 # no "downstream crates are not selected" note is printed for them.
 rdeps_selected=""
 rdeps_edges=""
 for root in $rdeps_roots; do
-  root_changed=""
-  while IFS=$'\t' read -r rec_crate rec_kind _; do
-    if [[ "$rec_crate" == "$root" && ("$rec_kind" == src || "$rec_kind" == all) ]]; then
-      root_changed=1
-    fi
-  done <<<"$mapped"
-  [[ -n "$root_changed" ]] || continue
+  root_changed "$root" || continue
   [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
   dependents=""
   while IFS= read -r dependent; do
@@ -758,6 +796,41 @@ for root in $rdeps_roots; do
     log "note: crates/$root changed; its reverse dependencies run too ($dependents)"
   else
     log "note: crates/$root changed; no workspace crate depends on it"
+  fi
+done
+
+# Library unit tests of a lib root's direct dependents ("lib": --lib, the
+# record a module-less <crate>::lib map entry makes). A broader selection of
+# the same crate (src, dependent, all) subsumes it, and it never selects the
+# feature crates or intent-app below. A dependent a full propagation root
+# already selects is left out of the note, since every target of it runs.
+for root in $lib_rdeps_roots; do
+  root_changed "$root" || continue
+  [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
+  dependents=""
+  covered=""
+  while IFS= read -r dependent; do
+    [[ -n "$dependent" ]] || continue
+    if [[ "$rdeps_selected" == *" $dependent "* ]]; then
+      covered=1
+      continue
+    fi
+    # Before the src/lib.rs check, so a lib moved off it gets the note.
+    if ! lib_is_testable "$dependent"; then
+      log "note: crates/$dependent depends on $root but its library unit tests cannot run ($lib_problem)"
+      continue
+    fi
+    [[ -f "crates/$dependent/src/lib.rs" ]] || continue
+    mapped+="$dependent"$'\t'"lib"$'\n'
+    dependents+="${dependents:+, }$dependent"
+  done <<<"$(direct_dependents "$root" "$rdeps_edges" | sort -u)"
+  rdeps_propagated+=" $root "
+  if [[ -n "$dependents" ]]; then
+    log "note: crates/$root changed; the library unit tests of the crates depending on it directly run too ($dependents)"
+  elif [[ -n "$covered" ]]; then
+    :
+  else
+    log "note: crates/$root changed; no workspace crate depending on it directly has library unit tests"
   fi
 done
 
@@ -920,9 +993,12 @@ extra=""
 [[ -n "$test_threads" ]] && extra+=" --test-threads $test_threads"
 
 # The instrumented form mirrors scripts/coverage-e2e.sh: same env, same
-# auggie_context_e2e exclusion (it needs a real auggie binary).
+# auggie_context_e2e exclusion (it needs a real auggie binary). A plan whose
+# selected tests are all #[ignore] runs zero tests; that warns instead of
+# failing the coverage-changed job (intentd#2787).
 cov_env="INTENTD_TEST_TIMEOUT_MULTIPLIER=3"
 cov_filter="not test(/^auggie_context_e2e::/)"
+cov_no_tests="--no-tests=warn"
 
 # Splits plan $1 (flags assembled above: no quoting, no glob characters) into
 # plan_args and its filterset plan_expr. Under --instrumented plan_expr also
@@ -955,7 +1031,7 @@ describe() {
   local tail=""
   [[ -z "$plan_expr" ]] || tail=" -E '$plan_expr'"
   if [[ -n "$instrumented" ]]; then
-    echo "$cov_env cargo llvm-cov --no-report nextest ${plan_args[*]}$extra$tail"
+    echo "$cov_env cargo llvm-cov --no-report nextest ${plan_args[*]}$extra $cov_no_tests$tail"
   else
     echo "cargo nextest run ${plan_args[*]}$extra$tail"
   fi
@@ -993,6 +1069,7 @@ while IFS= read -r -u 3 plan; do
   plan_words "$plan"
   # shellcheck disable=SC2086
   set -- "${plan_args[@]}" $extra
+  [[ -z "$instrumented" ]] || set -- "$@" "$cov_no_tests"
   [[ -z "$plan_expr" ]] || set -- "$@" -E "$plan_expr"
   scope_index=$((scope_index + 1))
   set +e

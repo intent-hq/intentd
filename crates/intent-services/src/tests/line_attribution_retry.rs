@@ -11,7 +11,7 @@ async fn setup() -> (TempDb, Services, EventBus, WorkspaceId, WorkspaceId, NoteI
     let tmp = TempDb::new();
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
     let ws = WorkspaceId::new();
     let other_ws = WorkspaceId::new();
     let id = NoteId::from("same-note");

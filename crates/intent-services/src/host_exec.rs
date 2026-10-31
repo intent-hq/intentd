@@ -115,6 +115,14 @@ impl HostExecError {
 ///
 /// Returns an invalid-params `HostExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecError> {
+    // `secretEnv` belongs to the agent `ws.host.exec` binding only (PROTOCOL
+    // §5.56): the agent path resolves and strips it before parsing, so its
+    // presence here means a client connection, which has no agent identity.
+    if params.contains_key("secretEnv") {
+        return Err(HostExecError::invalid(
+            "Invalid parameter: secretEnv is only available to agents through ws.host.exec",
+        ));
+    }
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -700,7 +708,7 @@ mod tests {
         let store = intent_store::Store::open(&tmp.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store.clone());
+        let services = crate::Services::new_isolated(store.clone());
         let runtime = services.host_exec_runtime();
         let pid_file = tmp.path().join("pid");
         let fifo = tmp.path().join("gate");

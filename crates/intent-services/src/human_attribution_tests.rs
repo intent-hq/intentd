@@ -208,7 +208,7 @@ async fn transfer_human_queue_restart_and_history_replacement_keep_trust_boundar
         .unwrap()
         .insert(agent.clone(), vec![entry.clone()]);
     svc.persist_queue_snapshot(&agent).await;
-    let restarted = crate::Services::new(svc.store.clone());
+    let restarted = crate::Services::new_isolated(svc.store.clone());
     assert_eq!(restarted.rehydrate_agent_queues().await.unwrap(), 1);
     let restored = restarted.find_queued_message(&agent, &entry.id).unwrap();
     assert!(

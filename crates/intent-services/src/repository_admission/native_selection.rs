@@ -60,6 +60,22 @@ fn denied(_: impl std::fmt::Debug) -> Error {
 fn changed_command() -> Error {
     Error::InvalidParams("Selection command already claimed".into())
 }
+fn invalid_remote_name() -> Error {
+    Error::InvalidParams("Invalid repository remote name".into())
+}
+/// Why a frame was refused at capture. Only the two caller-input refusals are
+/// distinct; every other failure converts to the uniform unavailable refusal,
+/// so no callee's error text can reach the wire through this path.
+enum EntryError {
+    Unavailable,
+    ChangedCommand,
+    InvalidRemoteName,
+}
+impl From<Error> for EntryError {
+    fn from(_: Error) -> Self {
+        Self::Unavailable
+    }
+}
 
 pub(crate) struct Capacity {
     records: Arc<Semaphore>,
@@ -464,7 +480,7 @@ struct Request {
     completed: AtomicBool,
     consumed: AtomicBool,
     public: AtomicBool,
-    entry_error: Option<bool>, // true: changed command; false: unavailable
+    entry_error: Option<EntryError>,
     created: Instant,
 }
 impl Request {
@@ -491,8 +507,9 @@ impl Request {
             return Err(unavailable());
         }
         match request.entry_error {
-            Some(true) => Err(changed_command()),
-            Some(false) => Err(unavailable()),
+            Some(EntryError::ChangedCommand) => Err(changed_command()),
+            Some(EntryError::InvalidRemoteName) => Err(invalid_remote_name()),
+            Some(EntryError::Unavailable) => Err(unavailable()),
             None => Ok(request),
         }
     }
@@ -508,6 +525,15 @@ impl Request {
             operation.active.store(false, Ordering::Release);
         }
     }
+    /// Release this frame's own lane, if it still holds one. A frame never
+    /// releases a lane it does not own, so late cleanup cannot free a successor.
+    fn release_own_lane(&self) {
+        if self.owns_lane.load(Ordering::Acquire) {
+            if let Ok(op) = self.operation() {
+                self.release_lane(&op);
+            }
+        }
+    }
     fn finish(&self) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
@@ -515,8 +541,8 @@ impl Request {
         if let Some(life) = &self.lifetime {
             life.retirement().end_scope();
         }
+        self.release_own_lane();
         if let Ok(op) = self.operation() {
-            self.release_lane(&op);
             if self.initiator.load(Ordering::Acquire) {
                 op.retire_write();
                 op.no_start(Failure::AdmissionRetired);
@@ -558,7 +584,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     let mut target = None;
     let mut initiator = false;
     let mut owns_lane = false;
-    let mut entry_error = life.is_none().then_some(false);
+    let mut entry_error = life.is_none().then_some(EntryError::Unavailable);
     if life.is_some() {
         if let Some((id, command)) = frame_target(&frame) {
             let record = c
@@ -570,22 +596,22 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             if let Some(op) =
                 record.filter(|o| o.query == frame.query() && o.published.load(Ordering::Acquire))
             {
-                let claim = (|| {
+                let claim = (|| -> std::result::Result<(), EntryError> {
                     op.disclosure_current()?;
+                    // Malformed input is refused before the lane is taken, so
+                    // it neither waits for nor blocks the operation's request.
+                    if command.as_ref().is_some_and(|command| !command.valid()) {
+                        return Err(EntryError::InvalidRemoteName);
+                    }
                     op.active
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .map_err(denied)?;
                     owns_lane = true;
                     if let Some(command) = command {
-                        if !command.valid() {
-                            return Err(Error::InvalidParams(
-                                "Invalid repository remote name".into(),
-                            ));
-                        }
                         let mut p = op.progress.lock().map_err(denied)?;
                         if let Some(old) = &p.command {
                             if old != &command {
-                                return Err(changed_command());
+                                return Err(EntryError::ChangedCommand);
                             }
                             op.observe_budget()?;
                         } else {
@@ -599,11 +625,11 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                     Ok(())
                 })();
                 if let Err(e) = claim {
-                    entry_error = Some(matches!(e, Error::InvalidParams(_)));
+                    entry_error = Some(e);
                 }
                 target = Some(op);
             } else if !matches!(frame, Frame::Release(_)) {
-                entry_error = Some(false);
+                entry_error = Some(EntryError::Unavailable);
             }
         }
     }
@@ -762,12 +788,25 @@ impl RepositoryReadRequestScope for Request {
         _kind: RepositoryReadReplyKind,
         transfer: &'a mut (dyn FnMut() -> Result<()> + Send),
     ) -> BoxFuture<'a, Result<()>> {
+        /// The transport sends a refusal as soon as `deliver` returns (or panics),
+        /// before it retires the frame; release the lane on every exit first.
+        struct LaneRelease<'a>(&'a Request);
+        impl Drop for LaneRelease<'_> {
+            fn drop(&mut self) {
+                self.0.release_own_lane();
+            }
+        }
         let entered = self.check();
         Box::pin(async move {
+            let _lane = LaneRelease(self);
             if self.public.load(Ordering::Acquire) || self.entry_error.is_some() {
                 if self.consumed.swap(true, Ordering::AcqRel) {
                     return Err(unavailable());
                 }
+                // As on the admitted path, release this frame's own lane before its
+                // reply becomes observable: the client's next request on the same
+                // operation must not race the transport's later frame cleanup.
+                self.release_own_lane();
                 return transfer();
             }
             entered?;
@@ -800,10 +839,16 @@ impl RepositoryReadRequestScope for Request {
                                     // Release this frame before its reply becomes observable.
                                     // Later cleanup must not release a successor frame's lane.
                                     self.release_lane(&op);
+                                    // Likewise publish a capture before its selection ID
+                                    // becomes observable; an untransferred one stays private.
+                                    let capture = matches!(self.frame, Frame::Capture(_));
+                                    if capture {
+                                        op.published.store(true, Ordering::Release);
+                                    }
                                     let result =
                                         transfer().map_err(|_| AdmissionError::Unavailable);
-                                    if result.is_ok() && matches!(self.frame, Frame::Capture(_)) {
-                                        op.published.store(true, Ordering::Release);
+                                    if result.is_err() && capture {
+                                        op.published.store(false, Ordering::Release);
                                     }
                                     result
                                 })

@@ -17,11 +17,22 @@
 //! scaffolding; its module doc spells out those semantics. The rule itself is
 //! deliberately small:
 //!
-//! - A statement is flagged when it contains a fold call (`to_lowercase`,
-//!   `to_ascii_lowercase`, `eq_ignore_ascii_case`, `make_ascii_lowercase`)
-//!   AND a slug identifier: an identifier token with an underscore-delimited
-//!   component equal to `owner`, `repo`, `repository`, or `slug`, or the bare
-//!   token `name` when the same statement also carries an `owner` component.
+//! - A statement is flagged when one of its top-level `&&` / `||` operands
+//!   contains a fold call (`to_lowercase`, `to_ascii_lowercase`,
+//!   `eq_ignore_ascii_case`, `make_ascii_lowercase`) AND a slug identifier:
+//!   an identifier token with an underscore-delimited component equal to
+//!   `owner`, `repo`, `repository`, or `slug`, or the bare token `name` when
+//!   the statement also carries an `owner` component. Operands are split
+//!   outside every `(…)` / `[…]` group, after the statement's first top-level
+//!   assignment operator, and never at a `||` / `&&` that begins an operand
+//!   (a closure opener such as `= ||` / `move ||`, or a double borrow
+//!   `= &&x`). The binding target before that assignment counts with every
+//!   operand, so `let repo_ok = a && b.to_lowercase() == c` is flagged.
+//! - A slug identifier in another operand does not count: a git handle named
+//!   `repo` in `id != c.to_ascii_lowercase() || repo.find_commit(id).is_err()`
+//!   is not slug identity (intent-hq/intentd#2810). A fold passed into a
+//!   method on such a handle (`repo.find_commit(c.to_lowercase())`) is one
+//!   operand and still flagged; opt it out.
 //! - Skipped: `crates/intent-core/src/repo_ref.rs`, on top of the test code
 //!   the shared walker and `#[cfg(test)]` blanking leave out.
 //! - Opt-out: `// repo-slug-fold: allow — <reason>` on the line immediately
@@ -58,41 +69,141 @@ struct Hit {
     marker_malformed: bool,
 }
 
-/// ASCII identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`) in `text`.
-fn identifiers(text: &str) -> Vec<&str> {
+/// One token of a blanked statement: a word (identifier, keyword, or number)
+/// or a punctuation token (multi-character operators kept whole, so `&&` and
+/// `||` are single tokens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok<'a> {
+    Word(&'a str),
+    Punct(&'a str),
+}
+
+/// Multi-character operators the split depends on, longest first: `&&` /
+/// `||` are the split points, and every operator containing `=` must stay
+/// whole so a lone `=` token is always an assignment.
+const MULTI_PUNCT: &[&str] = &[
+    "<<=", ">>=", "..=", "==", "!=", "<=", ">=", "=>", "&&", "||", "+=", "-=", "*=", "/=", "%=",
+    "^=", "|=", "&=",
+];
+/// Assignment operators: what precedes the first top-level one is the
+/// statement's binding target.
+const ASSIGN_OPS: &[&str] = &[
+    "=", "+=", "-=", "*=", "/=", "%=", "^=", "|=", "&=", "<<=", ">>=",
+];
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn tokens(text: &str) -> Vec<Tok<'_>> {
     let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    for (idx, c) in text.char_indices() {
-        let word_char = c.is_ascii_alphanumeric() || c == '_';
-        match (start, word_char) {
-            (None, true) => start = Some(idx),
-            (Some(s), false) => {
-                out.push(&text[s..idx]);
-                start = None;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let word = is_word_char(c);
+        let len = if word {
+            rest.find(|ch: char| !is_word_char(ch))
+                .unwrap_or(rest.len())
+        } else {
+            MULTI_PUNCT
+                .iter()
+                .find(|p| rest.starts_with(**p))
+                .map_or(c.len_utf8(), |p| p.len())
+        };
+        let (tok, tail) = rest.split_at(len);
+        out.push(if word {
+            Tok::Word(tok)
+        } else {
+            Tok::Punct(tok)
+        });
+        rest = tail;
+    }
+    out
+}
+
+/// Whether a `||` / `&&` after `prev` begins an operand — a closure opener
+/// (`= ||`, `move ||`, `async ||`, `&||`) or a double borrow (`= &&x`) —
+/// rather than joining two boolean operands.
+fn begins_operand(prev: Option<Tok>) -> bool {
+    match prev {
+        None => true,
+        Some(Tok::Punct(p)) => {
+            ASSIGN_OPS.contains(&p) || ["=>", "&", ",", ":", "!", "|", "(", "["].contains(&p)
+        }
+        Some(Tok::Word(w)) => ["move", "async", "return", "in"].contains(&w),
+    }
+}
+
+/// Splits a statement into its binding target (the tokens before its first
+/// top-level assignment operator; empty when it has none) and the top-level
+/// `&&` / `||` operands of the rest — split outside every `(…)` / `[…]`
+/// group, never at a `||` / `&&` that begins an operand.
+fn split_operands<'a, 't>(toks: &'t [Tok<'a>]) -> (&'t [Tok<'a>], Vec<&'t [Tok<'a>]>) {
+    let mut target: &[Tok] = &[];
+    let mut assigned = false;
+    let mut operands = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, t) in toks.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|p| toks[p]);
+        match *t {
+            Tok::Punct("(" | "[") => depth += 1,
+            Tok::Punct(")" | "]") => depth = depth.saturating_sub(1),
+            Tok::Punct(p)
+                if depth == 0 && !assigned && operands.is_empty() && ASSIGN_OPS.contains(&p) =>
+            {
+                target = &toks[..i];
+                assigned = true;
+                start = i + 1;
+            }
+            Tok::Punct("&&" | "||") if depth == 0 && !begins_operand(prev) => {
+                operands.push(&toks[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
     }
-    if let Some(s) = start {
-        out.push(&text[s..]);
-    }
-    out.retain(|id| id.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
-    out
+    operands.push(&toks[start..]);
+    (target, operands)
+}
+
+/// Identifier words (not numbers or punctuation) among `toks`.
+fn identifiers<'a>(toks: &[Tok<'a>]) -> Vec<&'a str> {
+    toks.iter()
+        .filter_map(|t| match *t {
+            Tok::Word(w) if w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') => Some(w),
+            _ => None,
+        })
+        .collect()
 }
 
 fn has_component(ident: &str, component: &str) -> bool {
     ident.split('_').any(|part| part == component)
 }
 
-/// Whether one statement folds a slug identifier.
+/// Whether one statement folds a slug identifier: some top-level `&&` / `||`
+/// operand holds a fold call and, counting the statement's binding target
+/// with every operand, a slug identifier.
 fn is_flagged(statement: &str) -> bool {
-    let idents = identifiers(statement);
-    if !idents.iter().any(|id| FOLD_CALLS.contains(id)) {
+    if !FOLD_CALLS.iter().any(|f| statement.contains(f)) {
         return false;
     }
-    let has_owner = idents.iter().any(|id| has_component(id, "owner"));
-    idents.iter().any(|id| {
+    let toks = tokens(statement);
+    let has_owner = identifiers(&toks)
+        .iter()
+        .any(|id| has_component(id, "owner"));
+    let is_slug = |id: &&str| {
         SLUG_COMPONENTS.iter().any(|c| has_component(id, c)) || (*id == "name" && has_owner)
+    };
+    let (target, operands) = split_operands(&toks);
+    let target_has_slug = identifiers(target).iter().any(is_slug);
+    operands.into_iter().any(|operand| {
+        let idents = identifiers(operand);
+        idents.iter().any(|id| FOLD_CALLS.contains(id))
+            && (target_has_slug || idents.iter().any(is_slug))
     })
 }
 
@@ -332,6 +443,39 @@ fn parse_github_owner_repo(github_url: &str) -> Option<(String, String)> {
 }
 "#;
 
+/// `head_reached_by` as it stood before intentd commit 8ce3c3dd
+/// (`crates/intent-git/src/local_changes.rs`, intent-hq/intentd#2810): the
+/// fold is on a commit id, and `repo` is a git handle in another operand.
+const HEAD_REACHED_BY_PRE_8CE3C3DD: &str = r"
+pub fn head_reached_by(worktree_path: &Path, heads: &[String]) -> Result<bool> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let Some(head) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .map(|c| c.id())
+    else {
+        return Ok(false);
+    };
+    for candidate in heads {
+        let Ok(oid) = Oid::from_str(candidate.trim()) else {
+            continue;
+        };
+        // `Oid::from_str` zero-pads a short prefix; only an exact id of a
+        // commit present locally can vouch for `HEAD`.
+        if oid.to_string() != candidate.trim().to_ascii_lowercase()
+            || repo.find_commit(oid).is_err()
+        {
+            continue;
+        }
+        if oid == head || repo.graph_descendant_of(oid, head).map_err(map_git_err)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+";
+
 #[test]
 fn flags_pre_31dc6cc7_lookup_known_repo_local_path() {
     let src = LOOKUP_KNOWN_REPO_LOCAL_PATH_PRE_31DC6CC7;
@@ -560,4 +704,86 @@ fn only_repo_ref_is_exempt() {
         .collect();
     assert!(!is_exempt(&elsewhere));
     assert_eq!(display_rel(&exempt), "crates/intent-core/src/repo_ref.rs");
+}
+
+#[test]
+fn ignores_pre_8ce3c3dd_head_reached_by_commit_id_fold() {
+    assert_eq!(hit_lines(HEAD_REACHED_BY_PRE_8CE3C3DD), Vec::<usize>::new());
+}
+
+/// Hit count of `statement` scanned as the only statement of a function body.
+fn statement_hits(statement: &str) -> usize {
+    scan_source(&format!("fn f() {{\n    {statement};\n}}\n")).len()
+}
+
+#[test]
+fn a_slug_and_a_fold_in_one_operand_are_flagged() {
+    for statement in [
+        "repo.to_lowercase()",
+        "owner.to_lowercase()",
+        "self.repo_slug.make_ascii_lowercase()",
+        "o.eq_ignore_ascii_case(owner) || repo.find_commit(x).is_err()",
+        "repo.find_commit(x).is_err() || o.eq_ignore_ascii_case(&owner)",
+        "if o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo) {}",
+        "if r.to_lowercase() == repo {}",
+        "if o.to_ascii_lowercase() == *owner {}",
+        "let found = repo_names.contains(&n.to_lowercase())",
+        "let k = str::to_lowercase(&owner)",
+        "let owner = segs.next()?.to_lowercase()",
+        "let owner = &o.to_lowercase()",
+        "owner_lc += &o.to_lowercase()",
+        "let owner = format!(\"{o}\").to_lowercase()",
+        "let (owner, repo) = (o.to_lowercase(), r.to_lowercase())",
+        "let owner: Option<String> = segs.next().map(str::to_lowercase)",
+        "let Some(owner) = o.map(|s| s.to_lowercase()) else { return None }",
+        "let s = repo.chars().collect::<String>().to_lowercase()",
+        "let v = repo_names.iter().map::<String, _>(str::to_lowercase).count()",
+        "let owner: std::borrow::Cow<'_, str> = value.to_lowercase().into()",
+        "let v = repo_names.iter().any(|r| r.is_empty() || r.to_lowercase() == x)",
+        "let repo_key = || s.to_lowercase()",
+        "let f = move || repo.to_lowercase()",
+        "let repo_match = !r.is_empty() && r.eq_ignore_ascii_case(target)",
+        "repo_matches = a.is_some() && s.to_lowercase() == x",
+        "let repo_name = if has_remote && !r.is_empty() { r } else { fb }.to_lowercase()",
+        "let repo_check = || x.is_empty() || y.to_lowercase() == z",
+        "if ws.owner == owner && ws.name.eq_ignore_ascii_case(name) {}",
+        "let repo_fn = async || s.to_lowercase()",
+        "let repo_fn: &dyn Fn() -> String = &|| s.to_lowercase()",
+        "let owner_lc = &&o.to_lowercase()",
+    ] {
+        assert_eq!(statement_hits(statement), 1, "{statement:?}");
+    }
+}
+
+#[test]
+fn a_slug_in_another_top_level_operand_does_not_count() {
+    for statement in [
+        "if oid.to_string() != candidate.trim().to_ascii_lowercase() || repo.find_commit(oid).is_err() {}",
+        "let ok = repo.is_bare() && kind.eq_ignore_ascii_case(\"bare\")",
+        "let dirty = repo.statuses(None)?.len() > 0 || label.to_lowercase() == \"wip\"",
+        "if a.to_lowercase() == b || owner.is_none() {}",
+        "let ok = a.to_lowercase() == b || repo.is_bare()",
+        "matches = kind.eq_ignore_ascii_case(\"bare\") && repo.is_bare()",
+    ] {
+        assert_eq!(statement_hits(statement), 0, "{statement:?}");
+    }
+}
+
+#[test]
+fn a_fold_passed_into_a_method_on_a_repo_handle_is_still_flagged() {
+    // Known limit: one operand, so the text-level rule cannot tell a git
+    // handle from a slug. Such a site opts out with a reasoned marker.
+    assert_eq!(
+        statement_hits("repo.find_commit(oid.to_string().to_lowercase())"),
+        1
+    );
+    // Bare `name` pairs with an `owner` anywhere in the statement (the
+    // half-folded owner/name comparison of intent-hq/intentd#1809), so an
+    // unrelated `owner()` call in another operand still pairs with it.
+    assert_eq!(
+        statement_hits("if name.to_lowercase() == \"main\" && repo.owner().is_some() {}"),
+        1
+    );
+    let src = "fn f() {\n    // repo-slug-fold: allow — git handle, not slug identity\n    repo.find_commit(oid.to_string().to_lowercase());\n}\n";
+    assert_eq!(hit_lines(src), Vec::<usize>::new());
 }

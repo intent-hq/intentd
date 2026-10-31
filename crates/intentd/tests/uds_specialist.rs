@@ -136,7 +136,7 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let mut services = Services::new(store)
+    let mut services = Services::new_isolated(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone())
         .with_specialist_dirs(

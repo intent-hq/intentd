@@ -1,4 +1,4 @@
-//! Daemon-to-daemon remote agents persistence (migration 0176).
+//! Daemon-to-daemon remote agents persistence (migration 0177).
 //!
 //! Machine side: the executor credentials this daemon minted for backends
 //! (`executor_credential`, token stored only as a SHA-256 hash) and one link

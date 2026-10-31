@@ -50,7 +50,7 @@ impl Fixture {
         std::fs::create_dir_all(&bundled).unwrap();
         let registry =
             Arc::new(SettingsRegistry::load(data.join("config.toml")).expect("load registry"));
-        let svc = Services::new(store)
+        let svc = Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_settings_registry(registry)
             .with_secret_store(secrets.clone())

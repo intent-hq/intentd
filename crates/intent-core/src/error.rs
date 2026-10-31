@@ -53,6 +53,13 @@ pub enum Error {
         checkout_mode: Option<crate::model::CheckoutMode>,
     },
 
+    /// A §5.56 secret-request call failed for a typed reason
+    /// (`secret-request-unknown`, `invalid-params`, `secret-unavailable`).
+    /// Surfaces as `-32602` with `error.data = { code }`. The message names
+    /// the request or secret only — it never carries a secret value.
+    #[error("{message}")]
+    SecretRequest { code: &'static str, message: String },
+
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
     #[error("internal error: {0}")]
@@ -629,6 +636,7 @@ impl Error {
             | Error::NotFound(_)
             | Error::WorkspaceRetired { .. }
             | Error::RetireUnsupported { .. }
+            | Error::SecretRequest { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::PlacementUnavailable(_)

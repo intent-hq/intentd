@@ -87,12 +87,23 @@ chmod +x "$bin_dir/git"
 # ("<unset>" when none) to CARGO_LOCALE_LOG, and it exits with
 # CARGO_STUB_EXIT (default 0). It drains stdin like a real nextest child
 # could, so the script must not feed it the remaining plans.
+# CARGO_STUB_NO_TESTS=1 models a selection with zero runnable tests (every
+# selected test #[ignore]) the way nextest reports it: "error: no tests to
+# run" and exit 4, unless argv carries --no-tests=warn (a warning, exit 0).
 cat >"$bin_dir/cargo" <<'SH'
 #!/usr/bin/env bash
 [[ "${INTENTD_ASSERT_BOUND_CALLER-}" == 1 ]] || { echo "cargo: caller policy is not armed" >&2; exit 91; }
 printf '%s: %s%s\n' "$PWD" "${INTENTD_TEST_TIMEOUT_MULTIPLIER:+INTENTD_TEST_TIMEOUT_MULTIPLIER=$INTENTD_TEST_TIMEOUT_MULTIPLIER }" "$*" >>"$CARGO_TEST_LOG"
 printf '%s\n' "${LC_ALL-<unset>}" >>"$CARGO_LOCALE_LOG"
 while IFS= read -r line; do printf '%s\n' "$line" >>"$CARGO_STDIN_LOG"; done
+if [[ -n "${CARGO_STUB_NO_TESTS-}" ]]; then
+  if [[ " $* " == *" --no-tests=warn "* ]]; then
+    echo "warning: no tests to run" >&2
+    exit 0
+  fi
+  echo "error: no tests to run" >&2
+  exit 4
+fi
 exit "${CARGO_STUB_EXIT:-0}"
 SH
 chmod +x "$bin_dir/cargo"
@@ -271,7 +282,7 @@ expect_cargo() {
 expect_cov() {
   local expected="" line
   for line in "$@"; do
-    expected+="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest $line -E not test(/^auggie_context_e2e::/)"$'\n'
+    expected+="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest $line --no-tests=warn -E not test(/^auggie_context_e2e::/)"$'\n'
   done
   [[ "$cargo_log" == "${expected%$'\n'}" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"${expected%$'\n'}"
 }
@@ -287,7 +298,7 @@ expect_plan() {
 expect_cov_plan() {
   local line
   for line in "$@"; do
-    [[ "$stdout" == *"[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest $line -E 'not test(/^auggie_context_e2e::/)'"* ]] || fail "$case_name: plan is missing '$line':"$'\n'"$stdout"
+    [[ "$stdout" == *"[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest $line --no-tests=warn -E 'not test(/^auggie_context_e2e::/)'"* ]] || fail "$case_name: plan is missing '$line':"$'\n'"$stdout"
   done
   [[ "$(grep -c '^\[coverage-changed\] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov ' <<<"$stdout")" -eq $# ]] || fail "$case_name: expected $# plan line(s):"$'\n'"$stdout"
 }
@@ -541,6 +552,137 @@ expect_ok
 expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
 [[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
+# intent-js is the host() bridge the ws.* bindings and hook scripts cross: a
+# change to it also selects the library unit tests (--lib) of each crate
+# depending on it directly that has a testable src/lib.rs (intentd#2811
+# changed only intent-js/src and failed in the merge queue). Its own dependents
+# and the integration tests of its dependents are not selected. The fixture
+# adds intent-js with a plain dependency (alpha, whose dependent delta is not
+# selected), a workspace-inherited dev-dependency (intent-services, whose
+# feature crates and intent-app are not selected), binary-only dependents
+# (beta, intentd: no library) and a lib that opts out of tests (epsilon).
+setup_intent_js() {
+  write crates/intent-js/Cargo.toml $'[package]\nname = "intent-js"'
+  write crates/intent-js/src/lib.rs
+  write crates/intent-js/src/engine.rs
+  write crates/intent-js/tests/bridge.rs
+  write crates/intent-js/resources/prelude.js
+  write crates/alpha/Cargo.toml $'[package]\nname = "alpha"\n\n[dependencies]\nintent-core = { path = "../intent-core", version = "0.1" }\nintent-js = { path = "../intent-js" }'
+  write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies]\n# intent-core = { path = "../intent-core" }\nserde = "1"\nintent-js = { path = "../intent-js" }'
+  write crates/intent-services/Cargo.toml $'[package]\nname = "intent-services"\n\n[target."cfg(unix)".dependencies]\nintent-core.workspace = true\n\n[dev-dependencies]\nintent-js.workspace = true'
+  write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\n\n[dependencies.intent-services]\nworkspace = true\n\n[dependencies.intent-js]\nworkspace = true'
+  write crates/epsilon/Cargo.toml $'[package]\nname = "epsilon"\n\n[lib]\ntest = false\n\n[dependencies]\nintent-js = { path = "../intent-js" }'
+  write crates/epsilon/src/lib.rs
+  commit_all "intent-js fixture"
+  g update-ref refs/remotes/origin/main HEAD
+}
+js_lib_rdeps="-p alpha -p intent-services --lib"
+js_own="-p intent-js --lib --bins --tests"
+js_note="[test-changed] note: crates/intent-js changed; the library unit tests of the crates depending on it directly run too (alpha, intent-services)"
+js_epsilon_note="[test-changed] note: crates/epsilon depends on intent-js but its library unit tests cannot run (crates/epsilon/Cargo.toml sets [lib] test = false)"
+
+case_name="intent-js src change selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+commit_all
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_plan "$js_lib_rdeps" "$js_own"
+expect_cargo "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *"$js_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+[[ "$stdout" == *"$js_epsilon_note"* ]] || fail "$case_name: no untestable-lib note: $stdout"
+[[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 2 ]] || fail "$case_name: expected two notes: $stdout"
+
+case_name="intent-js non-src crate file also selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/resources/prelude.js
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "-p intent-js"
+[[ "$stdout" == *"$js_note"* ]] || fail "$case_name: no lib-dependents note: $stdout"
+
+case_name="intent-js test-only change selects only intent-js"
+reset_repo
+setup_intent_js
+edit crates/intent-js/tests/bridge.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p intent-js --test bridge"
+[[ "$stdout" != *"note:"* ]] || fail "$case_name: unexpected note: $stdout"
+
+# A dependent's own selection combines with its --lib: alpha's src change
+# subsumes it (and says delta is not selected), and an intent-services test
+# file runs that target next to the library unit tests.
+case_name="intent-js dependents' own selections combine with their library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+edit crates/alpha/src/lib.rs
+edit crates/intent-services/tests/smoke.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p alpha -p intent-js --lib --bins --tests" "-p intent-services --lib --test smoke"
+[[ "$stdout" == *"note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no alpha note: $stdout"
+[[ "$stdout" != *"crates/intent-js/src changed"* ]] || fail "$case_name: misleading intent-js note: $stdout"
+
+# alpha and intent-services are intent-core reverse dependencies, so every
+# target of them runs: the intent-js note does not claim only --lib runs.
+case_name="intent-js and intent-core changes together keep intent-core's full propagation"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+edit crates/intent-core/src/lib.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "-p alpha -p delta -p gamma -p intent-app -p intent-core -p intent-js -p intent-services -p intent-svc-transfer --lib --bins --tests" "-p intentd --bins --tests"
+[[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+[[ "$stdout" != *"crates/intent-js changed"* ]] || fail "$case_name: misleading lib-dependents note: $stdout"
+[[ "$stdout" == *"$js_epsilon_note"* ]] || fail "$case_name: no untestable-lib note: $stdout"
+
+case_name="intent-js dependent whose lib is not src/lib.rs gets a note"
+reset_repo
+setup_intent_js
+write crates/zeta/Cargo.toml $'[package]\nname = "zeta"\n\n[lib]\npath = "src/bridge.rs"\n\n[dependencies]\nintent-js = { path = "../intent-js" }'
+write crates/zeta/src/bridge.rs
+commit_all "zeta"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-js/src/engine.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *'[test-changed] note: crates/zeta depends on intent-js but its library unit tests cannot run (crates/zeta/Cargo.toml sets [lib] path = "src/bridge.rs", not src/lib.rs)'* ]] || fail "$case_name: no moved-lib note: $stdout"
+
+case_name="intent-js lib propagation merges with a <crate>::lib map entry"
+reset_repo
+setup_intent_js
+write .config/e2e-test-map.txt $'crates/intent-js/src/*      alpha::lib\ncrates/intent-js/src/*      intentd::suite_wss'
+commit_all "map"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-js/src/engine.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$js_lib_rdeps" "$js_own" "-p intentd --test suite_wss"
+
+case_name="instrumented intent-js src change selects its direct dependents' library unit tests"
+reset_repo
+setup_intent_js
+edit crates/intent-js/src/engine.rs
+run_script --instrumented
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cov "$js_lib_rdeps" "$js_own"
+[[ "$stdout" == *"[coverage-changed] note: crates/intent-js changed; the library unit tests of the crates depending on it directly run too (alpha, intent-services)"* ]] || fail "$case_name: no lib-dependents note: $stdout"
 
 # --print-edges / --print-rdeps expose the scanner's view for
 # scripts/check-rdeps-parity.py, which compares it with cargo metadata in CI.
@@ -1076,7 +1218,7 @@ reset_repo
 edit crates/alpha/tests/one.rs
 CARGO_STUB_EXIT=100 run_script --instrumented
 [[ "$status" -eq 100 ]] || fail "$case_name exited $status (expected 100): $stderr"
-[[ "$stderr" == "[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p alpha --test one -E 'not test(/^auggie_context_e2e::/)' exited 100" ]] || fail "$case_name stderr: $stderr"
+[[ "$stderr" == "[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p alpha --test one --no-tests=warn -E 'not test(/^auggie_context_e2e::/)' exited 100" ]] || fail "$case_name stderr: $stderr"
 
 case_name="instrumented storage observer preserves scopes, stdin, policy and failure"
 reset_repo
@@ -1111,6 +1253,21 @@ import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
 assert len(rows) == 2 and rows[-1]['exit_code'] == 23 and rows[-1]['stage'] == 'scope-1', rows
 PYTHON
+
+# A changed test file whose every test is #[ignore] (like
+# crates/intentd/tests/e2e_wss_installed_cli.rs) yields a plan with zero
+# runnable tests. nextest fails such a run by default ("error: no tests to
+# run", exit 4), which failed coverage-changed on intentd#2787 while the
+# local RESUME run passed; the instrumented run passes --no-tests=warn.
+case_name="instrumented plan selecting only skipped tests warns and exits 0"
+reset_repo
+edit crates/intentd/tests/e2e_core.rs
+CARGO_STUB_NO_TESTS=1 run_script --instrumented
+[[ "$status" -eq 0 ]] || fail "$case_name exited $status: $stderr"
+[[ "$stderr" == "warning: no tests to run" ]] || fail "$case_name stderr: $stderr"
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_e2e --no-tests=warn -E ((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))"
+[[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
+[[ "$stdout" == *"nextest -p intentd --test suite_e2e --no-tests=warn -E '"* ]] || fail "$case_name plan: $stdout"
 
 # A build-wide change never exits 3 under --instrumented: the merge queue's
 # coverage jobs already run the full instrumented suite, so the script prints
@@ -1226,9 +1383,9 @@ reset_repo
 edit crates/intentd/tests/e2e_core.rs
 TEST_THREADS=2 run_script --instrumented
 expect_ok
-cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_e2e --test-threads 2 -E ((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))"
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_e2e --test-threads 2 --no-tests=warn -E ((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))"
 [[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
-[[ "$stdout" == *"nextest -p intentd --test suite_e2e --test-threads 2 -E '((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))'"* ]] ||
+[[ "$stdout" == *"nextest -p intentd --test suite_e2e --test-threads 2 --no-tests=warn -E '((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))'"* ]] ||
   fail "$case_name plan: $stdout"
 
 case_name="runner receives a suite plan's filterset as one plan word"
@@ -1285,7 +1442,7 @@ reset_repo
 edit crates/delta/src/script.rs
 run_script --instrumented
 expect_ok
-cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E ((binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))) and (not test(/^auggie_context_e2e::/))"
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests --no-tests=warn -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e --no-tests=warn -E ((binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))) and (not test(/^auggie_context_e2e::/))"
 [[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
 
 case_name="mapped glob matches a new untracked source"
@@ -1548,7 +1705,7 @@ lib_fixture "crates/delta/src/whole.rs alpha::lib tests"
 edit crates/delta/src/whole.rs
 run_script --instrumented --base HEAD
 expect_ok
-cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p alpha --lib -E ((binary_id(=alpha)&test(/^(tests)::/))) and (not test(/^auggie_context_e2e::/))"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_wss -E not test(/^auggie_context_e2e::/)"
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p alpha --lib --no-tests=warn -E ((binary_id(=alpha)&test(/^(tests)::/))) and (not test(/^auggie_context_e2e::/))"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests --no-tests=warn -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_wss --no-tests=warn -E not test(/^auggie_context_e2e::/)"
 [[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
 
 case_name="check-map accepts library modules"
