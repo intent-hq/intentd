@@ -80,6 +80,7 @@ pub(super) struct MachineApi {
     unbindable: Mutex<Vec<ExecutorCredentialId>>,
     revocations: broadcast::Sender<ExecutorCredentialId>,
     lookups: Mutex<Vec<String>>,
+    node_mode: AtomicBool,
 }
 
 impl MachineApi {
@@ -92,6 +93,7 @@ impl MachineApi {
             unbindable: Mutex::new(Vec::new()),
             revocations: broadcast::channel(16).0,
             lookups: Mutex::new(Vec::new()),
+            node_mode: AtomicBool::new(false),
         }
     }
 
@@ -118,6 +120,9 @@ impl MachineApi {
 }
 
 impl WorkspaceApi for MachineApi {
+    fn node_mode(&self) -> bool {
+        self.node_mode.load(Ordering::SeqCst)
+    }
     fn primary_principal_id(&self) -> BoxFuture<'_, intent_core::Result<PrincipalId>> {
         Box::pin(async move { Ok(self.principal.clone()) })
     }
@@ -669,6 +674,94 @@ async fn executor_tokens_are_refused_on_every_other_path() {
         .upgrade("/ws", &[("authorization", owner.as_str())])
         .await;
     assert_eq!(status, 101);
+}
+
+/// A daemon in node mode keeps serving the executor link (it is on
+/// `NODE_MODE_HTTP_PATHS`) and the JSON-RPC socket, and refuses the guest
+/// invite endpoint and the preview tunnel with 403 before any credential is
+/// read.
+#[tokio::test]
+async fn node_mode_keeps_the_executor_link_and_refuses_invite_and_tunnel() {
+    let machine = Machine::start(Mode::Secure { ws_enabled: true }).await;
+    machine.api.node_mode.store(true, Ordering::SeqCst);
+    let auth = bearer(&executor_token());
+    let (status, _) = machine
+        .upgrade(LINK_PATH, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(status, 101, "node mode serves /node/link");
+    let (status, _) = machine.upgrade(GIT_PATH, &[]).await;
+    assert_eq!(status, 401, "/node/git reaches its own credential gate");
+    let owner = bearer(&owner_token());
+    let (status, _) = machine
+        .upgrade("/ws", &[("authorization", owner.as_str())])
+        .await;
+    assert_eq!(status, 101, "node mode serves /ws");
+    let lookups = machine.api.lookups.lock().unwrap().len();
+    for path in ["/invite", "/tunnel"] {
+        let (status, _) = machine
+            .upgrade(path, &[("authorization", owner.as_str())])
+            .await;
+        assert_eq!(status, 403, "{path} is refused in node mode");
+    }
+    assert_eq!(
+        machine.api.lookups.lock().unwrap().len(),
+        lookups,
+        "a refused path reads no credential"
+    );
+}
+
+/// Startup hand-off: before dispatch is ready `/invite` and `/tunnel` reach
+/// only the bootstrap seat (503), and once node-mode services are installed
+/// they are refused (403). Readiness is read once per upgrade, so no upgrade
+/// sees "not node mode" from one read and "ready" from another.
+#[tokio::test]
+async fn node_mode_startup_handoff_never_opens_invite_or_tunnel() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = EventBus::new(
+        intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap(),
+    );
+    let api = Arc::new(MachineApi::new());
+    api.node_mode.store(true, Ordering::SeqCst);
+    let certificate = certificate();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
+    let dispatch = crate::startup::StartupDispatch::new(intent_core::startup::StartupStatus::new());
+    let server = WsApiServer::new_startup(
+        dispatch.clone(),
+        Some(&certificate),
+        Some(&tokens),
+        WsOptions {
+            base_port: 0,
+            ..WsOptions::default()
+        },
+    )
+    .unwrap();
+    let port = server.start().await.unwrap();
+    let owner = bearer(&owner_token());
+    let headers = [("authorization", owner.as_str())];
+    for path in ["/invite", "/tunnel"] {
+        let (status, _) = upgrade_tls(port, &certificate, path, &headers).await;
+        assert_eq!(
+            status, 503,
+            "{path} before ready reaches only the bootstrap seat"
+        );
+    }
+    assert!(dispatch.install(crate::startup::ReadyServices {
+        api: api.clone(),
+        bus,
+        rpc_limiter: crate::RpcLimiter::new(0),
+        reverse_registry: Arc::new(crate::PrimaryReverseRegistry::default()),
+        server_pairing_info: None,
+        control: None,
+    }));
+    for path in ["/invite", "/tunnel"] {
+        let (status, _) = upgrade_tls(port, &certificate, path, &headers).await;
+        assert_eq!(status, 403, "{path} once ready in node mode");
+    }
+    let (status, _) = upgrade_tls(port, &certificate, "/ws", &headers).await;
+    assert_eq!(status, 101, "/ws still opens once ready");
+    server.stop().await;
 }
 
 #[tokio::test]

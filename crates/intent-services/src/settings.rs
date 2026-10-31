@@ -2704,6 +2704,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "experimental",
             false,
         ),
+        enumerated(
+            "daemon.mode",
+            "Daemon mode",
+            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node selects node mode for one run without changing this",
+            "daemon",
+            &["regular", "node"],
+            "regular",
+        ),
     ];
     definitions.extend(
         intent_providers::ACP_PROVIDERS
@@ -7999,6 +8007,7 @@ mod tests {
             ("remoteAgents.enabled", "remoteAgents", json!(false)),
             ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
             ("experimental.remoteAgents", "experimental", json!(false)),
+            ("daemon.mode", "daemon", json!("regular")),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
@@ -8020,6 +8029,10 @@ mod tests {
             panic!("remoteAgents.permission must be an enum");
         };
         assert_eq!(values, ["allowAll", "autoByRisk", "denyAll"]);
+        let SettingType::Enum(values) = find_definition("daemon.mode").unwrap().ty else {
+            panic!("daemon.mode must be an enum");
+        };
+        assert_eq!(values, ["regular", "node"]);
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));
@@ -8038,11 +8051,16 @@ mod tests {
             intent_core::settings_file::RemoteAgentPermission::AllowAll
         );
         assert!(!effective.experimental.remote_agents);
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Regular
+        );
 
         svc.update(&json!([
             { "path": "remoteAgents.enabled", "value": true },
             { "path": "remoteAgents.permission", "value": "denyAll" },
             { "path": "experimental.remoteAgents", "value": true },
+            { "path": "daemon.mode", "value": "node" },
         ]))
         .await
         .expect("update");
@@ -8053,10 +8071,15 @@ mod tests {
             intent_core::settings_file::RemoteAgentPermission::DenyAll
         );
         assert!(effective.experimental.remote_agents);
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Node
+        );
         for path in [
             "remoteAgents.enabled",
             "remoteAgents.permission",
             "experimental.remoteAgents",
+            "daemon.mode",
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["origin"], json!("file"), "{path} origin");

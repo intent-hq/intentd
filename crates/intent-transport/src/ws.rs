@@ -903,6 +903,22 @@ impl WsInner {
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
+        // Readiness is read once per upgrade: the node-mode decision and the
+        // bootstrap/ordinary split below must see the same dispatch, or
+        // startup finishing between two reads would let a refused path take
+        // an ordinary connection.
+        let (ready, node_mode) = match self.dispatch.ready() {
+            Some(ready) => (true, ready.api.node_mode()),
+            None => (false, false),
+        };
+        // Node mode serves only `NODE_MODE_HTTP_PATHS` (health, the JSON-RPC
+        // socket and the executor link); the guest invite endpoint and the
+        // preview tunnel belong to the orchestration node mode turns off. One
+        // gate ahead of every route. A not-yet-ready upgrade goes to the
+        // bootstrap seat, which serves only `/ws` with the startup status.
+        if node_mode && !crate::catalog::node_mode_serves_path(path) {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
         if path == crate::node_link::LINK_PATH || path == crate::node_link::GIT_PATH {
             return self
                 .executor_upgrade(
@@ -929,7 +945,7 @@ impl WsInner {
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
         }
-        if self.dispatch.ready().is_none() {
+        if !ready {
             return self
                 .bootstrap_upgrade(stream, path, target, authorization.as_deref(), ws_key)
                 .await;

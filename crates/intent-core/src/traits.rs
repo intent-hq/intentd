@@ -43,6 +43,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Whether this daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): the transport then serves only
+    /// `NODE_MODE_METHODS` and refuses everything else with `node-mode`.
+    /// Fixed for the process lifetime; `false` by default.
+    fn node_mode(&self) -> bool {
+        false
+    }
+
     fn desktop_agent_call(
         &self,
         _workspace: WorkspaceId,
