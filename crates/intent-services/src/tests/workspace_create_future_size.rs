@@ -12,8 +12,8 @@
 //! Two sizes are measured:
 //! - the create block: the `async move` future `create_workspace` hands to
 //!   `Services::execution_call`, recorded there before it is boxed
-//!   (`execution_call::last_inner_future_size`). One rebinding of the input
-//!   adds about one `WorkspaceCreate` to it.
+//!   (`execution_call::take_last_inner_future_size`). One rebinding of the
+//!   input adds about one `WorkspaceCreate` to it.
 //! - the `execution_call` wrapper: the returned `BoxFuture`, read through the
 //!   `dyn Future` vtable with `size_of_val(&*boxed)`. The wrapper boxes the
 //!   create block once; un-boxing it again (holding the block inline) would
