@@ -187,6 +187,17 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
+In app and daemon versions that support the requested settings card, the Assistant
+can use `ws.app.settings.propose` to show a change the user applies or discards; the
+card can be undone. The daemon accepts only settings whose definition has
+`proposable: true`. Older apps support a fixed set of settings cards; if the app
+cannot apply the requested setting, direct the user to the matching Settings
+section above. Credentials, remote access and sharing, forge connections,
+executable and folder paths, command permissions, and global or workspace
+instructions are refused: use Settings for those changes.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/settings.rs (PROPOSAL_EXCLUDED_*); packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/settings.rs; packages/cloudlands-fe/src/lib/components/chat/proposals/settings-proposal-actions.ts; packages/cloudlands-fe/src/shared/app-settings-schema.ts. -->
+
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
 For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. Users can also ask the Assistant to set up or update a server. Use `ws.app.mcp` to read existing configurations, avoid duplicates, and apply the requested change app-wide. These configuration tools are available only in Assistant chat; ordinary workspace agents retain access to enabled servers' tools.
