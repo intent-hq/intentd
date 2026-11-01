@@ -1461,3 +1461,34 @@ printf '{"subject": "feat: committed after remount"}'"#,
         1
     );
 }
+
+/// Plain-folder workspaces (PROTOCOL §5.1 "Plain-folder workspaces") never
+/// auto-commit, even when the folder later gained a `.git` and holds an
+/// attributed change: the persisted flag decides, not the folder contents.
+#[intent_test_macros::daemon_test]
+async fn plain_folder_workspace_never_auto_commits() {
+    let repo = init_git_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace_with_repo(&ws_id, &repo);
+    ws.plain_folder = true;
+    store.insert_workspace(&ws).await.expect("insert ws");
+    std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+
+    let agent = session("agent-p1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-p1").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-p1", "end_turn"))
+        .await;
+
+    let (agent_id, _, message) = last_commit_trailers(&repo.dir);
+    assert_eq!(agent_id, None, "no agent commit in a plain folder");
+    assert_eq!(message.trim(), "seed", "HEAD is still the seed commit");
+    assert!(
+        repo.dir.join("change.txt").exists(),
+        "the user's file is untouched"
+    );
+}

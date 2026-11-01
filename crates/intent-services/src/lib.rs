@@ -5328,10 +5328,15 @@ impl Services {
     /// insert that already carries PR data feeds the displayStatus
     /// derivation, so it routes through the transition-only recompute
     /// (a merge never touches the PR columns, so it cannot move the rung).
+    /// A plain-folder workspace has no git roots (§5.1): refused before any
+    /// write or event.
     pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
+        if self.is_plain_folder(&root.workspace_id).await {
+            return Err(plain_folder::git_only_refusal("Registering a git root"));
+        }
         let (stored, inserted) = self.store.upsert_workspace_git_root(root).await?;
         let event_type = if inserted {
             GIT_ROOT_REGISTERED
@@ -5413,7 +5418,7 @@ impl Services {
         local_maintenance: bool,
         deferrals: &mut pr_discovery::DeferralTally,
     ) {
-        if ws.is_remote || ws.archived {
+        if ws.is_remote || ws.archived || ws.plain_folder {
             return;
         }
         if let Some(worktree) = git_ops::worktree_path(ws).filter(|_| local_maintenance) {
@@ -6181,7 +6186,7 @@ impl Services {
         // source control is unconfigured.
         use pr_ops::PrRefreshOutcome;
         let ws = self.store.get_workspace(workspace_id).await?;
-        if ws.is_remote || ws.archived {
+        if ws.is_remote || ws.archived || ws.plain_folder {
             return Ok(PrRefreshOutcome::Skipped);
         }
         if pr_ops::repo_of(&ws).is_err() {
@@ -6246,7 +6251,7 @@ impl Services {
         use pr_ops::PrRefreshOutcome;
         let fetch_deadline = tokio::time::Instant::now() + self.pr_refresh_fetch_timeout;
 
-        if ws.is_remote || ws.archived {
+        if ws.is_remote || ws.archived || ws.plain_folder {
             return Ok(PrRefreshOutcome::Skipped);
         }
         let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
@@ -6679,12 +6684,17 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
+        // Plain folders have no PRs or git roots (§5.1): they never enter the
+        // sweep, so it spends no forge budget or local git work on them.
         let workspaces = match self
             .store
             .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
             .await
         {
-            Ok(list) => list,
+            Ok(mut list) => {
+                list.retain(|ws| !ws.plain_folder);
+                list
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
@@ -38198,10 +38208,14 @@ impl Services {
     /// Recompute the workspace's durable line-change aggregates from its
     /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
     /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
-    /// stored aggregates are published as they are.
+    /// stored aggregates are published as they are. Plain-folder workspaces
+    /// recompute but publish nothing: they emit no `changes:*` events (§5.1).
     pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
             tracing::warn!(error = %e, "metrics: recompute failed");
+        }
+        if self.is_plain_folder(workspace_id).await {
+            return;
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {

@@ -787,6 +787,52 @@ fn golden_pr_monitor_checklist_branch_lines() {
     );
 }
 
+/// A queued entry turning `unmergeable` (intentd#2897) is a change line
+/// carrying the dequeue / fix / re-enqueue recovery, the checklist's queue
+/// row says so, and a still-queued recovery reports once.
+#[test]
+fn golden_pr_monitor_unmergeable_queue_entry() {
+    let queued = |state: &str| {
+        let mut s = pr_snapshot("open");
+        s.requirements.is_in_merge_queue = Some(true);
+        s.requirements.merge_queue = Some(intent_sourcecontrol::MergeQueueEntry {
+            position: 2,
+            queue_size: Some(2),
+            state: Some(state.to_string()),
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+        });
+        s
+    };
+    let stuck = queued("unmergeable");
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&queued("queued"), &stuck),
+        vec![
+            "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of it and \
+             will not merge. Its branch is locked while queued, so a push is rejected — remove \
+             it from the queue first (GraphQL dequeuePullRequest), fix the branch, then enqueue \
+             it again"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&stuck, &queued("mergeable")),
+        vec!["merge queue entry is no longer unmergeable (now mergeable)".to_string()]
+    );
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&stuck),
+        "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
+         - in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
+         dequeue it, fix the branch, then enqueue again"
+    );
+}
+
 /// Every checklist names the head commit its check results belong to
 /// (intentd#2875: a wake delivered minutes late reported "12 passed" for the
 /// commit before a push, and the agent called the PR ready). An unknown head

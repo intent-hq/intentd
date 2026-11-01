@@ -1270,6 +1270,36 @@ impl Harness for V1 {
                 });
             }
         }
+        // The queue entry's state is otherwise informational (position,
+        // size, estimate), but `unmergeable` strands the PR: it conflicts
+        // with an entry ahead and will never merge on its own, and its
+        // branch is locked while queued (intentd#2897 sat ~55 min). Recovery
+        // reports only while the entry is still read with a known state;
+        // leaving the queue reports itself.
+        let entry_state = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue
+                .as_ref()
+                .filter(|_| r.is_in_merge_queue == Some(true))
+                .and_then(|e| e.state.clone())
+        };
+        match (entry_state(o).as_deref(), entry_state(n).as_deref()) {
+            (before, Some("unmergeable")) if before != Some("unmergeable") => {
+                changes.push(
+                    "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
+                     it and will not merge. Its branch is locked while queued, so a push is \
+                     rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
+                     fix the branch, then enqueue it again"
+                        .to_string(),
+                );
+            }
+            (Some("unmergeable"), Some(after)) if after != "unmergeable" => {
+                changes.push(format!(
+                    "merge queue entry is no longer unmergeable (now {})",
+                    after.replace('_', " ")
+                ));
+            }
+            _ => {}
+        }
         if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(
                 "mergeable: {} → {}",

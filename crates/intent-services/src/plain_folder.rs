@@ -20,6 +20,26 @@ pub(crate) fn requested(input: &WorkspaceCreate) -> bool {
     input.plain_folder == Some(true)
 }
 
+/// Refusal for a git-only operation (git roots, PR monitors) on a
+/// plain-folder workspace, which has no git features (§5.1).
+pub(crate) fn git_only_refusal(operation: &str) -> Error {
+    Error::InvalidParams(format!(
+        "{operation} is not available in a plain folder workspace: it has no Git features."
+    ))
+}
+
+impl crate::Services {
+    /// Whether `workspace_id` is a plain-folder workspace, read from the
+    /// persisted flag only (never the folder contents). An unreadable row
+    /// counts as not plain, so git workspaces keep today's behavior.
+    pub(crate) async fn is_plain_folder(&self, workspace_id: &intent_core::WorkspaceId) -> bool {
+        self.store()
+            .get_workspace(workspace_id)
+            .await
+            .is_ok_and(|ws| ws.plain_folder)
+    }
+}
+
 fn nonblank(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty())
 }

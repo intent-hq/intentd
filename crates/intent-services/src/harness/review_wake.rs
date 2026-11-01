@@ -191,7 +191,13 @@ pub(crate) fn checklist(r: &Value, head: Option<&str>, ready: bool) -> String {
         .into(),
     );
     if r["isInMergeQueue"] == true {
-        lines.push("in merge queue".into());
+        lines.push(if r["mergeQueue"]["state"] == "unmergeable" {
+            "in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
+             dequeue it, fix the branch, then enqueue again"
+                .into()
+        } else {
+            "in merge queue".into()
+        });
     }
     if let Some(reason) = r["mergeBlockedReason"].as_str() {
         lines.push(format!("blocked: {reason}"));

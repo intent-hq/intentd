@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fast child-process contracts for the test-only caller policy (no Rust build)."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +13,10 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
 WRAPPER = SCRIPTS / "with-test-policy.sh"
+_spec = importlib.util.spec_from_file_location("script_helpers", SCRIPTS / "script_helpers.py")
+script_helpers = importlib.util.module_from_spec(_spec)
+sys.dont_write_bytecode = True
+_spec.loader.exec_module(script_helpers)
 
 
 class PolicyTests(unittest.TestCase):
@@ -70,10 +74,9 @@ class PolicyTests(unittest.TestCase):
                         scripts, bin_dir = root / "scripts", root / "bin"
                         scripts.mkdir()
                         bin_dir.mkdir()
-                        shutil.copy(SCRIPTS / script, scripts)
-                        if WRAPPER.exists():
-                            shutil.copy(WRAPPER, scripts)
-                        shutil.copy(SCRIPTS / "ci-killed-rustc-retry.sh", scripts)
+                        # The script and every helper it calls (derived,
+                        # not hand-kept: intentd#2896).
+                        script_helpers.copy_into([script], scripts)
                         cargo = bin_dir / "cargo"
                         cargo.write_text(
                             f"#!{sys.executable} -S\n"

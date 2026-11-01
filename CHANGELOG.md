@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.102] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(agent-queue)* Reconcile durable queues at shutdown so a cancelled write-through cannot lose a row ([#2918](https://github.com/intent-hq/intentd/pull/2918))
+
+
+## [0.11.101] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Wake when a queued PR's merge-queue entry turns unmergeable ([#2915](https://github.com/intent-hq/intentd/pull/2915))
+
+### 🧪 Testing
+
+- Drive attachment reclaim test expiry with the paused clock ([#2917](https://github.com/intent-hq/intentd/pull/2917))
+
+
+## [0.11.100] - 2026-11-01
+
+### 📚 Documentation
+
+- *(guide)* Mention the Workspace purged pill on archived rows ([#2907](https://github.com/intent-hq/intentd/pull/2907))
+
+### 🧪 Testing
+
+- *(services)* Split two callback-delivery loop tests into per-mode cases ([#2909](https://github.com/intent-hq/intentd/pull/2909))
+
+
+## [0.11.99] - 2026-11-01
+
+### 🚀 Features
+
+- Suppress git events and PR monitoring in plain-folder workspaces ([#2902](https://github.com/intent-hq/intentd/pull/2902))
+
+
 ## [0.11.98] - 2026-11-01
 
 ### 🚀 Features

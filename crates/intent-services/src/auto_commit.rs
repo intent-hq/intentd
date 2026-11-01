@@ -9,7 +9,8 @@
 //! changes, a merge is pending (scoped commits are refused mid-merge,
 //! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
-//! `provider_stopped`/`refusal`). A checkout folder that is missing on disk
+//! `provider_stopped`/`refusal`), or the workspace is a plain folder
+//! (§5.1, no git features). A checkout folder that is missing on disk
 //! skips the commit with one transition warning instead of one per idle
 //! (intent-hq/intent#7183, [`crate::worktree_presence`]).
 //!
@@ -284,6 +285,16 @@ impl Services {
         // (worktreePath → repositoryPath), so skipping here would be the
         // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
+            // Plain folders have no git features (§5.1): never commit, even
+            // when the folder later gained a `.git`.
+            Ok(ws) if ws.plain_folder => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    workspace = %session.workspace_id.0,
+                    "auto-commit skipped: plain-folder workspace"
+                );
+                return;
+            }
             Ok(ws) => {
                 if ws.checkout_mode.is_some() {
                     self.worktree_presence.mark_git(&ws.id);
