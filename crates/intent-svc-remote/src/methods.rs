@@ -414,7 +414,11 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     let Some(row) = store.get_exposed_machine(&machine_id).await? else {
         return Ok(json!({ "ok": true }));
     };
-    if let Some(node) = feature.running_node(&machine_id) {
+    let node = match feature.running_node(&machine_id) {
+        Some(node) if node.route().is_some() => Some(node),
+        unbound => recover_survivors(feature, svc, &row, unbound).await?,
+    };
+    if let Some(node) = node {
         let running = node.running();
         if running > 0 && !stop_agents {
             return Err(in_use(&row.name, running));
@@ -437,6 +441,66 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         result["credentialId"] = json!(credential);
     }
     Ok(result)
+}
+
+/// The connector to use for removing `row` when this process has not bound
+/// to it yet (no connector, or one that has not connected since it started):
+/// after a backend restart the machine keeps its agents running, and only a
+/// bind's welcome tells which of the agents recorded on its live leases
+/// still run. With none recorded, `unbound` is kept as is. Otherwise the
+/// connector is started (the caller holds the lifecycle lock) and connected
+/// within [`crate::connector::Tuning::remove_timeout`], so the welcome
+/// claims the survivors before they are counted. A revoked credential needs
+/// no stops; an unreachable machine fails the removal `machine-unreachable`
+/// and keeps the machine, its token and its lease.
+async fn recover_survivors(
+    feature: &RemoteFeature,
+    svc: &Services,
+    row: &ExposedMachine,
+    unbound: Option<RemoteNode>,
+) -> Result<Option<RemoteNode>> {
+    let store = svc.store();
+    let head_id = store.daemon_id().await?;
+    let mut recorded = 0;
+    for lease in store.list_owned_node_leases(&head_id).await? {
+        if lease.owner.node_id == row.id && !lease.state.is_terminal() {
+            recorded += store.list_remote_agents(&lease.owner.lease_id).await?.len();
+        }
+    }
+    if recorded == 0 {
+        return Ok(unbound);
+    }
+    let node = match unbound {
+        Some(node) => node,
+        None => feature.node_locked(svc, &row.id).await?,
+    };
+    let connected = tokio::time::timeout(feature.tuning().remove_timeout, node.connect()).await;
+    match connected {
+        Ok(Ok(())) => Ok(Some(node)),
+        Ok(Err(Error::RemoteMachine(failure)))
+            if failure.data["code"] == crate::connect::MACHINE_REVOKED =>
+        {
+            Ok(Some(node))
+        }
+        Ok(Err(Error::RemoteMachine(failure))) => Err(survivors_unknown(
+            &row.name,
+            recorded,
+            failure.data["attempts"].clone(),
+        )),
+        Ok(Err(other)) => Err(other),
+        Err(_) => Err(survivors_unknown(&row.name, recorded, json!([]))),
+    }
+}
+
+fn survivors_unknown(name: &str, recorded: usize, attempts: Value) -> Error {
+    coded(
+        true,
+        crate::connect::MACHINE_UNREACHABLE,
+        format!(
+            "{name} is unreachable, so it cannot confirm whether its {recorded} remote agent(s) still run; try again when it is reachable, or revoke the credential on the machine."
+        ),
+        json!({ "attempts": attempts }),
+    )
 }
 
 /// Wait for the machine to acknowledge the stops of `agents` before it is
