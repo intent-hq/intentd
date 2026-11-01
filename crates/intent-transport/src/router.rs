@@ -2387,7 +2387,7 @@ async fn dispatch(
             let ws = opt_workspace_id(params);
             let preview_chars = opt_int(params, "previewChars");
             let limit = opt_int(params, "limit");
-            let next_token = opt_str(params, "nextToken");
+            let next_token = opt_str_strict(params, "nextToken")?;
             match api
                 .agent_list_user_messages(agent_id, ws, preview_chars, limit, next_token)
                 .await

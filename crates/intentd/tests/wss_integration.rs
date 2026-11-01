@@ -19224,6 +19224,32 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     )
     .await;
     assert_eq!(bad_token["error"]["code"], -32602, "{bad_token}");
+    for (id, token) in [(16, "123"), (17, "{}"), (18, "[]")] {
+        let typed = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":{token}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            typed["error"]["code"], -32602,
+            "a non-string nextToken is rejected, never read as absent: {typed}"
+        );
+    }
+    let null_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":19,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":null}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        null_token["result"].get("nextToken").is_none(),
+        "a null nextToken reads as absent: {null_token}"
+    );
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
     let other_ws = wss_call(
