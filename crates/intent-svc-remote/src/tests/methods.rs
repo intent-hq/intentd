@@ -954,3 +954,400 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
         .unwrap()
         .is_empty());
 }
+
+/// A backend that placed `agent` on `machine` and then restarted: the agent's
+/// record and its live lease persist, the machine still runs the agent, and
+/// no connector to the machine exists yet (startup starts none).
+async fn restarted_with_a_surviving_agent(backend: &Backend, machine: &mut Machine) -> AgentId {
+    let node = backend.expose(machine).await;
+    let lease_id = node.status().lease_id;
+    let agent = AgentId::new();
+    let now = intent_core::now_iso();
+    backend
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: workspace(),
+            title: "Remote".into(),
+            branch: "main".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+        .bind(agent.as_str())
+        .bind(workspace().as_str())
+        .bind(&now)
+        .bind(&now)
+        .execute(backend.store().write_pool())
+        .await
+        .unwrap();
+    backend
+        .store()
+        .record_remote_agent(&intent_core::remote_launch::RemoteAgentRecord {
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            node_id: machine.id(),
+            lease_id,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    *machine.host.running.lock().unwrap() = vec![agent.clone()];
+    // The restart: the in-memory connector is gone.
+    backend
+        .services
+        .remote_feature()
+        .unwrap()
+        .take_node(&machine.id())
+        .expect("the feature's connector")
+        .shutdown();
+    agent
+}
+
+async fn assert_machine_kept(backend: &Backend, machine: &Machine) {
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1,
+        "the machine stays registered"
+    );
+    assert!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap()
+            .is_some(),
+        "its token stays"
+    );
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.owner.node_id == machine.id() && !lease.state.is_terminal()),
+        "its lease stays live"
+    );
+}
+
+// Review of intentd#2910: after a backend restart no connector runs, so
+// removal must not take the machine for idle while its agents survive.
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let error = backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    assert_machine_kept(&backend, &machine).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_with_stop_agents_waits_for_the_machines_ack() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let remove = backend.call(
+        "remove",
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    );
+    tokio::pin!(remove);
+    let (link, stop_id) = tokio::select! {
+        result = &mut remove => panic!("removed before the surviving agent's stop was acked: {result:?}"),
+        found = async {
+            let mut link = machine.accept().await;
+            let stop_id = link.stop_for(&agent).await;
+            (link, stop_id)
+        } => found,
+    };
+    assert_machine_kept(&backend, &machine).await;
+    let (removed, ()) = tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+    assert_eq!(
+        removed.unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn after_a_restart_an_unreachable_machine_with_agents_keeps_everything() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    machine.stop().await;
+
+    for params in [
+        json!({ "machineId": machine.id() }),
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    ] {
+        let error = backend.call("remove", params).await.unwrap_err();
+        assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+        assert!(!data(&error)["attempts"].as_array().unwrap().is_empty());
+        assert_machine_kept(&backend, &machine).await;
+    }
+}
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+
+    let token = "a".repeat(64);
+    let credential = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+    let mut params = machine.add_params();
+    params["credentialId"] = json!(credential.id);
+    params["token"] = json!(token);
+    let error = backend.call("add", params).await.unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.credential_id, old_credential, "the credential is kept");
+    assert_machine_kept(&backend, &machine).await;
+}
+
+// Review of intentd#2930: a bind records its route before it claims the
+// welcome's agents. A removal or a credential replacement that runs while a
+// refresh's bind is in that window must still wait for the claim, not count
+// zero survivors.
+#[derive(Clone, Copy, Debug)]
+enum DuringBind {
+    Remove,
+    RemoveStoppingAgents,
+    ReplaceCredential,
+}
+
+async fn during_a_restart_bind(action: DuringBind) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    let mut hooked = tuning();
+    hooked.before_claim = crate::connector::BeforePublish(Some(Arc::new(
+        move |_: &Arc<crate::connector::Shared>| {
+            // Hold only the first bind, between its route and its claim.
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                if let Some(release) = release_rx.lock().unwrap().take() {
+                    // Hand this worker's other tasks off before blocking.
+                    tokio::task::block_in_place(|| {
+                        let _ = release.recv();
+                    });
+                }
+            }
+        },
+    )));
+    let backend = Backend::with_tuning(hooked).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let (method, params) = match action {
+        DuringBind::Remove => ("remove", json!({ "machineId": machine.id() })),
+        DuringBind::RemoveStoppingAgents => (
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        ),
+        DuringBind::ReplaceCredential => {
+            let token = "a".repeat(64);
+            let credential =
+                Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            ("add", params)
+        }
+    };
+
+    // A refresh starts the connector and binds; the bind stops before its
+    // claim with the route already recorded.
+    let services = backend.services.clone();
+    let id = machine.id();
+    let refresh = tokio::spawn(async move {
+        with_caller(
+            Caller::Daemon,
+            services.remote_machines("refresh", json!({ "machineId": id })),
+        )
+        .await
+    });
+    let mut link = machine.accept().await;
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let services = backend.services.clone();
+    let call = tokio::spawn(async move {
+        with_caller(Caller::Daemon, services.remote_machines(method, params)).await
+    });
+    // timing-guard: a call that skipped the claim finishes at once
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!call.is_finished(), "{action:?} waits for the bind's claim");
+    assert_machine_kept(&backend, &machine).await;
+    release_tx.send(()).unwrap();
+
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = call.await.unwrap().unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            let stop_id = link.stop_for(&agent).await;
+            assert!(!call.is_finished(), "removal waits for the StopAck");
+            assert_machine_kept(&backend, &machine).await;
+            link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+            assert_eq!(
+                call.await.unwrap().unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+    refresh.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::Remove).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_stopping_agents_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_replacing_the_credential_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::ReplaceCredential).await;
+}
+
+// Review of intentd#2930: a bind whose claim could not read this lease's
+// agent records publishes its link with nothing claimed. Removal and
+// credential replacement must refuse then, keeping everything, and succeed
+// once a retried claim can read the records.
+async fn when_the_claim_cannot_read_its_records(action: DuringBind) {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut failing = tuning();
+    failing.fail_claim_reads = fail.clone();
+    let backend = Backend::with_tuning(failing).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let params = |machine: &Machine, credential: Option<(&ExecutorCredential, &str)>| match action {
+        DuringBind::Remove => json!({ "machineId": machine.id() }),
+        DuringBind::RemoveStoppingAgents => {
+            json!({ "machineId": machine.id(), "stopAgents": true })
+        }
+        DuringBind::ReplaceCredential => {
+            let (credential, token) = credential.unwrap();
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            params
+        }
+    };
+    let method = match action {
+        DuringBind::ReplaceCredential => "add",
+        _ => "remove",
+    };
+    let token = "a".repeat(64);
+    let replacement = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+
+    let error = backend
+        .call(method, params(&machine, Some((&replacement, &token))))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32603, "{action:?}: {error:?}");
+    assert!(
+        error.to_string().contains("could not tell which"),
+        "{action:?}: {error}"
+    );
+    let mut link = machine.accept().await;
+    assert_machine_kept(&backend, &machine).await;
+
+    // The records are readable again: the retry claims the survivor.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = backend
+                .call(method, params(&machine, Some((&replacement, &token))))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            let remove = backend.call(method, params(&machine, None));
+            tokio::pin!(remove);
+            let stop_id = tokio::select! {
+                result = &mut remove => panic!("removed before the survivor's stop was acked: {result:?}"),
+                stop_id = link.stop_for(&agent) => stop_id,
+            };
+            let (removed, ()) =
+                tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+            assert_eq!(
+                removed.unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::Remove).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_stopping_agents_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_the_claim_cannot_read_its_records()
+{
+    when_the_claim_cannot_read_its_records(DuringBind::ReplaceCredential).await;
+}

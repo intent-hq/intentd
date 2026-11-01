@@ -80,10 +80,18 @@ pub(crate) struct Tuning {
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: fail every claim's read of this lease's agent records
+    /// while set.
+    #[cfg(test)]
+    pub fail_claim_reads: Arc<std::sync::atomic::AtomicBool>,
     /// Test seam: runs at bind, after the queued stops are sent and before
     /// the link is published.
     #[cfg(test)]
     pub before_publish: BeforePublish,
+    /// Test seam: runs at bind, after the route is recorded and before the
+    /// welcome's agents are claimed.
+    #[cfg(test)]
+    pub before_claim: BeforePublish,
 }
 
 /// A test hook run with the connector's state just before a bound link is
@@ -125,7 +133,11 @@ impl Default for Tuning {
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
             #[cfg(test)]
+            fail_claim_reads: Arc::default(),
+            #[cfg(test)]
             before_publish: BeforePublish::default(),
+            #[cfg(test)]
+            before_claim: BeforePublish::default(),
         }
     }
 }
@@ -177,6 +189,13 @@ pub(crate) struct Shared {
     resending: Mutex<HashMap<StopId, u64>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
+    /// Set once a bind in this process has claimed the agents its welcome
+    /// reported: from then on the attached agents are the machine's
+    /// survivors. Set after the claim, not with the route, which a bind
+    /// records before its claim.
+    claimed: std::sync::atomic::AtomicBool,
+    /// Serializes claims: a bind's and a retried one ([`RemoteNode::reclaim`]).
+    claim_lock: tokio::sync::Mutex<()>,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
@@ -580,6 +599,8 @@ impl RemoteNode {
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
             route: Mutex::new(None),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            claim_lock: tokio::sync::Mutex::new(()),
             capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
             demand,
@@ -664,6 +685,35 @@ impl RemoteNode {
     /// The label of the route the current (or last) link bound on.
     pub(crate) fn route(&self) -> Option<String> {
         lock(&self.shared.route).clone()
+    }
+
+    /// Whether a bind in this process has claimed the machine's surviving
+    /// agents, so [`Self::running`] counts them.
+    pub(crate) fn has_claimed(&self) -> bool {
+        self.shared
+            .claimed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Claim the agents the last welcome reported, if no claim has
+    /// succeeded yet (the bind's could not read this lease's records).
+    /// Stops it queues go out on the live link. Returns whether the
+    /// survivors are now claimed.
+    pub(crate) async fn reclaim(&self) -> bool {
+        if self.has_claimed() {
+            return true;
+        }
+        let running = lock(&self.shared.status).running_agents.clone();
+        if !claim(&self.shared, &running).await {
+            return false;
+        }
+        self.shared
+            .claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(link) = self.shared.current_link() {
+            self.shared.resend_queued(&link);
+        }
+        true
     }
 
     /// Connect if needed and ask the machine for a fresh capabilities
@@ -896,7 +946,15 @@ async fn run(
         // Before the link is published: queue the stops of agents head no
         // longer claims, then send every queued stop, so they precede any
         // launch or prompt on this link.
-        claim(&shared, &welcome).await;
+        #[cfg(test)]
+        if let Some(hook) = &shared.tuning.before_claim.0 {
+            hook(&shared);
+        }
+        if claim(&shared, &welcome.running_agents).await {
+            shared
+                .claimed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
@@ -1119,26 +1177,45 @@ impl Acks {
 /// stop with a new id, resent until acknowledged; one
 /// head knows but has not attached since it started gets a runtime, kept
 /// until the agent manager takes it, so its output is not dropped.
-async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome) {
-    if welcome.running_agents.is_empty() {
-        return;
+///
+/// Returns whether the claim succeeded: `false` when this lease's agent
+/// records could not be read, so nothing was claimed. Claims take turns
+/// (`claim_lock`), so a retried claim never attaches an agent twice.
+async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
+    let _claiming = shared.claim_lock.lock().await;
+    if running_agents.is_empty() {
+        return true;
     }
     let lease_id = lock(&shared.status).lease_id.clone();
-    let claimed = match shared.store.list_remote_agents(&lease_id).await {
+    #[cfg(test)]
+    let read = if shared
+        .tuning
+        .fail_claim_reads
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        Err(intent_core::Error::Internal(
+            "test: claim read fails".into(),
+        ))
+    } else {
+        shared.store.list_remote_agents(&lease_id).await
+    };
+    #[cfg(not(test))]
+    let read = shared.store.list_remote_agents(&lease_id).await;
+    let claimed = match read {
         Ok(claimed) => claimed,
         Err(error) => {
             // Without the records head cannot tell which agents are its
-            // own; stopping them all could end live work, so wait for the
-            // next bind.
+            // own; stopping them all could end live work, so claim nothing
+            // and report the failure.
             tracing::warn!(%error, "remote node: could not read this lease's agents; claiming nothing");
-            return;
+            return false;
         }
     };
     let workspaces: HashMap<&AgentId, &WorkspaceId> = claimed
         .iter()
         .map(|record| (&record.agent_id, &record.workspace_id))
         .collect();
-    for agent_id in &welcome.running_agents {
+    for agent_id in running_agents {
         match workspaces.get(agent_id) {
             None => {
                 tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
@@ -1156,6 +1233,7 @@ async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome) {
             Some(_) => {}
         }
     }
+    true
 }
 
 /// Dial the git connection for `link`'s binding and serve the node's git
