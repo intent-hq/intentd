@@ -1101,3 +1101,28 @@ async fn after_a_restart_an_unreachable_machine_with_agents_keeps_everything() {
         assert_machine_kept(&backend, &machine).await;
     }
 }
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+
+    let token = "a".repeat(64);
+    let credential = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+    let mut params = machine.add_params();
+    params["credentialId"] = json!(credential.id);
+    params["token"] = json!(token);
+    let error = backend.call("add", params).await.unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.credential_id, old_credential, "the credential is kept");
+    assert_machine_kept(&backend, &machine).await;
+}
