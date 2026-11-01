@@ -1510,3 +1510,144 @@ async fn node_runner_reports_default_account_auth_failures_on_a_turn() {
         wait_for(&h.runner, "exit", exited("a1")).await;
     }
 }
+
+/// Review of intentd#2910: a credential equal to an ACP enum word must not
+/// break the typed parse on head. Enum values at their schema positions (an
+/// annotation's `audience` roles, a config option's `type`) are kept as sent;
+/// every free-form string around them is still masked.
+#[test]
+fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
+    let parses = |params: &serde_json::Value| {
+        serde_json::from_value::<intent_acp::session::SessionUpdate>(params["update"].clone())
+            .is_ok()
+    };
+    for secret in ["user", "assistant", "select"] {
+        let profile = ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+        );
+        let redactor = Redactor::new(Some(&profile));
+        let annotations = json!({
+            "audience": ["user", "assistant"],
+            "priority": 0.5,
+            "lastModified": format!("by {secret}"),
+        });
+
+        let mut chunk = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": format!("the token is {secret}"),
+                    "annotations": annotations.clone(),
+                },
+            },
+        });
+        redactor.notification(&mut chunk);
+        let content = &chunk["update"]["content"];
+        assert_eq!(
+            content["annotations"]["audience"],
+            json!(["user", "assistant"]),
+            "{secret}"
+        );
+        assert_eq!(
+            content["annotations"]["lastModified"], "by [redacted]",
+            "{secret}"
+        );
+        assert_eq!(
+            content["text"], "the token is [redacted]",
+            "{secret}: a secret in free text is masked"
+        );
+        assert!(parses(&chunk), "{secret}: unparseable {chunk}");
+
+        let mut tool = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": format!("read {secret}"),
+                "kind": "read",
+                "status": "completed",
+                "content": [{
+                    "type": "content",
+                    "content": {
+                        "type": "resource_link",
+                        "uri": format!("file:///{secret}.md"),
+                        "name": format!("{secret}.md"),
+                        "annotations": annotations.clone(),
+                    },
+                }],
+            },
+        });
+        redactor.notification(&mut tool);
+        let link = &tool["update"]["content"][0]["content"];
+        assert_eq!(
+            link["annotations"]["audience"],
+            json!(["user", "assistant"]),
+            "{secret}"
+        );
+        assert_eq!(link["name"], "[redacted].md", "{secret}");
+        assert_eq!(tool["update"]["title"], "read [redacted]", "{secret}");
+        assert!(parses(&tool), "{secret}: unparseable {tool}");
+
+        let mut config = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model",
+                    "name": format!("Model for {secret}"),
+                    "type": "select",
+                    "currentValue": "fast",
+                    "options": [{ "value": "fast", "name": format!("Fast {secret}") }],
+                }],
+            },
+        });
+        redactor.notification(&mut config);
+        let option = &config["update"]["configOptions"][0];
+        assert_eq!(option["type"], "select", "{secret}");
+        assert_eq!(option["name"], "Model for [redacted]", "{secret}");
+        assert_eq!(option["options"][0]["name"], "Fast [redacted]", "{secret}");
+        assert!(parses(&config), "{secret}: unparseable {config}");
+    }
+}
+
+/// Only an enum's own words pass unmasked at those positions: a secret a
+/// provider places there is masked like any other string.
+#[test]
+fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
+    let secret = "zq7w-not-a-role";
+    let profile = ProfileEnv::new(
+        "codex@work",
+        "f1",
+        vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+    );
+    let redactor = Redactor::new(Some(&profile));
+    let mut chunk = json!({
+        "sessionId": "s1",
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "text",
+                "text": "hi",
+                "annotations": { "audience": ["user", secret] },
+            },
+        },
+    });
+    redactor.notification(&mut chunk);
+    assert_eq!(
+        chunk["update"]["content"]["annotations"]["audience"],
+        json!(["user", "[redacted]"])
+    );
+    let mut config = json!({
+        "sessionId": "s1",
+        "update": {
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{ "id": "model", "name": "Model", "type": secret, "currentValue": "x" }],
+        },
+    });
+    redactor.notification(&mut config);
+    assert_eq!(config["update"]["configOptions"][0]["type"], "[redacted]");
+}
