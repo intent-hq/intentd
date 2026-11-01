@@ -2363,6 +2363,7 @@ jobs:
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py
+          python3 -I -B scripts/test-script-helpers.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
           python3 -I -B scripts/test-subprocess-env-policy.py
