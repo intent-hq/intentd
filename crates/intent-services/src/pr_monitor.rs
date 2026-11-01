@@ -8016,8 +8016,8 @@ mod tests {
             "{checks:?}"
         );
         assert_eq!(checks.failing_required, vec!["CI Gate".to_string()]);
-        const RED: &str = "check CI Gate: passed → failed";
-        assert_eq!(row.pending_changes, vec![RED.to_string()]);
+        let red_line = "check CI Gate: passed → failed";
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
         let text = owner_messages(&svc, &owner).await;
         assert!(
             !text.contains("pr_monitor_wake"),
@@ -8038,7 +8038,7 @@ mod tests {
             serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
         let checks = &snapshot.requirements.checks;
         assert_eq!((checks.passed, checks.failed), (1, 1), "{checks:?}");
-        assert_eq!(row.pending_changes, vec![RED.to_string()]);
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
 
         // Delivered exactly once, and only the red transition.
         assert_eq!(
@@ -8048,7 +8048,7 @@ mod tests {
             true
         );
         let text = owner_messages(&svc, &owner).await;
-        assert_eq!(text.matches(RED).count(), 1, "{text}");
+        assert_eq!(text.matches(red_line).count(), 1, "{text}");
         assert!(!text.contains("failed → passed"), "{text}");
         let row = svc
             .store()
