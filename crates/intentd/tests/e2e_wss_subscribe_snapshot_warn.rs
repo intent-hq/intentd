@@ -446,13 +446,14 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
             snapshot.as_array().unwrap(),
         ] {
             for row in rows {
-                let reminder = &row["attentionReminder"];
+                // Fresh idle rows omit their complete empty reason set;
+                // absence leaves the raw attention and display status intact.
                 assert!(
-                    reminder["reasons"].as_array().is_some_and(Vec::is_empty),
+                    row.get("attentionReminder").is_none(),
                     "fresh workspace reminder: {row}"
                 );
-                assert_eq!(reminder["dismissed"], json!(false));
-                assert_eq!(reminder["displayStatus"], row["displayStatus"]);
+                assert_eq!(row["attention"], json!("none"));
+                assert_eq!(row["displayStatus"], json!("idle"));
             }
         }
 

@@ -761,14 +761,15 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
             "resp: {resp}"
         );
         let workspace = &resp["result"]["workspace"];
-        let reminder = &workspace["attentionReminder"];
+        // A complete empty reason set is omitted, including after answered
+        // questions clear the cached projection. Preserve the raw fallback.
         assert!(
-            reminder["reasons"].as_array().is_some_and(Vec::is_empty),
+            workspace.get("attentionReminder").is_none(),
             "answered questions must not leave reminders: {resp}"
         );
-        assert_eq!(reminder["dismissed"], json!(false));
-        assert_eq!(reminder["displayStatus"], workspace["displayStatus"]);
-        observed.push(json!({"read": read, "reminder": reminder}));
+        assert_eq!(workspace["attention"], json!("none"));
+        assert_eq!(workspace["displayStatus"], json!("idle"));
+        observed.push(json!({"read": read, "reminder": workspace.get("attentionReminder")}));
     }
 
     // The WARN (were it wrongly emitted) lands on stderr before the response
