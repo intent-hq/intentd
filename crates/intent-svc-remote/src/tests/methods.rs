@@ -183,6 +183,92 @@ async fn a_wrong_token_or_pin_is_unreachable_with_the_link_code() {
         .is_empty());
 }
 
+/// A stand-in for the sitter-shipped tailcat binary in pipe-client mode:
+/// for `address` it pipes stdin/stdout to `127.0.0.1:<port>`.
+#[cfg(unix)]
+fn fake_tailcat(dir: &std::path::Path, address: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("tailcat");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/usr/bin/env bash\n[ \"$1\" = \"{address}\" ] || exit 7\n\
+             exec 3<>/dev/tcp/127.0.0.1/$2 || exit 8\ncat <&3 &\ncat >&3\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A machine whose listener is loopback-only mints `hosts: []` with its
+/// tailcat address: it is added, and later reached, over tailcat alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tailcat_only_machine_with_no_hosts_is_added_and_refreshed() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let dir = tempfile::tempdir().unwrap();
+    backend
+        .services
+        .configure_remote_machines(Some(fake_tailcat(dir.path(), "tcmachine1")));
+    *machine.host.hosts.lock().unwrap() = Vec::new();
+    *machine.host.tc_address.lock().unwrap() = Some("tcmachine1".into());
+    let mut params = machine.add_params();
+    params["hosts"] = json!([]);
+    params["tcAddress"] = json!("tcmachine1");
+
+    let added = backend.call("add", params).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+    assert_eq!(added["machine"]["hosts"], json!([]));
+    assert_eq!(added["machine"]["tcAddress"], "tcmachine1");
+
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    machine
+        .accept()
+        .await
+        .answer_capabilities(capabilities(0))
+        .await;
+    let refreshed = refreshing.await.unwrap().unwrap();
+    assert_eq!(refreshed["machine"]["state"], "connected");
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.hosts.is_empty());
+    assert_eq!(row.tc_address.as_deref(), Some("tcmachine1"));
+    assert!(row.last_connected_at.is_some());
+}
+
+/// With neither a host nor a tailcat address there is no route at all.
+#[tokio::test]
+async fn add_without_any_route_is_rejected_before_dialing() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    for tc_address in [None, Some(json!("")), Some(json!(null))] {
+        let mut params = machine.add_params();
+        params["hosts"] = json!([]);
+        if let Some(tc_address) = tc_address {
+            params["tcAddress"] = tc_address;
+        }
+        let error = backend.call("add", params).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidParams(_)), "{error:?}");
+        assert!(error.to_string().contains("tcAddress"), "{error}");
+    }
+}
+
 #[tokio::test]
 async fn add_rejects_malformed_params_before_dialing() {
     let backend = Backend::new().await;
@@ -302,6 +388,81 @@ async fn a_revoked_credential_marks_the_machine_revoked() {
     assert_eq!(data(&error)["code"], "machine-revoked");
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"][0]["state"], "revoked");
+}
+
+/// A machine whose link is up but that does not report in time (a freshly
+/// started daemon before its first provider report) is `machine-unreachable`
+/// naming the live route and the link code, not a bare internal error.
+#[tokio::test]
+async fn a_refresh_the_machine_does_not_answer_is_machine_unreachable() {
+    let mut quick = tuning();
+    quick.capabilities_timeout = Duration::from_millis(300);
+    let backend = Backend::with_tuning(quick).await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    // Bound, but the capabilities request is never answered.
+    let _link = machine.accept().await;
+    let error = refreshing.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), -32603, "{error:?}");
+    let data = data(&error);
+    assert_eq!(data["code"], "machine-unreachable", "{data}");
+    assert_eq!(
+        data["attempts"],
+        json!([{ "route": format!("127.0.0.1:{}", machine.port), "error": "node-link-timeout" }])
+    );
+    let message = error.to_string();
+    assert!(message.contains("Test machine"), "{message}");
+    assert!(!message.contains(&machine.token));
+}
+
+/// Revocation stops the binding's agents on the machine, so once the
+/// machine refuses the credential the backend no longer counts them: they
+/// end with `machine-revoked`, and a plain remove goes through.
+#[tokio::test]
+async fn a_revoked_machine_no_longer_counts_its_agents() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    assert_eq!(node.running(), 1);
+
+    machine.stop().await;
+    machine.revoke().await;
+    machine.restart().await;
+    tokio::time::timeout(wait(), async {
+        while node.running() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the revoked machine's agents are no longer counted");
+    assert!(!runtime.is_running());
+    let exit = runtime.exit_error().unwrap_or_default();
+    assert!(exit.contains("machine-revoked"), "{exit}");
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"][0]["state"], "revoked");
+    assert_eq!(listed["machines"][0]["runningAgents"], 0);
+    assert_eq!(
+        backend
+            .call("remove", json!({ "machineId": machine.id() }))
+            .await
+            .unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
 }
 
 #[tokio::test]

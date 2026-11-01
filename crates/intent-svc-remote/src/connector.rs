@@ -175,6 +175,8 @@ pub(crate) struct Shared {
     /// The stops a task is resending, with the link generation it resends
     /// on, so one link has one resender per stop.
     resending: Mutex<HashMap<StopId, u64>>,
+    /// The label of the route the current (or last) link bound on.
+    route: Mutex<Option<String>>,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
@@ -429,7 +431,7 @@ impl Shared {
         status.running_agents.clone_from(&welcome.running_agents);
         drop(status);
         self.capabilities(&welcome.capabilities);
-        if !welcome.hosts.is_empty() {
+        if !welcome.hosts.is_empty() || welcome.tc_address.is_some() {
             let mut target = lock(&self.target);
             target.hosts.clone_from(&welcome.hosts);
             target.tc_address.clone_from(&welcome.tc_address);
@@ -577,6 +579,7 @@ impl RemoteNode {
             stops: Mutex::new(BTreeMap::new()),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
+            route: Mutex::new(None),
             capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
             demand,
@@ -656,6 +659,11 @@ impl RemoteNode {
             Ok(Err(_)) => Err(ConnectFailure::Local("the connector has stopped".into())),
             Err(_) => Err(ConnectFailure::Unreachable(Vec::new())),
         }
+    }
+
+    /// The label of the route the current (or last) link bound on.
+    pub(crate) fn route(&self) -> Option<String> {
+        lock(&self.shared.route).clone()
     }
 
     /// Connect if needed and ask the machine for a fresh capabilities
@@ -824,12 +832,26 @@ async fn run(
             }
             return;
         }
-        let Connected { dialed, endpoint } = match connected {
+        let Connected {
+            dialed,
+            endpoint,
+            route,
+        } = match connected {
             Ok(connected) => connected,
             Err(failure) => {
                 tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
                 if matches!(failure, ConnectFailure::Revoked(_)) {
+                    // Revocation stopped this binding's agents on the
+                    // machine: their stops are moot, and they no longer run.
                     shared.drop_stops();
+                    let ended = shared.agents.end_all(&format!(
+                        "{}: {} revoked this backend's credential and stopped the agent",
+                        crate::connect::MACHINE_REVOKED,
+                        target.name
+                    ));
+                    if ended > 0 {
+                        tracing::info!(machine = %target.id, ended, "remote machine: revoked; its agents ended");
+                    }
                 }
                 shared.record_failure(&failure).await;
                 shared.announce().await;
@@ -865,6 +887,7 @@ async fn run(
         } = dialed;
         backoff.reset();
         retry = false;
+        *lock(&shared.route) = Some(route);
         if let Err(error) = lease.record_welcome(&welcome).await {
             tracing::warn!(%error, "remote machine: could not record the welcome");
         }

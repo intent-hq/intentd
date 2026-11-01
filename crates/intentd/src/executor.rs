@@ -270,14 +270,13 @@ impl ExecutorService {
         }
         let base = self.deps.data_dir.join(EXECUTOR_DIR);
         let root = base.join(&credential.0);
-        // Unix socket paths are short; name the socket by a prefix of the
-        // credential id, next to (not inside) its root.
-        let socket = base.join(format!(
-            "{}.sock",
-            &credential.0[..credential.0.len().min(12)]
-        ));
+        let id = credential.0.clone();
         let storage = Arc::new(
-            tokio::task::spawn_blocking(move || Storage::open(&root, Some(socket))).await??,
+            tokio::task::spawn_blocking(move || {
+                let socket = storage::git_socket_path(&base, &id, &storage::runtime_base())?;
+                Storage::open(&root, Some(socket))
+            })
+            .await??,
         );
         let socket = storage.git_socket();
         let journal_dir = storage.journal_dir();

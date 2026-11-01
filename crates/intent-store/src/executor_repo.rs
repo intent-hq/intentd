@@ -31,6 +31,12 @@ fn db(error: impl std::fmt::Display) -> Error {
 fn invalid(message: &str) -> Error {
     Error::InvalidParams(message.into())
 }
+/// Whether an exposed machine can be dialed at all: a direct host, or a
+/// tailcat address (all a loopback-only listener advertises).
+fn has_route(hosts: &[String], tc_address: Option<&str>) -> bool {
+    !hosts.is_empty() || tc_address.is_some_and(|address| !address.is_empty())
+}
+
 fn encode(value: &impl serde::Serialize) -> Result<String> {
     serde_json::to_string(value).map_err(db)
 }
@@ -376,7 +382,8 @@ impl Store {
     /// # Errors
     ///
     /// `InvalidParams` for an empty id, name, fingerprint or credential, no
-    /// hosts, port 0 or a `connected` state; `Internal` on database failure.
+    /// route (neither a host nor a tailcat address), port 0 or a `connected`
+    /// state; `Internal` on database failure.
     pub async fn save_exposed_machine(
         &self,
         machine: &ExposedMachine,
@@ -385,7 +392,7 @@ impl Store {
             || machine.name.is_empty()
             || machine.fingerprint.is_empty()
             || machine.credential_id.as_str().is_empty()
-            || machine.hosts.is_empty()
+            || !has_route(&machine.hosts, machine.tc_address.as_deref())
             || machine.port == 0
         {
             return Err(invalid("invalid exposed machine"));
@@ -501,7 +508,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// `InvalidParams` for no hosts; `Internal` on database failure.
+    /// `InvalidParams` for no route (neither a host nor a tailcat address);
+    /// `Internal` on database failure.
     pub async fn record_exposed_machine_connection(
         &self,
         id: &str,
@@ -509,8 +517,10 @@ impl Store {
         tc_address: Option<&str>,
         connected_at: &str,
     ) -> Result<bool> {
-        if hosts.is_empty() {
-            return Err(invalid("an exposed machine needs at least one host"));
+        if !has_route(hosts, tc_address) {
+            return Err(invalid(
+                "an exposed machine needs a host or a tailcat address",
+            ));
         }
         let done = sqlx::query(
             "UPDATE exposed_machine SET hosts_json = ?, tc_address = ?, last_connected_at = ? \
