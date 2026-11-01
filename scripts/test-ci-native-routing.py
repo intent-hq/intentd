@@ -46,13 +46,13 @@ PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
-# Main pushes skip the Windows post-merge job when release-fast-path reports
-# release_push=true (a tree auto-cut-alpha just required green plus release
-# metadata) or `supersede` reports superseded=true (main's live tip is already
-# strictly ahead of this commit). Every other push job still runs.
-RELEASE_PUSH_SKIPS = {"windows"}
-# A superseded commit also skips its paid macOS build (only the tip's proof is
-# read); a release push keeps it (see test_release_push_keeps_macos_release_build).
+# Main pushes skip the Windows post-merge job and the paid macOS build when
+# release-fast-path reports release_push=true (a tree auto-cut-alpha just
+# required green plus release metadata; see
+# test_release_push_skips_macos_release_build) or `supersede` reports
+# superseded=true (main's live tip is already strictly ahead of this commit,
+# and only the tip's proof is read). Every other push job still runs.
+RELEASE_PUSH_SKIPS = {"windows", "build"}
 SUPERSEDED_SKIPS = {"windows", "build"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
 # their outputs), so a failed classifier or scan degrades to full CI.
@@ -1317,16 +1317,25 @@ class NativeRoutingTests(unittest.TestCase):
                 mutate(workflow["jobs"]["supersede"])
                 self.assertTrue(supersede_job_errors(workflow))
 
-    def test_release_push_keeps_macos_release_build(self):
+    def test_release_push_skips_macos_release_build(self):
         # The push macOS release build is the only mandatory per-tip macOS
         # workspace release build (release-profile code such as
-        # cfg(not(debug_assertions)) is never compiled in the queue;
-        # release-cache.yml builds only on matching paths or dispatch), so a
-        # release-metadata push skips only Windows.
+        # cfg(not(debug_assertions)) is never compiled in the queue). auto-cut
+        # cuts only after the tip's push gate, macOS release build included,
+        # is green, and the release-metadata push that follows changes only
+        # versions on that tree, so it skips the paid rebuild (the tag's
+        # release workflow builds every target anyway).
+        self.assertEqual(scheduled(self.workflow, "push", release_push="true")["build"], "skipped")
+        self.assertEqual(scheduled(self.workflow, "push", release_push="false")["build"], "success")
         steps = {step.get("name"): step for step in self.workflow["jobs"]["build"]["steps"]}
-        for name in ("Build (release)", "Warm merge queue check cache"):
-            self.assertTrue(condition(steps[name]["if"], context("push", release_push="true")), name)
-        self.assertEqual(scheduled(self.workflow, "push", release_push="true")["build"], "success")
+        self.assertTrue(condition(steps["Build (release)"]["if"], context("push")))
+
+    def test_push_warms_the_check_cache_only_on_self_hosted_runners(self):
+        # An ephemeral VM discards its target dir, so the warm check would
+        # only spend paid macOS minutes there.
+        step = next(s for s in self.workflow["jobs"]["build"]["steps"] if s.get("name") == "Warm merge queue check cache")
+        self.assertIn("contains(matrix.os, 'self-hosted')", step["if"])
+        self.assertNotIn("merge_group", step["if"])
 
     def test_release_push_classifier_compares_against_the_previous_tip(self):
         job = self.workflow["jobs"]["release-fast-path"]
