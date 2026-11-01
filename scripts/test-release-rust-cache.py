@@ -81,7 +81,8 @@ class ManagedCache(unittest.TestCase):
                 fake.chmod(0o755)
                 out = tmp / 'out'
                 subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', body], cwd=tmp, check=True,
-                               env={'PATH': os.environ['PATH'], 'GITHUB_OUTPUT': str(out), 'BASE_SHA': 'a' * 40})
+                               env={'PATH': os.environ['PATH'], 'GITHUB_OUTPUT': str(out), 'BASE_SHA': 'a' * 40,
+                                    **{k: v for k, v in os.environ.items() if k == 'LD_LIBRARY_PATH'}})
                 self.assertEqual(out.read_text(), f'release_push={expected}\n')
 
     def test_release_and_warming_use_identical_setup_and_targets(self):
