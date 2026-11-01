@@ -112,9 +112,9 @@ class DecideTests(unittest.TestCase):
 
     def test_earliest_failure_is_reported(self):
         jobs = [job('coverage-all', conclusion='failure', completed_at='2026-10-27T01:20:00Z'),
-                job('Daemon lifecycle (macos)', conclusion='failure', completed_at='2026-10-27T01:05:00Z'),
+                job('Daemon lifecycle (linux)', conclusion='failure', completed_at='2026-10-27T01:05:00Z'),
                 running('build')]
-        self.assertEqual(fail_fast.decide(jobs)[1]['name'], 'Daemon lifecycle (macos)')
+        self.assertEqual(fail_fast.decide(jobs)[1]['name'], 'Daemon lifecycle (linux)')
 
     def test_gate_presence_wins_over_a_failure(self):
         # A failed job with the gate already queued still cancels nothing: the

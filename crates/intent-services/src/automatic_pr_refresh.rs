@@ -230,8 +230,8 @@ impl Services {
     /// the workspace's PR monitors. Every forge call goes through the
     /// automatic admission at the idle gate, the shared rate-limit pause,
     /// and provider failure caching and budgets (never the forced
-    /// `explicitly_refresh` path). Skips archived, deleted, remote, or
-    /// missing workspaces, and is silent when source control is
+    /// `explicitly_refresh` path). Skips archived, deleted, remote, missing,
+    /// or plain-folder workspaces, and is silent when source control is
     /// unconfigured. Errors are logged, never returned.
     pub(crate) async fn refresh_prs_on_agent_idle(&self, workspace_id: &WorkspaceId) {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
@@ -239,6 +239,7 @@ impl Services {
         };
         if ws.archived
             || ws.is_remote
+            || ws.plain_folder
             || matches!(
                 ws.status,
                 WorkspaceStatus::Archived | WorkspaceStatus::Deleted

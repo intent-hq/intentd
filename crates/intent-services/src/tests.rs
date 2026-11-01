@@ -32,6 +32,7 @@ mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
 mod workspace_plain_folder;
+mod workspace_plain_folder_events;
 mod workspace_plain_folder_safety;
 
 /// Runs before `main()` — and therefore before any test threads exist, making

@@ -174,3 +174,152 @@ async fn pulls_get_carries_the_queue_entry_only_while_queued() {
     assert_eq!(left["pull"]["isInMergeQueue"], json!(false));
     assert!(left["pull"].get("mergeQueue").is_none(), "{left}");
 }
+
+fn in_state(position: u32, state: Option<&str>) -> PrMonitorSnapshot {
+    snapshot(|s| {
+        s.requirements.is_in_merge_queue = Some(true);
+        s.requirements.merge_queue = Some(MergeQueueEntry {
+            state: state.map(String::from),
+            ..entry(position, Some(1500))
+        });
+    })
+}
+
+const UNMERGEABLE_LINE: &str = "merge queue entry is UNMERGEABLE: the PR conflicts with an entry \
+     ahead of it and will not merge. Its branch is locked while queued, so a push is rejected — \
+     remove it from the queue first (GraphQL dequeuePullRequest), fix the branch, then enqueue it \
+     again";
+
+/// The entry turning `unmergeable` is the one queue-state change that wakes
+/// the agent (intentd#2897 sat ~55 min at position 2 as UNMERGEABLE while
+/// every wake said only "in merge queue"); recovery while still queued
+/// reports once, and everything else about the entry stays informational.
+#[test]
+fn an_unmergeable_queue_entry_is_a_diff_line_and_recovery_clears_it() {
+    let queued = in_state(2, Some("queued"));
+    let unmergeable = in_state(2, Some("unmergeable"));
+    assert_eq!(
+        diff_snapshots(&queued, &unmergeable),
+        vec![UNMERGEABLE_LINE.to_string()]
+    );
+    // Unknown → unmergeable reports too; entering the queue already
+    // unmergeable reports both facts.
+    assert_eq!(
+        diff_snapshots(&in_state(2, None), &unmergeable),
+        vec![UNMERGEABLE_LINE.to_string()]
+    );
+    assert_eq!(
+        diff_snapshots(&snapshot(|_| {}), &unmergeable),
+        vec![
+            "entered the merge queue".to_string(),
+            UNMERGEABLE_LINE.to_string()
+        ]
+    );
+    // Staying unmergeable while the queue moves around it is quiet.
+    assert!(diff_snapshots(&unmergeable, &in_state(1, Some("unmergeable"))).is_empty());
+    // Recovery while still queued with a known state reports once.
+    assert_eq!(
+        diff_snapshots(&unmergeable, &in_state(1, Some("awaiting_checks"))),
+        vec!["merge queue entry is no longer unmergeable (now awaiting checks)".to_string()]
+    );
+    // An unread state is not a recovery, and leaving the queue reports
+    // only that.
+    assert!(diff_snapshots(&unmergeable, &in_state(2, None)).is_empty());
+    assert_eq!(
+        diff_snapshots(&unmergeable, &snapshot(|_| {})),
+        vec!["left the merge queue".to_string()]
+    );
+    // A stale entry outliving the queued flag is never read as queued.
+    let stale = snapshot(|s| {
+        s.requirements.merge_queue = Some(MergeQueueEntry {
+            state: Some("unmergeable".into()),
+            ..entry(2, None)
+        });
+    });
+    assert!(diff_snapshots(&snapshot(|_| {}), &stale).is_empty());
+}
+
+#[test]
+fn the_wake_checklist_flags_an_unmergeable_entry() {
+    let checklist = render_checklist(&in_state(2, Some("unmergeable")));
+    assert!(
+        checklist.contains(
+            "- in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
+             dequeue it, fix the branch, then enqueue again"
+        ),
+        "{checklist}"
+    );
+    assert!(!checklist.contains("- in merge queue\n"), "{checklist}");
+}
+
+/// Through the poll: the stub forge's entry state goes queued →
+/// unmergeable on a cheap poll (queue state never bumps the PR's
+/// `updatedAt`), producing a pending line that wakes the owner; a
+/// recovery before the debounce window elapses clears the pending line
+/// without a wake.
+#[intent_test_macros::daemon_test]
+async fn a_queued_pr_turning_unmergeable_wakes_the_owner() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    forge.edit_quiet(|s| {
+        s.folded = Some(FoldedRead::default());
+        s.in_merge_queue = Some(true);
+        s.merge_queue_entry = Some(entry(2, Some(1500)));
+    });
+    let set_state = |state: &str| {
+        forge.edit_quiet(|s| {
+            s.merge_queue_entry = Some(MergeQueueEntry {
+                state: Some(state.into()),
+                ..entry(2, Some(1500))
+            });
+        });
+    };
+
+    // Recovery inside the debounce window: the pending line clears, no wake.
+    let held = svc.with_pr_monitor_debounce_seconds(3600);
+    let monitor = register(&held, &ws, &owner).await;
+    let messages = owner_messages(&held, &owner).await;
+    set_state("unmergeable");
+    held.poll_pr_monitors().await;
+    let row = held
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .unwrap();
+    assert_eq!(row.pending_changes, vec![UNMERGEABLE_LINE.to_string()]);
+    set_state("queued");
+    held.poll_pr_monitors().await;
+    let row = held
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .unwrap();
+    assert!(row.pending_changes.is_empty(), "{:?}", row.pending_changes);
+    assert_eq!(owner_messages(&held, &owner).await, messages, "no wake");
+
+    // Unmergeable when the window elapses (forced with the explicit flush,
+    // since the debounce has a floor): the owner is woken with the recovery
+    // instructions and the checklist row, and nothing stays pending.
+    set_state("unmergeable");
+    held.poll_pr_monitors().await;
+    let row = held
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .unwrap();
+    assert_eq!(row.pending_changes, vec![UNMERGEABLE_LINE.to_string()]);
+    assert_eq!(
+        held.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+            .await
+            .unwrap()["flushed"],
+        true
+    );
+    let text = owner_messages(&held, &owner).await;
+    assert!(text.contains("GraphQL dequeuePullRequest"), "{text}");
+    assert!(text.contains("the entry is UNMERGEABLE"), "{text}");
+    let row = held
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .unwrap();
+    assert!(row.pending_changes.is_empty(), "{:?}", row.pending_changes);
+}

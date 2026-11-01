@@ -396,7 +396,9 @@ class CleanupTests(unittest.TestCase):
 
 class LifecycleCleanupTests(CleanupTests):
     # Run every existing ownership, lock, symlink and real-Cargo race proof
-    # against the lifecycle root as well as the original build root.
+    # against the lifecycle root as well as the original build root. The
+    # lifecycle and Services runtime roots are retired (their proofs moved into
+    # ci.yml's `build` job) and stay eligible only to reclaim stale profiles.
     target_name = 'daemon-lifecycle-macos'
 
     def test_both_roots_are_validated_before_any_deletion(self):

@@ -23,6 +23,10 @@ SPEC = importlib.util.spec_from_file_location(
 runtime = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runtime
 SPEC.loader.exec_module(runtime)
+HELPERS_SPEC = importlib.util.spec_from_file_location(
+    "script_helpers", Path(__file__).with_name("script_helpers.py"))
+script_helpers = importlib.util.module_from_spec(HELPERS_SPEC)
+HELPERS_SPEC.loader.exec_module(script_helpers)
 BUNDLE = None
 
 
@@ -40,9 +44,7 @@ class ReviewBundleTests(unittest.TestCase):
     def test_descriptor_tamper_is_refused(self):
         copied = self.root / "scripts"
         copied.mkdir()
-        for name in ("prepare-claude-review-runtime.py", "prepare-claude-callback-runtime.py",
-                     "claude-review-runtime.json"):
-            shutil.copyfile(Path(__file__).with_name(name), copied / name)
+        script_helpers.copy_into(["prepare-claude-review-runtime.py"], copied)
         with (copied / "claude-review-runtime.json").open("ab") as stream:
             stream.write(b" ")
         result = subprocess.run([sys.executable, str(copied / "prepare-claude-review-runtime.py"),

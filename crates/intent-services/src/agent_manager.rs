@@ -12383,7 +12383,7 @@ impl AgentManager {
         for worker in finishing {
             let _ = worker.await;
         }
-        self.services.persist_shutdown_drains().await;
+        self.services.persist_shutdown_queues().await;
         // Finish `end_turn` writes aborted after their release: the agent is
         // outside `in_flight`, and a persisted `Active` would make the next
         // startup heal record its completed turn as a crash. Only a status

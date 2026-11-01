@@ -418,6 +418,8 @@ mod tests;
 mod queue_merge_tests;
 #[cfg(test)]
 mod queue_visibility_contract_tests;
+#[cfg(test)]
+mod shutdown_queue_tests;
 
 #[cfg(test)]
 mod tests_stab28;
@@ -2069,6 +2071,24 @@ impl Drop for DrainingGuard {
             }
         }
     }
+}
+
+/// Whether a durable queue already holds `live` in the same order (same ids,
+/// payloads and correlation), so shutdown reconciliation can skip it.
+/// Absolute positions are not compared: rehydration skips undecodable rows and
+/// `queue_rows` renumbers the rest, so an untouched queue with a skipped row
+/// before or between valid ones must still compare equal and keep that row.
+fn same_queue_rows(
+    durable: &[intent_store::AgentQueueRow],
+    live: &[intent_store::AgentQueueRow],
+) -> bool {
+    durable.len() == live.len()
+        && durable.iter().zip(live).all(|(d, l)| {
+            d.id == l.id
+                && d.payload == l.payload
+                && d.created_at == l.created_at
+                && d.turn_id == l.turn_id
+        })
 }
 
 /// Combined-delivery carry-over bundle (monorepo#1014 / monorepo#1034): the
@@ -18473,19 +18493,62 @@ impl Services {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Called after delivery/worker joins. Keep the overlay frozen for any
-    /// previously admitted request still unwinding; subsequent queue writes
-    /// must not overwrite its payloads either.
-    pub(crate) async fn persist_shutdown_drains(&self) {
-        let ids: Vec<_> = self
+    /// Called after delivery/worker joins, and again by final shutdown:
+    /// reconcile every agent's durable queue with its in-memory snapshot
+    /// (frozen draining overlay included) in one pass under the persist gate.
+    ///
+    /// Write-through persistence runs AFTER its in-memory mutation, inside the
+    /// mutating task, and shutdown aborts turn workers. A cancelled persist
+    /// leaves the durable queue one mutation behind memory: a failed delivery
+    /// requeued in memory after its dequeue already deleted the row would be
+    /// lost by a clean restart. Only agents whose rows differ are rewritten,
+    /// and rows this daemon cannot decode are left out of the comparison, so
+    /// an agent nobody mutated keeps them.
+    pub(crate) async fn persist_shutdown_queues(&self) {
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let mut agents: HashSet<AgentId> = self
             .draining_queue_entries
             .lock()
             .unwrap()
             .keys()
             .cloned()
             .collect();
-        for id in ids {
-            self.persist_queue_snapshot(&id).await;
+        agents.extend(self.agent_queues.lock().unwrap().keys().cloned());
+        let durable = match self.store.load_all_agent_queues().await {
+            Ok(rows) => {
+                let mut by_agent: HashMap<AgentId, Vec<intent_store::AgentQueueRow>> =
+                    HashMap::new();
+                for row in rows {
+                    if row.position >= 0
+                        && serde_json::from_value::<QueuedMessage>(row.payload.clone()).is_ok()
+                    {
+                        by_agent.entry(row.agent_id.clone()).or_default().push(row);
+                    }
+                }
+                Some(by_agent)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "shutdown queue reconcile could not read durable queues; rewriting all");
+                None
+            }
+        };
+        for agent_id in agents {
+            let rows = self.queue_rows(&agent_id);
+            let unchanged = durable.as_ref().is_some_and(|durable| {
+                same_queue_rows(
+                    durable
+                        .get(&agent_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    &rows,
+                )
+            });
+            if unchanged {
+                continue;
+            }
+            if let Err(e) = self.store.replace_agent_queue(&agent_id, &rows).await {
+                tracing::warn!(agent = %agent_id, error = %e, "shutdown queue reconcile failed");
+            }
         }
     }
 
