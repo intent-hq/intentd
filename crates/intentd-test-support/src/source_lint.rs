@@ -43,6 +43,14 @@
 //! and a nonempty reason. Each lint supplies its own tag to
 //! [`markers_by_line`] and decides which line(s) it consults.
 //!
+//! Rules that look at tokens read them with [`tokenize`] (or
+//! [`Statement::tokens`] for one statement with source lines): identifiers,
+//! numbers, and punctuation with the [`MULTI_CHAR_PUNCT`] operators kept
+//! whole, each with char offsets, line, and bracket depth. Before it, five
+//! lints carried their own readers, and intent-hq/intentd#2822 needed nine
+//! review fixes to one of them (`&&` / `||` splitting, closure `||`
+//! detection, bracket matching) that the others never got.
+//!
 //! This module is test-only infrastructure: the crate is `publish = false`
 //! and reachable only as a `[dev-dependencies]` entry, so nothing here ever
 //! ships in the daemon.
@@ -510,8 +518,11 @@ pub fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
     j
 }
 
-/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
-fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
+/// Index just past the delimiter group (`(…)`, `[…]`, or `{…}`) opening at
+/// `j`, given its `open` / `close` characters; `chars.len()` when it never
+/// closes.
+#[must_use]
+pub fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
     let mut depth = 0usize;
     while let Some(&c) = chars.get(j) {
         j += 1;
@@ -775,6 +786,287 @@ pub fn split_statements(text: &str) -> Vec<Statement> {
     out
 }
 
+/// Multi-character operators [`tokenize`] keeps whole, longest first so the
+/// longest match wins (`..=` before `..`, `<<=` before `<=`). The shifts
+/// `<<` / `>>` are deliberately absent: they stay two `<` / `>` tokens so the
+/// closers of nested generics (`Vec<Vec<u8>>`) count one by one, as a lint
+/// tracking angle depth needs; `<<=` / `>>=` are kept whole so a lone `=`
+/// token is always an assignment.
+pub const MULTI_CHAR_PUNCT: &[&str] = &[
+    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
+    "*=", "/=", "%=", "^=", "&=", "|=", "..",
+];
+
+/// What kind of text a [`Token`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// An ASCII identifier or keyword: `[A-Za-z_][A-Za-z0-9_]*` (so `_`,
+    /// `self`, and `fn` are identifiers too).
+    Ident,
+    /// A numeric literal: a digit, then `[A-Za-z0-9_]*` (`1u8`, `0xff`,
+    /// `1_000`), plus one fractional part when a `.` is directly followed by
+    /// a digit (`1.5`, `2.0f64`) and the number does not follow a lone `.`
+    /// (a tuple index; `..` is a range, so `0.0..1.5` keeps `1.5`). `0..10` is `0`, `..`, `10`; `x.0.y` keeps `0` alone, and
+    /// `t.0.1` reads as `t`, `.`, `0`, `.`, `1`.
+    Number,
+    /// One of [`MULTI_CHAR_PUNCT`], or any other single non-whitespace
+    /// character (non-ASCII ones included).
+    Punct,
+}
+
+/// One token of blanked source, as [`tokenize`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub text: String,
+    /// Char index of the token's first character in the tokenized input.
+    pub start: usize,
+    /// Char index just past the token.
+    pub end: usize,
+    /// 1-based source line the token starts on.
+    pub line: usize,
+    /// How many `(` / `[` / `{` enclose the token. An opener and its closer
+    /// carry the depth outside them; a closer with nothing open stays at 0.
+    pub depth: usize,
+}
+
+impl Token {
+    /// Whether the token's text is exactly `text`.
+    #[must_use]
+    pub fn is(&self, text: &str) -> bool {
+        self.text == text
+    }
+
+    /// Whether the token is an identifier or keyword.
+    #[must_use]
+    pub fn is_ident(&self) -> bool {
+        self.kind == TokenKind::Ident
+    }
+
+    /// Whether the token is an identifier or a number (what a plain
+    /// `[A-Za-z0-9_]+` word scan would return).
+    #[must_use]
+    pub fn is_word(&self) -> bool {
+        self.kind != TokenKind::Punct
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The one Rust token reader the source lints share. Reads blanked text (see
+/// [`lex`]: comments and literals already spaces, so nothing quoted can
+/// count) into identifiers, numbers, and punctuation, keeping every
+/// [`MULTI_CHAR_PUNCT`] operator whole and recording each token's char
+/// offsets, line, and bracket depth. `first_line` is the source line of
+/// `chars[0]`. Whitespace separates tokens and is dropped.
+///
+/// Not handled, by design: raw identifiers (`r#type` reads as `r`, `#`,
+/// `type`), exponent signs (`1e-5` reads as `1e`, `-`, `5`), and lifetimes —
+/// [`lex`] blanks a lifetime's `'`, so `'a` reads as the identifier `a`
+/// (check the raw source at `start - 1` when that matters).
+#[must_use]
+pub fn tokenize_from(chars: &[char], first_line: usize) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut line = first_line;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c.is_whitespace() {
+            line += usize::from(c == '\n');
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let kind = if c.is_ascii_alphabetic() || c == '_' {
+            while chars.get(i).copied().is_some_and(is_word_char) {
+                i += 1;
+            }
+            TokenKind::Ident
+        } else if c.is_ascii_digit() {
+            while chars.get(i).copied().is_some_and(is_word_char) {
+                i += 1;
+            }
+            let tuple_index =
+                start > 0 && chars[start - 1] == '.' && (start < 2 || chars[start - 2] != '.');
+            if !tuple_index
+                && chars.get(i) == Some(&'.')
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit)
+            {
+                i += 1;
+                while chars.get(i).copied().is_some_and(is_word_char) {
+                    i += 1;
+                }
+            }
+            TokenKind::Number
+        } else {
+            let rest = &chars[i..];
+            let width = MULTI_CHAR_PUNCT
+                .iter()
+                .find(|p| rest.len() >= p.len() && p.chars().zip(rest).all(|(a, b)| a == *b))
+                .map_or(1, |p| p.len());
+            i += width;
+            TokenKind::Punct
+        };
+        let text: String = chars[start..i].iter().collect();
+        let token_depth = match text.as_str() {
+            "(" | "[" | "{" => {
+                depth += 1;
+                depth - 1
+            }
+            ")" | "]" | "}" => {
+                depth = depth.saturating_sub(1);
+                depth
+            }
+            _ => depth,
+        };
+        out.push(Token {
+            kind,
+            text,
+            start,
+            end: i,
+            line,
+            depth: token_depth,
+        });
+    }
+    out
+}
+
+/// [`tokenize_from`] with `chars[0]` on line 1.
+#[must_use]
+pub fn tokenize(chars: &[char]) -> Vec<Token> {
+    tokenize_from(chars, 1)
+}
+
+/// [`tokenize`] over a `&str`; offsets are still char indices.
+#[must_use]
+pub fn tokenize_str(text: &str) -> Vec<Token> {
+    let chars: Vec<char> = text.chars().collect();
+    tokenize(&chars)
+}
+
+impl Statement {
+    /// The statement's tokens with source lines: [`Token::line`] is the line
+    /// in the file, and offsets are char indices into [`Statement::text`].
+    #[must_use]
+    pub fn tokens(&self) -> Vec<Token> {
+        let chars: Vec<char> = self.text.chars().collect();
+        let lead = chars
+            .iter()
+            .take_while(|c| c.is_whitespace())
+            .filter(|c| **c == '\n')
+            .count();
+        tokenize_from(&chars, self.line.saturating_sub(lead).max(1))
+    }
+}
+
+/// Index of the token closing the `(` / `[` / `{` token at `open`, counting
+/// only brackets of that kind; `None` when `open` is not an opener or never
+/// closes.
+#[must_use]
+pub fn matching_close(tokens: &[Token], open: usize) -> Option<usize> {
+    let (opener, closer) = match tokens.get(open)?.text.as_str() {
+        "(" => ("(", ")"),
+        "[" => ("[", "]"),
+        "{" => ("{", "}"),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        if t.is(opener) {
+            depth += 1;
+        } else if t.is(closer) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// The closing delimiter matching an opening one, on blanked text.
+fn closing_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+/// Index of the delimiter closing the `(…)` / `[…]` / `{…}` group that opens
+/// at `open`, on blanked text (so a delimiter inside a comment or literal
+/// never counts): [`skip_group`] as an index into the text. Only the group's
+/// own delimiter pair is counted. `None` when `chars[open]` is not an opening
+/// delimiter or the group never closes.
+#[must_use]
+pub fn group_close(chars: &[char], open: usize) -> Option<usize> {
+    let open_c = *chars.get(open)?;
+    let close_c = closing_of(open_c)?;
+    let past = skip_group(chars, open, open_c, close_c);
+    let group = &chars[open..past];
+    let opens = group.iter().filter(|&&c| c == open_c).count();
+    let closes = group.iter().filter(|&&c| c == close_c).count();
+    (opens == closes).then(|| past - 1)
+}
+
+/// Index of the delimiter opening the group whose closing `)` / `]` / `}`
+/// sits at `close` — the reverse of [`group_close`].
+#[must_use]
+pub fn group_open(chars: &[char], close: usize) -> Option<usize> {
+    let close_c = *chars.get(close)?;
+    let open_c = ['(', '[', '{']
+        .into_iter()
+        .find(|&o| closing_of(o) == Some(close_c))?;
+    let mut depth = 0usize;
+    for k in (0..=close).rev() {
+        if chars[k] == close_c {
+            depth += 1;
+        } else if chars[k] == open_c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Maps char offsets to 1-based line numbers in O(log n) per lookup, so a
+/// lint reporting many offsets in a large file does not rescan it from the
+/// start for each one.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    /// Char offset at which each line starts; `starts[0] == 0`.
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    /// Indexes the line starts of `chars` (blanked or not: blanking keeps
+    /// every newline).
+    #[must_use]
+    pub fn new(chars: &[char]) -> Self {
+        let starts = std::iter::once(0)
+            .chain(
+                chars
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c == '\n')
+                    .map(|(k, _)| k + 1),
+            )
+            .collect();
+        Self { starts }
+    }
+
+    /// 1-based line holding char offset `offset`.
+    #[must_use]
+    pub fn line(&self, offset: usize) -> usize {
+        self.starts.partition_point(|&start| start <= offset)
+    }
+}
+
 /// The cargo workspace root (the directory holding `Cargo.toml` and
 /// `crates/`), resolved from this crate's own manifest directory so every
 /// lint gets the same answer whichever crate it lives in.
@@ -876,6 +1168,7 @@ mod tests {
 
     use super::*;
 
+    #[track_caller]
     fn line_of(src: &str, needle: &str) -> usize {
         let Some(index) = src.lines().position(|l| l.contains(needle)) else {
             panic!("fixture has no line containing {needle:?}")
@@ -1448,5 +1741,230 @@ let h = 8;
                 assert!(msg.contains(&tests.display().to_string()), "{msg}");
             }
         }
+    }
+
+    fn kinds_and_texts(text: &str) -> Vec<(TokenKind, String)> {
+        tokenize_str(text)
+            .into_iter()
+            .map(|t| (t.kind, t.text))
+            .collect()
+    }
+
+    fn texts(text: &str) -> Vec<String> {
+        tokenize_str(text).into_iter().map(|t| t.text).collect()
+    }
+
+    #[test]
+    fn tokenize_separates_identifiers_numbers_and_punctuation() {
+        use TokenKind::{Ident, Number, Punct};
+        let got = kinds_and_texts("let _x1 = 1u8 + 0xff_u32 * 1.5 - 2.0f64;");
+        let want = [
+            (Ident, "let"),
+            (Ident, "_x1"),
+            (Punct, "="),
+            (Number, "1u8"),
+            (Punct, "+"),
+            (Number, "0xff_u32"),
+            (Punct, "*"),
+            (Number, "1.5"),
+            (Punct, "-"),
+            (Number, "2.0f64"),
+            (Punct, ";"),
+        ];
+        assert_eq!(got, want.map(|(k, t)| (k, t.to_string())).to_vec());
+        assert_eq!(texts("0..10"), ["0", "..", "10"]);
+        assert_eq!(texts("0..=9"), ["0", "..=", "9"]);
+        assert_eq!(texts("x.0.y"), ["x", ".", "0", ".", "y"]);
+        assert_eq!(texts("t.0.1.data"), ["t", ".", "0", ".", "1", ".", "data"]);
+        assert_eq!(texts("x = 0.5"), ["x", "=", "0.5"]);
+        assert_eq!(texts("0.0..1.5"), ["0.0", "..", "1.5"]);
+        assert_eq!(texts("1.max(2)"), ["1", ".", "max", "(", "2", ")"]);
+        assert_eq!(texts("1e-5"), ["1e", "-", "5"]);
+        assert_eq!(texts("r#type"), ["r", "#", "type"]);
+        assert_eq!(kinds_and_texts("_")[0], (Ident, "_".to_string()));
+    }
+
+    #[test]
+    fn tokenize_keeps_every_multi_char_operator_whole() {
+        for op in MULTI_CHAR_PUNCT {
+            assert_eq!(texts(&format!("a {op} b")), ["a", op, "b"], "{op}");
+            assert_eq!(texts(&format!("a{op}b")), ["a", op, "b"], "{op} unspaced");
+        }
+        assert_eq!(texts("a..=b"), ["a", "..=", "b"]);
+        assert_eq!(texts("a<<=b"), ["a", "<<=", "b"]);
+        assert_eq!(texts("a ... b"), ["a", "...", "b"]);
+        assert_eq!(texts("A::B::C"), ["A", "::", "B", "::", "C"]);
+        assert_eq!(texts("A :: B"), ["A", "::", "B"]);
+        assert_eq!(texts("a & &b"), ["a", "&", "&", "b"]);
+        assert_eq!(texts("a | |b"), ["a", "|", "|", "b"]);
+    }
+
+    #[test]
+    fn tokenize_splits_shifts_so_generic_closers_count_one_by_one() {
+        assert_eq!(
+            texts("Vec<Vec<u8>>"),
+            ["Vec", "<", "Vec", "<", "u8", ">", ">"]
+        );
+        assert_eq!(texts("a << b >> c"), ["a", "<", "<", "b", ">", ">", "c"]);
+        // Longest match wins, as in rustc: a generic closer glued to `=` reads
+        // as `>>=`.
+        assert_eq!(
+            texts("let v: Vec<Vec<u8>>= x"),
+            ["let", "v", ":", "Vec", "<", "Vec", "<", "u8", ">>=", "x"]
+        );
+    }
+
+    #[test]
+    fn tokenize_reads_closure_bars_and_boolean_operators_alike() {
+        assert_eq!(texts("a || b && c"), ["a", "||", "b", "&&", "c"]);
+        assert_eq!(texts("let f = || x;"), ["let", "f", "=", "||", "x", ";"]);
+        assert_eq!(texts("move |a| a"), ["move", "|", "a", "|", "a"]);
+        assert_eq!(texts("&&x"), ["&&", "x"]);
+        assert_eq!(texts("a |= b"), ["a", "|=", "b"]);
+    }
+
+    #[test]
+    fn tokenize_tracks_bracket_depth() {
+        let toks = tokenize_str("f(a, [b, {c}]) ) d");
+        let depth: Vec<(&str, usize)> = toks.iter().map(|t| (t.text.as_str(), t.depth)).collect();
+        assert_eq!(
+            depth,
+            [
+                ("f", 0),
+                ("(", 0),
+                ("a", 1),
+                (",", 1),
+                ("[", 1),
+                ("b", 2),
+                (",", 2),
+                ("{", 2),
+                ("c", 3),
+                ("}", 2),
+                ("]", 1),
+                (")", 0),
+                (")", 0),
+                ("d", 0),
+            ]
+        );
+        assert!(tokenize_str(") ] } x").iter().all(|t| t.depth == 0));
+    }
+
+    #[test]
+    fn tokenize_records_char_offsets_and_lines() {
+        let text = "é a\n  ::b\n\n(c)";
+        let chars: Vec<char> = text.chars().collect();
+        let toks = tokenize(&chars);
+        let got: Vec<(&str, usize, usize, usize)> = toks
+            .iter()
+            .map(|t| (t.text.as_str(), t.start, t.end, t.line))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("é", 0, 1, 1),
+                ("a", 2, 3, 1),
+                ("::", 6, 8, 2),
+                ("b", 8, 9, 2),
+                ("(", 11, 12, 4),
+                ("c", 12, 13, 4),
+                (")", 13, 14, 4),
+            ]
+        );
+        for t in &toks {
+            assert_eq!(chars[t.start..t.end].iter().collect::<String>(), t.text);
+        }
+        assert_eq!(tokenize_from(&chars, 10)[4].line, 13);
+        assert_eq!(tokenize_str("é")[0].kind, TokenKind::Punct);
+    }
+
+    #[test]
+    fn tokenize_reads_blanked_source() {
+        let src = "fn f<'a>(x: &'a str) -> bool { x == \"a || b\" } // c && d\n";
+        let blanked = lex(src).blanked;
+        assert_eq!(
+            texts(&blanked),
+            [
+                "fn", "f", "<", "a", ">", "(", "x", ":", "&", "a", "str", ")", "->", "bool", "{",
+                "x", "==", "}",
+            ]
+        );
+    }
+
+    #[test]
+    fn statement_tokens_carry_source_lines() {
+        let src = "fn f() {\n    let a = b\n        && c;\n\n    g(\n      d)\n}\n";
+        let statements = split_statements(&lex(src).blanked);
+        let lines: Vec<Vec<(String, usize)>> = statements
+            .iter()
+            .map(|s| s.tokens().into_iter().map(|t| (t.text, t.line)).collect())
+            .collect();
+        let owned = |v: &[(&str, usize)]| {
+            v.iter()
+                .map(|(t, l)| ((*t).to_string(), *l))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lines,
+            [
+                owned(&[("fn", 1), ("f", 1), ("(", 1), (")", 1)]),
+                owned(&[
+                    ("let", 2),
+                    ("a", 2),
+                    ("=", 2),
+                    ("b", 2),
+                    ("&&", 3),
+                    ("c", 3)
+                ]),
+                owned(&[("g", 5), ("(", 5), ("d", 6), (")", 6)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_close_counts_only_the_opener_kind() {
+        let toks = tokenize_str("( a [ b ) ] ( c )");
+        assert_eq!(matching_close(&toks, 0), Some(4));
+        assert_eq!(matching_close(&toks, 2), Some(5));
+        assert_eq!(matching_close(&toks, 6), Some(8));
+        assert_eq!(matching_close(&toks, 1), None);
+        assert_eq!(matching_close(&tokenize_str("{ ( }"), 1), None);
+        assert_eq!(matching_close(&tokenize_str("{ { } }"), 0), Some(3));
+    }
+
+    #[test]
+    fn skip_group_ends_past_the_matching_closer() {
+        let chars: Vec<char> = "x(a(b)c)d".chars().collect();
+        assert_eq!(skip_group(&chars, 1, '(', ')'), 8);
+        let chars: Vec<char> = "{ a { } ".chars().collect();
+        assert_eq!(skip_group(&chars, 0, '{', '}'), chars.len());
+    }
+}
+
+#[cfg(test)]
+mod group_and_line_tests {
+    use super::*;
+
+    #[test]
+    fn group_close_and_open_match_their_own_pair_only() {
+        let chars: Vec<char> = "f(a[1], {b(2)}) [x]".chars().collect();
+        assert_eq!(group_close(&chars, 1), Some(14));
+        assert_eq!(group_close(&chars, 3), Some(5));
+        assert_eq!(group_close(&chars, 8), Some(13));
+        assert_eq!(group_open(&chars, 14), Some(1));
+        assert_eq!(group_open(&chars, 13), Some(8));
+        assert_eq!(group_open(&chars, 18), Some(16));
+        assert_eq!(group_close(&chars, 0), None, "`f` is not a delimiter");
+        let unclosed: Vec<char> = "{ (".chars().collect();
+        assert_eq!(group_close(&unclosed, 0), None);
+        let ends_on_inner_close: Vec<char> = "{ { }".chars().collect();
+        assert_eq!(group_close(&ends_on_inner_close, 0), None);
+    }
+
+    #[test]
+    fn line_index_maps_offsets_to_one_based_lines() {
+        let chars: Vec<char> = "ab\nc\n\nd".chars().collect();
+        let index = LineIndex::new(&chars);
+        let lines: Vec<usize> = (0..chars.len()).map(|k| index.line(k)).collect();
+        assert_eq!(lines, vec![1, 1, 1, 2, 2, 3, 4]);
     }
 }

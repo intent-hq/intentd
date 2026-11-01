@@ -81,6 +81,7 @@ impl Fixture {
         Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap()
     }
 
+    #[track_caller]
     fn assert_owned(&self) {
         let file = OpenOptions::new()
             .read(true)
@@ -162,6 +163,7 @@ impl Fixture {
         self.run_expected(command, "doctor", success)
     }
 
+    #[track_caller]
     fn doctor(&self) {
         let stdout = self.doctor_output(true);
         assert!(stdout.contains("migrations current"), "{stdout}");
@@ -582,6 +584,30 @@ async fn diagnostic_handle_rejects_writes_and_checkpoint() {
     let db = fixture.data_dir().join("intentd.db");
     let writer = Store::open(&db).await.unwrap();
     seed(&writer).await;
+    // Precondition: the WAL holds frames not yet checkpointed, so a
+    // checkpoint would have work to do. Otherwise the outcome depends on the
+    // schema size (the number of migrations): once the WAL passes SQLite's
+    // 1000-page automatic checkpoint while readers keep it from restarting,
+    // every commit backfills it fully, and a read-only checkpoint of a fully
+    // backfilled WAL succeeds as a no-op. The single-connection write pool
+    // stops auto-checkpointing, then writes un-checkpointed frames.
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE workspace SET title = 'Synthetic (updated)' WHERE id = 'synthetic-workspace'",
+    )
+    .execute(writer.write_pool())
+    .await
+    .unwrap();
+    let shm = fs::read(db.with_extension("db-shm")).unwrap();
+    let max_frame = u32::from_ne_bytes(shm[16..20].try_into().unwrap());
+    let backfilled = u32::from_ne_bytes(shm[96..100].try_into().unwrap());
+    assert!(
+        max_frame > backfilled,
+        "fixture needs un-checkpointed WAL frames (mxFrame {max_frame}, nBackfill {backfilled})"
+    );
     let diagnostic = intent_store::DiagnosticStore::open(&db).await.unwrap();
     assert!(sqlx::query("DELETE FROM agent_message_payload")
         .execute(diagnostic.read_pool())

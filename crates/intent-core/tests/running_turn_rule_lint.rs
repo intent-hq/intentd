@@ -70,7 +70,7 @@ use std::path::{Component, Path, PathBuf};
 
 use intentd_test_support::source_lint::{
     blank_cfg_test_items, cfg_test_item_ranges, crate_src_files, lex, markers_by_line,
-    split_statements, statement_line, word_at, workspace_root, Marker,
+    split_statements, statement_line, workspace_root, Marker, Statement, Token, TokenKind,
 };
 
 const RUNNING_TURN_VARIANTS: &[&str] = &["Pending", "Active", "Processing"];
@@ -91,95 +91,49 @@ struct Hit {
     marker_malformed: bool,
 }
 
-/// The tokens an or-group is made of. Everything that is neither a path, a
-/// `|`, nor one of the alternative wrappers (`&`, `(`, `)`) is `Other` and
-/// ends any group in progress.
+/// The pieces an or-group is made of, read from the shared token reader.
+/// Everything that is neither a path, a `|`, nor one of the alternative
+/// wrappers (`&`, `(`, `)`) is `Other` and ends any group in progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
+enum Piece {
     /// `A::B::C` (whitespace allowed around `::`), as its segments.
     Path(Vec<String>),
-    /// A single `|`; `||` is `Other`.
+    /// A single `|`; `||` and `|=` are `Other`.
     Pipe,
-    /// A single `&`; `&&` is `Other`.
+    /// A single `&`; `&&` and `&=` are `Other`.
     Amp,
     LParen,
     RParen,
     Other,
 }
 
-/// Tokens of one statement's text with the 1-based line each starts on
-/// (`first_line` is the line of the statement's first non-whitespace
-/// character, as `split_statements` records it).
-fn tokenize(text: &str, first_line: usize) -> Vec<(Token, usize)> {
-    let chars: Vec<char> = text.trim_start().chars().collect();
+/// Pieces of one statement with the source line each starts on: identifiers
+/// joined across `::` into paths, the or-group punctuation, and `Other` for
+/// every remaining token.
+fn pieces(statement: &Statement) -> Vec<(Piece, usize)> {
+    let tokens = statement.tokens();
     let mut out = Vec::new();
-    let mut line = first_line;
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\n' {
-            line += 1;
-            i += 1;
-        } else if c.is_whitespace() {
-            i += 1;
-        } else if c.is_ascii_alphabetic() || c == '_' {
-            let start_line = line;
-            let mut segments = Vec::new();
-            loop {
-                let (word, next) = word_at(&chars, i).expect("identifier start");
-                segments.push(word);
-                i = next;
-                let mut j = i;
-                let mut newlines = 0usize;
-                while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-                    newlines += usize::from(chars[j] == '\n');
-                    j += 1;
+    while let Some(token) = tokens.get(i) {
+        i += 1;
+        let piece = match (token.kind, token.text.as_str()) {
+            (TokenKind::Ident, _) => {
+                let mut segments = vec![token.text.clone()];
+                while tokens.get(i).is_some_and(|t| t.is("::"))
+                    && tokens.get(i + 1).is_some_and(Token::is_ident)
+                {
+                    segments.push(tokens[i + 1].text.clone());
+                    i += 2;
                 }
-                if chars.get(j) == Some(&':') && chars.get(j + 1) == Some(&':') {
-                    j += 2;
-                    let mut k = j;
-                    while chars.get(k).is_some_and(|c| c.is_whitespace()) {
-                        newlines += usize::from(chars[k] == '\n');
-                        k += 1;
-                    }
-                    if chars
-                        .get(k)
-                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
-                    {
-                        line += newlines;
-                        i = k;
-                        continue;
-                    }
-                }
-                break;
+                Piece::Path(segments)
             }
-            out.push((Token::Path(segments), start_line));
-        } else if c.is_ascii_digit() {
-            while chars
-                .get(i)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-            {
-                i += 1;
-            }
-            out.push((Token::Other, line));
-        } else if c == '|' || c == '&' {
-            if chars.get(i + 1) == Some(&c) {
-                out.push((Token::Other, line));
-                i += 2;
-            } else {
-                let token = if c == '|' { Token::Pipe } else { Token::Amp };
-                out.push((token, line));
-                i += 1;
-            }
-        } else {
-            let token = match c {
-                '(' => Token::LParen,
-                ')' => Token::RParen,
-                _ => Token::Other,
-            };
-            out.push((token, line));
-            i += 1;
-        }
+            (TokenKind::Punct, "|") => Piece::Pipe,
+            (TokenKind::Punct, "&") => Piece::Amp,
+            (TokenKind::Punct, "(") => Piece::LParen,
+            (TokenKind::Punct, ")") => Piece::RParen,
+            _ => Piece::Other,
+        };
+        out.push((piece, token.line));
     }
     out
 }
@@ -216,28 +170,28 @@ impl OrGroup {
 /// as `(` were opened. Returns the path, its line, and the index after the
 /// alternative; `None` when the tokens at `i` do not form one (so a `(`
 /// that wraps a whole group, `(A | B)`, is not an alternative wrapper).
-fn alternative_at(tokens: &[(Token, usize)], i: usize) -> Option<(Vec<String>, usize, usize)> {
+fn alternative_at(tokens: &[(Piece, usize)], i: usize) -> Option<(Vec<String>, usize, usize)> {
     let mut j = i;
     let mut parens = 0usize;
     let (path, line) = loop {
         match tokens.get(j)? {
-            (Token::LParen, _) => {
+            (Piece::LParen, _) => {
                 parens += 1;
                 j += 1;
             }
-            (Token::Amp, _) => {
+            (Piece::Amp, _) => {
                 j += 1;
-                if matches!(tokens.get(j), Some((Token::Path(p), _)) if p == &["mut"]) {
+                if matches!(tokens.get(j), Some((Piece::Path(p), _)) if p == &["mut"]) {
                     j += 1;
                 }
             }
-            (Token::Path(p), line) => break (p.clone(), *line),
+            (Piece::Path(p), line) => break (p.clone(), *line),
             _ => return None,
         }
     };
     j += 1;
     for _ in 0..parens {
-        if !matches!(tokens.get(j), Some((Token::RParen, _))) {
+        if !matches!(tokens.get(j), Some((Piece::RParen, _))) {
             return None;
         }
         j += 1;
@@ -245,7 +199,7 @@ fn alternative_at(tokens: &[(Token, usize)], i: usize) -> Option<(Vec<String>, u
     Some((path, line, j))
 }
 
-fn or_groups(tokens: &[(Token, usize)]) -> Vec<OrGroup> {
+fn or_groups(tokens: &[(Piece, usize)]) -> Vec<OrGroup> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -255,7 +209,7 @@ fn or_groups(tokens: &[(Token, usize)]) -> Vec<OrGroup> {
         };
         let mut paths = vec![first];
         i = next;
-        while tokens.get(i).is_some_and(|(t, _)| *t == Token::Pipe) {
+        while tokens.get(i).is_some_and(|(t, _)| *t == Piece::Pipe) {
             match alternative_at(tokens, i + 1) {
                 Some((p, _, next)) => {
                     paths.push(p);
@@ -296,7 +250,7 @@ fn scan_source(src: &str) -> Vec<Hit> {
     let marker_at = |line: usize| markers.get(line - 1).copied().unwrap_or(Marker::Absent);
     let mut hits = Vec::new();
     for statement in split_statements(&blanked) {
-        for group in or_groups(&tokenize(&statement.text, statement.line)) {
+        for group in or_groups(&pieces(&statement)) {
             if !is_running_turn_triple(&group) {
                 continue;
             }
@@ -445,6 +399,7 @@ fn running_turn_rule_is_only_spelled_in_agent_status() {
 }
 
 /// Sorted non-test sources of the SQL rule's scope, `crates/intent-store/src`.
+#[track_caller]
 fn sql_literal_sources(root: &Path) -> Vec<PathBuf> {
     let dir: PathBuf = SQL_LITERAL_DIR.iter().collect();
     let files: Vec<PathBuf> = crate_src_files(root)

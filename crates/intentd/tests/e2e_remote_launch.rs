@@ -171,6 +171,7 @@ async fn event(ws: &mut common::TlsWs, kind: &str) -> Value {
     .unwrap_or_else(|_| panic!("no {kind} event"))
 }
 
+#[track_caller]
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

@@ -228,6 +228,22 @@ impl ProfileActivation {
         state.live.get(agent_id).is_some_and(|p| state.stale(p))
     }
 
+    /// Whether what `agent_id`'s process reports about `reference`'s quota
+    /// applies to the saved settings: false when its live process under
+    /// `reference` started with settings that were edited or deleted since.
+    /// True when no such process is registered (nothing says otherwise).
+    pub(crate) fn runs_saved_settings(&self, agent_id: &AgentId, reference: &str) -> bool {
+        let Some(profile_id) = profile_id_of(reference) else {
+            return true;
+        };
+        let state = self.state.lock().unwrap();
+        state
+            .live
+            .get(agent_id)
+            .filter(|p| p.profile_id == profile_id)
+            .is_none_or(|p| state.saved.get(&profile_id) == Some(&p.fingerprint))
+    }
+
     /// The fingerprint `agent_id`'s live process started with, when it runs
     /// under `reference`.
     pub(crate) fn live_fingerprint(&self, agent_id: &AgentId, reference: &str) -> Option<String> {

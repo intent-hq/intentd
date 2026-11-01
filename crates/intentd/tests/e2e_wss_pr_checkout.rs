@@ -251,6 +251,7 @@ impl SourceControl for RecordingForge {
     }
 }
 
+#[track_caller]
 fn git(path: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")

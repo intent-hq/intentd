@@ -305,13 +305,21 @@ impl Conn {
             .collect()
     }
 
-    /// Wait for one response and assert it succeeded.
-    async fn expect_ok(&mut self, id: i64) {
-        let [(_, frame)] = self.responses(&[id]).await.try_into().unwrap();
-        assert!(
-            frame.get("error").is_none(),
-            "request {id} must succeed: {frame}"
-        );
+    /// Wait for one response and assert it succeeded. A sync
+    /// `#[track_caller]` fn returning the future, not an `async fn`, so the
+    /// failure names the calling test line: the attribute is a no-op on an
+    /// `async fn` (rust-lang/rust#110011).
+    #[track_caller]
+    fn expect_ok(&mut self, id: i64) -> impl std::future::Future<Output = ()> + '_ {
+        let caller = std::panic::Location::caller();
+        async move {
+            let _guard = common::CallerOnPanic(caller);
+            let [(_, frame)] = self.responses(&[id]).await.try_into().unwrap();
+            assert!(
+                frame.get("error").is_none(),
+                "request {id} must succeed (called at {caller}): {frame}"
+            );
+        }
     }
 
     /// Wait until `count` null-id error frames have arrived, in arrival order.

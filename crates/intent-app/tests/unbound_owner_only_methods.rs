@@ -576,6 +576,7 @@ const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
 /// and inside that child) it answers `false` and the caller runs its
 /// body inline. A re-exec rather than `remove_var`: the harness is
 /// multi-threaded.
+#[track_caller]
 fn reran_unarmed(test: &str) -> bool {
     if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
         return false;

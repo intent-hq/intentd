@@ -43,7 +43,7 @@ pub mod path_utils;
 pub mod placement;
 pub mod process_policy;
 pub mod pull_request_key;
-pub use pull_request_key::pull_request_key;
+pub use pull_request_key::{pull_request_key, PullRequestSelector};
 #[doc(hidden)]
 pub mod queue_visibility_contract;
 pub mod remote_launch;
@@ -93,8 +93,8 @@ pub use clock::{
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{
-    CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, ProviderProfileFailure,
-    Result,
+    CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, PlainFolderPathReason,
+    PlainFolderPathRejection, ProviderProfileFailure, Result,
 };
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
@@ -151,13 +151,13 @@ pub use model::{
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
     CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
-    CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, Hook,
-    HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
+    CreatedTaskEntry, CrossWorkspaceSearch, DiskUsageBreakdownEntry, Draft, Event, EventActor,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts,
+    GitPullResult, GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,

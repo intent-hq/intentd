@@ -6,6 +6,7 @@ fn tool(code: &str) -> Value {
     json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_api","arguments":{"code":code,"summary":"Verify button-free cursor movement"}}})
 }
 
+#[track_caller]
 fn assert_tool_error(response: &Value, code: &str) {
     assert_eq!(response["result"]["isError"], true, "{response}");
     assert!(

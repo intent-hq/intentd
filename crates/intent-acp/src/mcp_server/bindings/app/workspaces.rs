@@ -21,6 +21,10 @@ pub(crate) const PRELUDE: &str = r"
     ws.app.workspaces = {
         list: (options) => host({ method: 'app.workspaces.list', args: options || {} }),
         get: (id) => host({ method: 'app.workspaces.get', args: { id } }),
+        search: (options) => host({
+            method: 'app.workspaces.search',
+            args: typeof options === 'string' ? { query: options } : (options || {}),
+        }),
         transfer: (id, options) => {
             if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw new Error('transfer options must be an object');
             return host({ method: 'app.workspaces.transfer', args: { ...(options || {}), id } });
@@ -50,6 +54,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "search" => search(api, workspace_id, args).await,
         "transfer" => transfer(api, args).await,
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
@@ -300,6 +305,47 @@ async fn transfer(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, St
 /// identity, so forge-slug casing (`Intent-HQ` vs `intent-hq`) never excludes a
 /// match. A half that is not filtered on is taken from the workspace row so the
 /// comparison stays a plain `RepoRef` equality.
+/// `ws.app.workspaces.search({ query?, pr?, repository?, includeRetired?,
+/// limit? })` (a bare string is shorthand for `{ query }`): the
+/// `ws.crossWorkspace.search` ranking over every visible workspace in any
+/// repository. `repository` (`"owner/name"`) narrows to one GitHub
+/// repository. Each row gains `link` / `markdownLink`.
+async fn search(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let search = crate::mcp_server::bindings::cross_workspace::parse_search(args)?;
+    let repository = parse_repository(args)?;
+    let mut result = api
+        .app_workspaces_search(workspace_id.clone(), search, repository)
+        .await
+        .map_err(map_err)?;
+    if let Some(rows) = result.get_mut("matches").and_then(Value::as_array_mut) {
+        rows.iter_mut()
+            .for_each(crate::mcp_server::bindings::insert_workspace_links);
+    }
+    Ok(result)
+}
+
+/// `repository: "owner/name"` (surrounding whitespace and a `.git` suffix
+/// tolerated).
+fn parse_repository(args: &Value) -> Result<Option<RepoRef>, String> {
+    let raw = match args.get("repository") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.trim(),
+        Some(_) => return Err("repository must be an \"owner/name\" string".to_string()),
+    };
+    let parsed = raw.split_once('/').and_then(|(owner, name)| {
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        let valid = |part: &str| !part.is_empty() && !part.contains(['/', ' ', '#']);
+        (valid(owner) && valid(name)).then(|| RepoRef::new(owner, name))
+    });
+    parsed
+        .map(Some)
+        .ok_or_else(|| format!("repository `{raw}` must be \"owner/name\""))
+}
+
 fn repo_filter_matches(ws: &Workspace, owner: Option<&str>, name: Option<&str>) -> bool {
     match (owner, name) {
         (None, None) => true,
@@ -1230,7 +1276,14 @@ mod tests {
         events: Arc<Mutex<Vec<PublishEvent>>>,
         plan_calls: Arc<Mutex<Vec<WorkspaceId>>>,
         plan_error: bool,
+        search_calls: Arc<Mutex<Vec<SearchCall>>>,
     }
+
+    type SearchCall = (
+        WorkspaceId,
+        intent_core::CrossWorkspaceSearch,
+        Option<RepoRef>,
+    );
 
     impl FakeApi {
         fn published_events(&self) -> Vec<PublishEvent> {
@@ -1269,6 +1322,24 @@ mod tests {
             Box::pin(async move {
                 events.lock().unwrap().push(event);
                 Ok(())
+            })
+        }
+
+        fn app_workspaces_search(
+            &self,
+            workspace_id: WorkspaceId,
+            search: intent_core::CrossWorkspaceSearch,
+            repository: Option<RepoRef>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.search_calls
+                .lock()
+                .unwrap()
+                .push((workspace_id, search, repository));
+            Box::pin(async {
+                Ok(json!({
+                    "matches": [{ "id": "ws-fe", "title": "Login polish", "repository": "intent-hq/cloudlands-fe" }],
+                    "truncated": false,
+                }))
             })
         }
 
@@ -1430,6 +1501,70 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// `app.workspaces.search` peels `repository` beside the shared
+    /// crossWorkspace search arguments and adds workspace links to rows.
+    #[tokio::test]
+    async fn search_parses_arguments_and_links_rows() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief = WorkspaceId::from_string(intent_core::CHIEF_WORKSPACE_ID);
+        let v = dispatch(
+            &api,
+            &chief,
+            None,
+            "search",
+            &json!({ "query": " login ", "pr": "#7", "repository": " Intent-HQ/cloudlands-fe.git ", "limit": 5 }),
+        )
+        .await
+        .unwrap();
+        assert!(v["matches"][0]["link"].as_str().unwrap().contains("ws-fe"));
+        assert!(v["matches"][0]["markdownLink"].is_string());
+        let calls = fake.search_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (caller, search, repository) = &calls[0];
+        assert!(caller.is_chief());
+        assert_eq!(search.query.as_deref(), Some("login"));
+        assert!(search.pr.is_some());
+        assert_eq!(search.limit, 5);
+        assert_eq!(
+            repository.as_ref(),
+            Some(&RepoRef::new("intent-hq", "cloudlands-fe"))
+        );
+
+        dispatch(&api, &chief, None, "search", &json!({ "pr": 12 }))
+            .await
+            .unwrap();
+        assert_eq!(fake.search_calls.lock().unwrap()[1].2, None);
+
+        for (args, needle) in [
+            (
+                json!({ "query": "x", "repository": "cloudlands-fe" }),
+                "owner/name",
+            ),
+            (json!({ "query": "x", "repository": "a/b/c" }), "owner/name"),
+            (json!({ "query": "x", "repository": "/b" }), "owner/name"),
+            (json!({ "query": "x", "repository": 7 }), "owner/name"),
+            (json!({ "repository": "a/b" }), "non-empty query"),
+        ] {
+            let err = dispatch(&api, &chief, None, "search", &args)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{args}: {err}");
+        }
+        assert_eq!(fake.search_calls.lock().unwrap().len(), 2);
+
+        let err = dispatch(
+            &api,
+            &WorkspaceId::from_string("amber-forest"),
+            None,
+            "search",
+            &json!({ "query": "x" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "ws.app.* is only available in the Assistant workspace");
     }
 
     #[tokio::test]

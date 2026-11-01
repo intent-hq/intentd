@@ -73,6 +73,7 @@ class PolicyTests(unittest.TestCase):
                         shutil.copy(SCRIPTS / script, scripts)
                         if WRAPPER.exists():
                             shutil.copy(WRAPPER, scripts)
+                        shutil.copy(SCRIPTS / "ci-killed-rustc-retry.sh", scripts)
                         cargo = bin_dir / "cargo"
                         cargo.write_text(
                             f"#!{sys.executable} -S\n"

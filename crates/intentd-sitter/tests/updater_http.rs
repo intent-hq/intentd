@@ -1054,6 +1054,7 @@ fn install_with_endpoint(
     (dir, paths, outcome)
 }
 
+#[track_caller]
 fn assert_installed_from_github(outcome: &UpdateOutcome, paths: &SitterPaths) {
     assert_eq!(
         *outcome,

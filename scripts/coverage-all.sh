@@ -33,7 +33,10 @@ echo "Running all workspace tests with coverage instrumentation (nextest)..."
 # failure left 10424/15393 tests unrun), yet stop a systemic break (every e2e
 # test hanging to its 180s kill) well before the step timeout. The exit
 # status still fails the job.
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 --workspace
+# In CI, ci-killed-rustc-retry.sh retries the build once when the runner
+# kills rustc with no compiler error (an out-of-memory kill); locally it
+# runs the command unchanged.
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/ci-killed-rustc-retry.sh "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 --workspace
 
 # Generate lcov.info if requested (for CI artifact upload)
 # Do this BEFORE the floor check so the artifact is available even on failure

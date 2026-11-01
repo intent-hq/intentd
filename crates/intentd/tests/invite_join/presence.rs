@@ -156,6 +156,7 @@ async fn events_through_marker(
     .expect("workspace event barrier")
 }
 
+#[track_caller]
 fn assert_scoped(events: &[Value], workspace: &str) {
     for event in events {
         assert_eq!(event["workspaceId"], workspace, "{event}");

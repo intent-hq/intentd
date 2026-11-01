@@ -54,6 +54,7 @@ impl NativeCheckoutCredentials for Credential {
         }
         Ok(())
     }
+    #[track_caller]
     fn credential(&mut self, url: &str) -> Result<git2::Cred, git2::Error> {
         assert_eq!(url, self.url);
         if self.retired {
@@ -71,6 +72,7 @@ impl NativeCheckoutCredentials for Credential {
     fn rejected(&self) {
         REJECTED.with(|v| v.set(true));
     }
+    #[track_caller]
     fn observe(&self, status: u16, _: Option<std::time::Instant>) {
         self.responses.set(self.responses.get() + 1);
         if self.responses.get() == 2 {
@@ -83,6 +85,7 @@ impl NativeCheckoutCredentials for Credential {
             self.rejected();
         }
     }
+    #[track_caller]
     fn with_basic_auth(
         &mut self,
         url: &str,

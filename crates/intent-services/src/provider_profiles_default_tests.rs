@@ -700,3 +700,49 @@ async fn an_earlier_settings_profile_process_never_demotes_the_saved_profile() {
     fx.svc.auth_owner(&old, &reference).await.demote();
     assert_eq!(crate::provider_auth::cached_profile_auth_verdict(&b), None);
 }
+
+#[intent_test_macros::daemon_test]
+async fn default_reads_return_folder_paths_as_stored() {
+    let fx = Fixture::new().await;
+    let result = fx
+        .update_default(json!({
+            "baseProviderId": "codex",
+            "env": [
+                { "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-personal" },
+                { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+            ],
+        }))
+        .await
+        .unwrap();
+    let expected = json!([
+        { "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-personal" },
+        { "key": "OPENAI_API_KEY", "kind": "set", "value": MASK },
+    ]);
+    assert_eq!(result["defaultConfig"]["env"], expected);
+    assert!(!result.to_string().contains(SECRET));
+    assert_eq!(fx.defaults_row("codex").await["env"], expected);
+
+    let claude = fx
+        .update_default(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "Claude_Config_Dir", "kind": "set", "value": "/accounts/claude" }],
+        }))
+        .await
+        .unwrap();
+    let expected = json!([
+        { "key": "Claude_Config_Dir", "kind": "set", "value": "/accounts/claude" },
+    ]);
+    assert_eq!(claude["defaultConfig"]["env"], expected);
+    assert_eq!(fx.defaults_row("claude-code").await["env"], expected);
+
+    // Launches still expand the saved `~`.
+    let overlay = fx.svc.resolve_profile_env("codex").await.unwrap().unwrap();
+    let expanded = daemon_home().join(".codex-personal");
+    assert_eq!(
+        entries_of(&overlay)[0],
+        (
+            "CODEX_HOME".into(),
+            Some(expanded.to_string_lossy().into_owned())
+        )
+    );
+}

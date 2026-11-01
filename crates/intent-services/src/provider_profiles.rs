@@ -268,12 +268,15 @@ impl StoredEnv {
         }
     }
 
+    /// The wire read form: a non-empty `set` value is [`MASK`] except for
+    /// the account-folder variables ([`is_folder_path_key`]), whose saved
+    /// value is returned as stored (a leading `~` is not expanded).
     fn masked_json(&self) -> Value {
         match self {
             Self::Set { key, value } => json!({
                 "key": key,
                 "kind": "set",
-                "value": if value.is_empty() { "" } else { MASK },
+                "value": if value.is_empty() || is_folder_path_key(key) { value.as_str() } else { MASK },
             }),
             Self::Unset { key } => json!({ "key": key, "kind": "unset" }),
         }
@@ -497,6 +500,16 @@ fn is_valid_key(key: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Whether `key` names an account folder (`CLAUDE_CONFIG_DIR` or
+/// `CODEX_HOME`, ignoring ASCII case). Reads return these values unmasked:
+/// a folder path is not a credential. Launch-log redaction still covers
+/// them through `ProfileEnv::secret_values`.
+fn is_folder_path_key(key: &str) -> bool {
+    intent_acp::profile_env::ACCOUNT_DIR_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
 }
 
 /// Expand a leading `~` in an account-directory value at resolution time
@@ -981,7 +994,7 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
     })
 }
 
-/// The wire `DefaultConfig` of one base provider (masked; no values).
+/// The wire `DefaultConfig` of one base provider (masked except folder paths).
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
     json!({
         "baseProviderId": base,
@@ -2191,16 +2204,22 @@ impl Services {
             }
         }
 
+        // Every saved edit resets the Default's shared quota state before
+        // anyone reads the new revision. The saved fingerprint moves first,
+        // so a process still on the earlier settings cannot mark it again
+        // (see `crate::provider_quota_cache`).
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&key, Some(&env.fingerprint))
+        });
+        self.provider_quota_cache.forget(base);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
             default_changed_event(revision, "default-updated", base, Some(env_changed)),
         )
         .await;
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&key, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&key);
@@ -2494,6 +2513,17 @@ impl Services {
             return Err(e);
         }
 
+        // Running processes keep the settings they started with; only the
+        // saved fingerprint moves. Nothing is interrupted or restarted. It
+        // moves before the profile's shared quota state is reset, so a
+        // process still on the earlier settings cannot mark it again (see
+        // `crate::provider_quota_cache`); every saved edit resets the state
+        // before anyone reads the new revision.
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&profile_id, Some(&env.fingerprint))
+        });
+        self.provider_quota_cache.forget(&meta.provider_ref());
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -2506,12 +2536,7 @@ impl Services {
             ),
         )
         .await;
-        // Running processes keep the settings they started with; only the
-        // saved fingerprint moves. Nothing is interrupted or restarted.
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&profile_id, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&profile_id);
@@ -2580,15 +2605,18 @@ impl Services {
             }
         }
 
+        // An in-progress turn finishes on its process; later turns need a
+        // replacement (`providerReplacementRequired`), not earlier settings.
+        // The saved fingerprint goes before the quota state, so that
+        // process cannot mark the deleted reference again.
+        let changes = self.profile_activation.saved_changed(&profile_id, None);
+        self.provider_quota_cache.forget(&reference);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
             profiles_changed_event(revision, "deleted", &profile_id, None, None),
         )
         .await;
-        // An in-progress turn finishes on its process; later turns need a
-        // replacement (`providerReplacementRequired`), not earlier settings.
-        let changes = self.profile_activation.saved_changed(&profile_id, None);
         self.publish_activation_changes(changes).await;
 
         // Prune the profile's `model.providerDefaults` and

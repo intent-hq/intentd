@@ -87,8 +87,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    cfg_test_items, lex, markers_by_line, rust_files, skip_whitespace, statement_line, Literal,
-    Marker,
+    cfg_test_items, lex, markers_by_line, rust_files, skip_group, skip_whitespace, statement_line,
+    Literal, Marker,
 };
 
 /// Opt-out tag: `// fixed-deadline: allow — <reason>`.
@@ -160,7 +160,7 @@ fn duration_literal_end(chars: &[char], j: usize) -> Option<usize> {
     if ty != "Duration" || !ctor.starts_with("from_") {
         return None;
     }
-    let close = close_paren(chars, expect(chars, j, "(")?);
+    let close = skip_group(chars, expect(chars, j, "(")? - 1, '(', ')');
     (!is_scaled_after(chars, close)).then_some(close)
 }
 
@@ -206,21 +206,6 @@ fn argument_starts(chars: &[char], open: usize) -> Vec<usize> {
         }
     }
     starts
-}
-
-/// Index just past the `)` closing the `(` that ends just before `open`.
-fn close_paren(chars: &[char], open: usize) -> usize {
-    let mut depth = 1usize;
-    let mut j = open;
-    while j < chars.len() && depth > 0 {
-        match chars[j] {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        j += 1;
-    }
-    j
 }
 
 /// Does the `Duration` ending at `j` go on to be scaled at runtime —
@@ -526,7 +511,7 @@ fn normalize_cfg_all_test(chars: &mut [char]) {
             i += 1;
             continue;
         };
-        let args_end = close_paren(chars, args_start);
+        let args_end = skip_group(chars, args_start - 1, '(', ')');
         let args: String = chars[args_start..args_end.saturating_sub(1)]
             .iter()
             .collect();

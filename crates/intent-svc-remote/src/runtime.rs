@@ -28,7 +28,7 @@ use crate::connector::Shared;
 /// JSON-RPC "internal error", for turns the node reports as failed.
 const TURN_FAILED_CODE: i64 = -32603;
 
-/// An agent on the configured node, as the agent manager drives it.
+/// An agent on an exposed machine, as the agent manager drives it.
 pub struct RemoteAgentRuntime {
     agent_id: AgentId,
     sink: Arc<AgentSink>,

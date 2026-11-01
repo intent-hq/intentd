@@ -182,6 +182,14 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
+When the user asks the Assistant to change a setting, `ws.app.settings.propose` shows a
+change card the user applies or discards; the card can be undone. It accepts only
+settings whose definition has `proposable: true`. Credentials, remote access and
+sharing, forge connections, executable and folder paths, command permissions, and
+global or workspace instructions are refused: send the user to the matching Settings section above instead.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/settings.rs (PROPOSAL_EXCLUDED_*); packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/settings.rs; packages/cloudlands-fe/src/lib/components/chat/proposals/{settings-proposal-actions,settings-proposal-definitions}.ts. -->
+
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
 For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. Users can also ask the Assistant to set up or update a server. Use `ws.app.mcp` to read existing configurations, avoid duplicates, and apply the requested change app-wide. These configuration tools are available only in Assistant chat; ordinary workspace agents retain access to enabled servers' tools.
@@ -287,12 +295,27 @@ for an installed Auggie to appear.
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
-Claude Code and choose **Add profile**: enter a name and environment variables
-(literal values, **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
-the provider host user's home folder (`~user` stays literal). The user signs in or
-prepares that account outside Intent. Credentials inherited from the environment can still
-apply: for a Claude Code profile that should use another account (or none), set
+Claude Code and choose **Add profile**, then a kind: **Different login**, **API key**
+(Claude Code only), **Token**, or **Advanced**. **Different login** creates a new
+sign-in folder under `~/intent/profiles/` on the daemon host. **Create & sign in**
+closes the dialog and runs the sign-in in the bottom terminal; the profile row shows
+**Waiting for sign-in…**, then a **Signed in** toast. When the daemon runs on another
+machine, Codex shows a one-time device code instead of a browser sign-in; device code
+login must first be turned on in ChatGPT → **Settings → Security** (or allowed by a
+workspace admin). The folder starts without the user's usual Claude Code or Codex
+settings (instructions, MCP servers, skills). Later, ⋯ → **Log In** on a Different-login
+profile signs in again to the same folder. Removing that profile leaves its folder,
+with its saved login, on disk. **API key** saves an Anthropic key (optionally a custom
+endpoint); **Token** saves a `claude setup-token` token, or a Codex access token
+(ChatGPT Business or Enterprise only). After **Create**, Intent runs a test prompt and
+shows **Key works** or **Key was rejected**. These kinds also unset inherited
+credentials that would otherwise win. **Advanced** is the raw editor: a name and
+environment variables (literal values, **Empty value**, or **Unset**; no shell
+expansion). Use `CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there
+only, a leading `~` or `~/` means the provider host user's home folder (`~user` stays
+literal), and the saved folder path is shown as typed while other saved values stay
+hidden. Credentials inherited from the environment can still apply to an Advanced
+profile: for a Claude Code profile that should use another account (or none), set
 inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
 **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
 custom base URL from the environment; for a different endpoint, give the profile
@@ -323,6 +346,8 @@ notice; if that one is still out of quota, Intent tries again later with growing
 waits. Conversations share what they learn: once one finds a configuration out of
 quota, others skip it on their next turn (until its reset time, or 5 hours), and once
 one succeeds on it again, conversations that left it go back on their next turn.
+Saving a change to a profile or to a Default configuration (for example a new API key
+or account folder) clears what was learned about it, so it is no longer skipped.
 Choosing a model or profile yourself makes that the new starting point. When every
 option is out of quota, Intent still tries them, and the usual quota message appears.
 
@@ -659,11 +684,11 @@ grouping choices keep their behavior.
 
 ## Set aside workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
 
-**Set aside** is unreleased until the companion frontend change ships. In a
-supporting frontend, use **Set aside** on a Home workspace row, card or menu. List
-view moves it into a collapsed **Set aside** section; board view shows it in the
+**Set aside** is available in alpha builds starting with v2.262.0. Use **Set aside**
+on a Home workspace row, card or menu. List view moves it into a collapsed
+**Set aside** section; board view shows it in the
 **Set aside** column on the right, and dragging a card into that column also sets it
 aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
 action. Searching includes set-aside workspaces. With a Home
@@ -680,10 +705,10 @@ not hide the workspace for collaborators or mark its work complete.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
-Archive is the one way to put a workspace away. In **Home → Workspaces**,
-right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
-and PR monitors and keeps its folder. Archived workspaces appear under the
-**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
+In **Home → Workspaces**, right-click a workspace and choose **Archive**.
+Archiving stops its agents, hooks and PR monitors and keeps its folder. Archived
+workspaces appear under the **Archived** filter. Choose **Unarchive**, or send an
+agent a message, to continue.
 
 Intent can archive idle workspaces automatically. It is off by default; turn on
 **Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
@@ -697,8 +722,9 @@ made after the merge still do.
 
 To keep one workspace from being archived automatically, right-click it in **Home →
 Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
-off for every workspace by default, only the workspace owner sees it, and it does not
-stop you archiving the workspace yourself.
+off for every workspace by default, only the workspace owner sees it, it appears only
+while **Archive idle workspaces** is on, and it does not stop you archiving the
+workspace yourself.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and

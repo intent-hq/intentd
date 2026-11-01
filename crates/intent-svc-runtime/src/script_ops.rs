@@ -6752,6 +6752,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn shutdown_pty_sessions_stops_scripts_and_kills_all_ptys() {
         let h = harness().await;
+        let mut sub = subscribe(&h);
         let (flag, pidfile) = straggler_paths("shutdown");
         let cmd = straggler_command(&flag.0, &pidfile.0, "wait");
         let id = create_simple(&h, "svc", &cmd, ScriptMode::Service).await;
@@ -6762,6 +6763,12 @@ mod tests {
         let straggler = await_straggler_pid(&pidfile.0).await;
         let _guard = KillOnDrop(straggler);
         assert!(pid_alive(straggler), "straggler alive before shutdown");
+        // The pidfile is written by the PTY's shell, which runs before
+        // `mark_running` persists the marker and flips the status; a loaded
+        // host can reach the sweep inside that window, where the service is
+        // not yet `running` and its marker is (correctly) not kept
+        // (intent-hq/intent#8187). Wait until it is observably running.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
 
         // A terminal-style PTY outside any script registry entry.
         let terminal = h
@@ -6799,6 +6806,86 @@ mod tests {
         assert!(
             markers.contains(&(h.ws.as_str().to_string(), id.clone())),
             "was_running marker survives graceful shutdown: {markers:?}"
+        );
+    }
+
+    /// Pins the window `shutdown_pty_sessions_stops_scripts_and_kills_all_ptys`
+    /// waits out (intent-hq/intent#8187): with `mark_running` parked before
+    /// its marker write, the service's shell has already written the
+    /// straggler pidfile while the status is not `running`. A shutdown sweep
+    /// that lands there stops the service but keeps no `was_running` marker —
+    /// it was never running by the sweep's status snapshot, and the refused
+    /// `mark_running` clears the marker it was about to write.
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_pty_sessions_in_mark_running_window_keeps_no_marker() {
+        let mut h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        h.services = h
+            .services
+            .clone()
+            .with_script_mark_running_park(park.clone());
+        let (flag, pidfile) = straggler_paths("shutdown-window");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "wait");
+        let id = create_simple(&h, "svc", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("mark_running entered the persist window");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_ne!(
+            st["status"], "running",
+            "the pidfile precedes the running flip: {st}"
+        );
+
+        let services = h.services.clone();
+        let sweep =
+            intent_core::spawn_daemon(async move { services.shutdown_pty_sessions().await });
+        // Release only once the sweep has snapshotted the entry (it flags
+        // `stopped_by_user` under that same lock), so the flip cannot win.
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while !h
+            .services
+            .script_manager()
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(h.ws.clone(), id.clone()))
+            .is_some_and(|m| m.stopped_by_user)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep never flagged the starting service"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        park.release.notify_one();
+        let (scripts, _ptys) = sweep.await.expect("sweep task");
+        assert_eq!(scripts, 1, "the starting service is stopped by the sweep");
+        await_pid_dead(straggler, "TERM+HUP-trapping straggler").await;
+
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "running", "refused flip after stop-all: {st}");
+        assert!(
+            h.services
+                .store()
+                .list_was_running_script_ids()
+                .await
+                .expect("list markers")
+                .is_empty(),
+            "no marker for a service the sweep caught before it was running"
         );
     }
 

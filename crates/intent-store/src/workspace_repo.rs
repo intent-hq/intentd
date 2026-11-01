@@ -27,7 +27,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity, retired_at, label, auto_archive_disabled";
+    browser_client_id, last_content_activity, retired_at, label, auto_archive_disabled, plain_folder";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -263,7 +263,7 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -304,6 +304,7 @@ impl Store {
             .bind(&ws.retired_at)
             .bind(&ws.label)
             .bind(i64::from(ws.auto_archive_disabled))
+            .bind(i64::from(ws.plain_folder))
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -372,6 +373,8 @@ impl Store {
     /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
     /// Likewise `auto_archive_disabled` moves only through
     /// [`Self::set_workspace_auto_archive_disabled`].
+    /// `plain_folder` is insert-only: no update path ever writes it (§5.1
+    /// "Plain-folder workspaces").
     ///
     /// # Errors
     ///
@@ -1299,6 +1302,17 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
+            // A plain-folder row's folder outlives the row on the tombstone
+            // (migration 0178), read in the same transaction as the delete.
+            let plain_folder_path: Option<String> = sqlx::query_scalar(
+                "SELECT repository_path FROM workspace \
+                 WHERE id = ? AND plain_folder = 1 AND repository_path != ''",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read plain folder path failed: {e}")))?
+            .flatten();
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
@@ -1308,10 +1322,12 @@ impl Store {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
             sqlx::query(
-                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at, plain_folder_path) \
+                 VALUES (?, ?, ?)",
             )
             .bind(&id.0)
             .bind(now_iso())
+            .bind(plain_folder_path)
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("record deleted workspace id failed: {e}")))?;
@@ -1324,6 +1340,27 @@ impl Store {
         self.browser_tab_displayed
             .forget_all(tab_ids.iter().map(String::as_str));
         Ok(())
+    }
+
+    /// The folder of every plain-folder workspace the store knows (PROTOCOL
+    /// §5.1 "Plain-folder workspaces"): live, archived and retired rows plus
+    /// deleted ones remembered on their tombstone. Path-based cleanup sweeps
+    /// never remove a directory overlapping one of these.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; callers
+    /// then skip the sweep (fail closed).
+    pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT repository_path FROM workspace \
+             WHERE plain_folder = 1 AND repository_path IS NOT NULL AND repository_path != '' \
+             UNION SELECT plain_folder_path FROM deleted_workspace_id \
+             WHERE plain_folder_path IS NOT NULL AND plain_folder_path != ''",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("plain folder paths lookup failed: {e}")))
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -1843,6 +1880,55 @@ impl Store {
             })
             .collect()
     }
+
+    /// Every PR link recorded for the workspaces in `workspace_ids`
+    /// (`ws.crossWorkspace.search({ pr })`), most recently linked first, ties
+    /// by key then workspace id. The caller resolves which keys a reference
+    /// names (`intent_core::PullRequestSelector`); this read uses the
+    /// `workspace_id` index, so its cost tracks the scoped workspaces' links
+    /// rather than the whole table. An empty scope reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_links_for_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PullRequestLink>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(workspace_ids)
+            .map_err(|e| Error::Internal(format!("encode workspace ids failed: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT pr_key, workspace_id, linked_at FROM pull_request_workspace \
+             WHERE workspace_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY linked_at DESC, pr_key ASC, workspace_id ASC",
+        )
+        .bind(ids)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list pull request links failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(PullRequestLink {
+                    pr_key: col(row, "pr_key")?,
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    linked_at: col(row, "linked_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One recorded PR <-> workspace link (migration 0161): the canonical
+/// `<host>/<owner>/<repo>/pull/<number>` key, the linked workspace, and when
+/// the link was first recorded (RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestLink {
+    pub pr_key: String,
+    pub workspace_id: WorkspaceId,
+    pub linked_at: String,
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>
@@ -2035,6 +2121,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
         label: col(row, "label")?,
         auto_archive_disabled: col::<i64>(row, "auto_archive_disabled")? != 0,
+        plain_folder: col::<i64>(row, "plain_folder")? != 0,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
         // wait/script/background flags, `cowSupported`, `diskUsage`,

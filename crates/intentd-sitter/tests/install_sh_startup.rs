@@ -292,6 +292,7 @@ fn run_owner_check_diagnostic(
 }
 
 /// Run the shipped `resolve_data_dir` and return the dir it names.
+#[track_caller]
 fn run_resolve_data_dir(cwd: &Path, os: &str, home: &Path, data_dir: Option<&str>) -> String {
     let driver = format!(
         "set -eu\nos={os}\n{functions}\nresolve_data_dir\n",
@@ -372,6 +373,7 @@ fn daemon_read_pid(contents: &str) -> Option<u32> {
 
 /// The pid the shipped `data_dir_owner_pid` reads out of a pidfile holding
 /// `contents`, if any.
+#[track_caller]
 fn installer_owner_pid(root: &Path, case: &str, contents: &str) -> Option<u32> {
     let data_dir = root.join(case);
     write_pid_file(&data_dir, contents);
@@ -788,6 +790,7 @@ fn unreachable_service_manager_stub(dir: &Path) -> PathBuf {
 
 /// Refusal assertions shared by the "still refused" cases below: same exit,
 /// same message, no PROCEEDED — the exemption must not soften the refusal.
+#[track_caller]
 fn assert_refused(os: &str, output: &Output) {
     assert_eq!(
         output.status.code(),

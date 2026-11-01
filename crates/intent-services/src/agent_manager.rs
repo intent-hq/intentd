@@ -13033,18 +13033,14 @@ impl AgentManager {
                     let mut hint = None;
                     if let Some(dir) = &stderr_dir {
                         if let Some(conn) = &dead_conn {
-                            conn.await_stderr_settled(stderr_settle_timeout()).await;
-                            if conn.stderr_captured() && stderr_capture_dir_populated(dir) {
-                                hint = Some(dir);
-                            }
+                            hint = StderrCaptureHint::after_settle(conn, dir.clone()).await;
                         }
                     }
-                    if let Some(dir) = hint {
+                    if let Some(hint) = hint {
                         tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
-                            "idle agent child exited unexpectedly; handle reaped (agent stderr captured at {})",
-                            dir.display()
+                            "idle agent child exited unexpectedly; handle reaped ({hint})"
                         );
                     } else {
                         tracing::warn!(
@@ -15491,11 +15487,10 @@ async fn run_message_worker(
                             // STAB-53: on a child-death failure, point at the
                             // captured stderr file so the crash is diagnosable.
                             match boxed_await(|| stderr_capture_hint(&mgr, &agent_id, &e)).await {
-                                Some(log) => tracing::warn!(
+                                Some(hint) => tracing::warn!(
                                     agent = %agent_id,
                                     error = %e,
-                                    "agent turn failed terminally (agent stderr captured at {})",
-                                    log.display()
+                                    "agent turn failed terminally ({hint})"
                                 ),
                                 None => {
                                     tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
@@ -15563,11 +15558,10 @@ async fn run_message_worker(
                     continue 'outer;
                 }
                 match boxed_await(|| stderr_capture_hint(&mgr, &agent_id, &e)).await {
-                    Some(log) => tracing::warn!(
+                    Some(hint) => tracing::warn!(
                         agent = %agent_id,
                         error = %e,
-                        "agent spawn failed after all retries (agent stderr captured at {})",
-                        log.display()
+                        "agent spawn failed after all retries ({hint})"
                     ),
                     None => {
                         tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
@@ -16868,15 +16862,14 @@ async fn retry_spawn_owned(
                 } else {
                     None
                 };
-                if let Some(log) = captured {
+                if let Some(hint) = captured {
                     tracing::warn!(
                         agent = %agent_id,
                         attempt = attempt,
                         max = MAX_SPAWN_ATTEMPTS,
                         retryable = retryable,
                         error = %e,
-                        "agent spawn attempt failed (agent stderr captured at {})",
-                        log.display()
+                        "agent spawn attempt failed ({hint})"
                     );
                 } else {
                     tracing::warn!(
@@ -17828,11 +17821,16 @@ fn is_benign_turn_error(err: &Error) -> bool {
 /// same per-agent dir from turning a silent child into a misleading "stderr
 /// captured at …" claim; a child that never wrote stderr gets the plain WARN
 /// instead.
+///
+/// intent-hq/intent#8145 follow-up: when the settle bound expires after this
+/// child forwarded stderr lines but before the background writer created the
+/// capture file (slow disk), the dir is still named, marked as possibly still
+/// saving — see [`StderrCaptureHint::decide`].
 async fn stderr_capture_hint(
     mgr: &AgentManager,
     agent_id: &AgentId,
     err: &Error,
-) -> Option<std::path::PathBuf> {
+) -> Option<StderrCaptureHint> {
     if !matches!(err, Error::Internal(msg) if msg.contains("agent stdout closed")) {
         return None;
     }
@@ -17857,10 +17855,59 @@ async fn stderr_capture_hint(
     // `handle_terminal_turn_failure`'s own later `kill_child_only` degrades
     // to a no-op (the handle is already gone).
     mgr.kill_child_only(agent_id).await;
-    connection
-        .await_stderr_settled(stderr_settle_timeout())
-        .await;
-    (connection.stderr_captured() && stderr_capture_dir_populated(&dir)).then_some(dir)
+    StderrCaptureHint::after_settle(&connection, dir).await
+}
+
+/// The "agent stderr captured at …" clause of a child-death WARN
+/// (monorepo#3570). `still_saving` marks a capture whose settle bound expired
+/// after this child forwarded stderr lines but before the capture file
+/// existed: the dir is named rather than hidden (intent-hq/intent#8145
+/// follow-up), but it may not hold the lines yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StderrCaptureHint {
+    dir: std::path::PathBuf,
+    still_saving: bool,
+}
+
+impl StderrCaptureHint {
+    /// Bounded-await `connection`'s stderr settle (no extra latency beyond
+    /// [`stderr_settle_timeout`]), then decide the hint for `dir`.
+    async fn after_settle(connection: &Connection, dir: std::path::PathBuf) -> Option<Self> {
+        let settled = connection
+            .await_stderr_settled(stderr_settle_timeout())
+            .await;
+        let still_saving = Self::decide(
+            settled,
+            connection.stderr_captured(),
+            stderr_capture_dir_populated(&dir),
+        )?;
+        Some(Self { dir, still_saving })
+    }
+
+    /// `None` = claim nothing; `Some(still_saving)` = name the dir.
+    /// - No stderr from THIS child → nothing (stale files never count).
+    /// - A capture file exists → named, unchanged wording (settled or not).
+    /// - No capture file, settled (EOF + flush done) → nothing: the capture
+    ///   itself failed.
+    /// - No capture file, bound expired → named, marked still saving (the
+    ///   background writer may not have created the file yet).
+    fn decide(settled: bool, captured: bool, populated: bool) -> Option<bool> {
+        match (captured, populated, settled) {
+            (false, _, _) | (true, false, true) => None,
+            (true, true, _) => Some(false),
+            (true, false, false) => Some(true),
+        }
+    }
+}
+
+impl std::fmt::Display for StderrCaptureHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent stderr captured at {}", self.dir.display())?;
+        if self.still_saving {
+            f.write_str("; capture may still be saving")?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether the stderr capture dir exists and holds at least one entry —
@@ -17930,6 +17977,13 @@ mod first_attempt_stderr_hint_tests {
         let tmp = crate::tests::test_tempdir("intentd-first-attempt-hint-");
         let attempt_file = tmp.path().join("attempts.txt");
         let attempt_file = attempt_file.to_string_lossy().into_owned();
+        // intent-hq/intent#8145: the hint names the dir only if the capture
+        // file exists when the settle wait ends. The production 2s bound is a
+        // diagnostic budget; on a loaded runner the capture can land after it
+        // and the WARN underclaims. Stretch it like any other hang guard.
+        let settle_ms = intentd_test_support::test_timeout(Duration::from_secs(10))
+            .as_millis()
+            .to_string();
         let _env = EnvGuard::apply(&[
             ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
             (
@@ -17938,6 +17992,7 @@ mod first_attempt_stderr_hint_tests {
             ),
             ("MOCK_AGENT_ATTEMPT_FILE", Some(attempt_file.as_str())),
             ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("0,0")),
+            ("INTENTD_STDERR_SETTLE_TIMEOUT_MS", Some(settle_ms.as_str())),
         ]);
         let (mgr, _seeded, _db) = manager_with(None, None).await;
         let log_root = tmp.path().join("agent-logs");
@@ -18045,7 +18100,10 @@ mod first_attempt_stderr_hint_tests {
         drop(stderr_w);
         assert_eq!(
             stderr_capture_hint(&mgr, &agent_id, &err).await,
-            Some(dir.clone()),
+            Some(StderrCaptureHint {
+                dir: dir.clone(),
+                still_saving: false,
+            }),
             "child that wrote stderr names its capture dir"
         );
 
@@ -18063,6 +18121,230 @@ mod first_attempt_stderr_hint_tests {
             "a non-child-death error never carries the hint"
         );
         mgr.kill_child_only(&agent_id).await;
+    }
+
+    /// intent-hq/intent#8145 mechanism: the hint is dropped exactly when the
+    /// settle bound expires before this child's stderr reaches the capture
+    /// file, and a bound that outlasts the same schedule names the dir. A
+    /// late EOF alone does not drop it (once a line is on disk the dir is
+    /// named even if settle times out), so the schedule delays the line
+    /// itself — the same observable state as a capture-file create/flush
+    /// starved past the bound on a loaded runner.
+    #[tokio::test]
+    async fn hint_is_dropped_iff_capture_lands_after_the_bound() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // fixed-deadline: allow — a schedule, not a wait: the stderr line
+        // lands this long into the long bound's wait.
+        const LATE_LINE_DELAY: Duration = Duration::from_secs(1);
+        let tmp = crate::tests::test_tempdir("intentd-late-settle-hint-");
+        let log_root = tmp.path().join("agent-logs");
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let agent_id = AgentId::from("agent-late-settle");
+        let dir = log_root.join(&agent_id.0);
+        let err = Error::Internal(STDOUT_CLOSED.to_string());
+
+        // `line_after_hint`: the line is written only once the hint has
+        // returned (the bound certainly expired first); otherwise it lands
+        // LATE_LINE_DELAY into the hint's wait.
+        let run = |bound_ms: String, line_after_hint: bool| {
+            let mgr = &mgr;
+            let agent_id = &agent_id;
+            let dir = dir.clone();
+            let err = &err;
+            async move {
+                let _env = EnvGuard::apply(&[(
+                    "INTENTD_STDERR_SETTLE_TIMEOUT_MS",
+                    Some(bound_ms.as_str()),
+                )]);
+                let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+                let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+                let (mut stderr_w, stderr_r) = tokio::io::duplex(4096);
+                let hooks = ConnectionHooks {
+                    stderr_log_dir: Some(dir),
+                    ..ConnectionHooks::default()
+                };
+                let conn = Arc::new(Connection::new(
+                    c2a_client,
+                    a2c_client,
+                    Some(Box::new(stderr_r)),
+                    hooks,
+                ));
+                install_handle_with_connection(mgr, agent_id, None, conn);
+                // Same-task concurrency (no spawn): the writer and the hint
+                // are polled together.
+                let (hint_done_tx, hint_done_rx) = tokio::sync::oneshot::channel::<()>();
+                let writer = async move {
+                    if line_after_hint {
+                        let _ = hint_done_rx.await;
+                    } else {
+                        tokio::time::sleep(LATE_LINE_DELAY).await;
+                    }
+                    stderr_w.write_all(b"dying words\n").await.unwrap();
+                    stderr_w.flush().await.unwrap();
+                    drop(stderr_w);
+                };
+                let hint = async {
+                    let hint = stderr_capture_hint(mgr, agent_id, err).await;
+                    let _ = hint_done_tx.send(());
+                    hint
+                };
+                let (hint, ()) = tokio::join!(hint, writer);
+                hint
+            }
+        };
+
+        // fixed-deadline: allow — any bound works: the line is withheld
+        // until the hint returns.
+        let short = run("200".to_string(), true).await;
+        assert!(
+            short.is_none(),
+            "a bound that expires before the capture lands drops the hint: {short:?}"
+        );
+        let long_ms = intentd_test_support::test_timeout(Duration::from_secs(10))
+            .as_millis()
+            .to_string();
+        assert_eq!(
+            run(long_ms, false).await,
+            Some(StderrCaptureHint {
+                dir: dir.clone(),
+                still_saving: false,
+            }),
+            "a bound that outlasts the same capture schedule names the dir"
+        );
+    }
+
+    /// intent-hq/intent#8145 follow-up (option a): this child forwarded a
+    /// stderr line, but the settle bound expires before the capture file
+    /// exists. The dir is still named, marked as possibly still saving,
+    /// instead of being dropped. "File not created yet" is pinned
+    /// deterministically by a capture dir whose parent is a regular file
+    /// (creation never lands) and stderr held open past the bound (no EOF,
+    /// so settle times out). The same shape with no stderr line claims
+    /// nothing.
+    #[tokio::test]
+    async fn forwarded_stderr_without_capture_file_names_dir_as_still_saving() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let tmp = crate::tests::test_tempdir("intentd-still-saving-hint-");
+        let log_root = tmp.path().join("agent-logs");
+        std::fs::write(&log_root, "not a dir\n").unwrap();
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let mgr = mgr.with_agent_log_root(log_root.clone());
+        let agent_id = AgentId::from("agent-still-saving");
+        let dir = log_root.join(&agent_id.0);
+        let err = Error::Internal(STDOUT_CLOSED.to_string());
+        // fixed-deadline: allow — the bound must expire: stderr stays open.
+        let _env = EnvGuard::apply(&[("INTENTD_STDERR_SETTLE_TIMEOUT_MS", Some("200"))]);
+
+        let connect = || {
+            let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+            let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+            let (stderr_w, stderr_r) = tokio::io::duplex(4096);
+            let hooks = ConnectionHooks {
+                stderr_log_dir: Some(dir.clone()),
+                ..ConnectionHooks::default()
+            };
+            let conn = Arc::new(Connection::new(
+                c2a_client,
+                a2c_client,
+                Some(Box::new(stderr_r)),
+                hooks,
+            ));
+            (conn, stderr_w, (c2a_agent, a2c_agent))
+        };
+
+        // No stderr line, stderr held open past the bound → no claim.
+        let (conn, stderr_w, _ends) = connect();
+        install_handle_with_connection(&mgr, &agent_id, None, conn);
+        assert!(
+            stderr_capture_hint(&mgr, &agent_id, &err).await.is_none(),
+            "a child that forwarded no stderr claims nothing when the bound expires"
+        );
+        drop(stderr_w);
+
+        // A forwarded line, no capture file, bound expires → still named.
+        let (conn, mut stderr_w, _ends) = connect();
+        install_handle_with_connection(&mgr, &agent_id, None, Arc::clone(&conn));
+        stderr_w.write_all(b"dying words\n").await.unwrap();
+        stderr_w.flush().await.unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while !conn.stderr_captured() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("the stderr drain forwards the line to the capture writer");
+        drop(conn);
+        let hint = stderr_capture_hint(&mgr, &agent_id, &err).await;
+        assert!(
+            !stderr_capture_dir_populated(&dir),
+            "the capture file must not exist for this case"
+        );
+        assert_eq!(
+            hint,
+            Some(StderrCaptureHint {
+                dir: dir.clone(),
+                still_saving: true,
+            }),
+            "forwarded stderr with no capture file yet still names the dir"
+        );
+        let rendered = hint.unwrap().to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "agent stderr captured at {}; capture may still be saving",
+                dir.display()
+            )
+        );
+        drop(stderr_w);
+    }
+}
+
+#[cfg(test)]
+mod stderr_capture_hint_decision_tests {
+    use super::StderrCaptureHint;
+
+    #[test]
+    fn decision_table() {
+        let d = StderrCaptureHint::decide;
+        // No stderr from this child: never claimed, settled or not.
+        assert_eq!(d(true, false, true), None);
+        assert_eq!(d(false, false, true), None);
+        assert_eq!(d(false, false, false), None);
+        assert_eq!(d(true, false, false), None);
+        // Capture file exists: named with today's wording, settled or not.
+        assert_eq!(d(true, true, true), Some(false));
+        assert_eq!(d(false, true, true), Some(false));
+        // No capture file after a full flush: the capture failed, no claim.
+        assert_eq!(d(true, true, false), None);
+        // No capture file yet and the bound expired: named, still saving.
+        assert_eq!(d(false, true, false), Some(true));
+    }
+
+    #[test]
+    fn display_marks_still_saving_only_when_set() {
+        let dir = std::path::PathBuf::from("/tmp/agent-logs/a1");
+        let done = StderrCaptureHint {
+            dir: dir.clone(),
+            still_saving: false,
+        };
+        assert_eq!(
+            done.to_string(),
+            "agent stderr captured at /tmp/agent-logs/a1"
+        );
+        let saving = StderrCaptureHint {
+            dir,
+            still_saving: true,
+        };
+        assert_eq!(
+            saving.to_string(),
+            "agent stderr captured at /tmp/agent-logs/a1; capture may still be saving"
+        );
     }
 }
 

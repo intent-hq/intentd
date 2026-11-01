@@ -91,8 +91,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    blank_cfg_test_items, cfg_test_item_ranges, lex, markers_by_line, skip_whitespace,
-    statement_line, word_at, Marker,
+    blank_cfg_test_items, cfg_test_item_ranges, lex, markers_by_line, skip_group, skip_whitespace,
+    statement_line, tokenize, Marker, Token,
 };
 
 const SELF_FILE: &str = "crates/intent-core/tests/queue_entry_egress_lint.rs";
@@ -197,57 +197,13 @@ struct Scan {
     consts: BTreeSet<String>,
 }
 
-/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
-fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
-    let mut depth = 0usize;
-    while let Some(&c) = chars.get(j) {
-        j += 1;
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-    }
-    j
-}
-
-/// An ASCII identifier token (`[A-Za-z_][A-Za-z0-9_]*`) in blanked text, by
-/// char index.
-struct Token {
-    start: usize,
-    end: usize,
-    word: String,
-}
-
-fn tokens(chars: &[char]) -> Vec<Token> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_ascii_alphabetic() || c == '_' {
-            let (word, end) = word_at(chars, i).expect("identifier start");
-            out.push(Token {
-                start: i,
-                end,
-                word,
-            });
-            i = end;
-        } else if c.is_ascii_digit() {
-            // A number's trailing letters (`1u8`) are not an identifier.
-            while chars
-                .get(i)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-            {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    out
+/// The identifiers of blanked text, by char index: the shared reader's
+/// tokens minus numbers (`1u8` is no identifier) and punctuation.
+fn identifiers(chars: &[char]) -> Vec<Token> {
+    tokenize(chars)
+        .into_iter()
+        .filter(Token::is_ident)
+        .collect()
 }
 
 /// 1-based line of char index `at`.
@@ -295,7 +251,7 @@ fn event_initializer(chars: &[char], toks: &[Token], idx: usize) -> Option<(Stri
             k += 1;
             continue;
         }
-        return Some((tok.word.clone(), k));
+        return Some((tok.text.clone(), k));
     }
 }
 
@@ -307,17 +263,17 @@ fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
     let raw: Vec<char> = events_src.chars().collect();
     let blanked = blank_cfg_test_items(&lex(events_src).blanked);
     let chars: Vec<char> = blanked.chars().collect();
-    let toks = tokens(&chars);
+    let toks = identifiers(&chars);
     let mut out = BTreeSet::new();
     for (idx, tok) in toks.iter().enumerate() {
         let lifetime = raw.get(tok.start.wrapping_sub(1)) == Some(&'\'');
-        if (tok.word != "const" && tok.word != "static") || lifetime {
+        if (tok.text != "const" && tok.text != "static") || lifetime {
             continue;
         }
         let Some(name) = toks
             .get(idx + 1)
             .filter(|t| t.start == skip_whitespace(&chars, tok.end))
-            .filter(|t| !FN_QUALIFIERS.contains(&t.word.as_str()))
+            .filter(|t| !FN_QUALIFIERS.contains(&t.text.as_str()))
         else {
             continue;
         };
@@ -334,7 +290,7 @@ fn queue_event_consts(events_src: &str) -> Result<BTreeSet<String>, String> {
         }
         let value: String = raw[open + 1..].iter().take_while(|c| **c != '"').collect();
         if value.starts_with(QUEUE_EVENT_PREFIX) {
-            out.insert(name.word.clone());
+            out.insert(name.text.clone());
         }
     }
     if out.is_empty() {
@@ -357,7 +313,7 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
     let blanked: Vec<char> = lexed.blanked.chars().collect();
     let untested = cfg_test_item_ranges(&blanked);
     let chars: Vec<char> = blank_cfg_test_items(&lexed.blanked).chars().collect();
-    let toks = tokens(&chars);
+    let toks = identifiers(&chars);
     let mut scan = Scan::default();
     let mut enclosing: Option<String> = None;
     let mut fn_defs: Vec<(usize, String)> = Vec::new();
@@ -366,15 +322,15 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
     let mut publish_tok: Option<usize> = None;
 
     for (idx, tok) in toks.iter().enumerate() {
-        let prev = idx.checked_sub(1).map(|p| toks[p].word.as_str());
+        let prev = idx.checked_sub(1).map(|p| toks[p].text.as_str());
         let next_tok = toks.get(idx + 1);
         let directly_next = |t: &Token| skip_whitespace(&chars, tok.end) == t.start;
-        match tok.word.as_str() {
+        match tok.text.as_str() {
             "fn" => {
                 if let Some(name) = next_tok.filter(|t| directly_next(t)) {
-                    scan.fns.insert(name.word.clone());
-                    enclosing = Some(name.word.clone());
-                    fn_defs.push((name.start, name.word.clone()));
+                    scan.fns.insert(name.text.clone());
+                    enclosing = Some(name.text.clone());
+                    fn_defs.push((name.start, name.text.clone()));
                 }
             }
             "use" => {
@@ -386,9 +342,9 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
             "const" | "static" => {
                 if let Some(name) = next_tok
                     .filter(|t| directly_next(t))
-                    .filter(|t| !FN_QUALIFIERS.contains(&t.word.as_str()))
+                    .filter(|t| !FN_QUALIFIERS.contains(&t.text.as_str()))
                 {
-                    scan.consts.insert(name.word.clone());
+                    scan.consts.insert(name.text.clone());
                 }
             }
             w if SNAPSHOT_CALLS.contains(&w) => {
@@ -471,10 +427,10 @@ fn scan_source(src: &str, queue_events: &BTreeSet<String>) -> Scan {
 /// The variant names of `enum QueueSurface { … }` in the contract source.
 fn surface_labels(contract_src: &str) -> Result<Vec<String>, String> {
     let chars: Vec<char> = lex(contract_src).blanked.chars().collect();
-    let toks = tokens(&chars);
+    let toks = identifiers(&chars);
     let Some(idx) = toks
         .windows(2)
-        .position(|w| w[0].word == "enum" && w[1].word == SURFACE_ENUM)
+        .position(|w| w[0].text == "enum" && w[1].text == SURFACE_ENUM)
     else {
         return Err(format!(
             "{CONTRACT_FILE}: no `enum {SURFACE_ENUM}` found — the contract table moved; \
@@ -492,7 +448,7 @@ fn surface_labels(contract_src: &str) -> Result<Vec<String>, String> {
         .iter()
         .filter(|t| t.start > open && t.end < close)
         .filter(|t| matches!(chars.get(skip_whitespace(&chars, t.end)), Some(',' | '}')))
-        .map(|t| t.word.clone())
+        .map(|t| t.text.clone())
         .collect();
     if labels.is_empty() {
         return Err(format!(
