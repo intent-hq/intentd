@@ -2351,24 +2351,38 @@ mod tests {
     /// Regression (monorepo#2275): expired sessions don't hold cap slots or
     /// staging dirs — the next `begin` reclaims them — while a session kept
     /// live by ongoing chunk activity is never reclaimed.
+    ///
+    /// The TTL is pinned generous via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS`
+    /// seam and every idle period is synthesized by advancing the paused
+    /// runtime clock, so real scheduling stalls are negligible next to the
+    /// TTL. With a 1s TTL and 250ms wall-clock sleeps, a stall of more than
+    /// 750ms between keep-alive chunks expired the "live" session under CI
+    /// load (merge_group coverage-all run 41256445158, which ejected
+    /// intentd#2891; same pattern as intent-hq/intent#4880).
     #[tokio::test]
     async fn begin_reclaims_expired_sessions_and_spares_active_ones() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "1000",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-reclaim".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
         let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
-        // Fill all 4 slots, then let them all go idle past the TTL.
+        // Fill all 4 slots, then let them all go idle past the TTL on the
+        // runtime clock. The clock is handed back before each service call
+        // (the store's pool-acquire timeouts are tokio timers a paused
+        // clock would auto-advance).
         let payload = b"reclaim-me".to_vec();
         let mut stale_ids = Vec::new();
         for _ in 0..4 {
             stale_ids.push(begin(&svc, &ws, &payload).await);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
 
         // A 5th begin succeeds — the expired sessions no longer count — and
         // their staging dirs are swept.
@@ -2382,11 +2396,13 @@ mod tests {
         }
 
         // Ongoing chunk activity keeps a session alive well past one TTL of
-        // wall time (5 x 250ms > 1000ms), with a 4x cadence-to-TTL margin so
-        // a stalled CI scheduler doesn't expire the "live" session.
+        // runtime-clock time (5 x TTL/2 = 2.5 TTL), each gap only half the
+        // TTL so the remaining half-TTL margin dwarfs any real stall.
         let mid = payload.len() / 2;
         for _ in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::pause();
+            tokio::time::advance(ttl / 2).await;
+            tokio::time::resume();
             svc.file_attachment_upload_chunk_op(live_id.clone(), 0, b64(&payload[..mid]))
                 .await
                 .expect("keep-alive chunk");
@@ -2396,7 +2412,7 @@ mod tests {
             .expect("final chunk");
         svc.file_attachment_upload_commit_op(live_id)
             .await
-            .expect("active session commits after > TTL wall time");
+            .expect("active session commits after > TTL of idle-clock time");
     }
 
     /// Regression (monorepo#2275): a pipelined commit racing an in-flight
