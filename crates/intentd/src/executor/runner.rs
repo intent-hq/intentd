@@ -1403,11 +1403,12 @@ async fn marked_processes(marker: &str) -> Vec<i32> {
 /// by itself:
 /// - a helper that leaves the provider's process group after the last
 ///   snapshot is missed;
-/// - a helper started after one snapshot that leaves the provider's
-///   process group before the next is missed. Snapshots are published in
-///   the order they started ([`Descendants`]), so an older periodic scan
-///   can no longer replace the setup snapshot that captured a startup
-///   helper.
+/// - a helper started after one snapshot that stops being the provider's
+///   descendant (it is reparented, for example when its parent exits)
+///   before the next one is in no snapshot, and is missed. Snapshots are
+///   published in the order they started ([`Descendants`]), so an older
+///   periodic scan can no longer replace the setup snapshot that captured
+///   a startup helper.
 ///
 /// Snapshots are deliberately not accumulated: a remembered pid can be
 /// reused by an unrelated process, and the pid lists carry no birth
