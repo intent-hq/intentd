@@ -1406,6 +1406,7 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
 /// processes); elsewhere, and for a helper that clears its environment,
 /// only the descendant snapshots find escaped helpers. A recycled pid
 /// cannot carry the marker of an earlier run.
+#[cfg_attr(not(target_os = "linux"), expect(clippy::unused_async))] // only the linux arm awaits
 async fn marked_processes(marker: &str) -> Vec<i32> {
     #[cfg(target_os = "linux")]
     {
