@@ -207,7 +207,9 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// `changes:git-status` event. Remote workspaces and workspaces without a
 /// resolvable worktree are skipped (their status cannot change via local
 /// `file:*` events), as are workspaces whose checkout folder is missing
-/// (intent-hq/intent#7183). Failures are logged, never fatal to the loop.
+/// (intent-hq/intent#7183) and plain-folder workspaces, which emit no git
+/// events even if the folder holds a `.git` (§5.1). Failures are logged,
+/// never fatal to the loop.
 pub(crate) async fn refresh_workspace(
     bus: &EventBus,
     services: &dyn WorkspaceApi,
@@ -222,7 +224,7 @@ pub(crate) async fn refresh_workspace(
             return;
         }
     };
-    if ws.is_remote {
+    if ws.is_remote || ws.plain_folder {
         return;
     }
     let Some(worktree) = git_ops::worktree_path(&ws) else {

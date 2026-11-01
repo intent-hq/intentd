@@ -2696,7 +2696,7 @@ impl Services {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or another live agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, the workspace is a plain folder, or another live agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -2762,7 +2762,7 @@ impl Services {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or the workspace is a plain folder, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_try_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -2771,6 +2771,11 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        // Plain folders have no PRs (§5.1): refuse before any forge call or
+        // write, so no `prMonitor:*` event can follow.
+        if self.is_plain_folder(workspace_id).await {
+            return Err(crate::plain_folder::git_only_refusal("PR monitoring"));
+        }
         let registration = self.pr_monitor_registration.enter(agent_id.clone());
         let _admission = registration.acquire().await;
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
