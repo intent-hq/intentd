@@ -6009,7 +6009,15 @@ mod normal_launch {
                     .take(80)
                     .collect::<String>()
             );
-            assert_eq!(item["metadata"], message.metadata.as_ref().unwrap().clone());
+            // The index serves the admitted message's own metadata, projected
+            // to the classification fields (PROTOCOL §5.5, intent-hq/intent#8278).
+            assert_eq!(
+                item["metadata"],
+                intent_store::project_user_message_index_metadata(
+                    message.metadata.as_ref().unwrap()
+                )
+                .unwrap()
+            );
         } else {
             assert!(
                 history["messages"]

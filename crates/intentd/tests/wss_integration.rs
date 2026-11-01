@@ -18983,8 +18983,11 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
 /// Non-user rows are never included; previews are bounded to
 /// `previewChars` (default 300, server-clamped into [1, 2000], with the
 /// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
-/// `metadata` passes through verbatim when present; a workspace mismatch
-/// and an unknown agent are not-found; a missing `agentId` is `-32602`.
+/// `metadata` is projected to the classification fields (heavy keys such as
+/// `events` never ride the wire, intent-hq/intent#8278); `limit` /
+/// `nextToken` page newest-first; a workspace mismatch and an unknown agent
+/// are not-found; a missing `agentId` or a malformed `nextToken` is
+/// `-32602`.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
@@ -19046,7 +19049,11 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
             &agent,
             "user",
             &json!([{ "type": "text", "text": "automated follow-up" }]),
-            Some(&json!({ "automated": true })),
+            Some(&json!({
+                "automated": true,
+                "type": "event_notification",
+                "events": [{ "type": "agent:reportToParent", "report": "r".repeat(8192) }],
+            })),
             &ts,
         )
         .await
@@ -19094,8 +19101,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(items[1]["id"], second);
     assert_eq!(
         items[1]["metadata"],
-        json!({ "automated": true }),
-        "metadata passes through verbatim"
+        json!({ "type": "event_notification" }),
+        "metadata is projected to the classification fields"
+    );
+    assert!(
+        result.get("nextToken").is_none(),
+        "unpaged reads keep the pre-paging shape: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -19170,6 +19181,49 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
         lenient_float["result"]["items"][0]["preview"], "first",
         "float previewChars truncates toward zero (5.9 → 5)"
     );
+
+    // Paging: the newest `limit` rows oldest→newest, then the opaque
+    // `nextToken` walks to the start and ends at `null`.
+    let paged = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2}}}}"#
+        ),
+    )
+    .await;
+    let paged = &paged["result"];
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(ids(paged), vec![second.clone(), third.clone()], "{paged}");
+    assert_eq!(paged["total"], 2);
+    let token = paged["nextToken"].as_str().expect("older rows remain");
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":14,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2,"nextToken":"{token}"}}}}"#
+        ),
+    )
+    .await;
+    let older = &older["result"];
+    assert_eq!(ids(older), vec![first.clone()], "{older}");
+    assert!(older["nextToken"].is_null(), "no older rows: {older}");
+    let bad_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":15,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":"bogus"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_token["error"]["code"], -32602, "{bad_token}");
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
     let other_ws = wss_call(
