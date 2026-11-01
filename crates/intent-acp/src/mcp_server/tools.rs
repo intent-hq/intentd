@@ -911,37 +911,9 @@ pub fn workspace_api_description(
     if gated.is_empty() && features.task_graph {
         return Cow::Borrowed(base);
     }
-    // Method doc lines sit at exactly two spaces of indentation
-    // (`  ws.<ns>.<method>(...`); their wrapped continuation lines are
-    // indented deeper. Anything else (Rules/Parameters/Examples prose) never
-    // matches a gated `ws.` prefix at indent 2.
-    let mut kept: Vec<&str> = Vec::new();
-    let mut skipping = false;
-    for line in base.lines() {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if indent == 2 && trimmed.starts_with("ws.") {
-            skipping = gated.iter().any(|(prefix, _)| trimmed.starts_with(prefix));
-        } else if indent < 4 || trimmed.is_empty() {
-            skipping = false;
-        }
-        if !skipping {
-            kept.push(line);
-        }
-    }
-    let mut out = String::with_capacity(base.len());
-    let mut prev_blank = false;
-    for line in kept {
-        if line.is_empty() && prev_blank {
-            continue;
-        }
-        prev_blank = line.is_empty();
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !base.ends_with('\n') {
-        out.pop();
-    }
+    let mut out = prune_doc_lines(base, |line| {
+        gated.iter().any(|(prefix, _)| line.starts_with(prefix))
+    });
     // Method-level scrub for `attentionRequests`: the surviving
     // `ws.agent.reportToParent` doc line cross-references the two pruned
     // methods, so drop that clause too.
@@ -998,6 +970,123 @@ pub fn workspace_api_description(
             );
     }
     Cow::Owned(out)
+}
+
+/// Drop every `ws.*` doc line (and its indented continuation lines) whose
+/// text starts with a prefix `gated` accepts; doubled blank lines left by a
+/// removed namespace paragraph collapse to one. Method doc lines and the
+/// `Namespaces` index entries sit at exactly two spaces of indentation
+/// (`  ws.<ns>.<method>(...`); their wrapped continuation lines are indented
+/// deeper. Anything else (Rules/Parameters/Examples prose) never matches a
+/// `ws.` prefix at indent 2.
+fn prune_doc_lines(base: &str, gated: impl Fn(&str) -> bool) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 2 && trimmed.starts_with("ws.") {
+            skipping = gated(trimmed);
+        } else if indent < 4 || trimmed.is_empty() {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = String::with_capacity(base.len());
+    let mut prev_blank = false;
+    for line in kept {
+        if line.is_empty() && prev_blank {
+            continue;
+        }
+        prev_blank = line.is_empty();
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// `ws.*` surfaces that need git or a forge, left out of the `workspace_api`
+/// description and `ws.help` in a plain-folder workspace and refused at
+/// dispatch (§5.1 "Plain-folder workspaces"). Namespace entries end with
+/// `.`; `ws.workspace.proposeSibling` names one method.
+const PLAIN_FOLDER_PREFIXES: &[&str] =
+    &["ws.git.", "ws.pr.", "ws.mr.", "ws.workspace.proposeSibling"];
+
+/// Git, branch and pull-request references outside the pruned doc lines —
+/// the `ws.hook.*` cross-references to `ws.pr.*`, the `ws.help("pr")`
+/// example, and the branch / PR fields of `ws.workspace.details`,
+/// `ws.workspace.setTitle`, `ws.agent.snapshot` and
+/// `ws.crossWorkspace.search` — rewritten for a plain-folder workspace
+/// (which has none of them). Each pair is applied in order to every
+/// occurrence, so the full, compact and condensed variants and the
+/// `host.exec` / `hostExec`-off / chief spellings are all covered (unit tests
+/// pin every `from` to the static description and guard that no git or PR
+/// word survives).
+const PLAIN_FOLDER_XREF_REWRITES: &[(&str, &str)] = &[
+    ("incl. pr.snapshot and host.exec", "incl. host.exec"),
+    (" incl. pr.snapshot", ""),
+    ("including `ws.pr.snapshot` and `ws.host.exec`", "including `ws.host.exec`"),
+    (", including `ws.pr.snapshot`", ""),
+    (PR_MONITOR_HOOK_XREF, ""),
+    ("`ws.help(\"pr\")` returns", "`ws.help(\"note\")` returns"),
+    ("statusImageAssetId, branch, repositoryName", "statusImageAssetId, repositoryName"),
+    ("{ ok, title, branch, skipped? }", "{ ok, title, skipped? }"),
+    (
+        "title. May rename the branch if it is still auto-generated; returns `skipped`",
+        "title. Returns `skipped`",
+    ),
+    ("numQuestionsAsked?, prMonitors?, prs?, tasks?", "numQuestionsAsked?, tasks?"),
+    (
+        " `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with \" (changes pending)\" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls).",
+        "",
+    ),
+    ("{ query?, pr?, includeRetired?, limit? }", "{ query?, includeRetired?, limit? }"),
+    ("by free text and/or a PR.", "by free text."),
+    (
+        " `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`",
+        " `query` matches title, status message and tags (every term) or note text. Rows: `{ id, title, status, archived, updatedAt, matchedOn, notes?, link, markdownLink }`",
+    ),
+];
+
+/// The documented refusal for a `host({ method })` frame that needs git or a
+/// forge in a plain-folder workspace (§5.1 "Plain-folder error"), or `None`
+/// for every other method. Frame methods carry no `ws.` prefix; `mr.*`
+/// frames are the `ws.mr.*` aliases.
+pub(crate) fn plain_folder_refusal(method: &str) -> Option<String> {
+    let binding = format!("ws.{method}");
+    PLAIN_FOLDER_PREFIXES
+        .iter()
+        .any(|prefix| {
+            if prefix.ends_with('.') {
+                binding.starts_with(prefix)
+            } else {
+                binding == *prefix
+            }
+        })
+        .then(|| format!("{binding} is not available in plain-folder workspaces"))
+}
+
+/// A `workspace_api` description (full, compact or condensed) or `ws.help`
+/// output with the plain-folder surfaces removed: the [`PLAIN_FOLDER_PREFIXES`]
+/// doc lines and index entries plus their cross-references. Applied by the
+/// bridge for plain-folder workspaces only, so every other description is
+/// unchanged by construction.
+#[must_use]
+pub fn plain_folder_description(desc: &str) -> String {
+    let mut out = prune_doc_lines(desc, |line| {
+        PLAIN_FOLDER_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    });
+    for (from, to) in PLAIN_FOLDER_XREF_REWRITES {
+        out = out.replace(from, to);
+    }
+    out
 }
 
 fn workspace_api_description_for_bridge(
@@ -4023,6 +4112,23 @@ mod script_recipe_tests {
                 intent_js::eval(&code, &intent_js::EvalOptions::default(), None)
                     .await
                     .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod plain_folder_tests {
+    use super::*;
+
+    /// Every rewrite still matches the static description (no stale marker
+    /// silently letting a git or PR mention through).
+    #[test]
+    fn plain_folder_rewrites_match_the_description() {
+        for (from, _) in PLAIN_FOLDER_XREF_REWRITES {
+            assert!(
+                WORKSPACE_API_DESCRIPTION.contains(from),
+                "stale plain-folder rewrite: {from}"
             );
         }
     }

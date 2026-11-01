@@ -24446,6 +24446,10 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn is_plain_folder_workspace(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { self.is_plain_folder(&workspace_id).await })
+    }
+
     fn retire_workspace(
         &self,
         id: WorkspaceId,

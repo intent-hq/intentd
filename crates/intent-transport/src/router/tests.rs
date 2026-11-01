@@ -164,8 +164,19 @@ impl WorkspaceApi for FakeApi {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
             }
+            if id.as_str() == "ws-plain" {
+                return Ok(Workspace {
+                    branch: String::new(),
+                    worktree_path: None,
+                    plain_folder: true,
+                    ..ws_with(&id)
+                });
+            }
             Ok(ws_with(&id))
         })
+    }
+    fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { id.as_str() == "ws-plain" })
     }
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
@@ -3616,6 +3627,46 @@ fn plain_folder_errors_map_to_machine_readable_codes() {
             "{wire}"
         );
     }
+}
+
+/// Explicit git and accept-changes mutations on a plain-folder workspace
+/// (§5.1) are refused at the front door with `plain-folder-unsupported`
+/// naming the method; the same call on a git workspace still dispatches.
+#[tokio::test]
+async fn plain_folder_git_mutations_are_refused_at_the_front_door() {
+    for (method, extra) in [
+        ("git.stage", r#","paths":["a.txt"]"#),
+        ("git.push", ""),
+        ("git.createBranch", r#","branchName":"topic""#),
+        (
+            "accept-changes.addRemote",
+            r#","remoteUrl":"https://github.com/o/r.git""#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-plain"{extra}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}: {v}");
+        assert_eq!(
+            v["error"]["data"],
+            serde_json::json!({ "code": "plain-folder-unsupported", "operation": method }),
+            "{method}"
+        );
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(format!(
+                "{method} is not available in plain-folder workspaces"
+            ))
+        );
+    }
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["a.txt"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ok.get("error").is_none(), "{ok}");
 }
 
 /// `workspace.update` never writes `plainFolder` (§5.1): the key is refused

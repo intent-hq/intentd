@@ -644,9 +644,13 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        // Retired workspaces are read-only (§5.1): refuse gated writes
-        // before any handler runs.
-        let result = match crate::retired_gate::check(api, method, &params).await {
+        // Retired workspaces are read-only and plain-folder workspaces have
+        // no git or forge (§5.1): refuse gated writes before any handler runs.
+        let gate = match crate::retired_gate::check(api, method, &params).await {
+            Ok(()) => crate::plain_folder_gate::check(api, method, &params).await,
+            Err(e) => Err(e),
+        };
+        let result = match gate {
             Ok(()) => dispatch(api, method, &params).await,
             Err(e) => Err(domain_to_rpc(e)),
         };
