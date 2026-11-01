@@ -171,7 +171,7 @@ Open Settings and use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
-| Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
+| Appearance | Theme, colors, language, fonts, font size, and chat display | `/settings?tab=display#theme` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
@@ -181,6 +181,12 @@ Open Settings and use these sidebar labels (English labels shown):
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
+
+In **Appearance → Font style → Font size**, choose **Small**, **Default**, **Large**,
+or **Extra large**. This changes the app's text size immediately and is saved on this
+device. Choose **Default** to restore the original text size.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/FontSizeSettings.svelte; packages/cloudlands-fe/src/routes/RootAppProviders.svelte; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/sagas/user-preferences-persistence-saga.ts. -->
 
 When the user asks the Assistant to change a setting, `ws.app.settings.propose` shows a
 change card the user applies or discards; the card can be undone. It accepts only
