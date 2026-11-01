@@ -196,8 +196,11 @@ impl ExecutorService {
     }
 
     /// The capabilities report: platform, version, the shared limits and
-    /// their use, and the cached provider list.
+    /// their use, and the cached provider list. Until the first full report
+    /// lands, the list is primed with what is cheap to know, so a backend
+    /// binding right after its first mint sees the providers.
     fn capabilities(&self) -> MachineCapabilities {
+        self.deps.report.prime();
         let mut capabilities = MachineCapabilities::new(
             self.platform,
             env!("CARGO_PKG_VERSION"),

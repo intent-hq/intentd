@@ -1130,6 +1130,32 @@ fn the_report_is_due_only_while_a_credential_is_active() {
     assert!(!report_due(false, Some(now), now + REPORT_INTERVAL));
 }
 
+/// A backend that binds right after its first mint sees the providers:
+/// the welcome fills in what is cheap to know (launch resolution, no
+/// provider CLI) before the first full report, as turning the retired
+/// setting on used to.
+#[tokio::test]
+async fn a_bind_primes_the_report_before_its_welcome() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    assert_eq!(node.report.primes.load(Ordering::SeqCst), 0);
+    let dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(dialed.welcome.capabilities.providers[0].id, "mock");
+    assert!(
+        node.report.primes.load(Ordering::SeqCst) >= 1,
+        "the welcome primed the report"
+    );
+    assert_eq!(
+        node.report.refreshes.load(Ordering::SeqCst),
+        0,
+        "a bind never runs the full report"
+    );
+    node.stop().await;
+}
+
 /// On a multi-thread runtime a shutdown can land while the worker is
 /// between taking a revoked backend out of the service and registering
 /// its stop: shutdown must wait for the worker, so it still joins that
