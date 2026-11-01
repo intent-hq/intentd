@@ -944,9 +944,9 @@ jobs:
     # A main push compares against the previous tip (`github.event.before`):
     # a release-metadata push (`chore: release vX.Y.Z`) is a tree auto-cut
     # just required green plus release metadata, so it skips the Windows
-    # post-merge job (`release_push`). Each event gets only its own output,
-    # so a push never trips the `fast_path` guards on the `build` steps and
-    # the macOS release build still runs.
+    # post-merge job and the macOS `build` job (`release_push`). Each event
+    # gets only its own output, so a push never trips the `fast_path` guards
+    # on the `build` steps.
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))
     timeout-minutes: 5
     outputs:
@@ -995,17 +995,20 @@ jobs:
     # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
     # dependencies: the PR `fast_path` output is empty on push and
-    # merge_group (a release push reports only `release_push`, which these
-    # steps ignore, so the macOS release build still runs), and the native runner has a
+    # merge_group (a release push reports only `release_push`, which skips
+    # this whole job instead), and the native runner has a
     # hosted fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
     # `route` places the native entry and runs on every event this job runs
     # on. route runs on ubuntu-24.04, so this dependency can never queue
     # behind the self-hosted runners it decides about.
     # On push it is skipped when `supersede` reports this commit superseded
-    # (only the tip's proof is read); CI Gate accepts that skip only then.
+    # (only the tip's proof is read) or `release-fast-path` reports a
+    # release-metadata push (the tree the previous push built plus version
+    # bumps; the tag's release workflow builds it for every target); CI Gate
+    # accepts that skip only then.
     needs: [release-fast-path, route, supersede]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && needs.supersede.outputs.superseded != 'true')) }}
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && needs.supersede.outputs.superseded != 'true' && needs.release-fast-path.outputs.release_push != 'true')) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -1201,8 +1204,10 @@ jobs:
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
+      # Only a self-hosted runner keeps its target dir for the next queue run;
+      # on an ephemeral VM this check warmed nothing (2-3 paid macOS minutes).
       - name: Warm merge queue check cache
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push' && contains(matrix.os, 'self-hosted')
         run: cargo check --workspace --target ${{ matrix.target }}
 
   # Windows lint, merge queue only: the native production check and
@@ -2723,13 +2728,15 @@ jobs:
               ;;
             push)
               # Release-metadata and superseded pushes skip the Windows
-              # post-merge job; the skip is accepted only when the reporting
-              # job succeeded (see `release-fast-path` and `supersede`).
+              # post-merge job and the macOS release build; the skip is
+              # accepted only when the reporting job succeeded (see
+              # `release-fast-path` and `supersede`).
               windows=require
+              build=require
               if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
                 windows=optional
+                build=optional
               fi
-              build=require
               if [ "${{ needs.supersede.result }}" = success ] && [ "${{ needs.supersede.outputs.superseded }}" = true ]; then
                 windows=optional
                 build=optional

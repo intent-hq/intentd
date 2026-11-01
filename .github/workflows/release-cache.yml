@@ -50,6 +50,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      release_push: ${{ steps.release.outputs.release_push }}
     steps:
     - uses: actions/setup-python@v6
       with:
@@ -57,6 +58,21 @@ jobs:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
+    - id: release
+      name: Classify release-metadata push
+      if: github.event_name == 'push'
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.before }}
+      run: |
+        # Same classifier and contract as ci.yml's release-fast-path job: any
+        # failure or unknown shape is a miss, so the warm still runs.
+        git fetch --no-tags --depth=2 origin "$GITHUB_SHA" || true
+        out=$(./scripts/release-pr-fast-path.sh --exact-parent "$BASE_SHA" HEAD) || out="fast_path=false"
+        printf '%s\n' "$out"
+        line=$(printf '%s\n' "$out" | grep -E '^fast_path=(true|false)$' | tail -n1 || true)
+        line=${line:-fast_path=false}
+        echo "release_push=${line#fast_path=}" >> "$GITHUB_OUTPUT"
     - name: Install dist
       shell: bash
       run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
@@ -70,6 +86,7 @@ jobs:
         echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB_OUTPUT"
   daemon:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && needs.plan.outputs.release_push != 'true'
     needs: [plan, runner-route]
     strategy:
       fail-fast: false
@@ -227,6 +244,8 @@ jobs:
       run: sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
   sitter:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && needs.plan.outputs.release_push != 'true'
+    needs: [plan, runner-route]
     strategy:
       fail-fast: false
       matrix:
@@ -241,7 +260,6 @@ jobs:
           zigbuild: true
         - target: x86_64-pc-windows-msvc
           os: gh-windows-16x
-    needs: [runner-route]
     runs-on: ${{ contains(matrix.os, 'gh-linux') && fromJSON(needs.runner-route.outputs.slots || '{}')[format('sitter-{0}', matrix.target)] || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 30
     env:
