@@ -19648,6 +19648,141 @@ async fn resolve_spawn_uses_the_plain_folder() {
     assert_eq!(resolved.cwd, folder, "cwd is the plain folder");
 }
 
+/// Every provider onboarding can offer (no env-var or feature-code gate)
+/// launches identically in a plain-folder workspace and a git workspace: the
+/// same argv and provider env, differing only in the ACP session cwd (the
+/// user's folder vs the git checkout). No provider needs a git-specific
+/// launch flag — Codex runs through its ACP adapter, never `codex exec`,
+/// whose git-repository check (`--skip-git-repo-check`) would refuse a plain
+/// folder. Manual turns recorded on the plain-folder provider task.
+#[tokio::test]
+async fn onboarding_providers_launch_identically_in_plain_folder_and_git_workspaces() {
+    let onboarding: Vec<&intent_providers::ProviderConfig> = intent_providers::ACP_PROVIDERS
+        .iter()
+        .filter(|p| p.requires_env_var.is_none() && p.requires_feature_code.is_none())
+        .collect();
+    let ids: Vec<&str> = onboarding.iter().map(|p| p.id).collect();
+    for expected in ["claude-code", "codex", "opencode", "auggie"] {
+        assert!(
+            ids.contains(&expected),
+            "{expected} is offered in onboarding"
+        );
+    }
+    assert!(
+        !ids.contains(&"mock"),
+        "env-gated providers are not offered"
+    );
+
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    let npx_only: Vec<&str> = onboarding
+        .iter()
+        .filter(|p| p.npx_only_package.is_some())
+        .map(|p| p.id)
+        .collect();
+    crate::test_support::provider_installed::mark(&mut settings.providers.paths, &npx_only);
+    for provider in onboarding.iter().filter(|p| p.npx_only_package.is_none()) {
+        settings.providers.paths.insert(
+            provider.primary_binary_provider_id().to_string(),
+            "/bin/sh".to_string(),
+        );
+    }
+
+    let plain_guard = test_tempdir("intentd-rs-plain-providers-");
+    let plain_dir = plain_guard.path().to_path_buf();
+    let git_guard = test_tempdir("intentd-rs-git-providers-");
+    let git_dir = git_guard.path().to_path_buf();
+    git2::Repository::init(&git_dir).expect("git init");
+    let plain = Workspace {
+        id: WorkspaceId::from("ws-plain-providers"),
+        title: "Plain".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(plain_dir.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let git = Workspace {
+        id: WorkspaceId::from("ws-git-providers"),
+        title: "Git".to_string(),
+        branch: "main".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(git_dir.display().to_string()),
+        worktree_path: Some(git_dir.display().to_string()),
+        ..Default::default()
+    };
+
+    let launch = |resolved: &ResolvedSpawn| {
+        let mut opts = intent_acp::spawn::SpawnOptions::new(&resolved.provider);
+        opts.cwd = Some(&resolved.cwd);
+        opts.model = resolved.model.as_deref();
+        opts.provider_binary = resolved.provider_binary.as_deref();
+        opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
+        opts.npx_fallback_package = resolved.npx_fallback_package;
+        let args = intent_acp::spawn::build_args(&opts);
+        let env = intent_providers::build_provider_env_for_spawn(
+            &resolved.provider,
+            resolved.model.as_deref(),
+            None,
+            None,
+            None,
+            opts.via_npx(),
+            None,
+        );
+        (args, env, resolved.extra_env.clone())
+    };
+
+    for provider in &onboarding {
+        let mut session = session_with_specialist(None);
+        session.provider = Some(provider.id.to_string());
+        let in_plain = resolve_spawn(&session, Some(&plain), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: plain folder resolves: {e}", provider.id));
+        let in_git = resolve_spawn(&session, Some(&git), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: git workspace resolves: {e}", provider.id));
+        assert_eq!(
+            in_plain.cwd, plain_dir,
+            "{}: cwd is the plain folder",
+            provider.id
+        );
+        assert_eq!(
+            in_git.cwd, git_dir,
+            "{}: cwd is the git checkout",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider, in_git.provider,
+            "{}: same provider config",
+            provider.id
+        );
+        let (plain_args, plain_env, plain_extra) = launch(&in_plain);
+        let (git_args, git_env, git_extra) = launch(&in_git);
+        assert_eq!(plain_args, git_args, "{}: same launch args", provider.id);
+        assert_eq!(plain_env, git_env, "{}: same provider env", provider.id);
+        assert_eq!(plain_extra, git_extra, "{}: same extra env", provider.id);
+        assert!(
+            !plain_args.iter().any(|a| a == "--skip-git-repo-check"),
+            "{}: no git-check flag needed",
+            provider.id
+        );
+        if provider.id == "codex" {
+            assert_eq!(
+                in_plain.npx_fallback_package,
+                Some(intent_providers::CODEX_ACP_NPX_PACKAGE),
+                "codex runs its ACP adapter"
+            );
+            assert!(
+                !plain_args.iter().any(|a| a == "exec"),
+                "codex never runs `codex exec`: {plain_args:?}"
+            );
+            assert_eq!(
+                plain_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                git_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                "codex agent mode is the same in both workspace kinds"
+            );
+        }
+    }
+}
+
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
 /// direct-mode row missing `worktree_path`, intent-hq/monorepo#2611)
 /// resolves its spawn cwd to the repository folder — never the temp dir.
