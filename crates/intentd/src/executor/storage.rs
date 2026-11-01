@@ -216,6 +216,14 @@ impl Storage {
     }
 }
 
+impl Drop for Storage {
+    /// The socket may sit in a shared runtime directory: remove it with
+    /// its backend, while the root's lock still keeps other daemons out.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.git_socket);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

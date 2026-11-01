@@ -782,7 +782,16 @@ async fn a_long_data_dir_still_binds_and_launches() {
     dialed.link.send(&refused_launch("a1")).await.unwrap();
     let record = next_record(&mut dialed).await;
     assert_eq!(record.agent_id, AgentId::from("a1"));
+    let socket = storage::git_socket_path(
+        &data_dir.join(EXECUTOR_DIR),
+        &node.api.credential(&token()).id.0,
+        &storage::runtime_base(),
+    )
+    .unwrap();
+    assert!(socket.exists(), "{}", socket.display());
     node.stop().await;
+    // The socket sits in a shared runtime directory: it goes with its backend.
+    assert!(!socket.exists(), "{}", socket.display());
 }
 
 /// Each backend (credential) has its own storage, journal and sequence
