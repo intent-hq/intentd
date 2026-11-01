@@ -19649,14 +19649,20 @@ async fn resolve_spawn_uses_the_plain_folder() {
 }
 
 /// Every provider onboarding can offer (no env-var or feature-code gate)
-/// launches identically in a plain-folder workspace and a git workspace: the
-/// same argv and provider env, differing only in the ACP session cwd (the
-/// user's folder vs the git checkout). No provider needs a git-specific
-/// launch flag — Codex runs through its ACP adapter, never `codex exec`,
-/// whose git-repository check (`--skip-git-repo-check`) would refuse a plain
-/// folder. Manual turns recorded on the plain-folder provider task.
+/// resolves the same spawn in a plain-folder workspace as in a git workspace:
+/// every `ResolvedSpawn` field except `cwd` (the user's folder vs the git
+/// checkout) matches, and so do the provider launch args and provider env
+/// derived from it. No provider needs a git-specific launch flag — Codex runs
+/// through its ACP adapter, never `codex exec`, whose git-repository check
+/// (`--skip-git-repo-check`) would refuse a plain folder.
+///
+/// Not covered here: after resolution the agent manager adds git
+/// commit-identity and credential-helper env discovered from the cwd, so a
+/// plain folder (not a repository) gets no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+/// vars; git then falls back to the user's global config. Manual turns are
+/// recorded on the plain-folder provider task.
 #[tokio::test]
-async fn onboarding_providers_launch_identically_in_plain_folder_and_git_workspaces() {
+async fn onboarding_providers_resolve_the_same_spawn_in_plain_folder_and_git_workspaces() {
     let onboarding: Vec<&intent_providers::ProviderConfig> = intent_providers::ACP_PROVIDERS
         .iter()
         .filter(|p| p.requires_env_var.is_none() && p.requires_feature_code.is_none())
@@ -19752,6 +19758,37 @@ async fn onboarding_providers_launch_identically_in_plain_folder_and_git_workspa
         assert_eq!(
             in_plain.provider, in_git.provider,
             "{}: same provider config",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.selection, in_git.selection,
+            "{}: selection",
+            provider.id
+        );
+        assert_eq!(in_plain.model, in_git.model, "{}: model", provider.id);
+        assert_eq!(
+            in_plain.reasoning_effort, in_git.reasoning_effort,
+            "{}: reasoning effort",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider_binary, in_git.provider_binary,
+            "{}: provider binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_binary, in_git.npx_fallback_binary,
+            "{}: npx binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_package, in_git.npx_fallback_package,
+            "{}: npx package",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.unsloth_endpoint, in_git.unsloth_endpoint,
+            "{}: unsloth endpoint",
             provider.id
         );
         let (plain_args, plain_env, plain_extra) = launch(&in_plain);
