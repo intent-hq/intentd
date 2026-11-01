@@ -304,10 +304,26 @@ async fn exposed_machines_replace_by_id_and_report_the_replaced_credential() {
     ));
     bad.state = RemoteMachineState::Disconnected;
     bad.hosts.clear();
+    bad.tc_address = None;
     assert!(matches!(
         store.save_exposed_machine(&bad).await,
         Err(Error::InvalidParams(_))
     ));
+    // A loopback-only machine is reachable over its tailcat address alone.
+    let mut tailcat_only = machine("tc-only", "cred-4", "t");
+    tailcat_only.hosts.clear();
+    assert_eq!(
+        store.save_exposed_machine(&tailcat_only).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.get_exposed_machine("tc-only").await.unwrap(),
+        Some(tailcat_only)
+    );
+    assert_eq!(
+        store.remove_exposed_machine("tc-only").await.unwrap(),
+        Some(id("cred-4"))
+    );
     bad.hosts = vec!["h".into()];
     bad.port = 0;
     assert!(matches!(
@@ -362,6 +378,14 @@ async fn exposed_machine_state_routes_and_capabilities_are_cached() {
             .await,
         Err(Error::InvalidParams(_))
     ));
+    assert!(store
+        .record_exposed_machine_connection("mac", &[], Some("tc-abc"), "t")
+        .await
+        .unwrap());
+    assert!(store
+        .record_exposed_machine_connection("mac", &hosts, None, "2026-10-30T01:00:00Z")
+        .await
+        .unwrap());
 
     let platform = AgentPlatform {
         os: NodeOs::Macos,

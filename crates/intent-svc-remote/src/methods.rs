@@ -210,9 +210,9 @@ fn add_params(params: &Value) -> Result<AddParams> {
         .get("hosts")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::InvalidParams("hosts must be an array of strings".into()))?;
-    if hosts.is_empty() || hosts.len() > MAX_HOSTS {
+    if hosts.len() > MAX_HOSTS {
         return Err(Error::InvalidParams(format!(
-            "hosts must list 1-{MAX_HOSTS} hosts"
+            "hosts must list at most {MAX_HOSTS} hosts"
         )));
     }
     let hosts = hosts
@@ -236,12 +236,20 @@ fn add_params(params: &Value) -> Result<AddParams> {
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port != 0)
         .ok_or_else(|| Error::InvalidParams("port must be 1-65535".into()))?;
+    let tc_address = text(params, "tcAddress", false)?.map(str::to_owned);
+    // A loopback-only listener advertises no hosts: its tailcat address is
+    // then the only route.
+    if hosts.is_empty() && tc_address.is_none() {
+        return Err(Error::InvalidParams(
+            "hosts or tcAddress must give at least one route".into(),
+        ));
+    }
     Ok(AddParams {
         machine_id: machine_id.to_owned(),
         name: name.to_owned(),
         hosts,
         port,
-        tc_address: text(params, "tcAddress", false)?.map(str::to_owned),
+        tc_address,
         fingerprint: required(params, "fingerprint")?.to_owned(),
         credential_id: required(params, "credentialId")?.to_owned(),
         // Validated (and never echoed) when the target is built.
@@ -328,7 +336,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
     let welcome = dialed.welcome;
     let bound_at = NodeCounter(generation.load(std::sync::atomic::Ordering::SeqCst));
 
-    let (hosts, tc_address) = if welcome.hosts.is_empty() {
+    let (hosts, tc_address) = if welcome.hosts.is_empty() && welcome.tc_address.is_none() {
         (params.hosts.clone(), params.tc_address.clone())
     } else {
         (welcome.hosts.clone(), welcome.tc_address.clone())

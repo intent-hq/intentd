@@ -183,6 +183,92 @@ async fn a_wrong_token_or_pin_is_unreachable_with_the_link_code() {
         .is_empty());
 }
 
+/// A stand-in for the sitter-shipped tailcat binary in pipe-client mode:
+/// for `address` it pipes stdin/stdout to `127.0.0.1:<port>`.
+#[cfg(unix)]
+fn fake_tailcat(dir: &std::path::Path, address: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("tailcat");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/usr/bin/env bash\n[ \"$1\" = \"{address}\" ] || exit 7\n\
+             exec 3<>/dev/tcp/127.0.0.1/$2 || exit 8\ncat <&3 &\ncat >&3\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A machine whose listener is loopback-only mints `hosts: []` with its
+/// tailcat address: it is added, and later reached, over tailcat alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tailcat_only_machine_with_no_hosts_is_added_and_refreshed() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let dir = tempfile::tempdir().unwrap();
+    backend
+        .services
+        .configure_remote_machines(Some(fake_tailcat(dir.path(), "tcmachine1")));
+    *machine.host.hosts.lock().unwrap() = Vec::new();
+    *machine.host.tc_address.lock().unwrap() = Some("tcmachine1".into());
+    let mut params = machine.add_params();
+    params["hosts"] = json!([]);
+    params["tcAddress"] = json!("tcmachine1");
+
+    let added = backend.call("add", params).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+    assert_eq!(added["machine"]["hosts"], json!([]));
+    assert_eq!(added["machine"]["tcAddress"], "tcmachine1");
+
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    machine
+        .accept()
+        .await
+        .answer_capabilities(capabilities(0))
+        .await;
+    let refreshed = refreshing.await.unwrap().unwrap();
+    assert_eq!(refreshed["machine"]["state"], "connected");
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.hosts.is_empty());
+    assert_eq!(row.tc_address.as_deref(), Some("tcmachine1"));
+    assert!(row.last_connected_at.is_some());
+}
+
+/// With neither a host nor a tailcat address there is no route at all.
+#[tokio::test]
+async fn add_without_any_route_is_rejected_before_dialing() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    for tc_address in [None, Some(json!("")), Some(json!(null))] {
+        let mut params = machine.add_params();
+        params["hosts"] = json!([]);
+        if let Some(tc_address) = tc_address {
+            params["tcAddress"] = tc_address;
+        }
+        let error = backend.call("add", params).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidParams(_)), "{error:?}");
+        assert!(error.to_string().contains("tcAddress"), "{error}");
+    }
+}
+
 #[tokio::test]
 async fn add_rejects_malformed_params_before_dialing() {
     let backend = Backend::new().await;

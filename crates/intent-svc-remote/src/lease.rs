@@ -71,10 +71,13 @@ pub(crate) async fn record_new_lease(
             exclusive_reserved: false,
         },
         version: String::new(),
-        endpoint: target
-            .direct_routes()
-            .first()
-            .map(|route| format!("{}/node", route.endpoint.url)),
+        // Informational (the connector dials from the target). A machine
+        // with no direct host is reached over tailcat, whose pipe ends at
+        // the machine's own listener: record that route's endpoint.
+        endpoint: Some(target.direct_routes().first().map_or_else(
+            || format!("wss://localhost:{}/node", target.port),
+            |route| format!("{}/node", route.endpoint.url),
+        )),
         certificate_sha256: Some(target.certificate_sha256.clone()),
         last_seen_at: None,
     };

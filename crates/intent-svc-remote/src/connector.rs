@@ -429,7 +429,7 @@ impl Shared {
         status.running_agents.clone_from(&welcome.running_agents);
         drop(status);
         self.capabilities(&welcome.capabilities);
-        if !welcome.hosts.is_empty() {
+        if !welcome.hosts.is_empty() || welcome.tc_address.is_some() {
             let mut target = lock(&self.target);
             target.hosts.clone_from(&welcome.hosts);
             target.tc_address.clone_from(&welcome.tc_address);
