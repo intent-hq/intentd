@@ -629,7 +629,18 @@ pub(crate) async fn assemble_system_prompt(
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         if assistant.is_none() {
-            parts.push(harness.suggested_next_steps_block(effective_auto_commit));
+            match entry
+                .doctrine
+                .instructions
+                .plain_folder
+                .filter(|_| plain_folder)
+            {
+                // Plain folders have no commits, branches or pull requests:
+                // their footer examples and wording say so (no auto-commit
+                // clause either).
+                Some(doctrine) => parts.push(doctrine.suggested_next_steps.to_string()),
+                None => parts.push(harness.suggested_next_steps_block(effective_auto_commit)),
+            }
         }
     }
     if parts.is_empty() {
@@ -1489,6 +1500,135 @@ This is a test skill.
         assert_eq!(
             assembled(&store, temp_dir.path(), "interactive", false, &unflagged).await,
             prompt
+        );
+    }
+
+    /// Words Intent-authored prompt text must never use in a plain-folder
+    /// workspace (Brief Must 6), matched case-insensitively as whole words.
+    const PLAIN_FOLDER_BANNED_WORDS: &[&str] = &[
+        "git",
+        "commit",
+        "commits",
+        "committing",
+        "branch",
+        "branches",
+        "pull request",
+        "pull requests",
+        "pr",
+        "prs",
+        "merge request",
+        "mr",
+        "merge",
+        "merging",
+        "push",
+    ];
+
+    /// Every banned whole word in `text`, with the line it appears on.
+    fn plain_folder_word_leaks(text: &str) -> Vec<String> {
+        let pattern = format!(
+            r"(?i)\b({})\b",
+            PLAIN_FOLDER_BANNED_WORDS
+                .iter()
+                .map(|w| regex::escape(w))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let re = regex::Regex::new(&pattern).unwrap();
+        text.lines()
+            .filter_map(|line| {
+                re.find(line)
+                    .map(|m| format!("{:?} in: {}", m.as_str(), line.trim()))
+            })
+            .collect()
+    }
+
+    struct NoApi;
+    impl intent_core::WorkspaceApi for NoApi {}
+
+    /// The full assembled prompt for a plain-folder workspace — every
+    /// Intent-authored layer (bundled doctrine, commit policy slot, the
+    /// condensed `workspace_api` reference, role reminder, questions and
+    /// suggested-next-steps footers) on the latest harness — never mentions
+    /// git, commits, branches, pull/merge requests, merging or pushing, for
+    /// every default role, the coordinator role, top-level and sub-agents and
+    /// both auto-commit states. User-supplied specialist prompts (Brief
+    /// Must 7) and provider-owned text are not part of the assembly here.
+    #[tokio::test]
+    async fn plain_folder_prompt_never_mentions_git_or_forge_words() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = plain_folder_workspace(temp_dir.path());
+        let coordinator = SpecialistPromptInjection {
+            behavior_prompt: None,
+            specialist_name: Some("Coordinator".to_string()),
+            role_reminder: None,
+        };
+        let mut leaks = Vec::new();
+        for agent_type in [
+            "interactive",
+            "workspace",
+            "workspace-agent",
+            "task-loop",
+            "task-focused",
+            "task-debug",
+            "task-breakdown",
+            "debug",
+            "chat",
+        ] {
+            for specialist in [None, Some(&coordinator)] {
+                for is_sub_agent in [false, true] {
+                    for auto_commit in [false, true] {
+                        let docs = intent_acp::WorkspaceMcpServer::new(
+                            std::sync::Arc::new(NoApi),
+                            workspace.id.clone(),
+                        )
+                        .with_sub_agent(is_sub_agent)
+                        .with_plain_folder(true)
+                        .condensed_workspace_api_description();
+                        let prompt = assemble_system_prompt(
+                            &store,
+                            Some(temp_dir.path()),
+                            agent_type,
+                            specialist,
+                            is_sub_agent,
+                            auto_commit,
+                            false,
+                            &AgentFeaturesSettings::default(),
+                            Some(&workspace),
+                            None,
+                            Some(&docs),
+                        )
+                        .await
+                        .expect("prompt");
+                        // The plain-folder note must name `git init` (Brief
+                        // Must 6); it is the one sanctioned mention.
+                        let note = crate::harness::latest_entry()
+                            .doctrine
+                            .instructions
+                            .plain_folder
+                            .expect("latest set gates plain folders")
+                            .note;
+                        assert_eq!(prompt.matches(note).count(), 1, "{agent_type}");
+                        if !is_sub_agent {
+                            assert!(prompt.contains("## Suggested Next Steps"), "{agent_type}");
+                        }
+                        let prompt = prompt.replace(note, "");
+                        for leak in plain_folder_word_leaks(&prompt) {
+                            let entry = format!("{agent_type}: {leak}");
+                            if !leaks.contains(&entry) {
+                                leaks.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} leaks:\n{}",
+            leaks.len(),
+            leaks.join("\n")
         );
     }
 }

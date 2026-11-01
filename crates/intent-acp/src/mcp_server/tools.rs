@@ -1017,20 +1017,40 @@ fn prune_doc_lines(base: &str, gated: impl Fn(&str) -> bool) -> String {
 const PLAIN_FOLDER_PREFIXES: &[&str] =
     &["ws.git.", "ws.pr.", "ws.mr.", "ws.workspace.proposeSibling"];
 
-/// Cross-references to `ws.pr.*` outside its own doc lines (the `ws.hook.*`
-/// index hint and the `ws.hook.schedule` continuation line), rewritten for a
-/// plain-folder workspace. Each pair is applied in order, so both the
-/// `host.exec` spelling and its `hostExec`-off / chief variant are covered
-/// (unit tests guard that no `ws.pr` mention survives).
+/// Git, branch and pull-request references outside the pruned doc lines —
+/// the `ws.hook.*` cross-references to `ws.pr.*`, the `ws.help("pr")`
+/// example, and the branch / PR fields of `ws.workspace.details`,
+/// `ws.workspace.setTitle`, `ws.agent.snapshot` and
+/// `ws.crossWorkspace.search` — rewritten for a plain-folder workspace
+/// (which has none of them). Each pair is applied in order to every
+/// occurrence, so the full, compact and condensed variants and the
+/// `host.exec` / `hostExec`-off / chief spellings are all covered (unit tests
+/// pin every `from` to the static description and guard that no git or PR
+/// word survives).
 const PLAIN_FOLDER_XREF_REWRITES: &[(&str, &str)] = &[
     ("incl. pr.snapshot and host.exec", "incl. host.exec"),
     (" incl. pr.snapshot", ""),
-    (
-        "including `ws.pr.snapshot` and `ws.host.exec`",
-        "including `ws.host.exec`",
-    ),
+    ("including `ws.pr.snapshot` and `ws.host.exec`", "including `ws.host.exec`"),
     (", including `ws.pr.snapshot`", ""),
     (PR_MONITOR_HOOK_XREF, ""),
+    ("`ws.help(\"pr\")` returns", "`ws.help(\"note\")` returns"),
+    ("statusImageAssetId, branch, repositoryName", "statusImageAssetId, repositoryName"),
+    ("{ ok, title, branch, skipped? }", "{ ok, title, skipped? }"),
+    (
+        "title. May rename the branch if it is still auto-generated; returns `skipped`",
+        "title. Returns `skipped`",
+    ),
+    ("numQuestionsAsked?, prMonitors?, prs?, tasks?", "numQuestionsAsked?, tasks?"),
+    (
+        " `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with \" (changes pending)\" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls).",
+        "",
+    ),
+    ("{ query?, pr?, includeRetired?, limit? }", "{ query?, includeRetired?, limit? }"),
+    ("by free text and/or a PR.", "by free text."),
+    (
+        " `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`",
+        " `query` matches title, status message and tags (every term) or note text. Rows: `{ id, title, status, archived, updatedAt, matchedOn, notes?, link, markdownLink }`",
+    ),
 ];
 
 /// The documented refusal for a `host({ method })` frame that needs git or a
@@ -1064,7 +1084,7 @@ pub fn plain_folder_description(desc: &str) -> String {
             .any(|prefix| line.starts_with(prefix))
     });
     for (from, to) in PLAIN_FOLDER_XREF_REWRITES {
-        out = out.replacen(from, to, 1);
+        out = out.replace(from, to);
     }
     out
 }
@@ -4092,6 +4112,23 @@ mod script_recipe_tests {
                 intent_js::eval(&code, &intent_js::EvalOptions::default(), None)
                     .await
                     .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod plain_folder_tests {
+    use super::*;
+
+    /// Every rewrite still matches the static description (no stale marker
+    /// silently letting a git or PR mention through).
+    #[test]
+    fn plain_folder_rewrites_match_the_description() {
+        for (from, _) in PLAIN_FOLDER_XREF_REWRITES {
+            assert!(
+                WORKSPACE_API_DESCRIPTION.contains(from),
+                "stale plain-folder rewrite: {from}"
             );
         }
     }
