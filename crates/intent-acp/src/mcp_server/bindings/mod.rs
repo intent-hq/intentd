@@ -553,11 +553,6 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Convert a [`intent_core::Error`] into the JS-visible error text used
-/// throughout these bindings (the trait's `Display` impl already renders the
-/// message content the reference builders threw).
-// By-value so it slots point-free into `map_err(map_err)` in every binding.
-#[expect(clippy::needless_pass_by_value)]
 /// Whether `workspace_id` is a plain-folder workspace, read from the
 /// persisted `Workspace.plainFolder` flag (§5.1). A failed lookup counts as
 /// not plain, so git workspaces keep their surface; the Assistant workspace
@@ -573,6 +568,11 @@ pub(crate) async fn is_plain_folder(
             .is_ok_and(|w| w.plain_folder)
 }
 
+/// Convert a [`intent_core::Error`] into the JS-visible error text used
+/// throughout these bindings (the trait's `Display` impl already renders the
+/// message content the reference builders threw).
+// By-value so it slots point-free into `map_err(map_err)` in every binding.
+#[expect(clippy::needless_pass_by_value)]
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }

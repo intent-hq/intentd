@@ -63,6 +63,9 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The agent→BE MCP server: a fixed workspace context, the shared service
 /// surface, and the set of tool names denied for this agent's type.
+// Each bool is an independent spawn-time capture (chief-ness, sub-agent,
+// compact descriptions, plain folder), not a state machine.
+#[expect(clippy::struct_excessive_bools)]
 pub struct WorkspaceMcpServer {
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
