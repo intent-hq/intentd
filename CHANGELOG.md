@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.99] - 2026-11-01
+
+### 🚀 Features
+
+- Suppress git events and PR monitoring in plain-folder workspaces ([#2902](https://github.com/intent-hq/intentd/pull/2902))
+
+
 ## [0.11.98] - 2026-11-01
 
 ### 🚀 Features
