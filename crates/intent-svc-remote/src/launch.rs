@@ -37,8 +37,8 @@ use intent_core::machines::RemoteMachineState;
 
 use crate::RemoteServicesExt as _;
 
-/// The remote-launch port of the feature. With no exposed machine, or
-/// `experimental.remoteAgents` off, it behaves like the unavailable port.
+/// The remote-launch port of the feature. With no exposed machine it
+/// behaves like the unavailable port.
 #[derive(Default)]
 pub struct RemoteLaunch;
 
@@ -80,13 +80,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 /// The exposed machines' cached platforms: supported once a machine has
 /// reported what it runs; available when its last report has a free slot
-/// and it is neither revoked nor in need of an update. Nothing while
-/// `experimental.remoteAgents` is off.
+/// and it is neither revoked nor in need of an update.
 async fn machines_availability(svc: &Services) -> Result<PlatformAvailability> {
     let now = intent_core::now_iso();
-    if !svc.experimental_remote_agents_enabled() {
-        return Ok(PlatformAvailability::none(now));
-    }
     let mut supported = Vec::new();
     let mut available = Vec::new();
     for row in svc.store().list_exposed_machines().await? {
@@ -176,11 +172,9 @@ impl PlacementMachines for ExposedMachines<'_> {
 }
 
 /// The discovery text: the exposed machines with their providers, models
-/// and sign-in, and how to place an agent on one.
+/// and sign-in, and how to place an agent on one. `None` while no machine
+/// is exposed to this backend, so the model sees no remote-placement text.
 async fn help_text(svc: &Services) -> Option<String> {
-    if !svc.experimental_remote_agents_enabled() {
-        return None;
-    }
     let rows = svc.store().list_exposed_machines().await.ok()?;
     let feature = svc.remote_feature();
     exposed_machines_help(&rows, &|id| {
@@ -253,10 +247,7 @@ impl RemoteLaunchPort for RemoteLaunch {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
-            let Some(feature) = svc
-                .remote_feature()
-                .filter(|_| svc.experimental_remote_agents_enabled())
-            else {
+            let Some(feature) = svc.remote_feature() else {
                 return Err(unavailable(
                     placement,
                     PlatformAvailability::none(intent_core::now_iso()),

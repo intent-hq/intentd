@@ -117,7 +117,7 @@ struct Host {
 }
 
 impl ExecutorHost for Host {
-    fn enabled(&self) -> bool {
+    fn ready(&self) -> bool {
         true
     }
     fn node_id(&self) -> String {
@@ -492,9 +492,8 @@ fn exited(seq: u64, agent: &AgentId) -> JournalRecord {
     }
 }
 
-/// The backend: services with the remote feature registered,
-/// `experimental.remoteAgents` on, an in-memory secret store and an event
-/// bus.
+/// The backend: services with the remote feature registered, an
+/// in-memory secret store and an event bus.
 struct Backend {
     services: Services,
     bus: EventBus,
@@ -512,9 +511,6 @@ impl Backend {
         let store = Store::open(&tmp.path).await.unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let registry = Arc::new(SettingsRegistry::load(config.path().join("config.toml")).unwrap());
-        registry
-            .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
-            .unwrap();
         let bus = EventBus::new(store.clone());
         let services = crate::register(
             Services::new(store)

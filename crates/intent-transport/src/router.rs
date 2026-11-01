@@ -227,13 +227,6 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: failure.message(),
             data: Some(failure.data()),
         },
-        // A remote-agents setting is off: -32602 with
-        // `data.code: "remote-agents-disabled"`.
-        ref e @ Error::RemoteAgentsDisabled { .. } => RpcErr {
-            code: e.code(),
-            message: e.to_string(),
-            data: Some(json!({ "code": "remote-agents-disabled" })),
-        },
         // The WSS listener is stopped (`executor.mint` has no routes to
         // report): -32603 with `data.code: "listener-down"`, as on
         // `pairing.getInfo`.

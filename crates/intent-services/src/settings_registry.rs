@@ -49,9 +49,7 @@ use crate::source_control_auth_ops::repository_owner::{
 /// [`SettingsFile`] schema leaf-for-leaf (maps such as `providers.paths` are
 /// single leaves — their dynamic children are not individually addressable).
 pub(crate) const KNOWN_PATHS: &[&str] = &[
-    "remoteAgents.enabled",
     "remoteAgents.permission",
-    "experimental.remoteAgents",
     "daemon.mode",
     "providers.active",
     "providers.enabled",

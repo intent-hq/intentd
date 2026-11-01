@@ -287,8 +287,6 @@ fn fixture_providers_with(args: &[&str]) -> Option<BTreeMap<String, ProviderLaun
 
 /// A daemon serving the executor link, with the executor service installed.
 struct Running {
-    /// `remoteAgents.enabled`.
-    enabled: Arc<std::sync::atomic::AtomicBool>,
     server: intent_transport::WsApiServer,
     service: Arc<ExecutorService>,
     api: Arc<MachineApi>,
@@ -319,17 +317,12 @@ impl Running {
             primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
         });
-        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         // Agents work in plain directories here: no backend serves git. The
         // git checkout path is covered by the e2e tests.
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
                 data_dir: data_dir.to_owned(),
                 node_id: NODE_ID.into(),
-                enabled: {
-                    let enabled = enabled.clone();
-                    Arc::new(move || enabled.load(std::sync::atomic::Ordering::SeqCst))
-                },
                 admission,
                 launch: Arc::new(FixedLaunch(providers)),
                 report: report.clone(),
@@ -367,9 +360,7 @@ impl Running {
             None,
         )
         .unwrap();
-        let links = ExecutorLinks::new(service.clone());
-        service.attach_links(&links);
-        server.install_executor_links(links);
+        server.install_executor_links(ExecutorLinks::new(service.clone()));
         let port = server.start().await.unwrap();
         let endpoint = NodeEndpoint {
             url: format!("wss://127.0.0.1:{port}"),
@@ -378,7 +369,6 @@ impl Running {
             tailcat: None,
         };
         Self {
-            enabled,
             server,
             service,
             api,
@@ -1029,11 +1019,11 @@ async fn revoking_a_credential_stops_its_backends_agents() {
 }
 
 /// Before the service is installed (the listener starts before the store
-/// is ready) the slot reports the executor link as disabled.
+/// is ready, or the service failed to start) the slot is no executor host.
 #[test]
-fn the_slot_is_disabled_until_the_service_is_installed() {
+fn the_slot_is_not_ready_until_the_service_is_installed() {
     let slot = ExecutorSlot::default();
-    assert!(!slot.enabled());
+    assert!(!slot.ready());
     assert!(slot.service().is_none());
     assert_eq!(
         slot.status(&ExecutorCredentialId::new()),
@@ -1122,73 +1112,47 @@ async fn shutdown_during_a_revocation_still_stops_its_agents() {
     node.stop().await;
 }
 
-/// Turning `remoteAgents.enabled` off closes live executor connections: an
-/// already-bound backend can launch nothing more on its old session, and
-/// after re-enabling it binds afresh.
-#[tokio::test]
-async fn disabling_remote_agents_closes_live_links_and_re_enabling_admits_a_fresh_bind() {
-    let dir = tempfile::tempdir().unwrap();
-    let node = Running::start(dir.path(), 2).await;
-    let mut old = dial_link(&node.endpoint, hello(1, "lease-1", 0))
-        .await
-        .unwrap();
-    replay_complete(&mut old).await;
-    old.link.send(&refused_launch("a1")).await.unwrap();
-    assert_eq!(next_record(&mut old).await.seq, NodeCounter(1));
-
-    node.enabled
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    node.service.on_settings_changed().await;
-    assert!(next_frame(&mut old).await.is_none(), "the live link closed");
-    // A launch on the old session is not applied: nothing is journaled.
-    let _ = old.link.send(&refused_launch("a2")).await;
-    assert!(
-        dial_link(&node.endpoint, hello(2, "lease-1", 1))
-            .await
-            .is_err(),
-        "disabled: no new bind"
-    );
-
-    node.enabled
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    node.service.on_settings_changed().await;
-    let mut fresh = dial_link(&node.endpoint, hello(3, "lease-1", 1))
-        .await
-        .unwrap();
-    assert_eq!(
-        replay_complete(&mut fresh).await,
-        NodeCounter(1),
-        "the old session's launch after disable was never journaled"
-    );
-    fresh.link.send(&refused_launch("a3")).await.unwrap();
-    assert_eq!(next_record(&mut fresh).await.seq, NodeCounter(2));
-    node.stop().await;
+/// The provider report runs only while some executor credential is active:
+/// right away on the first poll that sees one, then every
+/// [`REPORT_INTERVAL`]; never on a machine no backend was given access to.
+#[test]
+fn the_report_is_due_only_while_a_credential_is_active() {
+    let now = std::time::Instant::now();
+    assert!(!report_due(false, None, now), "no credential: no report");
+    assert!(report_due(true, None, now), "first mint: report right away");
+    assert!(!report_due(true, Some(now), now));
+    assert!(!report_due(
+        true,
+        Some(now),
+        now + REPORT_INTERVAL.saturating_sub(Duration::from_secs(1))
+    ));
+    assert!(report_due(true, Some(now), now + REPORT_INTERVAL));
+    assert!(!report_due(false, Some(now), now + REPORT_INTERVAL));
 }
 
-/// A frame that reaches a session after the setting turned off (before the
-/// close lands) is not applied either.
+/// A backend that binds right after its first mint sees the providers:
+/// the welcome fills in what is cheap to know (launch resolution, no
+/// provider CLI) before the first full report, as turning the retired
+/// setting on used to.
 #[tokio::test]
-async fn a_session_applies_no_frame_while_remote_agents_are_disabled() {
+async fn a_bind_primes_the_report_before_its_welcome() {
+    use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
     let node = Running::start(dir.path(), 2).await;
-    let mut old = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+    assert_eq!(node.report.primes.load(Ordering::SeqCst), 0);
+    let dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
         .await
         .unwrap();
-    replay_complete(&mut old).await;
-    // Off, but no settings-change notification yet.
-    node.enabled
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let _ = old.link.send(&refused_launch("a1")).await;
+    assert_eq!(dialed.welcome.capabilities.providers[0].id, "mock");
     assert!(
-        next_frame(&mut old).await.is_none(),
-        "the session closed instead of launching"
+        node.report.primes.load(Ordering::SeqCst) >= 1,
+        "the welcome primed the report"
     );
-    node.enabled
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut fresh = dial_link(&node.endpoint, hello(2, "lease-1", 0))
-        .await
-        .unwrap();
-    assert_eq!(replay_complete(&mut fresh).await, NodeCounter(0));
+    assert_eq!(
+        node.report.refreshes.load(Ordering::SeqCst),
+        0,
+        "a bind never runs the full report"
+    );
     node.stop().await;
 }
 
@@ -1371,40 +1335,5 @@ async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
         .await
         .unwrap();
     assert_eq!(unknown, StopOutcome::NotRunning);
-    node.stop().await;
-}
-
-/// Turning `remoteAgents.enabled` on fills the provider list with what is
-/// cheap to know before anything else (so a backend binding right away
-/// sees the providers) and starts a full report, instead of waiting for
-/// the periodic refresh; turning it off does neither.
-#[tokio::test]
-async fn enabling_remote_agents_primes_and_refreshes_the_report() {
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let node = Running::start(dir.path(), 2).await;
-    node.enabled.store(false, Ordering::SeqCst);
-    node.service.on_settings_changed().await;
-    let primes = node.report.primes.load(Ordering::SeqCst);
-    let refreshes = node.report.refreshes.load(Ordering::SeqCst);
-
-    node.enabled.store(true, Ordering::SeqCst);
-    node.service.on_settings_changed().await;
-    assert_eq!(
-        node.report.primes.load(Ordering::SeqCst),
-        primes + 1,
-        "primed before returning"
-    );
-    tokio::time::timeout(wait(), async {
-        while node.report.refreshes.load(Ordering::SeqCst) == refreshes {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a full report starts");
-
-    // Already on: a settings change elsewhere does not prime again.
-    node.service.on_settings_changed().await;
-    assert_eq!(node.report.primes.load(Ordering::SeqCst), primes + 1);
     node.stop().await;
 }

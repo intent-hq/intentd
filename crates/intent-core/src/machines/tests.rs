@@ -181,18 +181,6 @@ fn remote_machine_state_names_match_the_wire() {
 }
 
 #[test]
-fn remote_agents_disabled_is_invalid_params_naming_the_setting() {
-    let error = Error::RemoteAgentsDisabled {
-        setting: "remoteAgents.enabled",
-    };
-    assert_eq!(error.code(), -32602);
-    assert_eq!(
-        error.to_string(),
-        "remote agents are disabled on this daemon: turn on remoteAgents.enabled first"
-    );
-}
-
-#[test]
 fn executor_live_status_defaults_to_disconnected() {
     assert_eq!(
         ExecutorLiveStatus::default(),

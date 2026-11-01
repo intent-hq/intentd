@@ -152,13 +152,6 @@ pub enum Error {
     #[error("{0}")]
     MachineUpdateRequired(Box<crate::machines::MachineUpdateRequired>),
 
-    /// A remote-agents request while its setting is off: `remoteAgents.enabled`
-    /// on the machine (`executor.mint`) or `experimental.remoteAgents` on the
-    /// backend. Surfaces as `-32602` with `error.data = { code:
-    /// "remote-agents-disabled" }`.
-    #[error("remote agents are disabled on this daemon: turn on {setting} first")]
-    RemoteAgentsDisabled { setting: &'static str },
-
     /// The daemon runs in node mode (`intentd serve --node` or
     /// `daemon.mode = "node"`): its own orchestration is off, so a method
     /// outside the node-mode list, or a front door that would start local
@@ -690,7 +683,6 @@ impl Error {
             | Error::PlacementUnavailable(_)
             | Error::ModelUnavailable(_)
             | Error::MachineUpdateRequired(_)
-            | Error::RemoteAgentsDisabled { .. }
             | Error::ContentBaseMismatch { .. }
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {

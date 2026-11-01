@@ -1,5 +1,6 @@
 //! The executor link served on the daemon's own WSS listener: the full
-//! admission matrix (path → enabled flags → Origin → executor-only token),
+//! admission matrix (path → listener API flag → Origin → executor-only
+//! token),
 //! per-credential binding, git admission, frame scope and revocation.
 
 use std::collections::HashMap;
@@ -198,13 +199,13 @@ impl WorkspaceApi for MachineApi {
 
 /// The executor service stand-in.
 struct Host {
-    enabled: AtomicBool,
+    ready: AtomicBool,
     accepted: mpsc::UnboundedSender<(ExecutorCredentialId, NodeConnection)>,
 }
 
 impl ExecutorHost for Host {
-    fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
     fn node_id(&self) -> String {
         MACHINE.into()
@@ -244,6 +245,11 @@ struct Machine {
 
 impl Machine {
     async fn start(mode: Mode) -> Self {
+        Self::start_with(mode, true).await
+    }
+
+    /// `minted`: whether any executor credential exists on this machine.
+    async fn start_with(mode: Mode, minted: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new(
             intent_store::Store::open(&dir.path().join("bus.db"))
@@ -251,12 +257,19 @@ impl Machine {
                 .unwrap(),
         );
         let api = Arc::new(MachineApi::new());
-        let executor = api.add(&executor_token(), credential(BACKEND));
-        let other = api.add(&other_executor_token(), credential(OTHER_BACKEND));
-        let racing = api.add(&racing_token(), credential(BACKEND));
-        api.unbindable.lock().unwrap().push(racing.id.clone());
-        let revoked = api.add(&revoked_token(), credential(BACKEND));
-        api.revoke(&revoked.id);
+        let (executor, other, racing) = (
+            credential(BACKEND),
+            credential(OTHER_BACKEND),
+            credential(BACKEND),
+        );
+        if minted {
+            api.add(&executor_token(), executor.clone());
+            api.add(&other_executor_token(), other.clone());
+            api.add(&racing_token(), racing.clone());
+            api.unbindable.lock().unwrap().push(racing.id.clone());
+            let revoked = api.add(&revoked_token(), credential(BACKEND));
+            api.revoke(&revoked.id);
+        }
         let certificate = certificate();
         let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
         let options = WsOptions {
@@ -272,7 +285,7 @@ impl Machine {
         let (tx, accepted) = mpsc::unbounded_channel();
         let host = (!matches!(mode, Mode::NoHost)).then(|| {
             Arc::new(Host {
-                enabled: AtomicBool::new(true),
+                ready: AtomicBool::new(true),
                 accepted: tx,
             })
         });
@@ -303,12 +316,12 @@ impl Machine {
         }
     }
 
-    fn set_enabled(&self, enabled: bool) {
+    fn set_ready(&self, ready: bool) {
         self.host
             .as_ref()
             .unwrap()
-            .enabled
-            .store(enabled, Ordering::SeqCst);
+            .ready
+            .store(ready, Ordering::SeqCst);
     }
 
     async fn accepted(&mut self) -> (ExecutorCredentialId, NodeConnection) {
@@ -555,27 +568,58 @@ async fn node_paths_are_forbidden_while_the_listener_api_is_disabled() {
     assert!(machine.api.lookups.lock().unwrap().is_empty());
 }
 
+/// An executor host whose service is not installed (it failed to start)
+/// is no executor host: `404`, and no credential is looked up.
 #[tokio::test]
-async fn node_paths_are_forbidden_while_remote_agents_are_disabled() {
+async fn node_paths_are_not_found_while_the_executor_service_is_not_ready() {
     let mut machine = Machine::start(Mode::Secure { ws_enabled: true }).await;
-    machine.set_enabled(false);
+    machine.set_ready(false);
     let auth = bearer(&executor_token());
     for path in NODE_PATHS {
         let (status, _) = machine
             .upgrade(path, &[("authorization", auth.as_str())])
             .await;
-        assert_eq!(status, 403, "{path}");
+        assert_eq!(status, 404, "{path}");
     }
-    assert!(
-        machine.api.lookups.lock().unwrap().is_empty(),
-        "no credential is looked up while remote agents are off"
-    );
+    assert!(machine.api.lookups.lock().unwrap().is_empty());
     machine.nothing_accepted().await;
-    machine.set_enabled(true);
+    machine.set_ready(true);
     let (status, _) = machine
         .upgrade(LINK_PATH, &[("authorization", auth.as_str())])
         .await;
-    assert_eq!(status, 101, "turning the setting on admits the same token");
+    assert_eq!(status, 101, "an installed service admits the same token");
+}
+
+/// No setting gates the link: a machine that never minted a credential
+/// refuses every `/node/*` request, whatever the token.
+#[tokio::test]
+async fn a_machine_without_minted_credentials_refuses_every_node_request() {
+    let mut machine = Machine::start_with(Mode::Secure { ws_enabled: true }, false).await;
+    let tokens = [
+        executor_token(),
+        other_executor_token(),
+        revoked_token(),
+        owner_token(),
+        member_token(),
+    ];
+    for path in NODE_PATHS {
+        let (status, _) = machine.upgrade(path, &[]).await;
+        assert_eq!(status, 401, "{path}: no token");
+        for token in &tokens {
+            let auth = bearer(token);
+            let (status, _) = machine
+                .upgrade(path, &[("authorization", auth.as_str())])
+                .await;
+            assert_eq!(status, 401, "{path}");
+        }
+    }
+    assert!(dial_link(
+        &machine.endpoint(&executor_token()),
+        hello(machine_binding(BACKEND, 1)),
+    )
+    .await
+    .is_err());
+    machine.nothing_accepted().await;
 }
 
 #[tokio::test]
@@ -1187,7 +1231,7 @@ async fn executor_revoke_closes_a_live_link_with_1008() {
     .unwrap();
     let (tx, mut accepted) = mpsc::unbounded_channel();
     server.install_executor_links(ExecutorLinks::new(Arc::new(Host {
-        enabled: AtomicBool::new(true),
+        ready: AtomicBool::new(true),
         accepted: tx,
     })));
     let port = server.start().await.unwrap();

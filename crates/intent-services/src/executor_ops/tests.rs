@@ -58,17 +58,7 @@ struct Fixture {
     member: PrincipalId,
 }
 
-impl Fixture {
-    fn set(&self, path: &str, value: Value) {
-        self.services
-            .settings_registry()
-            .expect("registry")
-            .apply(&[(path.to_string(), value)])
-            .expect("apply");
-    }
-}
-
-async fn fixture(enabled: bool, routes: Option<MachineRoutes>) -> Fixture {
+async fn fixture(routes: Option<MachineRoutes>) -> Fixture {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let member = intent_core::Principal {
@@ -89,17 +79,13 @@ async fn fixture(enabled: bool, routes: Option<MachineRoutes>) -> Fixture {
     );
     let services = Services::new(store.clone()).with_settings_registry(registry);
     services.attach_machine_routes(Arc::new(Routes(routes)));
-    let f = Fixture {
+    Fixture {
         _tmp: tmp,
         _config: config,
         store,
         services,
         member: member.id,
-    };
-    if enabled {
-        f.set("remoteAgents.enabled", json!(true));
     }
-    f
 }
 
 async fn owner(f: &Fixture) -> Caller {
@@ -119,7 +105,7 @@ async fn mint(f: &Fixture, caller: Caller) -> intent_core::Result<Value> {
 
 #[tokio::test]
 async fn owner_mints_a_hashed_credential_and_gets_the_token_once() {
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let minted = mint(&f, owner(&f).await).await.expect("mint");
     let token = minted["token"].as_str().unwrap().to_string();
     assert_eq!(token.len(), 64, "32 random bytes, hex");
@@ -181,7 +167,7 @@ async fn owner_mints_a_hashed_credential_and_gets_the_token_once() {
 async fn mint_omits_an_absent_tunnel_and_fingerprint() {
     let mut r = routes();
     r.tc_address = None;
-    let f = fixture(true, Some(r)).await;
+    let f = fixture(Some(r)).await;
     let minted = with_caller(
         owner(&f).await,
         f.services
@@ -199,7 +185,7 @@ async fn mint_omits_an_absent_tunnel_and_fingerprint() {
 
 #[tokio::test]
 async fn members_guests_agents_and_executors_cannot_mint_list_or_revoke() {
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let id = mint(&f, Caller::Daemon).await.unwrap()["credentialId"]
         .as_str()
         .unwrap()
@@ -250,20 +236,11 @@ async fn members_guests_agents_and_executors_cannot_mint_list_or_revoke() {
     );
 }
 
+/// No setting gates `executor.mint`: on a fresh config the owner mints,
+/// lists and revokes, and a member is still refused as forbidden.
 #[tokio::test]
-async fn mint_is_refused_while_remote_agents_are_disabled() {
-    let f = fixture(false, Some(routes())).await;
-    let refused = mint(&f, owner(&f).await).await;
-    assert!(
-        matches!(
-            refused,
-            Err(Error::RemoteAgentsDisabled {
-                setting: "remoteAgents.enabled"
-            })
-        ),
-        "{refused:?}"
-    );
-    // A member is refused as forbidden before the setting is consulted.
+async fn mint_needs_no_setting_and_stays_owner_only() {
+    let f = fixture(Some(routes())).await;
     let member = mint(
         &f,
         Caller::Wire {
@@ -273,10 +250,9 @@ async fn mint_is_refused_while_remote_agents_are_disabled() {
     )
     .await;
     assert!(matches!(member, Err(Error::Forbidden(_))), "{member:?}");
-    f.set("remoteAgents.enabled", json!(true));
-    mint(&f, owner(&f).await).await.expect("mint once enabled");
-    // Turning it off again keeps list and revoke available to the owner.
-    f.set("remoteAgents.enabled", json!(false));
+    mint(&f, owner(&f).await)
+        .await
+        .expect("mint on a fresh config");
     let listed = with_caller(owner(&f).await, f.services.executor_list_op())
         .await
         .unwrap();
@@ -286,12 +262,12 @@ async fn mint_is_refused_while_remote_agents_are_disabled() {
         .to_string();
     with_caller(owner(&f).await, f.services.executor_revoke_op(&id))
         .await
-        .expect("revoke while disabled");
+        .expect("revoke");
 }
 
 #[tokio::test]
 async fn mint_validates_params_and_needs_a_running_listener() {
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let long = "x".repeat(129);
     for params in [
         json!({}),
@@ -332,7 +308,7 @@ async fn mint_validates_params_and_needs_a_running_listener() {
         Err(Error::InvalidParams(_))
     ));
 
-    let down = fixture(true, None).await;
+    let down = fixture(None).await;
     let refused = mint(&down, Caller::Daemon).await;
     assert!(matches!(refused, Err(Error::ListenerDown)), "{refused:?}");
     let listed = with_caller(Caller::Daemon, down.services.executor_list_op())
@@ -347,7 +323,7 @@ async fn mint_validates_params_and_needs_a_running_listener() {
 
 #[tokio::test]
 async fn list_reports_live_status_and_revoke_fences_the_token() {
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let first = mint(&f, Caller::Daemon).await.unwrap();
     let second = mint(&f, Caller::Daemon).await.unwrap();
     let first_id = first["credentialId"].as_str().unwrap().to_string();
@@ -444,7 +420,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AllEvents {
 #[tokio::test]
 async fn the_minted_token_is_never_logged() {
     use tracing_subscriber::layer::SubscriberExt as _;
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let events = AllEvents::default();
     let _guard = crate::test_tracing::set_capture_default(
         tracing_subscriber::Registry::default().with(events.clone()),
@@ -468,7 +444,7 @@ async fn the_minted_token_is_never_logged() {
 #[tokio::test]
 async fn revoke_tells_the_listeners_so_live_links_close() {
     use intent_core::WorkspaceApi as _;
-    let f = fixture(true, Some(routes())).await;
+    let f = fixture(Some(routes())).await;
     let minted = mint(&f, Caller::Daemon).await.unwrap();
     let id = minted["credentialId"].as_str().unwrap().to_string();
     let mut revocations = f.services.subscribe_executor_revocations().unwrap();

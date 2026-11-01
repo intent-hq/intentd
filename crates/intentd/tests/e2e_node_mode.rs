@@ -289,19 +289,19 @@ async fn serve_node_serves_only_the_node_mode_list() {
     assert!(status.is_object());
     assert_ok(&uds.call("principal.me", json!({})).await, "principal.me");
     assert_ok(&uds.call("executor.list", json!({})).await, "executor.list");
-    let enabled = assert_ok(
-        &uds.call("settings.get", json!({ "path": "remoteAgents.enabled" }))
+    let permission = assert_ok(
+        &uds.call("settings.get", json!({ "path": "remoteAgents.permission" }))
             .await,
-        "settings.get remoteAgents.enabled",
+        "settings.get remoteAgents.permission",
     );
-    assert_eq!(enabled["value"], json!(false));
+    assert_eq!(permission["value"], json!("allowAll"));
     assert_ok(
         &uds.call(
             "settings.update",
-            json!({ "changes": [{ "path": "remoteAgents.enabled", "value": true }] }),
+            json!({ "changes": [{ "path": "remoteAgents.permission", "value": "denyAll" }] }),
         )
         .await,
-        "settings.update remoteAgents.enabled",
+        "settings.update remoteAgents.permission",
     );
     assert_ok(
         &uds.call(
@@ -324,7 +324,7 @@ async fn serve_node_serves_only_the_node_mode_list() {
     ] {
         assert_node_mode_refusal(&uds.call(method, params).await, method);
     }
-    for path in ["agents.maxConcurrent", "experimental.remoteAgents"] {
+    for path in ["agents.maxConcurrent", "git.autoCommit"] {
         assert_node_mode_refusal(
             &uds.call("settings.get", json!({ "path": path })).await,
             path,

@@ -1,8 +1,8 @@
 //! WSS end-to-end coverage for the backend's exposed machines (monorepo
 //! `docs/protocol/methods/nodes.md`, "Backend methods: exposed machines"):
 //! owner-only `remoteMachines.*` against a real `intentd serve`, members and
-//! guests refused with `-32003`, the mutations gated by
-//! `experimental.remoteAgents` (`remote-agents-disabled`), probe-before-save
+//! guests refused with `-32003`, no setting needed for the mutations (the
+//! retired `experimental.remoteAgents` is an unknown setting), probe-before-save
 //! (`machine-unreachable` naming the routes tried, nothing saved), and the
 //! executor token never reaching a result, an error or the log.
 
@@ -340,20 +340,14 @@ async fn remote_machines_are_owner_only_and_probe_before_saving_over_wss() {
         "token": machine_token,
     });
 
-    let disabled = rpc(&mut owner, 2, "remoteMachines.add", add.clone()).await;
-    assert_eq!(
-        error_code(&disabled),
-        (-32602, json!("remote-agents-disabled")),
-        "{disabled}"
-    );
-    let enabled = rpc(
+    let retired = rpc(
         &mut owner,
         3,
         "settings.update",
         json!({ "changes": [{ "path": "experimental.remoteAgents", "value": true }] }),
     )
     .await;
-    assert!(enabled.get("error").is_none(), "{enabled}");
+    assert!(retired.get("error").is_some(), "{retired}");
 
     let unreachable = rpc(&mut owner, 4, "remoteMachines.add", add.clone()).await;
     assert_eq!(
