@@ -1074,6 +1074,12 @@ In **Files**, search and file actions sit beside the section title. Open search 
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
 clears search and returns focus to its button.
 
+In alpha v2.264.0 and app versions with folder-chip navigation, click a folder
+mention in chat, rendered Markdown, or a note to reveal and expand that directory
+in **Files**. In older apps, open **Files** and browse the directory manually.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/services/mentions/chip.ts; src/lib/components/markdown/MarkdownViewer.svelte; src/lib/utils/editor-config.ts; src/lib/components/file-explorer/{VirtualizedFileTree.svelte,reveal-scroll.ts}. Folder-chip navigation is supported in alpha v2.264.0; older apps may not support it. -->
+
 In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
