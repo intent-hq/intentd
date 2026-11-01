@@ -1124,7 +1124,7 @@ fn the_report_is_due_only_while_a_credential_is_active() {
     assert!(!report_due(
         true,
         Some(now),
-        now + REPORT_INTERVAL - Duration::from_secs(1)
+        now + REPORT_INTERVAL.saturating_sub(Duration::from_secs(1))
     ));
     assert!(report_due(true, Some(now), now + REPORT_INTERVAL));
     assert!(!report_due(false, Some(now), now + REPORT_INTERVAL));
