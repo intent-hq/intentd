@@ -241,8 +241,8 @@ struct Agent {
     busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
     activity: ActivityTracker,
-    /// The provider's descendants at the last snapshot.
-    descendants: Arc<Mutex<Vec<i32>>>,
+    /// The provider's descendants at the latest snapshot.
+    descendants: Arc<Descendants>,
     /// This run's [`RUN_MARKER_ENV`] value.
     run_marker: String,
     /// Scrubs the profile's secret values from what the agent journals.
@@ -496,6 +496,39 @@ impl Redactor {
     }
 }
 
+/// The provider's descendants at the latest snapshot. Snapshots are taken
+/// by the periodic tracker and once after setup, concurrently.
+#[derive(Default)]
+struct Descendants {
+    started: std::sync::atomic::AtomicU64,
+    latest: Mutex<(u64, Vec<i32>)>,
+}
+
+impl Descendants {
+    /// Start a snapshot: its order among the snapshots.
+    fn begin(&self) -> u64 {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// Publish snapshot `scan`'s descendants, unless a snapshot that
+    /// started later is already published: an older periodic scan finishing
+    /// after the setup scan must not erase a helper the setup scan captured.
+    /// Snapshots are never accumulated (a remembered pid can be reused).
+    fn publish(&self, scan: u64, pids: Vec<i32>) {
+        let mut latest = lock(&self.latest);
+        if scan > latest.0 {
+            *latest = (scan, pids);
+        }
+    }
+
+    /// The descendants of the latest published snapshot.
+    fn pids(&self) -> Vec<i32> {
+        lock(&self.latest).1.clone()
+    }
+}
+
 /// What [`Redactor::schema`] does with one field.
 enum Keep {
     /// A protocol identifier: kept as sent when it is a string.
@@ -744,7 +777,7 @@ impl Runner {
             journaled: journaled_rx,
             ready: ready_rx,
             busy: Mutex::new(false),
-            descendants: Arc::new(Mutex::new(Vec::new())),
+            descendants: Arc::new(Descendants::default()),
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
             activity: ActivityTracker::new(),
@@ -952,8 +985,9 @@ impl Runner {
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tick.tick().await;
+                            let scan = descendants.begin();
                             let found = intent_acp::descendant_pids(pid).await;
-                            *lock(&descendants) = found;
+                            descendants.publish(scan, found);
                         }
                     })
                 });
@@ -978,7 +1012,7 @@ impl Runner {
                 // exited by itself: its process group, the helpers last seen
                 // as its descendants (and theirs), and on Linux every process
                 // still carrying this run's marker.
-                let mut known = lock(&agent.descendants).clone();
+                let mut known = agent.descendants.pids();
                 known.extend(marked_processes(&agent.run_marker).await);
                 kill_tree(child, pid, &known).await;
                 let result = match outcome {
@@ -1079,7 +1113,7 @@ impl Runner {
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
         (cwd, mcp): (&std::path::Path, intent_acp::session::McpServer),
-        (pid, descendants): (Option<u32>, &Mutex<Vec<i32>>),
+        (pid, descendants): (Option<u32>, &Descendants),
     ) -> Outcome {
         // The agent's workspace MCP server rides `session/new`, which every
         // ACP agent accepts stdio servers on.
@@ -1102,8 +1136,9 @@ impl Runner {
         // can make it exit: once it has exited, helpers in their own process
         // groups are no longer its descendants.
         if let Some(pid) = pid {
+            let scan = descendants.begin();
             let found = intent_acp::descendant_pids(pid).await;
-            *lock(descendants) = found;
+            descendants.publish(scan, found);
         }
         let _ = agent.marks.send(Mark::Started {
             base_commit: agent.base_commit.clone(),
@@ -1238,7 +1273,7 @@ impl Runner {
         lock(&self.inner.state)
             .agents
             .get(agent_id)
-            .map(|agent| lock(&agent.descendants).clone())
+            .map(|agent| agent.descendants.pids())
             .unwrap_or_default()
     }
 
@@ -1414,9 +1449,12 @@ async fn marked_processes(marker: &str) -> Vec<i32> {
 /// by itself:
 /// - a helper that leaves the provider's process group after the last
 ///   snapshot is missed;
-/// - each snapshot replaces the previous one, so a periodic snapshot taken
-///   before a startup helper existed can, if it completes last, replace the
-///   setup snapshot that captured it, and that helper is then missed.
+/// - a helper started after one snapshot that stops being the provider's
+///   descendant (it is reparented, for example when its parent exits)
+///   before the next one is in no snapshot, and is missed. Snapshots are
+///   published in the order they started ([`Descendants`]), so an older
+///   periodic scan can no longer replace the setup snapshot that captured
+///   a startup helper.
 ///
 /// Snapshots are deliberately not accumulated: a remembered pid can be
 /// reused by an unrelated process, and the pid lists carry no birth
