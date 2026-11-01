@@ -228,6 +228,13 @@ impl Services {
         if inputs.secret_request_pending {
             return;
         }
+        // An empty projection cannot acknowledge anything or change the raw
+        // status. Keep the cache above for invalidations, but avoid repeating
+        // that empty state on every idle list row. A nonempty acknowledged
+        // set still carries its caller-relative waiting/in-progress status.
+        if reasons.is_empty() {
+            return;
+        }
         workspace.attention_reminder = Some(WorkspaceAttentionReminder {
             reasons,
             dismissed,

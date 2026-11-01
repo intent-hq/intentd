@@ -64,6 +64,12 @@ async fn attention_reminders_exact_reasons_races_and_restart_over_wss() {
         .insert_workspace(&fixture_workspace(&workspace))
         .await
         .unwrap();
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let idle = get(&mut ws, 900, &workspace).await;
+    assert!(
+        idle.get("attentionReminder").is_none(),
+        "a fresh workspace with no reminder reasons omits the projection: {idle}"
+    );
     seed(
         &srv,
         &workspace,
@@ -71,7 +77,6 @@ async fn attention_reminders_exact_reasons_races_and_restart_over_wss() {
         json!({"pendingQuestionsMessageId":"question-a"}),
     )
     .await;
-    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let mut evidence = Vec::new();
     let before = get(&mut ws, 1, &workspace).await;
     assert_eq!(before["displayStatus"], "needs_attention");

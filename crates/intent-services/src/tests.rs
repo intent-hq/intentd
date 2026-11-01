@@ -946,6 +946,10 @@ async fn workspace_list_row_stays_within_row_budget() {
     };
 
     let row = worst_case_workspace_list_row().await;
+    assert!(
+        row.attention_reminder.is_none(),
+        "idle list rows omit empty reminder projections"
+    );
     let summary = row
         .agent_summary
         .as_ref()
@@ -995,7 +999,8 @@ async fn workspace_list_row_stays_within_row_budget() {
 /// a stale allowlist entry fails too. The only allowlisted keys an active,
 /// idle row legitimately lacks are the state-conditional ones:
 /// `archivedAt` (archived rows), `retiredAt` (retired rows), `pendingDeleteAt`
-/// (a running delete grace window) and `waiting` (omitted when `false`).
+/// (a running delete grace window), `waiting` (omitted when `false`) and
+/// `attentionReminder` (omitted when the complete reason set is empty).
 #[tokio::test]
 async fn workspace_list_row_keys_match_allowlist_golden() {
     use std::collections::BTreeSet;
@@ -1005,8 +1010,13 @@ async fn workspace_list_row_keys_match_allowlist_golden() {
         WORKSPACE_LIST_ROW_KEYS,
     };
 
-    const STATE_CONDITIONAL_KEYS: &[&str] =
-        &["archivedAt", "retiredAt", "pendingDeleteAt", "waiting"];
+    const STATE_CONDITIONAL_KEYS: &[&str] = &[
+        "archivedAt",
+        "retiredAt",
+        "pendingDeleteAt",
+        "waiting",
+        "attentionReminder",
+    ];
 
     let row = worst_case_workspace_list_row().await;
     let measured = serde_json::to_value(&row).unwrap();
