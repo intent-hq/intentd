@@ -345,8 +345,54 @@ async fn retired_paging_cleanup_resumes_after_a_restart_and_is_idempotent() {
     );
 }
 
+/// Retired entry rows a read sees now; 0 once the table is dropped.
+async fn remaining_retired_rows(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap_or(0)
+}
+
+/// Insert `note` the way [`Store::insert_note`] does (one `BEGIN IMMEDIATE`
+/// transaction on the single write connection) and return how many retired
+/// entry rows remained at the moment this write held the writer.
+async fn insert_note_counting_retired_rows(store: &Store, note: &Note) -> i64 {
+    let mut conn = store.write_pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='note_page_entry')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let remaining: i64 = if present {
+        sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    } else {
+        0
+    };
+    let inserted = crate::note_repo::exec_insert_note(&mut conn, note).await;
+    crate::commit_with_rollback_guard(conn, inserted, "commit unrelated note insert")
+        .await
+        .unwrap();
+    remaining
+}
+
+/// The cleanup hands the single writer back between short batches, so an
+/// unrelated write gets in while it runs instead of queueing behind all of
+/// it. Measured in cleanup progress (the retired rows each write sees once
+/// it holds the writer), never in wall-clock time: a busy runner stretches
+/// any step arbitrarily (one 500-row batch took 8.8 s in intentd
+/// merge-group run 41295819142, failing a 3 s step budget).
 #[tokio::test]
 async fn unrelated_writes_complete_promptly_while_the_cleanup_runs() {
+    const SEEDED: i64 = 200_000;
+    let batch = i64::from(crate::note_paging_cleanup::NOTE_PAGING_CLEANUP_BATCH_ROWS);
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     seed_retired_index(&store, 200_000).await;
@@ -358,38 +404,44 @@ async fn unrelated_writes_complete_promptly_while_the_cleanup_runs() {
             )
             .await
     });
-    // Bounds the wait only; one batch holds the writer for about 100 ms.
-    let bound = intentd_test_support::test_timeout(Duration::from_secs(1));
     let ws = WorkspaceId::from("ws");
-    let mut overlapped = 0;
-    for round in 0..10 {
-        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap_or(0);
-        if remaining > 0 && remaining < 200_000 {
-            overlapped += 1;
-        }
-        let started = Instant::now();
-        store
-            .insert_note(&task_note(&ws, &format!("during cleanup {round}"), None))
-            .await
-            .unwrap();
-        let waited = started.elapsed();
-        assert!(
-            waited < bound,
-            "round {round}: unrelated write waited {waited:?} behind the cleanup"
-        );
+    // (rows a read saw just before the write, rows left once it held the writer)
+    let mut writes: Vec<(i64, i64)> = Vec::new();
+    while !cleanup.is_finished() {
+        let before = remaining_retired_rows(&store).await;
+        let note = task_note(&ws, &format!("during cleanup {}", writes.len()), None);
+        let at_write = insert_note_counting_retired_rows(&store, &note).await;
+        writes.push((before, at_write));
+        // Pacing only: lets the cleanup run a few batches between writes.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(overlapped > 0, "writes never overlapped a running cleanup");
     let outcome = cleanup.await.unwrap();
     assert!(outcome.finished, "{outcome:?}");
     assert_eq!(outcome.rows_removed, 200_001);
+    assert_eq!(outcome.tables_dropped, 2);
+    let mut seen_at_write: Vec<i64> = writes.iter().map(|&(_, at_write)| at_write).collect();
+    seen_at_write.dedup();
     assert!(
-        outcome.max_step < intentd_test_support::test_timeout(Duration::from_secs(1)),
-        "{outcome:?}"
+        seen_at_write
+            .iter()
+            .any(|&at_write| at_write > 0 && at_write < SEEDED),
+        "no write got the writer while the cleanup was part-way; rows left at each write: {seen_at_write:?}"
     );
+    // A write waits for at most the batch in flight (plus any that commit
+    // during the read before it), never for the rest of the cleanup.
+    for (round, &(before, at_write)) in writes.iter().enumerate() {
+        if before >= 10 * batch {
+            assert!(
+                at_write > 0,
+                "round {round}: a write issued with {before} rows left waited for the whole cleanup"
+            );
+        }
+    }
+    let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM note WHERE workspace_id='ws'")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(notes, 1 + i64::try_from(writes.len()).unwrap());
 }
 
 async fn retired_rows(store: &Store, workspace: &str) -> (i64, i64) {
