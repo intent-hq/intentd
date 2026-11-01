@@ -259,8 +259,16 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
     let replacing_credential = previous
         .as_ref()
         .is_some_and(|row| row.credential_id.as_str() != params.credential_id);
-    let current = feature.running_node(&params.machine_id);
+    let mut current = feature.running_node(&params.machine_id);
     if replacing_credential {
+        // After a backend restart, survivors are known only once the old
+        // credential's connector binds: reclaim them before replacing it.
+        if let Some(previous) = previous
+            .as_ref()
+            .filter(|_| current.as_ref().is_none_or(|node| node.route().is_none()))
+        {
+            current = recover_survivors(feature, svc, previous, current).await?;
+        }
         if let Some(node) = &current {
             let running = node.running();
             if running > 0 {
