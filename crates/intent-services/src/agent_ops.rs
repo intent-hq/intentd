@@ -4850,19 +4850,6 @@ impl Services {
         Ok(json!({ "block": block }))
     }
 
-    /// `agent.listUserMessages` (PROTOCOL §5.5) without paging: every
-    /// user-role row. See [`Self::agent_list_user_messages_page_op`].
-    #[cfg(test)]
-    pub(crate) async fn agent_list_user_messages_op(
-        &self,
-        agent_id: AgentId,
-        workspace_id: Option<WorkspaceId>,
-        preview_chars: Option<i64>,
-    ) -> Result<Value> {
-        self.agent_list_user_messages_page_op(agent_id, workspace_id, preview_chars, None, None)
-            .await
-    }
-
     /// `agent.listUserMessages` (PROTOCOL §5.5): user-role messages of one
     /// agent as lightweight index items, oldest→newest. Previews are bounded
     /// to `preview_chars` characters (absent → 300, clamped into [1, 2000]);

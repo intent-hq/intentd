@@ -5797,9 +5797,11 @@ mod normal_launch {
             .unwrap();
         let index = h
             .original
-            .agent_list_user_messages_op(
+            .agent_list_user_messages_page_op(
                 h.f.row.id.clone(),
                 Some(h.f.row.workspace_id.clone()),
+                None,
+                None,
                 None,
             )
             .await
@@ -7313,9 +7315,11 @@ mod normal_launch {
             let index =
                 h.f.manager
                     .services
-                    .agent_list_user_messages_op(
+                    .agent_list_user_messages_page_op(
                         h.f.row.id.clone(),
                         Some(h.f.row.workspace_id.clone()),
+                        None,
+                        None,
                         None,
                     )
                     .await
