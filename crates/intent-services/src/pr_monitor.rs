@@ -92,6 +92,7 @@ use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 // Compiled storage/read primitives; the admitted caller directory wires these later.
+mod observation_feed;
 #[expect(
     dead_code,
     reason = "qualified reads await admitted caller-directory wiring"
@@ -100,6 +101,7 @@ pub(crate) mod qualified_cache;
 mod qualified_events;
 mod qualified_poll;
 mod routing;
+pub(crate) use observation_feed::ObservationFeed;
 use qualified_cache::{CacheKey, CacheSlot};
 pub(crate) use routing::wire as qualified_pr_monitor_wire;
 
@@ -327,12 +329,14 @@ fn pr_key_for(repo_ref: &RepoRef, pr_number: i64) -> PrKey {
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed
 /// `lastPolledAt`; registration and re-registration fetch their own baseline
-/// and stamp the field; `None` = never polled, sorts oldest) and whether its
-/// restart catch-up marker is still unattempted.
+/// and stamp the field; `None` = never polled, sorts oldest), whether its
+/// restart catch-up marker is still unattempted, and whether another fresh
+/// read saw its PR move since the monitor's last read ([`ObservationFeed`]).
 #[derive(Clone)]
 pub(crate) struct DueCandidate {
     pub(crate) anchor: Option<time::OffsetDateTime>,
     pub(crate) catch_up: bool,
+    pub(crate) observed: bool,
     pub(crate) interval: time::Duration,
     pub(crate) monitor: PrMonitor,
 }
@@ -361,9 +365,12 @@ fn catch_up_unattempted(
 /// monitors; the fastest interested workspace supplies the idle interval.
 /// A PR is due when its anchor exceeds both that interval and the global
 /// budget/configuration floor `interval` (or
-/// missing, or any sibling is catch-up-unattempted). Due PRs are ordered
-/// oldest anchor first (PR key breaks ties), the first `cap` are kept, and
-/// EVERY active monitor on a kept PR is returned in that order — siblings
+/// missing, or any sibling is catch-up-unattempted, or another read observed
+/// the PR move — [`ObservationFeed`]). Due PRs are ordered observed first,
+/// then oldest anchor first (PR key breaks ties), the first `cap` are kept —
+/// never fewer than the observed PRs, which a spacing hold or a small cap
+/// must not leave showing a lifecycle the workspace PR state already moved
+/// past — and EVERY active monitor on a kept PR is returned in that order — siblings
 /// share the one fetch and leave the tick with aligned `lastPolledAt`
 /// stamps, so a PR is fetched once per interval however many agents watch
 /// it and however staggered their registrations were.
@@ -376,6 +383,7 @@ pub(crate) fn select_due_pr_monitors(
     struct Group {
         anchor: Option<time::OffsetDateTime>,
         catch_up: bool,
+        observed: bool,
         interval: time::Duration,
         monitors: Vec<PrMonitor>,
     }
@@ -389,6 +397,7 @@ pub(crate) fn select_due_pr_monitors(
                 group.anchor = c.anchor;
             }
             group.catch_up |= c.catch_up;
+            group.observed |= c.observed;
             group.interval = group.interval.min(c.interval);
             group.monitors.push(c.monitor);
         } else {
@@ -398,25 +407,28 @@ pub(crate) fn select_due_pr_monitors(
                 Group {
                     anchor: c.anchor,
                     catch_up: c.catch_up,
+                    observed: c.observed,
                     interval: c.interval,
                     monitors: vec![c.monitor],
                 },
             ));
         }
     }
-    let mut due: Vec<(Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
+    let mut due: Vec<(bool, Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
         .into_iter()
         .filter(|(_, g)| {
             g.catch_up
+                || g.observed
                 || g.anchor
                     .is_none_or(|at| now - at >= interval.max(g.interval))
         })
-        .map(|(key, g)| (g.anchor, key, g.monitors))
+        .map(|(key, g)| (!g.observed, g.anchor, key, g.monitors))
         .collect();
-    due.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    due.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    let observed = due.iter().filter(|(unobserved, ..)| !unobserved).count();
     due.into_iter()
-        .take(cap)
-        .flat_map(|(_, _, monitors)| monitors)
+        .take(cap.max(observed))
+        .flat_map(|(.., monitors)| monitors)
         .collect()
 }
 
@@ -2327,6 +2339,9 @@ impl Services {
         let (entry, fetched) = self
             .read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
             .await?;
+        if fetched {
+            self.observe_pr_record(repo_ref, &entry.pr);
+        }
         if let Err(e) = self
             .fold_served_pr(
                 repo_ref,
@@ -2346,6 +2361,42 @@ impl Services {
             );
         }
         Ok((entry, fetched))
+    }
+
+    /// Feed a PR record another path just read fresh from the forge (the
+    /// workspace PR refresh, an on-demand serve) to the monitor sweep: when
+    /// it shows a monitored PR in a lifecycle the monitor has not read yet,
+    /// the PR is marked and the loop is kicked so the monitor polls it now
+    /// rather than on its idle cadence ([`ObservationFeed`]). This keeps the
+    /// monitor card and wake in step with the workspace PR pill, which the
+    /// same read updates.
+    pub(crate) fn observe_pr_record(&self, repo_ref: &RepoRef, pr: &PullRequest) {
+        let key = pr_key_for(repo_ref, pr.number.cast_signed());
+        if self.pr_monitor_feed.lock().unwrap().observe(key, pr) {
+            tracing::debug!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = pr.number,
+                state = ?pr.state,
+                "pr monitor: another read saw a monitored PR move; polling it now"
+            );
+            self.pr_monitor_kick.notify_one();
+        }
+    }
+
+    /// [`Self::observe_pr_record`] for a read that updates one monitor only
+    /// (registration, check-now): seeds a missing baseline, otherwise
+    /// observes ([`ObservationFeed::seed_or_observe`]).
+    fn seed_or_observe_pr_record(&self, repo_ref: &RepoRef, pr: &PullRequest) {
+        let key = pr_key_for(repo_ref, pr.number.cast_signed());
+        if self
+            .pr_monitor_feed
+            .lock()
+            .unwrap()
+            .seed_or_observe(key, pr)
+        {
+            self.pr_monitor_kick.notify_one();
+        }
     }
 
     /// Project a monitor observation into existing same-head workspace/root
@@ -2913,6 +2964,10 @@ impl Services {
             .await
         {
             Ok(entry) => {
+                // Seeds the feed baseline for a new PR; on a PR other monitors
+                // already watch, only the sweep may advance it (it polls every
+                // sibling), so this read is an observation.
+                self.seed_or_observe_pr_record(repo_ref, &entry.pr);
                 self.project_monitor_queue(repo_ref, &entry).await;
                 Ok(Some(entry.snapshot.materialize(None)))
             }
@@ -3537,6 +3592,9 @@ impl Services {
         .await
         {
             Ok(entry) => {
+                // A check-now polls only this monitor, so it must not advance
+                // the baseline its sibling monitors (other workspaces) rely on.
+                self.seed_or_observe_pr_record(&repo_ref, &entry.pr);
                 self.project_monitor_queue(&repo_ref, &entry).await;
                 entry.snapshot
             }
@@ -3592,6 +3650,12 @@ impl Services {
                     () = tokio::time::sleep_until(next) => {
                         services.poll_due_pr_monitors().await;
                         next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
+                    }
+                    // Another read saw a monitored PR move: poll it now. The
+                    // due-sweep picks only the marked PRs (everything else is
+                    // still fresh), so the regular cadence is unchanged.
+                    () = services.pr_monitor_kick.notified() => {
+                        services.poll_due_pr_monitors().await;
                     }
                     Some(command) = controls.recv() => command.run().await,
                 }
@@ -3803,6 +3867,7 @@ impl Services {
         };
         let monitored: HashSet<PrKey> = monitors.iter().map(pr_key).collect();
         prune_pr_cache(&self.pr_cache, &monitored);
+        self.pr_monitor_feed.lock().unwrap().retain(&monitored);
         if monitors.is_empty() {
             return;
         }
@@ -3871,6 +3936,11 @@ impl Services {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let repo_ref = monitor.repo();
+                    // Clear an observation mark before the fetch: a read that
+                    // sees the PR move while this fetch is in flight marks it
+                    // again (the baseline is still the pre-fetch state), so
+                    // a merge racing the fetch is polled on the next tick.
+                    let observed = self.pr_monitor_feed.lock().unwrap().take(&key);
                     // The timeout is defense in depth above the client-level
                     // network timeouts: a fetch that pends indefinitely maps
                     // to an error (recorded as `lastError` below) instead of
@@ -3893,9 +3963,13 @@ impl Services {
                             rate_limited = true;
                             Err(self.rate_limit_pause_error())
                         }
-                        Ok(Ok(observed)) => {
-                            self.project_monitor_queue(&repo_ref, &observed).await;
-                            Ok(observed.snapshot)
+                        Ok(Ok(read)) => {
+                            self.pr_monitor_feed
+                                .lock()
+                                .unwrap()
+                                .record_poll(key.clone(), &read.pr);
+                            self.project_monitor_queue(&repo_ref, &read).await;
+                            Ok(read.snapshot)
                         }
                         Ok(Err(error)) => Err(error.to_string()),
                         Err(_) => Err(format!(
@@ -3903,6 +3977,9 @@ impl Services {
                             self.pr_monitor_fetch_timeout
                         )),
                     };
+                    if observed && fetched.is_err() {
+                        self.pr_monitor_feed.lock().unwrap().restore(key);
+                    }
                     entry.insert(fetched).clone()
                 }
             };
@@ -4046,6 +4123,12 @@ impl Services {
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
                 catch_up: nudge.is_none() && catch_up_unattempted(&monitor, &catch_up),
+                observed: nudge.is_none()
+                    && self
+                        .pr_monitor_feed
+                        .lock()
+                        .unwrap()
+                        .is_changed(&pr_key(&monitor)),
                 interval: time::Duration::seconds(
                     i64::try_from(
                         intervals
@@ -5145,6 +5228,7 @@ mod tests {
     mod home_queue_regression;
     mod implicit_repository;
     mod merge_queue_position;
+    mod observation_feed_regression;
     mod qualified_isolation;
     mod qualified_recovery;
     mod quota_regression;
@@ -15063,6 +15147,7 @@ mod tests {
         let candidate = |anchor, catch_up, pr| DueCandidate {
             anchor,
             catch_up,
+            observed: false,
             interval: time::Duration::ZERO,
             monitor: mk(pr),
         };

@@ -1430,6 +1430,15 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
+    /// What each monitored PR looked like at the monitor's last read, and
+    /// which PRs another fresh read (workspace PR refresh, on-demand reads)
+    /// has since seen move, so the sweep polls them at once instead of on
+    /// its idle cadence ([`pr_monitor::ObservationFeed`]). Shared across
+    /// clones.
+    pr_monitor_feed: Arc<Mutex<pr_monitor::ObservationFeed>>,
+    /// Wakes the monitor loop for an immediate due-sweep when the feed marks
+    /// a PR changed. Shared across clones.
+    pr_monitor_kick: Arc<tokio::sync::Notify>,
     /// The shared PR cache: every PR read's memory of its last full forge
     /// read (PR record, shared snapshot, change fingerprint), so the
     /// monitor sweep reuses the previous sub-fetches while the fingerprint
@@ -1883,6 +1892,8 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
+            pr_monitor_feed: Arc::new(Mutex::new(pr_monitor::ObservationFeed::default())),
+            pr_monitor_kick: Arc::new(tokio::sync::Notify::new()),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
             automatic_pr_refresh: Arc::new(Mutex::new(automatic_pr_refresh::Admission::default())),
             pr_discovery: pr_discovery::Discovery::default(),
