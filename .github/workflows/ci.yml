@@ -3,10 +3,10 @@ on:
   # Push-to-main runs the macOS release build, packaging and runtime
   # checks, and the Windows runtime validation (the `windows` job, install-ps1
   # and the Windows pi-session-paths legs). Windows never runs on
-  # pull_request (PRs get only `windows-cross-lint`, Clippy for the Windows
-  # GNU target on Linux); the merge queue runs only the Windows lint
-  # (`windows-lint`: native check + target-gated Clippy), so a Windows-only
-  # compile or lint error cannot reach main. The runtime proofs are post-merge only, and a red
+  # pull_request or merge_group: PRs and the queue get `windows-cross-lint`
+  # (check + Clippy for the Windows GNU target on Linux), so a Windows-only
+  # compile or lint error cannot reach main. The native MSVC check and the
+  # runtime proofs are post-merge only, and a red
   # or unfinished push CI Gate on the main tip blocks the next alpha cut
   # (auto-cut-alpha.yml checks it before merging the Release PR). The main ruleset routes every merge
   # through the merge queue (see `merge_group` below) and blocks direct
@@ -25,9 +25,9 @@ on:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
   # checks plus the Linux `check` job (clippy, source lints),
   # `windows-cross-lint` (Windows GNU-target Clippy on Linux) and
-  # `coverage-changed` (the PR's changed tests). The queue reruns `check` and
-  # `coverage-changed` (its native `windows-lint` replaces the cross lint) and
-  # adds the Linux/macOS runtime matrices, the Windows lint and full
+  # `coverage-changed` (the PR's changed tests). The queue reruns `check`,
+  # `windows-cross-lint` and `coverage-changed` on the merged tree and
+  # adds the Linux/macOS runtime matrices and full
   # instrumented coverage on the merged tree (no Windows runtime proofs —
   # see `push` above); CI Gate enforces each
   # tier.
@@ -789,8 +789,9 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
-  # Windows cross lint, pull requests only: the native `windows-lint` job's
-  # two steps for the Windows GNU target on a Linux runner, so a Windows-only lint error (an import only
+  # Windows cross lint, pull requests and merge queue: the native production
+  # check and target-gated Clippy for the Windows GNU target on a Linux
+  # runner, so a Windows-only lint error (an import only
   # `#[cfg(unix)]` code uses, a `#[cfg(windows)]`-only warning) fails the PR
   # instead of ejecting it from the merge queue an hour later (intentd#2672,
   # merge-group run 40178615896; earlier #2555, #2556, #2579). PRs still never
@@ -798,19 +799,22 @@ jobs:
   # (libz-sys and friends, see the `build` job's Clippy comment) only need
   # MinGW-w64 for the GNU target, an apt package. intentd has no
   # `target_env = "msvc"` code, so the GNU target lints the same Windows code
-  # as MSVC; the queue-only native `windows-lint` job stays the final
-  # authority and catches any GNU/MSVC difference. Local equivalent:
-  # `make check-windows` from the monorepo root. Same `if` as `check`:
-  # same-repo PRs only (route success), skipped on release-metadata PRs.
+  # as MSVC: GNU/MSVC differences are limited to `target_env` code. The queue
+  # reruns this lint on the merged tree (the queue's former native MSVC lint
+  # cost a paid Windows runner per entry); the push-only `windows` job is the
+  # native MSVC check, compiling the merged tree for its runtime proofs and
+  # release build. Local equivalent: `make check-windows` from the monorepo
+  # root. Same `if` as `check`: same-repo PRs and the merge queue (route
+  # success), skipped on release-metadata PRs.
   # Runs on the 8-core WarpBuild runner from route's `cloud` mapping, never a
   # self-hosted slot (the apt install needs sudo, which the slots lack).
   windows-cross-lint:
-    if: ${{ !cancelled() && needs.route.result == 'success' && github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
     name: Windows cross lint (x86_64-pc-windows-gnu)
     runs-on: ${{ fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
     # A cold compile (sccache miss, lockfile bump) on 8 cores builds the
-    # workspace twice for a new target; the native windows-lint has 45.
+    # workspace twice for a new target.
     timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -989,9 +993,9 @@ jobs:
 
   build:
     # Native macOS Rust validation runs once on the queue's merged tree; main
-    # pushes retain the release build. Windows lint lives in the queue-only
-    # `windows-lint` job and the Windows runtime proofs in the push-only
-    # `windows` job below. The explicit event allowlist prevents matrix
+    # pushes retain the release build. The Windows lint is the Linux
+    # `windows-cross-lint` job above and the native Windows build and runtime
+    # proofs are the push-only `windows` job below. The explicit event allowlist prevents matrix
     # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
     # dependencies: the PR `fast_path` output is empty on push and
@@ -1099,16 +1103,15 @@ jobs:
       # every macOS dev box. Linting here (same invocation as the check job)
       # closes the gap. It runs on merge-queue runs, not on push: the queue
       # tests the actual merged tree, and main's push run builds a tree the
-      # queue already linted. (The Windows equivalent is the queue-only
-      # `windows-lint` job; PRs get a Linux pre-filter for it,
-      # `windows-cross-lint`, because the Windows GNU target needs only
-      # MinGW-w64.) It runs on the
-      # native runners rather than as Linux cross-target runs because
+      # queue already linted. (The Windows equivalent is
+      # `windows-cross-lint` on PRs and in the queue, because the Windows GNU
+      # target needs only MinGW-w64.) It runs on the
+      # native runner rather than as a Linux cross-target run because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
       # pkg-config resolves a system lib), which would require a full
-      # darwin / MSVC cross C toolchain on Linux; the native runners need
-      # nothing extra and share this job's warm target dir. release-fast-path's
+      # darwin cross C toolchain on Linux; the native runner needs
+      # nothing extra and shares this job's warm target dir. release-fast-path's
       # `fast_path` output is pull_request-only, so it is empty on merge_group
       # and the `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
@@ -1301,85 +1304,22 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push' && contains(matrix.os, 'self-hosted')
         run: cargo check --workspace --target ${{ matrix.target }}
 
-  # Windows lint, merge queue only: the native production check and
-  # target-gated Clippy the Linux `check` job cannot see (`#[cfg(windows)]` /
-  # `#[cfg(not(unix))]` code, intent-hq/intentd#1813, #1825 → #1835). It runs
-  # in the queue so a Windows-only compile or lint error is caught on the
-  # merged tree before it lands (a unix-only test helper from #2574 turned
-  # main's push gate red when this ran post-merge). Pull requests still never
-  # wait on a Windows runner, and the push run does not repeat it: main's
-  # tree is one the queue just linted. ~9 minutes on WarpBuild Windows 16x,
-  # in parallel with the ~25-minute queue run.
-  # Routed by the route job (intent-hq/intent#5518): the self-hosted 5090pc
-  # runner when the probe confirms it idle, the WarpBuild
-  # gh-windows-16x burst runner otherwise. The self-hosted labels are
-  # selected ONLY when route positively emitted them: an empty output —
-  # route failed, timed out, or was skipped (`!cancelled()` still runs this
-  # job) — falls back to the hosted label, never to a runner nothing
-  # confirmed online (intent-hq/intent#1382, #1583). The single-entry matrix
-  # keeps `matrix.target` / `matrix.os` shared with the `build` job's steps.
-  windows-lint:
-    needs: [route]
-    if: ${{ !cancelled() && github.event_name == 'merge_group' }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["warp-windows-2022-x64-16x"]') }}
-    name: Windows lint (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_INCREMENTAL: 0
-    steps:
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - uses: actions/checkout@v7
-      # See the `windows` job: Git Bash must shadow the WSL bash stub.
-      - name: Put Git Bash first on PATH (Windows)
-        shell: cmd
-        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure the self-hosted compiler cache
-        shell: bash
-        env:
-          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
-          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
-          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-sccache.py
-      # Same persistent dir as the `windows` job: the self-hosted runner is
-      # single-slot, so sharing keeps it warm for both.
-      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
-        if: contains(matrix.os, 'self-hosted')
-        shell: bash
-        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
-      - name: Resolve pinned Rust channel
-        id: toolchain
-        shell: bash
-        run: |
-          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.target }}
-          components: clippy
-      # Non-test production configuration; see the `build` job's comment on
-      # why --all-targets Clippy cannot replace it.
-      - name: Check (native production configuration)
-        run: cargo check --workspace --target ${{ matrix.target }}
-      - name: Clippy (target-gated code)
-        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
-
   # Windows runtime validation, post-merge only: the Windows runtime proofs,
   # the daemon lifecycle proof and the release build run on push to main —
   # never on pull_request or merge_group, so PRs and the queue never wait on
-  # them (the queue runs only `windows-lint` above). A Windows-only runtime
-  # failure therefore lands on main; the push CI Gate goes red and
-  # auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
-  # turns it green. Routed like `windows-lint`. It is skipped when this
+  # a Windows runner (the queue lints the Windows GNU target on Linux in
+  # `windows-cross-lint`). This is the native MSVC check: its compiles cover
+  # any GNU/MSVC (`target_env`) difference the cross lint cannot see. A
+  # Windows-only runtime or MSVC failure therefore lands on main; the push CI
+  # Gate goes red and auto-cut-alpha.yml refuses to cut an alpha until a fix
+  # (or a re-run) turns it green.
+  # Routed by the route job (intent-hq/intent#5518): the self-hosted 5090pc
+  # runner when the probe confirms it idle, the WarpBuild gh-windows-16x
+  # burst runner otherwise. The self-hosted labels are selected ONLY when
+  # route positively emitted them: an empty output (route failed, timed out,
+  # or was skipped; `!cancelled()` still runs this job) falls back to the
+  # hosted label, never to a runner nothing confirmed online
+  # (intent-hq/intent#1382, #1583). It is skipped when this
   # commit is already superseded (`supersede` reported superseded=true; a
   # newer push's scan cancels it if it is still running) or is a
   # release-metadata push (release-fast-path reported release_push=true). CI
@@ -1478,8 +1418,9 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-      # The Windows leg of `daemon-lifecycle` (which keeps Linux and macOS in
-      # the queue). Its Clippy is covered by the queue's `windows-lint`.
+      # The Windows leg of the lifecycle proof (Linux runs in the queue's
+      # `daemon-lifecycle` job, macOS in `build`). Its Windows Clippy is the
+      # GNU-target `windows-cross-lint` on PRs and in the queue.
       - name: Native lifecycle runtime proof (Windows)
         shell: bash
         run: python3 -I -B scripts/test-daemon-lifecycle.py
@@ -2608,14 +2549,14 @@ jobs:
           python3 -I -B scripts/test-daemon-lifecycle.py
   # Required context for each event: PRs certify only the lightweight tier.
   # Queue entries require the Linux/macOS native/runtime/coverage proofs and
-  # the Windows lint; push requires the release builds, packaging checks and
+  # the Windows GNU cross lint; push requires the release builds, packaging checks and
   # the Windows runtime validation (auto-cut-alpha.yml reads this push gate
   # on the main tip before cutting an alpha). Missing/failed results never pass.
   gate:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2644,7 +2585,6 @@ jobs:
               "$slow" check "${{ needs.check.result }}"
               "$slow" windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               optional build "${{ needs.build.result }}"
-              optional windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
@@ -2664,9 +2604,8 @@ jobs:
               require cache-smoke "${{ needs.cache-smoke.result }}"
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
-              optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
+              require windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
-              require windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
               require coverage-e2e "${{ needs.coverage-e2e.result }}"
               require coverage-all "${{ needs.coverage-all.result }}"
@@ -2702,7 +2641,6 @@ jobs:
               optional check "${{ needs.check.result }}"
               optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               "$build" build "${{ needs.build.result }}"
-              optional windows-lint "${{ needs.windows-lint.result }}"
               "$windows" windows "${{ needs.windows.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"

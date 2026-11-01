@@ -25,21 +25,20 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"route"}
 RUNTIME = {"deb-packaging", "release-scripts", "pi-session-paths"}
-# Windows lint (native check + target-gated Clippy) runs in the merge queue,
-# so a Windows-only compile or lint error cannot reach main (intentd#2574's
-# unix-only test helper broke main's push gate that way). The slower Windows
-# runtime proofs and release build stay post-merge: they never run on
-# pull_request or merge_group, and the push CI Gate (which auto-cut-alpha
-# reads on the main tip before cutting) requires all of them. No Windows
-# runner is ever requested on pull_request.
-WINDOWS_QUEUE_JOBS = {"windows-lint"}
+# PRs and the merge queue lint the Windows GNU target on Linux (no Windows
+# runner), so a Windows-only compile or lint error fails the PR or the queue
+# instead of main (intentd#2672; intentd#2574's unix-only test helper broke
+# main's push gate that way). GNU/MSVC differences are limited to
+# `target_env` code. The native MSVC build, the Windows runtime proofs and
+# the release build stay post-merge: they never run on pull_request or
+# merge_group, and the push CI Gate (which auto-cut-alpha reads on the main
+# tip before cutting) requires all of them. No Windows runner is ever
+# requested on pull_request or merge_group.
 WINDOWS_JOBS = {"windows", "install-ps1"}
-# PRs lint the Windows GNU target on Linux (no Windows runner), so most
-# Windows-only lint errors fail the PR instead of the queue (intentd#2672).
-WINDOWS_PR_JOBS = {"windows-cross-lint"}
+WINDOWS_LINT_JOBS = {"windows-cross-lint"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | WINDOWS_PR_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
-    "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_QUEUE_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
+    "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
+    "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_LINT_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
 PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
@@ -72,10 +71,10 @@ NATIVE_STEPS = (
     "Native lifecycle runtime proof (macOS)",
 )
 MACOS_LIFECYCLE_STEP = "Native lifecycle runtime proof (macOS)"
-# The Windows lint, in order, in the queue-only `windows-lint` job.
+# The Windows lint, in order, in the PR and queue `windows-cross-lint` job.
 WINDOWS_LINT_STEPS = {
-    "Check (native production configuration)": "cargo check --workspace --target ${{ matrix.target }}",
-    "Clippy (target-gated code)": "cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings",
+    "Check (Windows GNU production configuration)": "cargo check --workspace --target x86_64-pc-windows-gnu",
+    "Clippy (Windows GNU target)": "cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
 }
 # Every Windows runtime proof, in order, in the push-only `windows` job.
 WINDOWS_STEPS = {
@@ -435,8 +434,6 @@ def routing_errors(workflow):
                 errors.append(f"{event}: missing native fallback for route={route}")
             if event == "push" and jobs["windows"] != "success":
                 errors.append(f"{event}: missing Windows fallback for route={route}")
-            if event == "merge_group" and jobs["windows-lint"] != "success":
-                errors.append(f"{event}: missing Windows lint fallback for route={route}")
     return errors
 
 
@@ -477,8 +474,8 @@ def windows_errors(workflow):
     errors = []
     if windows_legs(workflow, "pull_request"):
         errors.append(f"pull_request: Windows runner requested by {sorted(windows_legs(workflow, 'pull_request'))}")
-    if windows_legs(workflow, "merge_group") != WINDOWS_QUEUE_JOBS:
-        errors.append(f"merge_group: Windows legs changed {sorted(windows_legs(workflow, 'merge_group'))}")
+    if windows_legs(workflow, "merge_group"):
+        errors.append(f"merge_group: Windows runner requested by {sorted(windows_legs(workflow, 'merge_group'))}")
     if windows_legs(workflow, "push") != WINDOWS_JOBS | {"pi-session-paths"}:
         errors.append(f"push: Windows legs changed {sorted(windows_legs(workflow, 'push'))}")
     pi = workflow["jobs"]["pi-session-paths"]["strategy"]["matrix"]["os"]
@@ -486,15 +483,45 @@ def windows_errors(workflow):
         expected = ["ubuntu-24.04", "windows-2025"] if event == "push" else ["ubuntu-24.04"]
         if matrix_values(pi, event) != expected:
             errors.append(f"pi-session-paths: wrong platforms on {event}")
-    errors += windows_job_errors(workflow, "windows-lint", "merge_group", WINDOWS_LINT_STEPS)
+    errors += cross_lint_errors(workflow)
     errors += windows_job_errors(workflow, "windows", "push", WINDOWS_STEPS)
-    # Moved, not duplicated: main's tree is one the queue just linted. Match
-    # the cargo subcommand too, so a renamed copy is still caught.
+    # Not duplicated: main's tree is one the queue just linted. Match the
+    # cargo subcommand too, so a renamed copy is still caught.
     for step in workflow["jobs"].get("windows", {}).get("steps", []):
         run = str(step.get("run", ""))
         if step.get("name") in WINDOWS_LINT_STEPS or re.search(r"\bcargo\s+(?:\+\S+\s+)?(?:check|clippy)\b", run):
-            errors.append("windows: lint steps belong to the queue-only windows-lint job")
+            errors.append("windows: lint steps belong to the windows-cross-lint job")
             break
+    return errors
+
+
+def cross_lint_errors(workflow):
+    """The Windows GNU lint: required on PRs and in the queue, on Linux, every step in order."""
+    name = "windows-cross-lint"
+    job = workflow["jobs"].get(name)
+    if not job:
+        return [f"{name}: missing PR and merge_group job"]
+    errors = []
+    if job.get("continue-on-error") or "strategy" in job:
+        errors.append(f"{name}: job must stay required")
+    if "windows" in str(job.get("runs-on", "")).lower() or "needs.route.outputs.cloud" not in str(job.get("runs-on", "")):
+        errors.append(f"{name}: must run on route's cloud Linux runner")
+    for event in REQUIRED:
+        for fork in (False, True):
+            # Fork PRs are excluded through `route`, which skips them.
+            route = scheduled(workflow, event, fork=fork)["route"]
+            runs = condition(job["if"], {**context(event, fork=fork), "needs.route.result": route},
+                             success=route == "success")
+            if runs != (event in ("pull_request", "merge_group") and not (fork and event == "pull_request")):
+                errors.append(f"{name}: wrong selection for {event}/fork={fork}")
+    steps = job["steps"]
+    found = [step.get("name") for step in steps if step.get("name") in WINDOWS_LINT_STEPS]
+    if found != list(WINDOWS_LINT_STEPS):
+        errors.append(f"{name}: lint steps missing or reordered {found}")
+    for lint, command in WINDOWS_LINT_STEPS.items():
+        step = next((s for s in steps if s.get("name") == lint), None)
+        if not step or step.get("run") != command or step.get("continue-on-error") or "if" in step:
+            errors.append(f"{lint}: missing required Windows lint in {name}")
     return errors
 
 
@@ -1179,7 +1206,7 @@ class LifecycleCacheTests(unittest.TestCase):
 
     def test_windows_shell_is_ready_before_cache_setup(self):
         jobs = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']
-        for job in ('windows', 'windows-lint'):
+        for job in ('windows',):
             with self.subTest(job=job):
                 steps = jobs[job]['steps']
                 setup = next(i for i, step in enumerate(steps) if step.get('name') == 'Configure the self-hosted compiler cache')
@@ -1245,9 +1272,8 @@ class LifecycleCacheTests(unittest.TestCase):
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
         step = next(s for s in jobs["build"]["steps"] if s.get("name") == "Point CARGO_TARGET_DIR outside the work dir (self-hosted)")
         self.assertEqual(step["shell"], "bash")
-        # windows-lint shares the push job's dir so the single-slot runner stays warm.
         targets = {job: next(s for s in jobs[job]["steps"] if s.get("name") == "Point CARGO_TARGET_DIR outside the work dir (self-hosted)")
-                   for job in ("windows", "windows-lint")}
+                   for job in ("windows",)}
         for platform, body, profile, expected in (
                 ("macos", step["run"].replace("${{ matrix.target }}", "aarch64-apple-darwin"), "",
                  os.environ["HOME"] + "/ci-target/intentd/build-aarch64-apple-darwin"),
@@ -1381,19 +1407,24 @@ class NativeRoutingTests(unittest.TestCase):
     def test_native_proofs_and_push_release_builds(self):
         self.assertEqual(native_errors(self.workflow), [])
 
-    def test_windows_lints_in_queue_and_runs_runtime_proofs_after_merge(self):
+    def test_windows_lints_on_linux_and_runs_natively_after_merge(self):
         self.assertEqual(windows_errors(self.workflow), [])
         self.assertEqual(windows_legs(self.workflow, "pull_request"), set())
-        self.assertEqual(windows_legs(self.workflow, "merge_group"), {"windows-lint"})
+        self.assertEqual(windows_legs(self.workflow, "merge_group"), set())
+        self.assertNotIn("windows-lint", self.workflow["jobs"])
         self.assertEqual(windows_legs(self.workflow, "push"), {"windows", "install-ps1", "pi-session-paths"})
 
     def test_mutations_cannot_move_windows_jobs_between_events(self):
         cases = {
-            "lint-pr": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name != 'push'"),
-            "lint-push": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name != 'pull_request'"),
-            "lint-dropped": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name == 'push'"),
+            "lint-push": lambda w: w["jobs"]["windows-cross-lint"].__setitem__("if", "github.event_name != 'pull_request' || github.event_name == 'pull_request'"),
+            "lint-pr-only": lambda w: w["jobs"]["windows-cross-lint"].__setitem__("if", "github.event_name == 'pull_request'"),
+            "lint-queue-only": lambda w: w["jobs"]["windows-cross-lint"].__setitem__("if", "github.event_name == 'merge_group'"),
+            "lint-native-queue": lambda w: w["jobs"].__setitem__("windows-lint", {
+                "needs": ["route"], "if": "github.event_name == 'merge_group'",
+                "runs-on": "${{ fromJSON(needs.route.outputs.windows_labels || '[\"warp-windows-2022-x64-16x\"]') }}", "steps": []}),
+            "lint-on-windows": lambda w: w["jobs"]["windows-cross-lint"].__setitem__("runs-on", "windows-2022"),
             "lint-duplicated": lambda w: w["jobs"]["windows"]["steps"].insert(
-                0, copy.deepcopy(next(s for s in w["jobs"]["windows-lint"]["steps"] if s.get("name") == "Clippy (target-gated code)"))),
+                0, copy.deepcopy(next(s for s in w["jobs"]["windows-cross-lint"]["steps"] if s.get("name") == "Clippy (Windows GNU target)"))),
             "lint-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
                 0, {"name": "Clippy (Windows)", "run": "cargo clippy --workspace --all-targets -- -D warnings"}),
             "check-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
@@ -1414,7 +1445,7 @@ class NativeRoutingTests(unittest.TestCase):
                 self.assertTrue(windows_errors(workflow) + native_errors(workflow))
 
     def test_mutations_cannot_drop_windows_proofs(self):
-        proofs = [("windows-lint", name) for name in WINDOWS_LINT_STEPS] + [("windows", name) for name in WINDOWS_STEPS]
+        proofs = [("windows-cross-lint", name) for name in WINDOWS_LINT_STEPS] + [("windows", name) for name in WINDOWS_STEPS]
         for job, name in proofs:
             for mutation in ("remove", "skip", "queue-only", "optional", "empty"):
                 with self.subTest(job=job, step=name, mutation=mutation):
@@ -1432,13 +1463,13 @@ class NativeRoutingTests(unittest.TestCase):
                     else:
                         step["run"] = ""
                     self.assertTrue(any(name in error for error in windows_errors(workflow)))
-        for job in ("windows", "windows-lint"):
+        for job in ("windows", "windows-cross-lint"):
             workflow = copy.deepcopy(self.workflow)
             workflow["jobs"][job]["continue-on-error"] = True
             self.assertIn(f"{job}: job must stay required", windows_errors(workflow))
 
     def test_gates_require_windows(self):
-        for event, job in [("push", job) for job in WINDOWS_JOBS] + [("merge_group", job) for job in WINDOWS_QUEUE_JOBS]:
+        for event, job in [("push", job) for job in WINDOWS_JOBS] + [("merge_group", job) for job in WINDOWS_LINT_JOBS]:
             with self.subTest(event=event, job=job):
                 workflow = copy.deepcopy(self.workflow)
                 step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
@@ -1573,8 +1604,7 @@ class NativeRoutingTests(unittest.TestCase):
             for event in REQUIRED:
                 jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "", head_ref=RELEASE_BRANCH)
                 for name in FAST_PATH_SKIPS:
-                    pr_only = event == "merge_group" and name in WINDOWS_PR_JOBS
-                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" or pr_only else "success"
+                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" else "success"
                     self.assertEqual(jobs[name], expected, f"{event}/{fast_path}: {name}")
         # A failed or skipped route still skips the slow jobs, and CI Gate
         # rejects that skip on a PR without a reported fast path.
@@ -1623,11 +1653,12 @@ class NativeRoutingTests(unittest.TestCase):
                     workflow["jobs"][job]["if"] = workflow["jobs"][job]["if"].replace(clause, "")
                     self.assertTrue(routing_errors(workflow))
 
-    def test_windows_cross_lint_runs_on_prs_only_on_a_cloud_linux_runner(self):
-        # The PR-time pre-filter for the queue's native windows-lint: Clippy
-        # for the Windows GNU target, denying warnings, on a Linux runner
-        # that can apt-install MinGW (route's `cloud` map never returns a
-        # self-hosted slot). The queue and main pushes skip it.
+    def test_windows_cross_lint_runs_on_prs_and_queue_on_a_cloud_linux_runner(self):
+        # The Windows lint for PRs and the merge queue: the production check
+        # and Clippy for the Windows GNU target, denying warnings, on a Linux
+        # runner that can apt-install MinGW (route's `cloud` map never returns
+        # a self-hosted slot). Main pushes skip it; the push-only `windows` job
+        # compiles natively for MSVC.
         job = self.workflow["jobs"]["windows-cross-lint"]
         commands = [str(step.get("run", "")) for step in job["steps"]]
         # The native job's production check, then Clippy, in that order.
@@ -1644,7 +1675,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertNotIn("strategy", job)
         self.assertFalse(job.get("continue-on-error"))
         for event in REQUIRED:
-            expected = "success" if event == "pull_request" else "skipped"
+            expected = "skipped" if event == "push" else "success"
             self.assertEqual(scheduled(self.workflow, event)["windows-cross-lint"], expected, event)
         self.assertEqual(scheduled(self.workflow, "pull_request", fork=True)["windows-cross-lint"], "skipped")
 
