@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.102] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(agent-queue)* Reconcile durable queues at shutdown so a cancelled write-through cannot lose a row ([#2918](https://github.com/intent-hq/intentd/pull/2918))
+
+
 ## [0.11.101] - 2026-11-01
 
 ### 🐛 Bug Fixes
