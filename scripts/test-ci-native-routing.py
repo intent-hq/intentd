@@ -561,8 +561,14 @@ def native_errors(workflow):
         step = steps.get(name)
         if not step or step.get("run") != command or step.get("continue-on-error"):
             errors.append(f"{name}: missing push compilation")
-        elif any(condition(step.get("if", True), context(event)) != (event == "push") for event in REQUIRED):
+        # The warm check only helps a runner that keeps its target dir, so it
+        # runs on self-hosted runners alone; the release build runs on any.
+        elif any(condition(step.get("if", True), {**context(event), "matrix.os": ["self-hosted", "macOS", "ARM64"]})
+                 != (event == "push") for event in REQUIRED):
             errors.append(f"{name}: must be push-only")
+        elif condition(step.get("if", True), {**context("push"), "matrix.os": ["warp-macos-26-arm64-6x"]}) != (
+                name == "Build (release)"):
+            errors.append(f"{name}: wrong selection for an ephemeral push runner")
     # --all-targets unifies dev-dependency fixture features into intent-services
     # and omits some feature-off production arms. Keep the non-test check too.
     check = steps.get("Check (native production configuration)", {})
