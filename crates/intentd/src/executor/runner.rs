@@ -405,19 +405,19 @@ impl Redactor {
     /// A content block's annotations: the `audience` roles are an enum.
     fn annotations(&self, annotations: &mut Value) {
         self.schema(annotations, &|key, _| match key {
-            "audience" => Keep::Walk(Self::identifiers),
+            "audience" => Keep::Walk(Self::roles),
             _ => Keep::Mask,
         });
     }
 
-    /// A list of protocol identifiers: strings kept as sent, anything else
-    /// masked as data.
-    fn identifiers(&self, identifiers: &mut Value) {
-        let Value::Array(items) = identifiers else {
-            return self.value(identifiers);
+    /// An annotation's audience: each role is kept only when it is one of
+    /// ACP's role words; anything else is masked as data.
+    fn roles(&self, roles: &mut Value) {
+        let Value::Array(items) = roles else {
+            return self.value(roles);
         };
-        for item in items.iter_mut().filter(|item| !item.is_string()) {
-            self.value(item);
+        for item in items {
+            self.enum_word(item, &["assistant", "user"]);
         }
     }
 
@@ -428,9 +428,22 @@ impl Redactor {
         };
         for item in items {
             self.schema(item, &|key, _| match key {
-                "type" => Keep::Id,
+                "type" => Keep::Walk(Self::config_kind),
                 _ => Keep::Mask,
             });
+        }
+    }
+
+    fn config_kind(&self, kind: &mut Value) {
+        self.enum_word(kind, &["boolean", "select"]);
+    }
+
+    /// Keep `value` as sent when it is exactly one of the enum's `words`, so
+    /// the update still parses; mask it as data otherwise, so nothing but a
+    /// protocol word ever passes unmasked.
+    fn enum_word(&self, value: &mut Value, words: &[&str]) {
+        if !value.as_str().is_some_and(|word| words.contains(&word)) {
+            self.value(value);
         }
     }
 

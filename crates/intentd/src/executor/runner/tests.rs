@@ -1613,3 +1613,41 @@ fn the_redactor_keeps_enum_schema_positions_so_the_update_still_parses() {
         assert!(parses(&config), "{secret}: unparseable {config}");
     }
 }
+
+/// Only an enum's own words pass unmasked at those positions: a secret a
+/// provider places there is masked like any other string.
+#[test]
+fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
+    let secret = "zq7w-not-a-role";
+    let profile = ProfileEnv::new(
+        "codex@work",
+        "f1",
+        vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+    );
+    let redactor = Redactor::new(Some(&profile));
+    let mut chunk = json!({
+        "sessionId": "s1",
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "text",
+                "text": "hi",
+                "annotations": { "audience": ["user", secret] },
+            },
+        },
+    });
+    redactor.notification(&mut chunk);
+    assert_eq!(
+        chunk["update"]["content"]["annotations"]["audience"],
+        json!(["user", "[redacted]"])
+    );
+    let mut config = json!({
+        "sessionId": "s1",
+        "update": {
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{ "id": "model", "name": "Model", "type": secret, "currentValue": "x" }],
+        },
+    });
+    redactor.notification(&mut config);
+    assert_eq!(config["update"]["configOptions"][0]["type"], "[redacted]");
+}
