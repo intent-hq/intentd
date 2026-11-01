@@ -390,6 +390,42 @@ async fn a_revoked_credential_marks_the_machine_revoked() {
     assert_eq!(listed["machines"][0]["state"], "revoked");
 }
 
+/// A machine whose link is up but that does not report in time (a freshly
+/// started daemon before its first provider report) is `machine-unreachable`
+/// naming the live route and the link code, not a bare internal error.
+#[tokio::test]
+async fn a_refresh_the_machine_does_not_answer_is_machine_unreachable() {
+    let mut quick = tuning();
+    quick.capabilities_timeout = Duration::from_millis(300);
+    let backend = Backend::with_tuning(quick).await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    // Bound, but the capabilities request is never answered.
+    let _link = machine.accept().await;
+    let error = refreshing.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), -32603, "{error:?}");
+    let data = data(&error);
+    assert_eq!(data["code"], "machine-unreachable", "{data}");
+    assert_eq!(
+        data["attempts"],
+        json!([{ "route": format!("127.0.0.1:{}", machine.port), "error": "node-link-timeout" }])
+    );
+    let message = error.to_string();
+    assert!(message.contains("Test machine"), "{message}");
+    assert!(!message.contains(&machine.token));
+}
+
 #[tokio::test]
 async fn an_unreachable_refresh_marks_the_machine_unreachable() {
     let backend = Backend::new().await;

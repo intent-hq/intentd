@@ -89,6 +89,30 @@ impl ConnectFailure {
     }
 }
 
+/// `machine-unreachable` for a link that bound on `route` but then failed
+/// with the executor link `code` before the machine answered.
+pub(crate) fn live_link_failure(name: &str, route: &str, code: &str) -> Error {
+    let message = if code == codes::TIMEOUT {
+        format!(
+            "{name} is connected but did not report its capabilities in time; \
+             a machine that just started can take a few minutes for its first report, \
+             so try again shortly."
+        )
+    } else {
+        format!(
+            "The link to {name} failed ({code}) before it reported its capabilities; try again."
+        )
+    };
+    Error::remote_machine(
+        true,
+        message,
+        json!({
+            "code": MACHINE_UNREACHABLE,
+            "attempts": [{ "route": route, "error": code }],
+        }),
+    )
+}
+
 fn attempts_json(attempts: &[Attempt]) -> serde_json::Value {
     attempts
         .iter()
@@ -116,6 +140,8 @@ fn peer_protocol(error: &Error) -> Option<u32> {
 pub(crate) struct Connected {
     pub dialed: DialedLink,
     pub endpoint: NodeEndpoint,
+    /// The route's label, as in [`Attempt::route`].
+    pub route: String,
 }
 
 /// Connect to `target`, binding with a hello from `hello` (called once per
@@ -234,6 +260,7 @@ where
         Ok(dialed) => Ok(Some(Connected {
             dialed,
             endpoint: route.endpoint,
+            route: route.label,
         })),
         Err(error) => {
             let code = code_of(&error);

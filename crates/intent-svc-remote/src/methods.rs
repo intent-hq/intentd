@@ -518,7 +518,19 @@ async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Res
         return Err(not_found(&machine_id));
     }
     let node = feature.node(svc, &machine_id).await?;
-    node.refresh_capabilities().await?;
+    if let Err(error) = node.refresh_capabilities().await {
+        // A connect failure is already `machine-unreachable` / `-revoked` /
+        // `-update-required`; a link that bound and then failed (no report
+        // in time, closed) is unreachable on that route too.
+        return Err(match intent_transport::node_link::error_code(&error) {
+            Some(code) => crate::connect::live_link_failure(
+                &node.status().node_name,
+                node.route().as_deref().unwrap_or("none"),
+                code,
+            ),
+            None => error,
+        });
+    }
     let row = svc
         .store()
         .get_exposed_machine(&machine_id)
