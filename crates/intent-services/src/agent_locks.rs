@@ -223,14 +223,16 @@ impl Services {
 
     /// Recompute `workspace_id`'s lock snapshot and publish
     /// `changes:agent-locks` iff it differs from `last` (the previously
-    /// published snapshot, if any). Returns the fresh snapshot.
+    /// published snapshot, if any). Returns the fresh snapshot. Plain-folder
+    /// workspaces emit no `changes:*` events (§5.1), so nothing is published
+    /// for them.
     pub(crate) async fn refresh_agent_locks(
         &self,
         workspace_id: &WorkspaceId,
         last: Option<&AgentLockSnapshot>,
     ) -> AgentLockSnapshot {
         let snap = self.compute_agent_locks(workspace_id).await;
-        if last != Some(&snap) {
+        if last != Some(&snap) && !self.is_plain_folder(workspace_id).await {
             publish_event(
                 self.event_bus.as_ref(),
                 changes_agent_locks_event(workspace_id, &snap),

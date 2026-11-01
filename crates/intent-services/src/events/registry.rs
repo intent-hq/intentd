@@ -43,7 +43,7 @@
 //! like an unarchive, catch-up included. Transitions are logged once through
 //! the shared [`WorktreePresence`] map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -201,6 +201,7 @@ impl WatcherRegistry {
         // instead of being skipped until the next daemon restart.
         let mut initial: Vec<(WorkspaceId, PathBuf)> = Vec::new();
         let mut missing: HashMap<WorkspaceId, PathBuf> = HashMap::new();
+        let mut plain: HashSet<WorkspaceId> = HashSet::new();
         match services
             .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
             .await
@@ -210,6 +211,9 @@ impl WatcherRegistry {
                     let Some(root) = ws.effective_path() else {
                         continue;
                     };
+                    if ws.plain_folder {
+                        plain.insert(ws.id.clone());
+                    }
                     let path = PathBuf::from(root);
                     if ws.is_remote || ws.archived {
                         if path.is_dir() {
@@ -253,7 +257,7 @@ impl WatcherRegistry {
         tracing::info!(count = file_watchers.len(), "file watchers started");
 
         let mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher> = HashMap::new();
-        for (ws_id, path) in &initial {
+        for (ws_id, path) in initial.iter().filter(|(id, _)| !plain.contains(id)) {
             if let Some(w) = start_git_metadata_watch(
                 &hub,
                 &git_common,
@@ -285,6 +289,7 @@ impl WatcherRegistry {
             skills,
             specialists,
             setup_backstop,
+            plain,
             Probe {
                 presence,
                 interval: probe_interval,
@@ -372,7 +377,9 @@ fn start_git_metadata_watch(
 }
 
 /// Start (or replace) the file + `.git` metadata watches for one workspace.
-/// `suffix` distinguishes the triggering transition in the logs.
+/// `suffix` distinguishes the triggering transition in the logs. A
+/// plain-folder workspace (in `plain`) gets the file watch only: it has no
+/// git features, even if the folder holds a `.git` (§5.1).
 #[expect(clippy::too_many_arguments)]
 fn start_watches(
     hub: &Arc<SharedWatchHub>,
@@ -381,6 +388,7 @@ fn start_watches(
     refresher: &Arc<GitStatusRefresher>,
     file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
     git_watchers: &mut HashMap<WorkspaceId, GitMetadataWatcher>,
+    plain: &HashSet<WorkspaceId>,
     ws_id: &WorkspaceId,
     path: &std::path::Path,
     suffix: &str,
@@ -390,6 +398,11 @@ fn start_watches(
         ws_id.clone(),
         FileWatcher::start(hub, bus.clone(), ws_id.clone(), path),
     );
+    if plain.contains(ws_id) {
+        tracing::debug!(workspace = %ws_id, "plain-folder workspace; not watching git metadata");
+        git_watchers.remove(ws_id);
+        return;
+    }
     if let Some(w) =
         start_git_metadata_watch(hub, common_watches, refresher, &ws_id.clone(), path, suffix)
     {
@@ -504,6 +517,7 @@ async fn lifecycle_loop(
     skills: SkillsWatcher,
     specialists: SpecialistsWatcher,
     setup_backstop: Duration,
+    mut plain: HashSet<WorkspaceId>,
     mut probe: Probe,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -546,6 +560,7 @@ async fn lifecycle_loop(
                         &refresher,
                         &mut file_watchers,
                         &mut git_watchers,
+                        &plain,
                         &ws_id,
                         &p.path,
                         " (setup completion backstop)",
@@ -575,6 +590,7 @@ async fn lifecycle_loop(
                         &refresher,
                         &mut file_watchers,
                         &mut git_watchers,
+                        &plain,
                         &ws_id,
                         &path,
                         " (checkout reappeared)",
@@ -621,6 +637,7 @@ async fn lifecycle_loop(
                 // watcher exists during the setup window, so setup churn is
                 // naturally dropped.
                 WORKSPACE_CREATED => {
+                    note_plain_folder(&ev, services.as_ref(), &mut plain).await;
                     let Some(path) = resolve_path(&ev, services.as_ref()).await else {
                         tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
                         continue;
@@ -647,6 +664,7 @@ async fn lifecycle_loop(
                         &refresher,
                         &mut file_watchers,
                         &mut git_watchers,
+                        &plain,
                         &ws_id,
                         &p.path,
                         " (setup completed)",
@@ -656,6 +674,7 @@ async fn lifecycle_loop(
                     specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
+                    note_plain_folder(&ev, services.as_ref(), &mut plain).await;
                     let path = match resolve_path(&ev, services.as_ref()).await {
                         Some(p)
                             if runtime_root_available(
@@ -703,6 +722,7 @@ async fn lifecycle_loop(
                         &refresher,
                         &mut file_watchers,
                         &mut git_watchers,
+                        &plain,
                         &ws_id,
                         &path,
                         " (runtime registration)",
@@ -722,6 +742,7 @@ async fn lifecycle_loop(
                         "runtime deregistration",
                     );
                     probe.forget(&ws_id);
+                    plain.remove(&ws_id);
                     skills.remove_workspace(&ws_id);
                     specialists.remove_workspace(&ws_id);
                 }
@@ -756,6 +777,7 @@ async fn lifecycle_loop(
                         tracing::debug!(workspace = %ws_id, "already watching; ignoring redundant unarchive delta");
                     }
                     Some(false) => {
+                        note_plain_folder(&ev, services.as_ref(), &mut plain).await;
                         let path = match resolve_path(&ev, services.as_ref()).await {
                             Some(p)
                                 if runtime_root_available(
@@ -783,6 +805,7 @@ async fn lifecycle_loop(
                             &refresher,
                             &mut file_watchers,
                             &mut git_watchers,
+                            &plain,
                             &ws_id,
                             &path,
                             " (workspace unarchived)",
@@ -819,6 +842,34 @@ async fn lifecycle_loop(
     }
     skills.shutdown().await;
     specialists.shutdown().await;
+}
+
+/// Record whether the event's workspace is a plain folder (§5.1), from the
+/// self-sufficient `data.workspace` payload when present, else a
+/// `get_workspace` lookup. The flag is fixed at create, so a failed lookup
+/// keeps what was already known.
+async fn note_plain_folder(
+    ev: &Event,
+    services: &dyn WorkspaceApi,
+    plain: &mut HashSet<WorkspaceId>,
+) {
+    let from_payload = ev
+        .data
+        .get("workspace")
+        .filter(|ws| ws.is_object())
+        .map(|ws| ws.get("plainFolder").and_then(serde_json::Value::as_bool) == Some(true));
+    let is_plain = match from_payload {
+        Some(flag) => flag,
+        None => match services.get_workspace(ev.workspace_id.clone()).await {
+            Ok(ws) => ws.plain_folder,
+            Err(_) => return,
+        },
+    };
+    if is_plain {
+        plain.insert(ev.workspace_id.clone());
+    } else {
+        plain.remove(&ev.workspace_id);
+    }
 }
 
 /// Resolve the on-disk root for a lifecycle event: prefer the self-sufficient
@@ -2583,5 +2634,212 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         empty_mountpoint_at_runtime_registration(true).await;
+    }
+
+    /// Event types a plain-folder workspace must never emit (PROTOCOL §5.1
+    /// "Plain-folder workspaces").
+    const PLAIN_FOLDER_SUPPRESSED: [&str; 5] =
+        ["changes:*", "git:*", "gitRoot:*", "pr:*", "prMonitor:*"];
+
+    fn suppressed_sub(bus: &EventBus) -> super::super::bus::Subscription {
+        bus.subscribe(SubscriptionFilter {
+            event_types: PLAIN_FOLDER_SUPPRESSED
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            ..SubscriptionFilter::default()
+        })
+    }
+
+    /// A plain-folder row as `workspace.create { plainFolder: true }`
+    /// persists it: the folder as `repositoryPath` only, no branch.
+    fn plain_workspace(id: &str, root: &std::path::Path) -> Workspace {
+        let mut ws = test_workspace(id, root);
+        ws.path = None;
+        ws.branch = String::new();
+        ws.repository_path = Some(root.to_string_lossy().into_owned());
+        ws.plain_folder = true;
+        ws
+    }
+
+    /// A git repository with one seed commit, so a `.git` metadata change
+    /// would normally produce a `changes:git-status` refresh.
+    fn seeded_repo(root: &std::path::Path) -> git2::Repository {
+        use git2::{Repository, Signature};
+        let repo = Repository::init(root).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        {
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+                .unwrap();
+        }
+        repo
+    }
+
+    /// Drain `sub` for `window` and return every event for `ws_id`.
+    async fn collect_for(
+        sub: &mut super::super::bus::Subscription,
+        ws_id: &WorkspaceId,
+        window: Duration,
+    ) -> Vec<String> {
+        let deadline = Instant::now() + window;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return seen;
+            }
+            match timeout(remaining, sub.recv()).await {
+                Ok(Some(batch)) => seen.extend(
+                    batch
+                        .into_iter()
+                        .filter(|ev| &ev.workspace_id == ws_id)
+                        .map(|ev| ev.event_type),
+                ),
+                _ => return seen,
+            }
+        }
+    }
+
+    /// A plain-folder workspace keeps its `file:*` events but emits no git
+    /// event while its files change — even when the folder holds a `.git`
+    /// (the persisted flag decides). A git workspace watched alongside it
+    /// still refreshes its status, which also proves the refresher ran.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn plain_folder_file_changes_emit_file_events_but_no_git_events() {
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = TestBudget::liveness();
+        let (_db, bus, mut file_sub) = bus_and_sub().await;
+        let mut suppressed = suppressed_sub(&bus);
+
+        let plain_root = TempDir::new("plain-boot");
+        let plain_repo = seeded_repo(&plain_root.path);
+        let plain = plain_workspace("ws-plain-boot", &plain_root.path);
+
+        let git_root = TempDir::new("git-boot-control");
+        let _git_repo = seeded_repo(&git_root.path);
+        let mut git = test_workspace("ws-git-boot-control", &git_root.path);
+        git.worktree_path = git.path.clone();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![plain.clone(), git.clone()]));
+        let registry = start_registry(&bus, api).await;
+        wait_for_root_within(&registry, &plain_root.path, true, &budget).await;
+        wait_for_root_within(&registry, &git_root.path, true, &budget).await;
+        confirm_watch_live(&mut file_sub, &plain.id, &plain_root.path).await;
+
+        std::fs::write(plain_root.path.join("notes.md"), "hello").expect("write plain");
+        plain_repo.set_head("refs/heads/other").unwrap();
+        assert!(
+            next_file_event(&mut file_sub, &plain.id, budget.remaining())
+                .await
+                .is_some(),
+            "plain folder must still emit file events"
+        );
+
+        std::fs::write(git_root.path.join("code.rs"), "fn main() {}").expect("write git");
+        let mut git_status_seen = false;
+        let mut plain_seen = Vec::new();
+        let deadline = Instant::now() + budget.remaining();
+        while !git_status_seen && Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(batch)) = timeout(left, suppressed.recv()).await else {
+                break;
+            };
+            for ev in batch {
+                if ev.workspace_id == git.id && ev.event_type == CHANGES_GIT_STATUS {
+                    git_status_seen = true;
+                } else if ev.workspace_id == plain.id {
+                    plain_seen.push(ev.event_type);
+                }
+            }
+        }
+        assert!(
+            git_status_seen,
+            "git workspace must still refresh its status"
+        );
+
+        plain_seen.extend(
+            collect_for(
+                &mut suppressed,
+                &plain.id,
+                super::super::git_status_refresher::DEBOUNCE * 3,
+            )
+            .await,
+        );
+        assert!(
+            plain_seen.is_empty(),
+            "plain folder emitted git events: {plain_seen:?}"
+        );
+    }
+
+    /// Runtime registration (create → setup completed) and the unarchive
+    /// catch-up refresh both stay silent for a plain-folder workspace.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn plain_folder_runtime_registration_and_unarchive_emit_no_git_events() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = TestBudget::liveness();
+        let (_db, bus, mut file_sub) = bus_and_sub().await;
+        let mut suppressed = suppressed_sub(&bus);
+        let fake = Arc::new(FakeApi::new(Vec::new()));
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let registry = start_registry(&bus, api).await;
+
+        let root = TempDir::new("plain-runtime");
+        let repo = seeded_repo(&root.path);
+        let ws = plain_workspace("ws-plain-runtime", &root.path);
+        fake.workspaces.lock().unwrap().push(ws.clone());
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+        bus.publish(&setup_completed_event(&ws, false))
+            .await
+            .expect("publish setup completed");
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
+        confirm_watch_live(&mut file_sub, &ws.id, &root.path).await;
+
+        std::fs::write(root.path.join("draft.txt"), "draft").expect("write");
+        repo.set_head("refs/heads/other").unwrap();
+        assert!(
+            next_file_event(&mut file_sub, &ws.id, budget.remaining())
+                .await
+                .is_some(),
+            "plain folder must still emit file events"
+        );
+
+        bus.publish(&archive_event(&ws, true))
+            .await
+            .expect("publish archived");
+        wait_for_root_within(&registry, &root.path, false, &budget).await;
+        bus.publish(&archive_event(&ws, false))
+            .await
+            .expect("publish unarchived");
+        wait_for_root_within(&registry, &root.path, true, &budget).await;
+
+        let seen = collect_for(
+            &mut suppressed,
+            &ws.id,
+            super::super::git_status_refresher::DEBOUNCE * 3,
+        )
+        .await;
+        assert!(seen.is_empty(), "plain folder emitted git events: {seen:?}");
     }
 }
