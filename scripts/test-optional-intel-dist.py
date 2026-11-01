@@ -23,6 +23,13 @@ INTEL = 'x86_64-apple-darwin'
 _spec = importlib.util.spec_from_file_location('fetch_locked_crates', ROOT / 'scripts/fetch-locked-crates.py')
 _fetch = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fetch)
+_spec = importlib.util.spec_from_file_location('script_helpers', ROOT / 'scripts/script_helpers.py')
+_helpers = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_helpers)
+# The scripts this harness runs in the clone; copy_into adds their helpers and
+# sibling loads so uncommitted edits to any of them are what runs (intentd#2896).
+RUN_IN_CLONE = ('optional-intel-release.py', 'configure-optional-intel-release.py',
+                'configure-release-host-network.py', 'configure-runner-routing.py')
 NOT_UNDER_TEST = ' A network failure here is not the cargo-dist behaviour under test.'
 
 
@@ -38,7 +45,7 @@ def main():
         root = Path(temp) / 'repo'
         subprocess.run(['git', 'clone', '--quiet', '--shared', str(ROOT), str(root)], check=True)
         shutil.copy(ROOT / 'dist-workspace.toml', root / 'dist-workspace.toml')
-        shutil.copy(ROOT / 'scripts/optional-intel-release.py', root / 'scripts/optional-intel-release.py')
+        _helpers.copy_into(RUN_IN_CLONE, root / 'scripts')
         env = {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'}
         _fetch.install_toolchain(root, env)
         _fetch.fetch_dependencies(root, env, hint=NOT_UNDER_TEST)
@@ -90,14 +97,11 @@ def main():
         # already-customized fixture. Existing unrelated customizations are
         # outside this script's ownership.
         subprocess.run(['dist', 'generate'], cwd=root, env=env, check=True)
-        shutil.copy(ROOT / 'scripts/configure-optional-intel-release.py', root / 'scripts/configure-optional-intel-release.py')
         customize = ['python3', '-I', '-B', 'scripts/configure-optional-intel-release.py']
         subprocess.run(customize, cwd=root, check=True)
         generated = (root / '.github/workflows/v-release.yml').read_text()
         subprocess.run(customize, cwd=root, check=True)
         assert generated == (root / '.github/workflows/v-release.yml').read_text()
-        shutil.copy(ROOT / 'scripts/configure-release-host-network.py',
-                    root / 'scripts/configure-release-host-network.py')
         host_network = ['python3', '-I', '-B', 'scripts/configure-release-host-network.py']
         subprocess.run(host_network, cwd=root, check=True)
         fetched = (root / '.github/workflows/v-release.yml').read_text()
@@ -106,7 +110,6 @@ def main():
         # Both the global `dist build` and `dist host` run offline after a retried fetch.
         assert fetched.count('CARGO_NET_OFFLINE: "true"') == 2
         assert fetched.count('run: python3 -I -B scripts/fetch-locked-crates.py') == 2
-        shutil.copy(ROOT / 'scripts/configure-runner-routing.py', root / 'scripts/configure-runner-routing.py')
         route_command = ['python3', '-I', '-B', 'scripts/configure-runner-routing.py']
         subprocess.run(route_command, cwd=root, check=True)
         routed = (root / '.github/workflows/v-release.yml').read_text()

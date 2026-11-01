@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Tests for script_helpers.py, the derived copy list of the fixture harnesses.
 
-scripts/test-changed-tests.sh and scripts/test-test-policy.py run scripts in a
-scratch checkout and copy each script's helpers there. intentd#2896 showed a
-hand-kept copy list breaking with exit 127 only in the full release-scripts
-run; these cases pin the derived list and the fail-fast error.
+scripts/test-changed-tests.sh, scripts/test-test-policy.py,
+scripts/test-optional-intel-release.py, scripts/test-optional-intel-dist.py and
+scripts/test-prepare-claude-review-runtime.py run scripts in a scratch copy and
+copy each script's helpers there. intentd#2896 showed a hand-kept copy list
+breaking with exit 127 only in the full release-scripts run; these cases pin
+the derived list (shell calls and Python sibling loads) and the fail-fast
+error.
 """
 
 import importlib.util
@@ -90,6 +93,56 @@ class ClosureTests(unittest.TestCase):
             self.closure("absent.sh")
         self.assertIn("scripts/absent.sh does not exist", str(raised.exception))
 
+    def test_python_sibling_loads_and_data_files(self):
+        write(self.dir, "main.py", "\n".join([
+            'from pathlib import Path',
+            'HERE = Path(__file__).resolve().parent',
+            'SCRIPTS = Path(__file__).parent  # the scripts directory',
+            'spec = load(Path(__file__).with_name("a.py"))',
+            "policy = Path(__file__).resolve().with_name('b-policy.json')",
+            'helper = HERE / "c.py"',
+            "data = SCRIPTS/'d.patch'",
+            'inline = Path(__file__).resolve().parent / "e.mjs"',
+            '',
+        ]))
+        write(self.dir, "a.py", "DESCRIPTOR = Path(__file__).with_name('f.json')\n")
+        for name in ("b-policy.json", "c.py", "e.mjs", "f.json"):
+            write(self.dir, name, "{}\n")
+        write(self.dir, "d.patch", "+scripts/not-a-call.sh\n")
+        self.assertEqual(self.closure("main.py"),
+                         ["a.py", "b-policy.json", "c.py", "d.patch", "e.mjs", "f.json", "main.py"])
+
+    def test_python_paths_outside_the_script_directory_are_not_siblings(self):
+        write(self.dir, "main.py", "\n".join([
+            'ROOT = Path(__file__).resolve().parent.parent',
+            'TOP = Path(__file__).resolve().parents[1]',
+            'a = ROOT / "gone.py"',
+            'b = TOP / "dist-workspace.toml"',
+            'c = archive.with_name("gone.sha256")',
+            'd = other / "gone.json"',
+            'e = MYHERE / "gone.py"',
+            'f = HERE / f"{name}.py"',
+            '# HERE = Path(__file__).parent',
+            '# spec = Path(__file__).with_name("gone.py")',
+            '',
+        ]))
+        self.assertEqual(self.closure("main.py"), ["main.py"])
+
+    def test_data_file_roots_are_copied_but_not_scanned(self):
+        write(self.dir, "install.ps1", "& scripts/gone.sh\n")
+        (self.dir / "blob.json").write_bytes(b"\xff\xfe scripts/gone.py")
+        self.assertEqual(self.closure("install.ps1", "blob.json"), ["blob.json", "install.ps1"])
+
+    def test_missing_python_sibling_names_caller_line_and_file(self):
+        write(self.dir, "main.py", "import x\nspec = Path(__file__).with_name('missing.py')\n")
+        with self.assertRaises(script_helpers.MissingHelper) as raised:
+            self.closure("main.py")
+        self.assertIn("main.py:2 loads missing.py", str(raised.exception))
+        write(self.dir, "data.py", "HERE = Path(__file__).resolve().parent\npath = HERE / 'gone.json'\n")
+        with self.assertRaises(script_helpers.MissingHelper) as raised:
+            self.closure("data.py")
+        self.assertIn("data.py:2 loads gone.json", str(raised.exception))
+
     def test_copy_into_copies_the_closure(self):
         write(self.dir, "main.sh", "scripts/a.sh\n")
         write(self.dir, "a.sh", "true\n")
@@ -124,6 +177,23 @@ class RepositoryTests(unittest.TestCase):
             closure = script_helpers.closure([script])
             self.assertIn("ci-killed-rustc-retry.sh", closure)
             self.assertIn("with-test-policy.sh", closure)
+
+    def test_script_helpers_itself_resolves(self):
+        # Every harness that uses copy_into loads script_helpers.py, so any
+        # closure reaching a harness reaches it; its own text must not read
+        # as a call to a missing helper.
+        self.assertIn("script_helpers.py", script_helpers.closure(["script_helpers.py"]))
+
+    def test_python_harnessed_scripts_resolve(self):
+        release = script_helpers.closure(["reconcile-sitter-intel.py"])
+        self.assertEqual(release, ["optional-intel-release.py", "reconcile-sitter-intel.py"])
+        review = script_helpers.closure(["prepare-claude-review-runtime.py"])
+        for name in ("prepare-claude-callback-runtime.py", "claude-review-runtime.json",
+                     "claude-review-runtime.patch", "claude-callback-runtime.json"):
+            self.assertIn(name, review)
+        dist = script_helpers.closure(["configure-optional-intel-release.py", "configure-release-host-network.py"])
+        for name in ("optional-intel-release.py", "fetch-locked-crates.py"):
+            self.assertIn(name, dist)
 
     def test_changed_tests_harness_fails_fast_naming_a_missing_helper(self):
         # The proof the issue asked for: a new helper call that the fixture
