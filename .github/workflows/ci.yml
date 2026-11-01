@@ -2278,6 +2278,12 @@ jobs:
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
           python3 -I -B scripts/test-subprocess-env-policy.py
+      # Without --bundle only the bundle-free cases run: a tampered review
+      # descriptor is refused, and the scratch copy they run in holds every
+      # file the preparer loads (its old hand-kept list lacked two, unnoticed
+      # until intentd#2911). Qualifying a real bundle stays an explicit run.
+      - name: Test review runtime descriptor refusal (no bundle)
+        run: python3 -I -B scripts/test-prepare-claude-review-runtime.py
       - name: Test obsolete merge-run policy and workflow integration (offline)
         run: |
           python3 -I -B scripts/test-retire-obsolete-merge-runs.py
