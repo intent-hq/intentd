@@ -84,6 +84,10 @@ pub(crate) struct Tuning {
     /// the link is published.
     #[cfg(test)]
     pub before_publish: BeforePublish,
+    /// Test seam: runs at bind, after the route is recorded and before the
+    /// welcome's agents are claimed.
+    #[cfg(test)]
+    pub before_claim: BeforePublish,
 }
 
 /// A test hook run with the connector's state just before a bound link is
@@ -126,6 +130,8 @@ impl Default for Tuning {
             fail_ack_writes: Arc::default(),
             #[cfg(test)]
             before_publish: BeforePublish::default(),
+            #[cfg(test)]
+            before_claim: BeforePublish::default(),
         }
     }
 }
@@ -177,6 +183,11 @@ pub(crate) struct Shared {
     resending: Mutex<HashMap<StopId, u64>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
+    /// Set once a bind in this process has claimed the agents its welcome
+    /// reported: from then on the attached agents are the machine's
+    /// survivors. Set after the claim, not with the route, which a bind
+    /// records before its claim.
+    claimed: std::sync::atomic::AtomicBool,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
@@ -580,6 +591,7 @@ impl RemoteNode {
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
             route: Mutex::new(None),
+            claimed: std::sync::atomic::AtomicBool::new(false),
             capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
             demand,
@@ -664,6 +676,14 @@ impl RemoteNode {
     /// The label of the route the current (or last) link bound on.
     pub(crate) fn route(&self) -> Option<String> {
         lock(&self.shared.route).clone()
+    }
+
+    /// Whether a bind in this process has claimed the machine's surviving
+    /// agents, so [`Self::running`] counts them.
+    pub(crate) fn has_claimed(&self) -> bool {
+        self.shared
+            .claimed
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Connect if needed and ask the machine for a fresh capabilities
@@ -896,7 +916,14 @@ async fn run(
         // Before the link is published: queue the stops of agents head no
         // longer claims, then send every queued stop, so they precede any
         // launch or prompt on this link.
+        #[cfg(test)]
+        if let Some(hook) = &shared.tuning.before_claim.0 {
+            hook(&shared);
+        }
         claim(&shared, &welcome).await;
+        shared
+            .claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {

@@ -1062,7 +1062,7 @@ async fn after_a_restart_remove_with_stop_agents_waits_for_the_machines_ack() {
         json!({ "machineId": machine.id(), "stopAgents": true }),
     );
     tokio::pin!(remove);
-    let (mut link, stop_id) = tokio::select! {
+    let (link, stop_id) = tokio::select! {
         result = &mut remove => panic!("removed before the surviving agent's stop was acked: {result:?}"),
         found = async {
             let mut link = machine.accept().await;
@@ -1125,4 +1125,129 @@ async fn after_a_restart_replacing_the_credential_refuses_while_a_surviving_agen
         .unwrap();
     assert_eq!(row.credential_id, old_credential, "the credential is kept");
     assert_machine_kept(&backend, &machine).await;
+}
+
+// Review of intentd#2930: a bind records its route before it claims the
+// welcome's agents. A removal or a credential replacement that runs while a
+// refresh's bind is in that window must still wait for the claim, not count
+// zero survivors.
+#[derive(Clone, Copy, Debug)]
+enum DuringBind {
+    Remove,
+    RemoveStoppingAgents,
+    ReplaceCredential,
+}
+
+async fn during_a_restart_bind(action: DuringBind) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    let mut hooked = tuning();
+    hooked.before_claim = crate::connector::BeforePublish(Some(Arc::new(
+        move |_: &Arc<crate::connector::Shared>| {
+            // Hold only the first bind, between its route and its claim.
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                if let Some(release) = release_rx.lock().unwrap().take() {
+                    // Hand this worker's other tasks off before blocking.
+                    tokio::task::block_in_place(|| {
+                        let _ = release.recv();
+                    });
+                }
+            }
+        },
+    )));
+    let backend = Backend::with_tuning(hooked).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let (method, params) = match action {
+        DuringBind::Remove => ("remove", json!({ "machineId": machine.id() })),
+        DuringBind::RemoveStoppingAgents => (
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        ),
+        DuringBind::ReplaceCredential => {
+            let token = "a".repeat(64);
+            let credential =
+                Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            ("add", params)
+        }
+    };
+
+    // A refresh starts the connector and binds; the bind stops before its
+    // claim with the route already recorded.
+    let services = backend.services.clone();
+    let id = machine.id();
+    let refresh = tokio::spawn(async move {
+        with_caller(
+            Caller::Daemon,
+            services.remote_machines("refresh", json!({ "machineId": id })),
+        )
+        .await
+    });
+    let mut link = machine.accept().await;
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let services = backend.services.clone();
+    let call = tokio::spawn(async move {
+        with_caller(Caller::Daemon, services.remote_machines(method, params)).await
+    });
+    // timing-guard: a call that skipped the claim finishes at once
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!call.is_finished(), "{action:?} waits for the bind's claim");
+    assert_machine_kept(&backend, &machine).await;
+    release_tx.send(()).unwrap();
+
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = call.await.unwrap().unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            let stop_id = link.stop_for(&agent).await;
+            assert!(!call.is_finished(), "removal waits for the StopAck");
+            assert_machine_kept(&backend, &machine).await;
+            link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+            assert_eq!(
+                call.await.unwrap().unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+    refresh.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::Remove).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_stopping_agents_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_replacing_the_credential_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::ReplaceCredential).await;
 }

@@ -265,7 +265,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         // credential's connector binds: reclaim them before replacing it.
         if let Some(previous) = previous
             .as_ref()
-            .filter(|_| current.as_ref().is_none_or(|node| node.route().is_none()))
+            .filter(|_| current.as_ref().is_none_or(|node| !node.has_claimed()))
         {
             current = recover_survivors(feature, svc, previous, current).await?;
         }
@@ -423,7 +423,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         return Ok(json!({ "ok": true }));
     };
     let node = match feature.running_node(&machine_id) {
-        Some(node) if node.route().is_some() => Some(node),
+        Some(node) if node.has_claimed() => Some(node),
         unbound => recover_survivors(feature, svc, &row, unbound).await?,
     };
     if let Some(node) = node {
@@ -451,8 +451,9 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     Ok(result)
 }
 
-/// The connector to use for removing `row` when this process has not bound
-/// to it yet (no connector, or one that has not connected since it started):
+/// The connector to use for removing `row` when no bind in this process has
+/// claimed its agents yet (no connector, one that has not connected since it
+/// started, or one whose first bind is still between its route and its claim):
 /// after a backend restart the machine keeps its agents running, and only a
 /// bind's welcome tells which of the agents recorded on its live leases
 /// still run. With none recorded, `unbound` is kept as is. Otherwise the
@@ -493,14 +494,14 @@ async fn recover_survivors(
         Ok(Err(Error::RemoteMachine(failure))) => Err(survivors_unknown(
             &row.name,
             recorded,
-            failure.data["attempts"].clone(),
+            &failure.data["attempts"],
         )),
         Ok(Err(other)) => Err(other),
-        Err(_) => Err(survivors_unknown(&row.name, recorded, json!([]))),
+        Err(_) => Err(survivors_unknown(&row.name, recorded, &json!([]))),
     }
 }
 
-fn survivors_unknown(name: &str, recorded: usize, attempts: Value) -> Error {
+fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
     coded(
         true,
         crate::connect::MACHINE_UNREACHABLE,

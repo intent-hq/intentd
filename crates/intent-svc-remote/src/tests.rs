@@ -67,6 +67,7 @@ fn tuning() -> Tuning {
         },
         fail_ack_writes: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),
+        before_claim: crate::connector::BeforePublish::default(),
     }
 }
 
