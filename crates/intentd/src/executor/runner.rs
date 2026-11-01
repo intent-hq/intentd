@@ -377,7 +377,7 @@ impl Redactor {
     /// protocol word; every other string is masked with [`Self::value`], and
     /// tool `rawInput` / `rawOutput` / `_meta` with [`Self::data`] (keys too).
     ///
-    /// Accepted v1 limit: a secret identical to an ACP enum word not listed
+    /// Accepted limit: a secret identical to an ACP enum word not listed
     /// here (for example an annotation audience `user`) is masked in that
     /// position, so head cannot parse that one update and drops it. This
     /// fails closed (nothing leaks), and real provider credentials are long
@@ -1363,7 +1363,7 @@ async fn marked_processes(marker: &str) -> Vec<i32> {
 /// descendants are swept from that snapshot (and, on Linux, from the run
 /// marker).
 ///
-/// Accepted v1 residuals (outside Linux, or for a helper that clears its
+/// Accepted residuals (outside Linux, or for a helper that clears its
 /// environment and so carries no run marker), all for a provider that exits
 /// by itself:
 /// - a helper that leaves the provider's process group after the last
