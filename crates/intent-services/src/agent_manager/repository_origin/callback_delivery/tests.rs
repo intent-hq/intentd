@@ -6955,283 +6955,165 @@ mod normal_launch {
         }
     }
 
-    #[intent_test_macros::daemon_test]
-    async fn normal_callback_monitor_prepared_turn_uses_original_runtime() {
-        for mode in [
-            "accepted",
-            "retired",
-            "stale-row",
-            "lost-slot",
-            "queued",
-            "queued-retired",
-            "refused-queue",
-            "queue-idle",
-            "queue-busy",
-            "queue-drain-retired",
-            "unsupported-read",
-            "tracked",
-            "tracked-ack-failure",
-        ] {
-            let h = NormalHarness::new(None, json!({})).await;
-            let _started = h.start().await.unwrap();
-            h.call(0, &h.confirmed(0).await, "return await ws.mr.monitor(4);")
-                .await;
-            let authority = h
-                .original
-                .review_monitor_authorities
+    async fn monitor_prepared_turn_uses_original_runtime(mode: &'static str) {
+        let h = NormalHarness::new(None, json!({})).await;
+        let _started = h.start().await.unwrap();
+        h.call(0, &h.confirmed(0).await, "return await ws.mr.monitor(4);")
+            .await;
+        let authority = h
+            .original
+            .review_monitor_authorities
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let original = authority.original_services().unwrap();
+        if mode.starts_with("tracked") {
+            sqlx::query("UPDATE pr_monitor SET pending_changes = '[\"new commits pushed\"]' WHERE agent_id = ?")
+                .bind(&h.f.row.id.0).execute(original.store.write_pool()).await.unwrap();
+        }
+        let row = original
+            .store
+            .load_active_qualified_pr_monitors()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let metadata = serde_json::from_value(json!({
+            "type":"pr_monitor_wake", "monitorId":row.monitor().monitor_id,
+            "repo":authority.binding.resource.repository.project_path,
+            "prNumber":authority.binding.resource.number,
+            "reason":"changes", "resource":authority.binding.resource,
+        }))
+        .unwrap();
+        let observation = h
+            .daemon({
+                let original = original.clone();
+                let authority = authority.clone();
+                async move {
+                    authority
+                        .run_poll(Box::pin(authority.read_poll(&original)))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+            })
+            .await;
+        let manager = h.f.manager.clone();
+        let prepared = h
+            .daemon({
+                let manager = manager.clone();
+                let row = row.clone();
+                async move {
+                    manager
+                        .prepare_monitor_turn(
+                            row,
+                            authority,
+                            observation.delivery,
+                            "original queued wake".into(),
+                            metadata,
+                        )
+                        .await
+                        .unwrap()
+                }
+            })
+            .await;
+        let prepared = if mode.starts_with("tracked") {
+            let prepared = prepared.track(&manager.services).unwrap();
+            assert!(manager
+                .services
+                .review_monitor_deliveries
                 .lock()
                 .unwrap()
-                .values()
-                .next()
+                .get(&row.monitor().monitor_id)
                 .unwrap()
-                .clone();
-            let original = authority.original_services().unwrap();
-            if mode.starts_with("tracked") {
-                sqlx::query("UPDATE pr_monitor SET pending_changes = '[\"new commits pushed\"]' WHERE agent_id = ?")
-                    .bind(&h.f.row.id.0).execute(original.store.write_pool()).await.unwrap();
-            }
-            let row = original
-                .store
-                .load_active_qualified_pr_monitors()
-                .await
-                .unwrap()
-                .pop()
-                .unwrap();
-            let metadata = serde_json::from_value(json!({
-                "type":"pr_monitor_wake", "monitorId":row.monitor().monitor_id,
-                "repo":authority.binding.resource.repository.project_path,
-                "prNumber":authority.binding.resource.number,
-                "reason":"changes", "resource":authority.binding.resource,
-            }))
-            .unwrap();
-            let observation = h
-                .daemon({
-                    let original = original.clone();
-                    let authority = authority.clone();
-                    async move {
-                        authority
-                            .run_poll(Box::pin(authority.read_poll(&original)))
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    }
-                })
-                .await;
-            let manager = h.f.manager.clone();
-            let prepared = h
+                .active());
+            prepared
+        } else {
+            prepared
+        };
+        if mode == "tracked-ack-failure" {
+            sqlx::query("CREATE TRIGGER reject_ack BEFORE UPDATE ON pr_monitor BEGIN SELECT RAISE(ABORT, 'acknowledgement failure'); END")
+                .execute(original.store.write_pool()).await.unwrap();
+        }
+        if matches!(mode, "retired" | "refused-queue") {
+            h.origin().retire();
+        }
+        let prepared = if mode.contains("queue") {
+            let queued = h
                 .daemon({
                     let manager = manager.clone();
-                    let row = row.clone();
-                    async move {
-                        manager
-                            .prepare_monitor_turn(
-                                row,
-                                authority,
-                                observation.delivery,
-                                "original queued wake".into(),
-                                metadata,
-                            )
-                            .await
-                            .unwrap()
-                    }
+                    async move { prepared.enqueue(&manager.services).await }
                 })
                 .await;
-            let prepared = if mode.starts_with("tracked") {
-                let prepared = prepared.track(&manager.services).unwrap();
-                assert!(manager
+            if mode == "refused-queue" {
+                assert!(queued.is_err());
+                assert!(manager.services.dequeue_message(&h.f.row.id).is_none());
+                h.finish().await;
+                return;
+            }
+            queued.unwrap();
+            assert!(manager.services.queue_snapshot(&h.f.row.id).is_empty());
+            manager.services.persist_queue_snapshot(&h.f.row.id).await;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_queue WHERE agent_id = ?")
+                    .bind(&h.f.row.id.0)
+                    .fetch_one(original.store.read_pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                count, 0,
+                "original authority cannot become a restored plain queue payload"
+            );
+            assert!(
+                manager
                     .services
-                    .review_monitor_deliveries
-                    .lock()
-                    .unwrap()
-                    .get(&row.monitor().monitor_id)
-                    .unwrap()
-                    .active());
-                prepared
-            } else {
-                prepared
-            };
-            if mode == "tracked-ack-failure" {
-                sqlx::query("CREATE TRIGGER reject_ack BEFORE UPDATE ON pr_monitor BEGIN SELECT RAISE(ABORT, 'acknowledgement failure'); END")
-                    .execute(original.store.write_pool()).await.unwrap();
-            }
-            if matches!(mode, "retired" | "refused-queue") {
-                h.origin().retire();
-            }
-            let prepared = if mode.contains("queue") {
-                let queued = h
-                    .daemon({
-                        let manager = manager.clone();
-                        async move { prepared.enqueue(&manager.services).await }
-                    })
-                    .await;
-                if mode == "refused-queue" {
-                    assert!(queued.is_err());
-                    assert!(manager.services.dequeue_message(&h.f.row.id).is_none());
-                    h.finish().await;
-                    continue;
+                    .dequeue_ready_batch(&h.f.row.id, false, 1)
+                    .is_none(),
+                "private wake cannot join an ordinary prompt batch"
+            );
+            if matches!(mode, "queue-idle" | "queue-busy" | "queue-drain-retired") {
+                if mode == "queue-drain-retired" {
+                    h.origin().retire();
                 }
-                queued.unwrap();
-                assert!(manager.services.queue_snapshot(&h.f.row.id).is_empty());
-                manager.services.persist_queue_snapshot(&h.f.row.id).await;
-                let count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM agent_queue WHERE agent_id = ?")
-                        .bind(&h.f.row.id.0)
-                        .fetch_one(original.store.read_pool())
-                        .await
-                        .unwrap();
-                assert_eq!(
-                    count, 0,
-                    "original authority cannot become a restored plain queue payload"
-                );
-                assert!(
-                    manager
-                        .services
-                        .dequeue_ready_batch(&h.f.row.id, false, 1)
-                        .is_none(),
-                    "private wake cannot join an ordinary prompt batch"
-                );
-                if matches!(mode, "queue-idle" | "queue-busy" | "queue-drain-retired") {
-                    if mode == "queue-drain-retired" {
-                        h.origin().retire();
-                    }
-                    h.daemon({
-                        let manager = manager.clone();
-                        let agent = h.f.row.id.clone();
-                        let workspace = h.f.row.workspace_id.clone();
-                        async move {
-                            if mode == "queue-busy" {
-                                let slot =
-                                    manager.try_begin_turn(&agent, &workspace).await.unwrap();
-                                manager
-                                    .clone()
-                                    .try_drain_queue(agent.clone(), workspace.clone())
-                                    .await;
-                                assert!(manager.services.has_ready_to_send(&agent));
-                                manager.release_slot(&agent, slot).await;
-                            }
+                h.daemon({
+                    let manager = manager.clone();
+                    let agent = h.f.row.id.clone();
+                    let workspace = h.f.row.workspace_id.clone();
+                    async move {
+                        if mode == "queue-busy" {
+                            let slot = manager.try_begin_turn(&agent, &workspace).await.unwrap();
                             manager
                                 .clone()
                                 .try_drain_queue(agent.clone(), workspace.clone())
                                 .await;
-                            tokio::time::timeout(fixture_wait(), async {
-                                while manager.is_busy(&agent)
-                                    || manager.services.has_ready_to_send(&agent)
-                                {
-                                    tokio::task::yield_now().await;
-                                }
-                            })
-                            .await
-                            .unwrap();
-                            manager.clone().try_drain_queue(agent, workspace).await;
+                            assert!(manager.services.has_ready_to_send(&agent));
+                            manager.release_slot(&agent, slot).await;
                         }
-                    })
-                    .await;
-                    assert_eq!(
-                        h.prompts().await.len(),
-                        usize::from(mode != "queue-drain-retired"),
-                        "{mode}"
-                    );
-                    assert_eq!(
-                        original
-                            .store
-                            .get_pr_monitor(&row.monitor().monitor_id)
-                            .await
-                            .unwrap()
-                            .pending_changes,
-                        row.monitor().pending_changes,
-                        "queue drain must not consume pending delivery"
-                    );
-                    h.finish().await;
-                    continue;
-                }
-                let entry_id = manager
-                    .services
-                    .agent_queues
-                    .lock()
-                    .unwrap()
-                    .get(&h.f.row.id)
-                    .unwrap()
-                    .first()
-                    .unwrap()
-                    .id
-                    .clone();
-                assert!(manager
-                    .services
-                    .take_queued_message_draining_gated(&h.f.row.id, &entry_id, None, None,)
-                    .is_err());
-                assert!(manager
-                    .services
-                    .take_queued_messages_draining_gated(&h.f.row.id, &[entry_id], None, true,)
-                    .is_err());
-                let (entry, draining) = manager
-                    .services
-                    .dequeue_message_draining(&h.f.row.id)
-                    .unwrap();
-                assert!(entry.to_value(0).is_null());
-                let encoded = serde_json::to_string(&entry).unwrap();
-                assert!(!encoded.contains("original queued wake"));
-                assert!(!encoded.contains("group/project"));
-                assert!(!format!("{entry:?}").contains("original queued wake"));
-                manager
-                    .services
-                    .publish_queue_processing(
-                        &h.f.row.id,
-                        &h.f.row.workspace_id,
-                        std::slice::from_ref(&entry),
-                    )
-                    .await;
-                let owner = entry.monitor_turn.as_ref().unwrap();
-                let prepared = owner.take().unwrap();
-                assert!(
-                    owner.take().is_none(),
-                    "queue clones cannot duplicate the original owner"
-                );
-                drop(draining);
-                if mode == "queued-retired" {
-                    h.origin().retire();
-                }
-                prepared
-            } else {
-                prepared
-            };
-            if mode == "stale-row" {
-                sqlx::query(
-                    "UPDATE pr_monitor SET last_error = 'intervening poll' WHERE monitor_id = ?",
-                )
-                .bind(&row.monitor().monitor_id.0)
-                .execute(original.store.write_pool())
-                .await
-                .unwrap();
-            }
-            let agent = h.f.row.id.clone();
-            let workspace = h.f.row.workspace_id.clone();
-            let result = h
-                .daemon(async move {
-                    let slot = manager.try_begin_turn(&agent, &workspace).await.unwrap();
-                    if mode == "lost-slot" {
-                        manager.release_slot(&agent, slot).await;
+                        manager
+                            .clone()
+                            .try_drain_queue(agent.clone(), workspace.clone())
+                            .await;
+                        tokio::time::timeout(fixture_wait(), async {
+                            while manager.is_busy(&agent)
+                                || manager.services.has_ready_to_send(&agent)
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        manager.clone().try_drain_queue(agent, workspace).await;
                     }
-                    let result = prepared.run(&manager, slot).await;
-                    manager.release_slot(&agent, slot).await;
-                    result
                 })
                 .await;
-            let accepted = matches!(
-                mode,
-                "accepted" | "queued" | "unsupported-read" | "tracked" | "tracked-ack-failure"
-            );
-            if mode == "tracked-ack-failure" {
-                assert!(result.is_err());
-                let record = original
-                    .review_monitor_deliveries
-                    .lock()
-                    .unwrap()
-                    .get(&row.monitor().monitor_id)
-                    .cloned()
-                    .unwrap();
-                assert!(!record.active());
-                assert!(record.transferred());
-                assert!(!record.acknowledged());
+                assert_eq!(
+                    h.prompts().await.len(),
+                    usize::from(mode != "queue-drain-retired"),
+                    "{mode}"
+                );
                 assert_eq!(
                     original
                         .store
@@ -7239,104 +7121,171 @@ mod normal_launch {
                         .await
                         .unwrap()
                         .pending_changes,
-                    row.monitor().pending_changes
+                    row.monitor().pending_changes,
+                    "queue drain must not consume pending delivery"
                 );
-                sqlx::query("DROP TRIGGER reject_ack")
-                    .execute(original.store.write_pool())
-                    .await
-                    .unwrap();
-                h.daemon(async move {
-                    assert!(record.acknowledge("2026-10-09T23:10:00Z").await.unwrap());
-                })
-                .await;
-                assert_eq!(
-                    h.prompts().await.len(),
-                    1,
-                    "retry acknowledgement without another prompt"
-                );
-            } else if accepted {
-                assert!(result.unwrap());
-            } else if mode == "stale-row" {
-                assert!(!result.unwrap());
-            } else {
-                assert!(result.is_err());
+                h.finish().await;
+                return;
             }
-            assert_eq!(h.prompts().await.len(), usize::from(accepted));
-            if accepted {
-                let prompts = h.prompts().await;
-                let params = prompts[0]["params"].clone();
-                let marker = &params["_meta"]["reviewMonitoringMessage"];
-                assert_eq!(
-                    marker["version"], 1,
-                    "committed monitor classification: {mode}"
-                );
-                let proof = original
+            let entry_id = manager
+                .services
+                .agent_queues
+                .lock()
+                .unwrap()
+                .get(&h.f.row.id)
+                .unwrap()
+                .first()
+                .unwrap()
+                .id
+                .clone();
+            assert!(manager
+                .services
+                .take_queued_message_draining_gated(&h.f.row.id, &entry_id, None, None,)
+                .is_err());
+            assert!(manager
+                .services
+                .take_queued_messages_draining_gated(&h.f.row.id, &[entry_id], None, true,)
+                .is_err());
+            let (entry, draining) = manager
+                .services
+                .dequeue_message_draining(&h.f.row.id)
+                .unwrap();
+            assert!(entry.to_value(0).is_null());
+            let encoded = serde_json::to_string(&entry).unwrap();
+            assert!(!encoded.contains("original queued wake"));
+            assert!(!encoded.contains("group/project"));
+            assert!(!format!("{entry:?}").contains("original queued wake"));
+            manager
+                .services
+                .publish_queue_processing(
+                    &h.f.row.id,
+                    &h.f.row.workspace_id,
+                    std::slice::from_ref(&entry),
+                )
+                .await;
+            let owner = entry.monitor_turn.as_ref().unwrap();
+            let prepared = owner.take().unwrap();
+            assert!(
+                owner.take().is_none(),
+                "queue clones cannot duplicate the original owner"
+            );
+            drop(draining);
+            if mode == "queued-retired" {
+                h.origin().retire();
+            }
+            prepared
+        } else {
+            prepared
+        };
+        if mode == "stale-row" {
+            sqlx::query(
+                "UPDATE pr_monitor SET last_error = 'intervening poll' WHERE monitor_id = ?",
+            )
+            .bind(&row.monitor().monitor_id.0)
+            .execute(original.store.write_pool())
+            .await
+            .unwrap();
+        }
+        let agent = h.f.row.id.clone();
+        let workspace = h.f.row.workspace_id.clone();
+        let result = h
+            .daemon(async move {
+                let slot = manager.try_begin_turn(&agent, &workspace).await.unwrap();
+                if mode == "lost-slot" {
+                    manager.release_slot(&agent, slot).await;
+                }
+                let result = prepared.run(&manager, slot).await;
+                manager.release_slot(&agent, slot).await;
+                result
+            })
+            .await;
+        let accepted = matches!(
+            mode,
+            "accepted" | "queued" | "unsupported-read" | "tracked" | "tracked-ack-failure"
+        );
+        if mode == "tracked-ack-failure" {
+            assert!(result.is_err());
+            let record = original
+                .review_monitor_deliveries
+                .lock()
+                .unwrap()
+                .get(&row.monitor().monitor_id)
+                .cloned()
+                .unwrap();
+            assert!(!record.active());
+            assert!(record.transferred());
+            assert!(!record.acknowledged());
+            assert_eq!(
+                original
                     .store
-                    .get_monitor_message_provenance(
-                        &h.f.row.id,
-                        marker["messageId"].as_str().unwrap(),
-                    )
+                    .get_pr_monitor(&row.monitor().monitor_id)
                     .await
                     .unwrap()
-                    .unwrap();
-                let digest = proof.envelope_sha256.iter().fold(
-                    String::with_capacity(64),
-                    |mut output, byte| {
+                    .pending_changes,
+                row.monitor().pending_changes
+            );
+            sqlx::query("DROP TRIGGER reject_ack")
+                .execute(original.store.write_pool())
+                .await
+                .unwrap();
+            h.daemon(async move {
+                assert!(record.acknowledge("2026-10-09T23:10:00Z").await.unwrap());
+            })
+            .await;
+            assert_eq!(
+                h.prompts().await.len(),
+                1,
+                "retry acknowledgement without another prompt"
+            );
+        } else if accepted {
+            assert!(result.unwrap());
+        } else if mode == "stale-row" {
+            assert!(!result.unwrap());
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(h.prompts().await.len(), usize::from(accepted));
+        if accepted {
+            let prompts = h.prompts().await;
+            let params = prompts[0]["params"].clone();
+            let marker = &params["_meta"]["reviewMonitoringMessage"];
+            assert_eq!(
+                marker["version"], 1,
+                "committed monitor classification: {mode}"
+            );
+            let proof = original
+                .store
+                .get_monitor_message_provenance(&h.f.row.id, marker["messageId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let digest =
+                proof
+                    .envelope_sha256
+                    .iter()
+                    .fold(String::with_capacity(64), |mut output, byte| {
                         std::fmt::Write::write_fmt(&mut output, format_args!("{byte:02x}"))
                             .expect("writing to a String cannot fail");
                         output
-                    },
-                );
-                let mut plain = params.clone();
-                plain.as_object_mut().unwrap().remove("_meta");
-                assert_eq!(
-                    params,
-                    intent_acp::review_monitoring::payload::classify_prompt(
-                        plain,
-                        &proof.message.id,
-                        &digest,
-                    )
-                    .unwrap(),
-                    "actual ACP payload must match exact committed evidence"
-                );
-                assert_eq!(proof.workspace_id, h.f.row.workspace_id);
-            }
-            if mode == "unsupported-read" {
-                let conversation =
-                    h.f.manager
-                        .services
-                        .agent_get_conversation_op(
-                            h.f.row.id.clone(),
-                            None,
-                            Some(h.f.row.workspace_id.clone()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            false,
-                        )
-                        .await
-                        .unwrap();
-                assert!(
-                    !conversation.to_string().contains("original queued wake"),
-                    "unsupported transcript reader must withhold the whole private wake"
-                );
-                let index =
-                    h.f.manager
-                        .services
-                        .agent_list_user_messages_op(
-                            h.f.row.id.clone(),
-                            Some(h.f.row.workspace_id.clone()),
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                assert!(
-                    !index.to_string().contains("original queued wake"),
-                    "unsupported message index must withhold private preview and metadata"
-                );
-                let services = &h.f.manager.services;
-                let slim = services
+                    });
+            let mut plain = params.clone();
+            plain.as_object_mut().unwrap().remove("_meta");
+            assert_eq!(
+                params,
+                intent_acp::review_monitoring::payload::classify_prompt(
+                    plain,
+                    &proof.message.id,
+                    &digest,
+                )
+                .unwrap(),
+                "actual ACP payload must match exact committed evidence"
+            );
+            assert_eq!(proof.workspace_id, h.f.row.workspace_id);
+        }
+        if mode == "unsupported-read" {
+            let conversation =
+                h.f.manager
+                    .services
                     .agent_get_conversation_op(
                         h.f.row.id.clone(),
                         None,
@@ -7344,89 +7293,151 @@ mod normal_launch {
                         None,
                         None,
                         None,
-                        Some(intent_core::ConversationProjection::Slim),
+                        None,
                         false,
                     )
                     .await
                     .unwrap();
-                let history = services
-                    .agent_history_batch_op(h.f.row.id.clone(), None, 100)
-                    .await
-                    .unwrap();
-                let summary = serde_json::to_value(
-                    services
-                        .agent_get_op(h.f.row.id.clone(), Some(h.f.row.workspace_id.clone()))
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
-                for value in [&conversation, &index, &slim, &history, &summary] {
-                    let encoded = value.to_string();
-                    assert!(!encoded.contains("original queued wake"));
-                    assert!(!encoded.contains("pr_monitor_wake"));
-                }
-                let stored = original
-                    .store
-                    .get_agent_messages_page(&h.f.row.id, 0, 100)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .find(|message| {
-                        message
-                            .metadata
-                            .as_ref()
-                            .is_some_and(|m| m["type"] == "pr_monitor_wake")
-                    })
-                    .unwrap();
-                assert!(stored.content.to_string().contains("original queued wake"));
-                assert!(services
-                    .agent_get_message_block_op(
+            assert!(
+                !conversation.to_string().contains("original queued wake"),
+                "unsupported transcript reader must withhold the whole private wake"
+            );
+            let index =
+                h.f.manager
+                    .services
+                    .agent_list_user_messages_op(
                         h.f.row.id.clone(),
-                        stored.id.clone(),
-                        format!("{}:0", stored.id),
                         Some(h.f.row.workspace_id.clone()),
+                        None,
                     )
                     .await
-                    .is_err());
-                let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event")
-                    .fetch_one(original.store.read_pool())
-                    .await
                     .unwrap();
-                services
-                    .publish_agent_message_events(&h.f.row.workspace_id, &h.f.row.id, &stored, None)
-                    .await;
-                let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event")
-                    .fetch_one(original.store.read_pool())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    before, after,
-                    "generic message events must withhold the whole envelope"
-                );
-            }
-            let pending = original
-                .store
-                .get_pr_monitor(&row.monitor().monitor_id)
+            assert!(
+                !index.to_string().contains("original queued wake"),
+                "unsupported message index must withhold private preview and metadata"
+            );
+            let services = &h.f.manager.services;
+            let slim = services
+                .agent_get_conversation_op(
+                    h.f.row.id.clone(),
+                    None,
+                    Some(h.f.row.workspace_id.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(intent_core::ConversationProjection::Slim),
+                    false,
+                )
                 .await
                 .unwrap();
-            if mode.starts_with("tracked") {
-                assert!(pending.pending_changes.is_empty());
-                assert_eq!(pending.baseline_snapshot, pending.last_snapshot);
-                if mode == "tracked" {
-                    assert!(!original
-                        .review_monitor_deliveries
-                        .lock()
-                        .unwrap()
-                        .contains_key(&row.monitor().monitor_id));
-                }
-            } else {
-                assert_eq!(
-                    pending.pending_changes,
-                    row.monitor().pending_changes,
-                    "transfer alone is not acknowledgement"
-                );
+            let history = services
+                .agent_history_batch_op(h.f.row.id.clone(), None, 100)
+                .await
+                .unwrap();
+            let summary = serde_json::to_value(
+                services
+                    .agent_get_op(h.f.row.id.clone(), Some(h.f.row.workspace_id.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for value in [&conversation, &index, &slim, &history, &summary] {
+                let encoded = value.to_string();
+                assert!(!encoded.contains("original queued wake"));
+                assert!(!encoded.contains("pr_monitor_wake"));
             }
-            h.finish().await;
+            let stored = original
+                .store
+                .get_agent_messages_page(&h.f.row.id, 0, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|m| m["type"] == "pr_monitor_wake")
+                })
+                .unwrap();
+            assert!(stored.content.to_string().contains("original queued wake"));
+            assert!(services
+                .agent_get_message_block_op(
+                    h.f.row.id.clone(),
+                    stored.id.clone(),
+                    format!("{}:0", stored.id),
+                    Some(h.f.row.workspace_id.clone()),
+                )
+                .await
+                .is_err());
+            let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event")
+                .fetch_one(original.store.read_pool())
+                .await
+                .unwrap();
+            services
+                .publish_agent_message_events(&h.f.row.workspace_id, &h.f.row.id, &stored, None)
+                .await;
+            let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event")
+                .fetch_one(original.store.read_pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "generic message events must withhold the whole envelope"
+            );
+        }
+        let pending = original
+            .store
+            .get_pr_monitor(&row.monitor().monitor_id)
+            .await
+            .unwrap();
+        if mode.starts_with("tracked") {
+            assert!(pending.pending_changes.is_empty());
+            assert_eq!(pending.baseline_snapshot, pending.last_snapshot);
+            if mode == "tracked" {
+                assert!(!original
+                    .review_monitor_deliveries
+                    .lock()
+                    .unwrap()
+                    .contains_key(&row.monitor().monitor_id));
+            }
+        } else {
+            assert_eq!(
+                pending.pending_changes,
+                row.monitor().pending_changes,
+                "transfer alone is not acknowledgement"
+            );
+        }
+        h.finish().await;
+    }
+
+    // One test per mode: each case builds its own harness, and running them
+    // in one loop exceeded the default slow-timeout on loaded hosts.
+    mod normal_callback_monitor_prepared_turn_uses_original_runtime {
+        use super::monitor_prepared_turn_uses_original_runtime;
+
+        macro_rules! cases {
+            ($($name:ident => $mode:literal,)+) => {$(
+                #[intent_test_macros::daemon_test]
+                async fn $name() {
+                    monitor_prepared_turn_uses_original_runtime($mode).await;
+                }
+            )+};
+        }
+
+        cases! {
+            accepted => "accepted",
+            retired => "retired",
+            stale_row => "stale-row",
+            lost_slot => "lost-slot",
+            queued => "queued",
+            queued_retired => "queued-retired",
+            refused_queue => "refused-queue",
+            queue_idle => "queue-idle",
+            queue_busy => "queue-busy",
+            queue_drain_retired => "queue-drain-retired",
+            unsupported_read => "unsupported-read",
+            tracked => "tracked",
+            tracked_ack_failure => "tracked-ack-failure",
         }
     }
 
@@ -7877,190 +7888,146 @@ mod normal_launch {
         }
     }
 
-    #[intent_test_macros::daemon_test]
-    async fn normal_callback_monitor_prompt_requires_original_live_destination() {
-        for retire_at in [
-            "never",
-            "before-prepare",
-            "before-send",
-            "wrong-session",
-            "wrong-connection",
-            "wrong-content",
-            "wrong-attachment",
-            "wrong-metadata",
-            "stream",
-            "stream-retired",
-            "stream-wrong-content",
-            "stream-wrong-attachment",
-            "stream-wrong-metadata",
-            "acknowledge",
-            "acknowledge-retired",
-            "acknowledge-stale",
-            "message-replaced",
-            "message-recreated",
-            "message-payload",
-        ] {
-            let h = NormalHarness::new(None, json!({})).await;
-            h.auth
-                .registry
-                .apply(&[
-                    ("workspaceApi.toonOutput".into(), json!(false)),
-                    ("workspaceApi.maxOutputChars".into(), json!(0)),
-                ])
-                .unwrap();
-            let mut started = h.start().await.unwrap();
-            let registered = h
-                .call(0, &h.confirmed(0).await, "return await ws.mr.monitor(4);")
-                .await;
-            let authorities = h
-                .original
-                .review_monitor_authorities
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            assert_eq!(authorities.len(), 1, "{registered}");
-            let authority = authorities[0].clone();
-            let original = authority.original_services().unwrap();
-            if retire_at.starts_with("acknowledge") || retire_at.contains("wrong-") {
-                sqlx::query("UPDATE pr_monitor SET pending_changes = '[\"new commits pushed\"]', baseline_snapshot = '{\"fixture\":\"older baseline\"}' WHERE agent_id = ?")
-                    .bind(&h.f.row.id.0).execute(original.store.write_pool()).await.unwrap();
-            }
-            let row = original
-                .store
-                .load_active_qualified_pr_monitors()
-                .await
-                .unwrap()
-                .pop()
-                .unwrap();
-            let metadata = serde_json::from_value(json!({
-                "type":"pr_monitor_wake", "monitorId":row.monitor().monitor_id,
-                "repo":authority.binding.resource.repository.project_path,
-                "prNumber":authority.binding.resource.number,
-                "reason":"changes", "resource":authority.binding.resource,
-            }))
+    async fn monitor_prompt_requires_original_live_destination(retire_at: &'static str) {
+        let h = NormalHarness::new(None, json!({})).await;
+        h.auth
+            .registry
+            .apply(&[
+                ("workspaceApi.toonOutput".into(), json!(false)),
+                ("workspaceApi.maxOutputChars".into(), json!(0)),
+            ])
             .unwrap();
-            let observation = h
-                .daemon({
-                    let authority = authority.clone();
-                    async move {
-                        authority
-                            .run_poll(Box::pin(authority.read_poll(&original)))
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    }
-                })
-                .await;
-            if retire_at == "before-prepare" {
-                h.origin().retire();
-            }
-            let origin = h.origin();
-            let services = h.original.clone();
-            let agent_id = h.f.row.id.clone();
-            let workspace_id = h.f.row.workspace_id.clone();
-            let outcome = h
-                .daemon(async move {
-                    let prepared = started
-                        .turn
-                        .prompt
-                        .as_mut()
+        let mut started = h.start().await.unwrap();
+        let registered = h
+            .call(0, &h.confirmed(0).await, "return await ws.mr.monitor(4);")
+            .await;
+        let authorities = h
+            .original
+            .review_monitor_authorities
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(authorities.len(), 1, "{registered}");
+        let authority = authorities[0].clone();
+        let original = authority.original_services().unwrap();
+        if retire_at.starts_with("acknowledge") || retire_at.contains("wrong-") {
+            sqlx::query("UPDATE pr_monitor SET pending_changes = '[\"new commits pushed\"]', baseline_snapshot = '{\"fixture\":\"older baseline\"}' WHERE agent_id = ?")
+                .bind(&h.f.row.id.0).execute(original.store.write_pool()).await.unwrap();
+        }
+        let row = original
+            .store
+            .load_active_qualified_pr_monitors()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let metadata = serde_json::from_value(json!({
+            "type":"pr_monitor_wake", "monitorId":row.monitor().monitor_id,
+            "repo":authority.binding.resource.repository.project_path,
+            "prNumber":authority.binding.resource.number,
+            "reason":"changes", "resource":authority.binding.resource,
+        }))
+        .unwrap();
+        let observation = h
+            .daemon({
+                let authority = authority.clone();
+                async move {
+                    authority
+                        .run_poll(Box::pin(authority.read_poll(&original)))
+                        .await
                         .unwrap()
-                        .prepare_monitor(authority, observation.delivery, "private monitor wake".into())
-                        .await;
-                    if retire_at == "before-prepare" {
-                        assert!(prepared.is_err());
-                        return false;
-                    }
-                    let prepared = prepared.unwrap();
-                    let completion = prepared.completion(&row);
-                    if retire_at.starts_with("acknowledge") {
-                        assert!(completion.acknowledge("2026-10-09T23:00:00Z").await.is_err(),
-                            "persistence or preparation cannot acknowledge a transfer");
-                    }
-                    let message = prepared.commit_message(&row, "original-wake", &metadata, "2026-10-09T22:00:00Z").await.unwrap().unwrap();
-                    prepared.bind_committed(&message).await.unwrap();
-                    if retire_at.starts_with("message-") {
-                        let saved = services.store.get_agent_message_by_id(&agent_id, "original-wake").await.unwrap().unwrap();
-                        if retire_at == "message-payload" {
-                            let block = json!({"type":"tool_result","tool_use_id":"modified-monitor","output":"x".repeat(32_000)});
-                            assert!(services.store.prestage_agent_message_payload(&agent_id, &saved.id, 0, &block).await.unwrap().is_some());
-                        } else {
-                            services.store.replace_agent_messages(&agent_id, &[]).await.unwrap();
-                            if retire_at == "message-recreated" {
-                                services.store.append_agent_message_with_id(
-                                    &agent_id, &saved.id, &saved.role, &saved.content,
-                                    saved.metadata.as_ref(), &saved.created_at,
-                                ).await.unwrap();
-                            }
-                        }
-                    }
-                    if matches!(retire_at, "before-send" | "stream-retired") {
-                        origin.retire();
-                    }
-                    let (input, mut foreign_reader) = tokio::io::duplex(4096);
-                    let (_foreign_writer, output) = tokio::io::duplex(4096);
-                    let foreign = Connection::new(input, output, None, intent_acp::ConnectionHooks::default());
-                    let destination: &Connection = if retire_at == "wrong-connection" {
-                        &foreign
+                        .unwrap()
+                }
+            })
+            .await;
+        if retire_at == "before-prepare" {
+            h.origin().retire();
+        }
+        let origin = h.origin();
+        let services = h.original.clone();
+        let agent_id = h.f.row.id.clone();
+        let workspace_id = h.f.row.workspace_id.clone();
+        let outcome = h
+            .daemon(async move {
+                let prepared = started
+                    .turn
+                    .prompt
+                    .as_mut()
+                    .unwrap()
+                    .prepare_monitor(authority, observation.delivery, "private monitor wake".into())
+                    .await;
+                if retire_at == "before-prepare" {
+                    assert!(prepared.is_err());
+                    return false;
+                }
+                let prepared = prepared.unwrap();
+                let completion = prepared.completion(&row);
+                if retire_at.starts_with("acknowledge") {
+                    assert!(completion.acknowledge("2026-10-09T23:00:00Z").await.is_err(),
+                        "persistence or preparation cannot acknowledge a transfer");
+                }
+                let message = prepared.commit_message(&row, "original-wake", &metadata, "2026-10-09T22:00:00Z").await.unwrap().unwrap();
+                prepared.bind_committed(&message).await.unwrap();
+                if retire_at.starts_with("message-") {
+                    let saved = services.store.get_agent_message_by_id(&agent_id, "original-wake").await.unwrap().unwrap();
+                    if retire_at == "message-payload" {
+                        let block = json!({"type":"tool_result","tool_use_id":"modified-monitor","output":"x".repeat(32_000)});
+                        assert!(services.store.prestage_agent_message_payload(&agent_id, &saved.id, 0, &block).await.unwrap().is_some());
                     } else {
-                        started.turn.connection.as_ref().unwrap()
-                    };
-                    let mut blocks = json!([{"type":"text","text": if matches!(retire_at, "wrong-content" | "stream-wrong-content") {"substituted private wake"} else {"private monitor wake"}}]);
-                    if retire_at.ends_with("wrong-attachment") {
-                        blocks.as_array_mut().unwrap().push(json!({
-                            "type":"resource", "resource":{
-                                "uri":"file:///private-monitor-attachment.txt",
-                                "mimeType":"text/plain", "text":"substituted attachment"
-                            }
-                        }));
-                    }
-                    if retire_at.ends_with("wrong-metadata") {
-                        blocks[0]["_meta"] = json!({"monitorPayload":"substituted metadata"});
-                    }
-                    let prompt = serde_json::from_value(blocks.clone()).unwrap();
-                    assert_eq!(serde_json::to_value(&prompt).unwrap(), blocks,
-                        "mutation must survive ACP serialization: {retire_at}");
-                    if retire_at.starts_with("stream") {
-                        let mut notifications = started.turn.notifications.lock().await;
-                        let result = services.run_prompt_turn_captured(
-                            started.turn.runtime.as_ref(),
-                            &mut notifications,
-                            &agent_id,
-                            &workspace_id,
-                            &started.session_id,
-                            crate::provider_images::PreparedPrompt::new(prompt).await.unwrap(),
-                            None,
-                            Some(crate::agent_session::LocalPromptInput {
-                                connection: destination,
-                                captured: None,
-                                required: Some(Box::new(prepared)),
-                            }),
-                            false,
-                        ).await.is_ok();
-                        if retire_at.contains("wrong-") {
-                            assert!(!result);
-                            assert!(completion.acknowledge("2026-10-09T23:00:01Z").await.is_err());
-                            let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
-                            assert_eq!(saved.pending_changes, row.monitor().pending_changes);
-                            assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
+                        services.store.replace_agent_messages(&agent_id, &[]).await.unwrap();
+                        if retire_at == "message-recreated" {
+                            services.store.append_agent_message_with_id(
+                                &agent_id, &saved.id, &saved.role, &saved.content,
+                                saved.metadata.as_ref(), &saved.created_at,
+                            ).await.unwrap();
                         }
-                        return result;
                     }
-                    let result = intent_acp::session::prompt_with_required_admission(
-                        destination,
-                        if retire_at == "wrong-session" {
-                            "another-session"
-                        } else {
-                            &started.session_id
-                        },
-                        prompt,
-                        &intent_acp::session::ActivityTracker::new(),
-                        Box::new(prepared),
-                    )
-                    .await
-                    .is_ok();
+                }
+                if matches!(retire_at, "before-send" | "stream-retired") {
+                    origin.retire();
+                }
+                let (input, mut foreign_reader) = tokio::io::duplex(4096);
+                let (_foreign_writer, output) = tokio::io::duplex(4096);
+                let foreign = Connection::new(input, output, None, intent_acp::ConnectionHooks::default());
+                let destination: &Connection = if retire_at == "wrong-connection" {
+                    &foreign
+                } else {
+                    started.turn.connection.as_ref().unwrap()
+                };
+                let mut blocks = json!([{"type":"text","text": if matches!(retire_at, "wrong-content" | "stream-wrong-content") {"substituted private wake"} else {"private monitor wake"}}]);
+                if retire_at.ends_with("wrong-attachment") {
+                    blocks.as_array_mut().unwrap().push(json!({
+                        "type":"resource", "resource":{
+                            "uri":"file:///private-monitor-attachment.txt",
+                            "mimeType":"text/plain", "text":"substituted attachment"
+                        }
+                    }));
+                }
+                if retire_at.ends_with("wrong-metadata") {
+                    blocks[0]["_meta"] = json!({"monitorPayload":"substituted metadata"});
+                }
+                let prompt = serde_json::from_value(blocks.clone()).unwrap();
+                assert_eq!(serde_json::to_value(&prompt).unwrap(), blocks,
+                    "mutation must survive ACP serialization: {retire_at}");
+                if retire_at.starts_with("stream") {
+                    let mut notifications = started.turn.notifications.lock().await;
+                    let result = services.run_prompt_turn_captured(
+                        started.turn.runtime.as_ref(),
+                        &mut notifications,
+                        &agent_id,
+                        &workspace_id,
+                        &started.session_id,
+                        crate::provider_images::PreparedPrompt::new(prompt).await.unwrap(),
+                        None,
+                        Some(crate::agent_session::LocalPromptInput {
+                            connection: destination,
+                            captured: None,
+                            required: Some(Box::new(prepared)),
+                        }),
+                        false,
+                    ).await.is_ok();
                     if retire_at.contains("wrong-") {
                         assert!(!result);
                         assert!(completion.acknowledge("2026-10-09T23:00:01Z").await.is_err());
@@ -8068,72 +8035,130 @@ mod normal_launch {
                         assert_eq!(saved.pending_changes, row.monitor().pending_changes);
                         assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
                     }
-                    if retire_at.starts_with("acknowledge") {
-                        assert!(result);
-                        if retire_at == "acknowledge-retired" { origin.retire(); }
-                        if retire_at == "acknowledge-stale" {
-                            sqlx::query("UPDATE pr_monitor SET last_error = 'intervening poll' WHERE monitor_id = ?")
-                                .bind(&row.monitor().monitor_id.0).execute(services.store.write_pool()).await.unwrap();
-                        }
-                        let acknowledged = completion.acknowledge("2026-10-09T23:00:01Z").await;
-                        if retire_at == "acknowledge" {
-                            assert!(acknowledged.unwrap());
-                            assert!(!completion.acknowledge("2026-10-09T23:00:02Z").await.unwrap());
-                        } else if retire_at == "acknowledge-stale" {
-                            assert!(!acknowledged.unwrap());
-                        } else {
-                            assert!(acknowledged.is_err());
-                        }
-                        let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
-                        if retire_at == "acknowledge" {
-                            assert!(saved.pending_changes.is_empty());
-                            assert_eq!(saved.baseline_snapshot, saved.last_snapshot);
-                        } else {
-                            assert_eq!(saved.pending_changes, row.monitor().pending_changes);
-                            assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
-                        }
-                    }
-                    if retire_at == "wrong-connection" {
-                        let mut byte = [0];
-                        assert!(
-                            tokio::time::timeout(
-                                intentd_test_support::test_timeout(std::time::Duration::from_millis(30)),
-                                tokio::io::AsyncReadExt::read(&mut foreign_reader, &mut byte)
-                            )
-                            .await
-                            .is_err(),
-                            "private frame reached another connection"
-                        );
-                    }
-                    result
-                })
-                .await;
-            let accepted =
-                matches!(retire_at, "never" | "stream") || retire_at.starts_with("acknowledge");
-            assert_eq!(outcome, accepted, "{retire_at}");
-            let frames = h.prompts().await;
-            assert_eq!(
-                frames.len(),
-                usize::from(accepted),
-                "no substituted frame or base fallback: {retire_at}"
-            );
-            if retire_at.contains("wrong-") {
-                let count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM agent_message WHERE agent_id = ? AND role = 'user'",
+                    return result;
+                }
+                let result = intent_acp::session::prompt_with_required_admission(
+                    destination,
+                    if retire_at == "wrong-session" {
+                        "another-session"
+                    } else {
+                        &started.session_id
+                    },
+                    prompt,
+                    &intent_acp::session::ActivityTracker::new(),
+                    Box::new(prepared),
                 )
-                .bind(&h.f.row.id.0)
-                .fetch_one(h.original.store.read_pool())
                 .await
-                .unwrap();
-                assert_eq!(
-                    count, 1,
-                    "rejection must not duplicate the persisted wake: {retire_at}"
-                );
-            }
-            if accepted {
-                assert!(frames[0].to_string().contains("private monitor wake"));
-            }
-            h.finish().await;
+                .is_ok();
+                if retire_at.contains("wrong-") {
+                    assert!(!result);
+                    assert!(completion.acknowledge("2026-10-09T23:00:01Z").await.is_err());
+                    let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
+                    assert_eq!(saved.pending_changes, row.monitor().pending_changes);
+                    assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
+                }
+                if retire_at.starts_with("acknowledge") {
+                    assert!(result);
+                    if retire_at == "acknowledge-retired" { origin.retire(); }
+                    if retire_at == "acknowledge-stale" {
+                        sqlx::query("UPDATE pr_monitor SET last_error = 'intervening poll' WHERE monitor_id = ?")
+                            .bind(&row.monitor().monitor_id.0).execute(services.store.write_pool()).await.unwrap();
+                    }
+                    let acknowledged = completion.acknowledge("2026-10-09T23:00:01Z").await;
+                    if retire_at == "acknowledge" {
+                        assert!(acknowledged.unwrap());
+                        assert!(!completion.acknowledge("2026-10-09T23:00:02Z").await.unwrap());
+                    } else if retire_at == "acknowledge-stale" {
+                        assert!(!acknowledged.unwrap());
+                    } else {
+                        assert!(acknowledged.is_err());
+                    }
+                    let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
+                    if retire_at == "acknowledge" {
+                        assert!(saved.pending_changes.is_empty());
+                        assert_eq!(saved.baseline_snapshot, saved.last_snapshot);
+                    } else {
+                        assert_eq!(saved.pending_changes, row.monitor().pending_changes);
+                        assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
+                    }
+                }
+                if retire_at == "wrong-connection" {
+                    let mut byte = [0];
+                    assert!(
+                        tokio::time::timeout(
+                            intentd_test_support::test_timeout(std::time::Duration::from_millis(30)),
+                            tokio::io::AsyncReadExt::read(&mut foreign_reader, &mut byte)
+                        )
+                        .await
+                        .is_err(),
+                        "private frame reached another connection"
+                    );
+                }
+                result
+            })
+            .await;
+        let accepted =
+            matches!(retire_at, "never" | "stream") || retire_at.starts_with("acknowledge");
+        assert_eq!(outcome, accepted, "{retire_at}");
+        let frames = h.prompts().await;
+        assert_eq!(
+            frames.len(),
+            usize::from(accepted),
+            "no substituted frame or base fallback: {retire_at}"
+        );
+        if retire_at.contains("wrong-") {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_message WHERE agent_id = ? AND role = 'user'",
+            )
+            .bind(&h.f.row.id.0)
+            .fetch_one(h.original.store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 1,
+                "rejection must not duplicate the persisted wake: {retire_at}"
+            );
+        }
+        if accepted {
+            assert!(frames[0].to_string().contains("private monitor wake"));
+        }
+        h.finish().await;
+    }
+
+    // One test per mode: each case builds its own harness, and running them
+    // in one loop exceeded the default slow-timeout on loaded hosts.
+    mod normal_callback_monitor_prompt_requires_original_live_destination {
+        use super::monitor_prompt_requires_original_live_destination;
+
+        macro_rules! cases {
+            ($($name:ident => $mode:literal,)+) => {$(
+                #[intent_test_macros::daemon_test]
+                async fn $name() {
+                    monitor_prompt_requires_original_live_destination($mode).await;
+                }
+            )+};
+        }
+
+        cases! {
+            never => "never",
+            before_prepare => "before-prepare",
+            before_send => "before-send",
+            wrong_session => "wrong-session",
+            wrong_connection => "wrong-connection",
+            wrong_content => "wrong-content",
+            wrong_attachment => "wrong-attachment",
+            wrong_metadata => "wrong-metadata",
+            stream => "stream",
+            stream_retired => "stream-retired",
+            stream_wrong_content => "stream-wrong-content",
+            stream_wrong_attachment => "stream-wrong-attachment",
+            stream_wrong_metadata => "stream-wrong-metadata",
+            acknowledge => "acknowledge",
+            acknowledge_retired => "acknowledge-retired",
+            acknowledge_stale => "acknowledge-stale",
+            message_replaced => "message-replaced",
+            message_recreated => "message-recreated",
+            message_payload => "message-payload",
         }
     }
     use crate::agent_manager::{
