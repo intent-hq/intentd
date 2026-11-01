@@ -136,6 +136,14 @@ impl WorkspaceApi for FakeApi {
             .unwrap_or_else(WorkspaceSetupStatus::unknown)
     }
 
+    fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
+        let plain = matches!(
+            *self.workspace_variant.lock().unwrap(),
+            WorkspaceVariant::PlainFolder
+        );
+        Box::pin(async move { plain })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let variant = *self.workspace_variant.lock().unwrap();
         let override_sm = self.status_message_state.lock().unwrap().clone();

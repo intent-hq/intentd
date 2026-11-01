@@ -553,19 +553,15 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Whether `workspace_id` is a plain-folder workspace, read from the
-/// persisted `Workspace.plainFolder` flag (§5.1). A failed lookup counts as
-/// not plain, so git workspaces keep their surface; the Assistant workspace
-/// is never a plain folder.
+/// Whether `workspace_id` is a plain-folder workspace (§5.1), via the
+/// dedicated `WorkspaceApi::is_plain_folder_workspace` read. A failed lookup
+/// counts as not plain, so git workspaces keep their surface; the Assistant
+/// workspace is never a plain folder.
 pub(crate) async fn is_plain_folder(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
 ) -> bool {
-    !workspace_id.is_chief()
-        && api
-            .get_workspace(workspace_id.clone())
-            .await
-            .is_ok_and(|w| w.plain_folder)
+    !workspace_id.is_chief() && api.is_plain_folder_workspace(workspace_id.clone()).await
 }
 
 /// Convert a [`intent_core::Error`] into the JS-visible error text used

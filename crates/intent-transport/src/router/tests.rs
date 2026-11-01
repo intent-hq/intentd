@@ -175,6 +175,9 @@ impl WorkspaceApi for FakeApi {
             Ok(ws_with(&id))
         })
     }
+    fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { id.as_str() == "ws-plain" })
+    }
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             if id.as_str() == "missing" {

@@ -753,6 +753,17 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Whether `workspace_id` is a plain-folder workspace (PROTOCOL §5.1
+    /// "Plain-folder workspaces"), read from the persisted `plainFolder`
+    /// flag only. Gates the git and forge surfaces (the `ws.git.*`,
+    /// `ws.pr.*`, `ws.mr.*` and `ws.workspace.proposeSibling` bindings and
+    /// the git/accept-changes RPCs). One cheap store read; the default
+    /// (non-store impls) and a failed read report `false`.
+    fn is_plain_folder_workspace(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, bool> {
+        let _ = workspace_id;
+        Box::pin(async { false })
+    }
+
     /// Retire a workspace (PROTOCOL §5.1 `workspace.retire`): allowed from
     /// Active or Archived. An Active workspace gets the archive teardown
     /// first (interrupt turns, cancel hooks / PR monitors, detach guests);

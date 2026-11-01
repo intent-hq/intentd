@@ -63,16 +63,17 @@ pub(crate) async fn check(
     else {
         return Ok(());
     };
-    match api.get_workspace(workspace_id).await {
-        Ok(workspace) if workspace.plain_folder => Err(Error::PlainFolderUnsupported { operation }),
-        _ => Ok(()),
+    if api.is_plain_folder_workspace(workspace_id).await {
+        Err(Error::PlainFolderUnsupported { operation })
+    } else {
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{BoxFuture, Result, Workspace};
+    use intent_core::BoxFuture;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -98,23 +99,9 @@ mod tests {
     }
 
     impl WorkspaceApi for Api {
-        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                match id.as_str() {
-                    "ws-plain" => Ok(Workspace {
-                        id,
-                        plain_folder: true,
-                        ..Default::default()
-                    }),
-                    "ws-git" => Ok(Workspace {
-                        id,
-                        branch: "main".into(),
-                        ..Default::default()
-                    }),
-                    other => Err(Error::NotFound(format!("workspace {other}"))),
-                }
-            })
+            Box::pin(async move { id.as_str() == "ws-plain" })
         }
     }
 
@@ -147,7 +134,7 @@ mod tests {
         let api = Api::default();
         for method in PLAIN_FOLDER_GATED_METHODS {
             check(&api, method, &params("ws-git")).await.unwrap();
-            // A missing workspace fails open: the handler reports it.
+            // A missing workspace reads as not plain: the handler reports it.
             check(&api, method, &params("ws-missing")).await.unwrap();
             check(&api, method, &Map::new()).await.unwrap();
         }
