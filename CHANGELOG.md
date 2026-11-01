@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.98] - 2026-11-01
+
+### 🚀 Features
+
+- Plain-folder workspaces — persisted field and create path ([#2883](https://github.com/intent-hq/intentd/pull/2883))
+
+
 ## [0.11.97] - 2026-11-01
 
 ### 🐛 Bug Fixes
