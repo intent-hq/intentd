@@ -51,6 +51,8 @@ intent-js = { path = "../intent-js", version = "0.11.98", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+# The executor names a deep data dir's git socket by a hash.
+sha2 = "0.11"
 
 [features]
 default = []
@@ -178,7 +180,6 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-sha2 = "0.11"
 # `e2e_wss_agent_lifecycle.rs::terminal_create_env_over_wss` decodes base64
 # `terminal:data` chunks to prove the env overlay reached the child (§5.13).
 base64 = { workspace = true }

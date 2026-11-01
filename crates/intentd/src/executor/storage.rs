@@ -73,7 +73,7 @@ pub(super) fn git_socket_path(
         dir.display()
     );
     ensure!(
-        metadata.mode() & 0o077 == 0,
+        metadata.mode().trailing_zeros() >= 6,
         "socket directory {} must not be accessible to group or others (chmod 700)",
         dir.display()
     );
@@ -82,7 +82,11 @@ pub(super) fn git_socket_path(
     hasher.update([0]);
     hasher.update(credential.as_bytes());
     let digest = hasher.finalize();
-    let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let name = digest[..8].iter().fold(String::new(), |mut name, b| {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{b:02x}");
+        name
+    });
     let socket = dir.join(format!("{name}.sock"));
     ensure!(
         socket.as_os_str().len() <= MAX_SOCKET_PATH,
