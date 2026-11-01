@@ -954,3 +954,150 @@ async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
         .unwrap()
         .is_empty());
 }
+
+/// A backend that placed `agent` on `machine` and then restarted: the agent's
+/// record and its live lease persist, the machine still runs the agent, and
+/// no connector to the machine exists yet (startup starts none).
+async fn restarted_with_a_surviving_agent(backend: &Backend, machine: &mut Machine) -> AgentId {
+    let node = backend.expose(machine).await;
+    let lease_id = node.status().lease_id;
+    let agent = AgentId::new();
+    let now = intent_core::now_iso();
+    backend
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: workspace(),
+            title: "Remote".into(),
+            branch: "main".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+        .bind(agent.as_str())
+        .bind(workspace().as_str())
+        .bind(&now)
+        .bind(&now)
+        .execute(backend.store().write_pool())
+        .await
+        .unwrap();
+    backend
+        .store()
+        .record_remote_agent(&intent_core::remote_launch::RemoteAgentRecord {
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            node_id: machine.id(),
+            lease_id,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    *machine.host.running.lock().unwrap() = vec![agent.clone()];
+    // The restart: the in-memory connector is gone.
+    backend
+        .services
+        .remote_feature()
+        .unwrap()
+        .take_node(&machine.id())
+        .expect("the feature's connector")
+        .shutdown();
+    agent
+}
+
+async fn assert_machine_kept(backend: &Backend, machine: &Machine) {
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1,
+        "the machine stays registered"
+    );
+    assert!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap()
+            .is_some(),
+        "its token stays"
+    );
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.owner.node_id == machine.id() && !lease.state.is_terminal()),
+        "its lease stays live"
+    );
+}
+
+// Review of intentd#2910: after a backend restart no connector runs, so
+// removal must not take the machine for idle while its agents survive.
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let error = backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    assert_machine_kept(&backend, &machine).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_with_stop_agents_waits_for_the_machines_ack() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let remove = backend.call(
+        "remove",
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    );
+    tokio::pin!(remove);
+    let (mut link, stop_id) = tokio::select! {
+        result = &mut remove => panic!("removed before the surviving agent's stop was acked: {result:?}"),
+        found = async {
+            let mut link = machine.accept().await;
+            let stop_id = link.stop_for(&agent).await;
+            (link, stop_id)
+        } => found,
+    };
+    assert_machine_kept(&backend, &machine).await;
+    let (removed, ()) = tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+    assert_eq!(
+        removed.unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn after_a_restart_an_unreachable_machine_with_agents_keeps_everything() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    machine.stop().await;
+
+    for params in [
+        json!({ "machineId": machine.id() }),
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    ] {
+        let error = backend.call("remove", params).await.unwrap_err();
+        assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+        assert!(!data(&error)["attempts"].as_array().unwrap().is_empty());
+        assert_machine_kept(&backend, &machine).await;
+    }
+}
