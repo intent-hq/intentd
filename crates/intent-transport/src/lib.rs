@@ -73,6 +73,7 @@ pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
 mod panic_guard;
+mod plain_folder_gate;
 mod presence;
 mod private_output;
 mod retired_gate;

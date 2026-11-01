@@ -114,6 +114,13 @@ pub struct WorkspaceMcpServer {
     /// every non-flagged provider keeps today's full description
     /// byte-identical.
     compact_tool_descriptions: bool,
+    /// Whether this server front-doors a plain-folder workspace
+    /// (`Workspace.plainFolder`, §5.1), captured at bridge creation. Its
+    /// `workspace_api` description leaves out the git and forge surfaces
+    /// (`ws.git.*`, `ws.pr.*`, `ws.mr.*`, `ws.workspace.proposeSibling`);
+    /// dispatch and `ws.help` read the persisted flag themselves. Defaults
+    /// to `false`, which keeps every description byte-identical.
+    plain_folder: bool,
     /// Optional trusted producer; disabled for all existing construction paths.
     repository_guidance: Option<GuidanceBinding>,
     /// Original endpoint context; no runtime construction path installs it yet.
@@ -138,6 +145,7 @@ impl WorkspaceMcpServer {
             specialist_model_options: Vec::new(),
             is_sub_agent: false,
             compact_tool_descriptions: false,
+            plain_folder: false,
             repository_guidance: None,
             request_context: None,
         }
@@ -275,19 +283,41 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Mark this bridge as serving a plain-folder workspace (the spawn-time
+    /// wiring point, read from the persisted `Workspace.plainFolder`): the
+    /// `workspace_api` description in every variant (full, compact,
+    /// condensed) leaves out the git and forge surfaces.
+    #[must_use]
+    pub fn with_plain_folder(mut self, plain_folder: bool) -> Self {
+        self.plain_folder = plain_folder;
+        self
+    }
+
+    /// A description variant as THIS bridge serves it: unchanged, or with
+    /// the plain-folder surfaces removed.
+    fn shape_description(&self, desc: String) -> String {
+        if self.plain_folder {
+            tools::plain_folder_description(&desc)
+        } else {
+            desc
+        }
+    }
+
     /// The fully assembled `workspace_api` description for THIS bridge —
     /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
     /// gate folded in), and specialist model options all applied — exactly
     /// what a non-truncating provider's `tools/list` serves.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
-        tools::workspace_api_description_with_model_options(
-            self.is_chief,
-            &self.effective_agent_features(),
-            &self.specialist_model_options,
-            self.is_sub_agent,
+        self.shape_description(
+            tools::workspace_api_description_with_model_options(
+                self.is_chief,
+                &self.effective_agent_features(),
+                &self.specialist_model_options,
+                self.is_sub_agent,
+            )
+            .into_owned(),
         )
-        .into_owned()
     }
 
     /// The condensed `workspace_api` reference for THIS bridge — the same
@@ -299,11 +329,11 @@ impl WorkspaceMcpServer {
     /// variant.
     #[must_use]
     pub fn condensed_workspace_api_description(&self) -> String {
-        tools::condensed_workspace_api_description(
+        self.shape_description(tools::condensed_workspace_api_description(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
-        )
+        ))
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
@@ -471,10 +501,10 @@ impl WorkspaceMcpServer {
                 // (`condensed_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
                     if self.compact_tool_descriptions {
-                        tools::compact_workspace_api_description(
+                        self.shape_description(tools::compact_workspace_api_description(
                             self.is_chief,
                             &self.effective_agent_features(),
-                        )
+                        ))
                     } else {
                         self.full_workspace_api_description()
                     }

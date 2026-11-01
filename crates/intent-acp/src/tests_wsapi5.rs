@@ -1743,3 +1743,197 @@ async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope()
         CHIEF_WORKSPACE_ID
     );
 }
+
+/// Git and forge API names a plain-folder surface must never carry (§5.1).
+/// `ws.primitive` is stripped first so the `ws.pr` probe only hits the
+/// pull-request namespace.
+fn plain_folder_leaks(text: &str) -> Vec<&'static str> {
+    let text = text.replace("ws.primitive", "");
+    [
+        "ws.git",
+        "ws.pr",
+        "ws.mr",
+        "proposeSibling",
+        "pr.snapshot",
+        "pr.monitor",
+    ]
+    .into_iter()
+    .filter(|needle| text.contains(needle))
+    .collect()
+}
+
+/// In a plain-folder workspace every `ws.git.*`, `ws.pr.*`, `ws.mr.*` and
+/// `ws.workspace.proposeSibling` call fails with the documented refusal and
+/// never reaches the service.
+#[tokio::test]
+async fn plain_folder_refuses_git_and_forge_bindings() {
+    let (srv, api) = server_with_caller("agent-1");
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    for (code, binding) in [
+        ("return await ws.git.commit('msg');", "ws.git.commit"),
+        ("return await ws.git.listRoots();", "ws.git.listRoots"),
+        (
+            "return await ws.git.registerRoot('sub');",
+            "ws.git.registerRoot",
+        ),
+        (
+            "return await ws.git.unregisterRoot('sub');",
+            "ws.git.unregisterRoot",
+        ),
+        ("return await ws.pr.snapshot(7);", "ws.pr.snapshot"),
+        ("return await ws.pr.monitor(7);", "ws.pr.monitor"),
+        ("return await ws.pr.unmonitor(7);", "ws.pr.unmonitor"),
+        ("return await ws.pr.monitors();", "ws.pr.monitors"),
+        // The `ws.mr.*` aliases send the `pr.*` frames, so the refusal names
+        // the canonical binding.
+        ("return await ws.mr.snapshot(7);", "ws.pr.snapshot"),
+        ("return await ws.mr.monitors();", "ws.pr.monitors"),
+        (
+            "return await ws.workspace.proposeSibling({ title: 't', initialPrompt: 'p' });",
+            "ws.workspace.proposeSibling",
+        ),
+    ] {
+        let resp = call(&srv, code).await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{binding}: {resp}");
+        let expected = format!("{binding} is not available in plain-folder workspaces");
+        assert!(
+            text(&resp).contains(&expected),
+            "{binding}: {}",
+            text(&resp)
+        );
+    }
+    assert!(api.agent_commit_calls.lock().unwrap().is_empty());
+    assert_eq!(*api.git_root_list_calls.lock().unwrap(), 0);
+    assert!(api.git_root_register_calls.lock().unwrap().is_empty());
+    assert!(api.git_root_unregister_calls.lock().unwrap().is_empty());
+    // Other namespaces still work in a plain folder.
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+}
+
+/// A git workspace keeps the bindings (the refusal keys on the persisted
+/// `plainFolder` flag only).
+#[tokio::test]
+async fn git_workspace_keeps_git_bindings() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.listRoots();").await;
+    assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+    assert_eq!(*api.git_root_list_calls.lock().unwrap(), 1);
+}
+
+/// `ws.help` in a plain folder: the index and every namespace page leave out
+/// the git and forge surfaces, and the git/pr/mr namespaces are refused.
+#[tokio::test]
+async fn plain_folder_help_omits_git_and_forge_surfaces() {
+    let (srv, api) = server();
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    let index = body(&call(&srv, "return await ws.help();").await)
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(index.starts_with("Namespaces"), "{index}");
+    assert!(plain_folder_leaks(&index).is_empty(), "{index}");
+    assert!(index.contains("ws.workspace.*"), "{index}");
+    for ns in ["workspace", "hook", "agent", "event", "note"] {
+        let resp = call(&srv, &format!("return await ws.help('{ns}');")).await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{ns}: {resp}");
+        let page = body(&resp).as_str().unwrap().to_string();
+        assert!(
+            plain_folder_leaks(&page).is_empty(),
+            "{ns}: {:?}",
+            plain_folder_leaks(&page)
+        );
+    }
+    for ns in ["git", "pr", "ws.mr", "pr.*"] {
+        let resp = call(&srv, &format!("return await ws.help('{ns}');")).await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{ns}: {resp}");
+        assert!(
+            text(&resp).contains("is not available in plain-folder workspaces"),
+            "{ns}: {}",
+            text(&resp)
+        );
+    }
+    // A git workspace keeps them.
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::Titled;
+    let pr = body(&call(&srv, "return await ws.help('pr');").await)
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(pr.contains("ws.pr.snapshot("), "{pr}");
+}
+
+/// The advertised `workspace_api` description — full, compact (truncating
+/// providers' `tools/list`) and condensed (their system-prompt copy) —
+/// leaves out the git and forge surfaces on a plain-folder bridge, under
+/// every feature combination that rewrites the cross-references, and is
+/// byte-identical on a git bridge.
+#[tokio::test]
+async fn plain_folder_description_omits_git_and_forge_surfaces() {
+    use intent_core::settings_file::AgentFeaturesSettings;
+    let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+    let ws = WorkspaceId::from_string("ws-1");
+    let feature_sets = [
+        AgentFeaturesSettings::default(),
+        AgentFeaturesSettings {
+            host_exec: false,
+            ..AgentFeaturesSettings::default()
+        },
+        AgentFeaturesSettings {
+            pr_monitor: false,
+            ..AgentFeaturesSettings::default()
+        },
+        AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        },
+    ];
+    for features in feature_sets {
+        for is_sub_agent in [false, true] {
+            let bridge = |plain: bool, compact: bool| {
+                WorkspaceMcpServer::new(api.clone(), ws.clone())
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .with_compact_tool_descriptions(compact)
+                    .with_plain_folder(plain)
+            };
+            let full = bridge(true, false).full_workspace_api_description();
+            let condensed = bridge(true, true).condensed_workspace_api_description();
+            let listed = bridge(true, true)
+                .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                .await
+                .unwrap();
+            let compact = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "workspace_api")
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for (variant, desc) in [
+                ("full", &full),
+                ("condensed", &condensed),
+                ("compact", &compact),
+            ] {
+                assert!(
+                    plain_folder_leaks(desc).is_empty(),
+                    "{variant} (sub-agent {is_sub_agent}): {:?}",
+                    plain_folder_leaks(desc)
+                );
+                assert!(desc.contains("ws.note."), "{variant}");
+            }
+            // The git bridge is unchanged by the flag's default.
+            assert_eq!(
+                bridge(false, false).full_workspace_api_description(),
+                WorkspaceMcpServer::new(api.clone(), ws.clone())
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .full_workspace_api_description()
+            );
+            assert!(bridge(false, false)
+                .full_workspace_api_description()
+                .contains("ws.git.commit("));
+        }
+    }
+}

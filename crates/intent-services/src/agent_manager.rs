@@ -3559,6 +3559,9 @@ impl AgentManager {
             .services
             .specialist_model_options_for_workspace(&workspace_id)
             .await;
+        // Plain-folder workspaces (§5.1) get a `workspace_api` description
+        // without the git and forge surfaces.
+        let plain_folder = self.services.is_plain_folder(&workspace_id).await;
         let server_blueprint = {
             let workspace_id = workspace_id.clone();
             let agent_id = agent_id.clone();
@@ -3592,6 +3595,7 @@ impl AgentManager {
                             .collect(),
                     )
                     .with_compact_tool_descriptions(compact)
+                    .with_plain_folder(plain_folder)
             })
             .with_original_services(original_services, session.clone())
         };

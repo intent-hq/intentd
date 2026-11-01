@@ -343,6 +343,20 @@ async fn render_original(facts: &PreparedContextFacts) -> Option<String> {
         .get_agent_session(&agent_id)
         .await
         .ok()?;
+    // A plain-folder workspace (§5.1) has no git or forge, so its sessions
+    // get no repository guidance or facts envelope — the same predicate that
+    // swaps the system prompt's git guidance for the plain-folder note.
+    let workspace = facts
+        .owner
+        .services
+        .store
+        .get_workspace(&session.workspace_id)
+        .await
+        .ok();
+    let doctrine = crate::harness::resolve_entry(&session.harness_version).doctrine;
+    if crate::instructions::plain_folder_gated(doctrine.instructions, workspace.as_ref()) {
+        return None;
+    }
     let expected = GuidanceContextStamp {
         scope: facts.context.scope.clone(),
         revision: facts.context.revision.clone(),

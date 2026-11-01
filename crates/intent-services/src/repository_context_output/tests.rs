@@ -930,6 +930,104 @@ async fn context_output_original_missing_settings_attachment_omits_after_late_in
     owner.drain_jobs().await;
 }
 
+/// A plain-folder workspace (§5.1) gets no per-prompt repository guidance
+/// or facts envelope on the latest harness, while a git workspace on the
+/// same daemon keeps it.
+#[intent_test_macros::daemon_test]
+async fn context_output_plain_folder_session_prepares_no_guidance() {
+    use crate::repository_admission::lifecycle::physical_owner::{
+        RepositoryCreationIntent, RepositoryCreationOwner,
+    };
+    use crate::repository_admission::read_request::RepositoryReadOwner;
+    use crate::repository_admission_source_tests::fixtures::Fixture as GitFixture;
+    let git = GitFixture::new().await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/team/plain.git",
+        ],
+    );
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(git.dir.path().join("context-settings.toml")).unwrap(),
+    );
+    let service = Arc::new(
+        crate::Services::new_repository_fixture(
+            git.store.clone(),
+            intent_core::FileSecretStore::with_path(git.dir.path().join("context-secrets.json")),
+            None,
+        )
+        .with_settings_registry(registry)
+        .with_workspaces_root(git.dir.path().join("workspaces")),
+    );
+    let folder = git.dir.path().join("plain-notes");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder = folder.to_string_lossy().into_owned();
+    let plain = intent_core::Workspace {
+        id: intent_core::WorkspaceId::from("ws-plain-guidance"),
+        title: "Notes".into(),
+        branch: String::new(),
+        path: Some(folder.clone()),
+        repository_path: Some(folder),
+        worktree_path: None,
+        plain_folder: true,
+        created_at: git.workspace.created_at.clone(),
+        updated_at: git.workspace.updated_at.clone(),
+        ..Default::default()
+    };
+    service.store.insert_workspace(&plain).await.unwrap();
+    let lifecycle = service.repository_lifecycle_registry().await.unwrap();
+    for (workspace_id, expect_guidance) in [(git.workspace.id.clone(), true), (plain.id, false)] {
+        let session: intent_core::AgentSession = serde_json::from_value(serde_json::json!({
+            "id": intent_core::AgentId::new(),
+            "workspaceId": workspace_id,
+            "name": "plain-folder-guidance",
+            "status": "active",
+            "harnessVersion": intent_core::CURRENT_HARNESS_VERSION,
+            "createdAt": "2026-11-01T00:00:00Z",
+            "updatedAt": "2026-11-01T00:00:00Z"
+        }))
+        .unwrap();
+        service.store.insert_agent_session(&session).await.unwrap();
+        let physical = RepositoryCreationOwner::allocate(
+            &lifecycle,
+            &service.store,
+            session.workspace_id.clone(),
+            session.id.clone(),
+            RepositoryCreationIntent::FirstSet,
+        )
+        .unwrap()
+        .initialize(&service.store, || async {
+            Ok("scripted ACP initialization".into())
+        })
+        .await
+        .unwrap();
+        let owner = RepositoryContextOwner::bind(
+            service.clone(),
+            RepositoryReadOwner::capture(service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
+            &physical,
+        )
+        .unwrap();
+        let caller = Caller::Agent {
+            agent_id: session.id.clone(),
+        };
+        let guidance = intent_core::with_caller(caller, async {
+            owner.capture_prompt().unwrap().prepare().await
+        })
+        .await;
+        assert_eq!(
+            guidance.is_some(),
+            expect_guidance,
+            "{}",
+            session.workspace_id.as_str()
+        );
+        owner.drain_jobs().await;
+    }
+}
+
 #[intent_test_macros::daemon_test]
 async fn context_output_actual_same_binding_refresh_keeps_required_output_and_omits_old_facts() {
     use intent_sourcecontrol::gitlab_token::{EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT};

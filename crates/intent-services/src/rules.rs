@@ -260,6 +260,7 @@ pub(crate) async fn get_specialization_rules(
         workspace_path,
         agent_type,
         agent_features,
+        false,
     )
     .await
 }
@@ -267,13 +268,16 @@ pub(crate) async fn get_specialization_rules(
 /// [`get_specialization_rules`] with an explicit tier-3 instruction set —
 /// the SESSION's pinned doctrine when called from [`assemble_system_prompt`]
 /// (H2): tier 1/2 user-supplied content is unversioned, only the bundled
-/// built-in comes from `set`.
+/// built-in comes from `set`. `plain_folder` (from
+/// [`crate::instructions::plain_folder_gated`]) swaps the bundled git and
+/// forge guidance for the plain-folder note.
 pub(crate) async fn get_specialization_rules_for(
     set: &'static crate::instructions::InstructionSet,
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    plain_folder: bool,
 ) -> String {
     // 1. User-settings override (highest precedence — settings win over file/bundled).
     let overrides = read_overrides(store).await;
@@ -294,7 +298,12 @@ pub(crate) async fn get_specialization_rules_for(
     }
     // 3. Bundled built-in (composed with common/workspace per the reference),
     // from the caller's pinned instruction set.
-    crate::instructions::get_instruction_with_common_for(set, agent_type, agent_features)
+    crate::instructions::get_instruction_with_common_in(
+        set,
+        agent_type,
+        agent_features,
+        plain_folder,
+    )
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
@@ -474,6 +483,11 @@ pub(crate) async fn assemble_system_prompt(
         .or_else(|| workspace.map(|workspace| &workspace.id))
         .filter(|id| id.is_chief())
         .and(entry.doctrine.instructions.assistant);
+    // Plain-folder workspaces (§5.1) get no git, forge or PR guidance: the
+    // bundled common sections and the commit policy are replaced by the
+    // plain-folder note (latest harness only).
+    let plain_folder =
+        crate::instructions::plain_folder_gated(entry.doctrine.instructions, workspace);
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
@@ -488,6 +502,7 @@ pub(crate) async fn assemble_system_prompt(
             workspace_path,
             agent_type,
             agent_features,
+            plain_folder,
         )
         .await;
         if !specialization.trim().is_empty() {
@@ -575,7 +590,7 @@ pub(crate) async fn assemble_system_prompt(
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    if assistant.is_none() {
+    if assistant.is_none() && !plain_folder {
         parts.push(harness.commit_policy_clause());
     }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
@@ -1359,5 +1374,121 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
         );
         assert!(with_defaults.contains(&expected_specialization));
+    }
+
+    /// Headings and API names a plain-folder prompt must never carry (Brief
+    /// Must 6): the git, forge and sibling-workspace guidance.
+    const PLAIN_FOLDER_ABSENT: &[&str] = &[
+        "## GitHub & Git Operations",
+        "## Commit Policy",
+        "## Follow-up Workspaces",
+        "## Link other workspaces",
+        "## Waiting on External Conditions",
+        "ws.git",
+        "ws.pr",
+        "ws.mr",
+        "proposeSibling",
+    ];
+
+    fn plain_folder_workspace(folder: &Path) -> Workspace {
+        Workspace {
+            branch: String::new(),
+            plain_folder: true,
+            ..make_test_workspace(folder)
+        }
+    }
+
+    async fn assembled(
+        store: &Store,
+        folder: &Path,
+        agent_type: &str,
+        is_sub_agent: bool,
+        workspace: &Workspace,
+    ) -> String {
+        assemble_system_prompt(
+            store,
+            Some(folder),
+            agent_type,
+            None,
+            is_sub_agent,
+            true,
+            false,
+            &AgentFeaturesSettings::default(),
+            Some(workspace),
+            None,
+            None,
+        )
+        .await
+        .expect("prompt")
+    }
+
+    #[tokio::test]
+    async fn plain_folder_prompt_has_no_git_guidance_and_carries_the_note() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = plain_folder_workspace(temp_dir.path());
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            for is_sub_agent in [false, true] {
+                let prompt = assembled(
+                    &store,
+                    temp_dir.path(),
+                    agent_type,
+                    is_sub_agent,
+                    &workspace,
+                )
+                .await;
+                let probe = prompt.replace("ws.primitive", "");
+                for absent in PLAIN_FOLDER_ABSENT {
+                    assert!(
+                        !probe.contains(absent),
+                        "{agent_type} (sub-agent {is_sub_agent}) still carries {absent:?}"
+                    );
+                }
+                for present in [
+                    "## Plain folder workspace",
+                    "no undo",
+                    "Confirm with the user before you delete files or rewrite many files",
+                    "Do not run `git init`",
+                    "## Delegating Tasks",
+                    "## Note Editing",
+                ] {
+                    assert!(
+                        prompt.contains(present),
+                        "{agent_type} (sub-agent {is_sub_agent}) lacks {present:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_workspace_prompt_keeps_git_guidance_and_has_no_plain_folder_note() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = make_test_workspace(temp_dir.path());
+        let prompt = assembled(&store, temp_dir.path(), "interactive", false, &workspace).await;
+        for present in [
+            "## GitHub & Git Operations",
+            "## Commit Policy",
+            "## Follow-up Workspaces",
+            "## Link other workspaces",
+            "## Waiting on External Conditions",
+        ] {
+            assert!(prompt.contains(present), "git workspace lacks {present:?}");
+        }
+        assert!(!prompt.contains("## Plain folder workspace"));
+        // The flag, not the folder contents or an empty branch, selects the
+        // mode: an otherwise identical row without `plainFolder` is a git
+        // workspace.
+        let unflagged = Workspace {
+            branch: String::new(),
+            ..make_test_workspace(temp_dir.path())
+        };
+        assert_eq!(
+            assembled(&store, temp_dir.path(), "interactive", false, &unflagged).await,
+            prompt
+        );
     }
 }

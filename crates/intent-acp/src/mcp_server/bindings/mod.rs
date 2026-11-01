@@ -297,7 +297,16 @@ pub(crate) async fn try_dispatch(
     args: &Value,
 ) -> Result<Option<Value>, String> {
     if let Some(rest) = method.strip_prefix("help.") {
-        return help::dispatch(workspace_id, features, is_sub_agent, rest, args).map(Some);
+        let plain_folder = is_plain_folder(api, workspace_id).await;
+        return help::dispatch(
+            workspace_id,
+            features,
+            is_sub_agent,
+            plain_folder,
+            rest,
+            args,
+        )
+        .map(Some);
     }
     // Retired workspaces are read-only (PROTOCOL §5.1): an agent or hook
     // still running there (the agent that retired its own workspace, mid
@@ -313,6 +322,15 @@ pub(crate) async fn try_dispatch(
             return Err(map_err(intent_core::Error::WorkspaceRetired {
                 workspace_id: retired.as_str().to_string(),
             }));
+        }
+    }
+    // Plain-folder workspaces (§5.1) have no git or forge: `ws.git.*`,
+    // `ws.pr.*`, `ws.mr.*` and `ws.workspace.proposeSibling` fail with the
+    // documented refusal before any binding runs. Only these frames pay the
+    // workspace lookup.
+    if let Some(refusal) = super::tools::plain_folder_refusal(method) {
+        if is_plain_folder(api, workspace_id).await {
+            return Err(refusal);
         }
     }
     if let Some(rest) = method.strip_prefix("workspace.") {
@@ -540,6 +558,21 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
 /// message content the reference builders threw).
 // By-value so it slots point-free into `map_err(map_err)` in every binding.
 #[expect(clippy::needless_pass_by_value)]
+/// Whether `workspace_id` is a plain-folder workspace, read from the
+/// persisted `Workspace.plainFolder` flag (§5.1). A failed lookup counts as
+/// not plain, so git workspaces keep their surface; the Assistant workspace
+/// is never a plain folder.
+pub(crate) async fn is_plain_folder(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+) -> bool {
+    !workspace_id.is_chief()
+        && api
+            .get_workspace(workspace_id.clone())
+            .await
+            .is_ok_and(|w| w.plain_folder)
+}
+
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }

@@ -98,6 +98,11 @@ pub(crate) struct InstructionSet {
     /// default) gets the workspace body once, not as both the workspace layer
     /// and the fallback specific body. Harness 3.3+ (intent-hq/intent#5835).
     pub single_workspace_fallback: bool,
+    /// The plain-folder note that replaces the git and forge guidance of
+    /// `common` in a plain-folder workspace (`Workspace.plainFolder`, §5.1).
+    /// `Some` only on the latest harness set: older stamped sessions keep
+    /// their exact text, and `None` leaves every prompt untouched.
+    pub plain_folder_note: Option<&'static str>,
 }
 
 /// The v1 instruction set (`resources/agent-instructions/v1/`): today's text,
@@ -122,6 +127,7 @@ pub(crate) static V1: InstructionSet = InstructionSet {
     commit_message: COMMIT_MESSAGE,
     pr_description: PR_DESCRIPTION,
     single_workspace_fallback: false,
+    plain_folder_note: None,
 };
 
 /// The v1.1 instruction set (`resources/agent-instructions/v1.1/`): a
@@ -149,6 +155,7 @@ pub(crate) static V1_1: InstructionSet = InstructionSet {
     commit_message: instr!("v1.1", "commit-message"),
     pr_description: instr!("v1.1", "pr-description"),
     single_workspace_fallback: false,
+    plain_folder_note: None,
 };
 
 /// Harness v2 keeps every v1.1 instruction body except the common guidance,
@@ -206,8 +213,11 @@ pub(crate) static V3_4: InstructionSet = InstructionSet {
 };
 
 /// Harness v3.5 adds development-only persistent inline visual guidance.
+/// It is also the first set that gates plain-folder workspaces: the git and
+/// forge guidance of `common` is replaced by the plain-folder note.
 pub(crate) static V3_5: InstructionSet = InstructionSet {
     common: instr!("v3.5", "common"),
+    plain_folder_note: Some(instr!("v3.5", "plain-folder")),
     ..V3_4
 };
 
@@ -466,6 +476,46 @@ pub(crate) fn get_instruction_with_common(
     )
 }
 
+/// The `common` sections that teach git, forge, pull-request and
+/// sibling-workspace workflows. A plain-folder workspace has none of those
+/// features, so [`plain_folder_common`] removes them (Brief Must 6).
+const PLAIN_FOLDER_COMMON_SECTIONS: &[&str] = &[
+    "Follow-up Workspaces",
+    "GitHub & Git Operations",
+    "Link other workspaces",
+    "Waiting on External Conditions",
+];
+
+/// Whether prompt assembly from `set` treats `workspace` as a plain folder.
+/// The one plain-folder predicate for the session-pinned prompt text: it
+/// reads only the persisted `Workspace.plainFolder` flag (§5.1), and only a
+/// set carrying a [`InstructionSet::plain_folder_note`] (the latest harness)
+/// gates, so older stamped sessions keep their exact prompt.
+pub(crate) fn plain_folder_gated(
+    set: &InstructionSet,
+    workspace: Option<&intent_core::Workspace>,
+) -> bool {
+    set.plain_folder_note.is_some() && workspace.is_some_and(|w| w.plain_folder)
+}
+
+/// `common` for a plain-folder workspace: the git and forge sections are
+/// removed and the plain-folder note is appended. Borrows `common`
+/// unchanged when `plain_folder` is false or the set does not gate.
+fn plain_folder_common(
+    set: &InstructionSet,
+    common: Cow<'static, str>,
+    plain_folder: bool,
+) -> Cow<'static, str> {
+    let Some(note) = set.plain_folder_note.filter(|_| plain_folder) else {
+        return common;
+    };
+    let mut body = common.into_owned();
+    for heading in PLAIN_FOLDER_COMMON_SECTIONS {
+        body = remove_section(&body, heading);
+    }
+    Cow::Owned(format!("{body}\n\n{note}"))
+}
+
 /// Compose the bundled specialization rules for `agent_type` from `set` (port
 /// of `getInstructionWithCommon`): common → workspace → specific, with the
 /// `common`/`workspace`/utility/non-interactive special cases. Unknown ids fall
@@ -478,6 +528,18 @@ pub(crate) fn get_instruction_with_common_for(
     agent_type: &str,
     features: &AgentFeaturesSettings,
 ) -> String {
+    get_instruction_with_common_in(set, agent_type, features, false)
+}
+
+/// [`get_instruction_with_common_for`] for a workspace that may be a plain
+/// folder: when `plain_folder` is true (see [`plain_folder_gated`]) the
+/// `common` layer goes through [`plain_folder_common`].
+pub(crate) fn get_instruction_with_common_in(
+    set: &'static InstructionSet,
+    agent_type: &str,
+    features: &AgentFeaturesSettings,
+    plain_folder: bool,
+) -> String {
     let specific: Cow<'static, str> = if agent_type == "workspace-agent" {
         gated_workspace_agent(set, features)
     } else if agent_type == "task-breakdown" {
@@ -485,10 +547,10 @@ pub(crate) fn get_instruction_with_common_for(
     } else {
         Cow::Borrowed(get_instruction_by_id(set, agent_type, true).unwrap_or(set.workspace))
     };
+    let common = plain_folder_common(set, gated_common(set, features), plain_folder);
     if agent_type == "common" {
-        return gated_common(set, features).into_owned();
+        return common.into_owned();
     }
-    let common = gated_common(set, features);
     if agent_type == "workspace" {
         return format!("{common}\n\n---\n\n{specific}");
     }
@@ -1162,5 +1224,74 @@ mod tests {
     #[test]
     fn remove_section_is_noop_for_missing_heading() {
         assert_eq!(remove_section(COMMON, "No Such Section"), COMMON);
+    }
+
+    fn plain_folder_row() -> intent_core::Workspace {
+        intent_core::Workspace {
+            plain_folder: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_the_latest_set_gates_plain_folders() {
+        let latest = crate::harness::latest_entry().doctrine.instructions;
+        let plain = plain_folder_row();
+        assert!(plain_folder_gated(latest, Some(&plain)));
+        assert!(!plain_folder_gated(
+            latest,
+            Some(&intent_core::Workspace::default())
+        ));
+        assert!(!plain_folder_gated(latest, None));
+        for version in ["1.0", "2.10", "3.2", "3.3", "3.4"] {
+            assert_eq!(crate::harness::resolve_entry(version).version, version);
+            let set = crate::harness::resolve_entry(version).doctrine.instructions;
+            assert!(set.plain_folder_note.is_none(), "harness {version}");
+            assert!(!plain_folder_gated(set, Some(&plain)), "harness {version}");
+            // Even a forced flag cannot change an older set's text.
+            assert_eq!(
+                get_instruction_with_common_in(set, "interactive", &all_on(), true),
+                get_instruction_with_common_for(set, "interactive", &all_on()),
+                "harness {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_folder_common_swaps_git_sections_for_the_note() {
+        let set = crate::harness::latest_entry().doctrine.instructions;
+        let note = set
+            .plain_folder_note
+            .expect("latest set gates plain folders");
+        {
+            let features = all_on();
+            let git = get_instruction_with_common_in(set, "common", &features, false);
+            assert_eq!(git, gated_common(set, &features).as_ref());
+            let plain = get_instruction_with_common_in(set, "common", &features, true);
+            for heading in PLAIN_FOLDER_COMMON_SECTIONS {
+                // Every removed heading exists in the git body (no stale marker).
+                assert!(git.contains(&format!("## {heading}\n")), "{heading}");
+                assert!(!plain.contains(&format!("## {heading}")), "{heading}");
+            }
+            assert!(plain.ends_with(note));
+            for absent in ["ws.git", "ws.pr", "ws.mr", "proposeSibling", "gh pr"] {
+                assert!(!plain.contains(absent), "{absent}");
+            }
+            // Unrelated sections survive untouched.
+            for kept in [
+                "## Plain language for the user",
+                "## Delegating Tasks",
+                "## Browser tabs",
+                "## Note Editing",
+                "## Show media",
+            ] {
+                assert!(plain.contains(kept), "{kept}");
+            }
+        }
+        // Background one-shots carry no common layer, so nothing changes.
+        assert_eq!(
+            get_instruction_with_common_in(set, "commit-message", &all_on(), true),
+            get_instruction_with_common_for(set, "commit-message", &all_on())
+        );
     }
 }
