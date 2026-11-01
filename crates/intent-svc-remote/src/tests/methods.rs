@@ -292,32 +292,38 @@ async fn add_rejects_malformed_params_before_dialing() {
     }
 }
 
+/// No setting gates the backend side: on a fresh config the capability is
+/// advertised and the mutations run. The model-facing placement text (the
+/// `ws.agent.create` / `delegate` descriptions and `ws.help("agent")`)
+/// appears only while a machine is exposed to this backend.
 #[tokio::test]
-async fn mutations_need_the_experimental_setting() {
+async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
+    use intent_core::WorkspaceApi as _;
     let backend = Backend::new().await;
-    let machine = backend.machine().await;
-    backend
-        .services
-        .settings_registry()
+    let port = backend.services.feature_remote_launch_port();
+    assert!(backend.services.remote_machines_capability());
+    assert_eq!(port.placement_help(&backend.services).await, None);
+    assert!(port
+        .placements(&backend.services)
+        .await
         .unwrap()
-        .apply(&[("experimental.remoteAgents".to_owned(), json!(false))])
-        .unwrap();
-    for (method, params) in [
-        ("add", machine.add_params()),
-        ("remove", json!({ "machineId": machine.id() })),
-        ("refresh", json!({ "machineId": machine.id() })),
-    ] {
-        let error = backend.call(method, params).await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                Error::RemoteAgentsDisabled {
-                    setting: "experimental.remoteAgents"
-                }
-            ),
-            "{method}: {error:?}"
-        );
-    }
+        .supported_platforms
+        .is_empty());
+
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await.shutdown();
+    let help = port
+        .placement_help(&backend.services)
+        .await
+        .expect("an exposed machine is listed");
+    assert!(help.starts_with("Remote placement"), "{help}");
+    assert!(help.contains("\"Test machine\""), "{help}");
+
+    backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .expect("remove");
+    assert_eq!(port.placement_help(&backend.services).await, None);
     assert_eq!(
         backend.call("list", json!({})).await.unwrap(),
         json!({ "machines": [] })

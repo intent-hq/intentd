@@ -27,10 +27,10 @@
 //!
 //! The feature sits above `intent-services`; the composition root registers
 //! it with [`register`] and hands it the tailcat binary with
-//! [`RemoteServicesExt::configure_remote_machines`]. It is experimental:
-//! with `experimental.remoteAgents` off, the `remoteMachines.*` mutations
-//! fail with `remote-agents-disabled` and no agent is placed remotely. In
-//! node mode no connector ever starts.
+//! [`RemoteServicesExt::configure_remote_machines`]. No daemon setting
+//! gates it: the frontend's Labs flag decides whether a user sees it, and
+//! the model is told about remote placement only while a machine is
+//! exposed to this backend. In node mode no connector ever starts.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -1,9 +1,10 @@
 //! WSS end-to-end coverage for daemon-to-daemon executor credentials
 //! (monorepo `docs/protocol/methods/nodes.md`, "Machine methods: executor
 //! credentials"): owner-only `executor.mint` / `list` / `revoke` against a
-//! real `intentd serve`, members and guests refused with `-32003`,
-//! `remote-agents-disabled` while `remoteAgents.enabled` is off, the minted
-//! routes matching the listener, and the token never reaching the log.
+//! real `intentd serve`, members and guests refused with `-32003`, no
+//! setting needed to mint (the retired `remoteAgents.enabled` is an unknown
+//! setting), the minted routes matching the listener, and the token never
+//! reaching the log.
 
 #![cfg(unix)]
 
@@ -317,21 +318,14 @@ async fn executor_credentials_are_owner_only_over_wss() {
     let mut owner = connect_ws(port, cfg.clone()).await;
     let mint_params = json!({ "backendId": "backend-1", "backendName": "Linux backend" });
 
-    let disabled = rpc(&mut owner, 1, "executor.mint", mint_params.clone()).await;
-    assert_eq!(
-        error_code(&disabled),
-        (-32602, json!("remote-agents-disabled")),
-        "{disabled}"
-    );
-
-    let enabled = rpc(
+    let retired = rpc(
         &mut owner,
         2,
         "settings.update",
         json!({ "changes": [{ "path": "remoteAgents.enabled", "value": true }] }),
     )
     .await;
-    assert!(enabled.get("error").is_none(), "{enabled}");
+    assert!(retired.get("error").is_some(), "{retired}");
 
     let minted = rpc(&mut owner, 3, "executor.mint", mint_params.clone()).await;
     let result = minted["result"].clone();

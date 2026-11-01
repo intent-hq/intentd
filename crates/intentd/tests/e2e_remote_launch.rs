@@ -1,6 +1,6 @@
-//! Remote launch end to end: a real `intentd serve` backend (WSS,
-//! `experimental.remoteAgents` on) and a second real `intentd serve` as the
-//! machine (remote agents on), both on loopback. The machine mints an
+//! Remote launch end to end: a real `intentd serve` backend (WSS) and a
+//! second real `intentd serve` as the machine, both on loopback and with no
+//! remote-agent setting turned on (none exists). The machine mints an
 //! executor credential for the backend's id (`remoteMachines.backendInfo`)
 //! and the backend adds it with `remoteMachines.add`, as the frontend relays
 //! it. An agent created over WSS with a
@@ -235,13 +235,6 @@ async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let fingerprint = status["result"]["fingerprint"].as_str().unwrap().to_owned();
     let mut ws = connect(port, client_config(&fingerprint)).await;
-    ok(
-        &mut ws,
-        1,
-        "settings.update",
-        json!({ "changes": [{ "path": "remoteAgents.enabled", "value": true }] }),
-    )
-    .await;
     let minted = ok(
         &mut ws,
         2,
@@ -372,13 +365,6 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             "{capability} must not be advertised: {capabilities}"
         );
     }
-    ok(
-        &mut rpc_ws,
-        3,
-        "settings.update",
-        json!({ "changes": [{ "path": "experimental.remoteAgents", "value": true }] }),
-    )
-    .await;
     let backend = ok(&mut rpc_ws, 4, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
 
@@ -645,7 +631,7 @@ fn add_params(machine: &Machine, name: &str) -> Value {
 }
 
 /// Placement across two exposed machines over WSS: the `remoteMachines`
-/// capability follows `experimental.remoteAgents`; a named machine takes
+/// capability is advertised with no setting; a named machine takes
 /// the agent; a model no machine lists is `model-unavailable` naming each
 /// machine's models and sign-in status; an unknown `nodeId` is
 /// `machine-unknown`.
@@ -670,22 +656,7 @@ async fn placement_chooses_among_exposed_machines() {
 
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let hello = json!({ "clientId": "placement-e2e", "name": "Placement E2E" });
-    let off = ok(&mut rpc_ws, 1, "client.hello", hello.clone()).await;
-    assert!(
-        off["server"]["capabilities"]
-            .get("remoteMachines")
-            .is_none(),
-        "{off}"
-    );
-    ok(
-        &mut rpc_ws,
-        2,
-        "settings.update",
-        json!({ "changes": [{ "path": "experimental.remoteAgents", "value": true }] }),
-    )
-    .await;
-    let mut fresh = connect(port, cfg.clone()).await;
-    let on = ok(&mut fresh, 1, "client.hello", hello).await;
+    let on = ok(&mut rpc_ws, 1, "client.hello", hello).await;
     assert_eq!(on["server"]["capabilities"]["remoteMachines"], 1, "{on}");
 
     let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
@@ -714,8 +685,8 @@ async fn placement_chooses_among_exposed_machines() {
             "placement": placement,
         })
     };
-    // A machine's first report can take a while after remote agents were
-    // turned on; its refusal is retryable until then.
+    // A machine's first report can take a while after its first mint; its
+    // refusal is retryable until then.
     let deadline = tokio::time::Instant::now() + wait();
     let mut id = 100;
     let created = loop {

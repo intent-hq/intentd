@@ -57,8 +57,9 @@ pub enum NodeConnection {
 /// What the daemon's executor service provides to the listener. Until one
 /// is installed the listener answers `/node/*` with `404`.
 pub trait ExecutorHost: Send + Sync {
-    /// `remoteAgents.enabled`: while `false`, `/node/*` upgrades get `403`.
-    fn enabled(&self) -> bool;
+    /// Whether an executor service is installed and running. While `false`
+    /// there is no executor host and `/node/*` upgrades get `404`.
+    fn ready(&self) -> bool;
     /// This machine's daemon id; a bind must name it as `nodeId`.
     fn node_id(&self) -> String;
     /// The welcome for an accepted hello: capabilities, routes and this
@@ -135,10 +136,10 @@ impl ExecutorLinks {
         })
     }
 
-    /// Whether the machine serves executor links (`remoteAgents.enabled`).
+    /// Whether an executor service is installed behind the link server.
     #[must_use]
-    pub fn enabled(&self) -> bool {
-        self.host.enabled()
+    pub fn ready(&self) -> bool {
+        self.host.ready()
     }
 
     /// Admit a git upgrade only for the credential's current binding, named

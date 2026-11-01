@@ -20,8 +20,6 @@ use crate::lease::{new_owner, probe_hello, record_new_lease, HeadLease};
 use crate::machine::MachineTarget;
 use crate::{RemoteFeature, RemoteNode};
 
-/// The setting that gates the mutations.
-const EXPERIMENTAL_SETTING: &str = "experimental.remoteAgents";
 /// Longest id, name, credential id or route, in UTF-8 bytes.
 const MAX_TEXT_BYTES: usize = 256;
 /// Most hosts a machine may list.
@@ -89,16 +87,6 @@ fn text<'a>(params: &'a Value, name: &str, required: bool) -> Result<Option<&'a 
 
 fn required<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
     text(params, name, true).map(Option::unwrap_or_default)
-}
-
-fn ensure_enabled(svc: &Services) -> Result<()> {
-    if svc.experimental_remote_agents_enabled() {
-        Ok(())
-    } else {
-        Err(Error::RemoteAgentsDisabled {
-            setting: EXPERIMENTAL_SETTING,
-        })
-    }
 }
 
 fn not_found(machine_id: &str) -> Error {
@@ -263,7 +251,6 @@ fn add_params(params: &Value) -> Result<AddParams> {
 
 async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let params = add_params(params)?;
-    ensure_enabled(svc)?;
     // Held until saved, so no agent starts on the machine between the
     // in-use check and a credential replacement.
     let _lifecycle = feature.lifecycle(&params.machine_id).await;
@@ -422,7 +409,6 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             return Err(Error::InvalidParams("stopAgents must be a boolean".into()));
         }
     };
-    ensure_enabled(svc)?;
     let _lifecycle = feature.lifecycle(&machine_id).await;
     let store = svc.store();
     let Some(row) = store.get_exposed_machine(&machine_id).await? else {
@@ -508,7 +494,6 @@ async fn deliver_stops(
 
 async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let machine_id = required(params, "machineId")?.to_owned();
-    ensure_enabled(svc)?;
     if svc
         .store()
         .get_exposed_machine(&machine_id)

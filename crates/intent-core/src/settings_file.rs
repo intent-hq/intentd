@@ -94,7 +94,6 @@ pub struct SettingsFile {
     pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
     pub remote_agents: RemoteAgentsSettings,
-    pub experimental: ExperimentalSettings,
     pub daemon: DaemonSettings,
 }
 
@@ -1256,9 +1255,6 @@ impl Default for PrCacheSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct RemoteAgentsSettings {
-    /// `remoteAgents.enabled` — serve the executor link and allow
-    /// `executor.mint`. Off by default.
-    pub enabled: bool,
     /// `remoteAgents.permission` — how remote agents' provider permission
     /// prompts are answered, since no client is attached.
     pub permission: RemoteAgentPermission,
@@ -1308,17 +1304,6 @@ pub enum DaemonMode {
     /// Orchestration off: the daemon serves only the node-mode method list
     /// and runs agents for the backends it is exposed to.
     Node,
-}
-
-/// `[experimental]` — features that are off until they leave experimental
-/// (`experimental.*`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct ExperimentalSettings {
-    /// `experimental.remoteAgents` — backend side of daemon-to-daemon remote
-    /// agents: the `remoteMachines.*` mutations, placement on exposed
-    /// machines and the `remoteMachines` capability.
-    pub remote_agents: bool,
 }
 
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
@@ -1420,7 +1405,9 @@ where
 /// feature was removed) — discarded and stripped. `backgroundAgents` covers
 /// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
 /// values are migrated into the `quickActions.*` keys at boot and the table is
-/// then stripped.
+/// then stripped. `remoteAgents.enabled` and the `[experimental]` table (its
+/// only key was `remoteAgents`) are the retired remote-agent switches: remote
+/// agents need no daemon setting, so both are discarded and stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
@@ -1428,6 +1415,8 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "workspace.autoFetch",
     "backgroundAgents",
     "agents.flushQueuedMessages",
+    "remoteAgents.enabled",
+    "experimental",
 ];
 
 /// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
@@ -2963,6 +2952,32 @@ mod tests {
         assert_eq!(legacy.len(), 1);
     }
 
+    /// The retired remote-agent switches (`remoteAgents.enabled`,
+    /// `experimental.remoteAgents`) still load from an older file: they are
+    /// captured as legacy keys (logged once, then stripped at boot) while
+    /// `remoteAgents.permission` keeps parsing. The strict parse refuses
+    /// them like any other unknown key.
+    #[test]
+    fn legacy_parse_tolerates_retired_remote_agent_switches() {
+        let text = "[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(
+            file.remote_agents.permission,
+            RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            legacy.get("remoteAgents.enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            legacy.get("experimental"),
+            Some(&serde_json::json!({ "remoteAgents": true }))
+        );
+        assert_eq!(legacy.len(), 2);
+        assert!(SettingsFile::parse_str("[remoteAgents]\nenabled = true\n").is_err());
+        assert!(SettingsFile::parse_str("[experimental]\nremoteAgents = true\n").is_err());
+    }
+
     #[test]
     fn legacy_parse_captures_and_tolerates_listen_mode() {
         let text = "[server]\nlistenMode = \"both\"\nport = 5181\n";
@@ -3888,7 +3903,6 @@ mod tests {
     #[test]
     fn node_mode_settings_are_limited_to_three_families() {
         for path in [
-            "remoteAgents.enabled",
             "remoteAgents.permission",
             "daemon.mode",
             "server.wsApi.enabled",

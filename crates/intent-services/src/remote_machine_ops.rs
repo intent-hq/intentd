@@ -36,14 +36,6 @@ impl Services {
             .await
     }
 
-    /// `experimental.remoteAgents`: the backend may manage and use exposed
-    /// machines.
-    #[must_use]
-    pub fn experimental_remote_agents_enabled(&self) -> bool {
-        self.settings_registry()
-            .is_some_and(|registry| registry.snapshot().effective.experimental.remote_agents)
-    }
-
     /// This daemon's own routes (its display name and WSS fingerprint), for
     /// `remoteMachines.backendInfo`; `None` without a listener.
     pub async fn own_machine_routes(&self) -> Option<MachineRoutes> {

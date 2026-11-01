@@ -2929,12 +2929,12 @@ async fn cmd_serve_owned(
             provider,
         )));
     }
-    // Run backends' remote agents in this daemon (`remoteAgents.enabled`
-    // gates the link), sharing the process registry's limits.
+    // Run backends' remote agents in this daemon (only backends holding an
+    // executor credential the owner minted are admitted), sharing the
+    // process registry's limits.
     #[cfg(unix)]
     let executor_service = executor::start_in_daemon(executor::DaemonParts {
         slot: &executor_slot,
-        links: &executor_links,
         services: &services,
         manager: &manager,
         settings: &settings_registry,

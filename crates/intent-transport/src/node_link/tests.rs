@@ -73,7 +73,7 @@ struct TestHost {
 }
 
 impl ExecutorHost for TestHost {
-    fn enabled(&self) -> bool {
+    fn ready(&self) -> bool {
         true
     }
     fn node_id(&self) -> String {

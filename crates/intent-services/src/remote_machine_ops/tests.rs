@@ -131,18 +131,6 @@ async fn the_token_lives_in_the_secret_store_under_the_machine_account() {
 }
 
 #[tokio::test]
-async fn the_experimental_switch_is_the_setting() {
-    let f = fixture().await;
-    assert!(!f.services.experimental_remote_agents_enabled());
-    f.services
-        .settings_registry()
-        .unwrap()
-        .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
-        .unwrap();
-    assert!(f.services.experimental_remote_agents_enabled());
-}
-
-#[tokio::test]
 async fn remote_machine_changed_is_global_and_owner_only() {
     let f = fixture().await;
     let mut sub = f.bus.subscribe(SubscriptionFilter {

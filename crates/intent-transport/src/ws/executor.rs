@@ -1,9 +1,10 @@
 //! The executor link's upgrade gate on `/node/link` and `/node/git`
 //! (daemon-to-daemon remote agents). Order, every refusal before the `101`:
 //! no executor service installed `404` → `server.wsApi.enabled` off `403` →
-//! `remoteAgents.enabled` off `403` → any `Origin` `403` → not ready `503` →
-//! bearer header looked up **only** among active executor credentials `401`
-//! → git binding headers not current `409`. Owner and per-principal tokens
+//! any `Origin` `403` → not ready `503` → bearer header looked up **only**
+//! among active executor credentials `401` (so a machine that never minted
+//! one, or whose credentials are all revoked, refuses every request) → git
+//! binding headers not current `409`. No setting switches the link on or off. Owner and per-principal tokens
 //! are never looked up here, and executor tokens never on `/ws`, `/tunnel`
 //! or `/invite`. Insecure dev mode skips TLS, never the executor token.
 
@@ -42,10 +43,10 @@ impl WsInner {
             headers,
             epoch,
         } = request;
-        let Some(links) = self.executor_links.clone() else {
+        let Some(links) = self.executor_links.clone().filter(|links| links.ready()) else {
             return reject(&mut stream, 404, "Not Found").await;
         };
-        if !self.enabled || !links.enabled() || has_origin {
+        if !self.enabled || has_origin {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         let Some(services) = self.dispatch.ready() else {

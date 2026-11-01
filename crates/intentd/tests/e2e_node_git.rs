@@ -155,7 +155,7 @@ impl intent_transport::TokenStore for OwnerToken {
 struct Host(tokio::sync::mpsc::UnboundedSender<NodeConnection>);
 
 impl ExecutorHost for Host {
-    fn enabled(&self) -> bool {
+    fn ready(&self) -> bool {
         true
     }
     fn node_id(&self) -> String {

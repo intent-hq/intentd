@@ -16,9 +16,6 @@ use serde_json::{json, Map, Value};
 
 use crate::Services;
 
-/// The setting that gates `executor.mint`.
-const ENABLED_SETTING: &str = "remoteAgents.enabled";
-
 /// Longest `backendId`, `backendName` and `backendFingerprint`, in UTF-8 bytes.
 const MAX_PARAM_BYTES: usize = 128;
 
@@ -104,11 +101,6 @@ impl Services {
         }
     }
 
-    fn remote_agents_enabled(&self) -> bool {
-        self.settings_registry()
-            .is_some_and(|registry| registry.snapshot().effective.remote_agents.enabled)
-    }
-
     fn executor_live_status(&self, id: &ExecutorCredentialId) -> ExecutorLiveStatus {
         self.executor_liveness
             .get()
@@ -122,11 +114,6 @@ impl Services {
         let backend_id = text_param(&params, "backendId", true)?.unwrap_or_default();
         let backend_name = text_param(&params, "backendName", true)?.unwrap_or_default();
         let backend_fingerprint = text_param(&params, "backendFingerprint", false)?;
-        if !self.remote_agents_enabled() {
-            return Err(Error::RemoteAgentsDisabled {
-                setting: ENABLED_SETTING,
-            });
-        }
         let platform = AgentPlatform::host().ok_or_else(|| {
             Error::Unsupported("remote agents run on Linux and macOS only".into())
         })?;

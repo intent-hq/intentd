@@ -67,8 +67,9 @@ async fn node_mode_serves_only_the_three_setting_families() {
     assert!(WorkspaceApi::node_mode(svc.as_ref()));
 
     let s = svc.clone();
-    let got = as_daemon(async move { s.settings_get("remoteAgents.enabled".into()).await }).await;
-    assert_eq!(got.unwrap()["value"], json!(false));
+    let got =
+        as_daemon(async move { s.settings_get("remoteAgents.permission".into()).await }).await;
+    assert_eq!(got.unwrap()["value"], json!("allowAll"));
     let s = svc.clone();
     let got = as_daemon(async move { s.settings_get("agents.maxConcurrent".into()).await }).await;
     assert!(is_node_mode(&got), "{got:?}");
@@ -76,12 +77,15 @@ async fn node_mode_serves_only_the_three_setting_families() {
 
     let s = svc.clone();
     let applied = as_daemon(async move {
-        s.settings_update(json!([{ "path": "remoteAgents.enabled", "value": true }]))
+        s.settings_update(json!([{ "path": "remoteAgents.permission", "value": "autoByRisk" }]))
             .await
     })
     .await;
     assert!(applied.is_ok(), "{applied:?}");
-    assert!(registry.snapshot().effective.remote_agents.enabled);
+    assert_eq!(
+        registry.snapshot().effective.remote_agents.permission,
+        intent_core::settings_file::RemoteAgentPermission::AutoByRisk
+    );
 
     // One refused key refuses the whole batch; nothing is written.
     let s = svc.clone();
@@ -98,7 +102,7 @@ async fn node_mode_serves_only_the_three_setting_families() {
     assert!(effective.git.auto_commit);
     assert_eq!(
         effective.remote_agents.permission,
-        intent_core::settings_file::RemoteAgentPermission::AllowAll
+        intent_core::settings_file::RemoteAgentPermission::AutoByRisk
     );
     let s = svc.clone();
     let reset = as_daemon(async move { s.settings_reset("git.autoCommit".into()).await }).await;
@@ -201,16 +205,13 @@ impl crate::feature_ports::RemoteLaunchPort for MachinePort {
     }
 }
 
-/// `remoteMachines: 1` is advertised only by a backend with the remote
-/// feature and `experimental.remoteAgents` on, never in node mode.
+/// `remoteMachines: 1` is advertised by every backend with the remote
+/// feature, never in node mode. No setting gates it.
 #[tokio::test]
-async fn remote_machines_capability_needs_the_feature_and_the_setting_outside_node_mode() {
+async fn remote_machines_capability_needs_only_the_feature_outside_node_mode() {
     for node_mode in [false, true] {
         let dir = crate::test_support::test_tempdir("remote-machines-capability");
-        let (svc, registry) = services(&dir, node_mode, Some(false)).await;
-        registry
-            .apply(&[("experimental.remoteAgents".to_owned(), json!(true))])
-            .unwrap();
+        let (svc, _registry) = services(&dir, node_mode, Some(false)).await;
         assert!(
             !svc.remote_machines_capability(),
             "no remote feature: the backend methods are missing"
@@ -226,9 +227,5 @@ async fn remote_machines_capability_needs_the_feature_and_the_setting_outside_no
             !node_mode,
             "node mode {node_mode}"
         );
-        registry
-            .apply(&[("experimental.remoteAgents".to_owned(), json!(false))])
-            .unwrap();
-        assert!(!svc.remote_machines_capability(), "off with the setting");
     }
 }
