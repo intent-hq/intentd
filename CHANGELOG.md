@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.100] - 2026-11-01
+
+### 📚 Documentation
+
+- *(guide)* Mention the Workspace purged pill on archived rows ([#2907](https://github.com/intent-hq/intentd/pull/2907))
+
+### 🧪 Testing
+
+- *(services)* Split two callback-delivery loop tests into per-mode cases ([#2909](https://github.com/intent-hq/intentd/pull/2909))
+
+
+## [0.11.99] - 2026-11-01
+
+### 🚀 Features
+
+- Suppress git events and PR monitoring in plain-folder workspaces ([#2902](https://github.com/intent-hq/intentd/pull/2902))
+
+
 ## [0.11.98] - 2026-11-01
 
 ### 🚀 Features

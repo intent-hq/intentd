@@ -729,7 +729,9 @@ workspace yourself.
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
 untracked files, but keeps conversations, notes, tasks and the git branch. The
-workspace card's status then reads "Workspace folder purged to free disk space."
+workspace card's status then reads "Workspace folder purged to free disk space.",
+and under the **Archived** filter its row and board card show a **Workspace purged**
+pill.
 Workspaces whose folder is the repository itself and remote workspaces cannot be
 purged. To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set

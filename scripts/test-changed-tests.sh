@@ -24,20 +24,23 @@ script="$here/changed-tests.sh"
 script_bash=${CHANGED_TESTS_TEST_BASH:-$BASH}
 temp_dir=$(cd "$(mktemp -d)" && pwd -P)
 bin_dir="$temp_dir/bin"
+trap 'rm -rf "$temp_dir"' EXIT
 # The fixture checkout carries a copy of the script at scripts/ so the script
-# resolves the repo root from its own location, as the real one does.
+# resolves the repo root from its own location, as the real one does, plus
+# every scripts/ helper it calls. script_helpers.py derives that list from the
+# script itself, so a new helper call cannot break this suite with exit 127
+# deep inside a case (intentd#2896), and a call to a missing helper fails here
+# naming it.
 repo="$temp_dir/repo"
 mkdir -p "$bin_dir" "$repo/scripts"
-cp "$script" "$repo/scripts/changed-tests.sh"
-cp "$here/coverage-storage.py" "$repo/scripts/"
-if [[ -f "$here/with-test-policy.sh" ]]; then
-  cp "$here/with-test-policy.sh" "$repo/scripts/"
+if ! helpers=$(python3 -I -B "$here/script_helpers.py" changed-tests.sh); then
+  echo "changed-tests test failed: cannot list the helpers changed-tests.sh calls (see the error above)" >&2
+  exit 1
 fi
-if [[ -f "$here/ci-killed-rustc-retry.sh" ]]; then
-  cp "$here/ci-killed-rustc-retry.sh" "$repo/scripts/"
-fi
+for helper in $helpers; do
+  cp "$here/$helper" "$repo/scripts/"
+done
 script="$repo/scripts/changed-tests.sh"
-trap 'rm -rf "$temp_dir"' EXIT
 # Under GitHub Actions each plan's run goes through ci-killed-rustc-retry.sh,
 # which tees the plan's output (merging its stderr) and needs tools the
 # bin_dir below leaves out. This suite pins changed-tests.sh's own contract,
@@ -793,7 +796,9 @@ nogit="$temp_dir/nogit"
 rm -rf "$nogit"
 mkdir -p "$nogit/scripts"
 cp -R "$repo/crates" "$nogit/"
-cp "$script" "$nogit/scripts/"
+for helper in $helpers; do
+  cp "$here/$helper" "$nogit/scripts/"
+done
 mkdir -p "$nogit/.config"
 printf 'not a valid map line\n' >"$nogit/.config/e2e-test-map.txt"
 set +e
