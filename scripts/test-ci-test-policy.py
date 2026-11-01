@@ -32,8 +32,10 @@ INDIRECT_TEST_STEPS = {
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
     ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"),
 }
+# ci-killed-rustc-retry.sh is a transparent prefix: it runs the same cargo
+# command (once more only when the runner killed rustc).
 COMMAND = re.compile(
-    r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
+    r"^(?:[A-Z_]+=\S+\s+)*(?:\./scripts/ci-killed-rustc-retry\.sh\s+)?(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
     r"|\./scripts/(?:coverage-e2e|coverage-all|changed-tests)\.sh\b)"
 )
 

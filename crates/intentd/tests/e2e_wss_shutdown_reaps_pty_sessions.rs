@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -22,7 +23,6 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -45,26 +45,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 #[derive(Debug)]
@@ -397,7 +377,11 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
     let started_at = Instant::now();
     let shutdown = uds_rpc(&socket, 5, "system.shutdown", json!({})).await;
-    assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
+    assert_eq!(
+        shutdown["result"].get("ok"),
+        Some(&json!(true)),
+        "system.shutdown reply: {shutdown}"
+    );
 
     // Both stragglers must be gone within the bounded sweep: scripts are
     // flagged user-stopped synchronously, then one concurrent kill-all covers

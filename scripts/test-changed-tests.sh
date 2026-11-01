@@ -33,8 +33,17 @@ cp "$here/coverage-storage.py" "$repo/scripts/"
 if [[ -f "$here/with-test-policy.sh" ]]; then
   cp "$here/with-test-policy.sh" "$repo/scripts/"
 fi
+if [[ -f "$here/ci-killed-rustc-retry.sh" ]]; then
+  cp "$here/ci-killed-rustc-retry.sh" "$repo/scripts/"
+fi
 script="$repo/scripts/changed-tests.sh"
 trap 'rm -rf "$temp_dir"' EXIT
+# Under GitHub Actions each plan's run goes through ci-killed-rustc-retry.sh,
+# which tees the plan's output (merging its stderr) and needs tools the
+# bin_dir below leaves out. This suite pins changed-tests.sh's own contract,
+# so run it as a local caller would; scripts/test-ci-killed-rustc-retry.sh
+# covers the wrapper.
+unset GITHUB_ACTIONS
 
 fail() {
   echo "changed-tests test failed: $*" >&2
@@ -1763,6 +1772,7 @@ echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VER
 # expansions, so reject them by pattern too, then rerun the fixtures under a
 # real Bash 3 when one can be found.
 bash -n "$here/with-test-policy.sh" || fail "with-test-policy.sh does not parse"
+bash -n "$here/ci-killed-rustc-retry.sh" || fail "ci-killed-rustc-retry.sh does not parse"
 bash -n "$script" || fail "changed-tests.sh does not parse"
 bash -n "${BASH_SOURCE[0]}" || fail "test-changed-tests.sh does not parse"
 bash4_constructs='(^|[^A-Za-z0-9_])(declare|local|typeset)([[:blank:]]+-[A-Za-z]+)*[[:blank:]]+-[A-Za-z]*[An][A-Za-z]*([^A-Za-z]|$)|(^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|\$\{([A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*#?!$-])(\[[^]]*\])?(\^\^?|,,?)[^}]*\}|&>>|\|&|;;?&'
@@ -1791,7 +1801,7 @@ gate_sample miss 'echo ${rest%%/*}'
 gate_sample miss 'echo ${path##* -> }'
 gate_sample miss 'x) y ;;'
 gate_sample miss '# mapfile is unavailable on Bash 3'
-gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "${BASH_SOURCE[0]}")
+gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "$here/ci-killed-rustc-retry.sh" "${BASH_SOURCE[0]}")
 [[ -z "$gate_hits" ]] || fail "Bash 4+ constructs found (stock macOS bash is 3.2):"$'\n'"$gate_hits"
 
 # Lookup order, kept in step with the monorepo's scripts/find-bash3.sh (this

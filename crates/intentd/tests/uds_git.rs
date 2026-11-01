@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+#[track_caller]
 fn git(repo: &Path, args: &[&str]) {
     // The harness may inherit GIT_AUTHOR_*/GIT_COMMITTER_* (agent-spawned
     // shells do, post-#4142); env outranks the repo-local user.* config these

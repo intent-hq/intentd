@@ -134,8 +134,8 @@ the app window is minimized or covered. Content actions on it (`evaluate`,
 `screenshot`, `snapshot`, `getAccessibilityTree`, `navigate`, `focusTab`,
 `startSession`, and the `startCapture` / `captureStep` / `startTrace` session steps)
 keep it at full rate for as long as they run and for 30 s
-after your last action; after that an idle hidden tab drops back to a throttled rate
-(about 1 frame per second) to save battery. So animation, flicker and timing measured
+after your last action; after that an idle hidden tab drops back to a throttled,
+uneven rate to save battery. So animation, flicker and timing measured
 inside one `evaluate`, or across calls a few seconds apart, are real. After a longer
 gap, the first frames of the next action can still be throttled: send a cheap action
 first (e.g. `evaluate` of `1`). A trace or capture whose steps are more than 30 s apart

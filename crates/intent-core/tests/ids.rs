@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 use intent_core::ids::{AgentId, ClientId, NoteId, WorkspaceId};
 
+#[track_caller]
 fn assert_uuid_v4_shape(s: &str) {
     // `Uuid::new_v4().to_string()` is 36 chars with dashes at the canonical
     // positions (8-4-4-4-12).

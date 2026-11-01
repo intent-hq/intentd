@@ -724,6 +724,7 @@ const LOST_AT_DAEMON_STOP_ERROR: &str = "lost: the daemon stopped while the scri
 
 /// Serialized `ScriptRuntimeState` omits cleared fields (`skip_serializing_if`);
 /// a `null` anywhere in a runtime payload is a contract break.
+#[track_caller]
 fn assert_no_nulls(value: &Value, ctx: &str) {
     match value {
         Value::Null => panic!("{ctx}: null field (cleared fields must be omitted)"),

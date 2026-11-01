@@ -1065,6 +1065,7 @@ impl Harness for V1 {
         }
         super::review_wake::checklist(
             &requirements,
+            s.head_sha.as_deref(),
             crate::pr_monitor::requirements_ready(&s.requirements),
         )
     }

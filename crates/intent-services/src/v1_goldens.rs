@@ -662,6 +662,7 @@ fn golden_pr_monitor_checklist_and_change_wake() {
          \n\
          Where the PR stands now:\n\
          - state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
          - unresolved threads: 1 (resolution required to merge)\n\
@@ -738,6 +739,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - changes requested by 1 reviewer\n\
          - checks: 1 passed, 1 failed, 1 pending (of 3); failing required: build\n\
@@ -761,6 +763,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0 approving)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
@@ -775,12 +778,38 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
          - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)\n\
          - branch ancestry: unknown\n\
          - forge branch-update requirement: unknown"
     );
+}
+
+/// Every checklist names the head commit its check results belong to
+/// (intentd#2875: a wake delivered minutes late reported "12 passed" for the
+/// commit before a push, and the agent called the PR ready). An unknown head
+/// says the checks cannot be tied to a commit.
+#[test]
+fn golden_pr_monitor_checklist_names_the_head_the_checks_belong_to() {
+    let mut s = pr_snapshot("open");
+    s.head_sha = Some("7ad538b0c1d2e3f4".to_string());
+    let checklist = crate::pr_monitor::render_checklist(&s);
+    assert_eq!(
+        checklist.lines().nth(1),
+        Some("- head: 7ad538b0 (checks below are for this commit)"),
+        "{checklist}"
+    );
+    for head in [None, Some(String::new())] {
+        s.head_sha = head;
+        let checklist = crate::pr_monitor::render_checklist(&s);
+        assert_eq!(
+            checklist.lines().nth(1),
+            Some("- head: unknown (cannot tell which commit the checks below are for)"),
+            "{checklist}"
+        );
+    }
 }
 
 /// One-shot `runAt` fired notice: exact bytes (fired wording, not the TTL

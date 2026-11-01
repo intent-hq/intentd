@@ -336,10 +336,12 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
 }
+#[track_caller]
 fn refused(value: &Value) {
     assert_eq!(value["error"]["code"], -32003, "{value}");
 }

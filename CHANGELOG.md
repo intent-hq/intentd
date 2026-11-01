@@ -2,6 +2,138 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.98] - 2026-11-01
+
+### 🚀 Features
+
+- Plain-folder workspaces — persisted field and create path ([#2883](https://github.com/intent-hq/intentd/pull/2883))
+
+
+## [0.11.97] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Poll a monitored PR as soon as another read sees it move ([#2891](https://github.com/intent-hq/intentd/pull/2891))
+- *(pr-monitor)* Replace a queued PR monitor wake instead of stacking a stale one ([#2897](https://github.com/intent-hq/intentd/pull/2897))
+
+### 🧪 Testing
+
+- *(services)* Fix two timing-flaky intent-services tests ([#2895](https://github.com/intent-hq/intentd/pull/2895))
+
+
+## [0.11.96] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(services)* Name the stderr capture dir when the settle bound expires ([#2893](https://github.com/intent-hq/intentd/pull/2893))
+
+### 🧪 Testing
+
+- Report held settings gates when the GitLab ABA settings.update stalls ([#2898](https://github.com/intent-hq/intentd/pull/2898))
+
+
+## [0.11.95] - 2026-10-31
+
+### 📚 Documentation
+
+- Record Set aside alpha availability ([#2892](https://github.com/intent-hq/intentd/pull/2892))
+
+
+## [0.11.94] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(acp)* Fail requests registered after agent stdout EOF immediately ([#2879](https://github.com/intent-hq/intentd/pull/2879))
+
+
+## [0.11.93] - 2026-10-31
+
+### 🚀 Features
+
+- *(pr-monitor)* Name the head commit in every PR monitor checklist ([#2889](https://github.com/intent-hq/intentd/pull/2889))
+- *(acp)* Add ws.app.workspaces.search for the Assistant workspace ([#2874](https://github.com/intent-hq/intentd/pull/2874))
+
+### 🐛 Bug Fixes
+
+- *(settings)* Mark which settings chat cards may change (proposable) ([#2886](https://github.com/intent-hq/intentd/pull/2886))
+
+### 📚 Documentation
+
+- *(guide)* Note Disable auto-archive shows only while auto-archive is on ([#2868](https://github.com/intent-hq/intentd/pull/2868))
+- *(browser)* Describe the idle hidden-tab rate as throttled and uneven ([#2869](https://github.com/intent-hq/intentd/pull/2869))
+
+### 🧪 Testing
+
+- *(runtime)* Wait for running before the shutdown sweep in shutdown_pty_sessions_stops_scripts_and_kills_all_ptys ([#2876](https://github.com/intent-hq/intentd/pull/2876))
+- *(services)* Wait for saved completion watches in idle_three_cycle_does_not_defer ([#2885](https://github.com/intent-hq/intentd/pull/2885))
+- *(intentd)* Share the id-correlating UDS reply reader across e2e helpers ([#2881](https://github.com/intent-hq/intentd/pull/2881))
+
+
+## [0.11.92] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(providers)* Clear shared quota state when a provider configuration is edited ([#2878](https://github.com/intent-hq/intentd/pull/2878))
+
+### 🧪 Testing
+
+- *(lint)* Fail when AGENTS.md crate layout or lint table drifts ([#2875](https://github.com/intent-hq/intentd/pull/2875))
+
+
+## [0.11.91] - 2026-10-31
+
+### 🧪 Testing
+
+- Report caller lines from assertion helpers and lint for track_caller ([#2850](https://github.com/intent-hq/intentd/pull/2850))
+- *(intentd)* Correlate the shutdown reaper's UDS reply by id ([#2870](https://github.com/intent-hq/intentd/pull/2870))
+
+
+## [0.11.90] - 2026-10-31
+
+### 🚀 Features
+
+- *(acp)* Add ws.crossWorkspace.search across sibling workspaces ([#2865](https://github.com/intent-hq/intentd/pull/2865))
+
+### 📚 Documentation
+
+- *(guide)* Describe guided provider-profile setup ([#2862](https://github.com/intent-hq/intentd/pull/2862))
+
+### 🧪 Testing
+
+- *(runtime)* Wait for the recorded pty in service_pty_is_released_after_its_supervisor_settles ([#2867](https://github.com/intent-hq/intentd/pull/2867))
+- *(services)* Make migrate_queue_rearms_hold_timers_for_target independent of setup time ([#2866](https://github.com/intent-hq/intentd/pull/2866))
+
+
+## [0.11.89] - 2026-10-31
+
+### 🚀 Features
+
+- *(providers)* Return profile folder paths unmasked ([#2848](https://github.com/intent-hq/intentd/pull/2848))
+
+### 🐛 Bug Fixes
+
+- *(services)* Keep workspace.create poll frames off the debug stack ([#2860](https://github.com/intent-hq/intentd/pull/2860))
+
+### 🔧 Refactor
+
+- Share one token reader across intentd source lints ([#2855](https://github.com/intent-hq/intentd/pull/2855))
+
+### ⚡ Performance
+
+- *(services)* Store the execution_call inner future once and budget workspace.create ([#2847](https://github.com/intent-hq/intentd/pull/2847))
+
+
+## [0.11.88] - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(selection)* Report invalid remote names with the right error ([#2854](https://github.com/intent-hq/intentd/pull/2854))
+
+### 📚 Documentation
+
+- *(guide)* Mention the Assistant sidebar New chat action ([#2836](https://github.com/intent-hq/intentd/pull/2836))
+
+
 ## [0.11.87] - 2026-10-31
 
 ### 🔧 Refactor

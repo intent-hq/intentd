@@ -752,9 +752,11 @@ use std::time::{Duration, Instant};
 // 15.2 adds the Retired workspace state: workspace.retire, includeRetired list opt-in
 // (workspace.list/subscribe/findByPullRequest, crossWorkspace.listSiblings) and the
 // workspace-retired / retire-unsupported errors.
+// 15.3 adds plain-folder workspaces: Workspace.plainFolder and the workspace.create
+// plainFolder option (plain-folder-path-rejected); workspace.update refuses plainFolder.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "15.2";
+pub const PROTOCOL_VERSION: &str = "15.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

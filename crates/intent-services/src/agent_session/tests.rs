@@ -1709,9 +1709,12 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
         })
     };
     // Wait for the completing update to route: the live transcript's
-    // tool_result block flips to the slim placeholder once staged.
+    // tool_result block flips to the slim placeholder once staged. Both
+    // waits below only bound a hang — staging and the turn-end append each
+    // write a 64 KiB body, which under llvm-cov on a loaded runner outran a
+    // 2 s base budget — so they are generous; a passing run is not slowed.
     let mid = timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
         async {
             loop {
                 if let Some(slot) = services.live_turn(&agent_id) {
@@ -1723,7 +1726,10 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
                         break slot.message_id;
                     }
                 }
-                tokio::task::yield_now().await;
+                // Poll, don't spin: each probe clones the live transcript,
+                // and a hot `yield_now` loop competes with the turn task
+                // doing the staging it waits for.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         },
     )
@@ -1749,7 +1755,7 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
     // Release the turn: the final append adopts the staged row.
     release.send(()).expect("mock alive");
     timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
         turn,
     )
     .await

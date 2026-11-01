@@ -8847,6 +8847,43 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.crossWorkspace.search` (agent binding only; no wire method): the
+    /// caller's sibling workspaces matching `search`, best first, as
+    /// `{ matches: [{ id, title, branch, status, archived, updatedAt,
+    /// matchedOn, pullRequests?, notes? }], truncated }`. Same sibling scope
+    /// and errors as [`Self::cross_workspace_list_siblings`].
+    fn cross_workspace_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: crate::CrossWorkspaceSearch,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, search);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.app.workspaces.search` (Assistant workspace only): the
+    /// [`Self::cross_workspace_search`] ranking over every workspace the
+    /// caller can see, across repositories (the Assistant workspace itself
+    /// excluded). `repository` narrows to one GitHub `owner/name`
+    /// (case-insensitive). Rows also carry `repository` / `repositoryPath`.
+    fn app_workspaces_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: crate::CrossWorkspaceSearch,
+        repository: Option<crate::RepoRef>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, search, repository);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_workspaces_search not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `crossWorkspace.listNotes`: notes in a sibling workspace as a bare array
     /// of `{ id, title, createdAt, updatedAt }`.
     fn cross_workspace_list_notes(

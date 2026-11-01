@@ -15,6 +15,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod auto_archive_workspace;
+mod cross_workspace_search;
 mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;
@@ -24,8 +25,14 @@ mod skill_list;
 mod task_list_latency;
 mod task_push;
 mod workspace_auto_archive_disabled;
+// Budgets are debug-profile future sizes measured on x86_64 Linux (CI).
+#[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+mod workspace_create_future_size;
+mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
+mod workspace_plain_folder_safety;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -776,6 +783,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
     row.label = Some("Customer escalations for later".to_string());
     row.auto_archive_disabled = true;
+    row.plain_folder = true;
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(
