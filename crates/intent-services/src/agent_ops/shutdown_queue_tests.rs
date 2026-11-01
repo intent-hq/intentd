@@ -48,14 +48,13 @@ async fn shutdown_persists_a_requeue_whose_write_through_was_cancelled() {
     requeued.requeued_after_failure = true;
     svc.requeue_front(&agent, requeued);
     {
+        // Poll the write-through once while the gate is held, then drop it:
+        // the same cancellation a shutdown abort applies to a turn worker.
         let _held = svc.agent_queue_persist_gate.lock().await;
-        let cancelled = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            svc.persist_queue_snapshot(&agent),
-        )
-        .await;
+        let mut persist = std::pin::pin!(svc.persist_queue_snapshot(&agent));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
-            cancelled.is_err(),
+            std::future::Future::poll(persist.as_mut(), &mut cx).is_pending(),
             "the write-through must still be pending"
         );
     }
