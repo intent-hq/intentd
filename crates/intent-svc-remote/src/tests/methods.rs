@@ -1260,6 +1260,9 @@ async fn when_the_claim_cannot_read_its_records(action: DuringBind) {
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut failing = tuning();
     failing.fail_claim_reads = fail.clone();
+    // timing-guard: no redial between the refused call and the retry, so
+    // each call sees exactly one bind
+    failing.backoff = Backoff::new(Duration::from_millis(300), Duration::from_millis(600));
     let backend = Backend::with_tuning(failing).await;
     let mut machine = backend.machine().await;
     let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
@@ -1320,11 +1323,16 @@ async fn when_the_claim_cannot_read_its_records(action: DuringBind) {
             assert_eq!(row.credential_id, old_credential, "the credential is kept");
         }
         DuringBind::RemoveStoppingAgents => {
+            // The failed bind's link was closed; the stop goes out on the
+            // link that claims the survivor.
             let remove = backend.call(method, params(&machine, None));
             tokio::pin!(remove);
             let stop_id = tokio::select! {
                 result = &mut remove => panic!("removed before the survivor's stop was acked: {result:?}"),
-                stop_id = link.stop_for(&agent) => stop_id,
+                stop_id = async {
+                    link = machine.accept().await;
+                    link.stop_for(&agent).await
+                } => stop_id,
             };
             let (removed, ()) =
                 tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
@@ -1460,5 +1468,47 @@ mod at_boot {
             );
             machine.no_link(Duration::from_millis(300)).await;
         }
+    }
+
+    // Review of intentd#2931: a bind whose claim cannot read this lease's
+    // records must not serve the link (its survivors' records would be
+    // dropped yet acknowledged); the connector retries the bind on its own,
+    // and nothing is acknowledged before the claim succeeds.
+    #[tokio::test]
+    async fn a_failed_claim_at_boot_is_retried_before_anything_is_acknowledged() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut failing = tuning();
+        failing.fail_claim_reads = fail.clone();
+        // timing-guard: a redial gap long enough to clear the failure in
+        failing.backoff = Backoff::new(Duration::from_millis(300), Duration::from_millis(600));
+        let backend = Backend::with_tuning(failing).await;
+        let mut machine = backend.machine().await;
+        let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        backend.services.resume_exposed_machines().await;
+
+        let mut first = machine.accept().await;
+        first.closed_by_head().await;
+        assert_eq!(running_agents_listed(&backend).await, 0);
+
+        // The records are readable again; no user action follows.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut second = machine.accept().await;
+        assert_eq!(
+            second.hello.acked_seq,
+            NodeCounter(0),
+            "nothing was acknowledged"
+        );
+        second.replay_complete(0).await;
+        second
+            .journal(note(1, &agent, "while the claim failed"))
+            .await;
+        second.acked(1).await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is claimed on the retried bind");
     }
 }

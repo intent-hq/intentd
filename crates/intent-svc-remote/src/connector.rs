@@ -948,7 +948,6 @@ async fn run(
             events,
             welcome,
         } = dialed;
-        backoff.reset();
         retry = false;
         *lock(&shared.route) = Some(route);
         if let Err(error) = lease.record_welcome(&welcome).await {
@@ -963,11 +962,40 @@ async fn run(
         if let Some(hook) = &shared.tuning.before_claim.0 {
             hook(&shared);
         }
-        if claim(&shared, &welcome.running_agents).await {
-            shared
-                .claimed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !claim(&shared, &welcome.running_agents).await {
+            // The survivors cannot be told apart, so this link is not served:
+            // their journal records would have no runtime to go to, yet be
+            // acknowledged. Close it and bind again (with backoff) until the
+            // claim succeeds; nothing was acknowledged, so the machine
+            // replays everything on the next bind.
+            link.close();
+            shared.disconnected();
+            let failure = ConnectFailure::Local(
+                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received"
+                    .into(),
+            );
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Err(failure.clone()));
+            }
+            lock(&shared.capability_waiters).clear();
+            shared.announce().await;
+            retry = shared.wants_link();
+            if retry {
+                tokio::select! {
+                    () = tokio::time::sleep(backoff.next_delay()) => {}
+                    demand = demands.recv() => match demand {
+                        Some(waiter) => waiters.extend(waiter),
+                        None => return,
+                    },
+                    () = wait_true(&mut shutdown) => return,
+                }
+            }
+            continue;
         }
+        backoff.reset();
+        shared
+            .claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
