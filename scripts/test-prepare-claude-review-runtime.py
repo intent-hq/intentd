@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""Explicit offline qualification of the real pinned review bundle.
+"""Offline checks of the pinned review runtime preparer and its real bundle.
 
-Does not enable a provider or send a model prompt. The bundled containment
+Without --bundle, only DescriptorTests run: they need no assembled bundle, so
+ci.yml's release-scripts job runs them on every PR. They pin the refusal of a
+tampered review descriptor and the scratch copy that check runs in (before
+intentd#2911 its hand-kept copy list lacked two data files, unnoticed because
+nothing ran it automatically). They need Linux x64 with glibc >=2.38, as the
+preparer does.
+
+With --bundle, ReviewBundleTests also qualify the real pinned bundle. That
+does not enable a provider or send a model prompt. The bundled containment
 version command and default-off adapter handshake execute after authentication.
 """
 import argparse
@@ -30,9 +38,57 @@ HELPERS_SPEC.loader.exec_module(script_helpers)
 BUNDLE = None
 
 
+class DescriptorTests(unittest.TestCase):
+    """Bundle-free: the preparer runs from a scratch copy of scripts/."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            runtime.platform_check()
+        except runtime.archive.InvalidRuntime as error:
+            # A local run on another host skips; CI must never skip silently.
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise
+            raise unittest.SkipTest(f"the preparer refuses this host: {error}")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="review-runtime-descriptor-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.copied = self.root / "scripts"
+        self.copied.mkdir()
+        names = script_helpers.copy_into(["prepare-claude-review-runtime.py"], self.copied)
+        # intentd#2911: the hand-kept list this replaced lacked both.
+        for name in ("claude-review-runtime.patch", "claude-callback-runtime.json"):
+            self.assertIn(name, names)
+
+    def verify(self):
+        result = subprocess.run([sys.executable, "-I", "-B",
+                                 str(self.copied / "prepare-claude-review-runtime.py"),
+                                 "verify", "--root", str(self.root / "unused")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "unused").exists())
+        return result.stderr
+
+    def test_untampered_copy_passes_descriptor_check(self):
+        # Control: the copy is complete and trusted, so the refusal below is
+        # the added byte, not a missing file or an unsupported host.
+        stderr = self.verify()
+        self.assertIn("installation root is absent", stderr)
+        self.assertNotIn("untrusted review descriptor", stderr)
+
+    def test_descriptor_tamper_is_refused(self):
+        with (self.copied / "claude-review-runtime.json").open("ab") as stream:
+            stream.write(b" ")
+        self.assertIn("untrusted review descriptor", self.verify())
+
+
 class ReviewBundleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if BUNDLE is None:
+            raise unittest.SkipTest("needs --bundle")
         cls.contract = runtime.configuration()
         runtime.archive.check_bundle(cls.contract, BUNDLE)
 
@@ -40,19 +96,6 @@ class ReviewBundleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="review-runtime-qualification-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-
-    def test_descriptor_tamper_is_refused(self):
-        copied = self.root / "scripts"
-        copied.mkdir()
-        script_helpers.copy_into(["prepare-claude-review-runtime.py"], copied)
-        with (copied / "claude-review-runtime.json").open("ab") as stream:
-            stream.write(b" ")
-        result = subprocess.run([sys.executable, str(copied / "prepare-claude-review-runtime.py"),
-                                 "verify", "--root", str(self.root / "unused")],
-                                capture_output=True, text=True, timeout=10)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("untrusted review descriptor", result.stderr)
-        self.assertFalse((self.root / "unused").exists())
 
     def test_archive_tamper_refused_before_install(self):
         altered = self.root / "altered.tar.gz"
@@ -175,7 +218,12 @@ class ReviewBundleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", required=True, type=Path)
+    parser.add_argument("--bundle", type=Path,
+                        help="the assembled bundle to qualify; without it only DescriptorTests run")
     args = parser.parse_args()
+    if args.bundle is None:
+        print("No --bundle: running DescriptorTests only; the bundle is not qualified.",
+              file=sys.stderr)
+        unittest.main(argv=[sys.argv[0]], defaultTest="DescriptorTests", verbosity=2)
     BUNDLE = args.bundle.resolve(strict=True)
     unittest.main(argv=[sys.argv[0]], verbosity=2)
