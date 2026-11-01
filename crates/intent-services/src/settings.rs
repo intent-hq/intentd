@@ -1343,15 +1343,23 @@ impl SettingDefinition {
 /// Setting families an Assistant chat card must never change, even though
 /// they are neither sensitive nor read-only: the listener, auth and tunnel
 /// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
-/// credential routing (`sourceControl.`), and account companions of stored
-/// secrets (`accounts.`). Users change these in Settings.
-const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &["server.", "sharing.", "sourceControl.", "accounts."];
+/// credential routing (`sourceControl.`), account companions of stored
+/// secrets (`accounts.`), and running agents for other daemons
+/// (`remoteAgents.`). Users change these in Settings.
+const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
+    "server.",
+    "sharing.",
+    "sourceControl.",
+    "accounts.",
+    "remoteAgents.",
+];
 
 /// Individual settings an Assistant chat card must never change: the primary
 /// identity key, the Git SSH key, executables the daemon runs (provider CLIs,
 /// auggie, the terminal shell), data/workspace locations, the command
 /// permission rules, the prompt rules injected into every agent's system
-/// prompt, and opaque client/daemon state blobs.
+/// prompt, opaque client/daemon state blobs, placing agents on exposed
+/// machines (`experimental.remoteAgents`) and the daemon's mode.
 const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "identity.provider",
     "userRules",
@@ -1369,6 +1377,8 @@ const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "workspace.changeHistory",
     "workspaceInitializer.state",
     "hardwareConsole.state",
+    "experimental.remoteAgents",
+    "daemon.mode",
 ];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
@@ -4580,6 +4590,10 @@ mod tests {
             "workspaceRules",
             "specialists.dir",
             "linear.token",
+            "remoteAgents.enabled",
+            "remoteAgents.permission",
+            "experimental.remoteAgents",
+            "daemon.mode",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.proposable(), "{path} must not be proposable");

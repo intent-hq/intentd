@@ -65,8 +65,8 @@ mod auto_archive;
 mod auto_retire;
 mod executor_capabilities;
 mod executor_ops;
-mod remote_machine_ops;
 mod plain_folder;
+mod remote_machine_ops;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;

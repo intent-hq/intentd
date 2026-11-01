@@ -143,6 +143,7 @@ impl Uds {
     }
 }
 
+#[track_caller]
 fn assert_node_mode_refusal(reply: &Value, what: &str) {
     assert_eq!(reply["error"]["code"], -32003, "{what}: {reply}");
     assert_eq!(
@@ -151,6 +152,7 @@ fn assert_node_mode_refusal(reply: &Value, what: &str) {
     );
 }
 
+#[track_caller]
 fn assert_ok(reply: &Value, what: &str) -> Value {
     assert!(reply.get("error").is_none(), "{what}: {reply}");
     reply["result"].clone()

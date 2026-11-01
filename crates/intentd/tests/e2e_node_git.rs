@@ -44,6 +44,7 @@ fn remote(agent: &str) -> AgentRemote {
     AgentRemote::new(WS, agent).unwrap()
 }
 
+#[track_caller]
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

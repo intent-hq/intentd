@@ -20,10 +20,10 @@ const SECRET: &str = "sk-very-secret-value-1234";
 #[path = "provider_profiles_default_tests.rs"]
 mod default_overrides;
 
-#[path = "provider_profiles_remote_tests.rs"]
-mod remote_launch;
 #[path = "provider_profiles_quota_tests.rs"]
 mod quota_state;
+#[path = "provider_profiles_remote_tests.rs"]
+mod remote_launch;
 
 struct Fixture {
     _db: TempDb,
