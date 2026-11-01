@@ -801,22 +801,29 @@ directing users to this control. Some app versions show it only while **Archive
 idle workspaces** is on. Only the owner can change it; it starts off for each
 workspace and leaves manual archiving available. Older apps may not offer it.
 
-In app and daemon versions offering folder cleanup, choose **Purge workspace
-folder** on an archived workspace, then confirm. This deletes the folder,
-including uncommitted changes and untracked files, but keeps conversations, notes,
-tasks and the git branch. The status message reads "Workspace folder purged to
-free disk space." Remote workspaces and workspaces whose folder is the repository
-itself cannot be purged. In apps using this cleanup flow, the workspace stays
-under **Archived**, with its history readable.
+In app and daemon versions offering folder cleanup, use the controls below.
+The **Workspace purged** pill described below additionally requires an app
+version supporting that badge; earlier cleanup apps show only the status text.
 
-For automatic cleanup, matching apps offer **Workspace setup → Free disk space
-for archived workspaces** and a day count (7 when first enabled). Supporting
-daemons use `purgeArchivedAfterDays` in `config.toml`; this is off by default,
-checks about once an hour, and skips shared or non-retirable workspaces,
-uncommitted changes, unpushed commits in nested repositories inside the folder,
-and unreadable local-change state. On newer daemons, a recorded merged PR head
-covering a nested repository's commits can lift that unpushed-commit block; later
-commits and uncommitted changes still block automatic cleanup.
+To free disk space, right-click an archived workspace and choose **Purge workspace
+folder**, then confirm. This deletes the folder, including uncommitted changes and
+untracked files, but keeps conversations, notes, tasks and the git branch. The
+workspace card's status then reads "Workspace folder purged to free disk space.",
+and under the **Archived** filter its row and board card show a **Workspace purged**
+pill.
+Workspaces whose folder is the repository itself and remote workspaces cannot be
+purged. To purge automatically, turn on **Workspace setup → Free disk space for
+archived workspaces** and set the number of days (7 when first turned on), or set
+`purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
+hour, and skips workspaces with uncommitted changes or with unpushed commits in a
+nested repository (such as a submodule), unless Intent saw those commits merged in a
+pull request.
+
+In apps using this cleanup flow, the workspace stays under **Archived**, with its
+history readable. Automatic cleanup also skips shared or non-retirable workspaces
+and unreadable local-change state. On newer daemons, the merged-PR exception
+applies only to commits covered by the recorded PR head; later commits and
+uncommitted changes still block automatic cleanup.
 
 Older apps may instead offer **Retire**, the **Retired** filter, **Restore as blank
 workspace**, and **Automatically retire archived workspaces** with **Retire after
