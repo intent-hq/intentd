@@ -764,6 +764,27 @@ fn executor_platform_is_linux_or_macos_on_x86_64_or_aarch64() {
     assert!(platform_of("linux", "riscv64").is_err());
 }
 
+/// A data dir too deep for a Unix socket path (`SUN_LEN`) still serves its
+/// backends: the git helper socket moves to a short private path.
+#[tokio::test]
+async fn a_long_data_dir_still_binds_and_launches() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut data_dir = dir.path().to_owned();
+    while data_dir.as_os_str().len() < 160 {
+        data_dir.push("a-rather-long-data-dir-segment");
+    }
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let node = Running::start(&data_dir, 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
+    dialed.link.send(&refused_launch("a1")).await.unwrap();
+    let record = next_record(&mut dialed).await;
+    assert_eq!(record.agent_id, AgentId::from("a1"));
+    node.stop().await;
+}
+
 /// Each backend (credential) has its own storage, journal and sequence
 /// under `<data_dir>/executor/<credentialId>/`.
 #[tokio::test]
