@@ -267,8 +267,8 @@ intent-hq/intentd#1853); the `make` targets are the supported path.
 
 `make check` lints only the host target, so code gated to `cfg(unix)` or `cfg(windows)` can be
 clean there and still fail Windows Clippy (an import that only `cfg(unix)` code uses, intentd#2672).
-CI's `windows-cross-lint` job runs the same check on every PR, on Linux, so a local run only
-saves a push round trip; the merge queue's native `windows-lint` job stays the final authority.
+CI's `windows-cross-lint` job runs the same check on every PR and merge-queue entry, on Linux, so
+a local run only saves a push round trip; the push-only `windows` job is the native MSVC check.
 
 The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
 integration test is a source-scanning lint, selected by convention — run them all with
