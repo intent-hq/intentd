@@ -72,6 +72,10 @@ pub trait StartupExt {
     /// machines over their tailcat address. Nothing is dialed until a
     /// machine is needed.
     fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>);
+
+    /// Start the connector to every exposed machine that may still run this
+    /// backend's agents, so it reconnects in the background and claims them.
+    fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send;
 }
 
 impl StartupExt for Services {
@@ -81,5 +85,9 @@ impl StartupExt for Services {
 
     fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>) {
         intent_svc_remote::RemoteServicesExt::configure_remote_machines(self, tailcat_bin);
+    }
+
+    fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send {
+        intent_svc_remote::RemoteServicesExt::resume_exposed_machines(self)
     }
 }

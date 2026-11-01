@@ -193,11 +193,66 @@ pub fn register(services: Services) -> Services {
 }
 
 /// Remote entry points the daemon calls on [`Services`].
+/// See [`RemoteServicesExt::resume_exposed_machines`]. Starting a connector
+/// dials nothing inline: each one connects in the background, with backoff
+/// while it is unreachable, so a machine that is down never slows the start.
+async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
+    let Some(feature) = svc.remote_feature() else {
+        return Vec::new();
+    };
+    if svc.node_mode() {
+        return Vec::new();
+    }
+    let candidates = match machines_with_live_records(svc).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, "remote machines: could not read the recorded agents at start");
+            return Vec::new();
+        }
+    };
+    let mut started = Vec::new();
+    for machine_id in candidates {
+        match feature.node(svc, &machine_id).await {
+            Ok(_) => started.push(machine_id),
+            Err(error) => {
+                tracing::warn!(machine = %machine_id, %error, "remote machine: could not start its connector at start");
+            }
+        }
+    }
+    started
+}
+
+/// The exposed machines with a live lease that records agents that may
+/// still run.
+async fn machines_with_live_records(svc: &Services) -> Result<Vec<String>> {
+    let store = svc.store();
+    let head_id = store.daemon_id().await?;
+    let mut machines = Vec::new();
+    for lease in store.list_owned_node_leases(&head_id).await? {
+        let machine_id = &lease.owner.node_id;
+        if lease.state.is_terminal()
+            || machines.contains(machine_id)
+            || store.get_exposed_machine(machine_id).await?.is_none()
+        {
+            continue;
+        }
+        if connector::has_live_records(store, &lease.owner.lease_id).await? {
+            machines.push(machine_id.clone());
+        }
+    }
+    Ok(machines)
+}
+
 pub trait RemoteServicesExt {
     /// Give the feature the sitter-shipped tailcat binary, so machines can
     /// also be reached over their tailcat address. Without it only direct
     /// routes are tried.
     fn configure_remote_machines(&self, tailcat_bin: Option<PathBuf>);
+
+    /// At daemon start: start the connector to every exposed machine that
+    /// may still run this backend's agents, so it reconnects in the
+    /// background and claims them. Returns the machines started.
+    fn resume_exposed_machines(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
 
     /// The remote feature, when registered.
     fn remote_feature(&self) -> Option<&RemoteFeature>;
@@ -208,6 +263,11 @@ impl RemoteServicesExt for Services {
         if let Some(feature) = self.remote_feature() {
             *lock(&feature.tailcat_bin) = tailcat_bin;
         }
+    }
+
+    fn resume_exposed_machines(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        let svc = self.clone();
+        async move { resume_exposed_machines(&svc).await }
     }
 
     fn remote_feature(&self) -> Option<&RemoteFeature> {

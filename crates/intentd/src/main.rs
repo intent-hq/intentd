@@ -2564,6 +2564,15 @@ async fn cmd_serve_owned(
     // demand; hand the feature the tailcat binary for their tailcat routes.
     // Node mode never starts a connector.
     services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
+    // Machines that may still run this backend's agents reconnect on their
+    // own after a restart, in the background, so a machine that is down
+    // never slows the start.
+    let services_remote_resume = services.clone();
+    startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            services_remote_resume.resume_exposed_machines().await;
+        })
+    });
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();

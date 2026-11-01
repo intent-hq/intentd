@@ -196,6 +196,10 @@ pub(crate) struct Shared {
     claimed: std::sync::atomic::AtomicBool,
     /// Serializes claims: a bind's and a retried one ([`RemoteNode::reclaim`]).
     claim_lock: tokio::sync::Mutex<()>,
+    /// Set at start when agents that may still run are recorded on this
+    /// lease: the link is wanted, and redialed with backoff, until a bind
+    /// claims them.
+    survivors_unclaimed: std::sync::atomic::AtomicBool,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
@@ -251,6 +255,10 @@ impl Shared {
         self.agents.live_count() > 0
             || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
+            || (self
+                .survivors_unclaimed
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && !self.claimed.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Queue a stop for `agent_id` (reusing its id when one is already
@@ -601,15 +609,20 @@ impl RemoteNode {
             route: Mutex::new(None),
             claimed: std::sync::atomic::AtomicBool::new(false),
             claim_lock: tokio::sync::Mutex::new(()),
+            survivors_unclaimed: std::sync::atomic::AtomicBool::new(false),
             capability_waiters: Mutex::new(Vec::new()),
             ingested: Mutex::new(acked),
             demand,
             shutdown: watch::channel(false).0,
         });
-        // After a backend restart, agents placed here may still run: bind
-        // once to claim them (and let the idle timer close an unneeded link).
+        // After a backend restart, agents placed here may still run: keep
+        // dialing (with backoff) until a bind claims them, then let the idle
+        // timer close an unneeded link.
         let lease_id = lease.owner().lease_id.clone();
-        if !shared.store.list_remote_agents(&lease_id).await?.is_empty() {
+        if has_live_records(&shared.store, &lease_id).await? {
+            shared
+                .survivors_unclaimed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             shared.wake();
         }
         intent_core::spawn_daemon(run(shared.clone(), lease, Ingest::new(acked), demands));
@@ -935,7 +948,6 @@ async fn run(
             events,
             welcome,
         } = dialed;
-        backoff.reset();
         retry = false;
         *lock(&shared.route) = Some(route);
         if let Err(error) = lease.record_welcome(&welcome).await {
@@ -950,11 +962,40 @@ async fn run(
         if let Some(hook) = &shared.tuning.before_claim.0 {
             hook(&shared);
         }
-        if claim(&shared, &welcome.running_agents).await {
-            shared
-                .claimed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !claim(&shared, &welcome.running_agents).await {
+            // The survivors cannot be told apart, so this link is not served:
+            // their journal records would have no runtime to go to, yet be
+            // acknowledged. Close it and bind again (with backoff) until the
+            // claim succeeds; nothing was acknowledged, so the machine
+            // replays everything on the next bind.
+            link.close();
+            shared.disconnected();
+            let failure = ConnectFailure::Local(
+                "could not tell which of this backend's agents still run there (its agent records could not be read); nothing was received"
+                    .into(),
+            );
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(Err(failure.clone()));
+            }
+            lock(&shared.capability_waiters).clear();
+            shared.announce().await;
+            retry = shared.wants_link();
+            if retry {
+                tokio::select! {
+                    () = tokio::time::sleep(backoff.next_delay()) => {}
+                    demand = demands.recv() => match demand {
+                        Some(waiter) => waiters.extend(waiter),
+                        None => return,
+                    },
+                    () = wait_true(&mut shutdown) => return,
+                }
+            }
+            continue;
         }
+        backoff.reset();
+        shared
+            .claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
@@ -1170,6 +1211,23 @@ impl Acks {
             let _ = link.send(&LinkFrame::Ack { seq }).await;
         }
     }
+}
+
+/// Whether agents that may still run are recorded on `lease_id`: a record
+/// whose session has not ended (deleted or completed). A session that cannot
+/// be read counts, so a read failure never hides a survivor.
+pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bool> {
+    for record in store.list_remote_agents(lease_id).await? {
+        match store.get_agent_session(&record.agent_id).await {
+            Ok(session)
+                if matches!(
+                    session.status,
+                    intent_core::AgentStatus::Deleted | intent_core::AgentStatus::Completed
+                ) => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
 }
 
 /// Claim the node's running agents at bind: an agent head has no record of
