@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.97] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Poll a monitored PR as soon as another read sees it move ([#2891](https://github.com/intent-hq/intentd/pull/2891))
+- *(pr-monitor)* Replace a queued PR monitor wake instead of stacking a stale one ([#2897](https://github.com/intent-hq/intentd/pull/2897))
+
+### 🧪 Testing
+
+- *(services)* Fix two timing-flaky intent-services tests ([#2895](https://github.com/intent-hq/intentd/pull/2895))
+
+
 ## [0.11.96] - 2026-10-31
 
 ### 🐛 Bug Fixes
