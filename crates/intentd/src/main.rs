@@ -6359,7 +6359,9 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
 /// the Settings UI takes effect on the next tick without a restart. The
 /// sweeps themselves are [`intent_services::retention::run_retention_tick`]
 /// (testable in isolation with a fixed `now`); this loop owns only the timer
-/// and the pool maintenance. After
+/// and the pool maintenance. The first tick waits
+/// [`RETENTION_LOOP_START_DELAY`] so a short-lived daemon never starts a
+/// vacuum chunk its shutdown would have to wait for. After
 /// the sweeps each tick runs a time-paced freelist drain
 /// ([`intent_services::retention::run_incremental_vacuum_drain`]): short
 /// `PRAGMA incremental_vacuum` chunks that each hold the single write
@@ -6397,8 +6399,7 @@ fn spawn_stream_retention_loop(
     };
     let vacuum_policy = intent_services::retention::VacuumDrainPolicy::for_tick_interval(interval);
     intent_core::spawn_daemon(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticker = retention_ticker(interval);
         loop {
             ticker.tick().await;
             // Both tool-payload knobs are read live from the registry per tick.
@@ -6418,6 +6419,25 @@ fn spawn_stream_retention_loop(
             }
         }
     })
+}
+
+/// Delay before the retention loop's first tick. A vacuum chunk that is
+/// already running keeps going on the sqlx worker after the loop is aborted,
+/// so the final `wal_checkpoint(TRUNCATE)` in `Store::close` waits for it
+/// (seconds on a loaded runner). Deferring the first sweep and drain means
+/// short-lived daemons (e2e tests, quick restarts) never start one, and keeps
+/// them clear of the startup burst, like [`NOTE_PAGING_CLEANUP_START_DELAY`].
+const RETENTION_LOOP_START_DELAY: Duration = Duration::from_secs(30);
+
+/// The retention loop's timer: first tick after [`RETENTION_LOOP_START_DELAY`],
+/// then every `interval`.
+fn retention_ticker(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + RETENTION_LOOP_START_DELAY,
+        interval,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 /// Delay before the retired note paging cleanup starts, so it stays clear of
@@ -11766,6 +11786,80 @@ for line in sys.stdin:
             usage,
             TreeWalk::default(),
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
+        );
+    }
+
+    /// The retention loop must not start a vacuum drain right after startup
+    /// (intentd merge-queue coverage-e2e run 41259421848): an in-flight
+    /// `PRAGMA incremental_vacuum` chunk keeps running on the sqlx worker after
+    /// `retention_task.abort()`, so the final `wal_checkpoint(TRUNCATE)` in
+    /// `Store::close` waited seconds behind it on loaded runners. Short-lived
+    /// daemons must shut down before the first drain ever starts.
+    #[tokio::test]
+    async fn retention_loop_defers_vacuum_drain_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        sqlx::query("CREATE TABLE filler (id INTEGER PRIMARY KEY, data BLOB)")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        for id in 0..64 {
+            sqlx::query("INSERT INTO filler (id, data) VALUES (?, zeroblob(65536))")
+                .bind(id)
+                .execute(store.write_pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE filler")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let freelist = store.freelist_count().await.unwrap();
+        assert!(
+            freelist > 0,
+            "seed should leave a freelist (got {freelist})"
+        );
+        let registry = Arc::new(
+            intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
+        );
+        let retention = spawn_stream_retention_loop(store.clone(), 0, registry);
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        retention.abort();
+        let _ = retention.await;
+        assert_eq!(
+            store.freelist_count().await.unwrap(),
+            freelist,
+            "no vacuum chunk may run during the startup delay"
+        );
+        let started = std::time::Instant::now();
+        store.close().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "close waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The first retention tick (sweeps and vacuum drain) fires after
+    /// [`RETENTION_LOOP_START_DELAY`]; later ticks keep the unchanged interval.
+    #[tokio::test(start_paused = true)]
+    async fn retention_ticker_waits_start_delay_then_keeps_interval() {
+        let interval = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let mut ticker = retention_ticker(interval);
+        assert!(
+            tokio::time::timeout(
+                RETENTION_LOOP_START_DELAY.saturating_sub(Duration::from_millis(1)),
+                ticker.tick()
+            )
+            .await
+            .is_err(),
+            "the first tick must not fire before the start delay"
+        );
+        assert_eq!(ticker.tick().await - start, RETENTION_LOOP_START_DELAY);
+        assert_eq!(
+            ticker.tick().await - start,
+            RETENTION_LOOP_START_DELAY + interval
         );
     }
 }
