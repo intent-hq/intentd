@@ -25,6 +25,7 @@ mod sharing;
 mod workspace_auto_archive_disabled;
 mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
 mod workspace_retired;
 
 mod metadata_key_json;

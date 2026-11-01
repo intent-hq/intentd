@@ -20,7 +20,7 @@
 //! branch, at the same path. It is reached through `workspace.unarchive` /
 //! `workspace.restore` and the turn-start auto-unarchive.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use intent_core::{AgentId, Error, Result, Workspace, WorkspaceId, WorkspaceStatus};
 
@@ -140,6 +140,7 @@ impl Services {
         if !current.is_retired() {
             retire_supported(&current)?;
             self.require_owned_worktree(&current)?;
+            self.refuse_checkout_in_plain_folder(&current).await?;
             // A workspace inside its delete grace window is on its way out:
             // retiring it would race the committed delete.
             if self
@@ -199,6 +200,7 @@ impl Services {
         if !fresh.is_retired() {
             retire_supported(&fresh)?;
             self.require_owned_worktree(&fresh)?;
+            self.refuse_checkout_in_plain_folder(&fresh).await?;
         }
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
@@ -318,6 +320,9 @@ impl Services {
         // Same ownership proof as retire: revive detaches whatever sits at
         // the persisted path, so that path must be daemon-owned.
         self.require_owned_worktree(ws)?;
+        // Never provision (or detach) inside a plain folder (§5.1) that now
+        // sits at the persisted checkout's place.
+        self.refuse_checkout_in_plain_folder(ws).await?;
         let (Some(repo), Some(wt)) = (
             ws.repository_path.as_deref().map(PathBuf::from),
             ws.worktree_path.as_deref().map(PathBuf::from),
@@ -342,6 +347,7 @@ impl Services {
                                 return Err(Error::RetireUnsupported {
                                     workspace_id: name.clone(),
                                     checkout_mode,
+                                    plain_folder: false,
                                 });
                             }
                             intent_git::worktree::detach_worktree(&repo, &wt)?
@@ -442,6 +448,30 @@ impl Services {
     /// folder the daemon cannot prove it created, so retire is refused with
     /// `retire-unsupported` and nothing changes. A present folder must also
     /// be a linked worktree registered in the source repository.
+    /// Refuse to retire a workspace whose checkout, or its `<root>/<id>`
+    /// parent, overlaps a plain-folder workspace's folder (§5.1): the purge
+    /// would delete the user's files. `retire-unsupported` with
+    /// `plainFolder: true`, so the automatic purge skips it for good. A
+    /// failed plain-folder lookup refuses with the lookup error (retried).
+    async fn refuse_checkout_in_plain_folder(&self, ws: &Workspace) -> Result<()> {
+        let Some(wt) = ws.worktree_path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let guard = Ok(crate::plain_folder::PlainFolderGuard::load(&self.store).await?);
+        if !crate::plain_folder::PlainFolderGuard::checkout_removable(
+            &guard,
+            Path::new(wt),
+            "workspace.retire",
+        ) {
+            return Err(Error::RetireUnsupported {
+                workspace_id: ws.id.as_str().to_string(),
+                checkout_mode: None,
+                plain_folder: true,
+            });
+        }
+        Ok(())
+    }
+
     fn require_owned_worktree(&self, ws: &Workspace) -> Result<()> {
         let workspaces_root = self
             .workspaces_root
@@ -483,6 +513,7 @@ impl Services {
             Err(Error::RetireUnsupported {
                 workspace_id: ws.id.as_str().to_string(),
                 checkout_mode: ws.checkout_mode,
+                plain_folder: false,
             })
         }
     }
@@ -515,6 +546,29 @@ impl Services {
         // [`retire_supported`] admitted only a daemon-owned git worktree
         // (`checkoutMode` worktree, not skipIsolation / remote), so both
         // paths are present.
+        // Never a plain folder (§5.1 "Plain-folder workspaces"): loaded
+        // BEFORE anything is detached, renamed or removed. A checkout (or its
+        // `<root>/<id>` parent: trash sibling, metadata, empty-parent removal)
+        // overlapping a plain folder is left entirely alone, as is every
+        // id-derived candidate; a failed lookup keeps everything (fail
+        // closed). The up-front refusal in `retire_workspace_inner` normally
+        // stops this earlier.
+        let plain_guard = crate::plain_folder::PlainFolderGuard::load(&self.store).await;
+        let checkout_removable = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+            .is_none_or(|wt| {
+                crate::plain_folder::PlainFolderGuard::checkout_removable(
+                    &plain_guard,
+                    wt,
+                    "workspace.retire checkout",
+                )
+            });
+        if !checkout_removable {
+            return;
+        }
         let worktree_path = ws.worktree_path.clone().filter(|p| !p.is_empty());
         let repo_dir = ws
             .repository_path
@@ -558,6 +612,9 @@ impl Services {
             std::iter::once(workspaces_root.as_path())
                 .chain(worktrees_location.as_deref())
                 .any(|root| resolve_within_root(dir, root).is_some())
+        })
+        .filter(|dir| {
+            crate::plain_folder::PlainFolderGuard::removable(&plain_guard, dir, "workspace.retire")
         })
         .collect();
         let id = ws.id.clone();
@@ -632,16 +689,27 @@ pub(crate) fn resolve_within_root(
     (resolved != root && resolved.starts_with(&root)).then_some(resolved)
 }
 
-/// Retire is only for daemon-owned git worktrees: `cow` / `direct`
-/// checkouts (the folder IS the repository — deleting it loses the branch),
-/// `skipIsolation` workspaces (the folder is the user's repository), remote
-/// workspaces and checkout-less rows are refused with
-/// [`Error::RetireUnsupported`] before anything changes.
+/// Retire is only for daemon-owned git worktrees: plain-folder workspaces
+/// (the folder is the user's, §5.1 "Plain-folder workspaces" — checked
+/// first, from the persisted flag, whatever else the row holds), `cow` /
+/// `direct` checkouts (the folder IS the repository — deleting it loses the
+/// branch), `skipIsolation` workspaces (the folder is the user's
+/// repository), remote workspaces and checkout-less rows are refused with
+/// [`Error::RetireUnsupported`] before anything changes. The automatic
+/// purge skips every refused workspace.
 pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
+    if ws.plain_folder {
+        return Err(Error::RetireUnsupported {
+            workspace_id: ws.id.as_str().to_string(),
+            checkout_mode: None,
+            plain_folder: true,
+        });
+    }
     let refuse = |checkout_mode: Option<intent_core::CheckoutMode>| {
         Err(Error::RetireUnsupported {
             workspace_id: ws.id.as_str().to_string(),
             checkout_mode,
+            plain_folder: false,
         })
     };
     if ws.is_remote {
