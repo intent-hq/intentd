@@ -1251,3 +1251,103 @@ async fn after_a_restart_remove_stopping_agents_during_a_bind_waits_for_its_clai
 async fn after_a_restart_replacing_the_credential_during_a_bind_waits_for_its_claim() {
     during_a_restart_bind(DuringBind::ReplaceCredential).await;
 }
+
+// Review of intentd#2930: a bind whose claim could not read this lease's
+// agent records publishes its link with nothing claimed. Removal and
+// credential replacement must refuse then, keeping everything, and succeed
+// once a retried claim can read the records.
+async fn when_the_claim_cannot_read_its_records(action: DuringBind) {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut failing = tuning();
+    failing.fail_claim_reads = fail.clone();
+    let backend = Backend::with_tuning(failing).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let params = |machine: &Machine, credential: Option<(&ExecutorCredential, &str)>| match action {
+        DuringBind::Remove => json!({ "machineId": machine.id() }),
+        DuringBind::RemoveStoppingAgents => {
+            json!({ "machineId": machine.id(), "stopAgents": true })
+        }
+        DuringBind::ReplaceCredential => {
+            let (credential, token) = credential.unwrap();
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            params
+        }
+    };
+    let method = match action {
+        DuringBind::ReplaceCredential => "add",
+        _ => "remove",
+    };
+    let token = "a".repeat(64);
+    let replacement = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+
+    let error = backend
+        .call(method, params(&machine, Some((&replacement, &token))))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32603, "{action:?}: {error:?}");
+    assert!(
+        error.to_string().contains("could not tell which"),
+        "{action:?}: {error}"
+    );
+    let mut link = machine.accept().await;
+    assert_machine_kept(&backend, &machine).await;
+
+    // The records are readable again: the retry claims the survivor.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = backend
+                .call(method, params(&machine, Some((&replacement, &token))))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            let remove = backend.call(method, params(&machine, None));
+            tokio::pin!(remove);
+            let stop_id = tokio::select! {
+                result = &mut remove => panic!("removed before the survivor's stop was acked: {result:?}"),
+                stop_id = link.stop_for(&agent) => stop_id,
+            };
+            let (removed, ()) =
+                tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+            assert_eq!(
+                removed.unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::Remove).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_stopping_agents_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_the_claim_cannot_read_its_records()
+{
+    when_the_claim_cannot_read_its_records(DuringBind::ReplaceCredential).await;
+}

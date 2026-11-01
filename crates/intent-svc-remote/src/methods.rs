@@ -485,7 +485,14 @@ async fn recover_survivors(
     };
     let connected = tokio::time::timeout(feature.tuning().remove_timeout, node.connect()).await;
     match connected {
-        Ok(Ok(())) => Ok(Some(node)),
+        // Connected, but its bind may not have read this lease's records:
+        // claim again before anything is counted, and refuse while the
+        // survivors cannot be told apart.
+        Ok(Ok(())) if node.reclaim().await => Ok(Some(node)),
+        Ok(Ok(())) => Err(Error::Internal(format!(
+            "{}: could not tell which of its {recorded} recorded remote agent(s) still run, because this backend's agent records could not be read; nothing was changed. Try again.",
+            row.name
+        ))),
         Ok(Err(Error::RemoteMachine(failure)))
             if failure.data["code"] == crate::connect::MACHINE_REVOKED =>
         {
