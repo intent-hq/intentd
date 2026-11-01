@@ -202,7 +202,7 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
                          "${{ github.event_name == 'push' && format('-{0}', github.run_id) || '' }}")
         self.assertEqual(set(ci['jobs']['gate']['needs']), {
             'route', 'pr-static', 'release-fast-path', 'supersede', 'cache-smoke',
-            'daemon-lifecycle', 'check', 'windows-cross-lint', 'build', 'windows-lint', 'windows', 'macos-services-runtime', 'coverage-e2e', 'coverage-all',
+            'daemon-lifecycle', 'check', 'windows-cross-lint', 'build', 'windows-lint', 'windows', 'coverage-e2e', 'coverage-all',
             'coverage-changed', 'pr-title', 'docs-pr-scope', 'conflict-markers', 'monorepo-consumer-checks',
             'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths'})
         commands = '\n'.join(s.get('run', '') for s in ci['jobs']['release-scripts']['steps'])

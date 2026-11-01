@@ -1026,7 +1026,12 @@ jobs:
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # One macOS job carries every queue proof (check, Clippy, tunnel, Codex
+    # diagnostics, CoW fixtures, daemon lifecycle) so the paid runner sets up
+    # and compiles once per entry instead of three times. A cold run spent
+    # ~37 minutes before the Services tests started, so the combined budget is
+    # 90 minutes; warm entries take ~20.
+    timeout-minutes: 90
     # Keeps native Clippy/tests free of debuginfo/incremental artifacts
     # (cheaper compile, smaller shared cache). Safe job-wide: the release
     # build is unaffected — these vars only touch the dev/test profiles, and
@@ -1201,6 +1206,92 @@ jobs:
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
+      # macOS supports read-only metadata and rejects process probes before
+      # auth/npm setup. Require both a service rejection case and a real doctor
+      # case in discovery so a cfg/filter change cannot silently run zero tests.
+      - name: Codex focused diagnostics (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::'
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS diagnostic rejection regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS doctor command regression was not selected.'
+            exit 1
+          fi
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --nocapture
+      # These retained workspace fixtures used to skip on Linux before reaching
+      # their unbound caller. Require native CoW operations and original oracles.
+      - name: Retained workspace CoW fixtures (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+          INTENTD_TEST_REQUIRE_COW: "1"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          # Keep fixtures armed; the capability probe removes the guard only
+          # in its exact child. Retain scratch cleanup assertions for every case.
+          unset INTENTD_TEST_KEEP_TMP
+          tests=(
+            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
+            capability::tests::unbound_caller_is_forbidden_on_every_gate
+          )
+          cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
+          status=0
+          for test in "${tests[@]}"; do
+            listed=$("${cargo_test[@]}" "$test" -- --exact --list)
+            printf '%s\n' "$listed"
+            grep -Fx "$test: test" <<< "$listed" > /dev/null
+            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
+            log="$RUNNER_TEMP/cow-${test##*::}.log"
+            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
+            if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if rmdir "$scratch"; then
+              echo "CoW fixture scratch cleaned: $test"
+            else
+              echo "::error::Fixture scratch remains at $scratch"
+              status=1
+            fi
+            if [[ "$test" == tests::* ]]; then
+              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
+              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
+              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
+            fi
+          done
+          exit "$status"
+      # The macOS daemon lifecycle proof (the Linux leg stays in the
+      # `daemon-lifecycle` job; Windows runs post-merge in `windows`). It reuses
+      # this job's target dir through CARGO_BUILD_TARGET; the workspace-wide
+      # `Clippy (target-gated code)` above already lints intentd and
+      # intentd-sitter for this target.
+      - name: Native lifecycle runtime proof (macOS)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
+        shell: bash
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: python3 -I -B scripts/test-daemon-lifecycle.py
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
@@ -1394,132 +1485,6 @@ jobs:
         run: python3 -I -B scripts/test-daemon-lifecycle.py
       - name: Build (release)
         run: cargo build --workspace --release --target ${{ matrix.target }}
-
-  # Services test code generation must not share the native check/Clippy
-  # budget: a cold macOS queue run reached discovery compilation with only
-  # 23 minutes left and hit the 60-minute job limit before any test ran.
-  # Keep all diagnostics and CoW assertions mandatory, with their own bounded
-  # job and independent target directory rather than extending timeouts.
-  macos-services-runtime:
-    name: macOS Services runtime
-    needs: [release-fast-path, route]
-    if: ${{ !cancelled() && github.event_name == 'merge_group' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_INCREMENTAL: 0
-    steps:
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - uses: actions/checkout@v7
-      - name: Configure the self-hosted compiler cache
-        shell: bash
-        env:
-          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
-          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
-          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-sccache.py
-      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
-        if: contains(matrix.os, 'self-hosted')
-        shell: bash
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/macos-services-runtime-${{ matrix.target }}" >> "$GITHUB_ENV"
-      - name: Ensure macOS CI disk headroom
-        if: contains(matrix.os, 'self-hosted')
-        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
-      - name: Resolve pinned Rust channel
-        id: toolchain
-        shell: bash
-        run: |
-          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.target }}
-      # macOS supports read-only metadata and rejects process probes before
-      # auth/npm setup. Require both a service rejection case and a real doctor
-      # case in discovery so a cfg/filter change cannot silently run zero tests.
-      - name: Codex focused diagnostics (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: |
-          set -euo pipefail
-          filter='codex_diagnostics::'
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
-          printf '%s\n' "$listed"
-          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
-            echo '::error::macOS diagnostic rejection regression was not selected.'
-            exit 1
-          fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --list)
-          printf '%s\n' "$listed"
-          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
-            echo '::error::macOS doctor command regression was not selected.'
-            exit 1
-          fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --nocapture
-      # These retained workspace fixtures used to skip on Linux before reaching
-      # their unbound caller. Require native CoW operations and original oracles.
-      - name: Retained workspace CoW fixtures (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
-        timeout-minutes: 20
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-          INTENTD_TEST_REQUIRE_COW: "1"
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          set -euo pipefail
-          # Keep fixtures armed; the capability probe removes the guard only
-          # in its exact child. Retain scratch cleanup assertions for every case.
-          unset INTENTD_TEST_KEEP_TMP
-          tests=(
-            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
-            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
-            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
-            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
-            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
-            capability::tests::unbound_caller_is_forbidden_on_every_gate
-          )
-          cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
-          status=0
-          for test in "${tests[@]}"; do
-            listed=$("${cargo_test[@]}" "$test" -- --exact --list)
-            printf '%s\n' "$listed"
-            grep -Fx "$test: test" <<< "$listed" > /dev/null
-            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
-            log="$RUNNER_TEMP/cow-${test##*::}.log"
-            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
-            if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
-              status=1
-            fi
-            if rmdir "$scratch"; then
-              echo "CoW fixture scratch cleaned: $test"
-            else
-              echo "::error::Fixture scratch remains at $scratch"
-              status=1
-            fi
-            if [[ "$test" == tests::* ]]; then
-              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
-              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
-              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
-            fi
-          done
-          exit "$status"
 
   coverage-e2e:
     # merge_group-ONLY (see the `merge_group` trigger comment): the
@@ -2593,7 +2558,8 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
-  # Linux and macOS in the queue; the Windows lifecycle proof runs
+  # The Linux lifecycle proof in the queue. The macOS proof runs in the
+  # queue's `build` job (sharing its target dir) and the Windows proof
   # post-merge in the `windows` job.
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
@@ -2604,11 +2570,9 @@ jobs:
       matrix:
         include:
           # The Linux leg takes its own slot (listed in the route job's
-          # SLOT_JOBS); macOS keeps the shared mapping.
+          # SLOT_JOBS).
           - platform: linux
             os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
-          - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -2627,14 +2591,6 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # The self-hosted macOS runner has one slot.
-      - name: Point lifecycle target outside checkout (macOS)
-        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
-        shell: bash
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
-      - name: Ensure macOS CI disk headroom
-        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
-        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -2659,7 +2615,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2690,7 +2646,6 @@ jobs:
               optional build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
-              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
               "$slow" coverage-changed "${{ needs.coverage-changed.result }}"
@@ -2713,7 +2668,6 @@ jobs:
               require build "${{ needs.build.result }}"
               require windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
-              require macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               require coverage-e2e "${{ needs.coverage-e2e.result }}"
               require coverage-all "${{ needs.coverage-all.result }}"
               require coverage-changed "${{ needs.coverage-changed.result }}"
@@ -2750,7 +2704,6 @@ jobs:
               "$build" build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               "$windows" windows "${{ needs.windows.result }}"
-              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
               optional coverage-changed "${{ needs.coverage-changed.result }}"
