@@ -581,11 +581,18 @@ jobs:
           adapter=$(python3 -I -B -S scripts/prepare-claude-adapter-pin.py \
             --cache-dir "$RUNNER_TEMP/claude-adapter-pin")
           echo "INTENT_CLAUDE_ADAPTER_PIN_FIXTURE=$adapter" >> "$GITHUB_ENV"
+      # The first build of intent-services' lib test (the job's biggest
+      # rustc). Wrapped in scripts/ci-killed-rustc-retry.sh: when the runner
+      # kills that rustc with no compiler error (an out-of-memory kill; PR
+      # run 40293024372 printed `sccache: Compile terminated by signal 9`),
+      # it says so plainly in the log and job summary, prints memory
+      # evidence and retries once with half the build jobs. A real compile
+      # error or test failure propagates unchanged.
       - name: Real Claude adapter utility-session contract
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
-        run: "cargo test -p intent-services --lib claude_adapter_contract::"
+        run: "./scripts/ci-killed-rustc-retry.sh cargo test -p intent-services --lib claude_adapter_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
       # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -2073,7 +2080,8 @@ jobs:
                       if case["filter-match"]["status"] == "matches"]
           assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
           PYTHON
-          cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
+          # Same killed-compiler retry as the changed-tests plans above.
+          ./scripts/ci-killed-rustc-retry.sh cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
             -E "$filter" --no-fail-fast --retries 0 --show-progress none \
             --status-level pass --final-status-level fail
       - name: Upload changed coverage evidence
@@ -2275,7 +2283,9 @@ jobs:
   # issue never earns a release comment; a closed issue with a delivered
   # linked fix PR does), scripts/ci-lld-retry.sh (intent-hq/intent#5256:
   # the rust-lld vanished-object signature earns exactly one retry; a
-  # genuine lint fails fast), plus the
+  # genuine lint fails fast) and scripts/ci-killed-rustc-retry.sh (a rustc
+  # the runner killed with no compiler error earns exactly one retry; a real
+  # compile error fails fast), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
   # --instrumented llvm-cov form; intent-hq/intentd#1947) plus a check that
@@ -2387,6 +2397,8 @@ jobs:
         run: ./scripts/test-mirror-release-assets.sh
       - name: Test ci-lld-retry.sh
         run: ./scripts/test-ci-lld-retry.sh
+      - name: Test ci-killed-rustc-retry.sh
+        run: ./scripts/test-ci-killed-rustc-retry.sh
       - name: Test Windows cleanup policy
         run: python3 -I -B scripts/test-windows-ci-cleanup.py
       - name: Test macOS cleanup safety and Cargo lock ownership

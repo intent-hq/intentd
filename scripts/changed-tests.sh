@@ -130,6 +130,10 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # Every test child starts with this: with-test-policy.sh under the caller's
 # LC_ALL.
 test_policy=("${caller_locale[@]}" "$BASH" "$repo_root/scripts/with-test-policy.sh")
+# Each plan's cargo run goes through this too: in CI it retries the plan once
+# when the runner kills rustc with no compiler error (an out-of-memory kill);
+# elsewhere it runs the command unchanged.
+killed_rustc_retry=("$BASH" "$repo_root/scripts/ci-killed-rustc-retry.sh")
 caller_dir=$PWD
 base=${BASE:-origin/main}
 build_jobs=${BUILD_JOBS:-}
@@ -1074,14 +1078,14 @@ while IFS= read -r -u 3 plan; do
   scope_index=$((scope_index + 1))
   set +e
   if [[ -n "$instrumented" ]]; then
-    command=("${test_policy[@]}" cargo llvm-cov --no-report nextest "$@")
+    command=("${killed_rustc_retry[@]}" "${test_policy[@]}" cargo llvm-cov --no-report nextest "$@")
     if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
       command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
         --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")
     fi
     INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "${command[@]}"
   else
-    "${test_policy[@]}" cargo nextest run "$@"
+    "${killed_rustc_retry[@]}" "${test_policy[@]}" cargo nextest run "$@"
   fi
   status=$?
   set -e
