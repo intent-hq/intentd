@@ -1425,6 +1425,11 @@ pub struct Services {
     /// / unit-test wiring, or `wakeResume` disabled) keeps today's terminal
     /// behavior for transient upstream disconnects. Shared across clones.
     suspend_tracker: Option<Arc<dyn agent_session::SuspendOverlapQuery>>,
+    /// Each monitor's last `changed` wake still waiting in its owner's
+    /// queue, so a newer wake replaces it instead of queueing behind it
+    /// ([`pr_monitor::QueuedPrMonitorWake`]). In-memory only; shared across
+    /// clones.
+    pr_monitor_queued_wakes: pr_monitor::PrMonitorQueuedWakes,
     /// Monitors whose next poll must deliver without waiting out the debounce
     /// window (`ws.pr.monitor` restart catch-up). Populated by
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
@@ -1891,6 +1896,7 @@ impl Services {
             #[cfg(any(test, feature = "test-hooks"))]
             hook_store_fault: None,
             suspend_tracker: None,
+            pr_monitor_queued_wakes: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_feed: Arc::new(Mutex::new(pr_monitor::ObservationFeed::default())),
             pr_monitor_kick: Arc::new(tokio::sync::Notify::new()),

@@ -470,6 +470,81 @@ pub(crate) const PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR: i32 = 5;
 /// due and starve the rotation.
 pub(crate) type PrMonitorCatchUp = Arc<Mutex<HashMap<PrMonitorId, time::OffsetDateTime>>>;
 
+/// A monitor's last `changed` wake that went into its owner's queue instead
+/// of starting a turn — the one entry a newer wake for the same monitor may
+/// replace ([`Services::replace_queued_pr_monitor_wake`]).
+///
+/// The emit baseline advances when a wake is QUEUED, not when the agent
+/// reads it, so the next wake's own change list only covers what moved
+/// after the queued one. Replacing the queued wake with it would lose the
+/// queued wake's changes; the replacement is instead rendered against
+/// `reported_baseline` — the baseline the queued wake was diffed from, i.e.
+/// the PR state the agent last actually read about.
+///
+/// Anything else that resets the baseline (re-registration, adoption, a
+/// qualified refresh, cancellation) forgets the record
+/// ([`Services::forget_queued_pr_monitor_wake`]): the agent has just read the
+/// PR state, so the queued wake is no longer the last report it saw. A wake
+/// that started a turn directly is delivered and records nothing.
+///
+/// In memory only, shared across [`Services`] clones. After a restart the
+/// rehydrated queue entry has no record, so a newer wake queues behind it
+/// (both delivered, the pre-fix behavior) rather than guessing its baseline.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedPrMonitorWake {
+    agent_id: AgentId,
+    message_id: String,
+    /// The emit baseline the queued wake was rendered against.
+    reported_baseline: Option<String>,
+}
+
+/// See [`QueuedPrMonitorWake`].
+pub(crate) type PrMonitorQueuedWakes = Arc<Mutex<HashMap<PrMonitorId, QueuedPrMonitorWake>>>;
+
+/// What [`Services::replace_queued_pr_monitor_wake`] did with the
+/// monitor's queued `changed` wake.
+enum QueuedWakeReplacement {
+    /// Nothing replaced: deliver the wake as rendered, keeping both.
+    None,
+    /// The queued entry was swapped, in one queue step, for this wake at
+    /// the back of the queue as entry `message_id`, which reports from
+    /// `reported_baseline`.
+    Requeued {
+        message_id: String,
+        reported_baseline: Option<String>,
+    },
+    /// The final wake was written into the queued entry's place.
+    InPlace,
+}
+
+/// Which wake a monitor transition renders; both report the coalesced
+/// `diff(baseline, snapshot)` and so can be re-rendered from an older
+/// baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalescibleWake {
+    /// `reason: "changed"` — the consolidated change wake.
+    Changed,
+    /// `reason: "completed"` — the merged/closed final wake. It may replace
+    /// a queued `changed` wake but is itself never replaced or dropped.
+    Completed,
+}
+
+impl CoalescibleWake {
+    const fn reason(self) -> &'static str {
+        match self {
+            CoalescibleWake::Changed => "changed",
+            CoalescibleWake::Completed => "completed",
+        }
+    }
+
+    fn render(self, m: &PrMonitor, changes: &[String], snapshot: &PrMonitorSnapshot) -> String {
+        match self {
+            CoalescibleWake::Changed => render_change_wake(m, changes, snapshot),
+            CoalescibleWake::Completed => render_terminal_wake(m, changes, snapshot),
+        }
+    }
+}
+
 /// The diffable state of one monitored PR: the merge-requirements checklist
 /// plus the identity/comment-count fields the checklist itself does not
 /// carry. Persisted (JSON) as the monitor's baseline.
@@ -3158,6 +3233,7 @@ impl Services {
         // baseline just discarded; consume it so the adopter's first change
         // is debounced like any other, not fired immediately.
         self.consume_pr_monitor_catch_up(&m.monitor_id);
+        self.forget_queued_pr_monitor_wake(&m.monitor_id);
         tracing::info!(
             monitor = %m.monitor_id,
             from = %m.agent_id.0,
@@ -3211,6 +3287,8 @@ impl Services {
         if !updated {
             return Ok(None);
         }
+        // The re-register's checklist is the owner's latest read.
+        self.forget_queued_pr_monitor_wake(&m.monitor_id);
         m.last_snapshot = baseline.clone();
         m.baseline_snapshot = baseline;
         m.pending_changes = Vec::new();
@@ -3402,6 +3480,8 @@ impl Services {
             .lock()
             .unwrap()
             .remove(&monitor.monitor_id);
+        // A queued change wake stays queued; nothing later replaces it.
+        self.forget_queued_pr_monitor_wake(&monitor.monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
         match settlement {
@@ -4486,8 +4566,14 @@ impl Services {
             .await;
             return Ok(false);
         }
-        self.wake_pr_monitor_owner(&emitted, &message, "changed")
-            .await;
+        self.wake_pr_monitor_owner_coalesced(
+            monitor,
+            &emitted,
+            &message,
+            &snapshot,
+            CoalescibleWake::Changed,
+        )
+        .await;
         self.emit_pr_monitor_event(PR_MONITOR_EMITTED, &emitted, None)
             .await;
         Ok(true)
@@ -4571,8 +4657,14 @@ impl Services {
             .lock()
             .unwrap()
             .remove(&completed.monitor_id);
-        self.wake_pr_monitor_owner(&completed, &message, "completed")
-            .await;
+        self.wake_pr_monitor_owner_coalesced(
+            monitor,
+            &completed,
+            &message,
+            snapshot,
+            CoalescibleWake::Completed,
+        )
+        .await;
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
         // Completion flips the monitor's PR signal from open to merged, so
@@ -4773,10 +4865,19 @@ impl Services {
     /// just terminated must still settle the owner's deferred completion
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
-    async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
+    ///
+    /// Returns the queue entry id when the wake was QUEUED (behind a busy
+    /// turn, or parked on an archived workspace / retired session) rather
+    /// than delivered into a turn, `None` otherwise.
+    async fn wake_pr_monitor_owner(
+        &self,
+        monitor: &PrMonitor,
+        message: &str,
+        reason: &str,
+    ) -> Option<String> {
         let paused_until = self.sweep_rate_limit_paused_until();
         let metadata = pr_monitor_wake_metadata(monitor, reason, paused_until.as_deref());
-        if let Err(e) = self
+        let queued = match self
             .deliver_wake_message(
                 &monitor.workspace_id,
                 &monitor.agent_id,
@@ -4785,16 +4886,203 @@ impl Services {
             )
             .await
         {
-            tracing::warn!(
-                monitor = %monitor.monitor_id.0,
-                agent = %monitor.agent_id.0,
-                error = %e,
-                "pr monitor owner wake delivery failed"
-            );
-        }
+            Ok(result) => (result["queued"] == json!(true))
+                .then(|| result["queuedMessage"]["id"].as_str().map(str::to_string))
+                .flatten(),
+            Err(e) => {
+                tracing::warn!(
+                    monitor = %monitor.monitor_id.0,
+                    agent = %monitor.agent_id.0,
+                    error = %e,
+                    "pr monitor owner wake delivery failed"
+                );
+                None
+            }
+        };
         if reason == "cancelled" || reason == "completed" {
             self.resettle_owner_after_pr_monitor_terminal(monitor).await;
         }
+        queued
+    }
+
+    /// Deliver a `changed` / `completed` wake so the owner never reads a
+    /// stale update for this monitor. When the monitor's previous `changed`
+    /// wake is still waiting, undelivered, in the owner's queue
+    /// ([`Services::replace_queued_pr_monitor_wake`]):
+    ///
+    /// - a newer `changed` wake takes its place at the BACK of the queue, in
+    ///   one queue step, so a failure or restart never leaves neither;
+    /// - the `completed` (merged/closed) wake takes over its PLACE in the
+    ///   queue, so the final update is not delayed behind work queued after
+    ///   the older one.
+    ///
+    /// Either way the wake is re-rendered to cover the replaced one's
+    /// changes too. Otherwise `message`, rendered against `before`'s
+    /// baseline, is delivered as usual. A `changed` wake that lands in the
+    /// queue is remembered as the entry the next wake may replace.
+    ///
+    /// `before` is the row image the wake was computed from; `after` is the
+    /// row as the emit / completion left it (its owner receives the wake).
+    async fn wake_pr_monitor_owner_coalesced(
+        &self,
+        before: &PrMonitor,
+        after: &PrMonitor,
+        message: &str,
+        snapshot: &PrMonitorSnapshot,
+        wake: CoalescibleWake,
+    ) {
+        let queued = match self
+            .replace_queued_pr_monitor_wake(after, snapshot, wake)
+            .await
+        {
+            QueuedWakeReplacement::None => self
+                .wake_pr_monitor_owner(after, message, wake.reason())
+                .await
+                .map(|id| (id, before.baseline_snapshot.clone())),
+            QueuedWakeReplacement::Requeued {
+                message_id,
+                reported_baseline,
+            } => Some((message_id, reported_baseline)),
+            QueuedWakeReplacement::InPlace => {
+                // The final wake now sits in the queue; same terminal
+                // backstop as the ordinary completed delivery.
+                self.forget_queued_pr_monitor_wake(&after.monitor_id);
+                self.resettle_owner_after_pr_monitor_terminal(after).await;
+                return;
+            }
+        };
+        let mut wakes = self.pr_monitor_queued_wakes.lock().unwrap();
+        match (wake, queued) {
+            (CoalescibleWake::Changed, Some((message_id, reported_baseline))) => {
+                wakes.insert(
+                    after.monitor_id.clone(),
+                    QueuedPrMonitorWake {
+                        agent_id: after.agent_id.clone(),
+                        message_id,
+                        reported_baseline,
+                    },
+                );
+            }
+            _ => {
+                wakes.remove(&after.monitor_id);
+            }
+        }
+    }
+
+    /// Replace the monitor's still-queued `changed` wake with this one,
+    /// re-rendered against the queued wake's baseline: `changed` swaps the
+    /// queued entry for a new one at the back of the queue in one queue step
+    /// ([`Services::replace_pending_wake_at_tail`]), so no failure or restart
+    /// can leave neither queued; `completed` rewrites the queued entry in
+    /// place.
+    ///
+    /// The replacement reports `diff(reported_baseline, snapshot)` — every
+    /// change since the last state the owner actually read about, so
+    /// nothing only the replaced wake carried is lost — under the newer
+    /// wake's reason and checklist. A queued `completed` (or any other) wake
+    /// is never replaced, since only `changed` wakes are recorded and the
+    /// queue helpers re-check the entry's metadata.
+    ///
+    /// Returns [`QueuedWakeReplacement::None`] (nothing touched; the caller
+    /// delivers normally, keeping both) when there is no record, the record
+    /// is for another owner, the entry was already popped for delivery or
+    /// touched since it was queued, or a `changed` replacement would be
+    /// empty because everything since the last report reverted.
+    async fn replace_queued_pr_monitor_wake(
+        &self,
+        monitor: &PrMonitor,
+        snapshot: &PrMonitorSnapshot,
+        wake: CoalescibleWake,
+    ) -> QueuedWakeReplacement {
+        let Some(prior) = self
+            .pr_monitor_queued_wakes
+            .lock()
+            .unwrap()
+            .remove(&monitor.monitor_id)
+        else {
+            return QueuedWakeReplacement::None;
+        };
+        if prior.agent_id != monitor.agent_id {
+            return QueuedWakeReplacement::None;
+        }
+        let Some(mut reported) = prior
+            .reported_baseline
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        else {
+            return QueuedWakeReplacement::None;
+        };
+        backfill_upgraded_anchor(&mut reported, snapshot, None);
+        let changes = diff_snapshots(&reported, snapshot);
+        if wake == CoalescibleWake::Changed && changes.is_empty() {
+            return QueuedWakeReplacement::None;
+        }
+        let message = wake.render(monitor, &changes, snapshot);
+        let monitor_id = json!(monitor.monitor_id);
+        let is_queued_change = |queued: &Value| {
+            queued["type"] == "pr_monitor_wake"
+                && queued["monitorId"] == monitor_id
+                && queued["reason"] == "changed"
+                && queued.get("resource").is_none()
+                && queued.get("monitorAvailability").is_none()
+        };
+        let paused_until = self.sweep_rate_limit_paused_until();
+        let metadata = pr_monitor_wake_metadata(monitor, wake.reason(), paused_until.as_deref());
+        let replacement = match wake {
+            CoalescibleWake::Changed => {
+                let Some(queued) = self.replace_pending_wake_at_tail(
+                    &monitor.agent_id,
+                    &prior.message_id,
+                    &message,
+                    &metadata,
+                    is_queued_change,
+                ) else {
+                    return QueuedWakeReplacement::None;
+                };
+                QueuedWakeReplacement::Requeued {
+                    message_id: queued.id,
+                    reported_baseline: prior.reported_baseline,
+                }
+            }
+            CoalescibleWake::Completed => {
+                if !self.rewrite_pending_wake(
+                    &monitor.agent_id,
+                    &prior.message_id,
+                    &message,
+                    &metadata,
+                    is_queued_change,
+                ) {
+                    return QueuedWakeReplacement::None;
+                }
+                QueuedWakeReplacement::InPlace
+            }
+        };
+        // One write-through of the swapped queue.
+        self.publish_queue_updated(&monitor.agent_id).await;
+        // The owner may have gone idle since the old entry was queued; the
+        // drain's own busy/archived/retired gates make this a no-op otherwise.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(monitor.agent_id.clone(), monitor.workspace_id.clone())
+                .await;
+        }
+        tracing::debug!(
+            monitor = %monitor.monitor_id.0,
+            agent = %monitor.agent_id.0,
+            reason = wake.reason(),
+            "pr monitor: replaced the owner's undelivered queued wake with a newer one"
+        );
+        replacement
+    }
+
+    /// Forget the monitor's queued-wake record ([`QueuedPrMonitorWake`]):
+    /// called wherever the baseline is reset outside a wake, so a later
+    /// wake never re-reports changes the owner has since read.
+    fn forget_queued_pr_monitor_wake(&self, monitor_id: &PrMonitorId) {
+        self.pr_monitor_queued_wakes
+            .lock()
+            .unwrap()
+            .remove(monitor_id);
     }
 
     /// Wake the FORMER owner of a monitor its parent just took over
@@ -5231,6 +5519,7 @@ mod tests {
     mod observation_feed_regression;
     mod qualified_isolation;
     mod qualified_recovery;
+    mod queued_wake_coalescing;
     mod quota_regression;
     mod qwen_regression;
     mod registration_visibility;
