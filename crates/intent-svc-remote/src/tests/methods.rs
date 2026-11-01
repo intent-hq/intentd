@@ -1423,7 +1423,7 @@ mod at_boot {
         restarted_with_a_surviving_agent(&backend, &mut machine).await;
         machine.stop().await;
         let started = tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             backend.services.resume_exposed_machines(),
         )
         .await
