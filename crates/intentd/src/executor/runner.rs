@@ -372,16 +372,15 @@ impl Redactor {
     /// Mask a `session/update` notification's params. Field names and the
     /// string identifiers at their ACP schema positions (the session id,
     /// the update's variant tag, tool kind/status/id, content block and
-    /// tool-content tags, plan entry status/priority) are kept as sent, so
-    /// head can still parse the update even when a short secret equals a
-    /// protocol word; every other string is masked with [`Self::value`], and
-    /// tool `rawInput` / `rawOutput` / `_meta` with [`Self::data`] (keys too).
+    /// tool-content tags, an annotation's `audience` roles, a config option's
+    /// `type`, plan entry status/priority) are kept as sent, so head can
+    /// still parse the update even when a short secret equals a protocol
+    /// word; every other string is masked with [`Self::value`], and tool
+    /// `rawInput` / `rawOutput` / `_meta` with [`Self::data`] (keys too).
     ///
-    /// Accepted limit: a secret identical to an ACP enum word not listed
-    /// here (for example an annotation audience `user`) is masked in that
-    /// position, so head cannot parse that one update and drops it. This
-    /// fails closed (nothing leaks), and real provider credentials are long
-    /// random strings, so it is not expected in practice.
+    /// These are every closed enum the typed `SessionUpdate` parse reaches;
+    /// the remaining enums there (a notice's severity, a config option's
+    /// category) accept any string, so masking them never breaks the parse.
     fn notification(&self, params: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -398,8 +397,41 @@ impl Redactor {
             "sessionUpdate" | "kind" | "status" | "toolCallId" => Keep::Id,
             "content" => Keep::Walk(Self::content),
             "entries" => Keep::Walk(Self::plan_entries),
+            "configOptions" => Keep::Walk(Self::config_options),
             _ => Keep::Mask,
         });
+    }
+
+    /// A content block's annotations: the `audience` roles are an enum.
+    fn annotations(&self, annotations: &mut Value) {
+        self.schema(annotations, &|key, _| match key {
+            "audience" => Keep::Walk(Self::identifiers),
+            _ => Keep::Mask,
+        });
+    }
+
+    /// A list of protocol identifiers: strings kept as sent, anything else
+    /// masked as data.
+    fn identifiers(&self, identifiers: &mut Value) {
+        let Value::Array(items) = identifiers else {
+            return self.value(identifiers);
+        };
+        for item in items.iter_mut().filter(|item| !item.is_string()) {
+            self.value(item);
+        }
+    }
+
+    /// A config option update's options: each option's `type` tags its kind.
+    fn config_options(&self, options: &mut Value) {
+        let Value::Array(items) = options else {
+            return self.value(options);
+        };
+        for item in items {
+            self.schema(item, &|key, _| match key {
+                "type" => Keep::Id,
+                _ => Keep::Mask,
+            });
+        }
     }
 
     /// A content block, a tool call's content list, or a tool content item
@@ -414,6 +446,7 @@ impl Redactor {
         self.schema(content, &|key, _| match key {
             "type" | "mimeType" => Keep::Id,
             "content" => Keep::Walk(Self::content),
+            "annotations" => Keep::Walk(Self::annotations),
             _ => Keep::Mask,
         });
     }
