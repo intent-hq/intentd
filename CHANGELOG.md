@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.101] - 2026-11-01
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Wake when a queued PR's merge-queue entry turns unmergeable ([#2915](https://github.com/intent-hq/intentd/pull/2915))
+
+### 🧪 Testing
+
+- Drive attachment reclaim test expiry with the paused clock ([#2917](https://github.com/intent-hq/intentd/pull/2917))
+
+
 ## [0.11.100] - 2026-11-01
 
 ### 📚 Documentation
