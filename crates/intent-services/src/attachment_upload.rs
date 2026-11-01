@@ -2357,7 +2357,7 @@ mod tests {
     /// runtime clock, so real scheduling stalls are negligible next to the
     /// TTL. With a 1s TTL and 250ms wall-clock sleeps, a stall of more than
     /// 750ms between keep-alive chunks expired the "live" session under CI
-    /// load (merge_group coverage-all run 41256445158, which ejected
+    /// load (`merge_group` coverage-all run 41256445158, which ejected
     /// intentd#2891; same pattern as intent-hq/intent#4880).
     #[tokio::test]
     async fn begin_reclaims_expired_sessions_and_spares_active_ones() {
