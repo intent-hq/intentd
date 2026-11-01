@@ -90,6 +90,20 @@ impl AgentSink {
         state.turns.clear();
     }
 
+    /// The machine ended the agent without an exit record reaching head
+    /// (it revoked this backend's credential): it exits with `error`, so
+    /// waiting prompts fail and it is no longer live. A recorded exit wins.
+    fn end(&self, error: &str) {
+        let mut state = lock(&self.state);
+        if state.exit.is_none() {
+            state.exit = Some(Exit {
+                exit_code: None,
+                error: Some(error.to_owned()),
+            });
+        }
+        state.turns.clear();
+    }
+
     /// Whether head closed the sink (the agent was stopped from here).
     pub(crate) fn is_closed(&self) -> bool {
         lock(&self.state).closed
@@ -174,6 +188,16 @@ impl Agents {
             .filter(|(_, sink)| sink.is_live())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// End every live agent with `error`; returns how many there were.
+    pub(crate) fn end_all(&self, error: &str) -> usize {
+        let sinks = lock(&self.sinks);
+        let live: Vec<_> = sinks.values().filter(|sink| sink.is_live()).collect();
+        for sink in &live {
+            sink.end(error);
+        }
+        live.len()
     }
 
     /// End `agent_id`'s sink: waiting prompts fail and it is no longer live.

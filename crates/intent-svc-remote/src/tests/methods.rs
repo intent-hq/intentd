@@ -426,6 +426,45 @@ async fn a_refresh_the_machine_does_not_answer_is_machine_unreachable() {
     assert!(!message.contains(&machine.token));
 }
 
+/// Revocation stops the binding's agents on the machine, so once the
+/// machine refuses the credential the backend no longer counts them: they
+/// end with `machine-revoked`, and a plain remove goes through.
+#[tokio::test]
+async fn a_revoked_machine_no_longer_counts_its_agents() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    assert_eq!(node.running(), 1);
+
+    machine.stop().await;
+    machine.revoke().await;
+    machine.restart().await;
+    tokio::time::timeout(wait(), async {
+        while node.running() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the revoked machine's agents are no longer counted");
+    assert!(!runtime.is_running());
+    let exit = runtime.exit_error().unwrap_or_default();
+    assert!(exit.contains("machine-revoked"), "{exit}");
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"][0]["state"], "revoked");
+    assert_eq!(listed["machines"][0]["runningAgents"], 0);
+    assert_eq!(
+        backend
+            .call("remove", json!({ "machineId": machine.id() }))
+            .await
+            .unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+}
+
 #[tokio::test]
 async fn an_unreachable_refresh_marks_the_machine_unreachable() {
     let backend = Backend::new().await;

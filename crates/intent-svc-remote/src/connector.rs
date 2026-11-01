@@ -841,7 +841,17 @@ async fn run(
             Err(failure) => {
                 tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
                 if matches!(failure, ConnectFailure::Revoked(_)) {
+                    // Revocation stopped this binding's agents on the
+                    // machine: their stops are moot, and they no longer run.
                     shared.drop_stops();
+                    let ended = shared.agents.end_all(&format!(
+                        "{}: {} revoked this backend's credential and stopped the agent",
+                        crate::connect::MACHINE_REVOKED,
+                        target.name
+                    ));
+                    if ended > 0 {
+                        tracing::info!(machine = %target.id, ended, "remote machine: revoked; its agents ended");
+                    }
                 }
                 shared.record_failure(&failure).await;
                 shared.announce().await;
