@@ -2047,8 +2047,11 @@ impl Drop for DrainingGuard {
     }
 }
 
-/// Whether a durable queue already holds exactly `live` (same ids, order,
+/// Whether a durable queue already holds `live` in the same order (same ids,
 /// payloads and correlation), so shutdown reconciliation can skip it.
+/// Absolute positions are not compared: rehydration skips undecodable rows and
+/// `queue_rows` renumbers the rest, so an untouched queue with a skipped row
+/// before or between valid ones must still compare equal and keep that row.
 fn same_queue_rows(
     durable: &[intent_store::AgentQueueRow],
     live: &[intent_store::AgentQueueRow],
@@ -2056,7 +2059,6 @@ fn same_queue_rows(
     durable.len() == live.len()
         && durable.iter().zip(live).all(|(d, l)| {
             d.id == l.id
-                && d.position == l.position
                 && d.payload == l.payload
                 && d.created_at == l.created_at
                 && d.turn_id == l.turn_id

@@ -95,34 +95,57 @@ async fn shutdown_persists_a_removal_whose_write_through_was_cancelled() {
     assert_eq!(durable_ids(&svc, &agent).await, ["keep"]);
 }
 
+fn undecodable_row(agent: &AgentId, id: &str) -> intent_store::AgentQueueRow {
+    intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position: 0,
+        payload: json!({"unknownShape": true}),
+        created_at: intent_core::now_iso(),
+        turn_id: id.into(),
+    }
+}
+
 /// Agents whose durable queue already matches memory are left untouched, so
-/// rows this daemon cannot decode survive a shutdown that never mutated them.
+/// rows this daemon cannot decode survive a shutdown that never mutated them,
+/// wherever they sit: rehydration skips them and renumbers the valid rows, so
+/// the comparison must not depend on absolute positions.
 #[tokio::test]
 async fn shutdown_leaves_matching_queues_and_undecodable_rows_alone() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Untouched").await;
-    enqueue(&svc, &agent, "known", "known");
+    enqueue(&svc, &agent, "known-1", "one");
+    enqueue(&svc, &agent, "known-2", "two");
     svc.persist_queue_snapshot(&agent).await;
-    let mut rows = svc.store.load_all_agent_queues().await.unwrap();
-    rows.retain(|row| row.agent_id == agent);
-    rows.push(intent_store::AgentQueueRow {
-        id: "from-a-newer-daemon".into(),
-        agent_id: agent.clone(),
-        position: 1,
-        payload: json!({"unknownShape": true}),
-        created_at: intent_core::now_iso(),
-        turn_id: "from-a-newer-daemon".into(),
-    });
+    let mut valid = svc.store.load_all_agent_queues().await.unwrap();
+    valid.retain(|row| row.agent_id == agent);
+    assert_eq!(valid.len(), 2);
+    let mut rows = vec![
+        undecodable_row(&agent, "newer-before"),
+        valid[0].clone(),
+        undecodable_row(&agent, "newer-between"),
+        valid[1].clone(),
+        undecodable_row(&agent, "newer-after"),
+    ];
+    for (position, row) in rows.iter_mut().enumerate() {
+        row.position = i64::try_from(position).unwrap();
+    }
     svc.store.replace_agent_queue(&agent, &rows).await.unwrap();
 
     let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
-    assert_eq!(restarted.queue_snapshot(&agent).len(), 1);
+    assert_eq!(restarted.queue_snapshot(&agent).len(), 2);
     restarted.freeze_shutdown_drains();
     restarted.persist_shutdown_queues().await;
 
     assert_eq!(
         durable_ids(&restarted, &agent).await,
-        ["known", "from-a-newer-daemon"]
+        [
+            "newer-before",
+            "known-1",
+            "newer-between",
+            "known-2",
+            "newer-after"
+        ]
     );
 }
