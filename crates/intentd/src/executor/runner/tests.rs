@@ -1510,3 +1510,26 @@ async fn node_runner_reports_default_account_auth_failures_on_a_turn() {
         wait_for(&h.runner, "exit", exited("a1")).await;
     }
 }
+
+/// Review of intentd#2910: the periodic tracker and the setup snapshot run
+/// concurrently. A snapshot that started earlier must never replace one that
+/// started later, so an older periodic scan finishing after the setup scan
+/// cannot erase a detached helper the setup scan captured.
+#[test]
+fn an_older_descendant_snapshot_never_replaces_a_newer_one() {
+    let descendants = Descendants::default();
+    let periodic = descendants.begin();
+    let setup = descendants.begin();
+    descendants.publish(setup, vec![10, 11]);
+    descendants.publish(periodic, vec![10]);
+    assert_eq!(
+        descendants.pids(),
+        vec![10, 11],
+        "the setup snapshot's helper is kept"
+    );
+
+    // A later snapshot still replaces it: nothing accumulates.
+    let next = descendants.begin();
+    descendants.publish(next, vec![12]);
+    assert_eq!(descendants.pids(), vec![12]);
+}
