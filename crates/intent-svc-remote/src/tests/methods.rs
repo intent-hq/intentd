@@ -1351,3 +1351,114 @@ async fn after_a_restart_replacing_the_credential_refuses_while_the_claim_cannot
 {
     when_the_claim_cannot_read_its_records(DuringBind::ReplaceCredential).await;
 }
+
+// Coordinator follow-up to intentd#2930: after a restart the backend
+// reconnects on its own to machines that may still run its agents, so their
+// counts, journals and stops resume without waiting for a user action.
+mod at_boot {
+    use super::*;
+
+    async fn running_agents_listed(backend: &Backend) -> Value {
+        let listed = backend.call("list", json!({})).await.unwrap();
+        listed["machines"][0]["runningAgents"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_recorded_agents_is_not_dialed() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await;
+        backend
+            .services
+            .remote_feature()
+            .unwrap()
+            .take_node(&machine.id())
+            .unwrap()
+            .shutdown();
+        assert!(backend.services.resume_exposed_machines().await.is_empty());
+        machine.no_link(Duration::from_millis(500)).await;
+        assert!(backend
+            .services
+            .remote_feature()
+            .unwrap()
+            .running_node(&machine.id())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_surviving_agent_is_claimed_and_its_journal_streams() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        assert_eq!(
+            running_agents_listed(&backend).await,
+            0,
+            "before the boot step"
+        );
+
+        assert_eq!(
+            backend.services.resume_exposed_machines().await,
+            vec![machine.id()]
+        );
+        // Nothing else asks for the machine: the boot step alone dials it.
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is counted");
+        let listed = backend.call("list", json!({})).await.unwrap();
+        assert_eq!(listed["machines"][0]["state"], "connected");
+        link.journal(note(1, &agent, "after the restart")).await;
+        link.acked(1).await;
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_machine_does_not_hold_up_the_boot_and_is_dialed_again() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        machine.stop().await;
+        let started = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.services.resume_exposed_machines(),
+        )
+        .await
+        .expect("the boot step does not wait for the machine");
+        assert_eq!(started, vec![machine.id()]);
+        // timing-guard: several backoff rounds pass while it is down
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        machine.restart().await;
+        machine.accept().await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is counted once the machine is back");
+    }
+
+    #[tokio::test]
+    async fn agents_whose_sessions_ended_do_not_make_a_machine_dialed() {
+        for status in ["deleted", "Completed"] {
+            let backend = Backend::new().await;
+            let mut machine = backend.machine().await;
+            let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+            sqlx::query("UPDATE agent_session SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(agent.as_str())
+                .execute(backend.store().write_pool())
+                .await
+                .unwrap();
+            assert!(
+                backend.services.resume_exposed_machines().await.is_empty(),
+                "{status}"
+            );
+            machine.no_link(Duration::from_millis(300)).await;
+        }
+    }
+}
