@@ -1198,6 +1198,7 @@ impl WaitCase {
     /// fails when it is still waiting after `guard`. With a deadline or
     /// settle of [`UNREACHED`] polls, a wait that sits one out hangs into this
     /// guard instead of passing slowly.
+    #[track_caller]
     fn run_within(&self, guard: Duration) -> (Output, Duration) {
         let driver = format!(
             "set -eu\n\
