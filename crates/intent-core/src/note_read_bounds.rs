@@ -681,24 +681,21 @@ pub fn note_tasks_page(
     let (start, mut text_offset) = match page.next_token.as_deref() {
         Some(token) => {
             let (key, _) = parse_page_token(token, &scope)?;
-            match key.split_once('@') {
-                Some((line, offset)) => {
-                    let line: usize = line.parse().map_err(|_| "invalid nextToken")?;
-                    let offset: usize = offset.parse().map_err(|_| "invalid nextToken")?;
-                    let idx = rows
-                        .iter()
-                        .position(|r| r.line_number == line)
-                        .ok_or("invalid nextToken")?;
-                    let text = &rows[idx].text;
-                    if offset == 0 || offset >= text.len() || !text.is_char_boundary(offset) {
-                        return Err("invalid nextToken");
-                    }
-                    (idx, offset)
+            if let Some((line, offset)) = key.split_once('@') {
+                let line: usize = line.parse().map_err(|_| "invalid nextToken")?;
+                let offset: usize = offset.parse().map_err(|_| "invalid nextToken")?;
+                let idx = rows
+                    .iter()
+                    .position(|r| r.line_number == line)
+                    .ok_or("invalid nextToken")?;
+                let text = &rows[idx].text;
+                if offset == 0 || offset >= text.len() || !text.is_char_boundary(offset) {
+                    return Err("invalid nextToken");
                 }
-                None => {
-                    let after: usize = key.parse().map_err(|_| "invalid nextToken")?;
-                    (rows.partition_point(|r| r.line_number <= after), 0)
-                }
+                (idx, offset)
+            } else {
+                let after: usize = key.parse().map_err(|_| "invalid nextToken")?;
+                (rows.partition_point(|r| r.line_number <= after), 0)
             }
         }
         None => (0, 0),
@@ -1361,13 +1358,16 @@ mod tests {
                 return out;
             }
             assert_eq!(
-                row["contentBytes"].as_u64().unwrap() as usize,
+                usize::try_from(row["contentBytes"].as_u64().unwrap()).unwrap(),
                 note.content.len()
             );
-            assert_eq!(row["contentOffset"].as_u64().unwrap() as usize, offset);
+            assert_eq!(
+                usize::try_from(row["contentOffset"].as_u64().unwrap()).unwrap(),
+                offset
+            );
             match row["nextContentOffset"].as_u64() {
                 Some(next) => {
-                    let next = next as usize;
+                    let next = usize::try_from(next).unwrap();
                     assert!(next > offset && note.content.is_char_boundary(next));
                     offset = next;
                 }
@@ -1444,7 +1444,10 @@ mod tests {
                 let text = row["text"].as_str().unwrap();
                 match rebuilt.last_mut() {
                     Some((last, acc)) if *last == line => {
-                        assert!(row["textOffset"].as_u64().unwrap() as usize == acc.len());
+                        assert_eq!(
+                            usize::try_from(row["textOffset"].as_u64().unwrap()).unwrap(),
+                            acc.len()
+                        );
                         acc.push_str(text);
                     }
                     _ => {

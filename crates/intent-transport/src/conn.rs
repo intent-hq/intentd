@@ -1094,7 +1094,11 @@ async fn process_captured_frame(
                 &method,
                 rpc_id.clone(),
                 out_tx,
-                handle_sub_fast_path(sub, api, bus, out_tx, subs),
+                // Boxed off this frame: `process_captured_frame` sits close to
+                // the default test stack (see `crate::stack_frame`).
+                crate::stack_frame::boxed_await(|| {
+                    handle_sub_fast_path(sub, api, bus, out_tx, subs)
+                }),
             )
             .await;
         }

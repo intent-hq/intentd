@@ -964,6 +964,252 @@ async fn bounded_script_get(
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
+/// `note.list` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_list(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => WorkspaceId::from(s),
+        _ => return Err(invalid_params("workspaceId is required")),
+    };
+    let projection = parse_note_list_projection(params)?;
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
+    )?;
+    let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
+    let (rows, next) = intent_core::note_read_bounds::note_list_page(
+        notes,
+        ws_id.as_str(),
+        projection,
+        None,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({ "notes": rows, "nextToken": next }))
+}
+
+/// `note.get` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_get(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let max_content_bytes = parse_max_content_bytes(params)?;
+    let content_offset = opt_positive_usize(params, "contentOffset")?.unwrap_or(0);
+    match api.get_note(ws, note_id).await {
+        // Bounded reads: whatever `maxContentBytes` asks for, the row
+        // is cut to fit the read budget (`contentTruncated`), and
+        // `nextContentOffset` reads the rest, so nothing is lost.
+        Ok(note) => {
+            let row = intent_core::note_read_bounds::note_get_row(
+                &note,
+                max_content_bytes,
+                content_offset,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(|e| invalid_params(e.to_string()))?;
+            Ok(json!({ "note": row }))
+        }
+        Err(Error::NotFound(_)) => Err(not_found("Note not found")),
+        Err(e) => Err(domain_to_rpc(e)),
+    }
+}
+
+/// `note.listTasks` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_list_tasks(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::NOTE_TASKS_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_TASKS_MAX_LIMIT,
+    )?;
+    let ws_key = ws.as_str().to_string();
+    let note_key = note_id.as_str().to_string();
+    let tasks = api
+        .list_note_tasks(ws, note_id)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Bounded reads: one page as `{ tasks, nextToken }`.
+    let (rows, next) = intent_core::note_read_bounds::note_tasks_page(
+        &tasks,
+        &ws_key,
+        &note_key,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({ "tasks": rows, "nextToken": next }))
+}
+
+/// `note.lineAttribution.load` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_line_attribution_load(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let window = intent_core::note_read_bounds::LineWindow {
+        start_line: opt_positive_usize(params, "startLine")?,
+        max_lines: opt_positive_usize(params, "maxLines")?,
+        start_offset: None,
+    };
+    let data = api
+        .line_attribution_load(ws, note_id)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Bare LineAttributionData | null so the FE gutter’s
+    // `line-attribution:load` decoder round-trips as-is. A page
+    // that holds fewer than every attributed line (a window, or the
+    // read budget) adds `truncated` and `nextStartLine`.
+    let Some(mut data) = data else {
+        return Ok(Value::Null);
+    };
+    let page = intent_core::note_read_bounds::line_attribution_page(
+        &mut data,
+        window,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    );
+    let mut value = to_result_value(&data)?;
+    if page.truncated {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("truncated".into(), Value::Bool(true));
+            obj.insert("nextStartLine".into(), json!(page.next_start_line));
+        }
+    }
+    Ok(value)
+}
+
+/// `comment.list` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_comment_list(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let since = opt_str(params, "since");
+    let author_type = opt_str(params, "authorType");
+    let status = opt_str(params, "status");
+    let include_comments = parse_bool(params, "includeComments");
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
+    )?;
+    let ws_key = ws.as_str().to_string();
+    let note_key = note_id.as_str().to_string();
+    let result = api
+        .comment_list(ws, note_id, since, author_type, status, include_comments)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Totals count every thread the filters keep, not just this page.
+    let (rows, next) = intent_core::note_read_bounds::comment_list_page(
+        result.threads,
+        &ws_key,
+        &note_key,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({
+        "threads": rows,
+        "totalThreads": result.total_threads,
+        "totalComments": result.total_comments,
+        "nextToken": next,
+    }))
+}
+
+/// `crossWorkspace.readNote` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_cross_workspace_read_note(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+    let note_id = require_note_id(params)?;
+    let window = intent_core::note_read_bounds::LineWindow {
+        start_line: opt_positive_usize(params, "startLine")?,
+        max_lines: opt_positive_usize(params, "maxLines")?,
+        start_offset: opt_positive_usize(params, "startOffset")?,
+    };
+    api.cross_workspace_read_note(ws, target, note_id, window, true)
+        .await
+        .map_err(domain_to_rpc)
+}
+
+/// `note.update` with the cut-note write guard (bounded reads, §5.2). Kept out
+/// of [`dispatch`] and awaited boxed: its locals live across two awaits.
+async fn guarded_note_update(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let input = NoteUpdateInput {
+        content: opt_str(params, "content"),
+        title: opt_str(params, "title"),
+        tags: opt_tags(params, "tags"),
+        expected_version: opt_int(params, "expectedVersion"),
+        base_content_bytes: parse_base_content_bytes(params)?,
+    };
+    if input.content.is_some() {
+        crate::stack_frame::boxed_await(|| {
+            require_base_for_cut_note(api, &ws, &note_id, input.base_content_bytes)
+        })
+        .await?;
+    }
+    let note = api
+        .update_note(ws, note_id, input)
+        .await
+        .map_err(domain_to_rpc)?;
+    Ok(json!({ "note": note }))
+}
+
+/// `note.setContent` with the cut-note write guard (bounded reads, §5.2). Kept out
+/// of [`dispatch`] and awaited boxed: its locals live across two awaits.
+async fn guarded_note_set_content(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let content = require_str_param(params, "content")?;
+    let confirm = parse_confirm(params);
+    let expected_version = opt_int(params, "expectedVersion");
+    let base_content_bytes = parse_base_content_bytes(params)?;
+    crate::stack_frame::boxed_await(|| {
+        require_base_for_cut_note(api, &ws, &note_id, base_content_bytes)
+    })
+    .await?;
+    let result = api
+        .set_note_content_guarded(
+            ws,
+            note_id,
+            content,
+            confirm,
+            expected_version,
+            base_content_bytes,
+            None,
+        )
+        .await
+        .map_err(domain_to_rpc)?;
+    to_result_value(&result)
+}
+
 async fn dispatch(
     api: &dyn WorkspaceApi,
     method: &str,
@@ -1877,52 +2123,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "success": true }))
         }
-        "note.list" => {
-            let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
-                Some(s) if !s.is_empty() => WorkspaceId::from(s),
-                _ => return Err(invalid_params("workspaceId is required")),
-            };
-            let projection = parse_note_list_projection(params)?;
-            let page = parse_page_request(
-                params,
-                intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
-                intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
-            )?;
-            let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
-            let (rows, next) = intent_core::note_read_bounds::note_list_page(
-                notes,
-                ws_id.as_str(),
-                projection,
-                None,
-                &page,
-                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
-            )
-            .map_err(invalid_params)?;
-            Ok(json!({ "notes": rows, "nextToken": next }))
-        }
-        "note.get" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let max_content_bytes = parse_max_content_bytes(params)?;
-            let content_offset = opt_positive_usize(params, "contentOffset")?.unwrap_or(0);
-            match api.get_note(ws, note_id).await {
-                // Bounded reads: whatever `maxContentBytes` asks for, the row
-                // is cut to fit the read budget (`contentTruncated`), and
-                // `nextContentOffset` reads the rest, so nothing is lost.
-                Ok(note) => {
-                    let row = intent_core::note_read_bounds::note_get_row(
-                        &note,
-                        max_content_bytes,
-                        content_offset,
-                        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
-                    )
-                    .map_err(|e| invalid_params(e.to_string()))?;
-                    Ok(json!({ "note": row }))
-                }
-                Err(Error::NotFound(_)) => Err(not_found("Note not found")),
-                Err(e) => Err(domain_to_rpc(e)),
-            }
-        }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
+        "note.list" => crate::stack_frame::boxed_await(|| bounded_note_list(api, params)).await,
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
+        "note.get" => crate::stack_frame::boxed_await(|| bounded_note_get(api, params)).await,
         "note.create" => {
             let ws = require_ws_note(params)?;
             let title = require_str_param(params, "title")?;
@@ -1944,25 +2148,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        "note.update" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let input = NoteUpdateInput {
-                content: opt_str(params, "content"),
-                title: opt_str(params, "title"),
-                tags: opt_tags(params, "tags"),
-                expected_version: opt_int(params, "expectedVersion"),
-                base_content_bytes: parse_base_content_bytes(params)?,
-            };
-            if input.content.is_some() {
-                require_base_for_cut_note(api, &ws, &note_id, input.base_content_bytes).await?;
-            }
-            let note = api
-                .update_note(ws, note_id, input)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "note": note }))
-        }
+        // Whole arm boxed: the write guard adds a second await, and locals live
+        // across two awaits would grow every `dispatch` state (see `crate::stack_frame`).
+        "note.update" => crate::stack_frame::boxed_await(|| guarded_note_update(api, params)).await,
         "note.add" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -2011,27 +2199,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Whole arm boxed: the write guard adds a second await, and locals live
+        // across two awaits would grow every `dispatch` state (see `crate::stack_frame`).
         "note.setContent" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let content = require_str_param(params, "content")?;
-            let confirm = parse_confirm(params);
-            let expected_version = opt_int(params, "expectedVersion");
-            let base_content_bytes = parse_base_content_bytes(params)?;
-            require_base_for_cut_note(api, &ws, &note_id, base_content_bytes).await?;
-            let result = api
-                .set_note_content_guarded(
-                    ws,
-                    note_id,
-                    content,
-                    confirm,
-                    expected_version,
-                    base_content_bytes,
-                    None,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            crate::stack_frame::boxed_await(|| guarded_note_set_content(api, params)).await
         }
         "note.updateMetadata" => {
             let ws = require_ws_note(params)?;
@@ -2055,30 +2226,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "note.listTasks" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let page = parse_page_request(
-                params,
-                intent_core::note_read_bounds::NOTE_TASKS_DEFAULT_LIMIT,
-                intent_core::note_read_bounds::NOTE_TASKS_MAX_LIMIT,
-            )?;
-            let ws_key = ws.as_str().to_string();
-            let note_key = note_id.as_str().to_string();
-            let tasks = api
-                .list_note_tasks(ws, note_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            // Bounded reads: one page as `{ tasks, nextToken }`.
-            let (rows, next) = intent_core::note_read_bounds::note_tasks_page(
-                &tasks,
-                &ws_key,
-                &note_key,
-                &page,
-                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
-            )
-            .map_err(invalid_params)?;
-            Ok(json!({ "tasks": rows, "nextToken": next }))
+            crate::stack_frame::boxed_await(|| bounded_note_list_tasks(api, params)).await
         }
         "note.readAsset" => {
             let ws = require_ws_note(params)?;
@@ -2127,38 +2277,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "note.lineAttribution.load" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let window = intent_core::note_read_bounds::LineWindow {
-                start_line: opt_positive_usize(params, "startLine")?,
-                max_lines: opt_positive_usize(params, "maxLines")?,
-                start_offset: None,
-            };
-            let data = api
-                .line_attribution_load(ws, note_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            // Bare LineAttributionData | null so the FE gutter’s
-            // `line-attribution:load` decoder round-trips as-is. A page
-            // that holds fewer than every attributed line (a window, or the
-            // read budget) adds `truncated` and `nextStartLine`.
-            let Some(mut data) = data else {
-                return Ok(Value::Null);
-            };
-            let page = intent_core::note_read_bounds::line_attribution_page(
-                &mut data,
-                window,
-                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
-            );
-            let mut value = to_result_value(&data)?;
-            if page.truncated {
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("truncated".into(), Value::Bool(true));
-                    obj.insert("nextStartLine".into(), json!(page.next_start_line));
-                }
-            }
-            Ok(value)
+            crate::stack_frame::boxed_await(|| bounded_line_attribution_load(api, params)).await
         }
         "note.lineAttribution.computeNow" => {
             let ws = require_ws_note(params)?;
@@ -2373,39 +2494,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "comment.list" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let since = opt_str(params, "since");
-            let author_type = opt_str(params, "authorType");
-            let status = opt_str(params, "status");
-            let include_comments = parse_bool(params, "includeComments");
-            let page = parse_page_request(
-                params,
-                intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
-                intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
-            )?;
-            let ws_key = ws.as_str().to_string();
-            let note_key = note_id.as_str().to_string();
-            let result = api
-                .comment_list(ws, note_id, since, author_type, status, include_comments)
-                .await
-                .map_err(domain_to_rpc)?;
-            // Totals count every thread the filters keep, not just this page.
-            let (rows, next) = intent_core::note_read_bounds::comment_list_page(
-                result.threads,
-                &ws_key,
-                &note_key,
-                &page,
-                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
-            )
-            .map_err(invalid_params)?;
-            Ok(json!({
-                "threads": rows,
-                "totalThreads": result.total_threads,
-                "totalComments": result.total_comments,
-                "nextToken": next,
-            }))
+            crate::stack_frame::boxed_await(|| bounded_comment_list(api, params)).await
         }
         "comment.getThread" => {
             let ws = require_ws_note(params)?;
@@ -5375,18 +5466,9 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "crossWorkspace.readNote" => {
-            let ws = require_ws_note(params)?;
-            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
-            let note_id = require_note_id(params)?;
-            let window = intent_core::note_read_bounds::LineWindow {
-                start_line: opt_positive_usize(params, "startLine")?,
-                max_lines: opt_positive_usize(params, "maxLines")?,
-                start_offset: opt_positive_usize(params, "startOffset")?,
-            };
-            api.cross_workspace_read_note(ws, target, note_id, window, true)
-                .await
-                .map_err(domain_to_rpc)
+            crate::stack_frame::boxed_await(|| bounded_cross_workspace_read_note(api, params)).await
         }
         "crossWorkspace.listNotes" => {
             let ws = require_ws_note(params)?;
