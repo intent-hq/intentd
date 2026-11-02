@@ -446,6 +446,8 @@ windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and 
 Use **+** below the prompt to add context.
 These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
+the selected codebase is included even if it has not reached your history yet.
+Use the external-link action beside a codebase to open it in your browser.
 **Add codebase** adds a local folder, links a GitHub repository, or creates a
 new one. Open the agent picker to search by name and choose who starts the workspace.
 In **Setup script**, search the list and select the repository's config, last-used
