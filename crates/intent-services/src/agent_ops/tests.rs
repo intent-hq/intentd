@@ -895,6 +895,129 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
         .expect_err("retire with a pending descendant must fail");
 }
 
+/// Run `agent_retire_op` as the agent itself (`ws.agent.retire` scopes the
+/// call with `Caller::Agent`).
+async fn self_retire(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> intent_core::Result<serde_json::Value> {
+    intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: id.clone(),
+        },
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+}
+
+fn assert_last_top_level_refusal(err: &Error) {
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("last active top-level agent"),
+        "got: {err}"
+    );
+}
+
+/// Guard: an agent may not self-retire when it is the workspace's last
+/// active top-level agent. Children, background agents, and retired
+/// top-level agents do not count as another top-level agent; nothing is
+/// mutated on refusal.
+#[tokio::test]
+async fn agent_self_retire_rejects_the_last_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("the only top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+
+    // A settled child is not top-level: still refused, and the child is not
+    // cascade-retired.
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_child(&svc, &ws, &child, &solo, AgentStatus::RuntimeIdle).await;
+    // A background agent is not visible top-level either.
+    let bg = create_agent(&svc, &ws, "Background").await;
+    let mut bg_session = svc.store().get_agent_session(&bg).await.expect("bg");
+    bg_session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &bg_session)
+        .await
+        .expect("mark background");
+    // An already-retired top-level agent does not count.
+    let gone = create_agent(&svc, &ws, "Gone").await;
+    svc.agent_retire_op(gone.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire bystander");
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("children/background/retired agents do not count");
+    assert_last_top_level_refusal(&err);
+    for id in [&solo, &child, &bg] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "{id} must not be retired");
+    }
+
+    // With a second active top-level agent the self-retire succeeds…
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let r = self_retire(&svc, &ws, &solo)
+        .await
+        .expect("retire with a peer");
+    assert_eq!(r["success"], json!(true));
+    // …and the peer, now the last one, is refused in turn.
+    let err = self_retire(&svc, &ws, &peer)
+        .await
+        .expect_err("the remaining top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+}
+
+/// The guard only applies to agent callers' top-level sessions: a child
+/// agent may still self-retire under the last top-level agent, and a
+/// non-agent (user / wire) retire of the last top-level agent is allowed.
+#[tokio::test]
+async fn last_top_level_guard_skips_children_and_non_agent_callers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_child(&svc, &ws, &child, &parent, AgentStatus::RuntimeIdle).await;
+
+    self_retire(&svc, &ws, &child)
+        .await
+        .expect("a child agent may self-retire");
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("a non-agent caller may retire the last top-level agent");
+}
+
+/// Two top-level agents self-retiring at the same time: exactly one wins and
+/// the workspace keeps one active top-level agent.
+#[tokio::test]
+async fn concurrent_self_retires_leave_one_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+
+    let (ra, rb) = tokio::join!(self_retire(&svc, &ws, &a), self_retire(&svc, &ws, &b));
+    assert_eq!(
+        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+        1,
+        "exactly one self-retire may win: {ra:?} / {rb:?}"
+    );
+    let loser = ra.err().or(rb.err()).expect("one refusal");
+    assert_last_top_level_refusal(&loser);
+    let active = svc
+        .store()
+        .list_active_agent_session_summaries(&ws)
+        .await
+        .expect("list");
+    assert_eq!(active.len(), 1, "one top-level agent survives");
+}
+
 /// Cascade: retiring the parent retires every settled/idle descendant with
 /// it — each with its own `agent:retired` emit carrying the cascade reason —
 /// while terminal children, already-retired children (timestamp preserved),

@@ -11130,6 +11130,14 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
         AgentId::from("self-retire"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    // A peer top-level agent, so the last-top-level guard lets it retire.
+    let mut peer = mgr.services.store.get_agent_session(&id).await.unwrap();
+    peer.id = AgentId::from("self-retire-peer");
+    mgr.services
+        .store
+        .insert_agent_session_with_task_graph(&peer, false)
+        .await
+        .expect("insert peer");
     track(&mgr, &id);
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());

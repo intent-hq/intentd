@@ -1691,6 +1691,10 @@ async fn request_attention(
 /// wait for them first. On success the caller's settled descendants are
 /// cascade-retired with it (each with the full retire cleanup), and
 /// restoring the caller later does NOT restore them.
+///
+/// Also FAILS (invalid params, nothing mutated) when the caller is the
+/// workspace's last active top-level agent (no parent, not background, not
+/// retired): an agent may not leave the workspace without a visible agent.
 async fn retire(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
