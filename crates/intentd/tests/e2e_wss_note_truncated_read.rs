@@ -501,7 +501,11 @@ async fn note_subscribe_truncates_snapshot_and_live_updates() {
         json!({ "workspaceId": ws_id, "noteId": note_id, "maxContentBytes": limit }),
     )
     .await;
-    assert_eq!(row, &want["note"], "snapshot row matches note.get");
+    assert_eq!(
+        row,
+        &without_cursor(&want["note"]),
+        "snapshot row matches note.get"
+    );
 
     let grown = format!("{body}live line\n");
     wss_rpc(
@@ -522,7 +526,11 @@ async fn note_subscribe_truncates_snapshot_and_live_updates() {
         json!({ "workspaceId": ws_id, "noteId": note_id, "maxContentBytes": limit }),
     )
     .await;
-    assert_eq!(updated, &want["note"], "live row matches note.get");
+    assert_eq!(
+        updated,
+        &without_cursor(&want["note"]),
+        "live row matches note.get"
+    );
 
     wss_rpc(
         &mut rpc,
@@ -535,4 +543,24 @@ async fn note_subscribe_truncates_snapshot_and_live_updates() {
     let updated = &delta["delta"]["updated"][0];
     assert_eq!(updated["content"], "short\n");
     assert!(updated.get("contentTruncated").is_none() && updated.get("contentBytes").is_none());
+}
+
+/// A cut `note.get` row minus its content cursor. `note.get` alone adds
+/// `contentOffset` / `nextContentOffset` (bounded reads); the subscription
+/// rows carry the same body and truncation markers without them. Asserts
+/// the cursor points just past the served prefix, so the rest is readable.
+fn without_cursor(note: &Value) -> Value {
+    assert_eq!(note["contentTruncated"], true, "{note}");
+    assert_eq!(note["contentOffset"], 0, "{note}");
+    let served = note["content"].as_str().expect("content").len();
+    assert_eq!(
+        note["nextContentOffset"].as_u64(),
+        Some(served as u64),
+        "{note}"
+    );
+    let mut row = note.clone();
+    let obj = row.as_object_mut().expect("note object");
+    obj.remove("contentOffset");
+    obj.remove("nextContentOffset");
+    row
 }

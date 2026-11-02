@@ -1040,6 +1040,9 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
+    // Bounded reads: `note.listTasks` answers one page `{ tasks, nextToken }`.
+    assert!(tasks["nextToken"].is_null(), "one page: {tasks}");
+    let tasks = &tasks["tasks"];
     assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
     assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
 
@@ -1088,7 +1091,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
+    assert_eq!(tasks["tasks"][0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a

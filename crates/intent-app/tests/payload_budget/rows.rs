@@ -646,6 +646,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "targetWorkspaceId": ws, "noteId": note, "startLine": 2, "maxLines": 100_000 }),
                     Bytes(400 * 1024),
                 ),
+                v(
+                    "startOffset",
+                    json!({ "workspaceId": ws, "targetWorkspaceId": ws, "noteId": note, "startLine": 1, "startOffset": 1 }),
+                    Bytes(400 * 1024),
+                ),
             ],
         ),
         fixed(
