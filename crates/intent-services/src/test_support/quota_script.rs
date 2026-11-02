@@ -48,9 +48,13 @@ pub(crate) fn budget(server: WorkspaceMcpServer) -> WorkspaceMcpServer {
 ///
 /// Fails loudly, rather than letting the timer stand in for the ledger, when
 /// the served server does not carry [`QUOTA_SCRIPT_BUDGET`], when the call
-/// outlives [`QUOTA_HANG_GUARD`], or when it ran long enough to reach the
-/// script budget.
-pub(crate) async fn guard<T>(subcase: &str, served: Duration, call: impl Future<Output = T>) -> T {
+/// outlives [`QUOTA_HANG_GUARD`], or when its reply is the script budget's
+/// own timeout reply ([`timer_reply`]).
+pub(crate) async fn guard<T: std::fmt::Debug>(
+    subcase: &str,
+    served: Duration,
+    call: impl Future<Output = T>,
+) -> T {
     assert_eq!(
         served, QUOTA_SCRIPT_BUDGET,
         "{subcase}: a 63/64 acquisition control must serve its script with the \
@@ -72,12 +76,22 @@ pub(crate) async fn guard<T>(subcase: &str, served: Duration, call: impl Future<
              the outer hang guard expired after {elapsed:?}"
         );
     };
+    let timer = timer_reply(served);
     assert!(
-        elapsed < served,
-        "{subcase}: quota script hit its {served:?} time limit after {elapsed:?}; \
-         its reply reflects the timer, not the acquisition ledger"
+        !format!("{result:?}").contains(&timer),
+        "{subcase}: quota script hit its {served:?} time limit after {elapsed:?} \
+         (`{timer}`); its reply reflects the timer, not the acquisition ledger"
     );
     result
+}
+
+/// The reply text a `workspace_api` script gets when `budget` cuts it off
+/// (`intent_acp`'s `JsError::Timeout` rendering).
+fn timer_reply(budget: Duration) -> String {
+    format!(
+        "javascript execution timed out after {}ms",
+        budget.as_millis()
+    )
 }
 
 #[cfg(test)]
@@ -92,10 +106,12 @@ mod tests {
 
     #[tokio::test]
     #[should_panic(expected = "time limit")]
-    async fn guard_fails_a_run_that_reaches_its_budget() {
-        tokio::time::pause();
+    async fn guard_fails_a_reply_from_the_script_timer() {
         guard("timer", QUOTA_SCRIPT_BUDGET, async {
-            tokio::time::sleep(QUOTA_SCRIPT_BUDGET).await;
+            serde_json::json!({
+                "result": {"content": [{"type": "text",
+                    "text": "Error: javascript execution timed out after 150000ms"}]}
+            })
         })
         .await;
     }
