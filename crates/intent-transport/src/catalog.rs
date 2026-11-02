@@ -1276,7 +1276,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     bounded("agent.get", "One agent record."),
     bounded("agent.getConversation", "One paginated transcript page."),
     bounded("agent.getCreationPreferences", "Workspace specialist preference."),
-    bulk("agent.getMessageBlock", None, crate::MAX_OUTBOUND_MESSAGE_BYTES, "Hydrates one full content block on demand; the block is sent whole, bounded only by the outbound frame cap."),
+    bounded("agent.getMessageBlock", "One content block, capped at 480,000 bytes per page and paged by offset / nextOffset."),
     bounded("agent.getModels", "Model options for one agent."),
     bounded("agent.getQueue", "One agent's pending queue."),
     bounded("agent.getSession", "One ACP session summary."),

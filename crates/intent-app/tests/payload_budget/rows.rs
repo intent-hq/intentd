@@ -228,6 +228,8 @@ pub struct Ctx<'a> {
     /// An assistant message holding a large `tool_result` block, and the
     /// block's id (`agent.getMessageBlock`).
     pub tool_message_id: String,
+    /// The assistant message of [`seed::BIG_BLOCK_AGENT`].
+    pub big_block_message_id: String,
     pub tool_block_id: String,
     /// A member principal with live presence (seeded).
     pub member_principal: String,
@@ -372,6 +374,44 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "One workspace's specialist preference.",
             vec![v("default", w.clone(), Fixed("/specialistId"))],
         ),
+        {
+            let block = |extra: Value| {
+                let mut p = json!({
+                    "agentId": seed::BIG_BLOCK_AGENT,
+                    "messageId": c.big_block_message_id,
+                    "blockId": seed::BIG_BLOCK_ID,
+                });
+                for (k, val) in extra.as_object().expect("object") {
+                    p[k] = val.clone();
+                }
+                p
+            };
+            row(
+                "agent.getMessageBlock",
+                vec![
+                    v("default", block(json!({ "workspaceId": ws })), Bytes(400_000)),
+                    v("maxBytes=100000", block(json!({ "maxBytes": 100_000 })), Bytes(90_000)),
+                    v(
+                        "maxBytes=10000000",
+                        block(json!({ "maxBytes": 10_000_000 })),
+                        Bytes(400_000),
+                    ),
+                    v("offset", block(json!({ "offset": 1_000_000 })), Bytes(400_000)),
+                    next(
+                        "nextOffset",
+                        block(json!({})),
+                        "/nextOffset",
+                        "offset",
+                        Bytes(400_000),
+                    ),
+                    v(
+                        "unpaged",
+                        json!({ "agentId": agent, "messageId": c.tool_message_id, "blockId": c.tool_block_id }),
+                        Bytes(8 * 1024),
+                    ),
+                ],
+            )
+        },
         row(
             "agent.getQueue",
             vec![

@@ -67,6 +67,7 @@ fn placeholder_ctx(seeded: &seed::Seeded) -> rows::Ctx<'_> {
         worktree: "/tmp".into(),
         specialist: "specialist".into(),
         message_id: "message".into(),
+        big_block_message_id: "message".into(),
         tool_message_id: "message".into(),
         tool_block_id: "block".into(),
         member_principal: "member".into(),

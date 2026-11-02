@@ -116,7 +116,20 @@ pub async fn ctx<'a>(client: &mut Client, daemon: &Daemon, seeded: &'a Seeded) -
         .as_str()
         .unwrap_or_else(|| panic!("conversation page: {}", tool.frame))
         .to_string();
+    let big = client
+        .call(
+            "agent.getConversation",
+            &json!({ "agentId": crate::seed::BIG_BLOCK_AGENT, "limit": 10 }),
+        )
+        .await;
+    let big_block_message_id = big.result()["messages"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| m["role"] == json!("assistant")))
+        .and_then(|m| m["id"].as_str())
+        .unwrap_or_else(|| panic!("big-block conversation: {}", big.frame))
+        .to_string();
     Ctx {
+        big_block_message_id,
         tool_message_id,
         tool_block_id: "m1:3".into(),
         ws: ids.big_workspace.0.clone(),

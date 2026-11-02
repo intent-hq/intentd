@@ -86,6 +86,13 @@ pub const AGENT_TRACKED_CHANGES: usize = 500;
 pub const PROFILES_PER_PROVIDER: usize = 32;
 /// Pending host invites.
 pub const HOST_INVITES: usize = 40;
+/// Agent whose one assistant message holds a tool result of
+/// [`BIG_BLOCK_BYTES`] (block id [`BIG_BLOCK_ID`]): several capped pages of
+/// `agent.getMessageBlock`.
+pub const BIG_BLOCK_AGENT: &str = "agent-large-state-big-block";
+pub const BIG_BLOCK_ID: &str = "large-state-big-tool-result";
+pub const BIG_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+
 /// Backends with an executor credential on this machine, and machines
 /// exposed to this backend.
 pub const EXECUTOR_BACKENDS: usize = 30;
@@ -699,6 +706,37 @@ pub async fn store(state: &LargeState) -> Seeded {
             .await
             .expect("agent tracked change");
     }
+
+    // One very large tool output (a full build log captured by an agent).
+    let user = json!([{ "type": "text", "text": "Run the full build and show me the log." }]);
+    let assistant = json!([
+        { "type": "text", "text": "Here is the build log." },
+        { "type": "tool_result", "id": BIG_BLOCK_ID, "tool_use_id": "big-build",
+          "output": prose(7, BIG_BLOCK_BYTES), "is_error": false },
+    ]);
+    store
+        .insert_agent_session_with_messages(
+            &intent_services::test_support::fixtures::session(
+                &intent_core::AgentId::from_string(BIG_BLOCK_AGENT),
+                big_ws,
+            ),
+            &[
+                intent_store::ReplaceMessage {
+                    role: "user",
+                    content: &user,
+                    metadata: None,
+                    created_at: "2026-02-01T00:00:00.000Z",
+                },
+                intent_store::ReplaceMessage {
+                    role: "assistant",
+                    content: &assistant,
+                    metadata: None,
+                    created_at: "2026-02-01T00:00:01.000Z",
+                },
+            ],
+        )
+        .await
+        .expect("big-block agent");
 
     // Daemon-to-daemon machines: backends this machine admits, and
     // machines exposed to this backend (each with several routes).

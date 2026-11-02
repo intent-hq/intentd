@@ -2109,14 +2109,14 @@ fn payload_class_parameters_are_well_formed() {
 /// only intentional downloads are bulk. `workspace.export.read`'s `seq`
 /// selects a chunk rather than sizing it. `terminal.getBuffer` must stay a
 /// `BoundedRead`: scrollback replay runs on every terminal open, so moving
-/// it to bulk would silently drop it from the payload sweep. Update this
+/// it to bulk would silently drop it from the payload sweep; so must
+/// `agent.getMessageBlock`, which pages under the read budget. Update this
 /// list together with the handler.
 #[test]
 fn bulk_transfer_caps_match_handlers() {
     let chunk = intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
     let frame = crate::MAX_OUTBOUND_MESSAGE_BYTES;
     let expected: BTreeSet<(&str, Option<&str>, usize)> = [
-        ("agent.getMessageBlock", None, frame),
         ("file.read", None, frame),
         ("file.readChunk", Some("length"), chunk),
         ("git.showFile", None, frame),
@@ -2147,6 +2147,15 @@ fn bulk_transfer_caps_match_handlers() {
         terminal.class,
         PayloadClass::BoundedRead,
         "terminal.getBuffer is a normal operation (replay on every terminal open); keep it BoundedRead so the payload sweep covers it"
+    );
+    let block = PAYLOAD_CLASSES
+        .iter()
+        .find(|row| row.method == "agent.getMessageBlock")
+        .expect("agent.getMessageBlock is classified");
+    assert_eq!(
+        block.class,
+        PayloadClass::BoundedRead,
+        "agent.getMessageBlock pages each block under the read budget; keep it BoundedRead so the payload sweep covers it"
     );
 }
 

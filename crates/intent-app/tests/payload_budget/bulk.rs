@@ -7,7 +7,7 @@
 //! - `workspace.export.read` (server-cut chunks): every chunk of an export
 //!   of the big workspace holds at most the chunk cap.
 //! - Whole-object reads bounded by the outbound frame cap (`file.read`,
-//!   `git.showFile`, `note.readAsset`, `agent.getMessageBlock`): a large
+//!   `git.showFile`, `note.readAsset`): a large
 //!   object is served in one frame under the cap, and `file.read` of a file
 //!   past the cap is answered with an error instead of an oversized frame.
 
@@ -23,7 +23,6 @@ use crate::rows::Ctx;
 
 /// Every `BulkTransfer` method this module checks.
 pub const METHODS: &[&str] = &[
-    "agent.getMessageBlock",
     "file.read",
     "file.readChunk",
     "git.showFile",
@@ -184,16 +183,6 @@ pub async fn sweep(
         }
         None => fail(format!("bulk note.saveAsset: {}", saved.frame)),
     }
-
-    let (_, cap) = declared_cap("agent.getMessageBlock");
-    let block = client
-        .call(
-            "agent.getMessageBlock",
-            &json!({ "agentId": ctx.agent, "workspaceId": ws, "messageId": ctx.tool_message_id, "blockId": ctx.tool_block_id }),
-        )
-        .await;
-    check_whole(&mut fail, "agent.getMessageBlock", &block, cap);
-    line(&mut report, "agent.getMessageBlock", "tool_result", &block);
 
     // workspace.export.read: every server-cut chunk is under the chunk cap.
     let (export_param, export_cap) = declared_cap("workspace.export.read");
