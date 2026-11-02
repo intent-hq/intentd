@@ -120,19 +120,46 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    /// Per-workspace serialization of agent self-retires of top-level
+    /// sessions, so the last-top-level-agent guard in
+    /// [`Services::agent_retire_op`] cannot be raced by two top-level agents
+    /// retiring at once (each would otherwise see the other still active).
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AgentRetirementGates {
     pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
-        gate
+        weak_gate(&self.gates, agent_id)
     }
+
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        weak_gate(&self.workspaces, workspace_id)
+    }
+}
+
+fn weak_gate<K: std::hash::Hash + Eq + Clone>(
+    map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    key: &K,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = map.lock().expect("retirement gate map poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key.clone(), Arc::downgrade(&gate));
+    gate
+}
+
+/// A visible top-level session: no parent, not a background agent, not
+/// deleted, not soft-retired — the agents the user sees in the workspace's
+/// agent list (same predicate as the unread top-level derivation, plus the
+/// retired filter).
+fn is_active_top_level(session: &AgentSession) -> bool {
+    session.parent_agent_id.is_none()
+        && !session.is_background
+        && session.retired_at.is_none()
+        && !matches!(session.status, AgentStatus::Deleted)
 }
 
 /// Order attention persistence, deferred surfacing and matching clear events
@@ -6780,6 +6807,12 @@ impl Services {
     /// is still running a turn. On success the whole descendant subtree is
     /// cascade-retired (see the inline comments), and restoring the parent
     /// does NOT restore the cascaded children.
+    ///
+    /// GUARDED on the last top-level agent: when the caller is an AGENT
+    /// (`Caller::Agent`, i.e. `ws.agent.retire`) and the target is the
+    /// workspace's only active top-level session, the call FAILS
+    /// (`InvalidParams`, nothing mutated). Wire (user) retires are not
+    /// subject to this guard.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -6800,6 +6833,39 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
+        // Guard: an AGENT may not retire itself when it is the workspace's
+        // last active top-level agent — that would leave the workspace with
+        // no visible agent to talk to. User (wire) retires are unaffected.
+        // The workspace gate is held through the retire transition below so
+        // two top-level agents retiring concurrently cannot both pass.
+        let _last_top_level_gate = if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Agent { .. })
+        ) && is_active_top_level(&session)
+        {
+            let gate = self
+                .agent_retirement_gates
+                .for_workspace(&session.workspace_id);
+            let guard = gate.lock_owned().await;
+            let others = self
+                .store
+                .list_active_agent_session_summaries(&session.workspace_id)
+                .await?
+                .iter()
+                .filter(|s| s.id != session.id && is_active_top_level(s))
+                .count();
+            if others == 0 {
+                return Err(Error::InvalidParams(
+                    "cannot retire: this is the last active top-level agent in the workspace. \
+                     Retiring it would leave the workspace without an agent; finish your turn \
+                     normally instead."
+                        .to_string(),
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn
         // (pending/active/Processing). NOTHING is mutated on rejection (no

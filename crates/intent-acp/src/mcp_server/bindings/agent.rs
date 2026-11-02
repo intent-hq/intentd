@@ -1721,6 +1721,12 @@ async fn request_attention(
 /// wait for them first. On success the caller's settled descendants are
 /// cascade-retired with it (each with the full retire cleanup), and
 /// restoring the caller later does NOT restore them.
+///
+/// Also FAILS (invalid params, nothing mutated) when the caller is the
+/// workspace's last active top-level agent (no parent, not background, not
+/// retired): an agent may not leave the workspace without a visible agent.
+/// This holds from a background hook too: the call is always scoped as the
+/// agent caller.
 async fn retire(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1735,10 +1741,20 @@ async fn retire(
         reason = reason.as_deref().unwrap_or("(none)"),
         "agent.retire: soft-retiring agent session"
     );
-    let v = api
-        .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
-        .await
-        .map_err(map_err)?;
+    // Always retire AS the agent, even from a hook (which evaluates as
+    // `Caller::Daemon`): the service's last-top-level-agent guard keys on
+    // `Caller::Agent`, so a hook must not be a way around it.
+    let v = intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: caller.clone(),
+        },
+        async {
+            api.agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
+                .await
+        },
+    )
+    .await
+    .map_err(map_err)?;
     let mut out = merge_ok(v);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("agentId".to_string(), json!(caller.as_str()));
@@ -2542,6 +2558,60 @@ mod tests {
             })),
             None
         );
+    }
+
+    mod retire_caller_scope {
+        use super::super::*;
+        use intent_core::{BoxFuture, Caller, Result};
+
+        /// Records the ambient caller each `agent_retire` call sees.
+        #[derive(Default)]
+        struct FakeApi {
+            seen: std::sync::Mutex<Vec<Option<Caller>>>,
+        }
+
+        impl WorkspaceApi for FakeApi {
+            fn agent_retire(
+                &self,
+                _agent_id: AgentId,
+                _workspace_id: Option<WorkspaceId>,
+                _reason: Option<String>,
+            ) -> BoxFuture<'_, Result<Value>> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(intent_core::current_caller());
+                Box::pin(async { Ok(json!({ "success": true, "retiredAt": "t" })) })
+            }
+        }
+
+        /// A hook evaluates as `Caller::Daemon` with the owner as binding
+        /// caller; the retire must still reach the service as
+        /// `Caller::Agent { owner }` so the last-top-level guard applies.
+        #[tokio::test]
+        async fn hook_retire_reaches_the_service_as_the_agent_caller() {
+            let fake = Arc::new(FakeApi::default());
+            let api: Arc<dyn WorkspaceApi> = fake.clone();
+            let ws = WorkspaceId::from_string("ws-1");
+            let owner = AgentId::from("hook-owner");
+            intent_core::with_caller(
+                Caller::Daemon,
+                dispatch(
+                    &api,
+                    &ws,
+                    Some(&owner),
+                    EvalBudget::starting_now(Duration::from_secs(30)),
+                    "retire",
+                    &json!({}),
+                ),
+            )
+            .await
+            .expect("retire");
+            assert_eq!(
+                *fake.seen.lock().unwrap(),
+                vec![Some(Caller::Agent { agent_id: owner })]
+            );
+        }
     }
 
     mod list_specialists {
