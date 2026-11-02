@@ -1997,29 +1997,81 @@ impl Services {
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
-    /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
-    /// are clamped when read.
+    /// `prMonitor.pollSeconds` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `seconds` is below
+    /// [`intent_core::config::MIN_PR_MONITOR_POLL_SECONDS`], which the
+    /// cadence is read through (see [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_poll_seconds",
+            seconds,
+            (intent_core::config::MIN_PR_MONITOR_POLL_SECONDS, None),
+            "s",
+            "Pass at least MIN_PR_MONITOR_POLL_SECONDS; to poll now, call \
+             `poll_pr_monitors()` directly.",
+        );
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
 
     /// Pin the PR-monitor hourly forge request budget, bypassing the live
-    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values outside
-    /// [floor, ceiling] are clamped when read.
+    /// `prMonitor.hourlyRequestBudget` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `budget` is outside
+    /// [[`intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET`],
+    /// [`intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET`]], the
+    /// range the budget is read through (see
+    /// [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_hourly_request_budget",
+            budget,
+            (
+                intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+                Some(intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+            ),
+            " requests/hour",
+            "Pass a value within MIN_/MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET; to test the \
+             clamp itself, set `prMonitor.hourlyRequestBudget` through a config file.",
+        );
         self.pr_monitor_hourly_request_budget = Some(budget);
         self
     }
 
     /// Pin the share of the remaining forge quota the PR-monitor loop may
     /// plan to spend, bypassing the live `prMonitor.quotaSharePercent`
-    /// setting (test wiring). Values outside [floor, ceiling] are clamped
-    /// when read.
+    /// setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `percent` is outside
+    /// [[`intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT`],
+    /// [`intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT`]], the
+    /// range the share is read through (see
+    /// [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_quota_share_percent(mut self, percent: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_quota_share_percent",
+            percent,
+            (
+                intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
+                Some(intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT),
+            ),
+            "%",
+            "Pass a value within MIN_/MAX_PR_MONITOR_QUOTA_SHARE_PERCENT; to test the \
+             clamp itself, set `prMonitor.quotaSharePercent` through a config file.",
+        );
         self.pr_monitor_quota_share_percent = Some(percent);
         self
     }
@@ -2030,22 +2082,22 @@ impl Services {
     /// # Panics
     ///
     /// When `seconds` is below
-    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. The window
-    /// is read through the same floor as the live setting, so a smaller
-    /// value would silently become the floor: a test expecting an immediate
-    /// wake would see the change stay pending and mistake it for a delivery
-    /// bug. A test that wants delivery now pins a long window and calls
-    /// `pr_monitor_flush_op`.
+    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`], which the
+    /// window is read through (see [`assert_pr_monitor_override_honoured`]).
+    /// A test expecting an immediate wake would otherwise see the change
+    /// stay pending and mistake it for a delivery bug; a test that wants
+    /// delivery now pins a long window and calls `pr_monitor_flush_op`.
     #[must_use]
     #[track_caller]
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
-        let floor = intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS;
-        assert!(
-            seconds >= floor,
-            "with_pr_monitor_debounce_seconds({seconds}) is below the {floor}s floor the daemon \
-             enforces, so it would silently wait {floor}s instead. To deliver pending changes \
-             immediately, pin a long window (e.g. 3600) and call `pr_monitor_flush_op`; \
-             otherwise pass at least MIN_PR_MONITOR_DEBOUNCE_SECONDS."
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_debounce_seconds",
+            seconds,
+            (intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS, None),
+            "s",
+            "To deliver pending changes immediately, pin a long window (e.g. 3600) and \
+             call `pr_monitor_flush_op`; otherwise pass at least \
+             MIN_PR_MONITOR_DEBOUNCE_SECONDS.",
         );
         self.pr_monitor_debounce_seconds = Some(seconds);
         self
@@ -40029,5 +40081,36 @@ impl Services {
             self.attach_workspace_membership(&mut ws).await;
             Ok(Some(ws))
         })
+    }
+}
+
+/// Refuse a PR-monitor test override the daemon would not honour.
+///
+/// Each override is read through the same `[floor, ceiling]` clamp as its
+/// live `prMonitor.*` setting, so an out-of-range value would silently read
+/// as the nearest bound: a `0` debounce became a 10s wait and the test that
+/// expected an immediate wake saw nothing (intentd#2915). Panicking at the
+/// caller (`#[track_caller]` on every override) names the bad line instead.
+/// The clamp itself stays covered through a config file, which is the input
+/// it exists to guard.
+#[track_caller]
+fn assert_pr_monitor_override_honoured(
+    setter: &str,
+    value: u64,
+    (floor, ceiling): (u64, Option<u64>),
+    unit: &str,
+    hint: &str,
+) {
+    assert!(
+        value >= floor,
+        "{setter}({value}) is below the {floor}{unit} floor the daemon enforces, so it would \
+         silently read as {floor}{unit} instead. {hint}"
+    );
+    if let Some(ceiling) = ceiling {
+        assert!(
+            value <= ceiling,
+            "{setter}({value}) is above the {ceiling}{unit} ceiling the daemon enforces, so it \
+             would silently read as {ceiling}{unit} instead. {hint}"
+        );
     }
 }

@@ -17834,6 +17834,18 @@ mod tests {
         );
     }
 
+    /// Wire `svc` to a settings registry loaded from a hand-edited
+    /// `[prMonitor]` config section, the input the read-time clamps guard
+    /// (the test overrides refuse out-of-range values instead). The `TempDir`
+    /// must outlive the returned service.
+    fn with_pr_monitor_config(svc: &Services, section: &str) -> (tempfile::TempDir, Services) {
+        let dir = crate::test_support::test_tempdir("intentd-pr-monitor-clamp-");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("[prMonitor]\n{section}")).unwrap();
+        let registry = Arc::new(crate::settings_registry::SettingsRegistry::load(&path).unwrap());
+        (dir, svc.clone().with_settings_registry(registry))
+    }
+
     #[tokio::test]
     async fn poll_and_debounce_intervals_clamp_to_their_floors() {
         use intent_core::config::{
@@ -17848,31 +17860,24 @@ mod tests {
             svc.pr_monitor_debounce(),
             Duration::from_secs(DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS)
         );
+        let (_dir, clamped) =
+            with_pr_monitor_config(&svc, "pollSeconds = 1\ndebounceSeconds = 0\n");
+        let effective = clamped.effective_settings().pr_monitor;
+        assert_eq!((effective.poll_seconds, effective.debounce_seconds), (1, 0));
         assert_eq!(
-            svc.clone()
-                .with_pr_monitor_poll_seconds(1)
-                .pr_monitor_poll_interval(),
+            clamped.pr_monitor_poll_interval(),
             Duration::from_secs(MIN_PR_MONITOR_POLL_SECONDS)
         );
-        // The debounce floor guards the live setting: a hand-edited config
-        // file below it reads as the floor. (The test override refuses such
-        // values instead; see the next test.)
-        let dir = crate::test_support::test_tempdir("intentd-debounce-floor-");
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[prMonitor]\ndebounceSeconds = 0\n").unwrap();
-        let registry = Arc::new(crate::settings_registry::SettingsRegistry::load(&path).unwrap());
-        assert_eq!(registry.snapshot().effective.pr_monitor.debounce_seconds, 0);
         assert_eq!(
-            svc.clone()
-                .with_settings_registry(registry)
-                .pr_monitor_debounce(),
+            clamped.pr_monitor_debounce(),
             Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
         );
     }
 
-    /// The test override refuses a window the daemon would not honour: the
-    /// read-time floor would otherwise turn `0` into a silent wait, and a
-    /// test expecting an immediate wake would see nothing (intentd#2915).
+    /// The test overrides refuse a value the daemon would not honour: the
+    /// read-time clamp would otherwise turn it into the nearest bound
+    /// silently, e.g. a `0` debounce into a 10s wait that a test expecting
+    /// an immediate wake mistakes for a delivery bug (intentd#2915).
     #[tokio::test]
     #[should_panic(expected = "with_pr_monitor_debounce_seconds(0) is below the 10s floor")]
     async fn debounce_override_below_the_floor_panics_at_the_call_site() {
@@ -17881,13 +17886,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debounce_override_at_the_floor_is_honoured() {
+    #[should_panic(expected = "with_pr_monitor_poll_seconds(1) is below the 10s floor")]
+    async fn poll_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_poll_seconds(1);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "with_pr_monitor_hourly_request_budget(0) is below the 60 requests/hour floor"
+    )]
+    async fn hourly_budget_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_hourly_request_budget(0);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "with_pr_monitor_hourly_request_budget(5001) is above the 5000 requests/hour ceiling"
+    )]
+    async fn hourly_budget_override_above_the_ceiling_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET + 1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_quota_share_percent(0) is below the 1% floor")]
+    async fn quota_share_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_quota_share_percent(0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_quota_share_percent(101) is above the 100% ceiling")]
+    async fn quota_share_override_above_the_ceiling_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_quota_share_percent(MAX_PR_MONITOR_QUOTA_SHARE_PERCENT + 1);
+    }
+
+    /// Every bound itself is a legal override and reads back unchanged.
+    #[tokio::test]
+    async fn overrides_at_their_bounds_are_honoured() {
         let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
         assert_eq!(
-            svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+            svc.clone()
+                .with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
                 .pr_monitor_debounce(),
             Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
         );
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_poll_seconds(MIN_PR_MONITOR_POLL_SECONDS)
+                .pr_monitor_poll_interval(),
+            Duration::from_secs(MIN_PR_MONITOR_POLL_SECONDS)
+        );
+        for budget in [
+            MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+        ] {
+            assert_eq!(
+                svc.clone()
+                    .with_pr_monitor_hourly_request_budget(budget)
+                    .pr_monitor_hourly_request_budget(),
+                budget
+            );
+        }
+        for percent in [
+            MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
+            MAX_PR_MONITOR_QUOTA_SHARE_PERCENT,
+        ] {
+            assert_eq!(
+                svc.clone()
+                    .with_pr_monitor_quota_share_percent(percent)
+                    .pr_monitor_quota_share_percent(),
+                percent
+            );
+        }
     }
 
     /// The hourly request budget getter clamps into [floor, ceiling]: a
@@ -17902,24 +17976,44 @@ mod tests {
             svc.pr_monitor_hourly_request_budget(),
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
         );
+        for (configured, read) in [
+            (0, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+            (1_000_000, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+        ] {
+            let (_dir, clamped) =
+                with_pr_monitor_config(&svc, &format!("hourlyRequestBudget = {configured}\n"));
+            assert_eq!(
+                clamped
+                    .effective_settings()
+                    .pr_monitor
+                    .hourly_request_budget,
+                configured
+            );
+            assert_eq!(clamped.pr_monitor_hourly_request_budget(), read);
+        }
+    }
+
+    /// The quota share getter clamps into [1, 100] the same way.
+    #[tokio::test]
+    async fn quota_share_percent_clamps_to_floor_and_ceiling() {
+        use intent_core::config::DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT;
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
         assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(0)
-                .pr_monitor_hourly_request_budget(),
-            MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET
+            svc.pr_monitor_quota_share_percent(),
+            DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT
         );
-        assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(1_000_000)
-                .pr_monitor_hourly_request_budget(),
-            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
-        );
-        assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET)
-                .pr_monitor_hourly_request_budget(),
-            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
-        );
+        for (configured, read) in [
+            (0, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT),
+            (250, MAX_PR_MONITOR_QUOTA_SHARE_PERCENT),
+        ] {
+            let (_dir, clamped) =
+                with_pr_monitor_config(&svc, &format!("quotaSharePercent = {configured}\n"));
+            assert_eq!(
+                clamped.effective_settings().pr_monitor.quota_share_percent,
+                configured
+            );
+            assert_eq!(clamped.pr_monitor_quota_share_percent(), read);
+        }
     }
     #[intent_test_macros::daemon_test]
     async fn qualified_and_legacy_identical_names_numbers_keep_independent_records() {
