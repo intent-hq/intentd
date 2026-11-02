@@ -450,6 +450,7 @@ the selected codebase is included even if it has not reached your history yet.
 Use the external-link action beside a codebase to open it in your browser.
 **Add codebase** adds a local folder, links a GitHub repository, or creates a
 new one. Open the agent picker to search by name and choose who starts the workspace.
+**Create new or manage specialists** closes the workspace form and opens specialist settings.
 In **Setup script**, search the list and select the repository's config, last-used
 commands, or a template to apply it. **Edit commands** opens the selected script;
 **Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
