@@ -1320,7 +1320,19 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "rules.list",
             vec![
                 v("default", json!({}), Fixed("/rules")),
-                v("workspace", w.clone(), Items("/rules/rules", 50)),
+                v("workspace", w.clone(), Items("/rules/rules", 15)),
+                v(
+                    "limit=100000",
+                    json!({ "workspaceId": ws, "limit": 100_000 }),
+                    Items("/rules/rules", 15),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "limit": 100_000 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/rules/rules", 15),
+                ),
             ],
         )
         .with_reason("Unscoped, only the global user-override rules are listed."),
@@ -1528,7 +1540,21 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         ),
         row(
             "skill.list",
-            vec![v("default", w.clone(), Items("", 1_000))],
+            vec![
+                v("default", w.clone(), Items("", 300)),
+                v(
+                    "limit=100000",
+                    json!({ "workspaceId": ws, "limit": 100_000 }),
+                    Items("/skills", 300),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "limit": 100_000 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/skills", 300),
+                ),
+            ],
         ),
         fixed(
             "sourceControl.authStatus",
@@ -1556,11 +1582,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "specialist.list",
             vec![
-                v("default", json!({}), Items("/specialists", 100)),
+                v("default", json!({}), Items("/specialists", 8)),
                 v(
                     "max",
-                    json!({ "workspaceId": ws, "includeProject": true, "provider": "claude-code" }),
-                    Items("/specialists", 100),
+                    json!({ "workspaceId": ws, "includeProject": true, "provider": "claude-code", "limit": 100_000 }),
+                    Items("/specialists", 8),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "limit": 100_000 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/specialists", 8),
                 ),
             ],
         ),
