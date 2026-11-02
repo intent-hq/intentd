@@ -11142,6 +11142,51 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
     mgr.stop(&id).await;
 }
 
+/// A user retire of the workspace's last top-level agent is refused before
+/// the running target is stopped: its turn and worker survive untouched.
+#[tokio::test]
+async fn user_retire_last_top_level_rejection_does_not_stop_target() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retire-last-top-level"),
+        AgentId::from("solo"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("last active top-level agent")),
+        "{result:?}"
+    );
+    assert!(!aborted.is_finished());
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.contains(&id));
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    assert!(mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .retired_at
+        .is_none());
+    mgr.stop(&id).await;
+}
+
 #[tokio::test]
 async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
     let (_tmp, mgr) = manager().await;

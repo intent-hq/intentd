@@ -1084,6 +1084,43 @@ async fn concurrent_self_retires_leave_one_top_level_agent() {
     }
 }
 
+/// A guarded retire that read its target before waiting on the workspace
+/// gate must not turn into a last-agent refusal when, meanwhile, a rival
+/// retire of the same target won and the last peer retired too: the late
+/// call reports the documented idempotent `alreadyRetired` result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let gate = svc.agent_retirement_gates.for_workspace(&ws);
+    let held = gate.lock().await;
+    let late = {
+        let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
+        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+    };
+    // The late call holds its own handle on the gate once it has read the
+    // (still unretired) target and is about to wait on the lock.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while Arc::strong_count(&gate) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late retire reaches the workspace gate");
+    for id in [&target, &peer] {
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+            .await
+            .expect("daemon-internal retire");
+    }
+    drop(held);
+    let res = late
+        .await
+        .expect("join")
+        .expect("late retire is an idempotent retry");
+    assert_eq!(res["alreadyRetired"], json!(true), "{res}");
+}
+
 /// Cascade: retiring the parent retires every settled/idle descendant with
 /// it — each with its own `agent:retired` emit carrying the cascade reason —
 /// while terminal children, already-retired children (timestamp preserved),

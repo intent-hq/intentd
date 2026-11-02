@@ -6857,6 +6857,19 @@ impl Services {
                     .agent_retirement_gates
                     .for_workspace(&session.workspace_id);
                 let guard = gate.lock_owned().await;
+                // A concurrent retire of this same target may have won while
+                // this call waited for the workspace gate: report it as an
+                // idempotent retry, not as a last-agent refusal.
+                if let Some(existing) = self
+                    .store
+                    .get_agent_session_summary(&session.id)
+                    .await?
+                    .retired_at
+                {
+                    return Ok(
+                        json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
+                    );
+                }
                 let others = self
                     .store
                     .list_active_agent_session_summaries(&session.workspace_id)
