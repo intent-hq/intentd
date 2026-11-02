@@ -13,8 +13,9 @@
 //! freeze.
 
 use super::{
-    canonical_method, collaborator_may_call, COLLABORATOR_METHODS, FASTPATH_METHODS,
-    METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
+    canonical_method, collaborator_may_call, PayloadClass, COLLABORATOR_METHODS, FASTPATH_METHODS,
+    METHOD_ALIASES, NOTIFICATIONS, PAYLOAD_CLASSES, READ_PAYLOAD_BUDGET_BYTES, REVERSE_METHODS,
+    ROUTER_METHODS, SNAPSHOT_CHANNELS,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -1957,4 +1958,213 @@ fn removed_git_commit_is_not_advertised_or_authorized() {
     assert!(!super::collaborator_may_call("git.commit"));
     assert!(!super::collaborator_may_call("git.agentCommit"));
     assert!(super::member_may_call("git.agentCommit"));
+}
+
+// ---------------------------------------------------------------------------
+// Payload budget classification (PAYLOAD_CLASSES / SNAPSHOT_CHANNELS)
+// ---------------------------------------------------------------------------
+
+/// Router and fast-path methods: the set `PAYLOAD_CLASSES` must cover.
+fn payload_universe() -> BTreeSet<&'static str> {
+    ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS.iter())
+        .copied()
+        .collect()
+}
+
+/// The coverage problems of `classified` against `universe`, or `None`
+/// when every method is classified exactly once and nothing is stale.
+fn payload_classification_drift(universe: &BTreeSet<&str>, classified: &[&str]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let duplicates: BTreeSet<&str> = classified
+        .iter()
+        .copied()
+        .filter(|m| !seen.insert(*m))
+        .collect();
+    let unclassified: Vec<&str> = universe.difference(&seen).copied().collect();
+    let stale: Vec<&str> = seen.difference(universe).copied().collect();
+    if duplicates.is_empty() && unclassified.is_empty() && stale.is_empty() {
+        return None;
+    }
+    let mut msg = String::from(
+        "Payload classification drift: every method in ROUTER_METHODS and FASTPATH_METHODS must appear exactly once in catalog.rs PAYLOAD_CLASSES.\n",
+    );
+    if !unclassified.is_empty() {
+        let _ = writeln!(
+            msg,
+            "\nUnclassified — add a row to PAYLOAD_CLASSES (bounded / bulk / proxy / subscription / mutation) with a short reason:"
+        );
+        for m in &unclassified {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    if !duplicates.is_empty() {
+        let _ = writeln!(msg, "\nDuplicate — keep exactly one row for:");
+        for m in &duplicates {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    if !stale.is_empty() {
+        let _ = writeln!(
+            msg,
+            "\nStale — no longer a router or fast-path method; remove the row:"
+        );
+        for m in &stale {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    Some(msg)
+}
+
+#[test]
+fn payload_classes_cover_every_method_exactly_once() {
+    let classified: Vec<&str> = PAYLOAD_CLASSES.iter().map(|row| row.method).collect();
+    if let Some(msg) = payload_classification_drift(&payload_universe(), &classified) {
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn payload_classification_drift_reports_unclassified_duplicate_and_stale() {
+    let universe: BTreeSet<&str> = ["a.read", "b.write", "c.new"].into_iter().collect();
+    assert_eq!(
+        payload_classification_drift(&universe, &["a.read", "b.write", "c.new"]),
+        None
+    );
+    let msg = payload_classification_drift(&universe, &["a.read", "a.read", "b.write", "z.gone"])
+        .expect("drift must be reported");
+    assert!(
+        msg.contains("Unclassified") && msg.contains("  c.new"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Duplicate") && msg.contains("  a.read"),
+        "{msg}"
+    );
+    assert!(msg.contains("Stale") && msg.contains("  z.gone"), "{msg}");
+}
+
+#[test]
+fn payload_classes_are_sorted_and_explained() {
+    let listed: Vec<&str> = PAYLOAD_CLASSES.iter().map(|row| row.method).collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        listed, sorted,
+        "PAYLOAD_CLASSES must be sorted alphabetically by method"
+    );
+    for row in PAYLOAD_CLASSES {
+        assert!(
+            !row.reason.trim().is_empty(),
+            "PAYLOAD_CLASSES row {} has no reason — say what it returns or does",
+            row.method
+        );
+    }
+}
+
+#[test]
+fn payload_class_parameters_are_well_formed() {
+    const PROXY_NAMESPACES: &[&str] = &["github.", "linear.", "sentry.", "sourceControl."];
+    for row in PAYLOAD_CLASSES {
+        match row.class {
+            PayloadClass::BulkTransfer {
+                cap_param,
+                max_bytes,
+            } => {
+                assert!(
+                    max_bytes > READ_PAYLOAD_BUDGET_BYTES
+                        && max_bytes <= crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                    "BulkTransfer {}: max_bytes {max_bytes} must exceed the read budget (else classify it BoundedRead) and fit the outbound frame cap",
+                    row.method
+                );
+                match cap_param {
+                    Some(param) => assert!(
+                        !param.trim().is_empty(),
+                        "BulkTransfer {}: name the param that caps one response",
+                        row.method
+                    ),
+                    None => assert_eq!(
+                        max_bytes,
+                        crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                        "BulkTransfer {}: an object sent whole is bounded only by the outbound frame cap",
+                        row.method
+                    ),
+                }
+            }
+            PayloadClass::ExternalProxy { page_param } => {
+                assert!(
+                    PROXY_NAMESPACES.iter().any(|ns| row.method.starts_with(ns)),
+                    "ExternalProxy {} is not a GitHub, Linear, Sentry or source-control method",
+                    row.method
+                );
+                if let Some(param) = page_param {
+                    assert!(
+                        !param.trim().is_empty(),
+                        "ExternalProxy {}: page_param must name the clamped page-size param or be None",
+                        row.method
+                    );
+                }
+            }
+            PayloadClass::BoundedRead | PayloadClass::Subscription | PayloadClass::Mutation => {}
+        }
+    }
+}
+
+/// `*.subscribe` methods whose subscribe sends **no** seq-0 snapshot. Every
+/// other subscribe method must be in [`SNAPSHOT_CHANNELS`].
+const SNAPSHOT_FREE_SUBSCRIBE_METHODS: &[&str] = &[
+    // The event stream only tails live events; there is no initial state.
+    "events.subscribe",
+];
+
+#[test]
+fn snapshot_channels_list_every_snapshot_subscribe_method() {
+    let subscribe: BTreeSet<String> = client_callable_universe()
+        .into_iter()
+        .filter(|m| m.ends_with(".subscribe"))
+        .collect();
+    let listed: BTreeSet<String> = SNAPSHOT_CHANNELS
+        .iter()
+        .map(|(m, _)| *m)
+        .chain(SNAPSHOT_FREE_SUBSCRIBE_METHODS.iter().copied())
+        .map(str::to_string)
+        .collect();
+    let unclassified: Vec<_> = subscribe.difference(&listed).collect();
+    let stale: Vec<_> = listed.difference(&subscribe).collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "Snapshot channel drift.\n\
+         Unclassified subscribe methods {unclassified:?}: if the subscribe sends a seq-0 snapshot, add it to catalog.rs SNAPSHOT_CHANNELS with what the snapshot holds (the payload sweep subscribes to each); otherwise name it in SNAPSHOT_FREE_SUBSCRIBE_METHODS in catalog/tests.rs.\n\
+         Stale entries {stale:?}: no such subscribe method any more; remove them."
+    );
+}
+
+#[test]
+fn snapshot_channels_are_sorted_unique_and_explained() {
+    let listed: Vec<&str> = SNAPSHOT_CHANNELS.iter().map(|(m, _)| *m).collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        listed, sorted,
+        "SNAPSHOT_CHANNELS must be sorted alphabetically with no duplicates"
+    );
+    for (method, note) in SNAPSHOT_CHANNELS {
+        assert!(
+            !note.trim().is_empty(),
+            "SNAPSHOT_CHANNELS {method} must say what its seq-0 snapshot holds"
+        );
+        assert!(
+            !SNAPSHOT_FREE_SUBSCRIBE_METHODS.contains(method),
+            "{method} is listed as both snapshot and snapshot-free"
+        );
+        if let Some(row) = PAYLOAD_CLASSES.iter().find(|row| row.method == *method) {
+            assert_eq!(
+                row.class,
+                PayloadClass::Subscription,
+                "{method} sends a seq-0 snapshot, so its PAYLOAD_CLASSES row must be Subscription"
+            );
+        }
+    }
 }
