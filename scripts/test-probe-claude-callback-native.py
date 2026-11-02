@@ -137,7 +137,10 @@ class ProbeTests(unittest.TestCase):
     def test_failed_inert_proof_has_no_payload_fallback(self):
         refusal = {"stdout": "", "stderr": "fixture namespace denied", "returncode": 1,
                    "live_original_processes_after_cleanup": [], "reason": "exited"}
-        with patch.object(probe, "run_bounded", return_value=refusal) as launch:
+        # check_os pins the host's system library bytes, which change with
+        # every distro update; this case is about the fallback, not the pins.
+        with patch.object(probe, "check_os"), \
+                patch.object(probe, "run_bounded", return_value=refusal) as launch:
             result = probe.execute(self.args())
         self.assertEqual(result, 1)
         receipt = json.loads((self.root / "result/receipt.json").read_text())
