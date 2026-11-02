@@ -3,13 +3,7 @@
 # down: assert what the time limit stood for (rows changed, calls made, a write that got in
 # while other work was held, event order) instead of how long the step took, or mark a
 # measurement under a paused tokio clock with `// elapsed-assert: allow — <reason>`.
-crates/intent-core/src/path_utils.rs 1
-crates/intent-git/src/fetch.rs 1
-crates/intent-js/tests/engine.rs 3
 crates/intent-pty/src/host.rs 1
-crates/intent-pty/src/host/unix_io.rs 1
-crates/intent-transport/src/accept_backoff.rs 1
-crates/intent-transport/src/reverse/tests.rs 1
 crates/intentd/src/main.rs 1
 crates/intentd/tests/auggie_context_e2e.rs 1
 crates/intentd/tests/e2e_detached_lifecycle.rs 2

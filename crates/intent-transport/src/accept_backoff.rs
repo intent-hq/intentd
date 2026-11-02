@@ -288,16 +288,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let _ = tx.send(());
         });
-        let started = Instant::now();
+        // `true` is only returned when the shutdown future, not the
+        // MAX_DELAY sleep, finished first.
         let mut shutdown = std::pin::pin!(rx);
         assert!(
             sleep_unless_shutdown(MAX_DELAY, &mut shutdown).await,
             "shutdown should win"
-        );
-        assert!(
-            started.elapsed() < MAX_DELAY / 2,
-            "returned after {:?}, expected well under {MAX_DELAY:?}",
-            started.elapsed()
         );
     }
 

@@ -161,18 +161,29 @@ mod tests {
             stop: Arc::new(AtomicBool::new(true)),
             drain_deadline: None,
         };
-        let started = Instant::now();
         let mut buf = [0; 4];
-        loop {
-            // Every read has queued bytes: an escaped holder that continues
-            // writing must not turn graceful drain into another unbounded join.
-            peer.write_all(b"more").unwrap();
-            if reader.read(&mut buf).unwrap() == 0 {
-                break;
-            }
-            assert!(started.elapsed() < DRAIN_GRACE * 2, "drain did not stop");
-        }
-        assert!(started.elapsed() >= DRAIN_GRACE);
+        // Every read has queued bytes: an escaped holder that continues
+        // writing must not turn graceful drain into another unbounded join.
+        // The first cancelled read still drains, and starts one grace window.
+        let before = Instant::now();
+        peer.write_all(b"more").unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 4, "queued output drains");
+        let deadline = reader
+            .drain_deadline
+            .expect("cancelled read starts the drain");
+        assert!(
+            deadline >= before + DRAIN_GRACE && deadline <= Instant::now() + DRAIN_GRACE,
+            "the drain window is one DRAIN_GRACE from the first cancelled read"
+        );
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            0,
+            "nothing queued ends the drain"
+        );
+        // Once the window has passed, the drain ends even with output queued.
+        reader.drain_deadline = Some(before);
+        peer.write_all(b"more").unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 0, "drain did not stop");
     }
 
     /// Fill a real nonblocking descriptor before calling the Write adapter,
