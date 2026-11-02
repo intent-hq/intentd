@@ -952,6 +952,7 @@ async fn provider_default_overrides_contract_over_wss() {
             "env": [],
             "settingsFingerprint": "",
             "activation": { "runningProcesses": 0 },
+            "remoteCompatible": true,
         })
     };
     let list = ok(&mut ws, 1, "providers.profiles.list", json!({})).await;
@@ -1029,6 +1030,7 @@ async fn provider_default_overrides_contract_over_wss() {
                 ],
                 "settingsFingerprint": fingerprint,
                 "activation": { "runningProcesses": 0 },
+                "remoteCompatible": true,
             },
             "revision": 1,
             "activation": { "envChanged": true, "runningProcesses": 0 },
