@@ -199,7 +199,14 @@ async fn catalog_offers_profiles_and_rename_changes_only_the_label() {
         keys.sort();
         assert_eq!(
             keys,
-            ["backup", "baseProviderId", "id", "name", "providerRef"]
+            [
+                "backup",
+                "baseProviderId",
+                "id",
+                "name",
+                "providerRef",
+                "remoteCompatible"
+            ]
         );
     }
     let rendered = catalog.to_string();

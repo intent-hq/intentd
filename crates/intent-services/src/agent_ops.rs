@@ -6532,19 +6532,29 @@ impl Services {
         )
     }
 
-    /// Take the agent's accepted remote switch, if its session still names
-    /// it: the one change of identity its live run is replaced for (besides
-    /// a quota switch) instead of refused at start.
-    pub(crate) fn take_remote_model_switch(
+    /// Whether the agent has an accepted remote switch its session still
+    /// names: the one change of identity its live run is replaced for
+    /// (besides a quota switch) instead of refused at start, and whose
+    /// next successful start replays the Intent history. A switch the
+    /// session no longer names (a later change) is dropped.
+    pub(crate) fn remote_model_switch_pending(
         &self,
         agent_id: &AgentId,
         session: &AgentSession,
     ) -> bool {
-        self.remote_model_switches
-            .lock()
-            .unwrap()
-            .remove(agent_id)
-            .is_some_and(|(provider, model)| session.provider == provider && session.model == model)
+        let mut switches = self.remote_model_switches.lock().unwrap();
+        let named = switches.get(agent_id).is_some_and(|(provider, model)| {
+            session.provider == *provider && session.model == *model
+        });
+        if !named {
+            switches.remove(agent_id);
+        }
+        named
+    }
+
+    /// The agent's accepted remote switch is running on its machine.
+    pub(crate) fn clear_remote_model_switch(&self, agent_id: &AgentId) {
+        self.remote_model_switches.lock().unwrap().remove(agent_id);
     }
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When

@@ -12151,15 +12151,16 @@ impl AgentManager {
         // provider session gets the Intent history first; so does a quota
         // switch onto a backup (intent-hq/intent#8317). Any other change of
         // identity stops the old run rather than keep using it silently.
-        let switched = self.services.take_remote_model_switch(agent_id, session);
+        // Kept until the replacement run is installed, so a failed start
+        // (or a switch made while the agent had no run) still opens the
+        // next run with the history.
+        let switched = self.services.remote_model_switch_pending(agent_id, session);
         let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
             Some(h.spawned_provider.as_str()) != session.provider.as_deref()
                 || h.spawned_model != session.model
         });
-        let mut replay_history = false;
         if identity_changed {
             boxed_await(|| self.kill_child_only(agent_id)).await;
-            replay_history = switched;
             if !switched && !self.services.remote_failover_pending(agent_id, session) {
                 return Err(Error::InvalidParams(
                     "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
@@ -12167,6 +12168,10 @@ impl AgentManager {
             }
         }
         if self.handle_is_live(agent_id) {
+            // The live run already has the switched identity.
+            if switched {
+                self.services.clear_remote_model_switch(agent_id);
+            }
             return Ok(StartedSession {
                 session_id,
                 turn: self.capture_turn(agent_id)?,
@@ -12264,7 +12269,8 @@ impl AgentManager {
             Some(h) => h.wake_listener = Some(listener),
             None => listener.abort(),
         }
-        if replay_history {
+        if switched {
+            self.services.clear_remote_model_switch(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
         }
         Ok(StartedSession {
