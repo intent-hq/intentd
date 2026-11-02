@@ -35,6 +35,7 @@ pub mod human_author;
 pub mod ids;
 pub mod machine_selection;
 pub mod machines;
+pub mod message_block_page;
 pub mod model;
 pub mod native_review;
 pub mod node_link;
@@ -104,6 +105,10 @@ pub use host_membership::{
 pub use ids::{
     AgentId, ClientId, ExecutorCredentialId, HookId, NoteId, PrMonitorId, PrincipalId,
     WorkspaceGitRootId, WorkspaceId, CHIEF_WORKSPACE_ID,
+};
+pub use message_block_page::{
+    page_message_block, MessageBlockPage, AGENT_MESSAGE_BLOCK_MAX_BYTES, MESSAGE_BLOCK_MAX_BYTES,
+    MESSAGE_BLOCK_MIN_BYTES,
 };
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;

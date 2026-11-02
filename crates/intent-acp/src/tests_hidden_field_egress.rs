@@ -460,6 +460,7 @@ impl WorkspaceApi for FakeApi {
         message_id: String,
         block_id: String,
         _workspace_id: Option<WorkspaceId>,
+        _page: intent_core::MessageBlockPage,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let mut block = json!({ "id": block_id, "type": "text", "text": "full body" });

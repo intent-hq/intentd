@@ -4776,20 +4776,48 @@ mod tests {
     /// before returning `None` — models a locked / prompting OS keychain that
     /// used to hang `settings.list` indefinitely.
     #[derive(Debug)]
-    struct HangingSecretStore {
-        hang_for: Duration,
+    /// A wedged keychain: every call blocks until the test opens the gate.
+    /// An answer that arrives while the gate is still shut came from the
+    /// wrapper's timeout, never from the store — proof with no clock. Hold
+    /// [`GatedSecretStore::open_on_drop`] so the parked blocking-pool threads
+    /// exit when the test ends.
+    #[derive(Default)]
+    struct GatedSecretStore {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
     }
-    impl SecretStore for HangingSecretStore {
+    impl GatedSecretStore {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+        /// Opens the gate when dropped — also on a failed assertion, whose
+        /// runtime shutdown would otherwise wait on the parked threads.
+        fn open_on_drop(self: &Arc<Self>) -> impl Drop {
+            struct OpenOnDrop(Arc<GatedSecretStore>);
+            impl Drop for OpenOnDrop {
+                fn drop(&mut self) {
+                    self.0.open();
+                }
+            }
+            OpenOnDrop(Arc::clone(self))
+        }
+        fn wait(&self) {
+            let open = self.open.lock().unwrap();
+            drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        }
+    }
+    impl SecretStore for GatedSecretStore {
         fn load(&self, _account: &str) -> Result<Option<String>> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(None)
         }
         fn store(&self, _account: &str, _value: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
         fn delete(&self, _account: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
     }
@@ -4806,15 +4834,13 @@ mod tests {
         // Compressed load budget (`with_timings`) so the timeout path runs in
         // milliseconds instead of the production 3s default.
         let load_timeout = Duration::from_millis(100);
-        // Hang for well over the per-op budget so a naive implementation would
-        // stall for `N_sensitive * hang_for` and blow past the test's outer
-        // timeout — but short enough that the blocking-pool shutdown at
-        // end-of-test doesn't hold up the whole test binary.
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // The keychain stays wedged until the list has answered, so a list
+        // that waits on the store instead of its load budget hangs into the
+        // guard below.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             load_timeout,
             DEFAULT_WRITE_TIMEOUT,
             DEFAULT_CACHE_TTL,
@@ -4822,17 +4848,13 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // Outer cap: single-flight + TTL cache in AsyncSecretStore bounds the
-        // total latency to ONE keychain budget — well under the per-call
-        // stall the store models. A generous slack absorbs task-spawn
-        // overhead on cold runners.
-        let cap = load_timeout + Duration::from_secs(2);
-        let list = timeout(cap, svc.list())
-            .await
-            .expect("settings.list must not hang when the keychain stalls")
-            .expect("settings.list must not return a domain error");
-        let elapsed = started.elapsed();
+        let list = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.list(),
+        )
+        .await
+        .expect("settings.list must not hang when the keychain stalls")
+        .expect("settings.list must not return a domain error");
 
         // Every sensitive entry MUST redact to `null` (absent) — the timed-out
         // load is treated as "not present" so the response is well-formed.
@@ -4850,10 +4872,6 @@ mod tests {
             }
         }
         assert!(sensitive_seen > 0, "catalog must contain sensitive entries");
-        assert!(
-            elapsed < cap,
-            "settings.list took {elapsed:?} — timeout cap was {cap:?}",
-        );
 
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
@@ -4878,11 +4896,12 @@ mod tests {
         // stays well over the budget but short enough that the blocking-pool
         // shutdown at end-of-test doesn't hold up the whole test binary.
         let write_timeout = Duration::from_millis(150);
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // Wedged until the update has answered: only the write budget can end
+        // it, and an update that waits on the store hangs into the guard.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             DEFAULT_LOAD_TIMEOUT,
             write_timeout,
             DEFAULT_CACHE_TTL,
@@ -4890,25 +4909,16 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // AsyncSecretStore's write budget is `write_timeout`; use it plus a
-        // small slack so the assertion measures the bounded write path.
-        let cap = write_timeout + Duration::from_secs(2);
         let err = timeout(
-            cap,
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),
         )
         .await
         .expect("settings.update must not hang past the budget")
         .expect_err("hung keychain must surface an error, not success");
-        let elapsed = started.elapsed();
         assert!(
             matches!(err, Error::Internal(_)),
             "expected Error::Internal, got {err:?}",
-        );
-        assert!(
-            elapsed < cap,
-            "settings.update took {elapsed:?}, cap {cap:?}"
         );
 
         for suffix in ["", "-wal", "-shm"] {
@@ -6187,15 +6197,15 @@ mod tests {
         let svc = SettingsService::new(&store, &secrets, None);
 
         let entries = json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]);
-        let started = Instant::now();
-        let err = svc
-            .update(&entries)
-            .await
-            .expect_err("the timed-out sibling clear must surface");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "update must return once the settle cap expires, not wait for the delete"
-        );
+        // The delete stays parked until after the update has answered, so an
+        // update that waits for it instead of the settle cap hangs here.
+        let err = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.update(&entries),
+        )
+        .await
+        .expect("update must return once the settle cap expires, not wait for the delete")
+        .expect_err("the timed-out sibling clear must surface");
         match &err {
             Error::Internal(msg) => assert!(
                 msg.contains("credential state is unknown"),

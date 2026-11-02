@@ -50,9 +50,15 @@ pub(crate) async fn dispatch(
             let message_id = req_str(args, "messageId")?;
             let block_id = req_str(args, "blockId")?;
             let agent = target_chat(api, args).await?;
-            api.agent_get_message_block(agent.id, message_id, block_id, Some(WorkspaceId::chief()))
-                .await
-                .map_err(map_err)?
+            api.agent_get_message_block(
+                agent.id,
+                message_id,
+                block_id,
+                Some(WorkspaceId::chief()),
+                intent_core::MessageBlockPage::default(),
+            )
+            .await
+            .map_err(map_err)?
         }
         "rename" => {
             let name = req_str(args, "name")?;
@@ -302,6 +308,7 @@ mod tests {
             message_id: String,
             block_id: String,
             workspace_id: Option<WorkspaceId>,
+            _page: intent_core::MessageBlockPage,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.lock().unwrap().push(json!({
                 "method": "block", "agentId": agent_id, "workspaceId": workspace_id,

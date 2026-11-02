@@ -2127,7 +2127,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getMessageBlock`: one full content block of one persisted
-    /// message, by block id — `{ block }` (PROTOCOL §5.5). The on-demand
+    /// message, by block id — `{ block, truncated, field, encoding,
+    /// totalBytes, nextOffset }` (PROTOCOL §5.5). `page` caps the served
+    /// block and pages its body ([`crate::page_message_block`]). The on-demand
     /// counterpart of the `projection: "slim"` conversation read: a client
     /// holding a truncated block fetches the full body here. Block ids are
     /// the served identity — persisted assistant ids and the serve-time
@@ -2141,8 +2143,9 @@ pub trait WorkspaceApi: Send + Sync {
         message_id: String,
         block_id: String,
         workspace_id: Option<WorkspaceId>,
+        page: crate::MessageBlockPage,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, message_id, block_id, workspace_id);
+        let _ = (agent_id, message_id, block_id, workspace_id, page);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_message_block not implemented".to_string(),

@@ -19645,6 +19645,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionManagement".into(), serde_json::json!(1));
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
+            caps.insert("messageBlockPages".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -31425,10 +31426,11 @@ impl WorkspaceApi for Services {
         message_id: String,
         block_id: String,
         workspace_id: Option<WorkspaceId>,
+        page: intent_core::MessageBlockPage,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
-            self.agent_get_message_block_op(agent_id, message_id, block_id, workspace_id)
+            self.agent_get_message_block_page_op(agent_id, message_id, block_id, workspace_id, page)
                 .await
         })
     }
@@ -31964,6 +31966,17 @@ impl WorkspaceApi for Services {
             // Collaborator sender preamble (multiplayer): the edited message
             // is a fresh human-authored row by the editor.
             self.annotate_collaborator_sender(&workspace_id, &mut content)
+                .await?;
+            // Stored image block references (`messageBlockPages: 1`) resolve
+            // from this agent's transcript before anything is stopped or
+            // truncated, so the edited message's own images still resolve.
+            let image_blocks = self
+                .resolve_image_block_references(
+                    "agent.editAndRegenerate",
+                    &agent_id,
+                    &workspace_id,
+                    image_blocks,
+                )
                 .await?;
             // Attachment-reference validation (PROTOCOL §5.5), same seam as
             // agent.sendMessage — before any state change.

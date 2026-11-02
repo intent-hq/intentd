@@ -1232,9 +1232,10 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{noise}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n"
         );
-        let start = std::time::Instant::now();
+        // The sentinel pair follows the noise, so it is read only if the
+        // pipe is drained while the shell runs: a deadlocked capture is cut
+        // off by its timeout before the sentinels and extracts nothing.
         let dirs = write_and_capture(&fake_shell, &script).dirs;
-        let elapsed = start.elapsed();
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -1243,10 +1244,6 @@ mod tests {
             "Should extract PATH even with >64KB of noise"
         );
         assert_eq!(dirs[0], PathBuf::from("/large/bin"));
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "Should complete well within timeout (no deadlock), took {elapsed:?}"
-        );
     }
 
     #[test]

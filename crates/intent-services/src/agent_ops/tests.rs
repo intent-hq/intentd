@@ -895,6 +895,145 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
         .expect_err("retire with a pending descendant must fail");
 }
 
+/// Run `agent_retire_op` as the agent itself (`ws.agent.retire` scopes the
+/// call with `Caller::Agent`).
+async fn self_retire(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> intent_core::Result<serde_json::Value> {
+    intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: id.clone(),
+        },
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+}
+
+fn assert_last_top_level_refusal(err: &Error) {
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("last active top-level agent"),
+        "got: {err}"
+    );
+}
+
+/// Guard: an agent may not self-retire when it is the workspace's last
+/// active top-level agent. Children, background agents, and retired
+/// top-level agents do not count as another top-level agent; nothing is
+/// mutated on refusal.
+#[tokio::test]
+async fn agent_self_retire_rejects_the_last_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("the only top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+
+    // A settled child is not top-level: still refused, and the child is not
+    // cascade-retired.
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_child(&svc, &ws, &child, &solo, AgentStatus::RuntimeIdle).await;
+    // A background agent is not visible top-level either.
+    let bg = create_agent(&svc, &ws, "Background").await;
+    let mut bg_session = svc.store().get_agent_session(&bg).await.expect("bg");
+    bg_session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &bg_session)
+        .await
+        .expect("mark background");
+    // An already-retired top-level agent does not count.
+    let gone = create_agent(&svc, &ws, "Gone").await;
+    svc.agent_retire_op(gone.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire bystander");
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("children/background/retired agents do not count");
+    assert_last_top_level_refusal(&err);
+    for id in [&solo, &child, &bg] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "{id} must not be retired");
+    }
+
+    // With a second active top-level agent the self-retire succeeds…
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let r = self_retire(&svc, &ws, &solo)
+        .await
+        .expect("retire with a peer");
+    assert_eq!(r["success"], json!(true));
+    // …and the peer, now the last one, is refused in turn.
+    let err = self_retire(&svc, &ws, &peer)
+        .await
+        .expect_err("the remaining top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+}
+
+/// The guard only applies to agent callers' top-level sessions: a child
+/// agent may still self-retire under the last top-level agent, and a
+/// non-agent (user / wire) retire of the last top-level agent is allowed.
+#[tokio::test]
+async fn last_top_level_guard_skips_children_and_non_agent_callers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_child(&svc, &ws, &child, &parent, AgentStatus::RuntimeIdle).await;
+
+    self_retire(&svc, &ws, &child)
+        .await
+        .expect("a child agent may self-retire");
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("a non-agent caller may retire the last top-level agent");
+}
+
+/// Two top-level agents self-retiring at the same time on separate worker
+/// threads: exactly one wins and the workspace keeps one active top-level
+/// agent. Repeated so a missing workspace gate shows up as a flake-free
+/// failure rather than a lucky interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_self_retires_leave_one_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let mut survivor = create_agent(&svc, &ws, "A0").await;
+    for round in 1..=8 {
+        let rival = create_agent(&svc, &ws, &format!("B{round}")).await;
+        let spawn_retire = |id: AgentId| {
+            let (svc, ws) = (svc.clone(), ws.clone());
+            tokio::spawn(async move { self_retire(&svc, &ws, &id).await })
+        };
+        let (ra, rb) = tokio::join!(spawn_retire(survivor.clone()), spawn_retire(rival.clone()));
+        let (ra, rb) = (ra.expect("join a"), rb.expect("join b"));
+        assert_eq!(
+            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+            1,
+            "round {round}: exactly one self-retire may win: {ra:?} / {rb:?}"
+        );
+        if ra.is_ok() {
+            survivor = rival;
+        }
+        let loser = ra.err().or(rb.err()).expect("one refusal");
+        assert_last_top_level_refusal(&loser);
+        let active = svc
+            .store()
+            .list_active_agent_session_summaries(&ws)
+            .await
+            .expect("list");
+        assert_eq!(
+            active.len(),
+            1,
+            "round {round}: one top-level agent survives"
+        );
+        assert_eq!(active[0].id, survivor);
+    }
+}
+
 /// Cascade: retiring the parent retires every settled/idle descendant with
 /// it — each with its own `agent:retired` emit carrying the cascade reason —
 /// while terminal children, already-retired children (timestamp preserved),
@@ -49828,4 +49967,306 @@ async fn models_list_codex_reports_warning_kind_only_for_known_causes() {
             "{res}"
         );
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Capped and paged `agent.getMessageBlock` + `agent.editAndRegenerate` stored
+// image block references (PROTOCOL §5.5, `messageBlockPages: 1`).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Serialized size of a JSON value, as the transport writes it.
+fn json_len(v: &serde_json::Value) -> usize {
+    serde_json::to_vec(v).expect("serialize").len()
+}
+
+/// A persisted multi-MB text block, tool output and image are each served
+/// under the cap through the default page; paging the text and the tool
+/// output with `offset` / `nextOffset` reassembles the exact stored bodies.
+#[tokio::test]
+async fn get_message_block_caps_and_pages_large_bodies() {
+    use intent_core::{MessageBlockPage, MESSAGE_BLOCK_MAX_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BlockCap").await;
+    let text = "line ✓ \"quoted\"\n".repeat(250_000);
+    let output = "out\t".repeat(600_000);
+    let image = "QUJD".repeat(500_000);
+    let content = json!([
+        { "type": "text", "id": "t", "text": text },
+        { "type": "tool_result", "id": "r", "tool_use_id": "tc", "output": output, "is_error": false },
+        { "type": "image", "id": "i", "data": image, "mimeType": "image/png" },
+    ]);
+    let row = svc
+        .store()
+        .append_agent_message(&id, "assistant", &content, &now_iso())
+        .await
+        .expect("append");
+
+    for (block_id, body) in [("t", &text), ("r", &output)] {
+        let mut joined = String::new();
+        let mut offset = None;
+        loop {
+            let page = MessageBlockPage {
+                offset,
+                max_bytes: None,
+            };
+            let r = svc
+                .agent_get_message_block_page_op(
+                    id.clone(),
+                    row.id.clone(),
+                    block_id.to_string(),
+                    Some(ws.clone()),
+                    page,
+                )
+                .await
+                .expect("page");
+            assert!(json_len(&r) < 500 * 1024, "result under budget");
+            assert!(json_len(&r["block"]) <= MESSAGE_BLOCK_MAX_BYTES);
+            assert_eq!(r["truncated"], true);
+            assert_eq!(r["encoding"], "text");
+            assert_eq!(r["totalBytes"], json!(body.len()));
+            let field = r["field"].as_str().expect("field");
+            joined.push_str(r["block"][field].as_str().expect("slice"));
+            match r["nextOffset"].as_u64() {
+                Some(n) => offset = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(&joined, body, "pages reassemble block {block_id}");
+    }
+
+    let r = svc
+        .agent_get_message_block_op(id.clone(), row.id.clone(), "i".into(), None)
+        .await
+        .expect("image");
+    assert!(json_len(&r) < 500 * 1024);
+    assert!(
+        r["block"].get("data").is_none(),
+        "over-cap image has no data"
+    );
+    assert_eq!(r["block"]["dataTruncated"], true);
+    assert_eq!(r["block"]["dataBytes"], json!(image.len()));
+    assert_eq!(r["truncated"], true);
+    assert_eq!(r["nextOffset"], serde_json::Value::Null);
+
+    let err = svc
+        .agent_get_message_block_page_op(
+            id,
+            row.id,
+            "i".into(),
+            None,
+            MessageBlockPage {
+                offset: Some(4),
+                max_bytes: None,
+            },
+        )
+        .await
+        .expect_err("offset on an image");
+    assert!(
+        matches!(&err, Error::InvalidParams(m) if m == "offset is not supported for this block"),
+        "{err:?}"
+    );
+}
+
+/// `agent.editAndRegenerate` with a `{ type: "image", messageId, blockId }`
+/// reference regenerates with the ORIGINAL full image bytes of the edited
+/// message (which the truncation drops), although `agent.getMessageBlock`
+/// serves that image without `data`.
+#[intent_test_macros::daemon_test]
+async fn edit_and_regenerate_resolves_stored_image_block_reference() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditRef").await;
+    let image = "QUJD".repeat(300_000);
+    let first = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "look" },
+                { "type": "image", "data": image, "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let block_id = format!("{}:1", first.id);
+    let capped = svc
+        .agent_get_message_block_op(id.clone(), first.id.clone(), block_id.clone(), None)
+        .await
+        .expect("capped read");
+    assert!(
+        capped["block"].get("data").is_none(),
+        "client never gets the bytes"
+    );
+
+    svc.agent_edit_and_regenerate(
+        ws.clone(),
+        id.clone(),
+        first.id.clone(),
+        "look again".into(),
+        Some(json!([{ "type": "image", "messageId": first.id, "blockId": block_id }])),
+        None,
+        None,
+    )
+    .await
+    .expect("edit by reference");
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 1, "edited message replaced");
+    let blocks = session.messages[0].content.as_array().expect("blocks");
+    let img = blocks
+        .iter()
+        .find(|b| b["type"] == "image")
+        .expect("image block persisted");
+    assert_eq!(
+        img["data"].as_str(),
+        Some(image.as_str()),
+        "full original bytes"
+    );
+    assert_eq!(img["mimeType"], "image/png");
+    assert!(img.get("messageId").is_none() && img.get("blockId").is_none());
+}
+
+/// Malformed, unknown and non-image block references are `-32602` before
+/// any state change; the transcript is untouched.
+#[intent_test_macros::daemon_test]
+async fn edit_and_regenerate_rejects_bad_block_references() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditRefErr").await;
+    let row = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let text_block = format!("{}:0", row.id);
+    let cases = [
+        (
+            json!({ "type": "image", "messageId": row.id }),
+            "agent.editAndRegenerate: imageBlocks[0] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": text_block, "data": "QQ==" }),
+            "agent.editAndRegenerate: imageBlocks[0] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": "m-missing", "blockId": "b" }),
+            "unknown message id: m-missing".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": format!("{}:7", row.id) }),
+            format!("unknown block id: {}:7", row.id),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": text_block }),
+            format!("agent.editAndRegenerate: imageBlocks[0] references block {text_block}, which is not an image with stored bytes"),
+        ),
+    ];
+    for (entry, want) in cases {
+        let err = svc
+            .agent_edit_and_regenerate(
+                ws.clone(),
+                id.clone(),
+                row.id.clone(),
+                "x".into(),
+                Some(json!([entry])),
+                None,
+                None,
+            )
+            .await
+            .expect_err("bad reference");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if *m == want),
+            "{entry}: {err:?}"
+        );
+    }
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 1, "transcript unchanged");
+    assert_eq!(session.messages[0].id, row.id);
+}
+
+/// Other `imageBlocks` seams do not accept references: an entry with
+/// neither `data` nor `attachmentId` stays `-32602`.
+#[test]
+fn block_reference_entries_fail_ordinary_image_validation() {
+    let err = crate::agent_ops::validate_image_blocks(
+        "agent.sendMessage",
+        Some(&json!([{ "type": "image", "messageId": "m", "blockId": "b" }])),
+    )
+    .expect_err("reference rejected");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// The `ws.agent.getMessageBlock` MCP binding pages a large block in
+/// 100 KiB pieces (a larger `maxBytes` is clamped down): the agent loops on `{ offset: nextOffset }` until `nextOffset` is null and
+/// reassembles the exact stored text (`WorkspaceMcpServer` dispatch ->
+/// `Services` -> `Store`).
+#[intent_test_macros::daemon_test]
+async fn mcp_get_message_block_binding_pages_with_next_offset() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
+    let id = create_agent(&svc, &ws, "BindingPages").await;
+    let text = (0..120_000).fold(String::new(), |mut out, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "{i}");
+        out
+    });
+    let row = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "id": "big", "text": text }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-00000000pager");
+    let server = WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller));
+    let code = format!(
+        "let joined = ''; let offset = null; let pages = 0; let maxPage = 0;
+         for (;;) {{
+           const r = await ws.agent.getMessageBlock('{id}', '{mid}', 'big', {{ offset, maxBytes: 480000 }});
+           joined += r.block[r.field]; pages += 1;
+           maxPage = Math.max(maxPage, JSON.stringify(r.block).length);
+           if (r.nextOffset === null) break;
+           offset = r.nextOffset;
+         }}
+         const lines = joined.split('\\n');
+         return {{ pages, maxPage, length: joined.length, lines: lines.length, last: lines[lines.length - 2] }};",
+        mid = row.id,
+    );
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "page a block" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let out = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value =
+        serde_json::from_str(out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert!(parsed["pages"].as_u64().unwrap() > 1, "{parsed}");
+    let max_page = parsed["maxPage"].as_u64().unwrap();
+    assert!(
+        max_page <= intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES && max_page > 90_000,
+        "agent pages are clamped to 100 KiB even when 480,000 is asked: {parsed}"
+    );
+    assert_eq!(parsed["length"], json!(text.len()), "{parsed}");
+    assert_eq!(parsed["lines"], json!(120_001), "{parsed}");
+    assert_eq!(parsed["last"], "119999", "{parsed}");
 }

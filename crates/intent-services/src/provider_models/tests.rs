@@ -2202,14 +2202,11 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let start = std::time::Instant::now();
+    // Left alone, the CLI would exit 0 with no output after its sleep, so
+    // the timeout error alone says the timeout cut it short.
     let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
         .await
         .unwrap_err();
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(20),
-        "timeout must cut the wedged CLI short"
-    );
     assert_eq!(err, "opencode models timed out");
 
     // kill_on_drop reaps the child when the timed-out output future drops:

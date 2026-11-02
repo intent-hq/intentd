@@ -958,7 +958,8 @@ fn exact_install_reports_a_concurrent_newer_winner_without_downgrading() {
 #[derive(Clone)]
 enum Endpoint {
     NotFound,
-    /// Holds the connection open past the client timeout.
+    /// Never answers: holds the connection until the client gives up and
+    /// closes it, so only the client's own timeout can end the request.
     Slow,
     /// 302 to `Location`.
     Redirect(String),
@@ -1009,9 +1010,8 @@ fn serve_endpoint(behaviour: Endpoint) -> (String, RequestLog) {
                 let (head, body) = match behaviour {
                     Endpoint::NotFound => ("404 Not Found".to_string(), b"nope".to_vec()),
                     Endpoint::Slow => {
-                        // timing-guard: simulates a slow endpoint; the client times out long before this
-                        thread::sleep(std::time::Duration::from_secs(5));
-                        ("200 OK".to_string(), Vec::new())
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                        return;
                     }
                     Endpoint::Redirect(location) => {
                         (format!("302 Found\r\nLocation: {location}"), Vec::new())
@@ -1088,14 +1088,18 @@ fn endpoint_404_installs_from_github_fallback() {
 #[test]
 fn slow_endpoint_installs_from_github_fallback() {
     let (url, seen) = serve_endpoint(Endpoint::Slow);
-    let started = std::time::Instant::now();
-    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
+    // The endpoint never answers, so the check can only reach the GitHub
+    // fallback through the endpoint timeout; without one it hangs here.
+    let (done, installed) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(install_with_endpoint(&url, CheckTrigger::Daily));
+    });
+    let (_dir, paths, outcome) = installed
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(30),
+        ))
+        .expect("the endpoint timeout never cut the stalled request short");
     assert_installed_from_github(&outcome, &paths);
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 

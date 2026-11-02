@@ -704,22 +704,21 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mk root");
 
         let hub = SharedWatchHub::new();
-        let start = std::time::Instant::now();
         let watch = watch_root(&hub, root.clone(), md_only, || {});
-        let elapsed = start.elapsed();
-        // Deterministic only under the current-thread runtime `#[tokio::test]`
-        // defaults to: the spawned `watch_loop` cannot be polled before this
-        // test's first `.await`. Under `flavor = "multi_thread"` a worker
-        // could land registration first and this would flake in the passing
-        // direction of the bug — the `elapsed` bound below is the
-        // flavor-independent part of the assertion.
+        // Deterministic under the current-thread runtime `#[tokio::test]`
+        // defaults to — keep this test on it: the spawned `watch_loop` cannot
+        // be polled before this test's first `.await`, so a watch already
+        // registered here was registered on the caller's thread. (Under
+        // `flavor = "multi_thread"` a worker could land registration first
+        // and this would flake in the passing direction of the bug.)
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "the deferral check below needs the current-thread runtime"
+        );
         assert!(
             watch.watched().is_none(),
             "registration must be deferred, not performed on the caller's thread"
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "watch_root must return immediately, took {elapsed:?}"
         );
 
         assert!(

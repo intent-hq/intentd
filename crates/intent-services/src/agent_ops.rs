@@ -120,19 +120,46 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    /// Per-workspace serialization of agent self-retires of top-level
+    /// sessions, so the last-top-level-agent guard in
+    /// [`Services::agent_retire_op`] cannot be raced by two top-level agents
+    /// retiring at once (each would otherwise see the other still active).
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AgentRetirementGates {
     pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
-        gate
+        weak_gate(&self.gates, agent_id)
     }
+
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        weak_gate(&self.workspaces, workspace_id)
+    }
+}
+
+fn weak_gate<K: std::hash::Hash + Eq + Clone>(
+    map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    key: &K,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = map.lock().expect("retirement gate map poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key.clone(), Arc::downgrade(&gate));
+    gate
+}
+
+/// A visible top-level session: no parent, not a background agent, not
+/// deleted, not soft-retired — the agents the user sees in the workspace's
+/// agent list (same predicate as the unread top-level derivation, plus the
+/// retired filter).
+fn is_active_top_level(session: &AgentSession) -> bool {
+    session.parent_agent_id.is_none()
+        && !session.is_background
+        && session.retired_at.is_none()
+        && !matches!(session.status, AgentStatus::Deleted)
 }
 
 /// Order attention persistence, deferred surfacing and matching clear events
@@ -3093,6 +3120,13 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
 /// (skipped downstream like every other malformed attachment entry) so
 /// legacy callers keep their fail-soft behavior — mirrors
 /// [`validate_file_blocks`].
+/// `-32602` for a malformed `agent.editAndRegenerate` block reference entry.
+fn malformed_image_block_reference(method: &str, index: usize) -> Error {
+    Error::InvalidParams(format!(
+        "{method}: imageBlocks[{index}] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`"
+    ))
+}
+
 pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) -> Result<()> {
     let Some(imgs) = image_blocks.and_then(Value::as_array) else {
         return Ok(());
@@ -4826,7 +4860,134 @@ impl Services {
     /// `outputPruned: true` so a client can tell "the full output is no
     /// longer retained" from "the fetch returned the full body" and does not
     /// re-request in a loop.
+    ///
+    /// Capped and paged (`messageBlockPages: 1`): the served block is bounded
+    /// by [`intent_core::MESSAGE_BLOCK_MAX_BYTES`] under the default page —
+    /// see [`Self::agent_get_message_block_page_op`]. Test-only shorthand.
+    #[cfg(test)]
     pub(crate) async fn agent_get_message_block_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        self.agent_get_message_block_page_op(
+            agent_id,
+            message_id,
+            block_id,
+            workspace_id,
+            intent_core::MessageBlockPage::default(),
+        )
+        .await
+    }
+
+    /// `agent.getMessageBlock` with an explicit page (PROTOCOL §5.5 "Capped
+    /// and paged block reads"): resolves the full served block
+    /// ([`Self::agent_message_block_full_op`]) and applies
+    /// [`intent_core::page_message_block`], so every response stays under
+    /// the 500 KiB read budget and large bodies page by `offset` /
+    /// `nextOffset`.
+    pub(crate) async fn agent_get_message_block_page_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+        page: intent_core::MessageBlockPage,
+    ) -> Result<Value> {
+        let block = self
+            .agent_message_block_full_op(agent_id, message_id, block_id, workspace_id)
+            .await?;
+        intent_core::page_message_block(block, &page)
+    }
+
+    /// Resolve `agent.editAndRegenerate` stored image block references
+    /// (PROTOCOL §5.5 "Image block references in `agent.editAndRegenerate`",
+    /// `messageBlockPages: 1`): each `{ type: "image", messageId, blockId }`
+    /// entry is replaced by a copy of the stored image — `{ type, data,
+    /// mimeType? }` with the full original bytes, or `{ type, attachmentId,
+    /// mimeType? }` — read from the SAME agent's transcript through the
+    /// uncapped block read. Runs before any state change (so before the
+    /// truncation drops the edited message). Entries without `messageId` /
+    /// `blockId` pass through untouched; the ordinary `imageBlocks` rules
+    /// then apply to the resolved array.
+    pub(crate) async fn resolve_image_block_references(
+        &self,
+        method: &str,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        image_blocks: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let mut imgs = match image_blocks {
+            Some(Value::Array(imgs)) => imgs,
+            other => return Ok(other),
+        };
+        for (i, img) in imgs.iter_mut().enumerate() {
+            let Some(obj) = img.as_object() else {
+                continue;
+            };
+            if !obj.contains_key("messageId") && !obj.contains_key("blockId") {
+                continue;
+            }
+            let nonempty = |key: &str| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let (Some(message_id), Some(block_id)) = (nonempty("messageId"), nonempty("blockId"))
+            else {
+                return Err(malformed_image_block_reference(method, i));
+            };
+            if obj.contains_key("data") || obj.contains_key("attachmentId") {
+                return Err(malformed_image_block_reference(method, i));
+            }
+            let block = self
+                .agent_message_block_full_op(
+                    agent_id.clone(),
+                    message_id,
+                    block_id.clone(),
+                    Some(workspace_id.clone()),
+                )
+                .await?;
+            let not_image = || {
+                Error::InvalidParams(format!(
+                    "{method}: imageBlocks[{i}] references block {block_id}, which is not an image with stored bytes"
+                ))
+            };
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                return Err(not_image());
+            }
+            let stored = |key: &str| {
+                block
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| Value::String(s.to_string()))
+            };
+            let mut resolved = serde_json::Map::new();
+            resolved.insert("type".to_string(), json!("image"));
+            if let Some(data) = stored("data") {
+                resolved.insert("data".to_string(), data);
+            } else if let Some(attachment_id) = stored("attachmentId") {
+                resolved.insert("attachmentId".to_string(), attachment_id);
+            } else {
+                return Err(not_image());
+            }
+            if let Some(mime) = stored("mimeType") {
+                resolved.insert("mimeType".to_string(), mime);
+            }
+            *img = Value::Object(resolved);
+        }
+        Ok(Some(Value::Array(imgs)))
+    }
+
+    /// The FULL served block behind `agent.getMessageBlock`, uncapped — the
+    /// read the cap is applied to, and the resolver for
+    /// `agent.editAndRegenerate` stored image block references (which need
+    /// the original bytes, never a cut).
+    pub(crate) async fn agent_message_block_full_op(
         &self,
         agent_id: AgentId,
         message_id: String,
@@ -4900,7 +5061,7 @@ impl Services {
             })
             .cloned()
             .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
-        Ok(json!({ "block": block }))
+        Ok(block)
     }
 
     /// `agent.listUserMessages` (PROTOCOL §5.5): user-role messages of one
@@ -6649,6 +6810,12 @@ impl Services {
     /// is still running a turn. On success the whole descendant subtree is
     /// cascade-retired (see the inline comments), and restoring the parent
     /// does NOT restore the cascaded children.
+    ///
+    /// GUARDED on the last top-level agent: when the caller is an AGENT
+    /// (`Caller::Agent`, i.e. `ws.agent.retire`) and the target is the
+    /// workspace's only active top-level session, the call FAILS
+    /// (`InvalidParams`, nothing mutated). Wire (user) retires are not
+    /// subject to this guard.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -6669,6 +6836,39 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
+        // Guard: an AGENT may not retire itself when it is the workspace's
+        // last active top-level agent — that would leave the workspace with
+        // no visible agent to talk to. User (wire) retires are unaffected.
+        // The workspace gate is held through the retire transition below so
+        // two top-level agents retiring concurrently cannot both pass.
+        let _last_top_level_gate = if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Agent { .. })
+        ) && is_active_top_level(&session)
+        {
+            let gate = self
+                .agent_retirement_gates
+                .for_workspace(&session.workspace_id);
+            let guard = gate.lock_owned().await;
+            let others = self
+                .store
+                .list_active_agent_session_summaries(&session.workspace_id)
+                .await?
+                .iter()
+                .filter(|s| s.id != session.id && is_active_top_level(s))
+                .count();
+            if others == 0 {
+                return Err(Error::InvalidParams(
+                    "cannot retire: this is the last active top-level agent in the workspace. \
+                     Retiring it would leave the workspace without an agent; finish your turn \
+                     normally instead."
+                        .to_string(),
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn
         // (pending/active/Processing). NOTHING is mutated on rejection (no

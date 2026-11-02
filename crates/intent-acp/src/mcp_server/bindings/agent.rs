@@ -224,8 +224,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, options } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
-        getMessageBlock: (agentId, messageId, blockId) =>
-            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId } }),
+        getMessageBlock: (agentId, messageId, blockId, opts) =>
+            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId, ...(opts || {}) } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
@@ -1607,11 +1607,13 @@ async fn read_conversation(
     Ok(v)
 }
 
-/// `ws.agent.getMessageBlock`: one FULL content block of one persisted
+/// `ws.agent.getMessageBlock`: one content block of one persisted
 /// message — the on-demand hydration counterpart of the slim
 /// `readConversation` above. Block ids are the served identity (persisted
-/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve),
-/// and the returned block is the full, unprojected body.
+/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve).
+/// The block is capped like the router method (PROTOCOL §5.5 "Capped and
+/// paged block reads"): a large body pages through the optional
+/// `{ offset?, maxBytes? }` and the result's `nextOffset`.
 async fn get_message_block(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1622,9 +1624,37 @@ async fn get_message_block(
     let _ = require_active_target(api, ws, &agent_id).await?;
     let message_id = req_str(args, "messageId").map_err(|_| "messageId is required".to_string())?;
     let block_id = req_str(args, "blockId").map_err(|_| "blockId is required".to_string())?;
-    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()))
+    let page = message_block_page(args)?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()), page)
         .await
         .map_err(map_err)
+}
+
+/// Parse the optional `offset` / `maxBytes` paging options of
+/// `ws.agent.getMessageBlock`; the same messages as the router reject
+/// invalid values. Agents page in [`intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES`]
+/// pieces: an absent / `null` `maxBytes` defaults to it and a larger one is
+/// clamped down to it (the core cap still clamps small values up).
+pub(crate) fn message_block_page(args: &Value) -> Result<intent_core::MessageBlockPage, String> {
+    let int = |key: &str, min: u64, msg: &str| -> Result<Option<u64>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|n| *n >= min)
+                .map(Some)
+                .ok_or_else(|| msg.to_string()),
+        }
+    };
+    Ok(intent_core::MessageBlockPage {
+        offset: int("offset", 0, "offset must be a non-negative integer")?,
+        max_bytes: Some(
+            int("maxBytes", 1, "maxBytes must be a positive integer")?
+                .map_or(intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES, |b| {
+                    b.min(intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES)
+                }),
+        ),
+    })
 }
 
 async fn summary(
@@ -1691,6 +1721,12 @@ async fn request_attention(
 /// wait for them first. On success the caller's settled descendants are
 /// cascade-retired with it (each with the full retire cleanup), and
 /// restoring the caller later does NOT restore them.
+///
+/// Also FAILS (invalid params, nothing mutated) when the caller is the
+/// workspace's last active top-level agent (no parent, not background, not
+/// retired): an agent may not leave the workspace without a visible agent.
+/// This holds from a background hook too: the call is always scoped as the
+/// agent caller.
 async fn retire(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1705,10 +1741,20 @@ async fn retire(
         reason = reason.as_deref().unwrap_or("(none)"),
         "agent.retire: soft-retiring agent session"
     );
-    let v = api
-        .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
-        .await
-        .map_err(map_err)?;
+    // Always retire AS the agent, even from a hook (which evaluates as
+    // `Caller::Daemon`): the service's last-top-level-agent guard keys on
+    // `Caller::Agent`, so a hook must not be a way around it.
+    let v = intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: caller.clone(),
+        },
+        async {
+            api.agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
+                .await
+        },
+    )
+    .await
+    .map_err(map_err)?;
     let mut out = merge_ok(v);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("agentId".to_string(), json!(caller.as_str()));
@@ -2101,6 +2147,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn message_block_page_defaults_and_clamps_to_agent_page_size() {
+        use intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES as AGENT_MAX;
+        let page = message_block_page(&json!({})).unwrap();
+        assert_eq!(page.offset, None);
+        assert_eq!(page.max_bytes, Some(AGENT_MAX));
+        assert_eq!(page.cap(), 102_400);
+        let page = message_block_page(&json!({ "maxBytes": null, "offset": 7 })).unwrap();
+        assert_eq!((page.offset, page.max_bytes), (Some(7), Some(AGENT_MAX)));
+        let page = message_block_page(&json!({ "maxBytes": 480_000 })).unwrap();
+        assert_eq!(page.cap(), 102_400, "agent requests clamp down to 100 KiB");
+        let page = message_block_page(&json!({ "maxBytes": 50_000 })).unwrap();
+        assert_eq!(page.cap(), 50_000);
+        let page = message_block_page(&json!({ "maxBytes": 1 })).unwrap();
+        assert_eq!(page.cap(), intent_core::MESSAGE_BLOCK_MIN_BYTES);
+        assert_eq!(
+            message_block_page(&json!({ "maxBytes": 0 })).unwrap_err(),
+            "maxBytes must be a positive integer"
+        );
+        assert_eq!(
+            message_block_page(&json!({ "offset": -1 })).unwrap_err(),
+            "offset must be a non-negative integer"
+        );
+    }
+
+    #[test]
     fn agent_list_filter_omits_terminal_rows_by_default() {
         let f = parse_agent_list_filter(&json!({})).expect("empty args parse");
         assert!(f.retains(AgentStatus::Active, None));
@@ -2487,6 +2558,60 @@ mod tests {
             })),
             None
         );
+    }
+
+    mod retire_caller_scope {
+        use super::super::*;
+        use intent_core::{BoxFuture, Caller, Result};
+
+        /// Records the ambient caller each `agent_retire` call sees.
+        #[derive(Default)]
+        struct FakeApi {
+            seen: std::sync::Mutex<Vec<Option<Caller>>>,
+        }
+
+        impl WorkspaceApi for FakeApi {
+            fn agent_retire(
+                &self,
+                _agent_id: AgentId,
+                _workspace_id: Option<WorkspaceId>,
+                _reason: Option<String>,
+            ) -> BoxFuture<'_, Result<Value>> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(intent_core::current_caller());
+                Box::pin(async { Ok(json!({ "success": true, "retiredAt": "t" })) })
+            }
+        }
+
+        /// A hook evaluates as `Caller::Daemon` with the owner as binding
+        /// caller; the retire must still reach the service as
+        /// `Caller::Agent { owner }` so the last-top-level guard applies.
+        #[tokio::test]
+        async fn hook_retire_reaches_the_service_as_the_agent_caller() {
+            let fake = Arc::new(FakeApi::default());
+            let api: Arc<dyn WorkspaceApi> = fake.clone();
+            let ws = WorkspaceId::from_string("ws-1");
+            let owner = AgentId::from("hook-owner");
+            intent_core::with_caller(
+                Caller::Daemon,
+                dispatch(
+                    &api,
+                    &ws,
+                    Some(&owner),
+                    EvalBudget::starting_now(Duration::from_secs(30)),
+                    "retire",
+                    &json!({}),
+                ),
+            )
+            .await
+            .expect("retire");
+            assert_eq!(
+                *fake.seen.lock().unwrap(),
+                vec![Some(Caller::Agent { agent_id: owner })]
+            );
+        }
     }
 
     mod list_specialists {

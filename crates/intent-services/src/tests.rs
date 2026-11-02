@@ -32322,6 +32322,11 @@ mod worktree_provisioning {
             Some(&serde_json::json!(1)),
             "the auto-archive opt-out is advertised as exact integer 1: {caps}"
         );
+        assert_eq!(
+            obj.get("messageBlockPages"),
+            Some(&serde_json::json!(1)),
+            "capped message block reads are advertised as exact integer 1: {caps}"
+        );
     }
 
     /// `unsloth.status` (monorepo#878 follow-up): with no `AgentManager`

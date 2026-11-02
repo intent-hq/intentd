@@ -602,12 +602,9 @@ mod tests {
             dir.path(),
             r#"echo '{ "version": "0.9.10" }'; exec sleep 600"#,
         );
-        let started = Instant::now();
+        // A probe that waited for the child would read the valid status once
+        // the sleep ends and answer Some; None comes only from the deadline.
         let probed = probe_daemon_version_with_timeout(&hung, Duration::from_millis(200));
-        assert_eq!(probed, None);
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "probe must not wait for the hung child"
-        );
+        assert_eq!(probed, None, "probe must not wait for the hung child");
     }
 }

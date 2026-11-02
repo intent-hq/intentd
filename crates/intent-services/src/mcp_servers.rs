@@ -4773,14 +4773,16 @@ for line in sys.stdin:
         assert_eq!(scrub_url("not a url"), "<configured url>");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn http_tool_session_request_bound_tracks_caller_timeout() {
         // The session's per-request client timeout must be the caller's
         // timeout, not the fixed 10s HANDSHAKE_TIMEOUT — otherwise a slow
         // HTTP tool silently caps at ~10s regardless of `timeoutMs`. A
         // never-answering listener + a short session timeout proves the
         // request bound follows the parameter: with the old fixed bound this
-        // would take the full 10s.
+        // would take the full 10s. The clock is paused, so the request timer
+        // fires as soon as the runtime idles and `elapsed` is the virtual
+        // time to the first timer that ended the session.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let hold = tokio::spawn(async move {
@@ -4803,7 +4805,8 @@ for line in sys.stdin:
         let msg = format!("{err}");
         assert!(msg.contains("timed out"), "got: {msg}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            // elapsed-assert: allow — paused tokio clock: the elapsed time is virtual, so it names the timer that fired, not host speed
+            started.elapsed() < HANDSHAKE_TIMEOUT,
             "request bound did not track the caller timeout: {:?}",
             started.elapsed()
         );
