@@ -177,8 +177,8 @@ Open Settings and use these sidebar labels (English labels shown):
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
-| Devices | Local machine, saved remote connections, and Browser access | `/settings?tab=devices#devices` |
-| Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
+| Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
+| Mobile | Intent Mobile pairing, Remote Access, and Browser access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
@@ -405,17 +405,17 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,DevicesConnectionSections}.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
 
 ## Use Intent from a browser on another device
 
-**Settings → Devices → Browser access** (`/settings?tab=devices#devices`) lets
+**Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
 a browser on another device, such as a laptop, use the desktop app, including every
 backend that desktop connects to. It is off by default and the desktop app must stay
 open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
-user reaches it through a private HTTPS front-end: the section shows a
-`tailscale serve --bg <port>` command to run on the desktop, after which they open the
-desktop's Tailscale address. Never suggest Tailscale Funnel or another public tunnel.
+user reaches it through a private HTTPS front-end they set up themselves; with
+Tailscale that is `tailscale serve --bg <port>` on the desktop, then the desktop's
+Tailscale address in the browser. Never suggest Tailscale Funnel or another public tunnel.
 
 The browser asks once for the **Access key** shown in that section; **Reset key** signs
 out every browser. In the browser, opening a saved connection opens that backend in a
