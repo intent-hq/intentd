@@ -56,7 +56,8 @@
 //!   true)` or an `.lt(&limit)` call is not seen, and neither is a measured
 //!   value whose name has none of the three parts (`let d = start.elapsed();
 //!   assert!(d < limit)`); a `<` right after `::` is taken as a turbofish and
-//!   skipped with its closing `>`, while a generic type written in a
+//!   skipped with its closing `>` (commas between them neither end the
+//!   condition nor an operand), while a generic type written in a
 //!   condition outside a turbofish (a closure's `Vec<u8>`) reads as a
 //!   comparison.
 
@@ -117,17 +118,12 @@ fn is_measured(tokens: &[Token]) -> bool {
         if !t.is_ident() {
             return false;
         }
-        let called = tokens.get(k + 1).is_some_and(|next| next.is("("))
-            && k > 0
-            && tokens[k - 1].is(".");
+        let called =
+            tokens.get(k + 1).is_some_and(|next| next.is("(")) && k > 0 && tokens[k - 1].is(".");
         if called && MEASURING_CALLS.contains(&t.text.as_str()) {
             return true;
         }
-        let parts: Vec<String> = t
-            .text
-            .split('_')
-            .map(str::to_ascii_lowercase)
-            .collect();
+        let parts: Vec<String> = t.text.split('_').map(str::to_ascii_lowercase).collect();
         parts.iter().any(|p| MEASURED_PARTS.contains(&p.as_str()))
             && !parts.iter().any(|p| LIMIT_PARTS.contains(&p.as_str()))
     })
@@ -135,43 +131,68 @@ fn is_measured(tokens: &[Token]) -> bool {
 
 /// The operand tokens on each side of the comparison at `cmp` within
 /// `cond`: back and forward to a boundary at the comparison's depth, or to
-/// the bracket enclosing it.
-fn operands(cond: &[Token], cmp: usize) -> (&[Token], &[Token]) {
+/// the bracket enclosing it. Boundaries inside a turbofish in `fish` (the
+/// `,` of `HashMap::<u8, u8>`) do not end an operand.
+fn operands<'a>(cond: &'a [Token], cmp: usize, fish: &[Turbofish]) -> (&'a [Token], &'a [Token]) {
     let depth = cond[cmp].depth;
-    let stops = |t: &Token| {
-        t.depth < depth || (t.depth == depth && OPERAND_BOUNDARIES.contains(&t.text.as_str()))
+    let stops = |k: usize| {
+        let t = &cond[k];
+        t.depth < depth
+            || (t.depth == depth
+                && OPERAND_BOUNDARIES.contains(&t.text.as_str())
+                && !in_turbofish(fish, k))
     };
-    let start = cond[..cmp].iter().rposition(stops).map_or(0, |p| p + 1);
-    let end = cond[cmp + 1..]
-        .iter()
-        .position(stops)
-        .map_or(cond.len(), |p| cmp + 1 + p);
+    let start = (0..cmp).rev().find(|&k| stops(k)).map_or(0, |p| p + 1);
+    let end = (cmp + 1..cond.len())
+        .find(|&k| stops(k))
+        .unwrap_or(cond.len());
     (&cond[start..cmp], &cond[cmp + 1..end])
 }
 
-/// Indices (into `cond`) of every `<` opening a turbofish (right after
-/// `::`) and of the `>` closing it, counting nested angles.
-fn turbofish_angles(cond: &[Token]) -> Vec<usize> {
+/// A turbofish's angle brackets, as indices into the scanned tokens: the
+/// `<` right after `::` and its matching `>` (the end of the tokens when
+/// unclosed).
+#[derive(Debug, Clone, Copy)]
+struct Turbofish {
+    open: usize,
+    close: usize,
+}
+
+/// Every turbofish in `tokens`, counting nested angles.
+fn turbofishes(tokens: &[Token]) -> Vec<Turbofish> {
     let mut out = Vec::new();
-    for (k, t) in cond.iter().enumerate() {
-        if !(t.is("<") && k > 0 && cond[k - 1].is("::")) || out.contains(&k) {
+    for (open, t) in tokens.iter().enumerate() {
+        if !(t.is("<") && open > 0 && tokens[open - 1].is("::")) {
             continue;
         }
-        out.push(k);
         let mut depth = 1usize;
-        for (j, inner) in cond.iter().enumerate().skip(k + 1) {
-            if inner.is("<") {
-                depth += 1;
-            } else if inner.is(">") {
-                depth -= 1;
-                if depth == 0 {
-                    out.push(j);
-                    break;
+        let close = tokens
+            .iter()
+            .enumerate()
+            .skip(open + 1)
+            .find(|(_, inner)| {
+                if inner.is("<") {
+                    depth += 1;
+                } else if inner.is(">") {
+                    depth -= 1;
                 }
-            }
-        }
+                depth == 0
+            })
+            .map_or(tokens.len(), |(j, _)| j);
+        out.push(Turbofish { open, close });
     }
     out
+}
+
+/// Is token `k` a turbofish's angle bracket or within one (the `<` / `>`
+/// of `Vec<u8>` in `HashMap::<u8, Vec<u8>>`)? None is a comparison.
+fn in_turbofish_angles(fish: &[Turbofish], k: usize) -> bool {
+    fish.iter().any(|f| f.open <= k && k <= f.close)
+}
+
+/// Is token `k` strictly between a turbofish's angle brackets?
+fn in_turbofish(fish: &[Turbofish], k: usize) -> bool {
+    fish.iter().any(|f| f.open < k && k < f.close)
 }
 
 /// Indices (into `tokens`) of every comparison token in an assertion
@@ -195,19 +216,21 @@ fn elapsed_comparisons(tokens: &[Token]) -> Vec<usize> {
             continue;
         };
         let inner = open.depth + 1;
-        let cond_end = tokens[i + 3..close]
+        let args = &tokens[i + 3..close];
+        let fish = turbofishes(args);
+        let cond_end = args
             .iter()
-            .position(|t| t.depth == inner && t.is(","))
-            .map_or(close, |p| i + 3 + p);
-        let cond = &tokens[i + 3..cond_end];
-        let turbofish = turbofish_angles(cond);
+            .enumerate()
+            .position(|(k, t)| t.depth == inner && t.is(",") && !in_turbofish(&fish, k))
+            .unwrap_or(args.len());
+        let cond = &args[..cond_end];
         for (k, c) in cond.iter().enumerate() {
             let smaller_left = c.is("<") || c.is("<=");
             let smaller_right = c.is(">") || c.is(">=");
-            if !(smaller_left || smaller_right) || turbofish.contains(&k) {
+            if !(smaller_left || smaller_right) || in_turbofish_angles(&fish, k) {
                 continue;
             }
-            let (left, right) = operands(cond, k);
+            let (left, right) = operands(cond, k, &fish);
             let smaller = if smaller_left { left } else { right };
             if !smaller.is_empty() && is_measured(smaller) {
                 out.push(i + 3 + k);
@@ -245,7 +268,10 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Vec<Hit> {
         }
         hits.push(Hit {
             line: token.line,
-            text: lines.get(token.line - 1).map_or("", |l| l.trim()).to_string(),
+            text: lines
+                .get(token.line - 1)
+                .map_or("", |l| l.trim())
+                .to_string(),
             marker_malformed: consulted.contains(&Marker::Malformed),
         });
     }
@@ -402,11 +428,13 @@ fn t() {
     assert![elapsed < cap];
     assert!(u128::from(waited_ms) <= bound.as_millis() + SLACK);
     assert!(started.elapsed().abs_diff(remainder) <= tick);
+    assert!(HashMap::<u8, u8>::new().is_empty() && elapsed < budget);
+    assert!(f::<u8, Vec<u8>>(elapsed) < budget, \"x\");
 }
 ";
     assert_eq!(
         lines_in(src),
-        vec![2, 3, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![2, 3, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     );
 }
 
