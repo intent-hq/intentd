@@ -21,6 +21,7 @@ use crate::common;
 use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 /// Layout for the spawned daemon: a short base dir (macOS caps UDS paths at
 /// ~104 bytes) holding the data dir and a hermetic workspaces root. The base
@@ -108,11 +109,25 @@ async fn listeners_bind_before_slow_watcher_init() {
         resp["result"].is_object(),
         "system.status must succeed while watcher init is still held; got {resp}"
     );
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // The gate is still closed, so init cannot have finished — and once the
+    // spawned init task reaches the gate it says so. Waiting for that keeps
+    // the seam honest: a test whose gate never engaged would pass vacuously.
+    let parked = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(20));
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("waiting for the gate file") {
+            break log;
+        }
+        assert!(
+            tokio::time::Instant::now() < parked,
+            "watcher init never reached the gate\n--- daemon log ---\n{log}"
+        );
+        // timing-guard: poll interval for the init task's gate acknowledgement
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(
-        log.contains("waiting for the gate file") && !log.contains("watcher registry ready"),
-        "watcher init must still be parked on the gate when the daemon answers\n\
-         --- daemon log ---\n{log}"
+        !log.contains("watcher registry ready"),
+        "watcher init finished while its gate was closed\n--- daemon log ---\n{log}"
     );
     std::fs::write(&dirs.watcher_gate, "").expect("open the watcher-init gate");
 }
