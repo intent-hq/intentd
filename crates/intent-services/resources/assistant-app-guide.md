@@ -472,13 +472,18 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector}.svelte; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
 agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
+The repository picker's tabs are **Clone** (a repository from a connected forge
+account), **Existing folder** (a folder on the machine), and **New**. **Clone** is
+hidden only once Intent has confirmed no forge account is connected; to clone, use
+the picker's connect link or **Settings → Connections**. Onboarding's project step
+uses the same tab names.
 Selecting a repository restores the agent setup last used to create a workspace
 there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
 reasoning effort. A repository with no saved setup uses the most recent setup.
