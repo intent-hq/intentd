@@ -877,7 +877,12 @@ async fn bounded_script_get(
     api: &dyn WorkspaceApi,
 ) -> Result<Value, RpcErr> {
     let ws = require_ws_note(params)?;
-    let offset = opt_positive_usize(params, "commandOffset")?.unwrap_or(0);
+    let offset = match params.get("commandOffset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .ok_or_else(|| invalid_params("commandOffset must be a positive integer"))?,
+    };
     let mut row = api
         .script_get(ws, require_str_param(params, "scriptId")?)
         .await
