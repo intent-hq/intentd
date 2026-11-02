@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.104] - 2026-11-02
+
+### 🚀 Features
+
+- Daemon-to-daemon remote agents ([#2910](https://github.com/intent-hq/intentd/pull/2910))
+
+
 ## [0.11.103] - 2026-11-02
 
 ### 🐛 Bug Fixes
