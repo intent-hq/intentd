@@ -31,6 +31,9 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use intent_services::feature_api::events::EventBus;
 use intent_services::feature_api::execution_call::expose_git_credential;
+use intent_services::feature_api::pagination::{
+    tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
+};
 use intent_services::feature_api::shell::{
     default_shell, scrubbed_env_vars_except, shell_true_invocation,
 };
@@ -350,19 +353,25 @@ pub(crate) async fn kill(pty: &PtyHost, terminal_id: &str) -> Result<Value> {
     Ok(json!({ "ok": true }))
 }
 
-/// Snapshot a PTY's scrollback for replay, base64-encoded (optionally keeping
-/// only the trailing `max_bytes`).
+/// Default and maximum raw bytes `terminal.getBuffer` returns: the newest
+/// 351 KiB of scrollback, whose base64 (479,232 bytes) fits the shared
+/// 480,000-byte page budget.
+pub(crate) const TERMINAL_BUFFER_MAX_BYTES: usize = 351 * 1024;
+
+/// Snapshot a PTY's scrollback for replay, base64-encoded, keeping only the
+/// trailing `max_bytes` (default and maximum [`TERMINAL_BUFFER_MAX_BYTES`]).
 pub(crate) fn get_buffer(
     pty: &PtyHost,
     terminal_id: &str,
     max_bytes: Option<i64>,
 ) -> Result<Value> {
     let id = resolve(terminal_id)?;
-    // Omitted (and legacy negative) bounds retain full-history semantics. A
-    // usable bound takes the ring tail directly, without cloning its prefix.
+    // Omitted (and legacy negative) bounds read the default tail; larger
+    // bounds clamp to it. The ring tail is taken without cloning its prefix.
     let max = max_bytes
         .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(usize::MAX);
+        .unwrap_or(TERMINAL_BUFFER_MAX_BYTES)
+        .min(TERMINAL_BUFFER_MAX_BYTES);
     let snapshot = pty.positioned_scrollback(id, max)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes);
     Ok(json!({
@@ -485,8 +494,16 @@ fn render_output(
         output_lines.pop();
     }
 
+    let joined = output_lines.join("\n");
+    let (body, cut) = tail_within_json_bytes(&joined, OUTPUT_TAIL_MAX_JSON_BYTES);
     let truncated = lines.len() > max_line_count;
-    let header = if truncated {
+    let header = if cut {
+        format!(
+            "Terminal {terminal_id} (cwd: {cwd}) [showing last {} of {} lines; older output omitted to fit the reply size limit]",
+            body.split('\n').count(),
+            lines.len()
+        )
+    } else if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
             lines.len()
@@ -495,10 +512,7 @@ fn render_output(
         format!("Terminal {terminal_id} (cwd: {cwd})")
     };
     let separator = "\u{2500}".repeat(40);
-    Value::String(format!(
-        "{header}\n{separator}\n{}",
-        output_lines.join("\n")
-    ))
+    Value::String(format!("{header}\n{separator}\n{body}"))
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -1339,6 +1353,68 @@ mod tests {
             .as_str()
             .expect("formatted")
             .contains("last 2 of 3 lines"));
+    }
+
+    #[test]
+    fn read_output_keeps_newest_lines_within_the_byte_budget() {
+        // 10,000 lines of 100 bytes: the 10,000-line clamp keeps them all, so
+        // only the byte budget bounds the reply.
+        let line = "x".repeat(99);
+        let text = (0..10_000)
+            .map(|i| format!("{i:05}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snapshot = LineSnapshot {
+            bytes: text.into_bytes(),
+            total_lines: 10_000,
+            start_line: 0,
+            end_line: 10_000,
+            retained_has_non_whitespace: true,
+        };
+        let out = render_output(&snapshot, "pty-1", "/tmp", Some(100_000), false, None);
+        let out = out.as_str().expect("formatted");
+        assert!(serde_json::to_string(out).unwrap().len() < OUTPUT_TAIL_MAX_JSON_BYTES + 1024);
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.contains("of 10000 lines; older output omitted"),
+            "{header}"
+        );
+        assert!(out.ends_with(&format!("09999{line}")));
+        // The first kept line is whole.
+        let first = out.lines().nth(2).unwrap();
+        assert_eq!(first.len(), 104, "{first}");
+    }
+
+    #[tokio::test]
+    async fn get_buffer_defaults_and_clamps_to_the_reply_cap() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "i=0; while [ $i -lt 9000 ]; do \
+             printf '%063d\\n' $i; i=$((i+1)); done; printf 'buffer-done\\n'"
+                .to_string(),
+        ];
+        let id = pty.spawn(spec).expect("spawn output producer");
+        poll_until(
+            || {
+                let bytes = pty.scrollback(id).ok()?;
+                contains_sub(&bytes, b"buffer-done").then_some(())
+            },
+            LONG_TIMEOUT,
+        )
+        .await
+        .expect("output reaches scrollback");
+        let id = id.to_string();
+        for max in [None, Some(i64::MAX), Some(-1)] {
+            let v = get_buffer(pty.as_ref(), &id, max).unwrap();
+            let data = decode(v["data"].as_str().unwrap());
+            assert_eq!(data.len(), TERMINAL_BUFFER_MAX_BYTES, "{max:?}");
+            assert!(contains_sub(&data, b"buffer-done"));
+            assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        }
+        let small = get_buffer(pty.as_ref(), &id, Some(1024)).unwrap();
+        assert_eq!(decode(small["data"].as_str().unwrap()).len(), 1024);
     }
 
     #[tokio::test]

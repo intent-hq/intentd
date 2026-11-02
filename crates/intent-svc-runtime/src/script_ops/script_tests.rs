@@ -429,3 +429,108 @@ async fn running_script_is_hidden_but_output_remains_available() {
         .await
         .expect("stop");
 }
+
+/// The full `script.list` view pages by `limit`, cursor and byte budget, and
+/// together the pages list every definition once in `(createdAt, id)` order.
+#[intent_test_macros::daemon_test]
+async fn full_list_pages_cover_every_definition_within_the_byte_budget() {
+    let h = harness().await;
+    let big = format!("echo {}", "x".repeat(200 * 1024));
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let command = if i < 3 {
+            big.clone()
+        } else {
+            "true".to_string()
+        };
+        ids.push(create(&h, &format!("s{i}"), &command, ScriptMode::Command).await);
+    }
+    let whole = h
+        .services
+        .script_list(h.ws.clone())
+        .await
+        .expect("unpaged list");
+    let expected: Vec<Value> = whole["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].clone())
+        .collect();
+    assert_eq!(expected.len(), 5);
+
+    // Three 200 KiB commands: the 480,000-byte page budget stops the first page at two.
+    let first = h
+        .services
+        .script_list_view(h.ws.clone(), serde_json::json!({}))
+        .await
+        .expect("first page");
+    assert_eq!(first["scripts"].as_array().unwrap().len(), 2);
+    assert!(serde_json::to_vec(&first).unwrap().len() < 500 * 1024);
+    let mut seen: Vec<Value> = first["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].clone())
+        .collect();
+    let mut cursor = first["nextCursor"].as_str().expect("more pages").to_owned();
+    loop {
+        let page = h
+            .services
+            .script_list_view(
+                h.ws.clone(),
+                serde_json::json!({ "view": "full", "limit": 2, "cursor": cursor }),
+            )
+            .await
+            .expect("next page");
+        let rows = page["scripts"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() <= 2);
+        assert!(rows.iter().all(|r| r["command"].is_string()), "full rows");
+        seen.extend(rows.iter().map(|s| s["id"].clone()));
+        match page.get("nextCursor") {
+            Some(next) => cursor = next.as_str().unwrap().to_owned(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+
+    // `limit` alone still caps the row count.
+    let one = h
+        .services
+        .script_list_view(
+            h.ws.clone(),
+            serde_json::json!({ "view": "full", "limit": 1 }),
+        )
+        .await
+        .expect("one row");
+    assert_eq!(one["scripts"].as_array().unwrap().len(), 1);
+    assert!(one["nextCursor"].is_string());
+
+    // A summary cursor is not a full-view cursor, and vice versa.
+    let summary = h
+        .services
+        .script_list_view(
+            h.ws.clone(),
+            serde_json::json!({ "view": "summary", "limit": 1 }),
+        )
+        .await
+        .expect("summary page");
+    for (options, label) in [
+        (
+            serde_json::json!({ "cursor": summary["nextCursor"] }),
+            "summary cursor on the full view",
+        ),
+        (
+            serde_json::json!({ "view": "summary", "cursor": first["nextCursor"] }),
+            "full cursor on the summary view",
+        ),
+        (serde_json::json!({ "limit": 0 }), "limit 0"),
+    ] {
+        assert!(
+            h.services
+                .script_list_view(h.ws.clone(), options)
+                .await
+                .is_err(),
+            "{label}"
+        );
+    }
+}

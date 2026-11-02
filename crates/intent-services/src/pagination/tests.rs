@@ -438,3 +438,39 @@ fn page_queue_reply_stops_at_the_byte_budget() {
     );
     assert!(paged["nextToken"].is_string());
 }
+
+#[test]
+fn tail_within_json_bytes_keeps_short_text_whole() {
+    assert_eq!(tail_within_json_bytes("a\nb", 100), ("a\nb", false));
+    assert_eq!(tail_within_json_bytes("", 0), ("", false));
+}
+
+#[test]
+fn tail_within_json_bytes_keeps_newest_whole_lines() {
+    let text = "first line\nsecond\nthird";
+    assert_eq!(tail_within_json_bytes(text, 14), ("second\nthird", true));
+    // A cut inside "second" drops the partial line.
+    assert_eq!(tail_within_json_bytes(text, 10), ("third", true));
+}
+
+#[test]
+fn tail_within_json_bytes_counts_escaped_size() {
+    // Each ESC serializes as `\u001b` (6 bytes) and each quote as `\"`.
+    let text = "\u{1b}\u{1b}\"\"";
+    let (tail, cut) = tail_within_json_bytes(text, 10);
+    assert!(cut);
+    assert_eq!(tail, "\u{1b}\"\"");
+    let escaped = serde_json::to_string(tail).unwrap();
+    assert!(escaped.len() - 2 <= 10, "{escaped}");
+}
+
+#[test]
+fn tail_within_json_bytes_cuts_on_char_boundaries_and_fits_the_budget() {
+    let text = "é".repeat(1000) + "\n" + &"🙂\t".repeat(2000);
+    for budget in [1, 7, 100, 4_097, 9_999] {
+        let (tail, cut) = tail_within_json_bytes(&text, budget);
+        assert!(cut);
+        assert!(text.ends_with(tail));
+        assert!(serde_json::to_string(tail).unwrap().len() - 2 <= budget);
+    }
+}

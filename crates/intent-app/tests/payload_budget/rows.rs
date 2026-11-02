@@ -1053,13 +1053,31 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "hook.list",
             vec![
-                v("default", w.clone(), Items("/hooks", 200)),
+                // Pages stop at `limit` rows (default 100) or the page byte
+                // budget (fewer than 100 of the fixture's hooks).
+                v("default", w.clone(), Items("/hooks", 50)),
                 v(
                     "includeRetired",
                     json!({ "workspaceId": ws, "includeRetired": true }),
-                    Items("/hooks", 200),
+                    Items("/hooks", 50),
+                ),
+                v(
+                    "limit=200",
+                    json!({ "workspaceId": ws, "limit": 200 }),
+                    Items("/hooks", 50),
+                ),
+                next(
+                    "cursor",
+                    json!({ "workspaceId": ws, "limit": 50 }),
+                    "/nextCursor",
+                    "cursor",
+                    Items("/hooks", 50),
                 ),
             ],
+        )
+        .parsed_by(
+            ("intent-svc-runtime/src/hook_manager.rs", "hook_list_page_params", "wire"),
+            &[],
         ),
         fixed(
             "host.checkAuggie",
@@ -1384,11 +1402,24 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "script.list",
             vec![
-                v("default", w.clone(), Items("/scripts", 200)),
+                // Full-view pages: default 100 rows within the byte budget.
+                v("default", w.clone(), Items("/scripts", 100)),
                 v(
                     "view=full",
                     json!({ "workspaceId": ws, "view": "full", "archive": "active" }),
-                    Items("/scripts", 200),
+                    Items("/scripts", 100),
+                ),
+                v(
+                    "view=full+limit=200",
+                    json!({ "workspaceId": ws, "view": "full", "limit": 200 }),
+                    Items("/scripts", 150),
+                ),
+                next(
+                    "view=full+cursor",
+                    json!({ "workspaceId": ws, "view": "full", "limit": 100 }),
+                    "/nextCursor",
+                    "cursor",
+                    Items("/scripts", 100),
                 ),
                 v(
                     "view=summary",

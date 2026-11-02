@@ -5389,8 +5389,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             // Active hooks only by default; `includeRetired` appends the
             // terminal rows as a light projection (no code/lastState/lastLogs).
-            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
-            api.hook_list(ws, None, include_retired)
+            // Paged: `limit?` (1–200, default 100), `cursor?`, plus a byte
+            // budget per page; `nextCursor` while more rows follow.
+            api.hook_list_page(ws, Value::Object(params.clone()))
                 .await
                 .map_err(domain_to_rpc)
         }

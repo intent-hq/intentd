@@ -24,6 +24,9 @@ use intent_core::{
     ScriptStatus, WorkspaceId,
 };
 use intent_pty::{OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
+use intent_services::feature_api::pagination::{
+    tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
+};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -95,6 +98,9 @@ const SCRIPT_SCROLLBACK_BYTES: usize = 64 * 1024;
 /// Trailing bytes of the run log returned as `script.run`'s `output` (the
 /// former whole-scrollback bound).
 const RUN_RESULT_OUTPUT_BYTES: u64 = 512 * 1024;
+/// Row JSON a full-view `script.list` page may carry (always at least one
+/// row), keeping the frame under the 500 KiB read payload budget.
+const FULL_PAGE_MAX_BYTES: usize = 480_000;
 
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
@@ -1154,6 +1160,65 @@ impl ScriptManager {
         Ok(page)
     }
 
+    /// One full-view `script.list` page: unarchived definitions plus runtime
+    /// in ascending `(createdAt, id)` order, at most `options.limit` rows and
+    /// [`FULL_PAGE_MAX_BYTES`] of row JSON (always at least one row), with
+    /// `nextCursor` while more rows follow.
+    pub(crate) async fn full_page(
+        &self,
+        ws: &WorkspaceId,
+        options: &intent_core::script_lists::ScriptListOptions,
+    ) -> Result<Value> {
+        let scope = intent_core::script_lists::full_scope(ws.as_str());
+        let boundary = options.boundary(&scope)?;
+        self.list_filtered_inner(ws, intent_core::ScriptArchiveFilter::Active, false)
+            .await?;
+        let saved_only = self.saved_only(ws).await?;
+        let guard = self.scripts.lock().unwrap();
+        let mut rows: Vec<&ManagedScript> = guard
+            .iter()
+            .filter(|((w, _), m)| {
+                w == ws
+                    && m.def.archived_at.is_none()
+                    && (!saved_only || m.def.purpose == intent_core::ScriptPurpose::Saved)
+            })
+            .map(|(_, m)| m)
+            .filter(|m| {
+                boundary.as_ref().is_none_or(|(created, id)| {
+                    (m.def.created_at.as_str(), m.def.id.as_str()) > (created.as_str(), id.as_str())
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            (a.def.created_at.as_str(), a.def.id.as_str())
+                .cmp(&(b.def.created_at.as_str(), b.def.id.as_str()))
+        });
+        let mut scripts = Vec::new();
+        let mut bytes = 0usize;
+        for m in &rows {
+            let row = with_runtime(&m.def, &m.state);
+            let len = serde_json::to_vec(&row).map_or(0, |v| v.len()) + 1;
+            if scripts.len() == options.limit
+                || (!scripts.is_empty() && bytes + len > FULL_PAGE_MAX_BYTES)
+            {
+                break;
+            }
+            bytes += len;
+            scripts.push(row);
+        }
+        let mut page = json!({ "scripts": [] });
+        if scripts.len() < rows.len() {
+            let last = rows[scripts.len() - 1];
+            page["nextCursor"] = json!(intent_core::script_lists::cursor(
+                &scope,
+                &last.def.created_at,
+                &last.def.id
+            ));
+        }
+        page["scripts"] = Value::Array(scripts);
+        Ok(page)
+    }
+
     pub(crate) async fn get(&self, ws: &WorkspaceId, id: &str) -> Result<Value> {
         let def = self
             .store
@@ -1637,13 +1702,11 @@ impl ScriptManager {
             if tail.text.trim().is_empty() {
                 return Ok(Value::String("No output yet.".to_string()));
             }
-            let total = tail.total_lines;
-            let header = if total > line_count {
-                format!("[showing last {line_count} of {total} lines]")
-            } else {
-                format!("[{total} lines]")
-            };
-            Ok(Value::String(format!("{header}\n{}", tail.text)))
+            Ok(Value::String(format_output_tail(
+                &tail.text,
+                tail.total_lines,
+                line_count,
+            )))
         })
         .await
         .map_err(|e| Error::Internal(format!("script output read failed: {e}")))?
@@ -2359,11 +2422,11 @@ impl ScriptManager {
         if let Some(n) = max_lines.filter(|n| *n > 0) {
             output = last_n_lines(&output, usize::try_from(n).expect("value fits in usize"));
         }
-        Ok(json!({
-            "exitCode": terminal_exit_code(exit.as_ref()),
-            "output": output,
-            "timedOut": timed_out,
-        }))
+        Ok(run_result(
+            terminal_exit_code(exit.as_ref()),
+            &output,
+            timed_out,
+        ))
     }
 
     /// Once a launch error is observed, its publication and settlement must
@@ -3181,6 +3244,45 @@ fn clamp_line_count(max_lines: Option<i64>, fallback: usize) -> usize {
     .expect("value fits in usize")
 }
 
+/// Header note for a text tail cut to [`OUTPUT_TAIL_MAX_JSON_BYTES`].
+const OUTPUT_TAIL_TRUNCATED_NOTE: &str = "older output omitted to fit the reply size limit";
+
+/// The newest part of `text` that fits [`OUTPUT_TAIL_MAX_JSON_BYTES`] once
+/// JSON-escaped, and whether older output was dropped.
+fn output_tail_within_budget(text: &str) -> (&str, bool) {
+    tail_within_json_bytes(text, OUTPUT_TAIL_MAX_JSON_BYTES)
+}
+
+/// `script.output`'s text: a line-count header, then the tail (already
+/// clamped to `line_count` lines) cut to the newest bytes within the budget.
+fn format_output_tail(tail: &str, total: usize, line_count: usize) -> String {
+    let (text, cut) = output_tail_within_budget(tail);
+    let header = if cut {
+        let shown = text.split('\n').count();
+        format!("[showing last {shown} of {total} lines; {OUTPUT_TAIL_TRUNCATED_NOTE}]")
+    } else if total > line_count {
+        format!("[showing last {line_count} of {total} lines]")
+    } else {
+        format!("[{total} lines]")
+    };
+    format!("{header}\n{text}")
+}
+
+/// `script.run`'s reply: `output` keeps the newest bytes within the reply
+/// budget; `outputTruncated: true` (absent otherwise) marks a cut.
+fn run_result(exit_code: i64, output: &str, timed_out: bool) -> Value {
+    let (output, cut) = output_tail_within_budget(output);
+    let mut reply = json!({
+        "exitCode": exit_code,
+        "output": output,
+        "timedOut": timed_out,
+    });
+    if cut {
+        reply["outputTruncated"] = json!(true);
+    }
+    reply
+}
+
 /// The trailing `n` newline-delimited lines of `text` (mirrors `getLastText`).
 fn last_n_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
@@ -3526,6 +3628,46 @@ mod tests {
              nextest's terminate budget {budget:?} (slow-timeout period {period:?} × \
              terminate-after {terminate_after} in {path}); nextest would SIGKILL a \
              stalled test before the harness deadline fires"
+        );
+    }
+
+    #[test]
+    fn output_tail_keeps_newest_bytes_within_the_reply_budget() {
+        let line = "y".repeat(195);
+        let tail = (0..10_000)
+            .map(|i| format!("{i:05}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = format_output_tail(&tail, 20_000, 10_000);
+        assert!(serde_json::to_string(&out).unwrap().len() <= OUTPUT_TAIL_MAX_JSON_BYTES + 256);
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.starts_with("[showing last ")
+                && header.contains("of 20000 lines; older output omitted"),
+            "{header}"
+        );
+        assert!(out.ends_with(&format!("09999{line}")));
+        assert_eq!(out.lines().nth(1).unwrap().len(), 200);
+        // Short tails are unchanged.
+        assert_eq!(
+            format_output_tail("a\nb", 5, 2),
+            "[showing last 2 of 5 lines]\na\nb"
+        );
+        assert_eq!(format_output_tail("a\nb", 2, 100), "[2 lines]\na\nb");
+    }
+
+    #[test]
+    fn run_result_caps_output_and_flags_the_cut() {
+        // Escape-heavy output: ESC serializes as six bytes.
+        let output = "\u{1b}[0m\n".repeat(200_000);
+        let reply = run_result(0, &output, false);
+        assert_eq!(reply["outputTruncated"], json!(true));
+        assert!(serde_json::to_string(&reply).unwrap().len() < OUTPUT_TAIL_MAX_JSON_BYTES + 256);
+        assert!(output.ends_with(reply["output"].as_str().unwrap()));
+        let small = run_result(-1, "done\n", true);
+        assert_eq!(
+            small,
+            json!({ "exitCode": -1, "output": "done\n", "timedOut": true })
         );
     }
 

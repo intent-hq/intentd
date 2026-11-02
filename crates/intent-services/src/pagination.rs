@@ -449,6 +449,49 @@ pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) 
     })
 }
 
+/// Budget, in JSON-escaped bytes, for one text tail in a read reply
+/// (`script.output`, `script.run`'s `output`, `terminal.readOutput`): the
+/// shared 480,000-byte page budget, so the frame stays under 512,000 bytes.
+pub const OUTPUT_TAIL_MAX_JSON_BYTES: usize = 480_000;
+
+/// Bytes `c` takes inside a JSON string as `serde_json` writes it.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The newest suffix of `text` whose JSON-escaped size fits `budget`, and
+/// whether anything was dropped. A cut inside a line moves past that line's
+/// newline (when the kept part has one) so the tail begins on a whole line.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn tail_within_json_bytes(text: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0usize;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let len = json_escaped_len(c);
+        if used + len > budget {
+            let kept = &text[start..];
+            if c == '\n' {
+                return (kept, true);
+            }
+            let kept = kept
+                .find('\n')
+                .filter(|n| n + 1 < kept.len())
+                .map_or(kept, |n| &kept[n + 1..]);
+            return (kept, true);
+        }
+        used += len;
+        start = i;
+    }
+    (text, false)
+}
+
 /// Encode an opaque continuation token for offset/skip-style backward paging
 /// (used by the store-backed `event.query` and git `file-tracking.loadCommits`
 /// reads, whose sources are already newest-first and expose a native
