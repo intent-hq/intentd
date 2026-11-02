@@ -3967,7 +3967,8 @@ mod tests {
             fn list_notes<'a>(
                 &'a self,
                 _workspace_id: &'a WorkspaceId,
-            ) -> intent_core::BoxFuture<'a, intent_core::Result<Vec<intent_core::Note>>> {
+            ) -> intent_core::BoxFuture<'a, intent_core::Result<Vec<intent_core::Note>>>
+            {
                 self.record("list_notes");
                 Box::pin(async { Ok(Vec::new()) })
             }
@@ -4040,6 +4041,8 @@ mod tests {
     /// though it otherwise acts as its owner.
     #[tokio::test]
     async fn hook_runs_cannot_control_the_desktop() {
+        struct NoApi;
+        impl WorkspaceApi for NoApi {}
         let ws = WorkspaceId::new();
         let hook = Hook {
             hook_id: HookId::new(),
@@ -4067,8 +4070,6 @@ mod tests {
             perpetual: false,
             dispatch_count: 0,
         };
-        struct NoApi;
-        impl WorkspaceApi for NoApi {}
         let outcome = run_hook_script(
             Arc::new(NoApi),
             &hook,

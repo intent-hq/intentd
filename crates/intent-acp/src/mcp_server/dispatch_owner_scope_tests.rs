@@ -150,10 +150,7 @@ async fn owner_binding_does_not_depend_on_the_enclosing_scope() {
     };
     let _ = intent_core::with_caller(other, host(frame)).await;
     let seen = probe.take();
+    let expected = Some(Caller::Agent { agent_id: owner });
     assert!(!seen.is_empty());
-    assert!(
-        seen.iter()
-            .all(|caller| caller == &Some(Caller::Agent { agent_id: owner.clone() })),
-        "{seen:?}"
-    );
+    assert!(seen.iter().all(|caller| caller == &expected), "{seen:?}");
 }
