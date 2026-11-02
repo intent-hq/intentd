@@ -1392,11 +1392,26 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         .with_reason("Unscoped, only the global user-override rules are listed."),
         row(
             "script.get",
-            vec![v(
-                "default",
-                json!({ "workspaceId": ws, "scriptId": c.script }),
-                Bytes(1024),
-            )],
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "scriptId": c.script }),
+                    Bytes(1024),
+                ),
+                // A command over the budget is served in parts.
+                v(
+                    "oversized command",
+                    json!({ "workspaceId": ws, "scriptId": s.huge_script }),
+                    Bytes(400 * 1024),
+                ),
+                next(
+                    "commandOffset",
+                    json!({ "workspaceId": ws, "scriptId": s.huge_script }),
+                    "/nextCommandOffset",
+                    "commandOffset",
+                    Bytes(256 * 1024),
+                ),
+            ],
         )
         .with_reason("One script definition."),
         row(

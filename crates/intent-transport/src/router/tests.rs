@@ -8387,3 +8387,93 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
         assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
 }
+
+/// `script.get` (§5.8 bounded reads): a definition whose `command` is over
+/// the read budget is served in parts (`commandOffset` in,
+/// `nextCommandOffset` out) that rebuild it exactly; bad offsets fail
+/// `-32602`.
+mod script_get_paging {
+    use intent_core::{BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    struct BigScript(String);
+
+    impl WorkspaceApi for BigScript {
+        fn script_get(&self, _: WorkspaceId, id: String) -> BoxFuture<'_, Result<Value>> {
+            let command = self.0.clone();
+            Box::pin(async move {
+                Ok(json!({ "id": id, "name": "big", "mode": "command", "command": command }))
+            })
+        }
+    }
+
+    async fn call(api: &BigScript, offset: Option<Value>) -> (Value, usize) {
+        let mut params = json!({ "workspaceId": "ws-1", "scriptId": "s-1" });
+        if let Some(offset) = offset {
+            params["commandOffset"] = offset;
+        }
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "script.get", "params": params })
+            .to_string();
+        let out = handle_message(api, &msg).await.expect("response");
+        (serde_json::from_str(&out).unwrap(), out.len())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_command_is_rebuilt_exactly_across_parts() {
+        let command = format!(
+            "echo '{}' # {}",
+            "\"".repeat(300_001),
+            "é😀\\".repeat(90_000)
+        );
+        let api = BigScript(command.clone());
+        let mut rebuilt = String::new();
+        let mut offset: Option<u64> = None;
+        let mut parts = 0;
+        loop {
+            let (v, frame) = call(&api, offset.map(Value::from)).await;
+            assert!(frame < 500 * 1024, "frame is {frame} bytes");
+            let row = &v["result"];
+            assert_eq!(row["commandTruncated"], true);
+            assert_eq!(row["commandBytes"], command.len());
+            assert_eq!(row["commandOffset"], offset.unwrap_or(0));
+            rebuilt.push_str(row["command"].as_str().unwrap());
+            parts += 1;
+            match row["nextCommandOffset"].as_u64() {
+                Some(next) => offset = Some(next),
+                None => break,
+            }
+        }
+        assert!(parts >= 3, "{parts} parts");
+        assert_eq!(rebuilt, command);
+    }
+
+    #[tokio::test]
+    async fn a_small_command_is_unchanged() {
+        let api = BigScript("make test".into());
+        let (v, _) = call(&api, None).await;
+        assert_eq!(v["result"]["command"], "make test");
+        assert!(v["result"].get("commandTruncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_command_offsets_are_invalid_params() {
+        let api = BigScript("aé".into());
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!("1"),
+            json!(1.5),
+            json!(2),
+            json!(3),
+            json!(9),
+        ] {
+            let (v, _) = call(&api, Some(bad.clone())).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "commandOffset {bad}");
+        }
+        let (v, _) = call(&api, Some(json!(1))).await;
+        assert_eq!(v["result"]["command"], "é");
+        assert_eq!(v["result"]["nextCommandOffset"], Value::Null);
+    }
+}

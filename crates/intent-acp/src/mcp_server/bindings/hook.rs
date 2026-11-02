@@ -26,7 +26,39 @@ pub(crate) const PRELUDE: &str = r"
     ws.hook = {
         schedule: (opts) => host({ method: 'hook.schedule', args: opts || {} }),
         list: (opts) => host({ method: 'hook.list', args: opts || {} }),
-        get: (hookId) => host({ method: 'hook.get', args: { hookId } }),
+        get: async (hookId) => {
+            // A hook whose code is over the read budget arrives in parts
+            // (`codeOffset` in, `nextCodeOffset` out); join them, restart
+            // if the code changes between parts, and refuse an incomplete
+            // result.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const first = await host({ method: 'hook.get', args: { hookId } });
+                if (!first || first.codeTruncated !== true) return first;
+                const size = first.codeBytes;
+                let code = first.code;
+                let next = first.nextCodeOffset;
+                let changed = false;
+                while (next !== null && next !== undefined) {
+                    const part = await host({ method: 'hook.get', args: { hookId, codeOffset: next } });
+                    if (part.codeBytes !== size || part.codeOffset !== next) { changed = true; break; }
+                    code += part.code;
+                    next = part.nextCodeOffset;
+                }
+                if (changed) continue;
+                let bytes = 0;
+                for (const ch of code) {
+                    const cp = ch.codePointAt(0);
+                    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+                }
+                if (bytes !== size) {
+                    throw new Error(`hook.get: code for ${hookId} is incomplete`);
+                }
+                const whole = { ...first, code };
+                for (const key of ['codeTruncated', 'codeBytes', 'codeOffset', 'nextCodeOffset']) delete whole[key];
+                return whole;
+            }
+            throw new Error(`hook.get: code for ${hookId} kept changing while it was read`);
+        },
         cancel: (hookId) => host({ method: 'hook.cancel', args: { hookId } }),
         runNow: (hookId) => host({ method: 'hook.runNow', args: { hookId } }),
     };
@@ -85,11 +117,26 @@ async fn list(
     Ok(raw)
 }
 
+/// Bytes one `hook.get` host reply may carry: the shared 480,000-byte read
+/// budget. Larger `code` is served in parts (`codeOffset` /
+/// `nextCodeOffset`), which the `ws.hook.get` prelude joins.
+const HOOK_GET_BUDGET_BYTES: usize = 480_000;
+
 async fn get(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Result<Value, String> {
     let hook_id = req_str(args, "hookId").map_err(|_| "hookId is required".to_string())?;
-    api.hook_get(ws.clone(), HookId::from(hook_id.as_str()))
+    let offset = match args.get("codeOffset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "codeOffset must be a non-negative integer".to_string())?,
+    };
+    let mut row = api
+        .hook_get(ws.clone(), HookId::from(hook_id.as_str()))
         .await
-        .map_err(map_err)
+        .map_err(map_err)?;
+    intent_core::text_field_page::page_text_field(&mut row, "code", offset, HOOK_GET_BUDGET_BYTES)?;
+    Ok(row)
 }
 
 async fn cancel(
