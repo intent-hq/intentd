@@ -1,0 +1,68 @@
+name: Report Nightly Payload Sweep Failures
+
+# Mirrors cloudlands-fe nightly-browser-report.yml: a separate workflow_run
+# reporter that runs only default-branch code, trusts only scheduled or
+# dispatched runs of main, and is the single writer of the central-tracker
+# issues (scripts/nightly-payload-failures.mjs).
+on:
+  workflow_run:
+    workflows: [Nightly Payload Sweep]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+# One central-tracker writer, including retries and different source runs.
+concurrency:
+  group: nightly-payload-issue-writer
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: >-
+      github.repository == 'intent-hq/intentd' &&
+      github.event.workflow_run.head_repository.full_name == 'intent-hq/intentd' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      # Fail before reading anything: without the secret no issue can be
+      # written, and a skipped report would look like a quiet night.
+      - name: Require MONOREPO_ISSUES_TOKEN
+        env:
+          MONOREPO_ISSUES_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: |
+          if [ -z "$MONOREPO_ISSUES_TOKEN" ]; then
+            echo "::error title=Missing MONOREPO_ISSUES_TOKEN::Nightly payload sweep failures cannot be filed on intent-hq/intent; set the MONOREPO_ISSUES_TOKEN repository secret and re-run this job."
+            exit 1
+          fi
+      # No dependency installation, test execution, artifact extraction or source
+      # checkout from the triggering run. Both scripts are default-branch code.
+      - name: Collect and validate sweep evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: node scripts/nightly-payload-failures.mjs collect --run "$SOURCE_RUN_ID" --attempt "$SOURCE_RUN_ATTEMPT" --out "$RUNNER_TEMP/nightly-report"
+      - name: File or update central tracker issues
+        env:
+          GH_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: node scripts/nightly-payload-failures.mjs publish --out "$RUNNER_TEMP/nightly-report" --write
+      - name: Preserve reporting evidence and retry plan
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-report-${{ github.event.workflow_run.id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nightly-report/
+          if-no-files-found: ignore
+          retention-days: 7

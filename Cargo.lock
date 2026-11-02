@@ -2215,14 +2215,19 @@ dependencies = [
 name = "intent-app"
 version = "0.11.107"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "intent-core",
+ "intent-linear",
+ "intent-sentry",
  "intent-services",
+ "intent-sourcecontrol",
  "intent-store",
  "intent-svc-remote",
  "intent-svc-runtime",
  "intent-svc-transfer",
  "intent-transport",
+ "intentd-test-support",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

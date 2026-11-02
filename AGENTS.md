@@ -86,6 +86,7 @@ only on `intent-services`, never on `intent-store`.
 | a test that needs a provider "installed", or passes locally but fails on CI with "not installed" | `crates/intent-services/src/test_support/provider_installed.rs` (mark a provider installed; Codex and Claude Code ignore `providers.paths` overrides, so `/bin/sh` overrides do nothing); `scripts/test-without-provider-clis.sh <command>` runs tests with every provider CLI hidden, the way CI's runners lack them (Linux, needs `bwrap`; CI's `check` job asserts its runners have none) |
 | a test that fails only on a busy host, a flake fix to prove, or "is this CI failure mine?" | `make test-stress E='<nextest filterset>' COUNT=200 LOAD=1` (see the root guide → Resuming local Rust gates); run it before and after a fix for comparable evidence |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
+| a new read method, or a read whose reply grows | `crates/intent-app/tests/payload_budget/` — `rows.rs` (one sweep row per `BoundedRead` / `ExternalProxy` method), `seed.rs` (state the large fixture lacks), `baseline.txt` (known offenders); "Payload budget" below |
 
 ## Performance — the RPC cost contract
 
@@ -130,12 +131,45 @@ A PR that adds a field to a list-shaped payload must state which ladder rung the
 sits on. "Computed inline on read" is not an option — that is exactly how the incidents
 above happened.
 
+### Payload budget
+
+Every read reply must stay under `READ_PAYLOAD_BUDGET_BYTES` (500 KiB, in
+`crates/intent-transport/src/catalog.rs`), measured as the JSON-RPC frame on the wire.
+`PAYLOAD_CLASSES` there puts every method in one class; `payload_budget_sweep_ci`
+(`crates/intent-app/tests/payload_budget/`) calls every `BoundedRead` and
+`ExternalProxy` method in every parameter variation, and subscribes to every
+`SNAPSHOT_CHANNELS` channel, over a real UDS connection against the large fixture
+(`intent_services::test_support::large_state`). It also checks each `BulkTransfer`
+method's declared cap. Run it with `make test-select E='test(/payload_budget/)'`; the
+full-scale sweep is `#[ignore]`d and runs with `INTENTD_LARGE_STATE_SCALE=full`.
+- **PR vs nightly:** PRs run the `ci` preset; `nightly-payload-sweep.yml` runs the ignored
+  full-scale sweep and fixture build, and failures file deduplicated `intent-hq/intent`
+  issues (`nightly-payload-report.yml`). Locally (`make test-select` cannot include ignored
+  tests): `INTENTD_LARGE_STATE_SCALE=full cargo test -p intent-app --test payload_budget -- --ignored`.
+
+- **New read method:** classify it in `PAYLOAD_CLASSES`, then add a row to `rows.rs`
+  (variants: no params, the largest `limit`, every optional param, a `max` variant with
+  every include flag on, and a next-page variant for a cursor). Each variant must succeed
+  and prove it reached large data (`Items` near the page limit or `Bytes`); `Fixed` is
+  for replies small by design, needs the row's reason, and still fails on an empty list or
+  object. Missing data goes in `seed.rs`; a method that cannot be driven here goes in a
+  reasoned golden that pins its outcome. The static check fails on a method with no row
+  and on a param no variant sets: router params are read from `router.rs`, a typed params
+  struct from its serde fields, and an arm that hands params on names its parser with
+  `parsed_by`.
+- **Baseline:** `baseline.txt` (`baseline-full.txt` for the full preset) lists today's
+  offenders as `<method> <variant> <bytes>`. The sweep fails on a new offender, on growth
+  over 5% above the recorded size, and on a stale line. Fixing an offender means deleting
+  its line; never add one. `PAYLOAD_BUDGET_UPDATE=1` rewrites the file from a run (for
+  review, not to admit a regression); `PAYLOAD_BUDGET_PROBE=1` prints every reply.
+
 ### Runtime backstop
 
 The daemon profiles each RPC dispatch and logs one WARN (method, statement count,
-duration) when a dispatch exceeds the statement-count or duration threshold. Reviewers
-should watch dogfooding logs for these warnings after merging anything that touches a
-read path — a new WARN on a hot RPC is a regression, not noise.
+duration) when a dispatch exceeds the statement-count or duration threshold, and one
+when a reply exceeds the 500 KiB payload budget (`RESPONSE_SIZE_WARN_THRESHOLD_BYTES`).
+Reviewers should watch dogfooding logs for these warnings after merging anything that
+touches a read path — a new WARN on a hot RPC is a regression, not noise.
 
 ## Testing — end-to-end against the real WSS transport
 
