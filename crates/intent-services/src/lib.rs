@@ -7626,6 +7626,67 @@ impl Services {
     /// `agent.wakeOrCreate` spawns a fresh agent instead of waking it.
     /// `agent.retry` remains the escape hatch (it clears the Error status,
     /// the `stop_reason`, and the streak before redriving).
+    /// Every `workspace.list` / lite snapshot step after the store read:
+    /// membership narrowing, the batched card aggregates (`full` selects the
+    /// enriched `workspace.list` rows, otherwise the lite snapshot rows), the
+    /// emit-path PR merge, list-row slimming and the membership summary.
+    pub(crate) async fn finish_workspace_list(
+        &self,
+        list: &mut Vec<Workspace>,
+        filter: intent_core::WorkspaceListFilter,
+        full: bool,
+    ) -> Result<()> {
+        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
+        // reads below must cover them whenever the list includes them.
+        let include_archived = filter.include_archived || filter.include_retired;
+        // Membership filter (multiplayer w3) before any enrichment, so a
+        // collaborator's rows never cost more than what it can see.
+        self.retain_member_workspaces(list).await?;
+        // `activity` is derived from live agent state, never persisted (§9.9);
+        // the card aggregates are computed fresh on the emit path (§9.1).
+        // Every store-backed aggregate is fetched once for the requested ids
+        // and joined below in store order; no per-workspace store futures.
+        let started = std::time::Instant::now();
+        let count = list.len();
+        let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+        let snapshot = self
+            .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+            .await;
+        for ws in list.iter_mut() {
+            self.enrich_workspace_from_snapshot(ws, &snapshot, full)
+                .await;
+        }
+        tracing::debug!(
+            workspaces = count,
+            full,
+            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "workspace.list: aggregate enrichment"
+        );
+        // Emit-path PR merge: fold git-root + monitor PRs into each
+        // row's `pullRequests`. Runs after enrichment: the displayStatus
+        // derivation already folded the git-root PRs and the monitor
+        // signals with the same per-URL priority (and canonicalized the
+        // row's own `activePullRequest` / `pullRequests` copies to the
+        // same lifecycle), so it must not see them a second time via the
+        // merged `pullRequests`. The git-root PRs move out of the
+        // snapshot — the list's one bulk git-root read serves both the
+        // derivation and the wire merge.
+        self.merge_external_pull_requests(list, include_archived, snapshot.git_root_prs)
+            .await;
+        // List-frame slimming (monorepo#3041): the final pass, after
+        // enrichment and the PR merge, so base rows served on the panic
+        // degradation path above (still carrying persisted `tokenUsage` /
+        // `setupScript`) and externally merged PR entries are slimmed
+        // alike. `workspace.get` keeps every field for detail reads.
+        for ws in list.iter_mut() {
+            ws.slim_for_list();
+        }
+        // Membership summary (multiplayer w1): one SQL query for the
+        // whole list, relative to the request's bound caller.
+        self.attach_workspace_memberships(list).await;
+        Ok(())
+    }
+
     pub(crate) fn session_poisoned(&self, session: &AgentSession) -> bool {
         if session.status != intent_core::AgentStatus::Error {
             return false;
@@ -21735,55 +21796,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
-        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
-        // reads below must cover them whenever the list includes them.
-        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             let mut list = store.list_workspaces(filter).await?;
-            // Membership filter (multiplayer w3) before any enrichment, so a
-            // collaborator's rows never cost more than what it can see.
-            this.retain_member_workspaces(&mut list).await?;
-            // `activity` is derived from live agent state, never persisted (§9.9);
-            // the card aggregates are computed fresh on the emit path (§9.1).
-            // Every store-backed aggregate is fetched once for the requested ids
-            // and joined below in store order; no per-workspace store futures.
-            let started = std::time::Instant::now();
-            let count = list.len();
-            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this
-                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
-                .await;
-            for ws in &mut list {
-                this.enrich_workspace_from_snapshot(ws, &snapshot, true)
-                    .await;
-            }
-            tracing::debug!(
-                workspaces = count,
-                total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "workspace.list: aggregate enrichment"
-            );
-            // Emit-path PR merge: fold git-root + monitor PRs into each
-            // row's `pullRequests`. Runs after enrichment: the displayStatus
-            // derivation already folded the git-root PRs and the monitor
-            // signals with the same per-URL priority (and canonicalized the
-            // row's own `activePullRequest` / `pullRequests` copies to the
-            // same lifecycle), so it must not see them a second time via the
-            // merged `pullRequests`. The git-root PRs move out of the
-            // snapshot — the list's one bulk git-root read serves both the
-            // derivation and the wire merge.
-            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
-                .await;
-            // List-frame slimming (monorepo#3041): the final pass, after
-            // enrichment and the PR merge, so base rows served on the panic
-            // degradation path above (still carrying persisted `tokenUsage` /
-            // `setupScript`) and externally merged PR entries are slimmed
-            // alike. `workspace.get` keeps every field for detail reads.
-            for ws in &mut list {
-                ws.slim_for_list();
-            }
-            // Membership summary (multiplayer w1): one SQL query for the
-            // whole list, relative to the request's bound caller.
-            this.attach_workspace_memberships(&mut list).await;
+            this.finish_workspace_list(&mut list, filter, true).await?;
             Ok(list)
         })
     }
@@ -21794,7 +21809,6 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
-        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             // Store rows + live activity + cheap status aggregates only. No
             // notes/sessions enrichment so workspace.subscribe seq-0 stays
@@ -21806,28 +21820,69 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(filter).await?;
-            this.retain_member_workspaces(&mut list).await?;
-            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this
-                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
-                .await;
-            for ws in &mut list {
-                this.enrich_workspace_from_snapshot(ws, &snapshot, false)
-                    .await;
-            }
-            // Emit-path PR merge, same as the full list path: the seq-0
-            // snapshot must carry the same `pullRequests` a later
-            // `workspace.list` would (and, like there, the displayStatus
-            // above already folded the git-root PRs, whose one bulk read
-            // now moves out of the snapshot into the merge).
-            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
-                .await;
-            // Same final slimming pass as the full list path (monorepo#3041).
-            for ws in &mut list {
-                ws.slim_for_list();
-            }
-            this.attach_workspace_memberships(&mut list).await;
+            this.finish_workspace_list(&mut list, filter, false).await?;
             Ok(list)
+        })
+    }
+
+    fn list_workspaces_page(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+        lite: bool,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<intent_core::WorkspacePage>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let limit = crate::pagination::clamp_page_limit(
+                limit,
+                intent_core::WORKSPACE_LIST_DEFAULT_LIMIT,
+                intent_core::WORKSPACE_LIST_MAX_LIMIT,
+            );
+            // Lite (snapshot) and enriched pages share one scope, so a
+            // snapshot's token continues through `workspace.list`.
+            let scope = serde_json::json!([
+                "workspace.list",
+                filter.include_archived,
+                filter.include_retired
+            ]);
+            let after = next_token
+                .as_deref()
+                .map(|token| crate::pagination::decode_keyset_token(token, &scope))
+                .transpose()?;
+            // One row past the page tells whether more rows follow.
+            let mut list = this
+                .store
+                .list_workspaces_page(
+                    filter,
+                    after.as_ref().map(|(c, i)| (c.as_str(), i.as_str())),
+                    limit + 1,
+                )
+                .await?;
+            let has_more = list.len() > limit;
+            list.truncate(limit);
+            let last_scanned = list
+                .last()
+                .map(|ws| crate::pagination::encode_keyset_token(&scope, &ws.created_at, &ws.id.0));
+            this.finish_workspace_list(&mut list, filter, !lite).await?;
+            let kept = crate::pagination::fit_rows_to_budget(
+                &list,
+                intent_core::WORKSPACE_LIST_BUDGET_BYTES,
+            );
+            let next_token = if kept < list.len() {
+                list.truncate(kept);
+                list.last().map(|ws| {
+                    crate::pagination::encode_keyset_token(&scope, &ws.created_at, &ws.id.0)
+                })
+            } else if has_more {
+                last_scanned
+            } else {
+                None
+            };
+            Ok(intent_core::WorkspacePage {
+                workspaces: list,
+                next_token,
+            })
         })
     }
 
@@ -31385,6 +31440,23 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        selection: intent_core::AgentListSelection,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<intent_core::AgentListPage>> {
+        Box::pin(async move {
+            // Scoped reads keep their existing (ungated) membership path.
+            if !matches!(selection, intent_core::AgentListSelection::Scoped(_)) {
+                self.require_member(&workspace_id).await?;
+            }
+            self.agent_list_page_op(workspace_id, selection, limit, next_token)
+                .await
+        })
+    }
+
     fn agent_list_including_retired(
         &self,
         workspace_id: WorkspaceId,
@@ -31533,6 +31605,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_session_op(agent_id).await
+        })
+    }
+
+    fn agent_get_session_bounded(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_get_session_bounded_op(agent_id).await
         })
     }
 
@@ -32210,6 +32293,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_queue_op(agent_id, workspace_id).await
+        })
+    }
+
+    fn agent_get_queue_page(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            let reply = self
+                .agent_get_queue_op(agent_id.clone(), workspace_id)
+                .await?;
+            crate::pagination::page_queue_reply(reply, &agent_id.0, limit, next_token.as_deref())
         })
     }
 
@@ -32936,6 +33035,7 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         stale_responding_after_ms: Option<i64>,
+        row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -32947,6 +33047,7 @@ impl WorkspaceApi for Services {
                 agent_id,
                 task_note_id,
                 stale_responding_after_ms,
+                row_limit,
             )
             .await
         })

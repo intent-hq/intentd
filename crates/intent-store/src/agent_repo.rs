@@ -1379,6 +1379,28 @@ impl Store {
         }
     }
 
+    /// Every persisted session column (the heavy `system_prompt`,
+    /// `image_blocks` and `initial_message` included) WITHOUT the message
+    /// log (`messages` stays empty), or `NotFound` — the bounded
+    /// `agent.getSession` read, which serves a budgeted transcript page
+    /// instead of hydrating the whole log.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session failed: {e}")))?;
+        match row {
+            Some(r) => map_session_row(&r),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
     /// Metadata-only session lookup: the session row WITHOUT its message log
     /// (`messages` stays empty), or `NotFound` — the single-session shape of
     /// [`Store::list_agent_session_summaries`]. Used by paths that never read

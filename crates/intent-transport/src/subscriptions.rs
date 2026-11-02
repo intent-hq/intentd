@@ -552,6 +552,75 @@ pub(crate) fn build_snapshot_push(subscription_id: &str, seq: u64, snapshot: &Va
     serde_json::to_string(&frame).unwrap_or_default()
 }
 
+/// [`build_snapshot_push`] for a paged collection snapshot (§6.9 "Paged
+/// snapshots"): the frame additionally carries `nextToken` — `null` when the
+/// snapshot is the whole collection, else the token the client passes to
+/// the channel's list read for the remaining rows.
+pub(crate) fn build_paged_snapshot_push(
+    subscription_id: &str,
+    seq: u64,
+    snapshot: &Value,
+    next_token: Option<&str>,
+) -> String {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "subscription.push",
+        "params": {
+            "subscriptionId": subscription_id,
+            "kind": "snapshot",
+            "seq": seq,
+            "snapshot": snapshot,
+            "nextToken": next_token,
+        }
+    });
+    serde_json::to_string(&frame).unwrap_or_default()
+}
+
+/// The `workspace` / `agent` seq-0 snapshot (§6.9 "Paged snapshots"): the
+/// first page of the channel's list read and its continuation token, or
+/// `None` for any other channel. Every caller gets the paged frame. A read
+/// error degrades to an empty complete page, like [`channel_snapshot`].
+pub(crate) async fn paged_collection_snapshot(
+    api: &dyn WorkspaceApi,
+    channel: Channel,
+    workspace_id: &WorkspaceId,
+    include_retired: bool,
+) -> Option<(Value, Option<String>)> {
+    match channel {
+        Channel::Workspace => {
+            let filter = intent_core::WorkspaceListFilter::new(true, include_retired);
+            Some(
+                match api.list_workspaces_page(filter, true, None, None).await {
+                    Ok(page) => (
+                        serde_json::to_value(page.workspaces)
+                            .unwrap_or_else(|_| Value::Array(Vec::new())),
+                        page.next_token,
+                    ),
+                    Err(_) => (Value::Array(Vec::new()), None),
+                },
+            )
+        }
+        Channel::Agent => Some(
+            match api
+                .agent_list_page(
+                    workspace_id.clone(),
+                    intent_core::AgentListSelection::Active,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(page) => (
+                    serde_json::to_value(page.agents).unwrap_or_else(|_| Value::Array(Vec::new())),
+                    page.next_token,
+                ),
+                Err(_) => (Value::Array(Vec::new()), None),
+            },
+        ),
+        _ => None,
+    }
+}
+
 /// Build a `subscription.push { kind: "delta", seq, delta }` notification
 /// (§3.3 / §6.3). `delta` carries the per-entity `{ added, updated, removedIds }`.
 pub(crate) fn build_delta_push(subscription_id: &str, seq: u64, delta: &Value) -> String {
@@ -2384,6 +2453,32 @@ fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
     agent.strip_detail_only_fields();
     agent.cap_list_previews();
     serde_json::to_value(agent).ok()
+}
+
+/// The seed of a non-administrator `workspace` subscriber's visible-id set
+/// (multiplayer w3) for a paged seq-0 snapshot: the ids of the first page when
+/// it is the whole list (`next_token` is `None`), else the ids of the
+/// caller's whole membership-scoped list. That read stays on the server, so
+/// the frame is still one page while tombstones for rows on later pages (the
+/// client loads them through `workspace.list`) are still delivered. If that
+/// read fails, the seed falls back to the first page's ids: the subscriber
+/// may miss a tombstone, but no id it cannot see is ever disclosed.
+pub(crate) async fn visible_workspace_seed(
+    api: &dyn WorkspaceApi,
+    first_page: &Value,
+    next_token: Option<&str>,
+    include_retired: bool,
+) -> HashSet<String> {
+    if next_token.is_none() {
+        return visible_workspace_ids(first_page);
+    }
+    match api
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::new(true, include_retired))
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|ws| ws.id.0).collect(),
+        Err(_) => visible_workspace_ids(first_page),
+    }
 }
 
 /// The workspace ids a `workspace` channel subscriber has been shown so far,

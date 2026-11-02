@@ -334,8 +334,13 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![
                 v("workspace", w.clone(), Bytes(64 * 1024)),
                 v(
+                    "limit=200",
+                    json!({ "workspaceId": ws, "limit": 200 }),
+                    Bytes(64 * 1024),
+                ),
+                v(
                     "max",
-                    json!({ "workspaceId": ws, "agentId": agent, "taskNoteId": c.task_note, "staleRespondingAfterMs": 1 }),
+                    json!({ "workspaceId": ws, "agentId": agent, "taskNoteId": c.task_note, "staleRespondingAfterMs": 1, "limit": 200 }),
                     Bytes(1024),
                 ),
             ],
@@ -426,8 +431,20 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "agent.getQueue",
             vec![
-                v("default", json!({ "agentId": agent }), Items("/queue", 500)),
-                v("workspace", wa.clone(), Items("/queue", 500)),
+                v("default", json!({ "agentId": agent }), Items("/queue", 50)),
+                v("workspace", wa.clone(), Items("/queue", 50)),
+                v(
+                    "limit=200",
+                    json!({ "agentId": agent, "limit": 200 }),
+                    Items("/queue", 200),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "agentId": agent, "limit": 100 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/queue", 100),
+                ),
             ],
         ),
         row(
@@ -452,31 +469,44 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "agent.list",
             vec![
-                v("default", w.clone(), Items("/agents", 500)),
+                v("default", w.clone(), Items("/agents", 100)),
+                // 200-row pages can stop at the 448 KiB page budget first.
+                v(
+                    "limit=200",
+                    json!({ "workspaceId": ws, "limit": 200 }),
+                    Bytes(300 * 1024),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "limit": 200 }),
+                    "/nextToken",
+                    "nextToken",
+                    Bytes(300 * 1024),
+                ),
                 v(
                     "includeRetired",
-                    json!({ "workspaceId": ws, "includeRetired": true }),
-                    Items("/agents", 500),
+                    json!({ "workspaceId": ws, "includeRetired": true, "limit": 200 }),
+                    Bytes(300 * 1024),
                 ),
                 v(
                     "retiredOnly",
                     json!({ "workspaceId": ws, "retiredOnly": true }),
-                    Items("/agents", seed::RETIRED_AGENTS),
+                    Items("/agents", 100),
                 ),
                 v(
                     "scope=delegated",
-                    json!({ "workspaceId": ws, "scope": "delegated", "parentAgentId": agent }),
-                    Items("/agents", 500),
+                    json!({ "workspaceId": ws, "scope": "delegated", "parentAgentId": agent, "limit": 200 }),
+                    Bytes(300 * 1024),
                 ),
                 v(
                     "scope=delegated+orphanedOnly",
                     json!({ "workspaceId": ws, "scope": "delegated", "orphanedOnly": true }),
-                    Items("/agents", seed::ORPHANED_AGENTS),
+                    Items("/agents", 100),
                 ),
                 v(
                     "scope=topLevel",
                     json!({ "workspaceId": ws, "scope": "topLevel" }),
-                    Items("/agents", seed::TOP_LEVEL_AGENTS),
+                    Items("/agents", 100),
                 ),
             ],
         ),
@@ -1751,11 +1781,21 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "workspace.list",
             vec![
-                v("default", json!({}), Items("/workspaces", 1_000)),
+                // Pages of 100 (default) and 200 rows can both stop at the
+                // 480,000-byte page budget first, so they prove reach by bytes.
+                v("default", json!({}), Bytes(300 * 1024)),
+                v("limit=200", json!({ "limit": 200 }), Bytes(300 * 1024)),
+                next(
+                    "nextToken",
+                    json!({ "limit": 200 }),
+                    "/nextToken",
+                    "nextToken",
+                    Bytes(300 * 1024),
+                ),
                 v(
                     "max",
-                    json!({ "includeArchived": true, "includeRetired": true }),
-                    Items("/workspaces", 1_000),
+                    json!({ "includeArchived": true, "includeRetired": true, "limit": 200 }),
+                    Bytes(300 * 1024),
                 ),
             ],
         ),
@@ -1817,7 +1857,7 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
     let agent = c.agent.as_str();
     let w = json!({ "workspaceId": ws });
     vec![
-        row("agent.subscribe", vec![v("default", w.clone(), Items("", 500))]),
+        row("agent.subscribe", vec![v("default", w.clone(), Items("", 100))]),
         row(
             "chat.subscribe",
             vec![
@@ -1881,8 +1921,8 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "workspace.subscribe",
             vec![
-                v("default", json!({}), Items("", 1_000)),
-                v("includeRetired", json!({ "includeRetired": true }), Items("", 1_000)),
+                v("default", json!({}), Items("", 100)),
+                v("includeRetired", json!({ "includeRetired": true }), Items("", 100)),
             ],
         ),
     ]

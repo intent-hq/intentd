@@ -1596,6 +1596,47 @@ impl Store {
         rows.iter().map(map_workspace_row).collect()
     }
 
+    /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
+    /// order: at most `limit` rows strictly after `after` (`(created_at,
+    /// id)` of the previous page's last row), so the read costs O(page).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_page(
+        &self,
+        filter: WorkspaceListFilter,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<Workspace>> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        let predicate = match (filter.include_archived, filter.include_retired) {
+            (true, true) => "1 = 1 OR status = ?",
+            (true, false) => "status <> ?",
+            (false, true) => "archived = 0 OR status = ?",
+            (false, false) => "archived = 0 AND status <> ?",
+        };
+        let keyset = if after.is_some() {
+            " AND (created_at > ? OR (created_at = ? AND id > ?))"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}){keyset} \
+             ORDER BY created_at, id LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql).bind(CHIEF_WORKSPACE_ID).bind(&retired);
+        if let Some((created_at, id)) = after {
+            query = query.bind(created_at).bind(created_at).bind(id);
+        }
+        let rows = query
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list workspaces page failed: {e}")))?;
+        rows.iter().map(map_workspace_row).collect()
+    }
+
     /// The retired workspace a call is scoped to: `workspace_id` when that
     /// row is `Retired`, else the workspace of the agent session `agent_id`
     /// when it is `Retired`; `None` otherwise (including unknown ids). One

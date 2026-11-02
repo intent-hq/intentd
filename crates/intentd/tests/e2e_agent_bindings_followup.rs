@@ -107,7 +107,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
 
     // Call agent.diagnostics
     let result = services
-        .agent_diagnostics(ws.clone(), None, None, None)
+        .agent_diagnostics(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
 

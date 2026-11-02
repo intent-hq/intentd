@@ -50,6 +50,26 @@ pub enum WorkspaceStatus {
 /// list surface (store, service, RPC, subscription, MCP bindings, internal
 /// sweeps) takes this type rather than a bare `bool` so no call site can pick
 /// up retired rows by accident.
+/// Default `workspace.list` page size when a paged read omits `limit`
+/// (PROTOCOL §5.1 "Paged workspace lists").
+pub const WORKSPACE_LIST_DEFAULT_LIMIT: usize = 100;
+/// Maximum `workspace.list` page size; larger `limit` values clamp down.
+pub const WORKSPACE_LIST_MAX_LIMIT: usize = 200;
+/// Serialized-size ceiling of one `workspace.list` page's rows (and of the
+/// paged workspace snapshot): the shared 480,000-byte page budget, so the
+/// frame stays under the 512,000-byte read budget. A page stops early at it
+/// and its `nextToken` resumes at the first row left out.
+pub const WORKSPACE_LIST_BUDGET_BYTES: usize = 480_000;
+
+/// One page of a paged `workspace.list` read (PROTOCOL §5.1).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WorkspacePage {
+    /// The page's rows, in `(createdAt, id)` ascending order.
+    pub workspaces: Vec<Workspace>,
+    /// Opaque token for the next page; `None` after the last page.
+    pub next_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkspaceListFilter {
     /// Include archived (non-retired) workspaces.
@@ -3522,6 +3542,48 @@ pub fn note_bounded_row(mut note: Note, max_content_bytes: usize) -> serde_json:
 /// fetch a bin's rows only on expand (the same pattern as the v8.3 retired
 /// bin). Retired sessions are their own bin (`retiredOnly`), never part of
 /// any scope.
+/// Default `agent.list` page size when a paged read omits `limit`
+/// (PROTOCOL §5.5 "Paged agent lists").
+pub const AGENT_LIST_DEFAULT_LIMIT: usize = 100;
+/// Maximum `agent.list` page size; larger `limit` values clamp down.
+pub const AGENT_LIST_MAX_LIMIT: usize = 200;
+/// Serialized-size ceiling of one `agent.list` page's rows (and of the paged
+/// agent snapshot); a page stops early at it and its `nextToken` resumes at
+/// the first row left out.
+pub const AGENT_LIST_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Default `agent.getQueue` page size when a paged read omits `limit`
+/// (PROTOCOL §5.5 "Paged queue reads").
+pub const AGENT_QUEUE_DEFAULT_LIMIT: usize = 50;
+/// Maximum `agent.getQueue` page size; larger `limit` values clamp down.
+pub const AGENT_QUEUE_MAX_LIMIT: usize = 200;
+/// Serialized-size ceiling of one `agent.getQueue` page's entries; a page
+/// stops early at it (always serving at least one entry).
+pub const AGENT_QUEUE_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Which sessions an `agent.list` read serves (PROTOCOL §5.5): the four
+/// wire variants (`includeRetired`, `retiredOnly`, `scope`, default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentListSelection {
+    /// Default read: active (not soft-retired) sessions.
+    Active,
+    /// `includeRetired: true`: every session.
+    All,
+    /// `retiredOnly: true`: soft-retired sessions only.
+    RetiredOnly,
+    /// `scope`: one bin of the active sessions.
+    Scoped(AgentListRowScope),
+}
+
+/// One page of a paged `agent.list` read (PROTOCOL §5.5).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AgentListPage {
+    /// The page's rows, in `(createdAt, id)` ascending order.
+    pub agents: Vec<AgentLite>,
+    /// Opaque token for the next page; `None` after the last page.
+    pub next_token: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentListRowScope {
     /// `parent_agent_id IS NULL AND is_background = 0` — the rows the FE
