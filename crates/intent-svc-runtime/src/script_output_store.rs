@@ -858,8 +858,12 @@ fn paginate_file(
             }
         })?;
     }
-    items.reverse();
-    Ok((json!({ "items": items, "nextToken": win.next_token }), peak))
+    let page = intent_services::feature_api::pagination::bound_text_page(
+        &items,
+        win.start,
+        win.next_token,
+    );
+    Ok((page, peak))
 }
 
 /// One step of [`scan_lines`]: a piece of the current line, or its end.

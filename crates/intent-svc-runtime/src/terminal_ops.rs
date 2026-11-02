@@ -1385,6 +1385,30 @@ mod tests {
         assert_eq!(first.len(), 104, "{first}");
     }
 
+    #[test]
+    fn paginated_read_output_cuts_an_oversized_escape_heavy_line() {
+        let quotes = "\"".repeat(300_000);
+        let text = format!("older\n{quotes}\n");
+        let snapshot = LineSnapshot {
+            bytes: text.into_bytes(),
+            total_lines: 2,
+            start_line: 0,
+            end_line: 2,
+            retained_has_non_whitespace: true,
+        };
+        let page = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        let size = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+            "page is {size} bytes"
+        );
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        let token = page["nextToken"].as_str().unwrap().to_owned();
+        let next = render_output(&snapshot, "pty-1", "/tmp", Some(50), false, Some(&token));
+        assert_eq!(next["items"], serde_json::json!(["older"]));
+    }
+
     #[tokio::test]
     async fn get_buffer_defaults_and_clamps_to_the_reply_cap() {
         let pty = host();

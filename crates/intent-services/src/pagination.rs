@@ -442,11 +442,103 @@ pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) 
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    let page = paginate_slice(&lines, limit, token);
-    json!({
-        "items": page.items,
-        "nextToken": page.next_token,
-    })
+    let win = page_window(lines.len(), limit, token);
+    bound_text_page(&lines[win.start..win.end], win.start, win.next_token)
+}
+
+/// The `{ items, nextToken, truncated? }` envelope for one text page window
+/// (`window` oldest→newest, starting at line `start`), within
+/// [`OUTPUT_TAIL_MAX_JSON_BYTES`] of JSON-escaped line text. Lines are taken
+/// newest first; when the budget stops the walk, `nextToken` is re-minted at
+/// the first line left out so the next page resumes there. A newest line too
+/// big on its own is cut to its first bytes that fit, with `truncated: true`
+/// (the rest of that one line is not served).
+#[must_use]
+pub fn bound_text_page<S: AsRef<str>>(
+    window: &[S],
+    start: usize,
+    next_token: Option<String>,
+) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    let mut first_kept = start + window.len();
+    let mut truncated = false;
+    for line in window.iter().rev() {
+        let line = line.as_ref();
+        let len = line.chars().map(json_escaped_len).sum::<usize>() + 3;
+        if used + len > OUTPUT_TAIL_MAX_JSON_BYTES {
+            if items.is_empty() {
+                let (head, _) = prefix_within_json_bytes(line, OUTPUT_TAIL_MAX_JSON_BYTES - 3);
+                items.push(Value::from(head));
+                first_kept -= 1;
+                truncated = true;
+            }
+            break;
+        }
+        used += len;
+        items.push(Value::from(line));
+        first_kept -= 1;
+    }
+    let next_token = if first_kept > start {
+        remint_backward_token(first_kept)
+    } else {
+        next_token
+    };
+    let mut page = json!({ "items": items, "nextToken": next_token });
+    if truncated {
+        page["truncated"] = Value::Bool(true);
+    }
+    page
+}
+
+/// The longest prefix of `text` whose JSON-escaped size fits `budget`, and
+/// whether anything was dropped.
+fn prefix_within_json_bytes(text: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0usize;
+    for (i, c) in text.char_indices() {
+        let len = json_escaped_len(c);
+        if used + len > budget {
+            return (&text[..i], true);
+        }
+        used += len;
+    }
+    (text, false)
+}
+
+/// Fit one list row in `budget` serialized bytes by dropping its largest
+/// top-level fields (never the `keep` keys), largest first, each replaced
+/// with `<field>Omitted: true` and `<field>Bytes` (a string's UTF-8 length,
+/// otherwise its JSON size). Returns whether anything was omitted; rows
+/// already within budget are left untouched.
+pub fn bound_row(row: &mut Value, budget: usize, keep: &[&str]) -> bool {
+    if serialized_size(row) <= budget {
+        return false;
+    }
+    let Some(obj) = row.as_object_mut() else {
+        return false;
+    };
+    let mut fields: Vec<(usize, String)> = obj
+        .iter()
+        .filter(|(k, _)| !keep.contains(&k.as_str()))
+        .map(|(k, v)| (serialized_size(v), k.clone()))
+        .collect();
+    fields.sort_by(|a, b| b.cmp(a));
+    let mut omitted = false;
+    for (_, field) in fields {
+        let Some(value) = obj.remove(&field) else {
+            continue;
+        };
+        let bytes = value
+            .as_str()
+            .map_or_else(|| serialized_size(&value), str::len);
+        obj.insert(format!("{field}Omitted"), Value::Bool(true));
+        obj.insert(format!("{field}Bytes"), Value::from(bytes));
+        omitted = true;
+        if serialized_size(&Value::Object(obj.clone())) <= budget {
+            break;
+        }
+    }
+    omitted
 }
 
 /// Budget, in JSON-escaped bytes, for one text tail in a read reply

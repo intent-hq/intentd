@@ -101,6 +101,9 @@ const RUN_RESULT_OUTPUT_BYTES: u64 = 512 * 1024;
 /// Row JSON a full-view `script.list` page may carry (always at least one
 /// row), keeping the frame under the 500 KiB read payload budget.
 const FULL_PAGE_MAX_BYTES: usize = 480_000;
+/// Room left for the page envelope (`{"scripts":[…],"nextCursor":…}`)
+/// when one oversized row is fitted on its own.
+const LIST_ENVELOPE_RESERVE: usize = 1024;
 
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
@@ -1162,7 +1165,9 @@ impl ScriptManager {
 
     /// One full-view `script.list` page: unarchived definitions plus runtime
     /// in ascending `(createdAt, id)` order, at most `options.limit` rows and
-    /// [`FULL_PAGE_MAX_BYTES`] of row JSON (always at least one row), with
+    /// [`FULL_PAGE_MAX_BYTES`] of row JSON (always at least one row; a row too
+    /// big on its own drops its largest fields as `<field>Omitted` /
+    /// `<field>Bytes`, read whole via `script.get`), with
     /// `nextCursor` while more rows follow.
     pub(crate) async fn full_page(
         &self,
@@ -1196,7 +1201,12 @@ impl ScriptManager {
         let mut scripts = Vec::new();
         let mut bytes = 0usize;
         for m in &rows {
-            let row = with_runtime(&m.def, &m.state);
+            let mut row = with_runtime(&m.def, &m.state);
+            intent_services::feature_api::pagination::bound_row(
+                &mut row,
+                FULL_PAGE_MAX_BYTES - LIST_ENVELOPE_RESERVE,
+                &["id", "workspaceId", "createdAt"],
+            );
             let len = serde_json::to_vec(&row).map_or(0, |v| v.len()) + 1;
             if scripts.len() == options.limit
                 || (!scripts.is_empty() && bytes + len > FULL_PAGE_MAX_BYTES)

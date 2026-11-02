@@ -474,3 +474,54 @@ fn tail_within_json_bytes_cuts_on_char_boundaries_and_fits_the_budget() {
         assert!(serde_json::to_string(tail).unwrap().len() - 2 <= budget);
     }
 }
+
+#[test]
+fn paginate_text_lines_budgets_bytes_and_resumes_after_the_cut() {
+    let line = "x".repeat(200_000);
+    let text = format!("old\n{line}\n{line}\n{line}\n");
+    let env = paginate_text_lines(&text, Some(50), None);
+    let items = env["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "third 200 KB line must not fit the page");
+    assert!(serde_json::to_vec(&env).unwrap().len() <= OUTPUT_TAIL_MAX_JSON_BYTES + 100);
+    assert!(env.get("truncated").is_none());
+    let next = paginate_text_lines(&text, Some(50), env["nextToken"].as_str());
+    let older: Vec<&str> = next["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(older, vec![line.as_str(), "old"]);
+    assert!(next["nextToken"].is_null());
+}
+
+#[test]
+fn paginate_text_lines_cuts_an_oversized_escape_heavy_line() {
+    let quotes = "\"".repeat(300_000);
+    let text = format!("older\n{quotes}\n");
+    let env = paginate_text_lines(&text, Some(50), None);
+    let items = env["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(env["truncated"], true);
+    let size = serde_json::to_vec(&env).unwrap().len();
+    assert!(
+        size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+        "page is {size} bytes"
+    );
+    let next = paginate_text_lines(&text, Some(50), env["nextToken"].as_str());
+    assert_eq!(next["items"], json!(["older"]));
+}
+
+#[test]
+fn bound_row_omits_largest_fields_until_the_row_fits() {
+    let mut row =
+        json!({ "id": "s1", "name": "n", "command": "\\".repeat(300_000), "env": { "A": "b" } });
+    assert!(bound_row(&mut row, 480_000, &["id", "name"]));
+    assert!(row.get("command").is_none());
+    assert_eq!(row["commandOmitted"], true);
+    assert_eq!(row["commandBytes"], 300_000);
+    assert_eq!(row["env"]["A"], "b");
+    let mut small = json!({ "id": "s2", "command": "ls" });
+    assert!(!bound_row(&mut small, 480_000, &["id"]));
+    assert_eq!(small["command"], "ls");
+}

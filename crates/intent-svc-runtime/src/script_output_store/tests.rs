@@ -875,3 +875,31 @@ fn sweep_deletes_stale_compaction_temps_even_with_retention_disabled() {
         "symlinks are left alone"
     );
 }
+
+#[test]
+fn paginate_budgets_bytes_and_cuts_an_oversized_escape_heavy_line() {
+    let (_dir, store) = store(1 << 26);
+    let quotes = "\"".repeat(300_000);
+    let wide = "y".repeat(200_000);
+    let body = format!("old\n{wide}\n{wide}\n{wide}\n{quotes}\n");
+    store.open_writer("ws", "s", "r").append(body.as_bytes());
+    let mut token: Option<String> = None;
+    let mut pages = Vec::new();
+    loop {
+        let got = store
+            .paginate("ws", "s", "r", Some(50), token.as_deref())
+            .unwrap();
+        assert_eq!(got, paginate_text_lines(&body, Some(50), token.as_deref()));
+        let size = serde_json::to_vec(&got).unwrap().len();
+        assert!(size <= 480_100, "page is {size} bytes");
+        pages.push(got["items"].as_array().unwrap().len());
+        if pages.len() == 1 {
+            assert_eq!(got["truncated"], true);
+        }
+        match got["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(pages, vec![1, 2, 2]);
+}

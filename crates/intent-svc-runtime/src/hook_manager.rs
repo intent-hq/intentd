@@ -1332,7 +1332,9 @@ impl HookServicesExt for Services {
 
     /// Wire `hook.list`: [`Self::hook_list_op`]'s workspace rows one page at
     /// a time — `limit?` (1–200, default 100) rows and at most
-    /// [`HOOK_LIST_PAGE_MAX_BYTES`] of row JSON (always at least one row),
+    /// [`HOOK_LIST_PAGE_MAX_BYTES`] of row JSON (always at least one row; a
+    /// row too big on its own drops its largest fields as `<field>Omitted` /
+    /// `<field>Bytes`),
     /// oldest first, with `nextCursor` while more rows follow. The cursor is
     /// bound to the workspace and `includeRetired`.
     async fn hook_list_page_op(&self, workspace_id: &WorkspaceId, params: &Value) -> Result<Value> {
@@ -1357,7 +1359,13 @@ impl HookServicesExt for Services {
         let mut hooks = Vec::new();
         let mut bytes = 0usize;
         for (_, row) in &rows {
-            let value = serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))?;
+            let mut value =
+                serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))?;
+            intent_services::feature_api::pagination::bound_row(
+                &mut value,
+                HOOK_LIST_PAGE_MAX_BYTES - 1024,
+                &["hookId", "workspaceId", "agentId", "createdAt", "status"],
+            );
             let len = serde_json::to_vec(&value).map_or(0, |v| v.len()) + 1;
             if hooks.len() == limit || (!hooks.is_empty() && bytes + len > HOOK_LIST_PAGE_MAX_BYTES)
             {
@@ -3551,6 +3559,53 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hook_list_bounds_an_oversized_singleton_row() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let quotes = "\"".repeat(300_000);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let code = if i == 1 {
+                format!("return {{ dispatch: false }}; // {quotes}")
+            } else {
+                "return { dispatch: false };".to_string()
+            };
+            let out = svc
+                .hook_schedule_op(
+                    &ws,
+                    &owner,
+                    &json!({ "name": format!("h{i}"), "code": code, "delayMs": 60_000 }),
+                )
+                .await
+                .expect("schedule");
+            ids.push(out["hook"]["hookId"].as_str().unwrap().to_owned());
+        }
+        let mut seen = Vec::new();
+        let mut params = json!({});
+        loop {
+            let page = svc.hook_list_page_op(&ws, &params).await.unwrap();
+            let size = serde_json::to_vec(&page).unwrap().len();
+            assert!(size <= HOOK_LIST_PAGE_MAX_BYTES, "page is {size} bytes");
+            for row in page["hooks"].as_array().unwrap() {
+                seen.push(row["hookId"].as_str().unwrap().to_owned());
+                if row["name"] == "h1" {
+                    assert!(row.get("code").is_none(), "oversized code omitted");
+                    assert_eq!(row["codeOmitted"], true);
+                    assert!(row["codeBytes"].as_u64().unwrap() > 300_000);
+                } else {
+                    assert!(row["code"].is_string());
+                }
+            }
+            match page.get("nextCursor") {
+                Some(next) => params = json!({ "limit": 1, "cursor": next }),
+                None => break,
+            }
+        }
+        seen.sort();
+        ids.sort();
+        assert_eq!(seen, ids, "pages cover every hook exactly once");
     }
 
     #[tokio::test]
