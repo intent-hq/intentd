@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.103] - 2026-11-02
+
+### 🐛 Bug Fixes
+
+- *(agent)* Project listUserMessages metadata and add newest-first paging ([#2928](https://github.com/intent-hq/intentd/pull/2928))
+- *(intentd)* Defer the retention loop's first tick so shutdown never waits on a startup vacuum chunk ([#2924](https://github.com/intent-hq/intentd/pull/2924))
+
+### 🧪 Testing
+
+- Make three daemon tests independent of runner speed ([#2925](https://github.com/intent-hq/intentd/pull/2925))
+- Refuse PR monitor debounce overrides below the floor ([#2923](https://github.com/intent-hq/intentd/pull/2923))
+
+
 ## [0.11.102] - 2026-11-01
 
 ### 🐛 Bug Fixes
