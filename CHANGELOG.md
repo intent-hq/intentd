@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.108] - 2026-11-02
+
+### 🚀 Features
+
+- *(harness)* Steer long-running work to Intent scripts (harness 3.6) ([#2955](https://github.com/intent-hq/intentd/pull/2955))
+
+### 🐛 Bug Fixes
+
+- Keep placement fields on agent list rows and announce isolation changes ([#2956](https://github.com/intent-hq/intentd/pull/2956))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Browser access now lives under Settings > Mobile ([#2954](https://github.com/intent-hq/intentd/pull/2954))
+
+### 🧪 Testing
+
+- Replace elapsed-time assertions in core crates with timing-free checks ([#2948](https://github.com/intent-hq/intentd/pull/2948))
+- *(intentd)* Replace elapsed-time assertions with timing-free checks ([#2947](https://github.com/intent-hq/intentd/pull/2947))
+- Sweep every read RPC against a large state with a 500 KiB budget ([#2950](https://github.com/intent-hq/intentd/pull/2950))
+
+
 ## [0.11.107] - 2026-11-02
 
 ### 🚀 Features
