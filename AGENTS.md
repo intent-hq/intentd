@@ -142,6 +142,10 @@ Every read reply must stay under `READ_PAYLOAD_BUDGET_BYTES` (500 KiB, in
 (`intent_services::test_support::large_state`). It also checks each `BulkTransfer`
 method's declared cap. Run it with `make test-select E='test(/payload_budget/)'`; the
 full-scale sweep is `#[ignore]`d and runs with `INTENTD_LARGE_STATE_SCALE=full`.
+- **PR vs nightly:** PRs run the `ci` preset; `nightly-payload-sweep.yml` runs the ignored
+  full-scale sweep and fixture build, and failures file deduplicated `intent-hq/intent`
+  issues (`nightly-payload-report.yml`). Locally (`make test-select` cannot include ignored
+  tests): `INTENTD_LARGE_STATE_SCALE=full cargo test -p intent-app --test payload_budget -- --ignored`.
 
 - **New read method:** classify it in `PAYLOAD_CLASSES`, then add a row to `rows.rs`
   (variants: no params, the largest `limit`, every optional param, a `max` variant with
