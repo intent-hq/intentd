@@ -2123,24 +2123,29 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.listUserMessages`: all user-role messages of an agent as
+    /// `agent.listUserMessages`: user-role messages of an agent as
     /// lightweight index items, oldest→newest —
-    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`
-    /// (PROTOCOL §5.5). `preview` is the extracted plain text bounded to
-    /// `preview_chars` characters (`None` → server default, server-clamped);
-    /// `metadata` is the persisted row metadata verbatim when present.
-    /// Non-user rows are never included. Bounded cost: one role-filtered
-    /// SQL read whose previews are extracted and truncated inside SQL —
-    /// full content blobs never leave the database and the transcript is
-    /// never hydrated. `NotFound` on an unknown agent or a workspace
-    /// mismatch.
+    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total,
+    /// nextToken? }` (PROTOCOL §5.5). `preview` is the extracted plain text
+    /// bounded to `preview_chars` characters (`None` → server default,
+    /// server-clamped); `metadata` is the row metadata projected to its
+    /// classification fields when any survive. With `limit` or `next_token`
+    /// the read is paged newest-first and the result carries `nextToken`
+    /// (`null` once no older rows remain). Non-user rows are never included.
+    /// Bounded cost: one role-filtered SQL read whose previews and metadata
+    /// are trimmed inside SQL — full content and metadata blobs never leave
+    /// the database and the transcript is never hydrated. `NotFound` on an
+    /// unknown agent or a workspace mismatch; `InvalidParams` on a malformed
+    /// `next_token`.
     fn agent_list_user_messages(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, workspace_id, preview_chars);
+        let _ = (agent_id, workspace_id, preview_chars, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list_user_messages not implemented".to_string(),

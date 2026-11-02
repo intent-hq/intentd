@@ -152,7 +152,13 @@ impl NativeRecipient {
                         "batch" => services.agent_history_batch_op(agent, None, 100).await,
                         "index" => {
                             services
-                                .agent_list_user_messages_op(agent, Some(workspace), Some(80))
+                                .agent_list_user_messages_page_op(
+                                    agent,
+                                    Some(workspace),
+                                    Some(80),
+                                    None,
+                                    None,
+                                )
                                 .await
                         }
                         "block" => {

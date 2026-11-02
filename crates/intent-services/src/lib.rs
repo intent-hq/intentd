@@ -31234,11 +31234,19 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
-            self.agent_list_user_messages_op(agent_id, workspace_id, preview_chars)
-                .await
+            self.agent_list_user_messages_page_op(
+                agent_id,
+                workspace_id,
+                preview_chars,
+                limit,
+                next_token,
+            )
+            .await
         })
     }
 
