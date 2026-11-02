@@ -151,8 +151,12 @@ full-scale sweep is `#[ignore]`d and runs with `INTENTD_LARGE_STATE_SCALE=full`.
   (variants: no params, the largest `limit`, every optional param, a `max` variant with
   every include flag on, and a next-page variant for a cursor). Each variant must succeed
   and prove it reached large data (`Items` near the page limit or `Bytes`); `Fixed` is
-  for replies small by design and needs the row's reason. Missing data goes in `seed.rs`.
-  The static check fails on a method with no row and on a router param no variant sets.
+  for replies small by design, needs the row's reason, and still fails on an empty list or
+  object. Missing data goes in `seed.rs`; a method that cannot be driven here goes in a
+  reasoned golden that pins its outcome. The static check fails on a method with no row
+  and on a param no variant sets: router params are read from `router.rs`, a typed params
+  struct from its serde fields, and an arm that hands params on names its parser with
+  `parsed_by`.
 - **Baseline:** `baseline.txt` (`baseline-full.txt` for the full preset) lists today's
   offenders as `<method> <variant> <bytes>`. The sweep fails on a new offender, on growth
   over 5% above the recorded size, and on a stale line. Fixing an offender means deleting
