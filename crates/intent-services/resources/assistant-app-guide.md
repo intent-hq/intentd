@@ -1079,15 +1079,16 @@ chat it opens beside the conversation.
 
 ## Review and commit workspace changes
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline,HistoryBoundary,SecondaryRootChangesView,PRSection}.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline,HistoryBoundary,SecondaryRootChangesView,PRSection,WorkspacePullRequests,SidebarPrList}.svelte. -->
 
 In the workspace sidebar, open **Changes** to review files and commit history.
 Owners can toggle **Auto-commit** beside the file summary. **Unstaged** and
 **Staged** appear when they contain files; **Stage all** and **Unstage all** sit
 in their section headers. After staging files, open **Commit** to enter a message.
 An open commit draft stays available if the staged list changes.
-Expand a commit or pull request to see its files, or select its title to open the
-complete change. Line-change totals appear at the right of each row. **Workspace start**
+Expand a commit to see its files, or select its title to open the complete change.
+Open a pull request from the sidebar's **Pull requests** list.
+Line-change totals appear at the right of each row. **Workspace start**
 marks the boundary; select it to show or hide earlier commits. For a secondary Git
 root, **Root registered** marks that root's boundary.
 
