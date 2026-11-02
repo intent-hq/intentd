@@ -9156,6 +9156,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
              waitedMs={waited_ms}: {drained}"
         );
         assert!(
+            // elapsed-assert: allow — the limit is measured too: the test's clock spans the daemon's wait, so load stretches both and cannot break the containment
             u128::from(waited_ms) <= wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS,
             "daemon-measured wait ({waited_ms}ms) exceeds the observed upper \
              bound {wait_upper_bound:?}: {drained}"
