@@ -247,6 +247,57 @@ pub async fn select_machines(
     Ok(free)
 }
 
+/// Whether a running remote agent on `node_id` can switch to `request`'s
+/// provider and model there (`agent.setModel`): judged on the machine's
+/// cached report with placement's rules (provider installed, its own
+/// sign-in usable unless a profile is selected, model listed or an alias of
+/// it), without connecting. A machine that is offline keeps its report; the
+/// relaunch then fails at start like any start.
+///
+/// # Errors
+///
+/// [`Error::PlacementUnavailable`] `machine-unknown` / `machine-revoked`
+/// when the machine is gone; [`Error::ModelUnavailable`] naming that
+/// machine only when its report does not offer the provider and model.
+pub fn check_switch_on_machine(
+    rows: &[ExposedMachine],
+    node_id: &str,
+    request: PlacementRequest<'_>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let observed = now.format(&Rfc3339).unwrap_or_default();
+    let Some(row) = rows.iter().find(|row| row.id == node_id) else {
+        return Err(machine_error(
+            request.placement,
+            PlacementUnavailableReason::MachineUnknown,
+            MachineRef {
+                node_id: node_id.to_owned(),
+                name: node_id.to_owned(),
+            },
+            PlatformAvailability::none(observed),
+        ));
+    };
+    if row.state == RemoteMachineState::Revoked {
+        return Err(machine_error(
+            request.placement,
+            PlacementUnavailableReason::MachineRevoked,
+            machine_ref(row),
+            PlatformAvailability::none(observed),
+        ));
+    }
+    if offers(row, &request) {
+        return Ok(());
+    }
+    let retryable =
+        provider_of(row, request.provider).is_some_and(|provider| provider.models_stale);
+    Err(Error::ModelUnavailable(Box::new(ModelUnavailable::new(
+        request.provider,
+        request.model.unwrap_or_default(),
+        machine_models(row, request.provider),
+        retryable,
+    ))))
+}
+
 fn machine_ref(row: &ExposedMachine) -> MachineRef {
     MachineRef {
         node_id: row.id.clone(),
@@ -528,7 +579,7 @@ pub fn exposed_machines_help(
     }
     text.push_str(
         "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (account folders such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` must exist on the machine, `~` meaning the machine's home), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree).",
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.",
     );
     Some(text)
 }

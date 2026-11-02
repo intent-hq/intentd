@@ -577,3 +577,294 @@ async fn a_backup_that_exits_before_starting_on_the_node_undoes_the_switch() {
         .unwrap();
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
 }
+
+/// Node "node-1" exposed with `claude-code` signed in and `models` listed.
+async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
+    use intent_core::node_link::{
+        MachineCapabilities, MachineCapacity, ProviderCapability, ProviderStatus,
+    };
+    let platform = intent_core::placement::AgentPlatform {
+        os: intent_core::nodes::NodeOs::Macos,
+        arch: intent_core::nodes::NodeArch::Aarch64,
+    };
+    let observed_at = now_iso();
+    mgr.services
+        .store
+        .save_exposed_machine(&intent_core::machines::ExposedMachine {
+            id: "node-1".into(),
+            name: "Mac".into(),
+            hosts: vec!["10.0.0.1".into()],
+            port: 7443,
+            tc_address: None,
+            fingerprint: "ab".repeat(32),
+            credential_id: intent_core::ExecutorCredentialId::from("cred-1".to_string()),
+            platform: Some(platform),
+            capabilities: Some(MachineCapabilities {
+                platform,
+                intentd_version: "0.11.87".into(),
+                capacity: MachineCapacity {
+                    running_agents: 1,
+                    agent_cap: 4,
+                    charged_memory_bytes: 0,
+                    memory_budget_bytes: None,
+                },
+                providers: vec![ProviderCapability {
+                    id: "claude-code".into(),
+                    visible: true,
+                    status: ProviderStatus::SignedIn,
+                    models: models.iter().map(|m| (*m).to_owned()).collect(),
+                    models_stale: false,
+                }],
+                observed_at: observed_at.clone(),
+            }),
+            observed_at: Some(observed_at),
+            state: intent_core::machines::RemoteMachineState::Disconnected,
+            added_at: now_iso(),
+            last_connected_at: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// A model switch the user makes on a running remote agent (§5.54 "switching
+/// a remote agent's model"): the next turn stops the run on the old model
+/// and relaunches the agent on the same machine with the new one, and that
+/// fresh provider session receives the Intent history first, as a local
+/// cross-session switch does.
+#[intent_test_macros::daemon_test]
+async fn a_remote_agents_model_switch_relaunches_it_on_its_machine_with_history() {
+    let ws = WorkspaceId::from("ws-remote-switch");
+    let id = AgentId::from("agent-remote-switch");
+    let first = FakeRuntime::new();
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .expect("the machine lists the model");
+
+    send(&mgr, &id, &ws, "what was the word?").await;
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 2, "relaunched once");
+    assert_eq!(
+        first.stops.load(Ordering::SeqCst),
+        1,
+        "the old run is stopped"
+    );
+    assert_eq!(first.prompts.lock().unwrap().len(), 1);
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    assert!(replayed.contains("what was the word?"), "{replayed}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet"));
+    assert_ne!(session.status, AgentStatus::Error);
+}
+
+/// The relaunch after a switch fails on the node and the turn's start is
+/// retried: the switch stays pending through the failure, so the retried
+/// run still opens with the Intent history (review of intentd#2961).
+#[intent_test_macros::daemon_test]
+async fn a_switch_whose_relaunch_fails_still_replays_history_on_the_retry() {
+    let _env = crate::test_support::fixtures::EnvGuard::apply(&[(
+        "INTENTD_SPAWN_RETRY_BACKOFF_MS",
+        Some("0,0"),
+    )]);
+    let ws = WorkspaceId::from("ws-remote-switch-retry");
+    let id = AgentId::from("agent-remote-switch-retry");
+    let first = FakeRuntime::new();
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Fails("the node launch timed out"),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .unwrap();
+    send(&mgr, &id, &ws, "what was the word?").await;
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        3,
+        "failed once, then started"
+    );
+    assert_eq!(
+        first.stops.load(Ordering::SeqCst),
+        1,
+        "the old run is stopped"
+    );
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    assert!(replayed.contains("what was the word?"), "{replayed}");
+}
+
+/// A switch made while the agent has no run (stopped): its next start
+/// launches on the new model and still opens with the Intent history.
+#[intent_test_macros::daemon_test]
+async fn a_switch_of_a_stopped_remote_agent_replays_history_at_its_next_start() {
+    let ws = WorkspaceId::from("ws-remote-switch-stopped");
+    let id = AgentId::from("agent-remote-switch-stopped");
+    let first = FakeRuntime::new();
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+    mgr.stop(&id).await;
+
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .unwrap();
+    send(&mgr, &id, &ws, "what was the word?").await;
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 2);
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet"));
+}
+
+/// In production the node starts the agent asynchronously: `runtime()`
+/// returns at once, and a run that exits before starting only surfaces as
+/// its first prompt failing, after which the turn is driven again on a
+/// fresh launch. The switch stays pending until the new run produces output,
+/// so that launch still opens with the Intent history (review of
+/// intentd#2961).
+#[intent_test_macros::daemon_test]
+async fn a_switched_run_that_exits_before_starting_still_replays_history_next_time() {
+    let ws = WorkspaceId::from("ws-remote-switch-exit");
+    let id = AgentId::from("agent-remote-switch-exit");
+    let first = FakeRuntime::new();
+    let dead = FakeRuntime::new();
+    *dead.exited.lock().unwrap() = Some("provider-start-failed: the node is restarting".into());
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Runs(dead.clone()),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .unwrap();
+    send(&mgr, &id, &ws, "what was the word?").await;
+    // The dead run fails the prompt before any output; the turn is driven
+    // again on a fresh launch.
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        dead.prompts.lock().unwrap().len(),
+        1,
+        "the switched run failed first"
+    );
+    assert_eq!(port.asked.load(Ordering::SeqCst), 3);
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    assert!(replayed.contains("what was the word?"), "{replayed}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet"));
+}
+
+/// A switch made while the old run's turn is still in flight: that run's
+/// later output and completed turn must not confirm the switch, so the next
+/// turn still relaunches the agent on the new model with the history
+/// (review of intentd#2961).
+#[intent_test_macros::daemon_test]
+async fn a_switch_during_a_running_turn_is_not_confirmed_by_the_old_run() {
+    let ws = WorkspaceId::from("ws-remote-switch-midturn");
+    let id = AgentId::from("agent-remote-switch-midturn");
+    let first = FakeRuntime::new();
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .expect("accepted while the old turn runs");
+    // The old run keeps producing output, then completes its turn.
+    let session_id = first.prompts.lock().unwrap()[0].0.clone();
+    first
+        .updates
+        .send(IncomingNotification {
+            method: "session/update".into(),
+            params: json!({"sessionId": session_id, "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "still on the old model"}
+            }}),
+        })
+        .unwrap();
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    send(&mgr, &id, &ws, "what was the word?").await;
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 2, "relaunched once");
+    assert_eq!(
+        first.stops.load(Ordering::SeqCst),
+        1,
+        "the old run is stopped"
+    );
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    assert!(replayed.contains("what was the word?"), "{replayed}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet"));
+    assert_ne!(session.status, AgentStatus::Error);
+}

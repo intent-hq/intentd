@@ -280,3 +280,154 @@ async fn default_overrides_with_an_account_folder_are_backend_only() {
         RemoteCompatibility::Compatible
     );
 }
+
+/// The account-folder refusal a read row carries.
+fn folder_refusal(key: &str) -> Value {
+    json!({ "reason": "account-folder", "keys": [key] })
+}
+
+/// Every `ProviderProfile` and `DefaultConfig` read says whether the
+/// configuration can run on another machine, and why not (§5.54 "Remote
+/// compatibility"): `list` (profiles and defaults), `create`, `update`,
+/// `reorder` and `updateDefault`.
+#[intent_test_macros::daemon_test]
+async fn profile_reads_say_whether_the_configuration_runs_on_another_machine() {
+    let fx = Fixture::new().await;
+    let folder = fx
+        .create(
+            "claude-code",
+            "Work account",
+            json!([{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-work" }]),
+        )
+        .await;
+    assert_eq!(folder["profile"]["remoteCompatible"], false);
+    assert_eq!(
+        folder["profile"]["remoteIncompatibility"],
+        folder_refusal("CLAUDE_CONFIG_DIR")
+    );
+    let api_key = fx
+        .create(
+            "claude-code",
+            "API key",
+            json!([{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": SECRET }]),
+        )
+        .await;
+    assert_eq!(api_key["profile"]["remoteCompatible"], true);
+    assert!(api_key["profile"].get("remoteIncompatibility").is_none());
+    let api_id = api_key["profile"]["id"].as_str().unwrap().to_owned();
+    let folder_id = folder["profile"]["id"].as_str().unwrap().to_owned();
+
+    // An env write moves it: the API-key profile gains a folder.
+    let updated = fx
+        .svc
+        .provider_profiles_update_impl(
+            api_id.clone(),
+            json!({ "env": [
+                { "key": "ANTHROPIC_API_KEY", "kind": "keep" },
+                { "key": "claude_config_dir", "kind": "set", "value": "/accounts/b" },
+            ] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["profile"]["remoteCompatible"], false);
+    assert_eq!(
+        updated["profile"]["remoteIncompatibility"],
+        folder_refusal("claude_config_dir")
+    );
+
+    let defaults = fx
+        .svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "codex",
+            "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-a" }],
+        }))
+        .await
+        .unwrap();
+    assert_eq!(defaults["defaultConfig"]["remoteCompatible"], false);
+    assert_eq!(
+        defaults["defaultConfig"]["remoteIncompatibility"],
+        folder_refusal("CODEX_HOME")
+    );
+
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    for row in list["profiles"].as_array().unwrap() {
+        assert_eq!(row["remoteCompatible"], false, "{row}");
+    }
+    for row in list["defaults"].as_array().unwrap() {
+        let base = row["baseProviderId"].as_str().unwrap();
+        assert_eq!(row["remoteCompatible"], base != "codex", "{base}");
+        assert_eq!(
+            row.get("remoteIncompatibility").is_some(),
+            base == "codex",
+            "{base}"
+        );
+    }
+
+    let reordered = fx
+        .svc
+        .provider_profiles_reorder_impl(json!({
+            "baseProviderId": "claude-code",
+            "profileIds": [api_id, folder_id],
+        }))
+        .await
+        .unwrap();
+    for row in reordered["profiles"].as_array().unwrap() {
+        assert_eq!(row["remoteCompatible"], false, "{row}");
+        assert!(row["remoteIncompatibility"]["keys"].is_array(), "{row}");
+    }
+}
+
+/// `providers.catalog`, which members and the picker read, carries the same
+/// flag on each profile summary, plus the Default configurations that cannot
+/// run elsewhere; never a value.
+#[intent_test_macros::daemon_test]
+async fn the_catalog_marks_configurations_that_cannot_run_on_another_machine() {
+    let fx = Fixture::new().await;
+    let catalog = fx.svc.providers_catalog().await.unwrap();
+    assert!(
+        catalog.get("defaultRemoteIncompatibility").is_none(),
+        "omitted while every Default is compatible"
+    );
+    fx.create(
+        "claude-code",
+        "Work account",
+        json!([{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-work" }]),
+    )
+    .await;
+    fx.create(
+        "codex",
+        "API key",
+        json!([{ "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET }]),
+    )
+    .await;
+    fx.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-a" }],
+        }))
+        .await
+        .unwrap();
+
+    let catalog = fx.svc.providers_catalog().await.unwrap();
+    let rows = catalog["profiles"].as_array().unwrap();
+    let by_name = |name: &str| rows.iter().find(|r| r["name"] == name).unwrap().clone();
+    let folder = by_name("Work account");
+    assert_eq!(folder["remoteCompatible"], false);
+    assert_eq!(
+        folder["remoteIncompatibility"],
+        folder_refusal("CLAUDE_CONFIG_DIR")
+    );
+    let api_key = by_name("API key");
+    assert_eq!(api_key["remoteCompatible"], true);
+    assert!(api_key.get("remoteIncompatibility").is_none());
+    assert_eq!(
+        catalog["defaultRemoteIncompatibility"],
+        json!({ "claude-code": folder_refusal("CLAUDE_CONFIG_DIR") })
+    );
+    let text = catalog.to_string();
+    assert!(!text.contains(SECRET));
+    assert!(
+        !text.contains(".claude-work"),
+        "folder values stay out of the catalog"
+    );
+}

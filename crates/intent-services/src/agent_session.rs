@@ -6438,7 +6438,9 @@ impl Services {
                 self.note_provider_working(agent_id);
             }
             // A remote agent's pending quota failover is confirmed (and
-            // announced) by its first output on the backup.
+            // announced) by its first output on the backup; so is a switch
+            // its user made, once the run producing it is the switched one.
+            self.confirm_remote_model_switch(agent_id);
             Box::pin(self.complete_remote_failover(workspace_id, agent_id)).await;
             Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
