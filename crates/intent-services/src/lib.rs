@@ -17753,6 +17753,16 @@ impl Services {
         };
         let Some((bus, ws)) = stream_target else {
             registry.unregister(request_id);
+            // Inline replies stay under the read payload budget; a cut is
+            // flagged with an additive `truncated: true`.
+            let mut matches = matches;
+            if search_ops::bound_inline_matches(&mut matches) {
+                return serde_json::json!({
+                    "requestId": request_id,
+                    "matches": matches,
+                    "truncated": true,
+                });
+            }
             return serde_json::json!({ "requestId": request_id, "matches": matches });
         };
         let stream_request_id = request_id.to_string();
@@ -20440,7 +20450,8 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let opts = search_ops::parse_opts(opts)?;
+            let mut opts = search_ops::parse_opts(opts)?;
+            search_ops::bound_in_files_opts(&mut opts, search_ops::bounded_read_defaults());
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({
@@ -20551,6 +20562,15 @@ impl WorkspaceApi for Services {
                     _ => vec![workspace_id.clone()],
                 };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
+            // Bounded defaults: absent → MATCH_LIMIT_DEFAULT, clamped to
+            // MATCH_LIMIT_MAX. Otherwise the caller's value reaches SQL as
+            // before (a negative LIMIT means no limit there).
+            let limit = if search_ops::bounded_read_defaults() {
+                search_ops::match_limit(limit, true)
+                    .map(|n| i64::try_from(n).expect("limit fits in i64"))
+            } else {
+                limit
+            };
             let token = registry.register_as(&request_id, capability::search_owner()?);
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
@@ -20604,7 +20624,7 @@ impl WorkspaceApi for Services {
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register_as(&request_id, capability::search_owner()?);
-            let limit = limit.and_then(|n| usize::try_from(n).ok());
+            let limit = search_ops::match_limit(limit, search_ops::bounded_read_defaults());
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
                 ..Default::default()

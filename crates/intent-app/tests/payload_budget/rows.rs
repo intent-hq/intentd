@@ -23,6 +23,13 @@ pub enum Proof {
     /// The reply is small by design (its row says why); the pointer must
     /// resolve to a non-null value.
     Fixed(&'static str),
+    /// A bounded cut: the array at the first pointer holds at least `min`
+    /// items and the second pointer (into `result`) is `true` — the
+    /// `truncated` / `hasMore` marker a byte ceiling sets.
+    Cut(&'static str, usize, &'static str),
+    /// Like [`Proof::Cut`], but the marker is per row: at least one item of
+    /// the array carries `true` at the second pointer (relative to the row).
+    RowsCut(&'static str, usize, &'static str),
 }
 
 /// Request params of one variant.
@@ -304,7 +311,7 @@ impl Row {
 /// Every sweep row, sorted by method.
 #[expect(clippy::too_many_lines, reason = "one flat table reads best")]
 pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
-    use Proof::{Bytes, Fixed, Items};
+    use Proof::{Bytes, Cut, Fixed, Items, RowsCut};
     let ws = c.ws.as_str();
     let agent = c.agent.as_str();
     let note = c.note.as_str();
@@ -612,21 +619,21 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "discussion.list",
             vec![
-                v("default", w.clone(), Items("/messages", 50)),
+                v("default", w.clone(), Cut("/messages", 50, "/hasMore")),
                 v(
                     "limit=100",
                     json!({ "workspaceId": ws, "conversationId": c.conversation, "limit": 100 }),
-                    Items("/messages", 100),
+                    Cut("/messages", 50, "/hasMore"),
                 ),
                 v(
                     "beforeSequence",
                     json!({ "workspaceId": ws, "limit": 100, "beforeSequence": 150 }),
-                    Items("/messages", 100),
+                    Cut("/messages", 50, "/hasMore"),
                 ),
                 v(
                     "afterSequence",
                     json!({ "workspaceId": ws, "limit": 100, "afterSequence": 0 }),
-                    Items("/messages", 100),
+                    Cut("/messages", 50, "/hasMore"),
                 ),
             ],
         ),
@@ -672,11 +679,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "event.query",
             vec![
-                v("default", w.clone(), Items("", 50)),
+                v("default", w.clone(), RowsCut("", 50, "/truncated")),
                 v(
                     "limit=100000",
                     json!({ "workspaceId": ws, "limit": 100_000 }),
-                    Items("", 500),
+                    RowsCut("", 500, "/truncated"),
                 ),
                 v(
                     "filters",
@@ -1427,7 +1434,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "search.events",
             vec![
-                v("default", json!({ "query": "agent" }), Items("/matches", 10)),
+                v(
+                    "default",
+                    json!({ "query": "agent" }),
+                    Cut("/matches", 500, "/truncated"),
+                ),
                 v(
                     "max",
                     json!({ "query": "agent", "workspaceId": ws, "limit": 100_000, "requestId": "r-events" }),
@@ -1458,19 +1469,23 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "default",
                     json!({ "workspaceId": ws, "query": "payload" }),
-                    Items("/matches", 100),
+                    Cut("/matches", 100, "/truncated"),
                 ),
                 v(
                     "max",
                     json!({ "workspaceId": ws, "query": "e", "requestId": "r-infiles", "opts": { "caseSensitive": false, "maxResults": 100_000 } }),
-                    Items("/matches", 1_000),
+                    Cut("/matches", 1_000, "/truncated"),
                 ),
             ],
         ),
         row(
             "search.messages",
             vec![
-                v("default", json!({ "query": "agent" }), Items("/matches", 10)),
+                v(
+                    "default",
+                    json!({ "query": "agent" }),
+                    Cut("/matches", 500, "/truncated"),
+                ),
                 v(
                     "max",
                     json!({ "query": "agent", "workspaceId": ws, "limit": 100_000, "preferWorkspaceId": ws, "requestId": "r-messages" }),

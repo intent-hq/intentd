@@ -12,10 +12,6 @@ agent.subscribe default 1205453
 comment.list max 2521050
 comment.subscribe default 2521087
 crossWorkspace.readNote default 2592598
-discussion.list afterSequence 685070
-discussion.list beforeSequence 685097
-discussion.list limit=100 685150
-event.query default 683216
 git.branchDiff baseCommitSha 819758
 git.branchDiff baseRef 1639071
 git.diffs default 3370597
@@ -71,10 +67,6 @@ rules.list workspace 1255854
 script.list default 1404298
 script.list view=full 1404298
 script.output maxLines=100000 779996
-search.events default 1508129
-search.inFiles default 2758060
-search.inFiles max 4347229
-search.messages default 673304
 skill.list default 1173844
 specialist.list default 6370075
 specialist.list max 6370075

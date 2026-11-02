@@ -157,3 +157,49 @@ fn fts_preview_windows_on_first_literal_token() {
     let p = fts_preview("deployment finished cleanly", "deploying");
     assert!(p.starts_with("deployment"));
 }
+
+#[test]
+fn content_search_windows_long_lines_around_the_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}NEEDLE{}", "a".repeat(10_000), "b".repeat(10_000));
+    std::fs::write(dir.path().join("min.js"), format!("{line}\n")).unwrap();
+    let result = search_in_files(
+        dir.path(),
+        "NEEDLE",
+        &SearchOpts::default(),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(result.matches.len(), 1);
+    let m = &result.matches[0];
+    assert_eq!(m.col, 10_001);
+    assert!(m.preview.contains("NEEDLE"), "{}", m.preview);
+    assert!(m.preview.starts_with('…') && m.preview.ends_with('…'));
+    assert_eq!(
+        m.preview.chars().count(),
+        crate::content::PREVIEW_MAX_CHARS + 2
+    );
+}
+
+#[test]
+fn content_search_stops_at_max_bytes_and_sets_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..2_000)
+        .map(|i| format!("hit {i} {}\n", "x".repeat(300)))
+        .collect();
+    std::fs::write(dir.path().join("big.txt"), body).unwrap();
+    let opts = SearchOpts {
+        max_bytes: Some(64 * 1024),
+        ..SearchOpts::default()
+    };
+    let result = search_in_files(dir.path(), "hit", &opts, &CancelToken::new()).unwrap();
+    assert!(result.truncated);
+    assert!(!result.matches.is_empty());
+    let bytes: usize = result
+        .matches
+        .iter()
+        .map(|m| m.file.len() + m.preview.len() + 40)
+        .sum();
+    assert!(bytes <= 64 * 1024, "{bytes}");
+    assert!(result.matches.len() > 100, "{}", result.matches.len());
+}
