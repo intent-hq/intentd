@@ -1757,6 +1757,7 @@ fn golden_isolation_hints() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

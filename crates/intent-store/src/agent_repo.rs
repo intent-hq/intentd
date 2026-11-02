@@ -49,7 +49,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted";
+    harness_features, retired_at, notifications_muted, pinned";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -1047,7 +1047,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 40-column `agent_session` insert value list onto `query`, in
+/// Bind the full 42-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1098,7 +1098,40 @@ fn bind_session_insert<'q>(
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
         .bind(&s.retired_at)
-        .bind(i64::from(s.notifications_muted)))
+        .bind(i64::from(s.notifications_muted))
+        .bind(i64::from(s.pinned)))
+}
+
+/// Per-session boolean user preferences. Each is written only by its narrow
+/// writer or an explicit patch in [`Store::update_agent_session_with_preferences`],
+/// never by the ordinary full-row update.
+#[derive(Clone, Copy)]
+enum SessionPreference {
+    NotificationsMuted,
+    Pinned,
+}
+
+impl SessionPreference {
+    /// Conditional single-column UPDATE binding `(value, id, workspace_id, value)`.
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => {
+                "UPDATE agent_session SET notifications_muted=? \
+                 WHERE id=? AND workspace_id=? AND notifications_muted != ?"
+            }
+            Self::Pinned => {
+                "UPDATE agent_session SET pinned=? \
+                 WHERE id=? AND workspace_id=? AND pinned != ?"
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => "set notifications muted",
+            Self::Pinned => "set pinned",
+        }
+    }
 }
 
 impl Store {
@@ -1151,7 +1184,7 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
         match tx.as_mut() {
@@ -1229,7 +1262,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -2943,13 +2976,14 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None, false)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, None, false)
             .await
     }
 
-    /// Atomically update a session, optional manual specialist memory, and an
-    /// explicitly requested notification-mute patch. Ordinary row writes omit
-    /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// Atomically update a session, optional manual specialist memory, and
+    /// explicitly requested notification-mute / sidebar-pin patches. Ordinary
+    /// row writes omit the patches so stale session snapshots cannot revert
+    /// the user's toggles.
     /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
     /// choice: the same UPDATE clears the Auto-pin mark
     /// (`reasoning_effort_auto`) even when the value is unchanged, so no
@@ -2965,6 +2999,7 @@ impl Store {
         s: &AgentSession,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        pinned: Option<bool>,
         explicit_effort: bool,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
@@ -3027,7 +3062,8 @@ impl Store {
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
-        // such a patch can never revert the user's mute.
+        // such a patch can never revert the user's mute. `pinned` (0179) is
+        // the same kind of user toggle and is excluded on the same grounds.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -3048,7 +3084,7 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
         let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist || notifications_muted.is_some() {
+        let mut tx = if remember_specialist || notifications_muted.is_some() || pinned.is_some() {
             Some(
                 self.write_pool()
                     .begin()
@@ -3143,18 +3179,20 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         if let Some(mut tx) = tx {
-            if let Some(muted) = notifications_muted {
-                sqlx::query(
-                    "UPDATE agent_session SET notifications_muted=? \
-                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
-                )
-                .bind(i64::from(muted))
-                .bind(&s.id.0)
-                .bind(&workspace_id.0)
-                .bind(i64::from(muted))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            for (column, value) in [
+                (SessionPreference::NotificationsMuted, notifications_muted),
+                (SessionPreference::Pinned, pinned),
+            ] {
+                if let Some(value) = value {
+                    sqlx::query(column.update_sql())
+                        .bind(i64::from(value))
+                        .bind(&s.id.0)
+                        .bind(&workspace_id.0)
+                        .bind(i64::from(value))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
+                }
             }
             if remember_specialist {
                 crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
@@ -3188,18 +3226,51 @@ impl Store {
         id: &AgentId,
         muted: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=? \
-             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        self.set_agent_session_preference(
+            workspace_id,
+            id,
+            SessionPreference::NotificationsMuted,
+            muted,
         )
-        .bind(i64::from(muted))
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(i64::from(muted))
-        .execute(self.write_pool())
         .await
-        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
-        .rows_affected();
+    }
+
+    /// Set the session's sidebar `pinned` flag (0179) — the store side of
+    /// `agent.update { pinned }`. Same contract as
+    /// [`Store::set_agent_notifications_muted`]: returns `true` when the
+    /// stored value changed, never advances the activity timestamp, and is
+    /// (with explicit patches in mixed updates) the only writer of the column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_pinned(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        pinned: bool,
+    ) -> Result<bool> {
+        self.set_agent_session_preference(workspace_id, id, SessionPreference::Pinned, pinned)
+            .await
+    }
+
+    /// Narrow writer shared by the per-session user-preference flags.
+    async fn set_agent_session_preference(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        preference: SessionPreference,
+        value: bool,
+    ) -> Result<bool> {
+        let rows = sqlx::query(preference.update_sql())
+            .bind(i64::from(value))
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .bind(i64::from(value))
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("{} failed: {e}", preference.label())))?
+            .rows_affected();
         if rows == 0 {
             let exists = sqlx::query_scalar::<_, String>(
                 "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
@@ -5055,6 +5126,7 @@ fn map_session_row_with_heavy_cols(
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
+        pinned: col::<i64>(row, "pinned")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -8893,6 +8965,83 @@ mod tests {
         ));
     }
 
+    /// `set_agent_pinned` (0179) follows the mute contract: it reports whether
+    /// the flag changed, never advances the activity timestamp, is scoped to
+    /// the workspace, and a stale full-row `update_agent_session` carrying the
+    /// pre-toggle flag leaves the persisted pin untouched. An explicit patch in
+    /// a mixed update writes it alongside the row.
+    #[tokio::test]
+    async fn pinned_is_a_preference_that_survives_stale_full_row_update() {
+        let tmp = TempDb::new("test-agent-pinned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-pinned".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-pinned".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        let stale = store.get_agent_session(&agent).await.expect("load session");
+        assert!(!stale.pinned, "new sessions are unpinned");
+
+        for (pinned, changed) in [(true, true), (true, false)] {
+            assert_eq!(
+                store
+                    .set_agent_pinned(&ws, &agent, pinned)
+                    .await
+                    .expect("set pinned"),
+                changed
+            );
+            let stored = store.get_agent_session(&agent).await.expect("reload");
+            assert!(stored.pinned);
+            assert_eq!(stored.updated_at, old, "a pin is not agent activity");
+        }
+
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        assert!(
+            store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .pinned,
+            "full-row update must not clobber pinned"
+        );
+
+        let mut mixed = store.get_agent_session(&agent).await.expect("reload");
+        mixed.name = "Renamed".to_string();
+        mixed.pinned = false;
+        store
+            .update_agent_session_with_preferences(&ws, &mixed, false, None, Some(false), false)
+            .await
+            .expect("mixed update with pin patch");
+        let after = store.get_agent_session(&agent).await.expect("reload");
+        assert!(!after.pinned, "explicit patch unpins");
+        assert_eq!(after.name, "Renamed");
+        assert!(!after.notifications_muted, "mute untouched by a pin patch");
+
+        assert!(matches!(
+            store
+                .set_agent_pinned(&WorkspaceId("wrong-workspace".to_string()), &agent, true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .set_agent_pinned(&ws, &AgentId("agent-missing".to_string()), true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(
+            !store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .pinned
+        );
+    }
+
     /// A muted session (`notifications_muted = 1`) never counts as unread:
     /// the single-workspace probe, both batch derivations, and the guarded
     /// settle-clear all ignore it. Unmuting makes the same row unread again —
@@ -9092,6 +9241,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -9177,6 +9327,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -9916,6 +10067,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -13838,6 +13990,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session)
@@ -13990,6 +14143,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -14116,7 +14270,7 @@ mod tests {
         assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
         let mut row = store.get_agent_session(&agent_id).await.unwrap();
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, false)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -14126,7 +14280,7 @@ mod tests {
         );
         row.reasoning_effort = Some("low".into());
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, true)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, true)
             .await
             .unwrap();
         assert_eq!(
@@ -15392,6 +15546,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -19874,6 +20029,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

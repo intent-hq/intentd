@@ -273,6 +273,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session1)
@@ -334,6 +335,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session2)

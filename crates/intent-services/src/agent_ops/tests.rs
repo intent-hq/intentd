@@ -32841,6 +32841,99 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
     assert!(!stored.notifications_muted);
 }
 
+/// `pinned` is a sidebar preference: pin / unpin (alone or together with the
+/// mute) is echoed on the response, persisted, and announced through
+/// `agent:updated` without advancing the activity timestamp the sidebar sorts by.
+#[tokio::test]
+async fn agent_update_pinned_preserves_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Pin timestamp").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    for changes in [
+        json!({ "pinned": true }),
+        json!({ "pinned": true }),
+        json!({ "pinned": false, "notificationsMuted": true }),
+        json!({ "pinned": true }),
+    ] {
+        let pinned = changes["pinned"].as_bool().unwrap();
+        let response = svc
+            .agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("toggle pin");
+        assert_eq!(response["agent"]["pinned"], pinned);
+        assert_eq!(response["agent"]["updatedAt"], old);
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event arrives")
+        .expect("subscription open");
+        let event = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_UPDATED)
+            .unwrap();
+        let mut expected = changes.clone();
+        expected["agentId"] = json!(id.0);
+        assert_eq!(event.data, expected);
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert_eq!(stored.updated_at, old);
+        assert_eq!(stored.pinned, pinned);
+    }
+    let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+    assert!(
+        stored.notifications_muted,
+        "mixed preference write kept the mute"
+    );
+
+    let listed = svc
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("agent.get projection");
+    assert!(listed.pinned);
+    assert_eq!(serde_json::to_value(&listed).unwrap()["pinned"], true);
+}
+
+/// A pin accompanying a substantive edit does not suppress its activity
+/// timestamp, and a non-boolean `pinned` is rejected with the session untouched.
+#[tokio::test]
+async fn agent_update_pinned_mixed_edit_and_validation() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Before").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+
+    svc.agent_update_op(id.clone(), json!({ "pinned": true, "name": "After" }))
+        .await
+        .expect("mixed update");
+    let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+    assert!(stored.updated_at.as_str() > old);
+    assert!(stored.pinned);
+    assert_eq!(stored.name, "After");
+
+    for bad in [json!(null), json!("yes"), json!(1)] {
+        let err = svc
+            .agent_update_op(id.clone(), json!({ "pinned": bad }))
+            .await
+            .expect_err("non-boolean pinned");
+        assert!(
+            matches!(&err, Error::InvalidParams(msg) if msg.contains("`pinned` must be a boolean")),
+            "{err:?}"
+        );
+    }
+    assert!(svc.agent_get_session_op(id).await.unwrap().pinned);
+}
+
 /// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
 /// the existing `agent.rename` semantics.
 #[tokio::test]

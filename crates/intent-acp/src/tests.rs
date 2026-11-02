@@ -11048,6 +11048,7 @@ mod wsapi4_bindings_tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
@@ -14512,6 +14513,7 @@ mod workspace_apply_proposal_tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
