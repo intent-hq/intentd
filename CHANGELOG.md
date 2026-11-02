@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.109] - 2026-11-02
+
+### 🐛 Bug Fixes
+
+- *(remote)* Fail over a remote agent only to a backup its machine can run ([#2957](https://github.com/intent-hq/intentd/pull/2957))
+
+
 ## [0.11.108] - 2026-11-02
 
 ### 🚀 Features
