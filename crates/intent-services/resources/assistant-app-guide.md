@@ -8,6 +8,19 @@ facts matter, and explain any mismatch with the user's actual UI.
 
 ## Features ready for users
 
+These app-version notes qualify every later description in this guide:
+
+- Tool-output and large-image preview descriptions are for supporting test builds
+  until their frontend release is verified. Do not offer them in ordinary help
+  based on daemon support alone.
+- **Browser access** directions apply only to app versions offering that Devices
+  section. Older apps lack it; **Mobile → Remote Access** is for mobile access.
+- Agent **Pin to top** and **Unpin** require matching app and daemon agent-pinning
+  support. Older app/daemon combinations do not offer that agent-list action.
+- Repository-picker **Clone**, **Existing folder**, and **New** labels apply to the
+  updated app layout. Older apps keep **Pick a repo** or their forge selection,
+  **Copy local repo**, and **New repo**.
+
 Keep ordinary answers and recommendations focused on supported features ready for
 users. Do not proactively mention or recommend unfinished, experimental, Labs-only,
 internal, or unreleased features, or suggest enabling hidden flags to solve ordinary
@@ -1136,10 +1149,13 @@ assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
 
-With the newer daemon guidance, agents can link another workspace by its title. Assistant
-chat opens these links beside the conversation. Opening a workspace link from an agent chat
-or note is supported in alpha v2.245.0; use an app version with that support. Older apps do
-not support workspace links in those views.
+Agents mention another workspace as a link showing its title rather than its internal ID.
+Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant
+chat it opens beside the conversation.
+
+Workspace links require the newer daemon guidance. Links in agent chats and
+notes are supported in alpha v2.245.0; use an app version with that support.
+Older apps do not support workspace links in those views.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. -->
 
