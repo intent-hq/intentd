@@ -29332,7 +29332,8 @@ mod search_adapters {
     #[intent_test_macros::daemon_test]
     async fn streaming_emits_result_batches_and_done() {
         let h = stream_harness().await;
-        // 60 matching messages → above the inline threshold → streamed.
+        // 60 matching messages → above the inline threshold → streamed. The
+        // explicit limit lifts the 50-match default.
         let msgs: Vec<(&str, Value)> = (0..60)
             .map(|i| ("assistant", json!(format!("needle {i}"))))
             .collect();
@@ -29345,7 +29346,7 @@ mod search_adapters {
                 "needle".into(),
                 None,
                 None,
-                None,
+                Some(60),
                 None,
                 Some("srch-stream".into()),
             )
