@@ -431,8 +431,16 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
+    let specialists = data_dir.join(".intent/specialists");
+    std::fs::create_dir_all(&specialists).unwrap();
+    std::fs::write(
+        specialists.join("custom-planner.md"),
+        "---\nname: Custom planner\ndescription: Planning\naliases: [\"planning-alias\"]\n---\nPlan the task.",
+    )
+    .unwrap();
+
     // Pre-seed a workspace (repository_path so project-tier resolution has a
-    // root; the alias itself resolves from the embedded bundled floor).
+    // root; the alias itself resolves from an authored project specialist).
     let ws_id = {
         use intent_core::WorkspaceId;
         use intent_store::Store;
@@ -468,17 +476,23 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let mut ws = connect_ws(port, cfg).await;
 
     // specialist.get on the alias serves the canonical resolved view.
-    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "coordinator" })).await;
+    let got = wss_rpc(
+        &mut ws,
+        2,
+        "specialist.get",
+        json!({ "id": "planning-alias", "workspacePath": data_dir }),
+    )
+    .await;
     assert_eq!(
-        got["specialist"]["id"], "spec-writer",
+        got["specialist"]["id"], "custom-planner",
         "alias resolves to the canonical def over WSS"
     );
-    assert_eq!(got["specialist"]["aliases"], json!(["coordinator", "lead"]));
+    assert_eq!(got["specialist"]["aliases"], json!(["planning-alias"]));
 
     // agent.create with the alias persists the canonical specialist id and
     // derives the display name from the canonical specialist. The explicit
-    // provider + bare model satisfies provider resolution (the bundled
-    // spec-writer pins no frontmatter model and this hermetic env configures
+    // provider + bare model satisfies provider resolution (the custom
+    // custom-planner pins no frontmatter model and this hermetic env configures
     // no default provider) without touching the alias seam under test.
     let created = wss_rpc(
         &mut ws,
@@ -486,7 +500,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "agent.create",
         json!({
             "workspaceId": ws_id,
-            "specialistId": "coordinator",
+            "specialistId": "planning-alias",
             "model": "opus",
             "provider": "auggie"
         }),
@@ -494,20 +508,24 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");
     assert_eq!(
-        created["agent"]["metadata"]["specialist"], "spec-writer",
+        created["agent"]["metadata"]["specialist"], "custom-planner",
         "alias create persists the canonical id, not the alias"
     );
-    assert_eq!(created["agent"]["name"], "Lead");
+    assert_eq!(created["agent"]["name"], "Custom planner");
 
     // agent.get round-trips the canonical id from the persisted row.
     let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
     assert_eq!(
-        get_res["agent"]["metadata"]["specialist"], "spec-writer",
+        get_res["agent"]["metadata"]["specialist"], "custom-planner",
         "persisted session carries the canonical id"
     );
 
     // Removed bundled choices cannot create new sessions.
     for removed in [
+        "spec-writer",
+        "coordinator",
+        "lead",
+        "implementor",
         "verifier",
         "developer-legacy",
         "coordinator-legacy",
@@ -538,7 +556,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
             "error names the id: {msg}"
         );
         assert!(
-            msg.contains("known specialists:") && msg.contains("spec-writer"),
+            msg.contains("known specialists:") && msg.contains("developer"),
             "error lists the known ids: {msg}"
         );
     }
@@ -663,9 +681,7 @@ async fn embedded_bundled_catalog_over_wss() {
         [
             "chief-of-staff",
             "developer",
-            "implementor",
             "pr-reviewer",
-            "spec-writer",
             "ui-designer",
             "vulnerability-scanner",
         ],
@@ -1222,32 +1238,6 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
         got["specialist"]["role"], created["specialist"]["role"],
         "create response agrees with the following get over WSS"
     );
-
-    let lead = wss_rpc(
-        &mut ws,
-        51,
-        "specialist.edit",
-        json!({"id":"sigma", "scope":"user", "spec":{
-            "name":"Sigma", "description":"Planning first", "role":"lead",
-            "teamAgents":["implementor"], "prompt":"Plan then edit or delegate."
-        }}),
-    )
-    .await;
-    assert_eq!(lead["specialist"]["role"], "lead");
-    let got = wss_rpc(&mut ws, 52, "specialist.get", json!({"id":"sigma"})).await;
-    assert_eq!(got["specialist"]["role"], "lead");
-
-    let created_lead = wss_rpc(
-        &mut ws,
-        53,
-        "specialist.create",
-        json!({"id":"planning-lead", "scope":"user", "spec":{
-            "name":"Planning lead", "description":"Planning first", "role":"lead",
-            "prompt":"Plan then edit or delegate."
-        }}),
-    )
-    .await;
-    assert_eq!(created_lead["specialist"]["role"], "lead");
 
     // edit — the explicit clears drop the fields.
     let edited = wss_rpc(

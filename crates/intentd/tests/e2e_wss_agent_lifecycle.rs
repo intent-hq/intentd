@@ -9928,7 +9928,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
                 "prompt": "build the initial feature",
                 "name": "Initial agent",
                 "model": "default", "provider": "mock",
-                "specialist": "implementor",
+                "specialist": "developer",
             },
         }),
     )
@@ -11314,7 +11314,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
             "initialAgent": {
                 "name": "Coordinator",
                 "model": "default", "provider": "mock",
-                "specialist": "implementor",
+                "specialist": "developer",
             },
         }),
     )
@@ -11375,7 +11375,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// Specialist-derived default name over WSS (PROTOCOL §5.1/§5.5):
 /// `workspace.create` with a name-less `initialAgent` carrying a specialist
 /// derives the agent's name from the specialist's resolved display name
-/// (frontmatter `name` — "Lead" for the embedded `spec-writer`) and
+/// (frontmatter `name` — "Developer" for the embedded `developer`) and
 /// leaves it generated, so the opening-turn `setAgentName` can give it a
 /// task-specific name.
 #[intent_test_macros::daemon_test]
@@ -11414,7 +11414,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
             "branch": "feat/initial-agent-specialist-name-e2e",
             "initialAgent": {
                 "model": "default", "provider": "mock",
-                "specialist": "spec-writer",
+                "specialist": "developer",
             },
         }),
     )
@@ -11424,8 +11424,8 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         .expect("initial agent returned")
         .to_string();
     assert_eq!(
-        created["initialAgent"]["name"], "Lead",
-        "name derived from spec-writer's display name: {created}"
+        created["initialAgent"]["name"], "Developer",
+        "name derived from developer's display name: {created}"
     );
     assert_eq!(
         created["initialAgent"]["nameExplicitlySet"], false,
@@ -11434,7 +11434,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
 
     // The derived name is persisted, not just projected into the create result.
     let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
-    assert_eq!(got["agent"]["name"], "Lead");
+    assert_eq!(got["agent"]["name"], "Developer");
     assert_eq!(got["agent"]["nameExplicitlySet"], false);
 }
 
@@ -20226,8 +20226,8 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
 
     for (index, (name, explicit, needs_name)) in [
         (None, false, true),
-        (Some("Implementor 2"), false, true),
-        (Some("Implementor"), true, false),
+        (Some("Developer 2"), false, true),
+        (Some("Developer"), true, false),
         (Some("Fix the sidebar"), false, false),
     ]
     .into_iter()
@@ -20235,7 +20235,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
     {
         let mut params = json!({
             "workspaceId": ws_id, "provider": "mock", "model": "default",
-            "specialistId": "implementor",
+            "specialistId": "developer",
         });
         if let Some(name) = name {
             params["name"] = json!(name);
@@ -20243,7 +20243,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
         }
         let created = wss_rpc(&mut rpc, 10, "agent.create", params).await;
         let agent_id = created["agent"]["id"].as_str().unwrap();
-        assert_eq!(created["agent"]["name"], name.unwrap_or("Implementor"));
+        assert_eq!(created["agent"]["name"], name.unwrap_or("Developer"));
         assert_eq!(created["agent"]["nameExplicitlySet"], explicit);
 
         for turn in 0..2 {
@@ -20300,7 +20300,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
         let got = wss_rpc(&mut rpc, 12, "agent.get", json!({"agentId": agent_id})).await;
         assert_eq!(
             got["agent"]["name"],
-            name.unwrap_or("Implementor"),
+            name.unwrap_or("Developer"),
             "the hint itself never mutates the stored name"
         );
     }

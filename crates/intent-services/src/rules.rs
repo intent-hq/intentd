@@ -330,7 +330,7 @@ pub(crate) struct SpecialistPromptInjection {
 /// actually running under.
 ///
 /// Hint matrix (per spec line 104-110):
-/// - Sandboxed implementor (`session.sandbox_path` present + specialist="implementor"):
+/// - Sandboxed agent (`session.sandbox_path` present):
 ///   isolation context block with sandbox path, branch, base commit, caches-warm
 ///   notice, branch-switching warning, and conflict-bounce resolution instructions.
 /// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
@@ -341,7 +341,7 @@ pub(crate) fn build_isolation_hint(
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
 ) -> Option<String> {
-    // Determine if this agent is a sandboxed implementor
+    // Isolation follows the checkout, independently of the selected specialist.
     let is_sandboxed = agent_session
         .and_then(|s| s.sandbox_path.as_ref())
         .is_some();
@@ -354,8 +354,8 @@ pub(crate) fn build_isolation_hint(
     // calls resolve to the latest.
     let harness = session_harness_entry(agent_session).harness;
 
-    // Case 1: Sandboxed implementor — inject isolation context
-    if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
+    // Case 1: Sandboxed agent — inject isolation context
+    if is_sandboxed {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");

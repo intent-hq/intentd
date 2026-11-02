@@ -114,7 +114,7 @@ async fn spawn_fixture_as(
         id.clone(),
         WorkspaceId::from("ws-1"),
         "Fast fixture",
-        "implementor",
+        "developer",
         dir.path().to_path_buf(),
         &opts,
     )

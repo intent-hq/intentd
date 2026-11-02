@@ -11157,11 +11157,12 @@ async fn resolve_session_is_orchestrator_gated_on_provider() {
         );
     }
     stored.harness_version = intent_core::CURRENT_HARNESS_VERSION.to_string();
+    stored.specialist = Some("developer".to_string());
     assert!(
         !services
             .resolve_session_is_orchestrator("claude-code", &stored)
             .await,
-        "the current Lead retains editing tools"
+        "Developer retains editing tools"
     );
     // Plain agents resolve false even on claude-code.
     stored.specialist = None;

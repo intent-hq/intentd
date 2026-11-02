@@ -5778,8 +5778,8 @@ impl Services {
             }
         }
         // Specialist alias canonicalization (PROTOCOL §5.11): a `specialist`
-        // naming an alias (e.g. `"coordinator"`) is rewritten to the claiming
-        // specialist's CANONICAL id (`"spec-writer"`) before any downstream
+        // naming a custom alias is rewritten to the claiming
+        // specialist's canonical id before any downstream
         // rung runs, so display-name/model/effort resolution, the prompt
         // snapshot, and the persisted `session.specialist` (surfaced as
         // `metadata.specialist`) all see the canonical id. A directly-known
@@ -5816,7 +5816,7 @@ impl Services {
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
         // name-less `agent.create` / `workspace.create.initialAgent` carrying
-        // a specialist surfaces e.g. "Coordinator" for `spec-writer` instead
+        // a specialist surfaces e.g. "Developer" for `developer` instead
         // of the generic `Agent {6-hex}` fallback. Resolution failure or an
         // unknown specialist never fails the create — the fallback below
         // still applies.

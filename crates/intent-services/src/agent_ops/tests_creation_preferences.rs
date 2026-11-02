@@ -39,7 +39,7 @@ async fn creation_preferences_persist_only_specialist_and_isolate_workspaces() {
     let result = create(
         &svc,
         &ws,
-        Some("coordinator"),
+        Some("ui-designer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -47,12 +47,12 @@ async fn creation_preferences_persist_only_specialist_and_isolate_workspaces() {
     )
     .await
     .unwrap();
-    assert_eq!(result["agent"]["metadata"]["specialist"], "spec-writer");
+    assert_eq!(result["agent"]["metadata"]["specialist"], "ui-designer");
     assert_eq!(
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
     assert_eq!(
         svc.agent_get_creation_preferences(other.clone())
@@ -81,7 +81,7 @@ async fn creation_preferences_persist_only_specialist_and_isolate_workspaces() {
     let reopened = Store::open(&tmp.path).await.unwrap();
     assert_eq!(
         reopened.get_agent_creation_preferences(&ws).await.unwrap(),
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
     assert_eq!(
         reopened
@@ -108,7 +108,7 @@ async fn creation_preferences_ignore_failed_unmarked_background_and_child_create
             .unwrap(),
         json!({})
     );
-    let first = create(&svc, &ws, Some("implementor"), remembered.clone())
+    let first = create(&svc, &ws, Some("developer"), remembered.clone())
         .await
         .unwrap();
     for extra in [
@@ -139,7 +139,7 @@ async fn creation_preferences_ignore_failed_unmarked_background_and_child_create
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"implementor"})
+        json!({"specialistId":"developer"})
     );
 }
 
@@ -153,7 +153,7 @@ async fn creation_preferences_remember_successful_welcome_selection_and_general(
     svc.agent_update(
         id.clone(),
         Some(ws.clone()),
-        json!({"specialist":"coordinator","rememberSpecialist":true}),
+        json!({"specialist":"ui-designer","rememberSpecialist":true}),
     )
     .await
     .unwrap();
@@ -161,7 +161,7 @@ async fn creation_preferences_remember_successful_welcome_selection_and_general(
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
     for changes in [
         json!({"specialist":"missing-specialist","rememberSpecialist":true}),
@@ -175,13 +175,13 @@ async fn creation_preferences_remember_successful_welcome_selection_and_general(
             svc.agent_get_creation_preferences(ws.clone())
                 .await
                 .unwrap(),
-            json!({"specialistId":"spec-writer"})
+            json!({"specialistId":"ui-designer"})
         );
     }
     svc.agent_update(
         id.clone(),
         Some(ws.clone()),
-        json!({"specialist":"implementor"}),
+        json!({"specialist":"developer"}),
     )
     .await
     .unwrap();
@@ -189,7 +189,7 @@ async fn creation_preferences_remember_successful_welcome_selection_and_general(
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
     svc.agent_update(
         id,
@@ -212,7 +212,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     let initial = create(
         &svc,
         &ws,
-        Some("implementor"),
+        Some("developer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -249,7 +249,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
             .unwrap()
             .specialist
             .as_deref(),
-        Some("implementor")
+        Some("developer")
     );
     assert!(
         !svc.store
@@ -262,7 +262,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"implementor"})
+        json!({"specialistId":"developer"})
     );
 }
 
@@ -276,7 +276,7 @@ async fn creation_preferences_do_not_replay_models_and_delete_with_workspace() {
     let first = create(
         &svc,
         &ws,
-        Some("implementor"),
+        Some("developer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -291,7 +291,7 @@ async fn creation_preferences_do_not_replay_models_and_delete_with_workspace() {
     let second = create(
         &svc,
         &ws,
-        Some("implementor"),
+        Some("developer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -304,7 +304,7 @@ async fn creation_preferences_do_not_replay_models_and_delete_with_workspace() {
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"implementor"})
+        json!({"specialistId":"developer"})
     );
     svc.store.delete_workspace(&ws).await.unwrap();
     assert_eq!(
@@ -332,7 +332,7 @@ async fn creation_preferences_background_updates_never_replace_manual_selection(
     svc.agent_update(
         id,
         Some(ws.clone()),
-        json!({"specialist":"implementor","rememberSpecialist":true,"isBackground":false}),
+        json!({"specialist":"developer","rememberSpecialist":true,"isBackground":false}),
     )
     .await
     .unwrap();
@@ -350,7 +350,7 @@ async fn creation_preferences_idempotent_replay_does_not_restore_old_choice() {
             ws.clone(),
             None,
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             Some("manual-create".into()),
             AgentCreateExtra {
@@ -376,7 +376,7 @@ async fn creation_preferences_idempotent_replay_does_not_restore_old_choice() {
             ws.clone(),
             None,
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             Some("manual-create".into()),
             AgentCreateExtra {
@@ -397,8 +397,8 @@ async fn creation_preferences_idempotent_replay_does_not_restore_old_choice() {
 async fn creation_preferences_welcome_renames_only_generated_placeholders() {
     let (_tmp, svc, ws) = setup().await;
     for (name, explicit, expected) in [
-        ("Agent", false, "Implementor"),
-        ("Agent 2", false, "Implementor"),
+        ("Agent", false, "Developer"),
+        ("Agent 2", false, "Developer"),
         ("My task", false, "My task"),
         ("Agent", true, "Agent"),
     ] {
@@ -422,7 +422,7 @@ async fn creation_preferences_welcome_renames_only_generated_placeholders() {
             .agent_update(
                 id.clone(),
                 Some(ws.clone()),
-                json!({"specialist":"implementor","rememberSpecialist":true}),
+                json!({"specialist":"developer","rememberSpecialist":true}),
             )
             .await
             .unwrap();
@@ -438,7 +438,7 @@ async fn creation_preferences_welcome_renames_only_generated_placeholders() {
             .unwrap();
         assert_eq!(
             cleared["agent"]["name"],
-            if expected == "Implementor" {
+            if expected == "Developer" {
                 "Agent"
             } else {
                 expected
@@ -456,8 +456,8 @@ async fn creation_preferences_initial_agent_plan_preserves_opt_in_and_name_prove
             intent_core::WorkspaceCreate {
                 title: Some("Initial choice".into()),
                 initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
-                    name: Some("Implementor".into()),
-                    specialist: Some("implementor".into()),
+                    name: Some("Developer".into()),
+                    specialist: Some("developer".into()),
                     remember_specialist: Some(true),
                     name_explicitly_set: Some(false),
                     ..Default::default()
@@ -476,7 +476,7 @@ async fn creation_preferences_initial_agent_plan_preserves_opt_in_and_name_prove
         svc.agent_get_creation_preferences(created.workspace.id)
             .await
             .unwrap(),
-        json!({"specialistId":"implementor"})
+        json!({"specialistId":"developer"})
     );
 }
 
@@ -488,7 +488,7 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     let created = create(
         &svc,
         &ws,
-        Some("implementor"),
+        Some("developer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -519,7 +519,7 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
         svc.agent_get_creation_preferences(ws.clone())
             .await
             .unwrap(),
-        json!({"specialistId":"implementor"})
+        json!({"specialistId":"developer"})
     );
     assert!(
         tokio::time::timeout(
@@ -586,7 +586,7 @@ async fn creation_preferences_skipped_placeholder_rename_reports_no_name() {
     let created = create(
         &svc,
         &ws,
-        Some("implementor"),
+        Some("developer"),
         AgentCreateExtra {
             remember_specialist: true,
             ..Default::default()
@@ -636,8 +636,8 @@ async fn creation_preferences_welcome_selection_freezes_complete_instructions() 
     for (initial, custom) in [
         (None, false),
         (None, true),
-        (Some("implementor"), false),
-        (Some("implementor"), true),
+        (Some("developer"), false),
+        (Some("developer"), true),
     ] {
         let created = create(
             &svc,
@@ -652,10 +652,10 @@ async fn creation_preferences_welcome_selection_freezes_complete_instructions() 
         .unwrap();
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
         for specialist in [
-            Some("implementor"),
+            Some("developer"),
             Some("developer"),
             None,
-            Some("implementor"),
+            Some("developer"),
         ] {
             svc.agent_update(
                 id.clone(),
@@ -705,7 +705,7 @@ async fn creation_preferences_welcome_selection_freezes_complete_instructions() 
 async fn creation_preferences_preserve_unmarked_legacy_and_changed_override_bodies() {
     let (_tmp, svc, ws) = setup().await;
     for legacy in [true, false] {
-        let created = create(&svc, &ws, Some("implementor"), AgentCreateExtra::default())
+        let created = create(&svc, &ws, Some("developer"), AgentCreateExtra::default())
             .await
             .unwrap();
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());

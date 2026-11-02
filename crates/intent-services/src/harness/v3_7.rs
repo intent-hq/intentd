@@ -1,9 +1,9 @@
-//! Source-aligned Developer and Lead workflows with minimal verification.
+//! Source-aligned Developer workflow and general-agent delegation.
 
 use super::{Doctrine, HarnessEntry};
 
 static DOCTRINE: Doctrine = Doctrine {
-    instructions: super::v3_6::ENTRY.doctrine.instructions,
+    instructions: &crate::instructions::V3_7,
     specialists: crate::specialists::EMBEDDED_BUNDLED_V3_7,
 };
 
@@ -26,19 +26,11 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "78a5c202fb320a498445e02c88459035b2976f26b303986346c28ca7437fa51e",
-            ),
-            (
-                "implementor",
-                "88eba423004822b1fa6320f10f1a9c80d71783774957b9313e123c665d2a32b8",
-            ),
-            (
-                "spec-writer",
-                "ea4d894f36a2863db0738045f326b2c502cc4b35003efa053209d3a6fc3ed903",
+                "034e0f0e4f5b732fa61126b33d397c9a42ca1a4b96d9b5abd6eb86e63ae7215b",
             ),
             (
                 "pr-reviewer",
-                "0ca55d5b0bd14f942cea27f96b6f5e5a3a3115e86c25229b65845a55045729a7",
+                "cac2b97a8be75d09178f486531ff42c28e4089f3b53e0ae5a7500bb256dabfba",
             ),
         ] {
             let content = super::ENTRY
@@ -58,20 +50,35 @@ mod tests {
     }
 
     #[test]
-    fn v3_7_versions_workflows_and_removes_verifier() {
+    fn v3_7_versions_workflows_and_removes_specialized_delegation_roles() {
         let current = super::super::resolve_entry("3.7");
         let previous = super::super::resolve_entry("3.6");
         assert_eq!(current.version, "3.7");
-        assert!(std::ptr::eq(
+        let (now, then) = (
             current.doctrine.instructions,
-            previous.doctrine.instructions
+            previous.doctrine.instructions,
+        );
+        assert_eq!(
+            now.common,
+            then.common.replace(", specialist: \"implementor\"", "")
+        );
+        assert_eq!(now.workspace, then.workspace);
+        assert_eq!(now.workspace_agent, then.workspace_agent);
+        assert_eq!(now.assistant, then.assistant);
+        assert_eq!(
+            now.single_workspace_fallback,
+            then.single_workspace_fallback
+        );
+        assert!(std::ptr::eq(
+            now.plain_folder.unwrap(),
+            then.plain_folder.unwrap()
         ));
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
         assert_eq!(
             current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len() - 1
+            previous.doctrine.specialists.len() - 3
         );
         for (old_id, old) in previous.doctrine.specialists {
             let replacement = current
@@ -79,23 +86,16 @@ mod tests {
                 .specialists
                 .iter()
                 .find(|(id, _)| id == old_id);
-            if *old_id == "verifier" {
+            if matches!(*old_id, "verifier" | "spec-writer" | "implementor") {
                 assert!(replacement.is_none());
                 continue;
             }
             let (new_id, new) = replacement.expect("retained specialist");
-            if matches!(
-                *new_id,
-                "developer" | "spec-writer" | "implementor" | "pr-reviewer"
-            ) {
+            if matches!(*new_id, "developer" | "pr-reviewer") {
                 assert_ne!(old, new, "{new_id}");
                 let (old_meta, _) = crate::specialists::parse_frontmatter(old);
                 let (new_meta, _) = crate::specialists::parse_frontmatter(new);
-                let keys = if *new_id == "spec-writer" {
-                    &["icon", "model"][..]
-                } else {
-                    &["name", "role", "teamAgents", "icon", "aliases", "model"][..]
-                };
+                let keys = &["name", "role", "teamAgents", "icon", "aliases", "model"];
                 for key in keys {
                     assert_eq!(old_meta.get(*key), new_meta.get(*key), "{new_id}: {key}");
                 }

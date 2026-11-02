@@ -1380,12 +1380,12 @@ async fn shared_specialist_mutations_require_administrator_directly() {
                 Err(Error::Forbidden(_))
             ));
             assert!(matches!(
-                svc.specialist_edit("implementor".into(), json!({}), "user".into(), None)
+                svc.specialist_edit("developer".into(), json!({}), "user".into(), None)
                     .await,
                 Err(Error::Forbidden(_))
             ));
             assert!(matches!(
-                svc.specialist_delete("implementor".into(), "user".into(), None)
+                svc.specialist_delete("developer".into(), "user".into(), None)
                     .await,
                 Err(Error::Forbidden(_))
             ));
@@ -1430,7 +1430,7 @@ async fn shared_specialist_reads_fence_guest_project_paths() {
     with_caller(guest, async {
         assert!(svc.specialist_list(None, None).await.is_ok());
         assert!(svc
-            .specialist_get("implementor".into(), None, None)
+            .specialist_get("developer".into(), None, None)
             .await
             .is_ok());
         assert!(svc

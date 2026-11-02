@@ -391,7 +391,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .insert_agent_session(&mk_agent(
             "agent-1",
             "Builder",
-            Some("implementor"),
+            Some("developer"),
             "2026-01-01T00:00:01Z",
         ))
         .await
@@ -419,7 +419,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     let summary = got.agent_summary.expect("agent_summary present");
     assert_eq!(summary.count, 2);
     assert!(summary.agents.iter().any(|a| a.name == "Builder"
-        && a.specialist.as_deref() == Some("implementor")
+        && a.specialist.as_deref() == Some("developer")
         && !a.is_streaming
         && !a.is_responding
         && a.parent_agent_id.is_none()
@@ -870,7 +870,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
                 effort_levels: None,
                 provider: None,
                 system_prompt: None,
-                specialist: Some("implementor".to_string()),
+                specialist: Some("developer".to_string()),
                 status: AgentStatus::Idle,
                 is_active: false,
                 messages: vec![],
@@ -1424,7 +1424,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         effort_levels: None,
         provider: None,
         system_prompt: None,
-        specialist: Some("implementor".to_string()),
+        specialist: Some("developer".to_string()),
         status: AgentStatus::Idle,
         is_active: false,
         messages: vec![],
@@ -30021,18 +30021,12 @@ mod rules {
         sub.recv().await.expect("subscription open")
     }
 
-    /// Task 6: sandboxed implementor sessions get an isolation context block
+    /// Task 6: sandboxed general agent sessions get an isolation context block
     /// with sandbox path, branch, and conflict-resolution instructions.
     #[tokio::test]
-    async fn assembly_injects_sandbox_context_for_sandboxed_implementor() {
+    async fn assembly_injects_sandbox_context_for_sandboxed_general_agent() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-
-        let injection = crate::rules::SpecialistPromptInjection {
-            behavior_prompt: Some("Implement your task.".into()),
-            specialist_name: Some("Implementor".into()),
-            role_reminder: Some("Stay in scope.".into()),
-        };
 
         // Create a mock workspace (direct mode + CoW supported)
         let workspace = intent_core::Workspace {
@@ -30065,7 +30059,7 @@ mod rules {
             effort_levels: None,
             provider: None,
             system_prompt: None,
-            specialist: Some("implementor".into()),
+            specialist: None,
             status: intent_core::AgentStatus::Active,
             is_active: false,
             messages: vec![],
@@ -30102,7 +30096,7 @@ mod rules {
             &store,
             Some(&tree.0),
             "task-loop",
-            Some(&injection),
+            None,
             true,
             false,
             false,
@@ -36362,7 +36356,7 @@ mod initial_agent_orchestration {
                     prompt: Some("fix the auth flow".to_string()),
                     name: Some("Auth fixer".to_string()),
                     model: Some("opus".to_string()),
-                    specialist: Some("implementor".to_string()),
+                    specialist: Some("developer".to_string()),
                     ..Default::default()
                 })),
                 None,
@@ -36385,7 +36379,7 @@ mod initial_agent_orchestration {
         assert_eq!(session.workspace_id, res.workspace.id);
         assert!(session.parent_agent_id.is_none());
         assert!(!session.is_background);
-        assert_eq!(session.specialist.as_deref(), Some("implementor"));
+        assert_eq!(session.specialist.as_deref(), Some("developer"));
         assert_eq!(session.model.as_deref(), Some("opus"));
         assert_eq!(
             session.initial_message.as_deref(),
@@ -36498,7 +36492,7 @@ mod initial_agent_orchestration {
 
         let input = || {
             create_input(Some(WorkspaceCreateInitialAgent {
-                specialist: Some("implementor".to_string()),
+                specialist: Some("developer".to_string()),
                 ..Default::default()
             }))
         };
@@ -36561,7 +36555,7 @@ mod initial_agent_orchestration {
                         prompt,
                         name: Some("Coordinator".to_string()),
                         model: Some("opus".to_string()),
-                        specialist: Some("implementor".to_string()),
+                        specialist: Some("developer".to_string()),
                         ..Default::default()
                     })),
                     None,
@@ -36590,7 +36584,7 @@ mod initial_agent_orchestration {
             assert_eq!(session.workspace_id, res.workspace.id);
             assert!(session.parent_agent_id.is_none());
             assert!(!session.is_background);
-            assert_eq!(session.specialist.as_deref(), Some("implementor"));
+            assert_eq!(session.specialist.as_deref(), Some("developer"));
             assert_eq!(session.model.as_deref(), Some("opus"));
             assert!(
                 session.initial_message.is_none(),
@@ -36646,7 +36640,7 @@ mod initial_agent_orchestration {
                     prompt: None,
                     name: Some("Coordinator".to_string()),
                     model: Some("opus".to_string()),
-                    specialist: Some("implementor".to_string()),
+                    specialist: Some("developer".to_string()),
                     metadata: Some(json!({ "initialMessage": "stale prompt from caller" })),
                     ..Default::default()
                 })),

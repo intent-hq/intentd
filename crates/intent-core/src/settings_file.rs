@@ -1881,7 +1881,7 @@ providerSettings = {}
 
 [specialists]
 # Default specialist -- specialist applied when none is chosen.
-# default = "implementor"
+# default = "developer"
 
 [workspace]
 # Branch prefix -- prefix for agent-created branches.

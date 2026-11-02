@@ -276,6 +276,12 @@ pub(crate) static V3_6: InstructionSet = InstructionSet {
     ..V3_5
 };
 
+/// Harness v3.7 delegates to general agents unless a specialist is selected.
+pub(crate) static V3_7: InstructionSet = InstructionSet {
+    common: instr!("v3.7", "common"),
+    ..V3_6
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -669,7 +675,7 @@ mod tests {
 
     /// The current common body includes workspace links, development-only
     /// visuals and the long-running-process (Intent scripts) guidance.
-    const COMMON_LATEST: &str = V3_6.common;
+    const COMMON_LATEST: &str = V3_7.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

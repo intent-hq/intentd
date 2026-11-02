@@ -689,7 +689,7 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
     let proposal_code = r#"return await ws.workspace.proposeSibling({
         title: "Focused follow-up",
         initialPrompt: "Implement only the focused follow-up and run its tests.",
-        specialist: "implementor"
+        specialist: "developer"
     });"#;
     let behavior = json!({
         "rules": [{

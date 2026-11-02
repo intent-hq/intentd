@@ -220,8 +220,8 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let specs = list["specialists"].as_array().expect("specialists array");
     assert_eq!(
         specs.len(),
-        8,
-        "seven catalog-visible embedded ids plus the custom verifier"
+        7,
+        "five catalog-visible embedded ids plus two custom bundled specialists"
     );
     assert!(
         specs.iter().all(|s| s["id"] != "ralph"),
