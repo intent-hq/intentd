@@ -530,18 +530,20 @@ child.on('exit',code=>process.exit(code||0));
             ("raw", "pages", CatalogFailure::PaginationLimit),
         ] {
             let fixture = Fixture::new(&json!({role:mode}));
-            let start = tokio::time::Instant::now();
-            let report = fixture
-                .launch(false)
-                .catalogs_with_auth(
+            // A limit that fails to apply leaves the run hanging (the
+            // `timeout` fake never answers) into this hang guard.
+            let report = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(20)),
+                fixture.launch(false).catalogs_with_auth(
                     Ok(fixture.auth().await),
                     Limits {
                         timeout: Duration::from_secs(2),
                         pages: 2,
                     },
-                )
-                .await;
-            assert!(start.elapsed() < Duration::from_secs(20));
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{role} {mode}: the limits never ended the run"));
             let (failed, success) = if role == "acp" {
                 (&report.acp, &report.raw)
             } else {

@@ -13250,10 +13250,22 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
     // Phase 2: ONE shared grace window over the whole batch. Handles that
     // don't finish in time are kept so they can be awaited again after the
     // SIGKILL sweep.
-    let deadline = tokio::time::Instant::now() + PROCESS_GROUP_TERM_GRACE;
+    let grace = shared_grace_window(tokio::time::Instant::now() + PROCESS_GROUP_TERM_GRACE);
+    tokio::pin!(grace);
+    let mut grace_over = false;
     let mut pending = Vec::new();
     for mut w in waits {
-        if tokio::time::timeout_at(deadline, &mut w).await.is_err() {
+        let exited = w.is_finished()
+            || (!grace_over
+                && tokio::select! {
+                    biased;
+                    _ = &mut w => true,
+                    () = &mut grace => {
+                        grace_over = true;
+                        false
+                    }
+                });
+        if !exited {
             pending.push(w);
         }
     }
@@ -13276,6 +13288,73 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
     sweep_escaped_descendants(&descendants).await;
 }
 
+/// The shared grace window of [`kill_child_trees`]: ends at `deadline`, or —
+/// in a test that installed a [`term_grace_gate`] — only when the test opens
+/// the gate, so a test can observe every group inside the window.
+#[cfg(unix)]
+async fn shared_grace_window(deadline: tokio::time::Instant) {
+    #[cfg(test)]
+    if let Some(gate) = term_grace_gate::current() {
+        gate.opened().await;
+        return;
+    }
+    tokio::time::sleep_until(deadline).await;
+}
+
+/// Test-only replacement for the [`PROCESS_GROUP_TERM_GRACE`] timer of
+/// [`kill_child_trees`]: a sweep run under [`term_grace_gate::scope`] holds
+/// its shared grace window open until the test opens the gate,
+/// so a test can check that every group got SIGTERM before any is killed —
+/// a serialized sweep never reaches the second group and hangs into the
+/// test's hang guard instead of passing slowly.
+#[cfg(all(test, unix))]
+pub(crate) mod term_grace_gate {
+    use std::future::Future;
+
+    use tokio::sync::watch;
+
+    tokio::task_local! { static GATE: TermGraceGate; }
+
+    /// The gate; clones share it.
+    #[derive(Clone)]
+    pub(crate) struct TermGraceGate(watch::Sender<bool>);
+
+    impl TermGraceGate {
+        pub(crate) fn new() -> Self {
+            Self(watch::Sender::new(false))
+        }
+
+        /// End every grace window held by this gate.
+        pub(crate) fn open(&self) {
+            self.0.send_replace(true);
+        }
+
+        pub(super) async fn opened(&self) {
+            let _ = self.0.subscribe().wait_for(|open| *open).await;
+        }
+    }
+
+    /// Run `future` with `gate` holding its kill sweeps' grace windows.
+    pub(crate) async fn scope<F: Future>(gate: TermGraceGate, future: F) -> F::Output {
+        GATE.scope(gate, future).await
+    }
+
+    /// Carry the caller's gate into a future spawned on another task.
+    pub(crate) fn inherit<F: Future>(future: F) -> impl Future<Output = F::Output> {
+        let gate = current();
+        async move {
+            match gate {
+                Some(gate) => GATE.scope(gate, future).await,
+                None => future.await,
+            }
+        }
+    }
+
+    pub(super) fn current() -> Option<TermGraceGate> {
+        GATE.try_with(Clone::clone).ok()
+    }
+}
+
 /// Non-unix fallback: no process groups, so kill each direct child; the kills
 /// are signal-only (no grace waits), so the sweep is already time-bounded.
 #[cfg(not(unix))]
@@ -13287,9 +13366,9 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
 
 #[cfg(all(test, unix))]
 mod kill_sweep_tests {
-    //! Timing proof for the parallel shutdown kill sweep: N children that
-    //! ignore SIGTERM must tear down in ~ONE shared grace window, not N
-    //! sequential ones.
+    //! The parallel shutdown kill sweep: N children that survive SIGTERM
+    //! must all be signalled inside ONE shared grace window, not one window
+    //! each.
 
     use super::*;
 
@@ -13345,41 +13424,121 @@ mod kill_sweep_tests {
         assert!(confirm_tree_exit(&mut leader, pgid, &[other_pid], grace).await);
     }
 
+    /// Children that survive SIGTERM, each its own process-group leader:
+    /// child `i` creates `<dir>/ready-<i>` once its TERM trap is installed and
+    /// `<dir>/term-<i>` when a SIGTERM arrives, then keeps running, so only
+    /// SIGKILL ends it. Returns the children with their pids.
+    pub(super) fn spawn_term_recording_children(dir: &Path, n: usize) -> Vec<(Child, u32)> {
+        (0..n)
+            .map(|i| {
+                let mut cmd = tokio::process::Command::new("sh");
+                // The group-wide SIGTERM also ends the loop's `sleep`; the
+                // trap records it and the loop starts another.
+                cmd.args([
+                    "-c",
+                    r#"trap 'touch "$1"' TERM; touch "$2"; while :; do sleep 1; done"#,
+                    "sh",
+                ])
+                .arg(dir.join(format!("term-{i}")))
+                .arg(dir.join(format!("ready-{i}")));
+                cmd.process_group(0);
+                cmd.kill_on_drop(true);
+                let child = cmd.spawn().expect("spawn TERM-recording child");
+                let pid = child.id().expect("live child has a pid");
+                (child, pid)
+            })
+            .collect()
+    }
+
+    /// Wait (under a hang guard) until `<dir>/<prefix>-<i>` exists for every
+    /// `i < n`.
+    pub(super) async fn wait_for_markers(dir: &Path, prefix: &str, n: usize) {
+        let all = || (0..n).all(|i| dir.join(format!("{prefix}-{i}")).exists());
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while !all() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| {
+            let seen: Vec<usize> = (0..n)
+                .filter(|i| dir.join(format!("{prefix}-{i}")).exists())
+                .collect();
+            panic!("only {prefix} markers {seen:?} of {n} appeared");
+        });
+    }
+
+    /// Wait (under a hang guard) until `pid` is gone — a `SIGKILLed` child
+    /// stays signal-0-visible as a zombie until its wait task reaps it.
+    pub(super) async fn wait_until_reaped(pid: u32) {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        let alive = || {
+            matches!(
+                kill(Pid::from_raw(pid.cast_signed()), None),
+                Ok(()) | Err(nix::errno::Errno::EPERM)
+            )
+        };
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                while alive() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("child {pid} was never killed and reaped"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_children_tear_down_in_one_shared_grace_window() {
         const N: usize = 4;
-        let mut children = Vec::with_capacity(N);
-        for _ in 0..N {
-            let mut cmd = tokio::process::Command::new("sh");
-            // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
-            // forcing the full grace window to elapse.
-            cmd.args(["-c", "trap '' TERM; sleep 30"]);
-            cmd.process_group(0);
-            cmd.kill_on_drop(true);
-            children.push((cmd.spawn().expect("spawn slow child"), None));
+        let dir = crate::test_support::test_tempdir("kill-sweep");
+        let spawned = spawn_term_recording_children(dir.path(), N);
+        wait_for_markers(dir.path(), "ready", N).await;
+        let pids: Vec<u32> = spawned.iter().map(|(_, pid)| *pid).collect();
+        let children = spawned
+            .into_iter()
+            .map(|(child, pid)| (child, Some(pid)))
+            .collect();
+
+        // The gate holds the grace window open: every group must get its
+        // SIGTERM inside one window. A sweep that spends a window per child
+        // never signals the second one, and the wait below hangs into its
+        // guard instead of passing slowly.
+        let gate = term_grace_gate::TermGraceGate::new();
+        let sweep = intent_core::spawn_daemon(term_grace_gate::scope(
+            gate.clone(),
+            kill_child_trees(children),
+        ));
+        wait_for_markers(dir.path(), "term", N).await;
+        assert!(
+            !sweep.is_finished(),
+            "the sweep returned while its grace window was still open"
+        );
+        for &pid in &pids {
+            assert!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok(),
+                "child {pid} survived SIGTERM, so it is still running inside the window"
+            );
         }
-        // Let each sh install its trap before SIGTERM arrives.
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let start = std::time::Instant::now();
-        kill_child_trees(children).await;
-        let elapsed = start.elapsed();
-
-        // Serial teardown would take ~N * grace (8s for 4 children); the
-        // shared window must finish in ~one grace period (<4s total).
-        assert!(
-            elapsed < PROCESS_GROUP_TERM_GRACE * 2,
-            "parallel sweep took {elapsed:?}, expected ~one {PROCESS_GROUP_TERM_GRACE:?} grace window"
-        );
-        // The children ignored SIGTERM, so the full shared grace must have
-        // elapsed (proves the window ran once, not that children died early).
-        assert!(
-            elapsed
-                >= PROCESS_GROUP_TERM_GRACE
-                    .checked_sub(Duration::from_millis(500))
-                    .unwrap(),
-            "sweep returned after {elapsed:?}, before the shared grace window elapsed"
-        );
+        // Ending the window sends the SIGKILL sweep to every group.
+        gate.open();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            sweep,
+        )
+        .await
+        .expect("the sweep finishes once its grace window ends")
+        .expect("sweep task");
+        for &pid in &pids {
+            wait_until_reaped(pid).await;
+        }
     }
 }
 

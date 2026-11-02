@@ -5296,29 +5296,29 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
     assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
-/// Timing proof for the batch stop path (the `workspace.delete` sweep): N
-/// tracked agents whose children ignore SIGTERM tear down in ~ONE shared
-/// grace window via `stop_many` — mirroring `kill_sweep_tests` — with the
-/// per-agent `stop()` semantics (handle removal, deregistration) applied to
-/// every agent.
+/// The batch stop path (the `workspace.delete` sweep): N tracked agents whose
+/// children survive SIGTERM are all signalled inside ONE shared grace window
+/// via `stop_many` — mirroring `kill_sweep_tests` — with the per-agent
+/// `stop()` semantics (handle removal, deregistration) applied to every
+/// agent.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
+    use super::kill_sweep_tests::{
+        spawn_term_recording_children, wait_for_markers, wait_until_reaped,
+    };
+    use super::term_grace_gate::{self, TermGraceGate};
+
     const N: usize = 4;
-    let grace = super::PROCESS_GROUP_TERM_GRACE;
     let (_tmp, mgr) = manager().await;
+    let dir = test_tempdir("stop-many-sweep");
     let mut ids = Vec::with_capacity(N);
     let mut pids = Vec::with_capacity(N);
-    for i in 0..N {
+    for (i, (child, pid)) in spawn_term_recording_children(dir.path(), N)
+        .into_iter()
+        .enumerate()
+    {
         let id = AgentId::from(format!("a-batch-{i}").as_str());
-        let mut cmd = tokio::process::Command::new("sh");
-        // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
-        // forcing the full grace window to elapse.
-        cmd.args(["-c", "trap '' TERM; sleep 30"]);
-        cmd.process_group(0);
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn().expect("spawn slow child");
-        let pid = child.id().expect("live child has a pid");
         let handle = mock_handle();
         handle
             .execution
@@ -5343,42 +5343,46 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         ids.push(id);
         pids.push(pid);
     }
-    // Let each sh install its trap before SIGTERM arrives.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_markers(dir.path(), "ready", N).await;
 
-    let start = std::time::Instant::now();
-    let fence = mgr.stop_many(&ids).await;
-    let elapsed = start.elapsed();
+    // The gate holds the shared grace window open: every child must get its
+    // SIGTERM inside it. A batch stop that tears agents down one window at a
+    // time never signals the second child, and the wait below hangs into its
+    // guard instead of passing slowly.
+    let gate = TermGraceGate::new();
+    let mgr = Arc::new(mgr);
+    let stop = {
+        let (mgr, ids) = (Arc::clone(&mgr), ids.clone());
+        intent_core::spawn_daemon(term_grace_gate::scope(gate.clone(), async move {
+            mgr.stop_many(&ids).await
+        }))
+    };
+    wait_for_markers(dir.path(), "term", N).await;
+    assert!(
+        !stop.is_finished(),
+        "batch stop returned while its grace window was still open"
+    );
+    for &pid in &pids {
+        assert!(
+            pid_alive(pid),
+            "child {pid} survived SIGTERM inside the window"
+        );
+    }
+    gate.open();
+    let fence = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        stop,
+    )
+    .await
+    .expect("batch stop finishes once its grace window ends")
+    .expect("stop task");
 
-    // Serial teardown would take ~N * grace (8s for 4 children); the shared
-    // window must finish in ~one grace period (<4s total).
-    assert!(
-        elapsed < grace * 2,
-        "batch stop took {elapsed:?}, expected ~one {grace:?} grace window"
-    );
-    // The children ignored SIGTERM, so the full shared grace must have
-    // elapsed (proves the window ran once, not that children died early).
-    assert!(
-        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
-        "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
-    );
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");
     assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
-    // The kill itself, not just the elapsed window: every child must be
-    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
-    // a zombie until its wait task reaps it (stragglers past
-    // KILL_SWEEP_REAP_GRACE reap in the background).
+    // The kill itself: every child is SIGKILLed once the window ends.
     for &pid in &pids {
-        let mut dead = !pid_alive(pid);
-        for _ in 0..100 {
-            if dead {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            dead = !pid_alive(pid);
-        }
-        assert!(dead, "child {pid} killed by the batch sweep");
+        wait_until_reaped(pid).await;
     }
     // The returned fence keeps every swept agent blocked from the
     // lazy-spawn paths until dropped, then re-opens them.

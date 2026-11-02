@@ -432,7 +432,7 @@ impl DetachedChild {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let _ = spawn_owned_cleanup(&runtime, async move {
+        let sweep = async move {
             let _leases = leases;
             kill_child_trees(trees).await;
             for cleanup in guarded {
@@ -441,8 +441,10 @@ impl DetachedChild {
             for dir in launch_dirs {
                 dir.remove();
             }
-        })
-        .await;
+        };
+        #[cfg(all(test, unix))]
+        let sweep = super::term_grace_gate::inherit(sweep);
+        let _ = spawn_owned_cleanup(&runtime, sweep).await;
     }
 }
 
