@@ -456,8 +456,9 @@ commands, or a template to apply it. **Edit commands** opens the selected script
 **Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
 **Done** or **Save & Done** keeps your edits; **Cancel** discards them and returns
 to the workspace form.
-For a local repository, turn off isolation in **Branch** to use its existing folder
-without creating a worktree.
+For a local repository, use the isolation switch at the bottom of **Branch**.
+With isolation on, agents edit a separate copy. Turn it off to edit files in the
+existing folder on its current branch, without creating a worktree.
 Your prompt draft stays intact. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
