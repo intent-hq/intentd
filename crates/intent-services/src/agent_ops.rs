@@ -6552,10 +6552,34 @@ impl Services {
         named
     }
 
-    /// The agent's accepted remote switch is confirmed: its new run produced
-    /// output or completed a turn on the machine.
-    pub(crate) fn clear_remote_model_switch(&self, agent_id: &AgentId) {
-        self.remote_model_switches.lock().unwrap().remove(agent_id);
+    /// Confirm the agent's accepted remote switch: its run produced output
+    /// or completed a turn. Only a run launched with the switched identity
+    /// confirms it; the old run, still finishing a turn that was in flight
+    /// when the switch was made, does not.
+    pub(crate) fn confirm_remote_model_switch(&self, agent_id: &AgentId) {
+        if !self
+            .remote_model_switches
+            .lock()
+            .unwrap()
+            .contains_key(agent_id)
+        {
+            return;
+        }
+        let Some((provider, model)) = self
+            .agent_manager()
+            .and_then(|mgr| mgr.spawned_identity(agent_id))
+        else {
+            return;
+        };
+        let mut switches = self.remote_model_switches.lock().unwrap();
+        if switches
+            .get(agent_id)
+            .is_some_and(|(switched_provider, switched_model)| {
+                switched_provider.as_deref() == Some(provider.as_str()) && *switched_model == model
+            })
+        {
+            switches.remove(agent_id);
+        }
     }
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When

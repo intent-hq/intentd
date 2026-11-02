@@ -10814,6 +10814,16 @@ impl AgentManager {
     /// as dead; a handle without an owned child trusts the connection probe
     /// alone, and an errored `try_wait` probe is treated as live so a
     /// transient wait failure never forces a spurious respawn.
+    /// The provider (as stored) and model the agent's current run was
+    /// launched with, if it has one.
+    pub(crate) fn spawned_identity(&self, agent_id: &AgentId) -> Option<(String, Option<String>)> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| (h.spawned_provider.clone(), h.spawned_model.clone()))
+    }
+
     fn handle_is_live(&self, agent_id: &AgentId) -> bool {
         let mut handles = self.handles.lock().unwrap();
         let Some(handle) = handles.get_mut(agent_id) else {
@@ -15225,7 +15235,7 @@ async fn run_message_worker(
                         // A remote agent's automatic switch, or one its
                         // user made, is confirmed by a completed turn on its
                         // new configuration.
-                        mgr.services.clear_remote_model_switch(&agent_id);
+                        mgr.services.confirm_remote_model_switch(&agent_id);
                         boxed_await(|| {
                             mgr.services
                                 .complete_remote_failover(&workspace_id, &agent_id)
