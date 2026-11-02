@@ -93,6 +93,25 @@ impl Services {
         };
         crate::publish_event(self.event_bus.as_ref(), event).await;
     }
+
+    /// Publish `agent:updated` for a remote agent whose projected placement
+    /// changed on its node (checkout isolated, or a start error), so the
+    /// `agent` channel pushes its list row with the new `effectiveIsolation`
+    /// / `placementError` instead of leaving the list at `pending` until
+    /// the agent is opened.
+    pub async fn publish_agent_placement_changed(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &intent_core::AgentId,
+    ) {
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            intent_core::events::AGENT_UPDATED,
+            serde_json::json!({ "agentId": agent_id.0 }),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]

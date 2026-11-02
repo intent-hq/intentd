@@ -167,11 +167,63 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
         .unwrap();
     assert_eq!(got.node_name.as_deref(), Some("Mac Studio"));
     assert_eq!(got.effective_isolation, Some(EffectiveIsolation::Pending));
-    // Detail-only: list rows stay within their budget without them.
+    // List rows carry the placement so the list can badge remote agents;
+    // only the lease stays detail-only.
     let listed = svc.agent_list_op(ws.clone()).await.unwrap();
-    let row = listed.iter().find(|a| a.id == id).unwrap();
-    assert_eq!(row.node_id, None);
-    assert_eq!(row.placement, None);
+    let row = serde_json::to_value(listed.iter().find(|a| a.id == id).unwrap()).unwrap();
+    assert_eq!(row["nodeId"], "node-1", "{row}");
+    assert_eq!(row["nodeName"], "Mac Studio", "{row}");
+    assert_eq!(row["effectiveIsolation"], "pending", "{row}");
+    assert_eq!(row["placement"], agent["placement"], "{row}");
+    assert!(row.get("leaseId").is_none(), "{row}");
+}
+
+#[tokio::test]
+async fn list_rows_carry_placement_for_remote_agents_only() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let placed = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote", "os": "macos"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let local = create(&svc, &ws, AgentCreateExtra::default())
+        .await
+        .unwrap();
+    let placed_id = placed["agent"]["id"].as_str().unwrap();
+    let local_id = local["agent"]["id"].as_str().unwrap();
+
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let row =
+        |id: &str| serde_json::to_value(listed.iter().find(|a| a.id.0 == id).unwrap()).unwrap();
+    let placed_row = row(placed_id);
+    for key in ["nodeId", "nodeName", "placement", "effectiveIsolation"] {
+        assert!(
+            placed_row.get(key).is_some(),
+            "remote row lacks `{key}`: {placed_row}"
+        );
+    }
+    assert!(placed_row.get("leaseId").is_none(), "{placed_row}");
+    let local_row = row(local_id);
+    for key in [
+        "nodeId",
+        "leaseId",
+        "nodeName",
+        "placement",
+        "effectiveIsolation",
+        "placementError",
+    ] {
+        assert!(
+            local_row.get(key).is_none(),
+            "local row carries `{key}`: {local_row}"
+        );
+    }
 }
 
 #[tokio::test]

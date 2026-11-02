@@ -1340,7 +1340,7 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
             }
             _ => return,
         };
-    if let Err(error) = crate::view::update(
+    match crate::view::update(
         &shared.store,
         &record.workspace_id,
         &record.agent_id,
@@ -1348,7 +1348,19 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
     )
     .await
     {
-        tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's placement state");
+        // Announce the change so the agent list follows it (the list row
+        // carries `effectiveIsolation` / `placementError`).
+        Ok(true) => {
+            if let Some(services) = &shared.services {
+                services
+                    .publish_agent_placement_changed(&record.workspace_id, &record.agent_id)
+                    .await;
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's placement state");
+        }
     }
 }
 

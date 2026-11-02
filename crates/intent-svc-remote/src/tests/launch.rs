@@ -323,6 +323,63 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     f.node.shutdown();
 }
 
+/// The placement change `Started` records is announced as `agent:updated`,
+/// so the agent channel pushes the agent's list row with `isolated`
+/// instead of leaving it at `pending` until the agent is opened (remote
+/// agents showed "Provisioning" on the list indefinitely in
+/// cloudlands-fe v2.268.0).
+#[tokio::test]
+async fn the_isolation_change_is_announced_to_the_agent_list() {
+    let (f, mut link, _machine) = fixture().await;
+    let (agent, _view) = f.placed().await;
+    let _runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+    link.expect(|frame| match frame {
+        LinkFrame::Launch(command) => Some(command),
+        _ => None,
+    })
+    .await;
+    let mut sub = f
+        .backend
+        .bus
+        .subscribe(intent_services::feature_api::SubscriptionFilter {
+            event_types: vec![intent_core::events::AGENT_UPDATED.to_owned()],
+            ..Default::default()
+        });
+
+    link.journal(JournalRecord {
+        seq: NodeCounter(1),
+        agent_id: agent.clone(),
+        workspace_id: workspace(),
+        turn_id: None,
+        recorded_at: intent_core::now_iso(),
+        body: JournalBody::Started {
+            base_commit: f.base.clone(),
+        },
+    })
+    .await;
+    link.acked(1).await;
+    let announced = tokio::time::timeout(wait(), async {
+        loop {
+            let events = sub.recv().await.expect("subscription open");
+            if let Some(event) = events
+                .into_iter()
+                .find(|e| e.session_id.as_deref() == Some(agent.as_str()))
+            {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("agent:updated arrives for the placed agent");
+    assert_eq!(announced.workspace_id, workspace());
+    assert_eq!(announced.data["agentId"], agent.as_str());
+    assert_eq!(
+        f.view(&agent).await.effective_isolation,
+        EffectiveIsolation::Isolated
+    );
+    f.node.shutdown();
+}
+
 /// An agent of a saved provider profile starts on the node with the
 /// profile's environment: the base provider id, and the overlay with
 /// account directories as typed (the node expands `~`).
