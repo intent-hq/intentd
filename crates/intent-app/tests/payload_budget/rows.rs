@@ -1402,7 +1402,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
                 // A command over the budget is served in parts.
                 v(
-                    "oversized command",
+                    "oversizedCommand",
                     json!({ "workspaceId": ws, "scriptId": c.huge_script }),
                     Bytes(400 * 1024),
                 ),
