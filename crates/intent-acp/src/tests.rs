@@ -10360,7 +10360,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 4, maxLines: 9 });",
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 4, maxLines: 9, startOffset: 12 });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -10377,6 +10377,7 @@ mod wsapi6_bindings_tests {
                 intent_core::note_read_bounds::LineWindow {
                     start_line: Some(4),
                     max_lines: Some(9),
+                    start_offset: Some(12),
                 },
                 intent_core::note_read_bounds::LineWindow::default(),
             ]

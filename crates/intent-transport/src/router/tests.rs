@@ -1959,7 +1959,7 @@ impl WorkspaceApi for FakeApi {
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({
-                "window": [window.start_line, window.max_lines],
+                "window": [window.start_line, window.max_lines, window.start_offset],
                 "boundedDefault": bounded_default,
                 "id": note_id.as_str(), "title": "t", "content": "c",
                 "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
@@ -6729,14 +6729,14 @@ async fn cross_workspace_methods_require_params() {
 
     // readNote line window: positive integers flow through; others → -32602.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","startLine":3,"maxLines":20}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","startLine":3,"maxLines":20,"startOffset":7}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(v["result"]["window"], serde_json::json!([3, 20]));
+    assert_eq!(v["result"]["window"], serde_json::json!([3, 20, 7]));
     assert_eq!(v["result"]["boundedDefault"], serde_json::json!(true));
     for bad in ["0", "-1", "1.5", "\"2\"", "true"] {
-        for key in ["startLine", "maxLines"] {
+        for key in ["startLine", "maxLines", "startOffset"] {
             let v = call(&format!(
                 r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","{key}":{bad}}}}}"#
             ))

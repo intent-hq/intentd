@@ -3527,6 +3527,7 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
             LineWindow {
                 start_line: Some(2),
                 max_lines: Some(5),
+                start_offset: None,
             },
             false,
         )
@@ -3546,6 +3547,7 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
             LineWindow {
                 start_line: Some(3),
                 max_lines: None,
+                start_offset: None,
             },
             false,
         )
@@ -3577,6 +3579,7 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
                 LineWindow {
                     start_line: start,
                     max_lines: None,
+                    start_offset: None,
                 },
                 true,
             )
@@ -3596,6 +3599,51 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
     }
     assert!(pages.len() > 1);
     assert_eq!(pages.join("\n"), big);
+
+    // One line far over the budget (multi-byte characters and escapes):
+    // the cursor resumes inside the line, and the pages rebuild it exactly.
+    let huge = format!("head\n{}\ntail", "é€😀\"x".repeat(150_000));
+    svc.store
+        .insert_note(&note(&sibling, "huge-line", &huge))
+        .await
+        .unwrap();
+    let mut rebuilt = String::new();
+    let mut window = LineWindow::default();
+    let mut served = 0;
+    loop {
+        let v = svc
+            .cross_workspace_read_note(
+                caller.clone(),
+                sibling.clone(),
+                NoteId::from("huge-line"),
+                window,
+                true,
+            )
+            .await
+            .expect("page");
+        assert!(
+            serde_json::to_string(&v).unwrap().len() < 500 * 1024,
+            "page over budget"
+        );
+        if served > 0 && v.get("startOffset").is_none() {
+            rebuilt.push('\n');
+        }
+        rebuilt.push_str(v["content"].as_str().unwrap());
+        served += 1;
+        let Some(next) = v["nextStartLine"].as_u64() else {
+            assert!(v["nextStartOffset"].is_null());
+            break;
+        };
+        window = LineWindow {
+            start_line: Some(usize::try_from(next).unwrap()),
+            max_lines: None,
+            start_offset: v["nextStartOffset"]
+                .as_u64()
+                .map(|o| usize::try_from(o).unwrap()),
+        };
+    }
+    assert!(served > 2);
+    assert_eq!(rebuilt, huge);
     // A caller without bounded defaults and no window keeps the whole note.
     let v = svc
         .cross_workspace_read_note(

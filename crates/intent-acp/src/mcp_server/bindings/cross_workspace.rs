@@ -79,6 +79,7 @@ async fn read_note(
     let window = LineWindow {
         start_line: super::note::opt_positive_line(args, "startLine")?,
         max_lines: super::note::opt_positive_line(args, "maxLines")?,
+        start_offset: super::note::opt_positive_line(args, "startOffset")?,
     };
     api.cross_workspace_read_note(
         ws.clone(),

@@ -21624,6 +21624,15 @@ impl WorkspaceApi for Services {
                         "nextStartLine".into(),
                         serde_json::json!(page.next_start_line()),
                     );
+                    // A cut line resumes at a byte offset on the same line,
+                    // so following the cursor rebuilds the note exactly.
+                    obj.insert(
+                        "nextStartOffset".into(),
+                        serde_json::json!(page.next_start_offset()),
+                    );
+                    if page.start_offset > 0 {
+                        obj.insert("startOffset".into(), serde_json::json!(page.start_offset));
+                    }
                 }
             }
             Ok(out)

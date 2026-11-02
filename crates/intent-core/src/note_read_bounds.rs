@@ -50,13 +50,16 @@ pub struct LineWindow {
     pub start_line: Option<usize>,
     /// Most lines to serve. `None` = as many as fit the byte budget.
     pub max_lines: Option<usize>,
+    /// Byte offset into the start line to resume a line an earlier page
+    /// cut (its `nextStartOffset`). `None` = the start of the line.
+    pub start_offset: Option<usize>,
 }
 
 impl LineWindow {
     /// Whether the caller asked for a window at all.
     #[must_use]
     pub fn is_requested(&self) -> bool {
-        self.start_line.is_some() || self.max_lines.is_some()
+        self.start_line.is_some() || self.max_lines.is_some() || self.start_offset.is_some()
     }
 }
 
@@ -69,43 +72,83 @@ pub struct NoteLinePage {
     pub numbered_content: String,
     /// First served line (1-based).
     pub start_line: usize,
+    /// Byte offset into the first served line where `content` begins
+    /// (non-zero only when the page resumes a cut line).
+    pub start_offset: usize,
     /// Last served line (1-based); `start_line - 1` when no line was served.
     pub end_line: usize,
     /// Total lines in the note (`content.split('\n').count()`).
     pub total_lines: usize,
     /// The last served line was cut short to fit the budget.
     pub line_cut: bool,
+    /// When `line_cut`: the byte offset into `end_line` where the next page
+    /// resumes (on a UTF-8 character boundary).
+    pub cut_offset: Option<usize>,
 }
 
 impl NoteLinePage {
     /// Whether the page is less than the whole note.
     #[must_use]
     pub fn truncated(&self) -> bool {
-        self.line_cut || self.start_line > 1 || self.end_line < self.total_lines
+        self.line_cut
+            || self.start_line > 1
+            || self.start_offset > 0
+            || self.end_line < self.total_lines
     }
 
     /// The line a caller passes as `startLine` to read on, or `None` at the
-    /// end of the note. A cut line is not re-served: the cursor moves past it.
+    /// end of the note. After a cut line this is the same line, resumed at
+    /// [`Self::next_start_offset`], so following the cursor loses nothing.
     #[must_use]
     pub fn next_start_line(&self) -> Option<usize> {
+        if self.cut_offset.is_some() {
+            return Some(self.end_line);
+        }
         (self.end_line < self.total_lines).then_some(self.end_line + 1)
+    }
+
+    /// The byte offset a caller passes as `startOffset` with
+    /// [`Self::next_start_line`]; `None` unless the last line was cut.
+    #[must_use]
+    pub fn next_start_offset(&self) -> Option<usize> {
+        self.cut_offset
     }
 }
 
-/// Error for a `startLine` past the end of the note.
+/// A line window that does not address the note.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartLinePastEnd {
-    pub start_line: usize,
-    pub total_lines: usize,
+pub enum NoteWindowError {
+    /// `startLine` is past the last line.
+    StartLinePastEnd {
+        start_line: usize,
+        total_lines: usize,
+    },
+    /// `startOffset` is not inside the start line or not on a character
+    /// boundary.
+    InvalidStartOffset {
+        start_offset: usize,
+        line_len: usize,
+    },
 }
 
-impl std::fmt::Display for StartLinePastEnd {
+impl std::fmt::Display for NoteWindowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "startLine ({}) exceeds total lines in note ({})",
-            self.start_line, self.total_lines
-        )
+        match self {
+            Self::StartLinePastEnd {
+                start_line,
+                total_lines,
+            } => write!(
+                f,
+                "startLine ({start_line}) exceeds total lines in note ({total_lines})"
+            ),
+            Self::InvalidStartOffset {
+                start_offset,
+                line_len,
+            } => write!(
+                f,
+                "startOffset ({start_offset}) is not a character boundary inside the start line ({line_len} bytes)"
+            ),
+        }
     }
 }
 
@@ -129,32 +172,48 @@ fn escaped_prefix(s: &str, budget: usize) -> &str {
 ///
 /// Lines are split on `\n` and numbered from 1, the numbering of
 /// `ws.note.read` and `note.editLines`. At least one line is always served
-/// when the window starts inside the note: a single line larger than the
-/// budget is served as a prefix with `line_cut` set.
+/// when the window starts inside the note: a line larger than the budget is
+/// served as a prefix with `line_cut` set, and the next page resumes it at
+/// `cut_offset` (`window.start_offset`). Following the cursor rebuilds the
+/// note byte for byte: a page with a non-zero `start_offset` continues the
+/// previous page's last line; any other page follows it after a `\n`.
 ///
 /// # Errors
-/// [`StartLinePastEnd`] when `startLine` is past the last line.
+/// [`NoteWindowError`] when `startLine` is past the last line, or
+/// `startOffset` is not a character boundary strictly inside the start line.
 pub fn note_line_page(
     content: &str,
     window: LineWindow,
     budget: usize,
-) -> Result<NoteLinePage, StartLinePastEnd> {
+) -> Result<NoteLinePage, NoteWindowError> {
     let total_lines = content.split('\n').count();
     let start_line = window.start_line.unwrap_or(1).max(1);
     if start_line > total_lines {
-        return Err(StartLinePastEnd {
+        return Err(NoteWindowError::StartLinePastEnd {
             start_line,
             total_lines,
         });
+    }
+    let start_offset = window.start_offset.unwrap_or(0);
+    if start_offset > 0 {
+        let line = content.split('\n').nth(start_line - 1).unwrap_or("");
+        if start_offset >= line.len() || !line.is_char_boundary(start_offset) {
+            return Err(NoteWindowError::InvalidStartOffset {
+                start_offset,
+                line_len: line.len(),
+            });
+        }
     }
     let max_lines = window.max_lines.unwrap_or(usize::MAX).max(1);
     let mut page = NoteLinePage {
         content: String::new(),
         numbered_content: String::new(),
         start_line,
+        start_offset,
         end_line: start_line - 1,
         total_lines,
         line_cut: false,
+        cut_offset: None,
     };
     let mut used = 0usize;
     for (idx, line) in content.split('\n').enumerate().skip(start_line - 1) {
@@ -162,6 +221,12 @@ pub fn note_line_page(
         if number - start_line >= max_lines {
             break;
         }
+        let line_offset = if number == start_line {
+            start_offset
+        } else {
+            0
+        };
+        let line = &line[line_offset..];
         let prefix = format!("{number:>4} | ");
         let sep = usize::from(number > start_line);
         // A `\n` separator is 2 bytes once JSON-escaped, in both strings.
@@ -172,8 +237,17 @@ pub fn note_line_page(
             line
         } else if number == start_line {
             let room = budget.saturating_sub(prefix.len()) / 2;
-            page.line_cut = true;
-            escaped_prefix(line, room)
+            let mut cut = escaped_prefix(line, room);
+            if cut.is_empty() {
+                // Always make progress: serve at least one character.
+                let first = line.chars().next().map_or(0, char::len_utf8);
+                cut = &line[..first];
+            }
+            if cut.len() < line.len() {
+                page.line_cut = true;
+                page.cut_offset = Some(line_offset + cut.len());
+            }
+            cut
         } else {
             break;
         };
@@ -596,6 +670,7 @@ mod tests {
             LineWindow {
                 start_line: Some(2),
                 max_lines: Some(2),
+                start_offset: None,
             },
             NOTE_READ_BUDGET_BYTES,
         )
@@ -613,6 +688,7 @@ mod tests {
             LineWindow {
                 start_line: Some(3),
                 max_lines: None,
+                start_offset: None,
             },
             NOTE_READ_BUDGET_BYTES,
         )
@@ -638,6 +714,7 @@ mod tests {
                 LineWindow {
                     start_line: Some(start),
                     max_lines: None,
+                    start_offset: None,
                 },
                 budget,
             )
@@ -654,16 +731,102 @@ mod tests {
         assert_eq!(lines.join("\n"), content);
     }
 
+    /// Follow the cursor from line 1 and rebuild the note from its pages.
+    fn rebuild(content: &str, budget: usize) -> (String, usize) {
+        let mut out = String::new();
+        let mut window = LineWindow::default();
+        let mut pages = 0;
+        loop {
+            let page = note_line_page(content, window, budget).unwrap();
+            assert!(json_len(&page.content) + json_len(&page.numbered_content) <= budget + 4);
+            if pages > 0 && page.start_offset == 0 {
+                out.push('\n');
+            }
+            out.push_str(&page.content);
+            pages += 1;
+            assert!(pages < 100_000, "cursor must make progress");
+            match page.next_start_line() {
+                Some(line) => {
+                    window = LineWindow {
+                        start_line: Some(line),
+                        max_lines: None,
+                        start_offset: page.next_start_offset(),
+                    };
+                }
+                None => break,
+            }
+        }
+        (out, pages)
+    }
+
     #[test]
-    fn a_line_larger_than_the_budget_is_cut_and_skipped() {
+    fn a_line_larger_than_the_budget_resumes_at_a_byte_offset() {
         let content = format!("{}\nnext", "é\"".repeat(10_000));
         let page = note_line_page(&content, LineWindow::default(), 1_000).unwrap();
         assert!(page.line_cut);
         assert!(page.truncated());
         assert_eq!(page.end_line, 1);
-        assert_eq!(page.next_start_line(), Some(2));
+        assert_eq!(page.next_start_line(), Some(1));
+        let offset = page.next_start_offset().unwrap();
+        assert_eq!(offset, page.content.len());
+        assert!(content.is_char_boundary(offset));
         assert!(json_len(&page.content) + json_len(&page.numbered_content) <= 1_000 + 4);
-        assert!(content.starts_with(&page.content));
+
+        let (rebuilt, pages) = rebuild(&content, 1_000);
+        assert!(pages > 2);
+        assert_eq!(rebuilt, content);
+    }
+
+    #[test]
+    fn multibyte_characters_at_every_cut_point_rebuild_byte_for_byte() {
+        // Mixed 1-, 2-, 3- and 4-byte characters plus escapes, on oversized
+        // lines between ordinary ones, at budgets that land cuts everywhere.
+        let big = "aé€😀\"\\\t".repeat(3_000);
+        let content = format!("first\n{big}\nmiddle\n\n{big}{big}\nlast");
+        for budget in [997, 1_000, 1_001, 1_003, 4_096] {
+            let (rebuilt, _) = rebuild(&content, budget);
+            assert_eq!(rebuilt, content, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn a_resumed_page_serves_the_rest_of_the_line_then_following_lines() {
+        let content = "abcdef\nghi";
+        let page = note_line_page(
+            content,
+            LineWindow {
+                start_line: Some(1),
+                max_lines: None,
+                start_offset: Some(3),
+            },
+            NOTE_READ_BUDGET_BYTES,
+        )
+        .unwrap();
+        assert_eq!(page.content, "def\nghi");
+        assert_eq!(page.numbered_content, "   1 | def\n   2 | ghi");
+        assert_eq!(page.start_offset, 3);
+        assert!(page.truncated());
+        assert_eq!(page.next_start_line(), None);
+    }
+
+    #[test]
+    fn a_start_offset_off_a_boundary_or_outside_the_line_is_an_error() {
+        for offset in [1, 3, 4] {
+            let err = note_line_page(
+                "éa\nb",
+                LineWindow {
+                    start_line: Some(1),
+                    max_lines: None,
+                    start_offset: Some(offset),
+                },
+                NOTE_READ_BUDGET_BYTES,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, NoteWindowError::InvalidStartOffset { .. }),
+                "{offset}"
+            );
+        }
     }
 
     fn attribution(lines: usize) -> crate::model::LineAttributionData {
@@ -702,6 +865,7 @@ mod tests {
                 LineWindow {
                     start_line: Some(start),
                     max_lines: None,
+                    start_offset: None,
                 },
                 10_000,
             );
@@ -736,6 +900,7 @@ mod tests {
             LineWindow {
                 start_line: Some(4),
                 max_lines: Some(2),
+                start_offset: None,
             },
             NOTE_READ_BUDGET_BYTES,
         );

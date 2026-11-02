@@ -2134,6 +2134,7 @@ async fn dispatch(
             let window = intent_core::note_read_bounds::LineWindow {
                 start_line: opt_positive_usize(params, "startLine")?,
                 max_lines: opt_positive_usize(params, "maxLines")?,
+                start_offset: None,
             };
             let data = api
                 .line_attribution_load(ws, note_id)
@@ -5382,6 +5383,7 @@ async fn dispatch(
             let window = intent_core::note_read_bounds::LineWindow {
                 start_line: opt_positive_usize(params, "startLine")?,
                 max_lines: opt_positive_usize(params, "maxLines")?,
+                start_offset: opt_positive_usize(params, "startOffset")?,
             };
             api.cross_workspace_read_note(ws, target, note_id, window, true)
                 .await
