@@ -281,19 +281,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_wins_while_asleep() {
+        // Shutdown is ready while the MAX_DELAY backoff timer is pending. On
+        // the paused clock a backoff that is waited out first still returns,
+        // but only after MAX_DELAY of virtual time.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = tx.send(());
-        });
-        // `true` is only returned when the shutdown future, not the
-        // MAX_DELAY sleep, finished first.
+        tx.send(()).unwrap();
+        let started = tokio::time::Instant::now();
         let mut shutdown = std::pin::pin!(rx);
         assert!(
             sleep_unless_shutdown(MAX_DELAY, &mut shutdown).await,
             "shutdown should win"
+        );
+        assert!(
+            // elapsed-assert: allow — paused tokio clock: elapsed is virtual and only moves if the backoff timer was waited out
+            started.elapsed() < MAX_DELAY,
+            "the backoff was waited out before shutdown"
         );
     }
 

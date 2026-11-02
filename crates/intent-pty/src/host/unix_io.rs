@@ -164,10 +164,25 @@ mod tests {
         let mut buf = [0; 4];
         // Every read has queued bytes: an escaped holder that continues
         // writing must not turn graceful drain into another unbounded join.
-        // The first cancelled read still drains, and starts one grace window.
-        let before = Instant::now();
+        // Inside the drain window queued output still drains. The window is
+        // set directly, so no step has to finish within real DRAIN_GRACE.
+        reader.drain_deadline = Some(Instant::now() + DRAIN_GRACE * 1000);
         peer.write_all(b"more").unwrap();
         assert_eq!(reader.read(&mut buf).unwrap(), 4, "queued output drains");
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            0,
+            "nothing queued ends the drain"
+        );
+        // Once the window has passed, the drain ends even with output queued.
+        reader.drain_deadline = Some(Instant::now());
+        peer.write_all(b"more").unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 0, "drain did not stop");
+        // The first cancelled read opens one DRAIN_GRACE window, whatever it
+        // returns (a stalled runner may already see it expired).
+        reader.drain_deadline = None;
+        let before = Instant::now();
+        let _ = reader.read(&mut buf).unwrap();
         let deadline = reader
             .drain_deadline
             .expect("cancelled read starts the drain");
@@ -175,15 +190,6 @@ mod tests {
             deadline >= before + DRAIN_GRACE && deadline <= Instant::now() + DRAIN_GRACE,
             "the drain window is one DRAIN_GRACE from the first cancelled read"
         );
-        assert_eq!(
-            reader.read(&mut buf).unwrap(),
-            0,
-            "nothing queued ends the drain"
-        );
-        // Once the window has passed, the drain ends even with output queued.
-        reader.drain_deadline = Some(before);
-        peer.write_all(b"more").unwrap();
-        assert_eq!(reader.read(&mut buf).unwrap(), 0, "drain did not stop");
     }
 
     /// Fill a real nonblocking descriptor before calling the Write adapter,
