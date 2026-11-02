@@ -32,6 +32,7 @@ mod e2e_wss_last_activity;
 mod e2e_wss_linear_pagination;
 mod e2e_wss_mcp_oauth_refresh;
 mod e2e_wss_mcp_servers;
+mod e2e_wss_message_block_pages;
 mod e2e_wss_note_set_content_merge;
 mod e2e_wss_note_truncated_read;
 mod e2e_wss_npx_launch_isolation;
