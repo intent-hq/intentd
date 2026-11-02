@@ -284,7 +284,10 @@ pub(crate) async fn history_index(
                 qualified_monitor: true,
                 id: message.id,
                 preview: text.chars().take(preview_chars).collect(),
-                metadata: message.metadata,
+                metadata: message
+                    .metadata
+                    .as_ref()
+                    .and_then(intent_store::project_user_message_index_metadata),
                 created_at: message.created_at,
             })
         })

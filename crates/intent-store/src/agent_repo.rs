@@ -6866,14 +6866,9 @@ impl Store {
     }
 
     /// Read an agent's user-role messages as lightweight index items in
-    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
-    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
-    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
-    /// the same expression the FTS index uses), and the preview truncated to
-    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
-    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
-    /// never transferred out of the database or decoded. `metadata` is
-    /// passed through verbatim when present.
+    /// chronological (`seq` ascending) order — the unpaged
+    /// `agent.listUserMessages` projection (PROTOCOL §5.5). Equivalent to
+    /// [`Self::get_agent_user_message_index_page`] with no page bound.
     ///
     /// # Errors
     ///
@@ -6884,9 +6879,52 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
+        Ok(self
+            .get_agent_user_message_index_page(agent_id, preview_chars, None)
+            .await?
+            .items)
+    }
+
+    /// Read an agent's user-role messages as lightweight index items in
+    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// projected inside SQL down to the classification fields
+    /// ([`project_user_message_index_metadata`]), so heavy keys such as an
+    /// event notification's `events` payload never leave the database
+    /// either (intent-hq/intent#8278).
+    ///
+    /// With a `page`, only the newest `page.limit` rows strictly older than
+    /// `page.before_seq` (all rows when `None`) are read, still returned
+    /// oldest→newest; [`UserMessageIndexPage::next_before_seq`] is the `seq`
+    /// of the oldest returned row when older rows remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation or a row decode
+    /// fails.
+    pub async fn get_agent_user_message_index_page(
+        &self,
+        agent_id: &AgentId,
+        preview_chars: usize,
+        page: Option<UserMessageIndexPageRequest>,
+    ) -> Result<UserMessageIndexPage> {
+        let metadata_sql = user_message_index_metadata_sql();
+        let (before_sql, order_sql) = match page {
+            Some(UserMessageIndexPageRequest {
+                before_seq: Some(_),
+                ..
+            }) => ("AND m.seq < ?", "ORDER BY m.seq DESC LIMIT ?"),
+            Some(_) => ("", "ORDER BY m.seq DESC LIMIT ?"),
+            None => ("", "ORDER BY m.seq ASC"),
+        };
         let sql = format!(
-            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
-                    m.metadata, m.created_at, \
+            "SELECT m.id, m.seq, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    {metadata_sql} AS metadata, m.created_at, \
                     (COALESCE(json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
                       AND (json_type(m.metadata, '$.resource') IS NOT NULL \
                         OR json_type(m.metadata, '$.availability') IS NOT NULL), 0) \
@@ -6897,32 +6935,56 @@ impl Store {
                            OR json_type(m.content, block.fullkey || '.messageMetadata.availability') IS NOT NULL)\
                      ) ELSE 0 END) AS qualified_monitor \
              FROM agent_message m \
-             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+             WHERE m.agent_id = ? AND m.role = 'user' {before_sql} {order_sql}"
         );
-        let rows = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql)
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
-            .bind(&agent_id.0)
+            .bind(&agent_id.0);
+        if let Some(page) = page {
+            if let Some(before_seq) = page.before_seq {
+                query = query.bind(before_seq);
+            }
+            // One extra row tells whether older history remains.
+            query = query.bind(i64::try_from(page.limit).unwrap_or(i64::MAX - 1) + 1);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
-        rows.iter()
-            .map(|row| {
-                let metadata: Option<serde_json::Value> =
-                    match col::<Option<String>>(row, "metadata")? {
-                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
-                            Error::Internal(format!("decode message metadata failed: {e}"))
-                        })?),
-                        None => None,
-                    };
-                Ok(UserMessageIndexItem {
-                    qualified_monitor: col(row, "qualified_monitor")?,
-                    id: col(row, "id")?,
-                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
-                    metadata,
-                    created_at: col(row, "created_at")?,
-                })
-            })
-            .collect()
+        let mut items = Vec::with_capacity(rows.len());
+        let mut seqs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let metadata = match col::<Option<String>>(row, "metadata")? {
+                Some(raw) => {
+                    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        Error::Internal(format!("decode message metadata failed: {e}"))
+                    })?;
+                    project_user_message_index_metadata(&value)
+                }
+                None => None,
+            };
+            seqs.push(col::<i64>(row, "seq")?);
+            items.push(UserMessageIndexItem {
+                qualified_monitor: col(row, "qualified_monitor")?,
+                id: col(row, "id")?,
+                preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
+                metadata,
+                created_at: col(row, "created_at")?,
+            });
+        }
+        let mut next_before_seq = None;
+        if let Some(page) = page {
+            if items.len() > page.limit {
+                items.truncate(page.limit);
+                seqs.truncate(page.limit);
+                next_before_seq = seqs.last().copied();
+            }
+            items.reverse();
+        }
+        Ok(UserMessageIndexPage {
+            items,
+            next_before_seq,
+        })
     }
 
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
@@ -7591,8 +7653,9 @@ pub struct ReplaceMessage<'a> {
 
 /// One row of the `agent.listUserMessages` index
 /// ([`Store::get_agent_user_message_index`]): the message id, a bounded
-/// plain-text preview, the verbatim metadata (when present), and the
-/// creation timestamp — never the full content blob.
+/// plain-text preview, the projected classification metadata
+/// ([`project_user_message_index_metadata`], when any field survives), and
+/// the creation timestamp — never the full content blob.
 #[derive(Debug, Clone)]
 pub struct UserMessageIndexItem {
     /// Whole-envelope classification only, never authorization. Kept internal
@@ -7602,6 +7665,138 @@ pub struct UserMessageIndexItem {
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+}
+
+/// A page bound for [`Store::get_agent_user_message_index_page`]: the newest
+/// `limit` user rows whose `seq` is strictly below `before_seq` (no bound
+/// when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessageIndexPageRequest {
+    pub limit: usize,
+    pub before_seq: Option<i64>,
+}
+
+/// The result of [`Store::get_agent_user_message_index_page`]: the items
+/// oldest→newest and, when a paged read left older rows unread, the `seq`
+/// to pass as the next page's `before_seq`.
+#[derive(Debug, Clone)]
+pub struct UserMessageIndexPage {
+    pub items: Vec<UserMessageIndexItem>,
+    pub next_before_seq: Option<i64>,
+}
+
+/// Top-level string metadata fields `agent.listUserMessages` serves: the
+/// authorship markers clients use to tell human rows from automated ones
+/// (PROTOCOL §5.5).
+const USER_MESSAGE_INDEX_STRING_KEYS: [&str; 4] =
+    ["type", "source", "fromAgentId", "fromPrincipalId"];
+
+/// `queueInfo` sub-fields `agent.listUserMessages` serves, with the JSON
+/// type each must have: the dequeue-wait note markers clients strip from
+/// previews.
+const USER_MESSAGE_INDEX_QUEUE_INFO_KEYS: [(&str, IndexValueKind); 3] = [
+    ("queuedAt", IndexValueKind::String),
+    ("waitedMs", IndexValueKind::Number),
+    ("batchId", IndexValueKind::String),
+];
+
+#[derive(Debug, Clone, Copy)]
+enum IndexValueKind {
+    String,
+    Number,
+}
+
+impl IndexValueKind {
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+        }
+    }
+
+    fn sql_types(self) -> &'static str {
+        match self {
+            Self::String => "('text')",
+            Self::Number => "('integer','real')",
+        }
+    }
+}
+
+/// Project persisted user-row metadata down to what `agent.listUserMessages`
+/// serves (PROTOCOL §5.5, intent-hq/intent#8278): the string-valued `type`,
+/// `source`, `fromAgentId` and `fromPrincipalId`, plus `queueInfo` narrowed
+/// to a string `queuedAt`, a numeric `waitedMs` and a string `batchId`.
+/// Every other key — notably an event notification's `events` payload — is
+/// dropped. `None` when nothing survives (including non-object metadata).
+#[must_use]
+pub fn project_user_message_index_metadata(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let source = metadata.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in USER_MESSAGE_INDEX_STRING_KEYS {
+        if let Some(value) = source.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(queue_info) = source
+        .get("queueInfo")
+        .and_then(serde_json::Value::as_object)
+    {
+        let mut projected = serde_json::Map::new();
+        for (key, kind) in USER_MESSAGE_INDEX_QUEUE_INFO_KEYS {
+            if let Some(value) = queue_info.get(key).filter(|v| kind.admits(v)) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        if !projected.is_empty() {
+            out.insert(
+                "queueInfo".to_string(),
+                serde_json::Value::Object(projected),
+            );
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+/// SQL expression pre-trimming `m.metadata` to the same fields as
+/// [`project_user_message_index_metadata`], so only the small projection
+/// leaves `SQLite`. Absent fields come out as JSON `null`; the Rust
+/// projection then drops them, so it stays the single source of truth.
+fn user_message_index_metadata_sql() -> String {
+    let field = |path: &str, types: &str| {
+        format!(
+            "CASE WHEN json_type(m.metadata, '{path}') IN {types} \
+             THEN json_extract(m.metadata, '{path}') END"
+        )
+    };
+    let mut args: Vec<String> = USER_MESSAGE_INDEX_STRING_KEYS
+        .iter()
+        .map(|key| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.{key}"), IndexValueKind::String.sql_types())
+            )
+        })
+        .collect();
+    let queue_args: Vec<String> = USER_MESSAGE_INDEX_QUEUE_INFO_KEYS
+        .iter()
+        .map(|(key, kind)| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.queueInfo.{key}"), kind.sql_types())
+            )
+        })
+        .collect();
+    args.push(format!(
+        "'queueInfo', CASE WHEN json_type(m.metadata, '$.queueInfo') = 'object' \
+         THEN json_object({}) END",
+        queue_args.join(", ")
+    ));
+    format!(
+        "CASE WHEN m.metadata IS NULL THEN NULL ELSE json_object({}) END",
+        args.join(", ")
+    )
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -15597,7 +15792,7 @@ mod tests {
 
     /// `get_agent_user_message_index` (`agent.listUserMessages`, §5.5)
     /// returns only user-role rows, oldest→newest, with previews bounded to
-    /// the requested char count and metadata passed through verbatim; other
+    /// the requested char count and metadata projected; other
     /// roles are excluded in SQL and an empty/unknown agent yields an empty
     /// index.
     #[tokio::test]
@@ -15758,8 +15953,8 @@ mod tests {
         );
         assert_eq!(
             items[1].metadata,
-            Some(serde_json::json!({"automated": true, "source": "hook"})),
-            "metadata passes through verbatim"
+            Some(serde_json::json!({"source": "hook"})),
+            "metadata is projected to the classification fields"
         );
         assert_eq!(
             items[2].preview.chars().count(),
@@ -15786,6 +15981,186 @@ mod tests {
             .await
             .expect("empty index")
             .is_empty());
+    }
+
+    /// Regression for intent-hq/intent#8278: a busy coordinator's
+    /// event-notification rows carry whole event payloads in
+    /// `metadata.events`, which made the index ~20 MB. The index serves only
+    /// the classification fields, trimmed inside SQL, and the SQL pre-trim
+    /// agrees with the Rust projection on every shape.
+    #[tokio::test]
+    async fn get_agent_user_message_index_projects_heavy_metadata() {
+        let tmp = TempDb::new("index-metadata-projection");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-projection".into());
+        let agent = AgentId("agent-index-projection".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let report = "r".repeat(64 * 1024);
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "event_notification",
+                    "events": [{"type": "agent:reportToParent", "report": report}],
+                    "queueInfo": {
+                        "queuedAt": "2026-11-01T07:01:11Z",
+                        "waitedMs": 6200,
+                        "batchId": "b-1",
+                        "queuedMessageId": "q-1",
+                        "extra": {"big": report},
+                    },
+                }),
+                Some(serde_json::json!({
+                    "type": "event_notification",
+                    "queueInfo": {"queuedAt": "2026-11-01T07:01:11Z", "waitedMs": 6200, "batchId": "b-1"},
+                })),
+            ),
+            (
+                serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1", "model": "m"}),
+                Some(
+                    serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1"}),
+                ),
+            ),
+            (
+                serde_json::json!({"type": 7, "source": {"nested": true}, "queueInfo": {"queuedAt": 1, "waitedMs": "x"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"queueInfo": {"queuedMessageId": "q-2"}}),
+                None,
+            ),
+            (serde_json::json!({"userAppMessageId": "app-1"}), None),
+            (
+                serde_json::json!({"queueInfo": {"waitedMs": 1.5}}),
+                Some(serde_json::json!({"queueInfo": {"waitedMs": 1.5}})),
+            ),
+            (serde_json::json!(["not", "an", "object"]), None),
+            (serde_json::json!("string metadata"), None),
+        ];
+        for (metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "row"}]),
+                    Some(metadata),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (metadata, expected)) in index.iter().zip(&cases) {
+            assert_eq!(&item.metadata, expected, "projection of {metadata}");
+            assert_eq!(
+                &project_user_message_index_metadata(metadata),
+                expected,
+                "Rust projection of {metadata}"
+            );
+        }
+        let encoded =
+            serde_json::to_string(&index.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>())
+                .unwrap();
+        assert!(
+            encoded.len() < 1024,
+            "heavy keys never leave the store: {encoded}"
+        );
+    }
+
+    /// A paged index read serves the newest `limit` rows oldest→newest, and
+    /// its `next_before_seq` walks older pages to the start without gaps or
+    /// repeats.
+    #[tokio::test]
+    async fn get_agent_user_message_index_page_walks_newest_first() {
+        let tmp = TempDb::new("index-paging");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-paging".into());
+        let agent = AgentId("agent-index-paging".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..7 {
+            let row = store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": format!("user {n}")}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+            ids.push(row.id);
+            store
+                .append_agent_message(
+                    &agent,
+                    "assistant",
+                    &serde_json::json!([{"type": "text", "text": "reply"}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let page = |before_seq| UserMessageIndexPageRequest {
+            limit: 3,
+            before_seq,
+        };
+        let first = store
+            .get_agent_user_message_index_page(&agent, 300, Some(page(None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            ids[4..].to_vec(),
+            "newest rows, oldest→newest"
+        );
+        let mut walked: Vec<String> = first.items.iter().map(|i| i.id.clone()).collect();
+        let mut cursor = first.next_before_seq;
+        let mut pages = 1;
+        while let Some(before_seq) = cursor {
+            let next = store
+                .get_agent_user_message_index_page(&agent, 300, Some(page(Some(before_seq))))
+                .await
+                .unwrap();
+            let mut older: Vec<String> = next.items.iter().map(|i| i.id.clone()).collect();
+            older.append(&mut walked);
+            walked = older;
+            cursor = next.next_before_seq;
+            pages += 1;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(walked, ids, "pages cover every user row exactly once");
+
+        let exact = store
+            .get_agent_user_message_index_page(
+                &agent,
+                300,
+                Some(UserMessageIndexPageRequest {
+                    limit: 7,
+                    before_seq: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.items.len(), 7);
+        assert_eq!(exact.next_before_seq, None, "no older rows remain");
     }
 
     /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
