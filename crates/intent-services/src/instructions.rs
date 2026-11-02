@@ -268,6 +268,14 @@ pub(crate) static V3_5: InstructionSet = InstructionSet {
     ..V3_4
 };
 
+/// Harness v3.6 keeps every v3.5 body except the common guidance, which adds
+/// a "Long-running Processes" section steering dev servers, watchers and long
+/// builds to Intent scripts instead of provider-native background shells.
+pub(crate) static V3_6: InstructionSet = InstructionSet {
+    common: instr!("v3.6", "common"),
+    ..V3_5
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -427,11 +435,19 @@ fn gated_common(
     } else {
         body = Cow::Owned(remove_section(&body, "Waiting on External Conditions"));
     }
+    if !features.scripts {
+        body = Cow::Owned(remove_section(&body, COMMON_LONG_RUNNING_PROCESSES));
+    }
     if !features.rich_chat_blocks {
         body = Cow::Owned(remove_section(&body, "Rich Chat Rendering"));
     }
     body
 }
+
+/// Heading of the harness v3.6 common section that steers long-running work
+/// to `ws.script.*`; removed when `agentFeatures.scripts` is off. Earlier
+/// sets lack the heading, so the gate is a no-op for them.
+pub(crate) const COMMON_LONG_RUNNING_PROCESSES: &str = "Long-running Processes";
 
 /// Markers of the task-graph teaching in `task-breakdown.md` (from
 /// intentd#1116/#1135), removed when `agentFeatures.taskGraph` is off
@@ -651,8 +667,9 @@ mod tests {
         defaults()
     }
 
-    /// The current common body includes workspace links and development-only visuals.
-    const COMMON_LATEST: &str = V3_5.common;
+    /// The current common body includes workspace links, development-only
+    /// visuals and the long-running-process (Intent scripts) guidance.
+    const COMMON_LATEST: &str = V3_6.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
@@ -1070,8 +1087,30 @@ mod tests {
         assert!(!out.contains("ws.hook."));
         // Neighboring sections survive intact, with clean separation.
         assert!(out.contains("## Raising Attention"));
-        assert!(out.contains("with no `advisory`).\n\n## Response Organization"));
+        assert!(out.contains("with no `advisory`).\n\n## Long-running Processes"));
         assert!(out.contains("## Rich Chat Rendering"));
+    }
+
+    #[test]
+    fn scripts_off_removes_only_long_running_processes_section() {
+        let heading = format!("## {COMMON_LONG_RUNNING_PROCESSES}\n");
+        assert!(COMMON_LATEST.contains(&heading));
+        let on = get_instruction_with_common("task-loop", &defaults());
+        assert!(on.contains(&heading));
+        let features = AgentFeaturesSettings {
+            scripts: false,
+            ..defaults()
+        };
+        let out = get_instruction_with_common("task-loop", &features);
+        assert!(!out.contains(&heading));
+        assert!(!out.contains("run_in_background"));
+        // Neighboring sections survive intact, with clean separation.
+        assert!(out.contains("ask the coordinator/user instead.\n\n## Response Organization"));
+        assert_eq!(
+            out,
+            remove_section(&on, COMMON_LONG_RUNNING_PROCESSES),
+            "only the scripts section is removed"
+        );
     }
 
     #[test]

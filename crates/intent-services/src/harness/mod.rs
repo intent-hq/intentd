@@ -57,6 +57,7 @@ pub(crate) mod v3_1;
 pub(crate) mod v3_3;
 pub(crate) mod v3_4;
 pub(crate) mod v3_5;
+pub(crate) mod v3_6;
 
 // Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
@@ -561,6 +562,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v3_3::ENTRY,
     &v3_4::ENTRY,
     &v3_5::ENTRY,
+    &v3_6::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
