@@ -13,13 +13,29 @@ These app-version notes qualify every later description in this guide:
 - Tool-output and large-image preview descriptions are for supporting test builds
   until their frontend release is verified. Do not offer them in ordinary help
   based on daemon support alone.
-- **Browser access** directions apply only to app versions offering that Devices
-  section. Older apps lack it; **Mobile → Remote Access** is for mobile access.
+- **Browser access** is experimental. Discuss it only when explicitly asked or
+  developing or testing it, and require an app offering its Labs command and
+  **Mobile → Browser access** section. Older apps may lack it;
+  **Mobile → Remote Access** is a separate mobile-access feature.
 - Agent **Pin to top** and **Unpin** require matching app and daemon agent-pinning
   support. Older app/daemon combinations do not offer that agent-list action.
 - Repository-picker **Clone**, **Existing folder**, and **New** labels apply to the
   updated app layout. Older apps keep **Pick a repo** or their forge selection,
   **Copy local repo**, and **New repo**.
+- Sidebar section tabs, hover previews, disclosure and count controls, script
+  **Actions**, file filters, unread dots, and commit/history labels apply only
+  in app versions offering them. Older apps may use different controls or return
+  to the overview when the selected tab is clicked; use their existing
+  **Context** actions to find the Spec and other notes.
+
+**Reveal in Sidebar** keeps other selected panes open only in supporting
+multi-pane apps. Older apps retain their existing single-pane navigation.
+
+In app versions with a PR list for the whole workspace, it appears above
+**Changes**. Switching the selected Git root changes the file changes view and
+keeps the PR list in place.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{WorkspacePullRequests,SidebarPrList}.svelte. -->
 
 Keep ordinary answers and recommendations focused on supported features ready for
 users. Do not proactively mention or recommend unfinished, experimental, Labs-only,
@@ -1035,12 +1051,7 @@ authenticated tunnel.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,WorkspacePullRequests,SidebarPrList,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
-
-Sidebar tabs and previews depend on the app version. The layout below applies to
-apps with the newer section tabs and hover previews. Older apps may use different
-controls or return to the overview when the selected tab is clicked; use their
-existing **Context** actions to find the Spec and other notes.
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
@@ -1083,12 +1094,8 @@ toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
 Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
-In a supporting multi-pane build, this keeps other selected panes open. When
-collapsed, it opens the matching floating section beside the rail.
-
-In app versions with a PR list for the whole workspace, it appears above
-**Changes**. Switching the selected Git root changes the file changes view and
-keeps the PR list in place.
+This keeps other selected panes open. When collapsed, it opens the matching
+floating section beside the rail.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
