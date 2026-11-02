@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.105] - 2026-11-02
+
+### 🚀 Features
+
+- Remove git and PR instructions and tools in plain-folder workspaces ([#2929](https://github.com/intent-hq/intentd/pull/2929))
+- *(agents)* Persist a per-agent sidebar pin ([#2938](https://github.com/intent-hq/intentd/pull/2938))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Verify an unmergeable queue entry before fixing the branch ([#2942](https://github.com/intent-hq/intentd/pull/2942))
+
+### 🧪 Testing
+
+- Lint and replace elapsed-time assertions in tests ([#2941](https://github.com/intent-hq/intentd/pull/2941))
+
+
 ## [0.11.104] - 2026-11-02
 
 ### 🚀 Features
