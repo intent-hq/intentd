@@ -405,13 +405,14 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte, command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
 
 ## Use Intent from a browser on another device (experimental)
 
-Browser access is experimental and hidden until its feature code is entered with
-Cmd+K. Do not offer it as a normal option; describe it only when the user asks about
-it, and say it is experimental. Do not reveal or guess the feature code.
+Browser access is experimental and hidden until the user runs **Enable experimental
+browser access** from Cmd+K (Labs). Do not offer it as a normal option; describe it only
+when the user asks about it, and say it is experimental. **Disable experimental browser
+access** hides the section and turns the server off.
 
 Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
 a browser on another device, such as a laptop, use the desktop app, including every
