@@ -2078,18 +2078,12 @@ fn payload_class_parameters_are_well_formed() {
                     "BulkTransfer {}: max_bytes {max_bytes} must exceed the read budget (else classify it BoundedRead) and fit the outbound frame cap",
                     row.method
                 );
-                match cap_param {
-                    Some(param) => assert!(
+                if let Some(param) = cap_param {
+                    assert!(
                         !param.trim().is_empty(),
-                        "BulkTransfer {}: name the param that caps one response",
+                        "BulkTransfer {}: name the param that shrinks one response, or use None for a server-side bound",
                         row.method
-                    ),
-                    None => assert_eq!(
-                        max_bytes,
-                        crate::MAX_OUTBOUND_MESSAGE_BYTES,
-                        "BulkTransfer {}: an object sent whole is bounded only by the outbound frame cap",
-                        row.method
-                    ),
+                    );
                 }
             }
             PayloadClass::ExternalProxy { page_param } => {
@@ -2109,6 +2103,42 @@ fn payload_class_parameters_are_well_formed() {
             PayloadClass::BoundedRead | PayloadClass::Subscription | PayloadClass::Mutation => {}
         }
     }
+}
+
+/// Regression: every bulk row's cap matches what its handler enforces.
+/// `terminal.getBuffer` has no hard ring cap (an ACP terminal's
+/// `outputByteLimit` sizes the ring unclamped, and an omitted `maxBytes`
+/// returns all of it), and `workspace.export.read`'s `seq` selects a chunk
+/// rather than sizing it. Update this list together with the handler.
+#[test]
+fn bulk_transfer_caps_match_handlers() {
+    let chunk = intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+    let frame = crate::MAX_OUTBOUND_MESSAGE_BYTES;
+    let expected: BTreeSet<(&str, Option<&str>, usize)> = [
+        ("agent.getMessageBlock", None, frame),
+        ("file.read", None, frame),
+        ("file.readChunk", Some("length"), chunk),
+        ("git.showFile", None, frame),
+        ("note.readAsset", None, frame),
+        ("terminal.getBuffer", Some("maxBytes"), frame),
+        ("workspace.export.read", None, chunk),
+    ]
+    .into_iter()
+    .collect();
+    let actual: BTreeSet<(&str, Option<&str>, usize)> = PAYLOAD_CLASSES
+        .iter()
+        .filter_map(|row| match row.class {
+            PayloadClass::BulkTransfer {
+                cap_param,
+                max_bytes,
+            } => Some((row.method, cap_param, max_bytes)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "BulkTransfer rows changed: check each cap against its handler and update this list"
+    );
 }
 
 /// `*.subscribe` methods whose subscribe sends **no** seq-0 snapshot. Every

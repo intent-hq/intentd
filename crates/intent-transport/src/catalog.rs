@@ -1146,11 +1146,6 @@ pub const READ_PAYLOAD_BUDGET_BYTES: usize = 500 * 1024;
 const IMPORT_MAX_CHUNK_BYTES: usize =
     intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
-/// Raw bytes a terminal scrollback ring holds, mirroring intent-pty's
-/// crate-private `DEFAULT_SCROLLBACK_BYTES`; `terminal.getBuffer` replays at
-/// most this much.
-const TERMINAL_SCROLLBACK_BYTES: usize = 512 * 1024;
-
 /// How large one response of a method may legitimately be. See
 /// [`PAYLOAD_CLASSES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,11 +1154,15 @@ pub enum PayloadClass {
     /// [`READ_PAYLOAD_BUDGET_BYTES`] on the large fixture.
     BoundedRead,
     /// An intentional large payload (file, blob, asset, export chunk).
-    /// `cap_param` is the request param that bounds one response (`None`
-    /// when the object is sent whole) and `max_bytes` the most one response
-    /// may carry before encoding.
+    /// `cap_param` is the request param a caller sets to shrink one
+    /// response, and `max_bytes` the most one response may carry before
+    /// encoding whatever the caller sends. `cap_param` is `None` when no
+    /// request param bounds the bytes: either the object is sent whole
+    /// (`max_bytes` is then the outbound frame cap) or the server cuts
+    /// fixed-size chunks (`max_bytes` is that chunk cap).
     BulkTransfer {
-        /// Request param bounding one response, or `None` if sent whole.
+        /// Request param that shrinks one response, or `None` when the
+        /// bound is server-side only.
         cap_param: Option<&'static str>,
         /// Most bytes one response carries before encoding.
         max_bytes: usize,
@@ -1657,7 +1656,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("task.updateNoteStatus", "Writes task state."),
     mutation("task.updateStatus", "Writes task state."),
     mutation("terminal.create", "Spawns a terminal."),
-    bulk("terminal.getBuffer", Some("maxBytes"), TERMINAL_SCROLLBACK_BYTES, "Raw scrollback replay; maxBytes trims it and the PTY scrollback ring caps it."),
+    bulk("terminal.getBuffer", Some("maxBytes"), crate::MAX_OUTBOUND_MESSAGE_BYTES, "Raw scrollback replay; maxBytes keeps the tail, and an omitted or negative maxBytes returns the whole ring. The ring defaults to 512 KiB, but an ACP terminal's outputByteLimit sets it without a clamp, so only the outbound frame cap is a hard bound."),
     mutation("terminal.kill", "Kills a terminal."),
     bounded("terminal.list", "Terminals of one workspace."),
     bounded("terminal.readOutput", "Terminal output page (maxLines, paginated)."),
@@ -1678,7 +1677,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("workspace.duplicate", "Duplicates a workspace."),
     mutation("workspace.export.abort", "Aborts an export."),
     mutation("workspace.export.finalize", "Finalizes an export."),
-    bulk("workspace.export.read", Some("seq"), IMPORT_MAX_CHUNK_BYTES, "One export chunk by seq; each chunk is capped at the transfer chunk size before base64."),
+    bulk("workspace.export.read", None, IMPORT_MAX_CHUNK_BYTES, "One export chunk; seq only selects which chunk. The server cuts chunks at the fixed transfer chunk cap before base64, and no request param changes it."),
     mutation("workspace.export.start", "Starts an export."),
     bounded("workspace.findByPullRequest", "Workspaces for one PR."),
     bounded("workspace.findRepositories", "Repositories under a path."),
