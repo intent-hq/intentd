@@ -781,7 +781,7 @@ async fn queue_merge_restored_alias_is_not_duplicated_by_frozen_draining_overlay
     assert_eq!(snapshot[0]["id"], "a1");
     assert_eq!(snapshot[0]["content"], "one\n\ntwo");
     svc.freeze_shutdown_drains();
-    svc.persist_shutdown_drains().await;
+    svc.persist_shutdown_queues().await;
     drop(guard);
     let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();

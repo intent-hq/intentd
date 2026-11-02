@@ -1,15 +1,19 @@
 //! Internal node persistence. All mutations serialize on the write pool and
 //! recheck the durable lease owner. This is not a wire authorization boundary;
 //! callers must still apply existing principal/agent/workspace authorization.
-//! Journal ingestion owns ack advancement in its transcript transaction. There
-//! is deliberately no standalone watermark setter here.
+//! The journal ack only moves forward ([`Store::advance_node_lease_ack`]):
+//! head persists it before acknowledging records to the node, so a restarted
+//! head never asks for records the node has already dropped.
 use crate::Store;
 use intent_core::{
     nodes::{
-        CheckpointOutcome, CheckpointReceipt, LeaseFence, LeaseOwner, LeaseState, NodeAssignment,
-        NodeCheckpoint, NodeCounter, NodeKind, NodeLease, NodeRecord, NodeState,
+        CheckpointOutcome, CheckpointReceipt, LeaseFence, LeaseOwner, LeaseState, NodeArch,
+        NodeAssignment, NodeCheckpoint, NodeCounter, NodeKind, NodeLease, NodeOs, NodeRecord,
+        NodeState,
     },
-    now_iso, AgentId, Error, Result, WorkspaceId,
+    now_iso,
+    remote_launch::RemoteAgentRecord,
+    AgentId, Error, Result, WorkspaceId,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{Row, SqliteConnection};
@@ -114,49 +118,8 @@ impl Store {
     /// # Errors
     /// Rejects malformed/mismatched records, reused identity or database errors.
     pub async fn enroll_node(&self, record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+        validate_enrollment(record, initial)?;
         let owner = &initial.owner;
-        if record.id.is_empty()
-            || record.head_id.is_empty()
-            || record.node_identity.is_empty()
-            || owner.node_id != record.id
-            || owner.head_id != record.head_id
-            || owner.node_identity != record.node_identity
-            || owner.lease_id.is_empty()
-            || uuid::Uuid::parse_str(&owner.incarnation).is_err()
-            || initial.state != LeaseState::Acquiring
-            || initial.release_requested
-            || initial.fence.is_some()
-            || initial.ack_seq != NodeCounter(0)
-            || initial.link_generation != NodeCounter(0)
-        {
-            return Err(invalid("invalid initial node/lease binding"));
-        }
-        if record.capacity.memory_budget_bytes > MAX_SAFE_INTEGER
-            || record.capacity.used_memory_bytes > MAX_SAFE_INTEGER
-        {
-            return Err(invalid("capacity exceeds safe JSON integer"));
-        }
-        match record.kind {
-            NodeKind::Static => {
-                if !record
-                    .endpoint
-                    .as_ref()
-                    .is_some_and(|s| s.starts_with("wss://") && s.ends_with("/node"))
-                    || !record.certificate_sha256.as_ref().is_some_and(|s| {
-                        s.len() == 64
-                            && s.bytes()
-                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    })
-                {
-                    return Err(invalid("static node requires pinned WSS endpoint"));
-                }
-            }
-            NodeKind::Local => {
-                if record.endpoint.is_some() || record.certificate_sha256.is_some() {
-                    return Err(invalid("local node has no network credential"));
-                }
-            }
-        }
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query("INSERT INTO execution_node (id, head_id, node_identity, record_json) VALUES (?, ?, ?, ?)")
             .bind(&record.id).bind(&record.head_id).bind(&record.node_identity).bind(encode(record)?)
@@ -171,6 +134,156 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
+    /// Daemon-to-daemon: start `initial`, a fresh lease on exposed machine
+    /// `record.id` for a newly added executor credential. Registers the
+    /// machine on first use and otherwise refreshes its record (same head
+    /// only), ends every live lease the head holds on it (`lost`, fenced:
+    /// the caller has stopped or refused their agents), then inserts the new
+    /// lease at link generation `generation`, the one its probe bound with.
+    /// # Errors
+    /// Rejects a malformed binding, a machine registered by another head or
+    /// database errors.
+    pub async fn renew_machine_lease(
+        &self,
+        record: &NodeRecord,
+        initial: &NodeLease,
+        generation: NodeCounter,
+    ) -> Result<()> {
+        validate_enrollment(record, initial)?;
+        let owner = &initial.owner;
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let head: Option<String> =
+            sqlx::query_scalar("SELECT head_id FROM execution_node WHERE id = ?")
+                .bind(&record.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        match head {
+            None => {
+                sqlx::query("INSERT INTO execution_node (id, head_id, node_identity, record_json) VALUES (?, ?, ?, ?)")
+                    .bind(&record.id).bind(&record.head_id).bind(&record.node_identity).bind(encode(record)?)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
+            Some(head) if head == record.head_id => {
+                end_live_leases(&mut tx, &record.id).await?;
+                sqlx::query(
+                    "UPDATE execution_node SET node_identity = ?, record_json = ? WHERE id = ?",
+                )
+                .bind(&record.node_identity)
+                .bind(encode(record)?)
+                .bind(&record.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            }
+            Some(_) => return Err(invalid("node is registered by another head")),
+        }
+        let mut lease = initial.clone();
+        lease.link_generation = generation;
+        sqlx::query("INSERT INTO node_lease (id, node_id, record_json) VALUES (?, ?, ?)")
+            .bind(&owner.lease_id)
+            .bind(&record.id)
+            .bind(encode(&lease)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// Daemon-to-daemon: end every live lease on exposed machine `node_id`
+    /// owned by `head_id` (the machine was removed). Returns how many ended.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn end_machine_leases(&self, node_id: &str, head_id: &str) -> Result<usize> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let owned: Option<String> =
+            sqlx::query_scalar("SELECT id FROM execution_node WHERE id = ? AND head_id = ?")
+                .bind(node_id)
+                .bind(head_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        if owned.is_none() {
+            return Ok(0);
+        }
+        let ended = end_live_leases(&mut tx, node_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(ended)
+    }
+}
+
+/// End every live lease of `node_id` as `lost`, fenced now.
+async fn end_live_leases(conn: &mut SqliteConnection, node_id: &str) -> Result<usize> {
+    let rows = sqlx::query("SELECT record_json FROM node_lease WHERE node_id = ? AND terminal = 0")
+        .bind(node_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db)?;
+    let mut ended = 0;
+    for row in rows {
+        let mut record: NodeLease = decode(row.get("record_json"))?;
+        if record.state.is_terminal() {
+            continue;
+        }
+        record.state = LeaseState::Lost;
+        record.fence = Some(LeaseFence {
+            kind: intent_core::nodes::LeaseFenceKind::ProcessesStopped,
+            recorded_at: now_iso(),
+        });
+        save_lease(&mut *conn, &record).await?;
+        ended += 1;
+    }
+    Ok(ended)
+}
+
+fn validate_enrollment(record: &NodeRecord, initial: &NodeLease) -> Result<()> {
+    let owner = &initial.owner;
+    if record.id.is_empty()
+        || record.head_id.is_empty()
+        || record.node_identity.is_empty()
+        || owner.node_id != record.id
+        || owner.head_id != record.head_id
+        || owner.node_identity != record.node_identity
+        || owner.lease_id.is_empty()
+        || uuid::Uuid::parse_str(&owner.incarnation).is_err()
+        || initial.state != LeaseState::Acquiring
+        || initial.release_requested
+        || initial.fence.is_some()
+        || initial.ack_seq != NodeCounter(0)
+        || initial.link_generation != NodeCounter(0)
+    {
+        return Err(invalid("invalid initial node/lease binding"));
+    }
+    if record.capacity.memory_budget_bytes > MAX_SAFE_INTEGER
+        || record.capacity.used_memory_bytes > MAX_SAFE_INTEGER
+    {
+        return Err(invalid("capacity exceeds safe JSON integer"));
+    }
+    match record.kind {
+        NodeKind::Static => {
+            if !record
+                .endpoint
+                .as_ref()
+                .is_some_and(|s| s.starts_with("wss://") && s.ends_with("/node"))
+                || !record.certificate_sha256.as_ref().is_some_and(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            {
+                return Err(invalid("static node requires pinned WSS endpoint"));
+            }
+        }
+        NodeKind::Local => {
+            if record.endpoint.is_some() || record.certificate_sha256.is_some() {
+                return Err(invalid("local node has no network credential"));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Store {
     /// Enumerate durable registrations for one head installation on restart.
     /// These private records must be projected before public inventory delivery.
     /// # Errors
@@ -615,6 +728,195 @@ impl Store {
         let json: Option<String> = sqlx::query_scalar("SELECT c.record_json FROM node_assignment a JOIN node_checkpoint c ON c.id = a.current_checkpoint_id WHERE a.agent_id = ? AND a.workspace_id = ?")
             .bind(agent_id.as_str()).bind(workspace_id.as_str()).fetch_optional(self.read_pool()).await.map_err(db)?;
         json.as_deref().map(decode).transpose()
+    }
+}
+
+impl Store {
+    /// The registration of node `id`, whichever head installation owns it.
+    /// Head uses it at startup to find its own id for a configured node.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn find_execution_node(&self, id: &str) -> Result<Option<NodeRecord>> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT record_json FROM execution_node WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(db)?;
+        json.as_deref().map(decode).transpose()
+    }
+
+    /// The head id this installation registered its nodes under, if it has
+    /// registered any.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn node_head_id(&self) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT head_id FROM execution_node ORDER BY rowid LIMIT 1")
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(db)
+    }
+
+    /// Record what the node reported when a link was bound: its platform,
+    /// capacity and version. The node becomes ready and an acquiring lease
+    /// becomes ready.
+    /// # Errors
+    /// Rejects terminal/stale leases, invalid transitions or database errors.
+    pub async fn record_node_welcome(
+        &self,
+        owner: &LeaseOwner,
+        os: NodeOs,
+        arch: NodeArch,
+        max_agents: u32,
+        version: &str,
+    ) -> Result<NodeLease> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let mut record = lease(&mut tx, owner).await?;
+        if record.state.is_terminal() {
+            return Err(invalid("terminal lease"));
+        }
+        let mut host = node(&mut tx, &owner.node_id, &owner.head_id).await?;
+        let seen = now_iso();
+        host.os = os;
+        host.arch = arch;
+        host.capacity.max_agents = max_agents;
+        host.version = version.to_owned();
+        host.state = NodeState::Ready;
+        host.last_seen_at = Some(seen.clone());
+        if record.state == LeaseState::Acquiring {
+            record.state = LeaseState::Ready;
+        }
+        record.last_seen_at = Some(seen);
+        save_node(&mut tx, &host).await?;
+        save_lease(&mut tx, &record).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(record)
+    }
+
+    /// Persist that head has ingested every journal record up to `seq`. The
+    /// ack never moves backwards; the persisted value is returned.
+    /// # Errors
+    /// Rejects terminal/stale leases or database errors.
+    pub async fn advance_node_lease_ack(
+        &self,
+        owner: &LeaseOwner,
+        seq: NodeCounter,
+    ) -> Result<NodeCounter> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let record = lease(&mut tx, owner).await?;
+        if record.state.is_terminal() {
+            return Err(invalid("terminal lease"));
+        }
+        if seq <= record.ack_seq {
+            return Ok(record.ack_seq);
+        }
+        sqlx::query("UPDATE node_lease SET ack_seq = ? WHERE id = ?")
+            .bind(seq.0.to_string())
+            .bind(&owner.lease_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(seq)
+    }
+
+    /// Record that `agent.agent_id` runs on `agent.node_id` under
+    /// `agent.lease_id`. Recording the same agent again is a no-op only for
+    /// an identical node and lease.
+    /// # Errors
+    /// Rejects an unknown or terminal lease, an agent already placed
+    /// elsewhere, a missing agent or database errors.
+    pub async fn record_remote_agent(&self, agent: &RemoteAgentRecord) -> Result<()> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let row = sqlx::query("SELECT node_id, terminal FROM node_lease WHERE id = ?")
+            .bind(&agent.lease_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| Error::NotFound("lease".into()))?;
+        if row.get::<String, _>("node_id") != agent.node_id || row.get::<bool, _>("terminal") {
+            return Err(invalid("lease does not admit agents on this node"));
+        }
+        let existing = sqlx::query("SELECT node_id, lease_id FROM remote_agent WHERE agent_id = ?")
+            .bind(agent.agent_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+        if let Some(existing) = existing {
+            if existing.get::<String, _>("node_id") == agent.node_id
+                && existing.get::<String, _>("lease_id") == agent.lease_id
+            {
+                return Ok(());
+            }
+            return Err(invalid("agent already runs on another lease"));
+        }
+        sqlx::query(
+            "INSERT INTO remote_agent (agent_id, workspace_id, node_id, lease_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(agent.agent_id.as_str())
+        .bind(agent.workspace_id.as_str())
+        .bind(&agent.node_id)
+        .bind(&agent.lease_id)
+        .bind(&agent.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// The agents recorded on `lease_id`, oldest first.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn list_remote_agents(&self, lease_id: &str) -> Result<Vec<RemoteAgentRecord>> {
+        let rows = sqlx::query(
+            "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent WHERE lease_id = ? ORDER BY created_at, agent_id",
+        )
+        .bind(lease_id)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .iter()
+            .map(|row| RemoteAgentRecord {
+                agent_id: AgentId::from(row.get::<String, _>("agent_id")),
+                workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+                node_id: row.get("node_id"),
+                lease_id: row.get("lease_id"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Where `agent_id` runs remotely, if it does.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_remote_agent(&self, agent_id: &AgentId) -> Result<Option<RemoteAgentRecord>> {
+        let row = sqlx::query(
+            "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent WHERE agent_id = ?",
+        )
+        .bind(agent_id.as_str())
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(row.map(|row| RemoteAgentRecord {
+            agent_id: AgentId::from(row.get::<String, _>("agent_id")),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            node_id: row.get("node_id"),
+            lease_id: row.get("lease_id"),
+            created_at: row.get("created_at"),
+        }))
+    }
+
+    /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn remove_remote_agent(&self, agent_id: &AgentId) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM remote_agent WHERE agent_id = ?")
+            .bind(agent_id.as_str())
+            .execute(self.write_pool())
+            .await
+            .map_err(db)?;
+        Ok(done.rows_affected() > 0)
     }
 }
 

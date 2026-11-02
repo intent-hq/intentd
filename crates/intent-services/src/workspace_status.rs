@@ -3950,6 +3950,7 @@ mod workspace_needs_attention {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 

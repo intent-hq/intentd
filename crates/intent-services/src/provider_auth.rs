@@ -103,7 +103,7 @@ pub enum CliAuthProbe {
 impl CliAuthProbe {
     /// The wire mapping for `host.providerAuthStatus`:
     /// `authenticated: true | false | null`.
-    fn auth_status(self) -> Option<bool> {
+    pub(crate) fn auth_status(self) -> Option<bool> {
         match self {
             CliAuthProbe::Authenticated => Some(true),
             CliAuthProbe::NotAuthenticated => Some(false),
@@ -199,19 +199,65 @@ pub async fn check_provider_auth_cli(
     check_provider_auth_cli_in(provider_id, program, auth_check_args, None).await
 }
 
+/// The login-shell credential capture a profile-less launch gap-fills
+/// (`intent_acp` `build_command`). The first capture can block on the
+/// login shell, so it runs off the async executor; a failure is empty.
+async fn captured_credential_env() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    tokio::task::spawn_blocking(intent_core::path_utils::login_shell_credential_env)
+        .await
+        .unwrap_or(&EMPTY)
+}
+
+/// Gap-fill `captured` into a probe the way a profile-less launch does:
+/// a variable the daemon's own environment sets is never overridden.
+/// SECURITY: the values are secrets — never log them.
+fn gap_fill_credentials(
+    cmd: &mut tokio::process::Command,
+    captured: &std::collections::BTreeMap<String, String>,
+) {
+    for (key, value) in captured {
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, value);
+        }
+    }
+}
+
 /// [`check_provider_auth_cli`], optionally under a resolved installed
 /// context (a named profile): the probe then runs with exactly that
-/// context's environment, as its launches do.
+/// context's environment, as its launches do. Without one it runs with the
+/// environment a profile-less launch gets: the daemon's own, gap-filled
+/// with the captured login-shell credentials.
 async fn check_provider_auth_cli_in(
     provider_id: &str,
     program: &OsStr,
     auth_check_args: &[&str],
     context: Option<&crate::installed_cli::InstalledContext>,
 ) -> CliAuthProbe {
+    let captured = if context.is_none() && provider_id != "claude-code" {
+        captured_credential_env().await
+    } else {
+        static EMPTY: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        &EMPTY
+    };
+    check_provider_auth_cli_with(provider_id, program, auth_check_args, context, captured).await
+}
+
+/// [`check_provider_auth_cli_in`] with the captured credentials given
+/// (the test seam). claude-code applies its own allow-listed merge.
+async fn check_provider_auth_cli_with(
+    provider_id: &str,
+    program: &OsStr,
+    auth_check_args: &[&str],
+    context: Option<&crate::installed_cli::InstalledContext>,
+    captured: &std::collections::BTreeMap<String, String>,
+) -> CliAuthProbe {
     let probe_command = |program: &OsStr| {
         let mut cmd = probe_command(program);
-        if let Some(context) = context {
-            context.apply(&mut cmd);
+        match context {
+            Some(context) => context.apply(&mut cmd),
+            None => gap_fill_credentials(&mut cmd, captured),
         }
         cmd
     };
@@ -681,9 +727,14 @@ impl AuthStatusCache {
     }
 
     fn fresh(&self, provider_id: &str) -> Option<AuthVerdict> {
+        self.fresh_entry(provider_id).map(|(_, verdict)| verdict)
+    }
+
+    /// [`AuthStatusCache::fresh`] with the instant the verdict was stored.
+    fn fresh_entry(&self, provider_id: &str) -> Option<(Instant, AuthVerdict)> {
         let entries = self.entries.lock().expect("auth cache poisoned");
         let (at, verdict) = entries.get(provider_id)?;
-        (at.elapsed() < AUTH_CACHE_TTL).then(|| verdict.clone())
+        (at.elapsed() < AUTH_CACHE_TTL).then(|| (*at, verdict.clone()))
     }
 
     fn store(&self, provider_id: &str, verdict: AuthVerdict) {
@@ -893,6 +944,79 @@ pub(crate) fn promote_auth_verdict(provider_id: &str) {
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
     cache().store(provider_id, AuthVerdict::plain(value));
+}
+
+/// Whether an ACP failure is the provider refusing to work until it is
+/// signed in: the same classification a local session's runtime auth
+/// failure uses.
+#[must_use]
+pub fn is_auth_required(error: &intent_acp::AcpError) -> bool {
+    crate::agent_session::is_acp_auth_required(error)
+}
+
+/// A provider's default account (the machine's own environment, no
+/// profile), as its sign-in probe last reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultSignIn {
+    /// `Some(true)` signed in, `Some(false)` signed out, `None` when the
+    /// provider has no probe, is not installed or the probe was
+    /// inconclusive.
+    pub signed_in: Option<bool>,
+    /// When the verdict was observed; `None` when it was not cached.
+    pub probed_at: Option<Instant>,
+}
+
+/// The default account's sign-in for `provider_id`, from the same cached,
+/// single-flighted probe as `host.providerAuthStatus` (probed again once
+/// its cache entry is older than the TTL). `override_path` is the
+/// provider's `providers.paths` entry, as a launch resolves it. A provider
+/// without a probe is unknown.
+pub async fn default_sign_in(provider_id: &str, override_path: Option<String>) -> DefaultSignIn {
+    let Some(id) = AUTH_PROBE_PROVIDERS
+        .iter()
+        .copied()
+        .find(|id| *id == provider_id)
+    else {
+        return DefaultSignIn::default();
+    };
+    let verdict = resolve_auth_status(id, false, override_path).await;
+    let sign_in = match cache().fresh_entry(id) {
+        Some((at, cached)) => DefaultSignIn {
+            signed_in: cached.authenticated,
+            probed_at: Some(at),
+        },
+        None => DefaultSignIn {
+            signed_in: verdict.authenticated,
+            probed_at: None,
+        },
+    };
+    default_account_sign_in(id, sign_in)
+}
+
+/// Providers whose sign-in probe runs an ACP adapter without the
+/// login-shell credentials a profile-less launch gap-fills, so a daemon
+/// started outside a login shell can see a signed-out account that its
+/// launches would find signed in.
+const PROBES_WITHOUT_LAUNCH_ENV: &[&str] = &["droid", "pi", "antigravity"];
+
+/// What a probe says about the default account a launch uses: a signed-out
+/// verdict from a probe without the launch's environment is only `unknown`,
+/// so placement does not skip a machine on it.
+fn default_account_sign_in(provider_id: &str, mut sign_in: DefaultSignIn) -> DefaultSignIn {
+    if PROBES_WITHOUT_LAUNCH_ENV.contains(&provider_id) && sign_in.signed_in == Some(false) {
+        sign_in.signed_in = None;
+    }
+    sign_in
+}
+
+/// Test seam: make one provider's cached verdict `by` older, so a test
+/// can step past the TTL without waiting.
+#[cfg(all(test, unix))]
+fn age_cached_verdict_for_tests(provider_id: &str, by: Duration) {
+    let mut entries = cache().entries.lock().expect("auth cache poisoned");
+    if let Some((at, _)) = entries.get_mut(provider_id) {
+        *at = at.checked_sub(by).expect("instant in range");
+    }
 }
 
 /// Resolve one provider's auth status through the cache: non-forced reads
@@ -1633,6 +1757,138 @@ while IFS= read -r unexpected; do exit 95; done
 
     /// A fresh RAII temp dir; removed on drop (including on panic). Set
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    /// The default account's sign-in is probed once and served from the
+    /// cache, with the instant it was observed, until the entry is older
+    /// than the TTL; then the next read probes again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_sign_in_serves_the_cached_probe_until_the_ttl_then_probes_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("default-sign-in");
+        let calls = dir.path().join("calls");
+        let stub = dir.path().join("opencode");
+        let write_stub = |body: &str| {
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\n[ \"$*\" = 'models' ] || exit 64\necho x >> '{}'\n{body}\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let probes = || {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let path = Some(stub.to_str().unwrap().to_owned());
+        write_stub("echo openai/gpt-5");
+
+        let first = default_sign_in("opencode", path.clone()).await;
+        assert_eq!(first.signed_in, Some(true));
+        let probed_at = first.probed_at.expect("a probed verdict is cached");
+        assert_eq!(probes(), 1);
+
+        // Within the TTL: the cached verdict, without spawning the CLI.
+        write_stub("exit 1");
+        let cached = default_sign_in("opencode", path.clone()).await;
+        assert_eq!(cached, first);
+        assert_eq!(probes(), 1);
+
+        // Past the TTL: probed again, with a newer observation.
+        age_cached_verdict_for_tests("opencode", AUTH_CACHE_TTL);
+        let again = default_sign_in("opencode", path).await;
+        assert_eq!(again.signed_in, Some(false));
+        assert!(again.probed_at.expect("cached") > probed_at.checked_sub(AUTH_CACHE_TTL).unwrap());
+        assert_eq!(probes(), 2);
+    }
+
+    /// droid, pi and antigravity probe without the login-shell credentials
+    /// a launch gets, so their signed-out verdict reads as unknown for the
+    /// default account; a signed-in one stands, and other providers keep
+    /// theirs.
+    #[tokio::test]
+    async fn default_sign_in_does_not_trust_signed_out_from_probes_without_the_launch_env() {
+        for id in ["droid", "pi", "antigravity"] {
+            let prior = cache().fresh(id);
+            cache().store(id, AuthVerdict::plain(Some(false)));
+            let sign_in = default_sign_in(id, None).await;
+            assert_eq!(sign_in.signed_in, None, "{id}");
+            assert!(sign_in.probed_at.is_some(), "{id}: still an observation");
+            cache().store(id, AuthVerdict::plain(Some(true)));
+            assert_eq!(
+                default_sign_in(id, None).await.signed_in,
+                Some(true),
+                "{id}"
+            );
+            cache().store(id, prior.unwrap_or_default());
+        }
+        let probed = DefaultSignIn {
+            signed_in: Some(false),
+            probed_at: None,
+        };
+        for id in ["claude-code", "codex", "opencode", "grok", "auggie"] {
+            assert_eq!(default_account_sign_in(id, probed), probed, "{id}");
+        }
+    }
+
+    /// A provider without a sign-in probe is unknown and never cached.
+    #[tokio::test]
+    async fn default_sign_in_without_a_probe_is_unknown() {
+        for id in ["mock", "cursor", "not-a-provider"] {
+            assert_eq!(
+                default_sign_in(id, None).await,
+                DefaultSignIn::default(),
+                "{id}"
+            );
+        }
+    }
+
+    /// A daemon started outside a login shell (a GUI app or service) sees
+    /// a CLI's credential location only through the captured login-shell
+    /// environment, which a profile-less launch gap-fills; the default
+    /// probe sees the same account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_cli_probe_sees_the_login_shell_credentials_a_launch_gets() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("CODEX_HOME").is_some() {
+            eprintln!("skipping: CODEX_HOME is set in the test environment");
+            return;
+        }
+        let dir = unique_temp_dir("shell-codex-home");
+        let home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        let stub = dir.path().join("codex");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$*\" = 'login status' ] || exit 64\n[ -n \"$CODEX_HOME\" ] && [ -f \"$CODEX_HOME/auth.json\" ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = &["login", "status"];
+        let shell_only = std::collections::BTreeMap::from([(
+            "CODEX_HOME".to_owned(),
+            home.to_str().unwrap().to_owned(),
+        )]);
+        let probe =
+            check_provider_auth_cli_with("codex", stub.as_os_str(), args, None, &shell_only).await;
+        assert_eq!(probe, CliAuthProbe::Authenticated);
+        let without = check_provider_auth_cli_with(
+            "codex",
+            stub.as_os_str(),
+            args,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(without, CliAuthProbe::NotAuthenticated);
+    }
+
     fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
         let mut dir = tempfile::Builder::new()
             .prefix(&format!("intent-provider-auth-{tag}-"))

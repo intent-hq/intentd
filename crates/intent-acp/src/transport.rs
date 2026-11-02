@@ -327,6 +327,16 @@ impl Drop for CaughtPromptAdmission<'_> {
     }
 }
 
+/// The error a request gets when the agent's stdout is closed: the shape the
+/// reader's EOF drain sends, shared by requests registered after the drain.
+fn stdout_closed_error() -> JsonRpcError {
+    JsonRpcError {
+        code: 0,
+        message: "agent stdout closed".to_string(),
+        data: None,
+    }
+}
+
 fn authentication_required() -> JsonRpcError {
     JsonRpcError {
         code: -32000,
@@ -837,6 +847,11 @@ pub struct Connection {
     /// [`WriteFences::count`] is nonzero, so ordinary traffic pays one load.
     write_fences: Arc<WriteFences>,
     pending: PendingMap,
+    /// Set by the reader at stdout EOF, under the `pending` lock and before
+    /// it drains the map (intent-hq/intent#8145). A request registered after
+    /// the drain checks it under the same lock, so a child that died before
+    /// the request was sent fails it at once instead of after its timeout.
+    stdout_closed: Arc<AtomicBool>,
     config_options: SessionConfigOptions,
     session_titles: watch::Receiver<SessionTitles>,
     title_controls: TitleControls,
@@ -870,6 +885,7 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
     {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let stdout_closed = Arc::new(AtomicBool::new(false));
         let config_options = SessionConfigOptions::default();
         let (titles_tx, session_titles) = watch::channel(SessionTitles::new());
         let title_controls = TitleControls::default();
@@ -911,6 +927,7 @@ impl Connection {
 
         // Reader task: frame on `\n`, parse, dispatch.
         let pending_reader = Arc::clone(&pending);
+        let stdout_closed_reader = Arc::clone(&stdout_closed);
         let configs_reader = Arc::clone(&config_options);
         let title_controls_reader = Arc::clone(&title_controls);
         let prompt_pending_reader = Arc::clone(&prompt_pending);
@@ -983,12 +1000,9 @@ impl Connection {
             prompt_pending_reader.lock().unwrap().close();
             {
                 let mut map = pending_reader.lock().unwrap();
+                stdout_closed_reader.store(true, Ordering::SeqCst);
                 for (_, sender) in map.drain() {
-                    let _ = sender.sender.send(Err(JsonRpcError {
-                        code: 0,
-                        message: "agent stdout closed".to_string(),
-                        data: None,
-                    }));
+                    let _ = sender.sender.send(Err(stdout_closed_error()));
                 }
             }
             // Wake watermark waiters so they recheck instead of sleeping out
@@ -1065,6 +1079,7 @@ impl Connection {
             writer_tx,
             write_fences,
             pending,
+            stdout_closed,
             config_options,
             session_titles,
             title_controls,
@@ -1099,16 +1114,27 @@ impl Connection {
         tokio::pin!(deadline, cancelled);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(
-            id,
-            PendingRequest {
-                sender: tx,
-                session_id: params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            },
-        );
+        {
+            let mut pending = self.pending.lock().unwrap();
+            // An auth-required agent closes stdout too; its error wins.
+            if !self.auth_required.load(Ordering::SeqCst)
+                && self.stdout_closed.load(Ordering::SeqCst)
+            {
+                return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(
+                    AcpError::Rpc(stdout_closed_error()),
+                ));
+            }
+            pending.insert(
+                id,
+                PendingRequest {
+                    sender: tx,
+                    session_id: params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            );
+        }
         let mut guard = CallbackPendingGuard {
             connection: self,
             id,
@@ -1307,16 +1333,28 @@ impl Connection {
         fence: Option<Arc<AtomicBool>>,
     ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(
-            id,
-            PendingRequest {
-                sender: tx,
-                session_id: params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            },
-        );
+        {
+            // Under the lock the reader drains with: either the EOF drain
+            // fails this entry, or the closed flag is already visible here.
+            // An auth-required agent closes stdout too; its error (checked
+            // below) wins.
+            let mut pending = self.pending.lock().unwrap();
+            if !self.auth_required.load(Ordering::SeqCst)
+                && self.stdout_closed.load(Ordering::SeqCst)
+            {
+                return Err(AcpError::Rpc(stdout_closed_error()));
+            }
+            pending.insert(
+                id,
+                PendingRequest {
+                    sender: tx,
+                    session_id: params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            );
+        }
         // Drop-guard cleanup: covers the error/timeout arms below AND the
         // caller dropping this future mid-flight (cancel-safety for the
         // pending map — see `PendingEntryGuard`).
@@ -3072,5 +3110,104 @@ mod write_fence_tests {
             "the fenced stop was written: {written}"
         );
         assert!(matches!(stop.await.unwrap(), Err(AcpError::Rpc(_))));
+    }
+}
+
+#[cfg(test)]
+mod request_after_stdout_eof_tests {
+    //! intent-hq/intent#8145: a child that exits before the daemon registers
+    //! its next request (an agent dying on launch, raced by a slow
+    //! instrumented daemon sending `initialize`) closes stdout BEFORE the
+    //! request is in the pending map. The reader's EOF drain cannot fail a
+    //! request it never saw, so the request must notice the closed stream
+    //! itself instead of waiting out its whole timeout.
+    use super::watermark_tests::silent_connection;
+    use super::*;
+    use serde_json::json;
+
+    /// Close the agent's stdout and wait until the reader has drained it: a
+    /// request already in flight is failed with "agent stdout closed".
+    async fn close_stdout_and_wait_for_drain(
+        conn: &Connection,
+        a2c_agent: tokio::io::DuplexStream,
+    ) {
+        let mut in_flight =
+            Box::pin(conn.request_timeout("session/ping", json!({}), Duration::from_secs(60)));
+        tokio::select! {
+            _ = &mut in_flight => panic!("request must still be pending"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        drop(a2c_agent);
+        let err = in_flight.await.unwrap_err();
+        assert!(
+            err.to_string().contains("agent stdout closed"),
+            "in-flight request failed by the EOF drain: {err}"
+        );
+    }
+
+    fn assert_stdout_closed(err: &AcpError) {
+        assert!(
+            matches!(err, AcpError::Rpc(e) if e.code == 0 && e.message == "agent stdout closed"),
+            "same error shape as the EOF drain, not a timeout: {err:?}"
+        );
+    }
+
+    /// Paused time: a request that waited on the dead stream would see its
+    /// 60s timer auto-advance and return `Timeout` — the bug — instead of
+    /// the immediate stdout-closed error.
+    #[tokio::test(start_paused = true)]
+    async fn request_after_stdout_eof_fails_fast_instead_of_timing_out() {
+        let (conn, _c2a_agent, a2c_agent) = silent_connection();
+        close_stdout_and_wait_for_drain(&conn, a2c_agent).await;
+
+        let err = conn
+            .request_timeout("session/new", json!({}), Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_stdout_closed(&err);
+        assert!(!conn.has_pending_requests(), "no slot left behind");
+    }
+
+    /// The handshake path the #8145 flake took: `initialize` sent to a child
+    /// that already exited fails with the stdout-closed error, so the spawn
+    /// retry classifies it as a child death (and names the stderr capture).
+    #[tokio::test(start_paused = true)]
+    async fn initialize_after_stdout_eof_fails_fast_instead_of_timing_out() {
+        let (conn, _c2a_agent, a2c_agent) = silent_connection();
+        close_stdout_and_wait_for_drain(&conn, a2c_agent).await;
+
+        let Err(err) = conn
+            .initialize_recipient(json!({}), Duration::from_secs(30))
+            .await
+        else {
+            panic!("initialize to a closed stdout must fail");
+        };
+        assert_stdout_closed(&err);
+    }
+
+    /// Callback requests register in the same pending map: one issued after
+    /// the drain is refused unsent instead of waiting out its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn callback_after_stdout_eof_is_refused_unsent() {
+        let (conn, _c2a_agent, a2c_agent) = silent_connection();
+        close_stdout_and_wait_for_drain(&conn, a2c_agent).await;
+
+        let outcome = conn
+            .request_callback(
+                "callback/test",
+                json!({}),
+                Duration::from_secs(60),
+                std::future::pending(),
+            )
+            .await;
+        match outcome {
+            CallbackRequestOutcome::NotSent(CallbackFailure::Connection(err)) => {
+                assert_stdout_closed(&err);
+            }
+            CallbackRequestOutcome::NotSent(_) => panic!("unsent, but not a connection error"),
+            CallbackRequestOutcome::Unknown(_) => panic!("sent to a dead child and timed out"),
+            CallbackRequestOutcome::Response(_) => panic!("no agent answered"),
+        }
+        assert!(!conn.has_pending_requests(), "no slot left behind");
     }
 }

@@ -109,10 +109,14 @@ class ProbeTests(unittest.TestCase):
             probe.execute(missing)
         launch.assert_not_called()
         bad = self.root / "bad-bundle"; bad.write_bytes(b"not the sealed artifact")
-        with patch.object(probe, "run_bounded") as launch, redirect_stderr(io.StringIO()):
+        # check_os pins host library bytes that drift with distro updates;
+        # stub it so the refusal comes from the bad bundle, as asserted below.
+        with patch.object(probe, "check_os"), patch.object(probe, "run_bounded") as launch, \
+                redirect_stderr(io.StringIO()) as stderr:
             result = probe.main(["--case", "native", "--output", str(self.root / "out"),
                                  "--bundle", str(bad), "--intentd", str(self.root / "no-bridge")])
         self.assertEqual(result, 1)
+        self.assertIn(str(bad), stderr.getvalue())
         launch.assert_not_called()
         self.assertFalse((self.root / "out").exists())
 
@@ -137,7 +141,10 @@ class ProbeTests(unittest.TestCase):
     def test_failed_inert_proof_has_no_payload_fallback(self):
         refusal = {"stdout": "", "stderr": "fixture namespace denied", "returncode": 1,
                    "live_original_processes_after_cleanup": [], "reason": "exited"}
-        with patch.object(probe, "run_bounded", return_value=refusal) as launch:
+        # check_os pins the host's system library bytes, which change with
+        # every distro update; this case is about the fallback, not the pins.
+        with patch.object(probe, "check_os"), \
+                patch.object(probe, "run_bounded", return_value=refusal) as launch:
             result = probe.execute(self.args())
         self.assertEqual(result, 1)
         receipt = json.loads((self.root / "result/receipt.json").read_text())

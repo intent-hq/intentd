@@ -11,6 +11,7 @@
 #![cfg(unix)]
 
 use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 #[path = "e2e_wss_server_pairing/personal_pairing.rs"]
 mod personal_pairing;
 
@@ -27,7 +28,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -122,25 +123,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .expect("UDS connect");
-    let (read_half, mut write_half) = stream.into_split();
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    let mut line = frame.to_string();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = tokio::io::BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 /// Pinned-fingerprint cert verifier (mirrors `wss_integration.rs`).

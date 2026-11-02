@@ -25,6 +25,7 @@ mod sharing;
 mod workspace_auto_archive_disabled;
 mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
 mod workspace_retired;
 
 mod metadata_key_json;
@@ -4474,6 +4475,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,

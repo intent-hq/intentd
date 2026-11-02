@@ -269,5 +269,6 @@ pub fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }

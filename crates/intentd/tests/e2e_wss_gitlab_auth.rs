@@ -742,6 +742,7 @@ fn expect_typed_error(v: &Value, code: &str) {
     assert_eq!(err["data"]["host"], json!(HOST), "envelope: {v}");
 }
 
+#[track_caller]
 fn expect_invalid_params(v: &Value) {
     assert_eq!(v["error"]["code"], json!(-32602), "envelope: {v}");
 }
@@ -1875,6 +1876,7 @@ async fn finish_startup(mock: &MockGitlab, task: tokio::task::JoinHandle<Value>)
     .unwrap()
 }
 
+#[track_caller]
 fn expect_superseded_startup(v: &Value) {
     assert_eq!(
         v["error"]["code"], -32603,

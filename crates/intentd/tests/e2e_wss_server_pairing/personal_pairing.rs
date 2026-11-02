@@ -55,7 +55,7 @@ fn spawn_personal(dir: &Path, sidecar: &Path, run: u8) -> GuardedChild {
 async fn assert_authenticated_uds_device(socket: &Path, owner: &PrincipalId) {
     let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
     let (read, mut write) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(read).lines();
+    let mut reader = tokio::io::BufReader::new(read);
     for (id, method, params) in [
         (
             1,
@@ -69,12 +69,12 @@ async fn assert_authenticated_uds_device(socket: &Path, owner: &PrincipalId) {
             .write_all(format!("{frame}\n").as_bytes())
             .await
             .unwrap();
-        let line = timeout(common::rpc_read_timeout(), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let reply: Value = serde_json::from_str(&line).unwrap();
+        let reply = timeout(
+            common::rpc_read_timeout(),
+            common::uds_exchange::read_reply(&mut reader, id, method),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"));
         assert_eq!(reply["jsonrpc"], "2.0");
         assert_eq!(reply["id"], id);
         assert!(reply.get("error").is_none(), "{reply}");

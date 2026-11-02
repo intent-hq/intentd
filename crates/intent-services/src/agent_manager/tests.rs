@@ -2045,6 +2045,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2094,6 +2095,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2157,6 +2159,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2255,6 +2258,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -5292,29 +5296,29 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
     assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
-/// Timing proof for the batch stop path (the `workspace.delete` sweep): N
-/// tracked agents whose children ignore SIGTERM tear down in ~ONE shared
-/// grace window via `stop_many` — mirroring `kill_sweep_tests` — with the
-/// per-agent `stop()` semantics (handle removal, deregistration) applied to
-/// every agent.
+/// The batch stop path (the `workspace.delete` sweep): N tracked agents whose
+/// children survive SIGTERM are all signalled inside ONE shared grace window
+/// via `stop_many` — mirroring `kill_sweep_tests` — with the per-agent
+/// `stop()` semantics (handle removal, deregistration) applied to every
+/// agent.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
+    use super::kill_sweep_tests::{
+        spawn_term_recording_children, wait_for_markers, wait_until_reaped,
+    };
+    use super::term_grace_gate::{self, TermGraceGate};
+
     const N: usize = 4;
-    let grace = super::PROCESS_GROUP_TERM_GRACE;
     let (_tmp, mgr) = manager().await;
+    let dir = test_tempdir("stop-many-sweep");
     let mut ids = Vec::with_capacity(N);
     let mut pids = Vec::with_capacity(N);
-    for i in 0..N {
+    for (i, (child, pid)) in spawn_term_recording_children(dir.path(), N)
+        .into_iter()
+        .enumerate()
+    {
         let id = AgentId::from(format!("a-batch-{i}").as_str());
-        let mut cmd = tokio::process::Command::new("sh");
-        // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
-        // forcing the full grace window to elapse.
-        cmd.args(["-c", "trap '' TERM; sleep 30"]);
-        cmd.process_group(0);
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn().expect("spawn slow child");
-        let pid = child.id().expect("live child has a pid");
         let handle = mock_handle();
         handle
             .execution
@@ -5339,42 +5343,47 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         ids.push(id);
         pids.push(pid);
     }
-    // Let each sh install its trap before SIGTERM arrives.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_markers(dir.path(), "ready", N).await;
 
-    let start = std::time::Instant::now();
-    let fence = mgr.stop_many(&ids).await;
-    let elapsed = start.elapsed();
+    // The gate holds the shared grace window open: every child must get its
+    // SIGTERM inside it. A batch stop that tears agents down one window at a
+    // time never signals the second child, and the wait below hangs into its
+    // guard instead of passing slowly.
+    let gate = TermGraceGate::new();
+    let mgr = Arc::new(mgr);
+    let stop = {
+        let (mgr, ids) = (Arc::clone(&mgr), ids.clone());
+        intent_core::spawn_daemon(term_grace_gate::scope(gate.clone(), async move {
+            mgr.stop_many(&ids).await
+        }))
+    };
+    wait_for_markers(dir.path(), "term", N).await;
+    assert!(
+        !stop.is_finished(),
+        "batch stop returned while its grace window was still open"
+    );
+    for &pid in &pids {
+        assert!(
+            pid_alive(pid),
+            "child {pid} survived SIGTERM inside the window"
+        );
+    }
+    gate.open();
+    let fence = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        stop,
+    )
+    .await
+    .expect("batch stop finishes once its grace window ends")
+    .expect("stop task");
+    assert_eq!(gate.windows(), 1, "the whole batch shares one grace window");
 
-    // Serial teardown would take ~N * grace (8s for 4 children); the shared
-    // window must finish in ~one grace period (<4s total).
-    assert!(
-        elapsed < grace * 2,
-        "batch stop took {elapsed:?}, expected ~one {grace:?} grace window"
-    );
-    // The children ignored SIGTERM, so the full shared grace must have
-    // elapsed (proves the window ran once, not that children died early).
-    assert!(
-        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
-        "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
-    );
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");
     assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
-    // The kill itself, not just the elapsed window: every child must be
-    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
-    // a zombie until its wait task reaps it (stragglers past
-    // KILL_SWEEP_REAP_GRACE reap in the background).
+    // The kill itself: every child is SIGKILLed once the window ends.
     for &pid in &pids {
-        let mut dead = !pid_alive(pid);
-        for _ in 0..100 {
-            if dead {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            dead = !pid_alive(pid);
-        }
-        assert!(dead, "child {pid} killed by the batch sweep");
+        wait_until_reaped(pid).await;
     }
     // The returned fence keeps every swept agent blocked from the
     // lazy-spawn paths until dropped, then re-opens them.
@@ -6419,6 +6428,7 @@ async fn seed_agent_with_task_graph(
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     // The chief row is seeded by migration 0033; every other workspace is
     // created here.
@@ -11125,6 +11135,14 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
         AgentId::from("self-retire"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    // A peer top-level agent, so the last-top-level guard lets it retire.
+    let mut peer = mgr.services.store.get_agent_session(&id).await.unwrap();
+    peer.id = AgentId::from("self-retire-peer");
+    mgr.services
+        .store
+        .insert_agent_session_with_task_graph(&peer, false)
+        .await
+        .expect("insert peer");
     track(&mgr, &id);
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
@@ -13008,6 +13026,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
@@ -13501,6 +13520,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     mgr.services
         .store
@@ -19623,6 +19643,201 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
         .expect("chief resolves despite blocked root");
     assert_eq!(resolved.cwd, std::env::temp_dir());
+}
+
+/// A plain-folder workspace (§5.1) has no worktree and no branch: its agents
+/// spawn in the user's folder at `repository_path`.
+#[tokio::test]
+async fn resolve_spawn_uses_the_plain_folder() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
+    let folder_guard = test_tempdir("intentd-rs-plain-");
+    let folder = folder_guard.path().to_path_buf();
+    let workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-plain"),
+        title: "WS".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(folder.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let resolved =
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("plain folder resolves");
+    assert_eq!(resolved.cwd, folder, "cwd is the plain folder");
+}
+
+/// Every provider onboarding can offer (no env-var or feature-code gate)
+/// resolves the same spawn in a plain-folder workspace as in a git workspace:
+/// every `ResolvedSpawn` field except `cwd` (the user's folder vs the git
+/// checkout) matches, and so do the provider launch args and provider env
+/// derived from it. No provider needs a git-specific launch flag — Codex runs
+/// through its ACP adapter, never `codex exec`, whose git-repository check
+/// (`--skip-git-repo-check`) would refuse a plain folder.
+///
+/// Not covered here: after resolution the agent manager adds git
+/// commit-identity and credential-helper env discovered from the cwd, so a
+/// plain folder (not a repository) gets no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+/// vars; git then falls back to the user's global config. Manual turns are
+/// recorded on the plain-folder provider task.
+#[tokio::test]
+async fn onboarding_providers_resolve_the_same_spawn_in_plain_folder_and_git_workspaces() {
+    let onboarding: Vec<&intent_providers::ProviderConfig> = intent_providers::ACP_PROVIDERS
+        .iter()
+        .filter(|p| p.requires_env_var.is_none() && p.requires_feature_code.is_none())
+        .collect();
+    let ids: Vec<&str> = onboarding.iter().map(|p| p.id).collect();
+    for expected in ["claude-code", "codex", "opencode", "auggie"] {
+        assert!(
+            ids.contains(&expected),
+            "{expected} is offered in onboarding"
+        );
+    }
+    assert!(
+        !ids.contains(&"mock"),
+        "env-gated providers are not offered"
+    );
+
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    let npx_only: Vec<&str> = onboarding
+        .iter()
+        .filter(|p| p.npx_only_package.is_some())
+        .map(|p| p.id)
+        .collect();
+    crate::test_support::provider_installed::mark(&mut settings.providers.paths, &npx_only);
+    for provider in onboarding.iter().filter(|p| p.npx_only_package.is_none()) {
+        settings.providers.paths.insert(
+            provider.primary_binary_provider_id().to_string(),
+            "/bin/sh".to_string(),
+        );
+    }
+
+    let plain_guard = test_tempdir("intentd-rs-plain-providers-");
+    let plain_dir = plain_guard.path().to_path_buf();
+    let git_guard = test_tempdir("intentd-rs-git-providers-");
+    let git_dir = git_guard.path().to_path_buf();
+    git2::Repository::init(&git_dir).expect("git init");
+    let plain = Workspace {
+        id: WorkspaceId::from("ws-plain-providers"),
+        title: "Plain".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(plain_dir.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let git = Workspace {
+        id: WorkspaceId::from("ws-git-providers"),
+        title: "Git".to_string(),
+        branch: "main".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(git_dir.display().to_string()),
+        worktree_path: Some(git_dir.display().to_string()),
+        ..Default::default()
+    };
+
+    let launch = |resolved: &ResolvedSpawn| {
+        let mut opts = intent_acp::spawn::SpawnOptions::new(&resolved.provider);
+        opts.cwd = Some(&resolved.cwd);
+        opts.model = resolved.model.as_deref();
+        opts.provider_binary = resolved.provider_binary.as_deref();
+        opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
+        opts.npx_fallback_package = resolved.npx_fallback_package;
+        let args = intent_acp::spawn::build_args(&opts);
+        let env = intent_providers::build_provider_env_for_spawn(
+            &resolved.provider,
+            resolved.model.as_deref(),
+            None,
+            None,
+            None,
+            opts.via_npx(),
+            None,
+        );
+        (args, env, resolved.extra_env.clone())
+    };
+
+    for provider in &onboarding {
+        let mut session = session_with_specialist(None);
+        session.provider = Some(provider.id.to_string());
+        let in_plain = resolve_spawn(&session, Some(&plain), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: plain folder resolves: {e}", provider.id));
+        let in_git = resolve_spawn(&session, Some(&git), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: git workspace resolves: {e}", provider.id));
+        assert_eq!(
+            in_plain.cwd, plain_dir,
+            "{}: cwd is the plain folder",
+            provider.id
+        );
+        assert_eq!(
+            in_git.cwd, git_dir,
+            "{}: cwd is the git checkout",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider, in_git.provider,
+            "{}: same provider config",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.selection, in_git.selection,
+            "{}: selection",
+            provider.id
+        );
+        assert_eq!(in_plain.model, in_git.model, "{}: model", provider.id);
+        assert_eq!(
+            in_plain.reasoning_effort, in_git.reasoning_effort,
+            "{}: reasoning effort",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider_binary, in_git.provider_binary,
+            "{}: provider binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_binary, in_git.npx_fallback_binary,
+            "{}: npx binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_package, in_git.npx_fallback_package,
+            "{}: npx package",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.unsloth_endpoint, in_git.unsloth_endpoint,
+            "{}: unsloth endpoint",
+            provider.id
+        );
+        let (plain_args, plain_env, plain_extra) = launch(&in_plain);
+        let (git_args, git_env, git_extra) = launch(&in_git);
+        assert_eq!(plain_args, git_args, "{}: same launch args", provider.id);
+        assert_eq!(plain_env, git_env, "{}: same provider env", provider.id);
+        assert_eq!(plain_extra, git_extra, "{}: same extra env", provider.id);
+        assert!(
+            !plain_args.iter().any(|a| a == "--skip-git-repo-check"),
+            "{}: no git-check flag needed",
+            provider.id
+        );
+        if provider.id == "codex" {
+            assert_eq!(
+                in_plain.npx_fallback_package,
+                Some(intent_providers::CODEX_ACP_NPX_PACKAGE),
+                "codex runs its ACP adapter"
+            );
+            assert!(
+                !plain_args.iter().any(|a| a == "exec"),
+                "codex never runs `codex exec`: {plain_args:?}"
+            );
+            assert_eq!(
+                plain_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                git_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                "codex agent mode is the same in both workspace kinds"
+            );
+        }
+    }
 }
 
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
@@ -30683,4 +30898,125 @@ mod profile_routing_tests {
             assert_eq!(activation.live_fingerprint(&id, &reference), None);
         }
     }
+}
+
+/// Remote (executor) launches share the slot cap with local agents and are
+/// refused, never queued, when it is full: `try_admit` answers at once with
+/// the running count and the cap.
+#[test]
+fn try_admit_refuses_at_the_shared_slot_cap_without_queueing() {
+    use intent_core::placement::CapacityRefusal;
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    reg.try_admit(&AgentId::from("remote-1"))
+        .expect("one free slot admits");
+    assert_eq!(reg.size(), 2, "the remote agent holds a slot");
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote-2")),
+        Err(CapacityRefusal::Count {
+            running_agents: 2,
+            agent_cap: 2,
+        })
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing local was evicted");
+    assert_eq!(reg.size(), 2, "a refused launch holds nothing");
+    assert!(
+        reg.inner.lock().unwrap().wait_queue.is_empty(),
+        "a refused launch is not queued"
+    );
+    assert!(reg.deregister(&local));
+    reg.try_admit(&AgentId::from("remote-2"))
+        .expect("the freed local slot admits a remote launch");
+}
+
+/// A remote agent is never an eviction candidate: a local spawn at the cap
+/// waits for a slot instead of killing it.
+#[tokio::test]
+async fn admitted_remote_agents_are_never_evicted_by_local_spawns() {
+    let reg = Arc::new(ProcessRegistry::new(1));
+    let remote = AgentId::from("remote");
+    reg.try_admit(&remote).expect("admits");
+    let local = AgentId::from("local");
+    let waiting = {
+        let reg = reg.clone();
+        tokio::spawn(async move { reg.acquire(&local, claim_all, release_none).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "the local spawn waits for the slot");
+    assert!(
+        reg.is_registered(&remote),
+        "the remote agent was not evicted"
+    );
+    assert!(reg.deregister(&remote));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        waiting,
+    )
+    .await
+    .expect("the released remote slot admits the local spawn")
+    .unwrap();
+}
+
+/// Over the shared memory budget (with the host short of headroom) a remote
+/// launch is refused with the charged and budgeted bytes.
+#[test]
+fn try_admit_refuses_over_the_shared_memory_budget() {
+    use intent_core::placement::CapacityRefusal;
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(5 * gb);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote")),
+        Err(CapacityRefusal::Memory {
+            charged_memory_bytes: 5 * gb,
+            memory_budget_bytes: 4 * gb,
+        })
+    );
+    assert_eq!(reg.size(), 1, "a refused launch holds nothing");
+    // Under budget, the admission is charged like a local spawn.
+    probe.set(gb);
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+    assert_eq!(
+        reg.budget_status().map(|(_, charged, _)| charged),
+        Some(Some(gb + PROVISIONAL_AGENT_BYTES))
+    );
+}
+
+/// A remote agent's provider resolves like a local spawn's: the configured
+/// `providers.paths` override wins, a profile resolves to its base, and an
+/// unknown or disabled provider is refused.
+#[cfg(unix)]
+#[test]
+fn resolve_provider_launch_matches_the_local_precedence() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = test_tempdir("resolve-launch");
+    let binary = dir.path().join("opencode");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    settings
+        .providers
+        .paths
+        .insert("opencode".into(), binary.display().to_string());
+    let spec = crate::resolve_provider_launch("opencode", &settings).expect("resolves");
+    assert_eq!(spec.provider.id, "opencode");
+    assert_eq!(spec.provider_binary.as_deref(), Some(binary.as_path()));
+    assert!(spec.npx_fallback_binary.is_none());
+
+    assert!(matches!(
+        crate::resolve_provider_launch("no-such-provider", &settings),
+        Err(Error::NotFound(_))
+    ));
+    settings.providers.enabled = Some([("opencode".to_owned(), false)].into());
+    assert!(matches!(
+        crate::resolve_provider_launch("opencode", &settings),
+        Err(Error::NotFound(_))
+    ));
 }

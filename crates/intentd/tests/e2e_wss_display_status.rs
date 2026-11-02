@@ -828,6 +828,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 

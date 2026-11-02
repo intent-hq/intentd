@@ -116,6 +116,7 @@ async fn run_bridge(ws: &mut Ws, workspace_id: &str, agent_id: &str) -> Value {
     result
 }
 
+#[track_caller]
 fn assert_redacted(value: &Value) {
     let serialized = value.to_string();
     for secret in [AUTH_SECRET, ENV_SECRET, REPLACEMENT] {

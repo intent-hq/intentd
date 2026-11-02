@@ -124,6 +124,7 @@
     "presence:changed",
     "principal:identity-changed",
     "providers:profiles-changed",
+    "remoteMachine:changed",
     "script:changed",
     "script:output",
     "script:state",

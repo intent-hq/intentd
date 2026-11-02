@@ -43,6 +43,7 @@ fn result(root: &Path, id: &str) -> Value {
         .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)))
 }
 
+#[track_caller]
 fn wait_file(path: &Path) {
     let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     while !path.exists() {

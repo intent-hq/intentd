@@ -145,11 +145,12 @@ fn lifecycle_capture_does_not_wait_for_inherited_output_eof() {
         ])
         .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "spawn")
         .env("INTENTD_LIFECYCLE_RELEASE", &release);
-    let started = std::time::Instant::now();
+    // The descendant keeps the inherited output open until the release file
+    // exists, which is written only after the capture returns: a capture that
+    // waited for EOF would hit its budget and return TimedOut instead.
     let result = captured_command(&mut command, Duration::from_secs(3));
     std::fs::write(&release, "done").unwrap();
     assert!(result.unwrap().status.success());
-    assert!(started.elapsed() < Duration::from_secs(3));
     let deadline =
         std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     while !release.with_extension("done").exists() {
@@ -172,13 +173,13 @@ fn lifecycle_capture_bounds_hung_commands_with_diagnostics() {
             "--nocapture",
         ])
         .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "hang");
-    let started = std::time::Instant::now();
+    // The fixture exits on its own after parking 5s, so TimedOut can only
+    // come from the 1s budget.
     let error = captured_command(&mut command, Duration::from_secs(1)).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(error
         .to_string()
         .contains("fixture waiting for termination"));
-    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 /// This cross-package test needs a freshly built sitter artifact, which Cargo

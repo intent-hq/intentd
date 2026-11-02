@@ -159,14 +159,19 @@ async fn note_write_survives_write_pool_acquire_timeout() {
 /// Under continuous saturation the pre-BEGIN acquire must give up within its
 /// hard budget (twice the pool acquire timeout: 20s in production, under the
 /// 30s desktop/browser RPC default) with nothing applied, so a caller that
-/// has already timed out never sees the edit commit later. The writer is
-/// held well past the budget and the note must be untouched afterwards.
+/// has already timed out never sees the edit commit later.
+///
+/// No clock is read. The writer stays held until the edit has returned, so
+/// the edit can only finish by giving up, and the note must be untouched
+/// afterwards; an acquire that never gave up hangs into the watchdog. The
+/// budget is checked by counting acquire attempts: each one that times out
+/// on its own costs at least [`ACQUIRE_TIMEOUT`] of wall time, so a load-slowed
+/// run makes fewer attempts, never more. Within a budget of two timeouts that
+/// leaves two full attempts plus one cut short at the deadline, and a larger
+/// budget shows up as extra attempts.
 #[tokio::test]
 async fn note_write_gives_up_within_budget_under_continuous_saturation() {
-    const HOLD: Duration = Duration::from_secs(8);
-    // Budget (2 x ACQUIRE_TIMEOUT) plus generous scheduling slack, still
-    // well below HOLD so a late success after release cannot pass.
-    const BOUND: Duration = Duration::from_millis(4_500);
+    const MAX_ATTEMPTS: usize = 3;
     let tmp = TempDb::new();
     let store = short_acquire_store(&tmp).await;
     let ws_id = WorkspaceId::new();
@@ -185,34 +190,31 @@ async fn note_write_gives_up_within_budget_under_continuous_saturation() {
         .acquire()
         .await
         .expect("hold write connection");
-    let holder = tokio::spawn(async move {
-        tokio::time::sleep(HOLD).await;
-        drop(held);
-    });
 
     note.content = "edited".to_string();
-    let started = std::time::Instant::now();
-    let result = store
-        .update_note_with_version(
-            &store.lock_note_content(&note.workspace_id, &note.id).await,
-            &note,
-            Some(0),
-            &author,
-            &ts,
-        )
-        .await;
-    let elapsed = started.elapsed();
-    let err = result.expect_err("a saturated writer must fail the edit, not commit it late");
-    assert!(
-        elapsed < BOUND,
-        "the acquire must give up within its budget, took {elapsed:?}"
+    let observed = Arc::new(AtomicUsize::new(0));
+    let lock = store.lock_note_content(&note.workspace_id, &note.id).await;
+    let edit = crate::POOL_TIMEOUT_OBSERVER.scope(
+        Arc::clone(&observed),
+        store.update_note_with_version(&lock, &note, Some(0), &author, &ts),
     );
+    let result = tokio::time::timeout(watchdog(), edit)
+        .await
+        .expect("the acquire must give up while the writer is still held");
+    drop(held);
+    drop(lock);
+    let err = result.expect_err("a saturated writer must fail the edit, not commit it late");
     assert!(
         matches!(&err, Error::Internal(msg) if msg.contains("nothing was applied")),
         "exhaustion must report a clean no-op failure: {err:?}"
     );
+    let attempts = observed.load(Ordering::SeqCst);
+    assert!(
+        (1..=MAX_ATTEMPTS).contains(&attempts),
+        "the acquire must give up within its budget of two {ACQUIRE_TIMEOUT:?} timeouts: \
+         {attempts} timed-out attempts (at most {MAX_ATTEMPTS})"
+    );
 
-    holder.await.expect("holder task");
     let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(
         stored.content, "base",

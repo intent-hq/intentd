@@ -1,0 +1,1514 @@
+//! `remoteMachines.*` on the backend: probe-before-save, the route race,
+//! routes refreshed from the welcome, the token kept in the secret store,
+//! refresh, revocation, removal and the `remoteMachine:changed` event.
+
+use intent_core::Error;
+use intent_services::feature_api::SubscriptionFilter;
+
+use super::*;
+
+fn data(error: &Error) -> Value {
+    match error {
+        Error::RemoteMachine(failure) => failure.data.clone(),
+        other => panic!("expected a remote machine error, got {other:?}"),
+    }
+}
+
+/// The next `remoteMachine:changed` payloads, up to `count`.
+async fn changes(sub: &mut intent_services::feature_api::Subscription, count: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    tokio::time::timeout(wait(), async {
+        while out.len() < count {
+            for event in sub.recv().await.expect("subscription open") {
+                out.push(event.data);
+            }
+        }
+    })
+    .await
+    .expect("remoteMachine:changed arrives");
+    out
+}
+
+fn subscribe(backend: &Backend) -> intent_services::feature_api::Subscription {
+    backend.bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::REMOTE_MACHINE_CHANGED.to_owned()],
+        ..SubscriptionFilter::default()
+    })
+}
+
+#[tokio::test]
+async fn backend_info_is_this_daemons_id_and_name() {
+    let backend = Backend::new().await;
+    let info = backend.call("backendInfo", json!({})).await.unwrap();
+    assert_eq!(info["backendId"], json!(backend.id().await));
+    assert!(!info["backendName"].as_str().unwrap().is_empty());
+    assert!(info.get("fingerprint").is_none(), "no listener here");
+}
+
+#[tokio::test]
+async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    *machine.host.hosts.lock().unwrap() = vec!["127.0.0.1".into(), "192.0.2.10".into()];
+    *machine.host.tc_address.lock().unwrap() = Some("tc-machine".into());
+    let mut sub = subscribe(&backend);
+
+    let added = backend.call("add", machine.add_params()).await.unwrap();
+    let probe = machine.accept().await;
+    assert_eq!(probe.hello.binding.head_id, backend.id().await);
+    assert_eq!(probe.hello.binding.node_id, machine.id());
+    assert_eq!(probe.hello.acked_seq, NodeCounter(0));
+
+    let machine_json = &added["machine"];
+    assert_eq!(machine_json["id"], json!(machine.id()));
+    assert_eq!(machine_json["name"], "Test machine");
+    assert_eq!(
+        machine_json["platform"],
+        json!({"os": "macos", "arch": "aarch64"})
+    );
+    // The routes are what the machine reported in its welcome.
+    assert_eq!(machine_json["hosts"], json!(["127.0.0.1", "192.0.2.10"]));
+    assert_eq!(machine_json["tcAddress"], "tc-machine");
+    assert_eq!(machine_json["port"], json!(machine.port));
+    assert_eq!(machine_json["state"], "disconnected");
+    assert_eq!(machine_json["runningAgents"], 0);
+    assert_eq!(machine_json["capabilities"]["capacity"]["agentCap"], 2);
+    assert!(machine_json["addedAt"].is_string());
+    assert!(machine_json["lastConnectedAt"].is_string());
+    assert!(added.get("replacedCredentialId").is_none());
+
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"].as_array().unwrap().len(), 1);
+    for text in [added.to_string(), listed.to_string()] {
+        assert!(!text.contains(&machine.token), "never the token");
+    }
+    assert_eq!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap(),
+        Some(machine.token.clone())
+    );
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.credential_id, machine.credential.id);
+
+    let event = changes(&mut sub, 1).await.remove(0);
+    assert_eq!(event["machine"]["id"], json!(machine.id()));
+    assert!(!event.to_string().contains(&machine.token));
+}
+
+#[tokio::test]
+async fn the_direct_routes_race_and_the_first_reachable_one_binds() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let mut params = machine.add_params();
+    // An unroutable documentation address first: the race takes the host
+    // that answers.
+    params["hosts"] = json!(["192.0.2.1", "127.0.0.1"]);
+    backend.call("add", params).await.unwrap();
+    machine.accept().await;
+}
+
+#[tokio::test]
+async fn an_unreachable_machine_saves_nothing_and_names_the_routes_tried() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    machine.stop().await;
+    let mut sub = subscribe(&backend);
+    let error = backend.call("add", machine.add_params()).await.unwrap_err();
+    assert_eq!(error.code(), -32603);
+    let data = data(&error);
+    assert_eq!(data["code"], "machine-unreachable");
+    assert_eq!(
+        data["attempts"],
+        json!([{ "route": format!("127.0.0.1:{}", machine.port), "error": "node-link-unavailable" }])
+    );
+    assert!(!error.to_string().contains(&machine.token));
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await
+        .is_err(),
+        "nothing is announced"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_token_or_pin_is_unreachable_with_the_link_code() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+
+    let mut wrong_token = machine.add_params();
+    wrong_token["token"] = json!("f".repeat(64));
+    let error = backend.call("add", wrong_token).await.unwrap_err();
+    let refused = data(&error);
+    assert_eq!(refused["code"], "machine-unreachable");
+    assert_eq!(refused["attempts"][0]["error"], "node-link-unauthorized");
+
+    let other = generate_certificate(vec!["127.0.0.1".into()]).unwrap();
+    let mut wrong_pin = machine.add_params();
+    wrong_pin["fingerprint"] = json!(other.fingerprint256);
+    let error = backend.call("add", wrong_pin).await.unwrap_err();
+    assert_eq!(
+        data(&error)["attempts"][0]["error"],
+        "node-link-certificate-mismatch"
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A stand-in for the sitter-shipped tailcat binary in pipe-client mode:
+/// for `address` it pipes stdin/stdout to `127.0.0.1:<port>`.
+#[cfg(unix)]
+fn fake_tailcat(dir: &std::path::Path, address: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("tailcat");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/usr/bin/env bash\n[ \"$1\" = \"{address}\" ] || exit 7\n\
+             exec 3<>/dev/tcp/127.0.0.1/$2 || exit 8\ncat <&3 &\ncat >&3\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A machine whose listener is loopback-only mints `hosts: []` with its
+/// tailcat address: it is added, and later reached, over tailcat alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tailcat_only_machine_with_no_hosts_is_added_and_refreshed() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let dir = tempfile::tempdir().unwrap();
+    backend
+        .services
+        .configure_remote_machines(Some(fake_tailcat(dir.path(), "tcmachine1")));
+    *machine.host.hosts.lock().unwrap() = Vec::new();
+    *machine.host.tc_address.lock().unwrap() = Some("tcmachine1".into());
+    let mut params = machine.add_params();
+    params["hosts"] = json!([]);
+    params["tcAddress"] = json!("tcmachine1");
+
+    let added = backend.call("add", params).await.unwrap();
+    machine.accept().await.closed_by_head().await;
+    assert_eq!(added["machine"]["hosts"], json!([]));
+    assert_eq!(added["machine"]["tcAddress"], "tcmachine1");
+
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    machine
+        .accept()
+        .await
+        .answer_capabilities(capabilities(0))
+        .await;
+    let refreshed = refreshing.await.unwrap().unwrap();
+    assert_eq!(refreshed["machine"]["state"], "connected");
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.hosts.is_empty());
+    assert_eq!(row.tc_address.as_deref(), Some("tcmachine1"));
+    assert!(row.last_connected_at.is_some());
+}
+
+/// With neither a host nor a tailcat address there is no route at all.
+#[tokio::test]
+async fn add_without_any_route_is_rejected_before_dialing() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    for tc_address in [None, Some(json!("")), Some(json!(null))] {
+        let mut params = machine.add_params();
+        params["hosts"] = json!([]);
+        if let Some(tc_address) = tc_address {
+            params["tcAddress"] = tc_address;
+        }
+        let error = backend.call("add", params).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidParams(_)), "{error:?}");
+        assert!(error.to_string().contains("tcAddress"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn add_rejects_malformed_params_before_dialing() {
+    let backend = Backend::new().await;
+    let machine = backend.machine().await;
+    for (field, value) in [
+        ("hosts", json!([])),
+        ("hosts", json!("127.0.0.1")),
+        ("port", json!(0)),
+        ("machineId", json!("bad id")),
+        ("fingerprint", json!("nope")),
+        ("token", json!("short")),
+    ] {
+        let mut params = machine.add_params();
+        params[field] = value;
+        let error = backend.call("add", params).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidParams(_)),
+            "{field}: {error:?}"
+        );
+        assert!(!error.to_string().contains(&machine.token));
+    }
+}
+
+/// No setting gates the backend side: on a fresh config the capability is
+/// advertised and the mutations run. The model-facing placement text (the
+/// `ws.agent.create` / `delegate` descriptions and `ws.help("agent")`)
+/// appears only while a machine is exposed to this backend.
+#[tokio::test]
+async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
+    use intent_core::WorkspaceApi as _;
+    let backend = Backend::new().await;
+    let port = backend.services.feature_remote_launch_port();
+    assert!(backend.services.remote_machines_capability());
+    assert_eq!(port.placement_help(&backend.services).await, None);
+    assert!(port
+        .placements(&backend.services)
+        .await
+        .unwrap()
+        .supported_platforms
+        .is_empty());
+
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await.shutdown();
+    let help = port
+        .placement_help(&backend.services)
+        .await
+        .expect("an exposed machine is listed");
+    assert!(help.starts_with("Remote placement"), "{help}");
+    assert!(help.contains("\"Test machine\""), "{help}");
+
+    backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .expect("remove");
+    assert_eq!(port.placement_help(&backend.services).await, None);
+    assert_eq!(
+        backend.call("list", json!({})).await.unwrap(),
+        json!({ "machines": [] })
+    );
+}
+
+#[tokio::test]
+async fn refresh_connects_on_demand_and_records_the_report() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    machine.no_link(Duration::from_millis(200)).await;
+    let mut sub = subscribe(&backend);
+
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    let mut link = machine.accept().await;
+    link.answer_capabilities(capabilities(1)).await;
+    let refreshed = refreshing.await.unwrap().unwrap();
+    assert_eq!(refreshed["machine"]["state"], "connected");
+    assert_eq!(
+        refreshed["machine"]["capabilities"]["capacity"]["runningAgents"],
+        1
+    );
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.capabilities.unwrap().capacity.running_agents, 1);
+    let events = changes(&mut sub, 2).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["machine"]["state"] == "connected"),
+        "{events:?}"
+    );
+
+    let unknown = backend
+        .call("refresh", json!({ "machineId": "nope" }))
+        .await
+        .unwrap_err();
+    assert_eq!(data(&unknown)["code"], "not-found");
+    assert_eq!(unknown.code(), -32602);
+}
+
+#[tokio::test]
+async fn a_revoked_credential_marks_the_machine_revoked() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    machine.revoke().await;
+    let error = backend
+        .call("refresh", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32603);
+    assert_eq!(data(&error)["code"], "machine-revoked");
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"][0]["state"], "revoked");
+}
+
+/// A machine whose link is up but that does not report in time (a freshly
+/// started daemon before its first provider report) is `machine-unreachable`
+/// naming the live route and the link code, not a bare internal error.
+#[tokio::test]
+async fn a_refresh_the_machine_does_not_answer_is_machine_unreachable() {
+    let mut quick = tuning();
+    quick.capabilities_timeout = Duration::from_millis(300);
+    let backend = Backend::with_tuning(quick).await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    // Bound, but the capabilities request is never answered.
+    let _link = machine.accept().await;
+    let error = refreshing.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), -32603, "{error:?}");
+    let data = data(&error);
+    assert_eq!(data["code"], "machine-unreachable", "{data}");
+    assert_eq!(
+        data["attempts"],
+        json!([{ "route": format!("127.0.0.1:{}", machine.port), "error": "node-link-timeout" }])
+    );
+    let message = error.to_string();
+    assert!(message.contains("Test machine"), "{message}");
+    assert!(!message.contains(&machine.token));
+}
+
+/// Revocation stops the binding's agents on the machine, so once the
+/// machine refuses the credential the backend no longer counts them: they
+/// end with `machine-revoked`, and a plain remove goes through.
+#[tokio::test]
+async fn a_revoked_machine_no_longer_counts_its_agents() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    assert_eq!(node.running(), 1);
+
+    machine.stop().await;
+    machine.revoke().await;
+    machine.restart().await;
+    tokio::time::timeout(wait(), async {
+        while node.running() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the revoked machine's agents are no longer counted");
+    assert!(!runtime.is_running());
+    let exit = runtime.exit_error().unwrap_or_default();
+    assert!(exit.contains("machine-revoked"), "{exit}");
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"][0]["state"], "revoked");
+    assert_eq!(listed["machines"][0]["runningAgents"], 0);
+    assert_eq!(
+        backend
+            .call("remove", json!({ "machineId": machine.id() }))
+            .await
+            .unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_refresh_marks_the_machine_unreachable() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    machine.stop().await;
+    let error = backend
+        .call("refresh", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-unreachable");
+    let listed = backend.call("list", json!({})).await.unwrap();
+    assert_eq!(listed["machines"][0]["state"], "unreachable");
+
+    // Back again: the next connect restores the healthy state.
+    machine.restart().await;
+    let refreshing = {
+        let services = backend.services.clone();
+        let id = machine.id();
+        tokio::spawn(async move {
+            with_caller(
+                Caller::Daemon,
+                services.remote_machines("refresh", json!({ "machineId": id })),
+            )
+            .await
+        })
+    };
+    machine
+        .accept()
+        .await
+        .answer_capabilities(capabilities(0))
+        .await;
+    refreshing.await.unwrap().unwrap();
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state,
+        intent_core::machines::RemoteMachineState::Disconnected
+    );
+}
+
+#[tokio::test]
+async fn remove_refuses_while_agents_run_unless_told_to_stop_them() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let mut link = machine.accept().await;
+    link.replay_complete(0).await;
+
+    let error = backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32602);
+    assert_eq!(data(&error)["code"], "machine-in-use");
+    assert_eq!(data(&error)["runningAgents"], 1);
+
+    let mut sub = subscribe(&backend);
+    // Review of intentd#2872: handing the stop to the link is not delivery.
+    // The removal waits for the machine's acknowledgement of that stop.
+    let remove = backend.call(
+        "remove",
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    );
+    tokio::pin!(remove);
+    let stop_id = tokio::select! {
+        result = &mut remove => panic!("removed before the machine acked the stop: {result:?}"),
+        stop_id = async {
+            let stop_id = link.stop_for(&agent).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop_id
+        } => stop_id,
+    };
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1,
+        "the machine stays until its stops are confirmed"
+    );
+    let (removed, ()) = tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+    assert_eq!(
+        removed.unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(!runtime.is_running());
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap(),
+        None
+    );
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert!(leases.iter().all(|lease| lease.state.is_terminal()));
+    // The stopped agent's count change may be announced first.
+    let removed_event = json!({ "machineId": machine.id(), "removed": true });
+    let mut seen = Vec::new();
+    while !seen.contains(&removed_event) {
+        seen.extend(changes(&mut sub, 1).await);
+    }
+    assert_eq!(
+        seen.last(),
+        Some(&removed_event),
+        "removal is announced last"
+    );
+
+    // Unknown: a no-op.
+    assert_eq!(
+        backend
+            .call("remove", json!({ "machineId": machine.id() }))
+            .await
+            .unwrap(),
+        json!({ "ok": true })
+    );
+}
+
+#[tokio::test]
+async fn adding_again_with_a_new_credential_starts_a_fresh_lease() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let old_lease = node.status().lease_id;
+    let old_credential = machine.credential.id.clone();
+
+    let token = "a".repeat(64);
+    let credential = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+    let mut params = machine.add_params();
+    params["credentialId"] = json!(credential.id);
+    params["token"] = json!(token);
+    let added = backend.call("add", params).await.unwrap();
+    machine.accept().await;
+    assert_eq!(added["replacedCredentialId"], json!(old_credential));
+
+    let fresh = backend.node(&machine.id()).await;
+    assert_ne!(fresh.status().lease_id, old_lease);
+    fresh.connect().await.unwrap();
+    let link = machine.accept().await;
+    assert_eq!(link.hello.binding.lease_id, fresh.status().lease_id);
+    assert_eq!(link.hello.acked_seq, NodeCounter(0), "a fresh journal");
+    fresh.shutdown();
+}
+
+/// Review of intentd#2872: a direct host that accepts TCP but fails the
+/// bind (here another daemon with a different certificate) must not hide a
+/// valid host listed after it. Which host accepts first is a race, so the
+/// connect is repeated.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_that_fails_the_bind_does_not_hide_a_valid_one() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let decoy = Machine::start_on([127, 0, 0, 2], &backend.id().await, machine.port).await;
+    assert_eq!(decoy.port, machine.port);
+    let mut params = machine.add_params();
+    params["hosts"] = json!(["127.0.0.2", "127.0.0.1"]);
+    backend
+        .call("add", params)
+        .await
+        .expect("add past the decoy");
+    machine.accept().await;
+
+    let target = crate::machine::MachineTarget::from_parts(
+        &machine.id(),
+        "Test machine",
+        vec!["127.0.0.2".into(), "127.0.0.1".into()],
+        machine.port,
+        None,
+        &machine.certificate.fingerprint256,
+        &machine.token,
+        None,
+    )
+    .unwrap();
+    let owner = crate::lease::new_owner(backend.store(), &machine.id())
+        .await
+        .unwrap();
+    for generation in 10..18 {
+        let connected = crate::connect::connect(&target, &tuning().connect, None, || {
+            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            async move { Ok(hello) }
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("connect {generation}: {failure:?}"));
+        connected.dialed.link.close();
+        machine.accept().await;
+    }
+    drop(decoy);
+}
+
+/// Review of intentd#2872: a host that accepts TCP but then stalls in the
+/// handshake gets one attempt's budget, not the whole connect's, so the valid
+/// host behind it is still tried.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let stalled = tokio::net::TcpListener::bind(("127.0.0.2", machine.port))
+        .await
+        .expect("bind the stalled host");
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = stalled.accept().await {
+            sockets.push(socket);
+        }
+    });
+    let target = crate::machine::MachineTarget::from_parts(
+        &machine.id(),
+        "Test machine",
+        vec!["127.0.0.2".into(), "127.0.0.1".into()],
+        machine.port,
+        None,
+        &machine.certificate.fingerprint256,
+        &machine.token,
+        None,
+    )
+    .unwrap();
+    let owner = crate::lease::new_owner(backend.store(), &machine.id())
+        .await
+        .unwrap();
+    // The whole budget stays under the dialer's own 10 s handshake bound,
+    // which is the bound a stalled host used to consume.
+    let budget = crate::connect::ConnectTuning {
+        attempt: std::time::Duration::from_secs(2),
+        total: std::time::Duration::from_secs(8),
+    };
+    for generation in 1..5 {
+        let connected = crate::connect::connect(&target, &budget, None, || {
+            let hello = crate::lease::probe_hello(&owner, NodeCounter(generation));
+            async move { Ok(hello) }
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("connect {generation}: {failure:?}"));
+        connected.dialed.link.close();
+        machine.accept().await;
+    }
+    held.abort();
+}
+
+/// A removal whose stops the machine does not acknowledge in time fails
+/// `machine-unreachable`, naming the unconfirmed agents, and deletes
+/// nothing; the stops stay queued.
+#[tokio::test]
+async fn remove_fails_and_keeps_everything_when_stops_go_unacknowledged() {
+    let mut quick = tuning();
+    quick.remove_timeout = std::time::Duration::from_millis(800);
+    let backend = Backend::with_tuning(quick).await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let _runtime = node.attach(&agent, &workspace());
+    let mut link = machine.accept().await;
+    link.replay_complete(0).await;
+
+    let (error, _) = tokio::join!(
+        backend.call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        ),
+        link.stop_for(&agent),
+    );
+    let error = error.unwrap_err();
+    assert_eq!(error.code(), -32603, "{error:?}");
+    assert_eq!(data(&error)["code"], "machine-unreachable");
+    assert_eq!(data(&error)["unconfirmedStops"], json!([agent.to_string()]));
+    assert_eq!(data(&error)["attempts"], json!([]));
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1
+    );
+    assert!(backend
+        .services
+        .load_remote_machine_token(&machine.id())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        node.shared_ref().has_pending_stops(),
+        "the stop stays queued"
+    );
+    node.shutdown();
+}
+
+/// Review of intentd#2872: a connector is created only under the machine's
+/// lifecycle lock, so `refresh` (or a placement) racing a credential
+/// replacement cannot cache a connector built on the old lease.
+#[tokio::test]
+async fn a_connector_is_created_only_under_the_lifecycle_lock() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await;
+    let feature = backend.services.remote_feature().unwrap();
+    feature.take_node(&machine.id()).unwrap().shutdown();
+
+    let held = feature.lifecycle(&machine.id()).await;
+    let refresh = backend.call("refresh", json!({ "machineId": machine.id() }));
+    tokio::pin!(refresh);
+    tokio::select! {
+        result = &mut refresh => panic!("refresh ran under a held lifecycle lock: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+    }
+    assert!(
+        feature.running_node(&machine.id()).is_none(),
+        "no connector is created while the lock is held"
+    );
+    drop(held);
+    let (refreshed, ()) = tokio::join!(refresh, async {
+        machine
+            .accept()
+            .await
+            .answer_capabilities(capabilities(0))
+            .await;
+    });
+    refreshed.expect("refresh once the lock is free");
+    feature.take_node(&machine.id()).unwrap().shutdown();
+}
+
+/// Review of intentd#2872: adding the same credential again with a new
+/// listener port moves the retained connector to that port too, not only
+/// its hosts.
+#[tokio::test]
+async fn adding_again_on_a_new_port_moves_the_connector() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let old_port = proxy.local_addr().unwrap().port();
+    let real_port = machine.port;
+    let forward = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut outbound) =
+                    tokio::net::TcpStream::connect(("127.0.0.1", real_port)).await
+                else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    let mut params = machine.add_params();
+    params["port"] = json!(old_port);
+    backend
+        .call("add", params)
+        .await
+        .expect("add on the old port");
+    machine.accept().await.closed_by_head().await;
+    let node = backend.node(&machine.id()).await;
+    node.connect().await.unwrap();
+    let first = machine.accept().await;
+
+    backend
+        .call("add", machine.add_params())
+        .await
+        .expect("add again on the new port");
+    machine.accept().await;
+    forward.abort();
+    first.link.close();
+    disconnected(&node).await;
+
+    node.connect()
+        .await
+        .expect("the connector dials the new port");
+    machine.accept().await;
+    node.shutdown();
+}
+
+/// Review of intentd#2872: adding a machine again with the same credential
+/// (a route refresh) keeps its lease and offers a newer generation, so the
+/// machine does not refuse it as stale.
+#[tokio::test]
+async fn adding_again_with_the_same_credential_keeps_the_lease() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let lease = node.status().lease_id;
+    node.connect().await.unwrap();
+    let first = machine.accept().await;
+
+    let again = backend
+        .call("add", machine.add_params())
+        .await
+        .expect("add again");
+    assert!(again.get("replacedCredentialId").is_none(), "{again}");
+    let probe = machine.accept().await;
+    assert_eq!(probe.hello.binding.lease_id, lease, "the same lease");
+    assert!(probe.hello.binding.generation > first.hello.binding.generation);
+    assert_eq!(backend.node(&machine.id()).await.status().lease_id, lease);
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert_eq!(
+        leases.iter().filter(|l| !l.state.is_terminal()).count(),
+        1,
+        "no second live lease"
+    );
+}
+
+/// Review of intentd#2872: removing a machine whose link is down must not
+/// drop the stops it still owes the machine. The removal fails, the machine
+/// and its credential stay, and once the machine is back the stop is
+/// delivered and the removal goes through.
+#[tokio::test]
+async fn remove_keeps_a_disconnected_machine_until_its_stops_are_delivered() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    machine.stop().await;
+    disconnected(&node).await;
+
+    let error = backend
+        .call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+    assert_eq!(data(&error)["unconfirmedStops"], json!([agent.to_string()]));
+    assert!(!runtime.is_running(), "the agent is stopped on this side");
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1
+    );
+    assert!(backend
+        .services
+        .load_remote_machine_token(&machine.id())
+        .await
+        .unwrap()
+        .is_some());
+
+    machine.restart().await;
+    let mut link = machine.accept().await;
+    let stop_id = link.stop_for(&agent).await;
+    // The stop counts only once the machine acks it.
+    assert!(node.shared_ref().has_pending_stops());
+    link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().has_pending_stops() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the machine's answer confirms the stop");
+    let removed = backend
+        .call(
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        )
+        .await;
+    assert_eq!(
+        removed.unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A backend that placed `agent` on `machine` and then restarted: the agent's
+/// record and its live lease persist, the machine still runs the agent, and
+/// no connector to the machine exists yet (startup starts none).
+async fn restarted_with_a_surviving_agent(backend: &Backend, machine: &mut Machine) -> AgentId {
+    let node = backend.expose(machine).await;
+    let lease_id = node.status().lease_id;
+    let agent = AgentId::new();
+    let now = intent_core::now_iso();
+    backend
+        .store()
+        .insert_workspace(&intent_core::Workspace {
+            id: workspace(),
+            title: "Remote".into(),
+            branch: "main".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+        .bind(agent.as_str())
+        .bind(workspace().as_str())
+        .bind(&now)
+        .bind(&now)
+        .execute(backend.store().write_pool())
+        .await
+        .unwrap();
+    backend
+        .store()
+        .record_remote_agent(&intent_core::remote_launch::RemoteAgentRecord {
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            node_id: machine.id(),
+            lease_id,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    *machine.host.running.lock().unwrap() = vec![agent.clone()];
+    // The restart: the in-memory connector is gone.
+    backend
+        .services
+        .remote_feature()
+        .unwrap()
+        .take_node(&machine.id())
+        .expect("the feature's connector")
+        .shutdown();
+    agent
+}
+
+async fn assert_machine_kept(backend: &Backend, machine: &Machine) {
+    assert_eq!(
+        backend.store().list_exposed_machines().await.unwrap().len(),
+        1,
+        "the machine stays registered"
+    );
+    assert!(
+        backend
+            .services
+            .load_remote_machine_token(&machine.id())
+            .await
+            .unwrap()
+            .is_some(),
+        "its token stays"
+    );
+    let leases = backend
+        .store()
+        .list_owned_node_leases(&backend.id().await)
+        .await
+        .unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.owner.node_id == machine.id() && !lease.state.is_terminal()),
+        "its lease stays live"
+    );
+}
+
+// Review of intentd#2910: after a backend restart no connector runs, so
+// removal must not take the machine for idle while its agents survive.
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let error = backend
+        .call("remove", json!({ "machineId": machine.id() }))
+        .await
+        .unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    assert_machine_kept(&backend, &machine).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_with_stop_agents_waits_for_the_machines_ack() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+
+    let remove = backend.call(
+        "remove",
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    );
+    tokio::pin!(remove);
+    let (link, stop_id) = tokio::select! {
+        result = &mut remove => panic!("removed before the surviving agent's stop was acked: {result:?}"),
+        found = async {
+            let mut link = machine.accept().await;
+            let stop_id = link.stop_for(&agent).await;
+            (link, stop_id)
+        } => found,
+    };
+    assert_machine_kept(&backend, &machine).await;
+    let (removed, ()) = tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+    assert_eq!(
+        removed.unwrap(),
+        json!({ "ok": true, "credentialId": machine.credential.id })
+    );
+    assert!(backend
+        .store()
+        .list_exposed_machines()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn after_a_restart_an_unreachable_machine_with_agents_keeps_everything() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    machine.stop().await;
+
+    for params in [
+        json!({ "machineId": machine.id() }),
+        json!({ "machineId": machine.id(), "stopAgents": true }),
+    ] {
+        let error = backend.call("remove", params).await.unwrap_err();
+        assert_eq!(data(&error)["code"], "machine-unreachable", "{error:?}");
+        assert!(!data(&error)["attempts"].as_array().unwrap().is_empty());
+        assert_machine_kept(&backend, &machine).await;
+    }
+}
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_a_surviving_agent_runs() {
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+
+    let token = "a".repeat(64);
+    let credential = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+    let mut params = machine.add_params();
+    params["credentialId"] = json!(credential.id);
+    params["token"] = json!(token);
+    let error = backend.call("add", params).await.unwrap_err();
+    assert_eq!(data(&error)["code"], "machine-in-use", "{error:?}");
+    assert_eq!(data(&error)["runningAgents"], 1);
+    let row = backend
+        .store()
+        .get_exposed_machine(&machine.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.credential_id, old_credential, "the credential is kept");
+    assert_machine_kept(&backend, &machine).await;
+}
+
+// Review of intentd#2930: a bind records its route before it claims the
+// welcome's agents. A removal or a credential replacement that runs while a
+// refresh's bind is in that window must still wait for the claim, not count
+// zero survivors.
+#[derive(Clone, Copy, Debug)]
+enum DuringBind {
+    Remove,
+    RemoveStoppingAgents,
+    ReplaceCredential,
+}
+
+async fn during_a_restart_bind(action: DuringBind) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    let mut hooked = tuning();
+    hooked.before_claim = crate::connector::BeforePublish(Some(Arc::new(
+        move |_: &Arc<crate::connector::Shared>| {
+            // Hold only the first bind, between its route and its claim.
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                if let Some(release) = release_rx.lock().unwrap().take() {
+                    // Hand this worker's other tasks off before blocking.
+                    tokio::task::block_in_place(|| {
+                        let _ = release.recv();
+                    });
+                }
+            }
+        },
+    )));
+    let backend = Backend::with_tuning(hooked).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let (method, params) = match action {
+        DuringBind::Remove => ("remove", json!({ "machineId": machine.id() })),
+        DuringBind::RemoveStoppingAgents => (
+            "remove",
+            json!({ "machineId": machine.id(), "stopAgents": true }),
+        ),
+        DuringBind::ReplaceCredential => {
+            let token = "a".repeat(64);
+            let credential =
+                Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            ("add", params)
+        }
+    };
+
+    // A refresh starts the connector and binds; the bind stops before its
+    // claim with the route already recorded.
+    let services = backend.services.clone();
+    let id = machine.id();
+    let refresh = tokio::spawn(async move {
+        with_caller(
+            Caller::Daemon,
+            services.remote_machines("refresh", json!({ "machineId": id })),
+        )
+        .await
+    });
+    let mut link = machine.accept().await;
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let services = backend.services.clone();
+    let call = tokio::spawn(async move {
+        with_caller(Caller::Daemon, services.remote_machines(method, params)).await
+    });
+    // timing-guard: a call that skipped the claim finishes at once
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!call.is_finished(), "{action:?} waits for the bind's claim");
+    assert_machine_kept(&backend, &machine).await;
+    release_tx.send(()).unwrap();
+
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = call.await.unwrap().unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            let stop_id = link.stop_for(&agent).await;
+            assert!(!call.is_finished(), "removal waits for the StopAck");
+            assert_machine_kept(&backend, &machine).await;
+            link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+            assert_eq!(
+                call.await.unwrap().unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+    refresh.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::Remove).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_remove_stopping_agents_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_restart_replacing_the_credential_during_a_bind_waits_for_its_claim() {
+    during_a_restart_bind(DuringBind::ReplaceCredential).await;
+}
+
+// Review of intentd#2930: a bind whose claim could not read this lease's
+// agent records publishes its link with nothing claimed. Removal and
+// credential replacement must refuse then, keeping everything, and succeed
+// once a retried claim can read the records.
+async fn when_the_claim_cannot_read_its_records(action: DuringBind) {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut failing = tuning();
+    failing.fail_claim_reads = fail.clone();
+    // timing-guard: no redial between the refused call and the retry, so
+    // each call sees exactly one bind
+    failing.backoff = Backoff::new(Duration::from_millis(300), Duration::from_millis(600));
+    let backend = Backend::with_tuning(failing).await;
+    let mut machine = backend.machine().await;
+    let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+    let old_credential = machine.credential.id.clone();
+    let params = |machine: &Machine, credential: Option<(&ExecutorCredential, &str)>| match action {
+        DuringBind::Remove => json!({ "machineId": machine.id() }),
+        DuringBind::RemoveStoppingAgents => {
+            json!({ "machineId": machine.id(), "stopAgents": true })
+        }
+        DuringBind::ReplaceCredential => {
+            let (credential, token) = credential.unwrap();
+            let mut params = machine.add_params();
+            params["credentialId"] = json!(credential.id);
+            params["token"] = json!(token);
+            params
+        }
+    };
+    let method = match action {
+        DuringBind::ReplaceCredential => "add",
+        _ => "remove",
+    };
+    let token = "a".repeat(64);
+    let replacement = Machine::mint(machine.services.store(), &backend.id().await, &token).await;
+
+    let error = backend
+        .call(method, params(&machine, Some((&replacement, &token))))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32603, "{action:?}: {error:?}");
+    assert!(
+        error.to_string().contains("could not tell which"),
+        "{action:?}: {error}"
+    );
+    let mut link = machine.accept().await;
+    assert_machine_kept(&backend, &machine).await;
+
+    // The records are readable again: the retry claims the survivor.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    match action {
+        DuringBind::Remove | DuringBind::ReplaceCredential => {
+            let error = backend
+                .call(method, params(&machine, Some((&replacement, &token))))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                data(&error)["code"],
+                "machine-in-use",
+                "{action:?}: {error:?}"
+            );
+            assert_eq!(data(&error)["runningAgents"], 1);
+            assert_machine_kept(&backend, &machine).await;
+            let row = backend
+                .store()
+                .get_exposed_machine(&machine.id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.credential_id, old_credential, "the credential is kept");
+        }
+        DuringBind::RemoveStoppingAgents => {
+            // The failed bind's link was closed; the stop goes out on the
+            // link that claims the survivor.
+            let remove = backend.call(method, params(&machine, None));
+            tokio::pin!(remove);
+            let stop_id = tokio::select! {
+                result = &mut remove => panic!("removed before the survivor's stop was acked: {result:?}"),
+                stop_id = async {
+                    link = machine.accept().await;
+                    link.stop_for(&agent).await
+                } => stop_id,
+            };
+            let (removed, ()) =
+                tokio::join!(remove, link.ack_stop(stop_id, &agent, StopOutcome::Stopped));
+            assert_eq!(
+                removed.unwrap(),
+                json!({ "ok": true, "credentialId": old_credential })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::Remove).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_remove_stopping_agents_refuses_while_the_claim_cannot_read_its_records() {
+    when_the_claim_cannot_read_its_records(DuringBind::RemoveStoppingAgents).await;
+}
+
+#[tokio::test]
+async fn after_a_restart_replacing_the_credential_refuses_while_the_claim_cannot_read_its_records()
+{
+    when_the_claim_cannot_read_its_records(DuringBind::ReplaceCredential).await;
+}
+
+// Coordinator follow-up to intentd#2930: after a restart the backend
+// reconnects on its own to machines that may still run its agents, so their
+// counts, journals and stops resume without waiting for a user action.
+mod at_boot {
+    use super::*;
+
+    async fn running_agents_listed(backend: &Backend) -> Value {
+        let listed = backend.call("list", json!({})).await.unwrap();
+        listed["machines"][0]["runningAgents"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_machine_without_recorded_agents_is_not_dialed() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await;
+        backend
+            .services
+            .remote_feature()
+            .unwrap()
+            .take_node(&machine.id())
+            .unwrap()
+            .shutdown();
+        assert!(backend.services.resume_exposed_machines().await.is_empty());
+        machine.no_link(Duration::from_millis(500)).await;
+        assert!(backend
+            .services
+            .remote_feature()
+            .unwrap()
+            .running_node(&machine.id())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_surviving_agent_is_claimed_and_its_journal_streams() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        assert_eq!(
+            running_agents_listed(&backend).await,
+            0,
+            "before the boot step"
+        );
+
+        assert_eq!(
+            backend.services.resume_exposed_machines().await,
+            vec![machine.id()]
+        );
+        // Nothing else asks for the machine: the boot step alone dials it.
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is counted");
+        let listed = backend.call("list", json!({})).await.unwrap();
+        assert_eq!(listed["machines"][0]["state"], "connected");
+        link.journal(note(1, &agent, "after the restart")).await;
+        link.acked(1).await;
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_machine_does_not_hold_up_the_boot_and_is_dialed_again() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        machine.stop().await;
+        let started = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            backend.services.resume_exposed_machines(),
+        )
+        .await
+        .expect("the boot step does not wait for the machine");
+        assert_eq!(started, vec![machine.id()]);
+        // timing-guard: several backoff rounds pass while it is down
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        machine.restart().await;
+        machine.accept().await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is counted once the machine is back");
+    }
+
+    #[tokio::test]
+    async fn agents_whose_sessions_ended_do_not_make_a_machine_dialed() {
+        for status in ["deleted", "Completed"] {
+            let backend = Backend::new().await;
+            let mut machine = backend.machine().await;
+            let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+            sqlx::query("UPDATE agent_session SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(agent.as_str())
+                .execute(backend.store().write_pool())
+                .await
+                .unwrap();
+            assert!(
+                backend.services.resume_exposed_machines().await.is_empty(),
+                "{status}"
+            );
+            machine.no_link(Duration::from_millis(300)).await;
+        }
+    }
+
+    // Review of intentd#2931: a bind whose claim cannot read this lease's
+    // records must not serve the link (its survivors' records would be
+    // dropped yet acknowledged); the connector retries the bind on its own,
+    // and nothing is acknowledged before the claim succeeds.
+    #[tokio::test]
+    async fn a_failed_claim_at_boot_is_retried_before_anything_is_acknowledged() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut failing = tuning();
+        failing.fail_claim_reads = fail.clone();
+        // timing-guard: a redial gap long enough to clear the failure in
+        failing.backoff = Backoff::new(Duration::from_millis(300), Duration::from_millis(600));
+        let backend = Backend::with_tuning(failing).await;
+        let mut machine = backend.machine().await;
+        let agent = restarted_with_a_surviving_agent(&backend, &mut machine).await;
+        backend.services.resume_exposed_machines().await;
+
+        let mut first = machine.accept().await;
+        first.closed_by_head().await;
+        assert_eq!(running_agents_listed(&backend).await, 0);
+
+        // The records are readable again; no user action follows.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut second = machine.accept().await;
+        assert_eq!(
+            second.hello.acked_seq,
+            NodeCounter(0),
+            "nothing was acknowledged"
+        );
+        second.replay_complete(0).await;
+        second
+            .journal(note(1, &agent, "while the claim failed"))
+            .await;
+        second.acked(1).await;
+        tokio::time::timeout(wait(), async {
+            while running_agents_listed(&backend).await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the survivor is claimed on the retried bind");
+    }
+}

@@ -18,6 +18,7 @@ fn bound() -> Duration {
 }
 
 /// Whether `pid` still names a process (signal 0 probe), zombies included.
+#[track_caller]
 fn alive(pid: u32) -> bool {
     match kill(Pid::from_raw(pid.cast_signed()), None) {
         Ok(()) => true,
@@ -27,6 +28,7 @@ fn alive(pid: u32) -> bool {
 }
 
 /// Poll `cond` up to [`bound()`]; panic with `what` when it never holds.
+#[track_caller]
 fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     let bound = bound();
     let deadline = Instant::now() + bound;
@@ -121,6 +123,7 @@ fn kill_tree_after_reap_returns_the_exit_status() {
 
 /// SIGKILL only the leader, leaving it an unreaped zombie with its
 /// `sleep 60` grandchild still running in the group.
+#[track_caller]
 fn spawn_with_grandchild_then_kill_the_leader() -> (GuardedChild, u32) {
     let (guard, grandchild) = spawn_with_grandchild();
     guard.signal(nix::sys::signal::Signal::SIGKILL).unwrap();

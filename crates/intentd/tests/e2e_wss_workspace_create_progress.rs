@@ -98,6 +98,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
     .expect("response timeout")
 }
 
+#[track_caller]
 fn run_git(args: &[&str], dir: &Path) {
     let out = std::process::Command::new("git")
         .args(args)

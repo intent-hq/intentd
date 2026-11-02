@@ -196,6 +196,47 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     pairing_info_json(provider).await
 }
 
+/// The services layer's [`intent_core::machines::MachineRoutesSource`] over
+/// the listener's pairing provider, for `executor.mint`: the same port,
+/// hosts, tunnel address and certificate fingerprint `server.pairingInfo`
+/// reports, plus the display name. Never the bearer token.
+pub struct MachineRoutesResolver {
+    provider: Arc<dyn ServerPairingInfo>,
+}
+
+impl MachineRoutesResolver {
+    #[must_use]
+    pub fn new(provider: Arc<dyn ServerPairingInfo>) -> Self {
+        Self { provider }
+    }
+}
+
+impl intent_core::machines::MachineRoutesSource for MachineRoutesResolver {
+    fn machine_routes(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<intent_core::machines::MachineRoutes>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let snapshot = self.provider.pairing_snapshot().await;
+            let port = snapshot.port.ok_or(Error::ListenerDown)?;
+            let cert = crate::ensure_tls_certificate(self.provider.data_dir())?;
+            let host = self.provider.host_environment();
+            let name = if host.pretty_hostname.trim().is_empty() {
+                host.hostname
+            } else {
+                host.pretty_hostname
+            };
+            Ok(intent_core::machines::MachineRoutes {
+                name,
+                port,
+                hosts: pairing_hosts(&snapshot),
+                tc_address: snapshot.tc_address,
+                fingerprint: cert.fingerprint256,
+            })
+        })
+    }
+}
+
 /// Hosts the pairing payload should advertise for `snapshot`: a listener
 /// bound to specific addresses is reachable only there, so advertise exactly
 /// those addresses; an unspecified bind (`0.0.0.0` / `::` — always the sole

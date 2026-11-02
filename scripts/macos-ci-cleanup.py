@@ -27,6 +27,9 @@ import subprocess
 
 GIB = 1024 ** 3
 CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
+# ci.yml's `build` job owns the only live root. The other two are the retired
+# per-job roots of the former macOS lifecycle and Services runtime jobs; they
+# stay eligible so existing runners reclaim their stale debug profiles.
 TARGETS = ('build-aarch64-apple-darwin', 'daemon-lifecycle-macos',
            'macos-services-runtime-aarch64-apple-darwin')
 PROFILES = ('debug', 'aarch64-apple-darwin/debug')

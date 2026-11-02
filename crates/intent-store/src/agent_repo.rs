@@ -49,7 +49,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted";
+    harness_features, retired_at, notifications_muted, pinned";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -799,8 +799,11 @@ pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
 /// [`Store::update_agent_session_metadata`]) never set or clear them, so a
 /// caller's stale snapshot cannot erase a newer value or bring back an old
 /// one (PROTOCOL §5.54 shared quota state).
-const DAEMON_OWNED_METADATA_KEYS: [&str; 2] =
-    [MANUAL_CHOICE_METADATA_KEY, PROVIDER_RETURN_METADATA_KEY];
+const DAEMON_OWNED_METADATA_KEYS: [&str; 3] = [
+    MANUAL_CHOICE_METADATA_KEY,
+    PROVIDER_RETURN_METADATA_KEY,
+    intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+];
 
 /// The two binds a whole-document `metadata` write needs (see
 /// [`daemon_owned_preserving_metadata`]): the caller's document without the
@@ -844,16 +847,18 @@ fn daemon_owned_preserving_metadata(
     raw_doc: &str,
     keep_choice_if: &str,
 ) -> String {
-    let [choice, ret] = DAEMON_OWNED_METADATA_KEYS;
+    let [choice, ret, remote] = DAEMON_OWNED_METADATA_KEYS;
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
               AND json_type(metadata) = 'object' \
               AND (json_type(metadata, '$.{choice}') IS NOT NULL \
-                   OR json_type(metadata, '$.{ret}') IS NOT NULL) \
+                   OR json_type(metadata, '$.{ret}') IS NOT NULL \
+                   OR json_type(metadata, '$.{remote}') IS NOT NULL) \
              THEN json_patch({object_doc}, json_object(\
                  '{choice}', CASE WHEN ({keep_choice_if}) \
                                   THEN json(metadata -> '$.{choice}') END, \
-                 '{ret}', json(metadata -> '$.{ret}'))) \
+                 '{ret}', json(metadata -> '$.{ret}'), \
+                 '{remote}', json(metadata -> '$.{remote}'))) \
          ELSE {raw_doc} END"
     )
 }
@@ -1042,7 +1047,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 40-column `agent_session` insert value list onto `query`, in
+/// Bind the full 42-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1093,7 +1098,40 @@ fn bind_session_insert<'q>(
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
         .bind(&s.retired_at)
-        .bind(i64::from(s.notifications_muted)))
+        .bind(i64::from(s.notifications_muted))
+        .bind(i64::from(s.pinned)))
+}
+
+/// Per-session boolean user preferences. Each is written only by its narrow
+/// writer or an explicit patch in [`Store::update_agent_session_with_preferences`],
+/// never by the ordinary full-row update.
+#[derive(Clone, Copy)]
+enum SessionPreference {
+    NotificationsMuted,
+    Pinned,
+}
+
+impl SessionPreference {
+    /// Conditional single-column UPDATE binding `(value, id, workspace_id, value)`.
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => {
+                "UPDATE agent_session SET notifications_muted=? \
+                 WHERE id=? AND workspace_id=? AND notifications_muted != ?"
+            }
+            Self::Pinned => {
+                "UPDATE agent_session SET pinned=? \
+                 WHERE id=? AND workspace_id=? AND pinned != ?"
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => "set notifications muted",
+            Self::Pinned => "set pinned",
+        }
+    }
 }
 
 impl Store {
@@ -1146,7 +1184,7 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
         match tx.as_mut() {
@@ -1224,7 +1262,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -2938,13 +2976,14 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None, false)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, None, false)
             .await
     }
 
-    /// Atomically update a session, optional manual specialist memory, and an
-    /// explicitly requested notification-mute patch. Ordinary row writes omit
-    /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// Atomically update a session, optional manual specialist memory, and
+    /// explicitly requested notification-mute / sidebar-pin patches. Ordinary
+    /// row writes omit the patches so stale session snapshots cannot revert
+    /// the user's toggles.
     /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
     /// choice: the same UPDATE clears the Auto-pin mark
     /// (`reasoning_effort_auto`) even when the value is unchanged, so no
@@ -2960,6 +2999,7 @@ impl Store {
         s: &AgentSession,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        pinned: Option<bool>,
         explicit_effort: bool,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
@@ -3022,7 +3062,8 @@ impl Store {
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
-        // such a patch can never revert the user's mute.
+        // such a patch can never revert the user's mute. `pinned` (0180) is
+        // the same kind of user toggle and is excluded on the same grounds.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -3043,7 +3084,7 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
         let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist || notifications_muted.is_some() {
+        let mut tx = if remember_specialist || notifications_muted.is_some() || pinned.is_some() {
             Some(
                 self.write_pool()
                     .begin()
@@ -3138,18 +3179,20 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         if let Some(mut tx) = tx {
-            if let Some(muted) = notifications_muted {
-                sqlx::query(
-                    "UPDATE agent_session SET notifications_muted=? \
-                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
-                )
-                .bind(i64::from(muted))
-                .bind(&s.id.0)
-                .bind(&workspace_id.0)
-                .bind(i64::from(muted))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            for (column, value) in [
+                (SessionPreference::NotificationsMuted, notifications_muted),
+                (SessionPreference::Pinned, pinned),
+            ] {
+                if let Some(value) = value {
+                    sqlx::query(column.update_sql())
+                        .bind(i64::from(value))
+                        .bind(&s.id.0)
+                        .bind(&workspace_id.0)
+                        .bind(i64::from(value))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
+                }
             }
             if remember_specialist {
                 crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
@@ -3183,18 +3226,51 @@ impl Store {
         id: &AgentId,
         muted: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=? \
-             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        self.set_agent_session_preference(
+            workspace_id,
+            id,
+            SessionPreference::NotificationsMuted,
+            muted,
         )
-        .bind(i64::from(muted))
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(i64::from(muted))
-        .execute(self.write_pool())
         .await
-        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
-        .rows_affected();
+    }
+
+    /// Set the session's sidebar `pinned` flag (0180) — the store side of
+    /// `agent.update { pinned }`. Same contract as
+    /// [`Store::set_agent_notifications_muted`]: returns `true` when the
+    /// stored value changed, never advances the activity timestamp, and is
+    /// (with explicit patches in mixed updates) the only writer of the column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_pinned(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        pinned: bool,
+    ) -> Result<bool> {
+        self.set_agent_session_preference(workspace_id, id, SessionPreference::Pinned, pinned)
+            .await
+    }
+
+    /// Narrow writer shared by the per-session user-preference flags.
+    async fn set_agent_session_preference(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        preference: SessionPreference,
+        value: bool,
+    ) -> Result<bool> {
+        let rows = sqlx::query(preference.update_sql())
+            .bind(i64::from(value))
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .bind(i64::from(value))
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("{} failed: {e}", preference.label())))?
+            .rows_affected();
         if rows == 0 {
             let exists = sqlx::query_scalar::<_, String>(
                 "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
@@ -5050,6 +5126,7 @@ fn map_session_row_with_heavy_cols(
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
+        pinned: col::<i64>(row, "pinned")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -6861,14 +6938,9 @@ impl Store {
     }
 
     /// Read an agent's user-role messages as lightweight index items in
-    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
-    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
-    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
-    /// the same expression the FTS index uses), and the preview truncated to
-    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
-    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
-    /// never transferred out of the database or decoded. `metadata` is
-    /// passed through verbatim when present.
+    /// chronological (`seq` ascending) order — the unpaged
+    /// `agent.listUserMessages` projection (PROTOCOL §5.5). Equivalent to
+    /// [`Self::get_agent_user_message_index_page`] with no page bound.
     ///
     /// # Errors
     ///
@@ -6879,9 +6951,52 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
+        Ok(self
+            .get_agent_user_message_index_page(agent_id, preview_chars, None)
+            .await?
+            .items)
+    }
+
+    /// Read an agent's user-role messages as lightweight index items in
+    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// projected inside SQL down to the classification fields
+    /// ([`project_user_message_index_metadata`]), so heavy keys such as an
+    /// event notification's `events` payload never leave the database
+    /// either (intent-hq/intent#8278).
+    ///
+    /// With a `page`, only the newest `page.limit` rows strictly older than
+    /// `page.before_seq` (all rows when `None`) are read, still returned
+    /// oldest→newest; [`UserMessageIndexPage::next_before_seq`] is the `seq`
+    /// of the oldest returned row when older rows remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation or a row decode
+    /// fails.
+    pub async fn get_agent_user_message_index_page(
+        &self,
+        agent_id: &AgentId,
+        preview_chars: usize,
+        page: Option<UserMessageIndexPageRequest>,
+    ) -> Result<UserMessageIndexPage> {
+        let metadata_sql = user_message_index_metadata_sql();
+        let (before_sql, order_sql) = match page {
+            Some(UserMessageIndexPageRequest {
+                before_seq: Some(_),
+                ..
+            }) => ("AND m.seq < ?", "ORDER BY m.seq DESC LIMIT ?"),
+            Some(_) => ("", "ORDER BY m.seq DESC LIMIT ?"),
+            None => ("", "ORDER BY m.seq ASC"),
+        };
         let sql = format!(
-            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
-                    m.metadata, m.created_at, \
+            "SELECT m.id, m.seq, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    {metadata_sql} AS metadata, m.created_at, \
                     (COALESCE(json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
                       AND (json_type(m.metadata, '$.resource') IS NOT NULL \
                         OR json_type(m.metadata, '$.availability') IS NOT NULL), 0) \
@@ -6892,32 +7007,56 @@ impl Store {
                            OR json_type(m.content, block.fullkey || '.messageMetadata.availability') IS NOT NULL)\
                      ) ELSE 0 END) AS qualified_monitor \
              FROM agent_message m \
-             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+             WHERE m.agent_id = ? AND m.role = 'user' {before_sql} {order_sql}"
         );
-        let rows = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql)
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
-            .bind(&agent_id.0)
+            .bind(&agent_id.0);
+        if let Some(page) = page {
+            if let Some(before_seq) = page.before_seq {
+                query = query.bind(before_seq);
+            }
+            // One extra row tells whether older history remains.
+            query = query.bind(i64::try_from(page.limit).unwrap_or(i64::MAX - 1) + 1);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
-        rows.iter()
-            .map(|row| {
-                let metadata: Option<serde_json::Value> =
-                    match col::<Option<String>>(row, "metadata")? {
-                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
-                            Error::Internal(format!("decode message metadata failed: {e}"))
-                        })?),
-                        None => None,
-                    };
-                Ok(UserMessageIndexItem {
-                    qualified_monitor: col(row, "qualified_monitor")?,
-                    id: col(row, "id")?,
-                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
-                    metadata,
-                    created_at: col(row, "created_at")?,
-                })
-            })
-            .collect()
+        let mut items = Vec::with_capacity(rows.len());
+        let mut seqs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let metadata = match col::<Option<String>>(row, "metadata")? {
+                Some(raw) => {
+                    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        Error::Internal(format!("decode message metadata failed: {e}"))
+                    })?;
+                    project_user_message_index_metadata(&value)
+                }
+                None => None,
+            };
+            seqs.push(col::<i64>(row, "seq")?);
+            items.push(UserMessageIndexItem {
+                qualified_monitor: col(row, "qualified_monitor")?,
+                id: col(row, "id")?,
+                preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
+                metadata,
+                created_at: col(row, "created_at")?,
+            });
+        }
+        let mut next_before_seq = None;
+        if let Some(page) = page {
+            if items.len() > page.limit {
+                items.truncate(page.limit);
+                seqs.truncate(page.limit);
+                next_before_seq = seqs.last().copied();
+            }
+            items.reverse();
+        }
+        Ok(UserMessageIndexPage {
+            items,
+            next_before_seq,
+        })
     }
 
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
@@ -7586,8 +7725,9 @@ pub struct ReplaceMessage<'a> {
 
 /// One row of the `agent.listUserMessages` index
 /// ([`Store::get_agent_user_message_index`]): the message id, a bounded
-/// plain-text preview, the verbatim metadata (when present), and the
-/// creation timestamp — never the full content blob.
+/// plain-text preview, the projected classification metadata
+/// ([`project_user_message_index_metadata`], when any field survives), and
+/// the creation timestamp — never the full content blob.
 #[derive(Debug, Clone)]
 pub struct UserMessageIndexItem {
     /// Whole-envelope classification only, never authorization. Kept internal
@@ -7597,6 +7737,138 @@ pub struct UserMessageIndexItem {
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+}
+
+/// A page bound for [`Store::get_agent_user_message_index_page`]: the newest
+/// `limit` user rows whose `seq` is strictly below `before_seq` (no bound
+/// when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessageIndexPageRequest {
+    pub limit: usize,
+    pub before_seq: Option<i64>,
+}
+
+/// The result of [`Store::get_agent_user_message_index_page`]: the items
+/// oldest→newest and, when a paged read left older rows unread, the `seq`
+/// to pass as the next page's `before_seq`.
+#[derive(Debug, Clone)]
+pub struct UserMessageIndexPage {
+    pub items: Vec<UserMessageIndexItem>,
+    pub next_before_seq: Option<i64>,
+}
+
+/// Top-level string metadata fields `agent.listUserMessages` serves: the
+/// authorship markers clients use to tell human rows from automated ones
+/// (PROTOCOL §5.5).
+const USER_MESSAGE_INDEX_STRING_KEYS: [&str; 4] =
+    ["type", "source", "fromAgentId", "fromPrincipalId"];
+
+/// `queueInfo` sub-fields `agent.listUserMessages` serves, with the JSON
+/// type each must have: the dequeue-wait note markers clients strip from
+/// previews.
+const USER_MESSAGE_INDEX_QUEUE_INFO_KEYS: [(&str, IndexValueKind); 3] = [
+    ("queuedAt", IndexValueKind::String),
+    ("waitedMs", IndexValueKind::Number),
+    ("batchId", IndexValueKind::String),
+];
+
+#[derive(Debug, Clone, Copy)]
+enum IndexValueKind {
+    String,
+    Number,
+}
+
+impl IndexValueKind {
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+        }
+    }
+
+    fn sql_types(self) -> &'static str {
+        match self {
+            Self::String => "('text')",
+            Self::Number => "('integer','real')",
+        }
+    }
+}
+
+/// Project persisted user-row metadata down to what `agent.listUserMessages`
+/// serves (PROTOCOL §5.5, intent-hq/intent#8278): the string-valued `type`,
+/// `source`, `fromAgentId` and `fromPrincipalId`, plus `queueInfo` narrowed
+/// to a string `queuedAt`, a numeric `waitedMs` and a string `batchId`.
+/// Every other key — notably an event notification's `events` payload — is
+/// dropped. `None` when nothing survives (including non-object metadata).
+#[must_use]
+pub fn project_user_message_index_metadata(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let source = metadata.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in USER_MESSAGE_INDEX_STRING_KEYS {
+        if let Some(value) = source.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(queue_info) = source
+        .get("queueInfo")
+        .and_then(serde_json::Value::as_object)
+    {
+        let mut projected = serde_json::Map::new();
+        for (key, kind) in USER_MESSAGE_INDEX_QUEUE_INFO_KEYS {
+            if let Some(value) = queue_info.get(key).filter(|v| kind.admits(v)) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        if !projected.is_empty() {
+            out.insert(
+                "queueInfo".to_string(),
+                serde_json::Value::Object(projected),
+            );
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+/// SQL expression pre-trimming `m.metadata` to the same fields as
+/// [`project_user_message_index_metadata`], so only the small projection
+/// leaves `SQLite`. Absent fields come out as JSON `null`; the Rust
+/// projection then drops them, so it stays the single source of truth.
+fn user_message_index_metadata_sql() -> String {
+    let field = |path: &str, types: &str| {
+        format!(
+            "CASE WHEN json_type(m.metadata, '{path}') IN {types} \
+             THEN json_extract(m.metadata, '{path}') END"
+        )
+    };
+    let mut args: Vec<String> = USER_MESSAGE_INDEX_STRING_KEYS
+        .iter()
+        .map(|key| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.{key}"), IndexValueKind::String.sql_types())
+            )
+        })
+        .collect();
+    let queue_args: Vec<String> = USER_MESSAGE_INDEX_QUEUE_INFO_KEYS
+        .iter()
+        .map(|(key, kind)| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.queueInfo.{key}"), kind.sql_types())
+            )
+        })
+        .collect();
+    args.push(format!(
+        "'queueInfo', CASE WHEN json_type(m.metadata, '$.queueInfo') = 'object' \
+         THEN json_object({}) END",
+        queue_args.join(", ")
+    ));
+    format!(
+        "CASE WHEN m.metadata IS NULL THEN NULL ELSE json_object({}) END",
+        args.join(", ")
+    )
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -8693,6 +8965,83 @@ mod tests {
         ));
     }
 
+    /// `set_agent_pinned` (0180) follows the mute contract: it reports whether
+    /// the flag changed, never advances the activity timestamp, is scoped to
+    /// the workspace, and a stale full-row `update_agent_session` carrying the
+    /// pre-toggle flag leaves the persisted pin untouched. An explicit patch in
+    /// a mixed update writes it alongside the row.
+    #[tokio::test]
+    async fn pinned_is_a_preference_that_survives_stale_full_row_update() {
+        let tmp = TempDb::new("test-agent-pinned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-pinned".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-pinned".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        let stale = store.get_agent_session(&agent).await.expect("load session");
+        assert!(!stale.pinned, "new sessions are unpinned");
+
+        for (pinned, changed) in [(true, true), (true, false)] {
+            assert_eq!(
+                store
+                    .set_agent_pinned(&ws, &agent, pinned)
+                    .await
+                    .expect("set pinned"),
+                changed
+            );
+            let stored = store.get_agent_session(&agent).await.expect("reload");
+            assert!(stored.pinned);
+            assert_eq!(stored.updated_at, old, "a pin is not agent activity");
+        }
+
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        assert!(
+            store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .pinned,
+            "full-row update must not clobber pinned"
+        );
+
+        let mut mixed = store.get_agent_session(&agent).await.expect("reload");
+        mixed.name = "Renamed".to_string();
+        mixed.pinned = false;
+        store
+            .update_agent_session_with_preferences(&ws, &mixed, false, None, Some(false), false)
+            .await
+            .expect("mixed update with pin patch");
+        let after = store.get_agent_session(&agent).await.expect("reload");
+        assert!(!after.pinned, "explicit patch unpins");
+        assert_eq!(after.name, "Renamed");
+        assert!(!after.notifications_muted, "mute untouched by a pin patch");
+
+        assert!(matches!(
+            store
+                .set_agent_pinned(&WorkspaceId("wrong-workspace".to_string()), &agent, true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .set_agent_pinned(&ws, &AgentId("agent-missing".to_string()), true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(
+            !store
+                .get_agent_session(&agent)
+                .await
+                .expect("reload")
+                .pinned
+        );
+    }
+
     /// A muted session (`notifications_muted = 1`) never counts as unread:
     /// the single-workspace probe, both batch derivations, and the guarded
     /// settle-clear all ignore it. Unmuting makes the same row unread again —
@@ -8892,6 +9241,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -8977,6 +9327,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -9716,6 +10067,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -13638,6 +13990,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session)
@@ -13790,6 +14143,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -13916,7 +14270,7 @@ mod tests {
         assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
         let mut row = store.get_agent_session(&agent_id).await.unwrap();
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, false)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -13926,7 +14280,7 @@ mod tests {
         );
         row.reasoning_effort = Some("low".into());
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, true)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, true)
             .await
             .unwrap();
         assert_eq!(
@@ -14433,6 +14787,68 @@ mod tests {
         assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
         assert_eq!(metadata["providerReturn"]["home"], "claude-code");
         assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Remote launch: the `remotePlacement` projection mirror is daemon-owned.
+    /// A whole-document metadata write (`agent.update` and friends) can
+    /// neither erase it nor forge one.
+    #[tokio::test]
+    async fn whole_document_writes_cannot_set_or_clear_remote_placement() {
+        use intent_core::now_iso;
+        use intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-remote-placement".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let placed = AgentId("agent-placed".to_string());
+        let local = AgentId("agent-local".to_string());
+        for id in [&placed, &local] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &placed,
+                REMOTE_PLACEMENT_METADATA_KEY,
+                r#"{"nodeId":"node-1"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("set view");
+        let forged =
+            serde_json::json!({ "keep": 1, REMOTE_PLACEMENT_METADATA_KEY: { "nodeId": "forged" } });
+        for id in [&placed, &local] {
+            store
+                .update_agent_session_metadata(&ws_id, id, Some(&forged), &now_iso())
+                .await
+                .expect("whole write");
+        }
+        let placed_meta = store
+            .get_agent_session(&placed)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(
+            placed_meta[REMOTE_PLACEMENT_METADATA_KEY]["nodeId"],
+            "node-1"
+        );
+        assert_eq!(placed_meta["keep"], 1);
+        let local_meta = store
+            .get_agent_session(&local)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(local_meta.get(REMOTE_PLACEMENT_METADATA_KEY).is_none());
+        assert_eq!(local_meta["keep"], 1);
     }
 
     /// Review of intentd#2624: whole-document writes keep the daemon-owned
@@ -15130,6 +15546,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -15530,7 +15947,7 @@ mod tests {
 
     /// `get_agent_user_message_index` (`agent.listUserMessages`, §5.5)
     /// returns only user-role rows, oldest→newest, with previews bounded to
-    /// the requested char count and metadata passed through verbatim; other
+    /// the requested char count and metadata projected; other
     /// roles are excluded in SQL and an empty/unknown agent yields an empty
     /// index.
     #[tokio::test]
@@ -15691,8 +16108,8 @@ mod tests {
         );
         assert_eq!(
             items[1].metadata,
-            Some(serde_json::json!({"automated": true, "source": "hook"})),
-            "metadata passes through verbatim"
+            Some(serde_json::json!({"source": "hook"})),
+            "metadata is projected to the classification fields"
         );
         assert_eq!(
             items[2].preview.chars().count(),
@@ -15719,6 +16136,186 @@ mod tests {
             .await
             .expect("empty index")
             .is_empty());
+    }
+
+    /// Regression for intent-hq/intent#8278: a busy coordinator's
+    /// event-notification rows carry whole event payloads in
+    /// `metadata.events`, which made the index ~20 MB. The index serves only
+    /// the classification fields, trimmed inside SQL, and the SQL pre-trim
+    /// agrees with the Rust projection on every shape.
+    #[tokio::test]
+    async fn get_agent_user_message_index_projects_heavy_metadata() {
+        let tmp = TempDb::new("index-metadata-projection");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-projection".into());
+        let agent = AgentId("agent-index-projection".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let report = "r".repeat(64 * 1024);
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "event_notification",
+                    "events": [{"type": "agent:reportToParent", "report": report}],
+                    "queueInfo": {
+                        "queuedAt": "2026-11-01T07:01:11Z",
+                        "waitedMs": 6200,
+                        "batchId": "b-1",
+                        "queuedMessageId": "q-1",
+                        "extra": {"big": report},
+                    },
+                }),
+                Some(serde_json::json!({
+                    "type": "event_notification",
+                    "queueInfo": {"queuedAt": "2026-11-01T07:01:11Z", "waitedMs": 6200, "batchId": "b-1"},
+                })),
+            ),
+            (
+                serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1", "model": "m"}),
+                Some(
+                    serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1"}),
+                ),
+            ),
+            (
+                serde_json::json!({"type": 7, "source": {"nested": true}, "queueInfo": {"queuedAt": 1, "waitedMs": "x"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"queueInfo": {"queuedMessageId": "q-2"}}),
+                None,
+            ),
+            (serde_json::json!({"userAppMessageId": "app-1"}), None),
+            (
+                serde_json::json!({"queueInfo": {"waitedMs": 1.5}}),
+                Some(serde_json::json!({"queueInfo": {"waitedMs": 1.5}})),
+            ),
+            (serde_json::json!(["not", "an", "object"]), None),
+            (serde_json::json!("string metadata"), None),
+        ];
+        for (metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "row"}]),
+                    Some(metadata),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (metadata, expected)) in index.iter().zip(&cases) {
+            assert_eq!(&item.metadata, expected, "projection of {metadata}");
+            assert_eq!(
+                &project_user_message_index_metadata(metadata),
+                expected,
+                "Rust projection of {metadata}"
+            );
+        }
+        let encoded =
+            serde_json::to_string(&index.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>())
+                .unwrap();
+        assert!(
+            encoded.len() < 1024,
+            "heavy keys never leave the store: {encoded}"
+        );
+    }
+
+    /// A paged index read serves the newest `limit` rows oldest→newest, and
+    /// its `next_before_seq` walks older pages to the start without gaps or
+    /// repeats.
+    #[tokio::test]
+    async fn get_agent_user_message_index_page_walks_newest_first() {
+        let tmp = TempDb::new("index-paging");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-paging".into());
+        let agent = AgentId("agent-index-paging".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..7 {
+            let row = store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": format!("user {n}")}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+            ids.push(row.id);
+            store
+                .append_agent_message(
+                    &agent,
+                    "assistant",
+                    &serde_json::json!([{"type": "text", "text": "reply"}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let page = |before_seq| UserMessageIndexPageRequest {
+            limit: 3,
+            before_seq,
+        };
+        let first = store
+            .get_agent_user_message_index_page(&agent, 300, Some(page(None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            ids[4..].to_vec(),
+            "newest rows, oldest→newest"
+        );
+        let mut walked: Vec<String> = first.items.iter().map(|i| i.id.clone()).collect();
+        let mut cursor = first.next_before_seq;
+        let mut pages = 1;
+        while let Some(before_seq) = cursor {
+            let next = store
+                .get_agent_user_message_index_page(&agent, 300, Some(page(Some(before_seq))))
+                .await
+                .unwrap();
+            let mut older: Vec<String> = next.items.iter().map(|i| i.id.clone()).collect();
+            older.append(&mut walked);
+            walked = older;
+            cursor = next.next_before_seq;
+            pages += 1;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(walked, ids, "pages cover every user row exactly once");
+
+        let exact = store
+            .get_agent_user_message_index_page(
+                &agent,
+                300,
+                Some(UserMessageIndexPageRequest {
+                    limit: 7,
+                    before_seq: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.items.len(), 7);
+        assert_eq!(exact.next_before_seq, None, "no older rows remain");
     }
 
     /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
@@ -19432,6 +20029,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

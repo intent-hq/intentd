@@ -487,9 +487,15 @@ async fn get_message_block(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
     api.agent_get(agent_id.clone(), Some(workspace_id.clone()))
         .await
         .map_err(map_err)?;
-    api.agent_get_message_block(agent_id, message_id, block_id, Some(workspace_id))
-        .await
-        .map_err(map_err)
+    api.agent_get_message_block(
+        agent_id,
+        message_id,
+        block_id,
+        Some(workspace_id),
+        intent_core::MessageBlockPage::default(),
+    )
+    .await
+    .map_err(map_err)
 }
 
 /// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
@@ -792,6 +798,12 @@ mod tests {
             last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
             id: AgentId::from_string(id),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -838,6 +850,7 @@ mod tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,

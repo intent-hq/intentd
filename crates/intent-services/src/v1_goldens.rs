@@ -662,6 +662,7 @@ fn golden_pr_monitor_checklist_and_change_wake() {
          \n\
          Where the PR stands now:\n\
          - state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
          - unresolved threads: 1 (resolution required to merge)\n\
@@ -738,6 +739,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - changes requested by 1 reviewer\n\
          - checks: 1 passed, 1 failed, 1 pending (of 3); failing required: build\n\
@@ -761,6 +763,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0 approving)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
@@ -775,12 +778,88 @@ fn golden_pr_monitor_checklist_branch_lines() {
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
          - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)\n\
          - branch ancestry: unknown\n\
          - forge branch-update requirement: unknown"
     );
+}
+
+/// A queued entry turning `unmergeable` (intentd#2897) is a change line
+/// carrying the dequeue / fix / re-enqueue recovery, the checklist's queue
+/// row says so, and a still-queued recovery reports once.
+#[test]
+fn golden_pr_monitor_unmergeable_queue_entry() {
+    let queued = |state: &str| {
+        let mut s = pr_snapshot("open");
+        s.requirements.is_in_merge_queue = Some(true);
+        s.requirements.merge_queue = Some(intent_sourcecontrol::MergeQueueEntry {
+            position: 2,
+            queue_size: Some(2),
+            state: Some(state.to_string()),
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+        });
+        s
+    };
+    let stuck = queued("unmergeable");
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&queued("queued"), &stuck),
+        vec![
+            "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of it and \
+             will not merge. Its branch is locked while queued, so a push is rejected — remove \
+             it from the queue first (GraphQL dequeuePullRequest), then git fetch origin and \
+             check the conflict is real: git merge-tree --write-tree <entry ahead's merge-group branch \
+             origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is ahead> <this \
+             head>. If that is clean the flag was stale: enqueue the same commit again; otherwise fix the \
+             branch, then enqueue it again"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&stuck, &queued("mergeable")),
+        vec!["merge queue entry is no longer unmergeable (now mergeable)".to_string()]
+    );
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&stuck),
+        "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
+         - in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
+         dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
+         origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
+    );
+}
+
+/// Every checklist names the head commit its check results belong to
+/// (intentd#2875: a wake delivered minutes late reported "12 passed" for the
+/// commit before a push, and the agent called the PR ready). An unknown head
+/// says the checks cannot be tied to a commit.
+#[test]
+fn golden_pr_monitor_checklist_names_the_head_the_checks_belong_to() {
+    let mut s = pr_snapshot("open");
+    s.head_sha = Some("7ad538b0c1d2e3f4".to_string());
+    let checklist = crate::pr_monitor::render_checklist(&s);
+    assert_eq!(
+        checklist.lines().nth(1),
+        Some("- head: 7ad538b0 (checks below are for this commit)"),
+        "{checklist}"
+    );
+    for head in [None, Some(String::new())] {
+        s.head_sha = head;
+        let checklist = crate::pr_monitor::render_checklist(&s);
+        assert_eq!(
+            checklist.lines().nth(1),
+            Some("- head: unknown (cannot tell which commit the checks below are for)"),
+            "{checklist}"
+        );
+    }
 }
 
 /// One-shot `runAt` fired notice: exact bytes (fired wording, not the TTL
@@ -1682,6 +1761,7 @@ fn golden_isolation_hints() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

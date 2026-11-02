@@ -44,6 +44,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use intentd_test_support::source_lint::{matching_close, tokenize_str, workspace_root, Token};
+
 const REGISTRY_FILE: &str = "crates/intent-acp/src/egress_registry.rs";
 const REGISTRY_CONST: &str = "AGENT_EGRESS_CALLS";
 const BINDINGS_DIR: &str = "crates/intent-acp/src/mcp_server/bindings";
@@ -266,96 +268,35 @@ fn blank_literals_and_comments(src: &str) -> String {
     out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Token<'a> {
-    text: &'a str,
-    start: usize,
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// Identifiers (with byte offsets) and single-char punctuation of blanked
-/// source; whitespace is dropped.
-fn tokenize(src: &str) -> Vec<Token<'_>> {
-    let mut tokens = Vec::new();
-    let mut iter = src.char_indices().peekable();
-    while let Some((start, c)) = iter.next() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if is_ident_char(c) {
-            let mut end = start + c.len_utf8();
-            while let Some(&(i, d)) = iter.peek() {
-                if !is_ident_char(d) {
-                    break;
-                }
-                end = i + d.len_utf8();
-                iter.next();
-            }
-            tokens.push(Token {
-                text: &src[start..end],
-                start,
-            });
-        } else {
-            tokens.push(Token {
-                text: &src[start..start + c.len_utf8()],
-                start,
-            });
-        }
-    }
-    tokens
-}
-
-/// Index of the token closing the brace/bracket/paren opened at `open`.
-fn matching_close(tokens: &[Token<'_>], open: usize) -> Option<usize> {
-    let (o, c) = match tokens[open].text {
-        "{" => ("{", "}"),
-        "[" => ("[", "]"),
-        "(" => ("(", ")"),
-        _ => return None,
-    };
-    let mut depth = 0usize;
-    for (i, t) in tokens.iter().enumerate().skip(open) {
-        if t.text == o {
-            depth += 1;
-        } else if t.text == c {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
 /// Index just past a `#[cfg(…)]` attribute starting at `i` whose predicate
 /// names `test` and not `not` (`#[cfg(test)]`, `#[cfg(all(test, unix))]`).
-fn cfg_test_attr_end(tokens: &[Token<'_>], i: usize) -> Option<usize> {
+fn cfg_test_attr_end(tokens: &[Token], i: usize) -> Option<usize> {
     let head = ["#", "[", "cfg", "("];
     let matches = tokens[i..]
         .iter()
         .zip(head)
-        .filter(|(t, want)| t.text == *want)
+        .filter(|(t, want)| t.is(want))
         .count();
     if matches != head.len() {
         return None;
     }
     let open = i + head.len() - 1;
     let close = matching_close(tokens, open)?;
-    let pred: Vec<&str> = tokens[open + 1..close].iter().map(|t| t.text).collect();
+    let pred: Vec<&str> = tokens[open + 1..close]
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect();
     if !pred.contains(&"test") || pred.contains(&"not") {
         return None;
     }
-    (tokens.get(close + 1)?.text == "]").then_some(close + 2)
+    tokens.get(close + 1)?.is("]").then_some(close + 2)
 }
 
 /// Token ranges `[start, end)` covered by `#[cfg(test)]` items: the attribute
 /// through the `}` closing the item's first brace, or through a `;` / `,`
 /// seen first outside parens, brackets, and generics (a `mod x;` / `use`
 /// declaration, a struct field, a struct-literal field, a match arm).
-fn cfg_test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
+fn cfg_test_ranges(tokens: &[Token]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -367,7 +308,7 @@ fn cfg_test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
         let mut end = tokens.len();
         let mut angle = 0usize;
         while j < tokens.len() {
-            match tokens[j].text {
+            match tokens[j].text.as_str() {
                 ";" | "," if angle == 0 => {
                     end = j + 1;
                     break;
@@ -379,12 +320,12 @@ fn cfg_test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
                 "(" | "[" => {
                     j = matching_close(tokens, j).map_or(tokens.len(), |c| c + 1);
                 }
-                "<" => {
-                    angle += 1;
-                    j += 1;
-                }
-                ">" if j > 0 && tokens[j - 1].text != "-" => {
-                    angle = angle.saturating_sub(1);
+                // Every `<` / `>` character counts, as when each was its own
+                // token: `<=` / `<<=` open, `>=` / `>>=` / `=>` close; only a
+                // return arrow `->` is not an angle bracket.
+                t if t != "->" && t.contains(['<', '>']) => {
+                    angle += t.matches('<').count();
+                    angle = angle.saturating_sub(t.matches('>').count());
                     j += 1;
                 }
                 _ => j += 1,
@@ -397,23 +338,23 @@ fn cfg_test_ranges(tokens: &[Token<'_>]) -> Vec<(usize, usize)> {
 }
 
 /// Tokens outside every `#[cfg(test)]` range.
-fn non_test_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
-    let ranges = cfg_test_ranges(tokens);
+fn non_test_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let ranges = cfg_test_ranges(&tokens);
     tokens
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(i, _)| !ranges.iter().any(|(s, e)| (*s..*e).contains(i)))
-        .map(|(_, t)| *t)
+        .map(|(_, t)| t)
         .collect()
 }
 
 /// Module names declared `#[cfg(test)] mod name;` (their files are test code).
-fn cfg_test_module_decls(tokens: &[Token<'_>]) -> Vec<String> {
+fn cfg_test_module_decls(tokens: &[Token]) -> Vec<String> {
     cfg_test_ranges(tokens)
         .into_iter()
         .filter_map(|(s, e)| {
             let body = &tokens[cfg_test_attr_end(tokens, s)?..e];
-            let mut it = body.iter().map(|t| t.text);
+            let mut it = body.iter().map(|t| t.text.as_str());
             // Skip `pub`, `pub(crate)`, ….
             let mut kw = it.next()?;
             while kw != "mod" {
@@ -425,41 +366,38 @@ fn cfg_test_module_decls(tokens: &[Token<'_>]) -> Vec<String> {
         .collect()
 }
 
-fn line_of(src: &str, byte: usize) -> usize {
-    src[..byte].matches('\n').count() + 1
-}
-
 // ---- readers ----------------------------------------------------------------
 
 /// First `(line, what)` where non-test code names a `READER_TYPES` identifier
 /// or calls a `READER_METHODS` method.
-fn first_reader(src: &str, tokens: &[Token<'_>]) -> Option<(usize, String)> {
+fn first_reader(tokens: &[Token]) -> Option<(usize, String)> {
     tokens.iter().enumerate().find_map(|(i, t)| {
-        if READER_TYPES.contains(&t.text) {
-            return Some((line_of(src, t.start), format!("type `{}`", t.text)));
+        let text = t.text.as_str();
+        if READER_TYPES.contains(&text) {
+            return Some((t.line, format!("type `{text}`")));
         }
-        let is_call = tokens.get(i + 1).is_some_and(|n| n.text == "(");
-        let is_method = i > 0 && tokens[i - 1].text == ".";
-        (is_call && is_method && READER_METHODS.contains(&t.text))
-            .then(|| (line_of(src, t.start), format!("call `.{}(`", t.text)))
+        let is_call = tokens.get(i + 1).is_some_and(|n| n.is("("));
+        let is_method = i > 0 && tokens[i - 1].is(".");
+        (is_call && is_method && READER_METHODS.contains(&text))
+            .then(|| (t.line, format!("call `.{text}(`")))
     })
 }
 
 /// `(fn name, fn line, body tokens)` for every `fn` with a body.
-fn functions<'a>(src: &str, tokens: &'a [Token<'a>]) -> Vec<(&'a str, usize, &'a [Token<'a>])> {
+fn functions(tokens: &[Token]) -> Vec<(&str, usize, &[Token])> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < tokens.len() {
-        if tokens[i].text != "fn" || !tokens[i + 1].text.starts_with(is_ident_char) {
+        if !tokens[i].is("fn") || !tokens[i + 1].is_word() {
             i += 1;
             continue;
         }
-        let name = tokens[i + 1].text;
-        let line = line_of(src, tokens[i].start);
+        let name = tokens[i + 1].text.as_str();
+        let line = tokens[i].line;
         let mut j = i + 2;
         let mut body = None;
         while j < tokens.len() {
-            match tokens[j].text {
+            match tokens[j].text.as_str() {
                 ";" => break,
                 "{" => {
                     let close = matching_close(tokens, j).unwrap_or(tokens.len() - 1);
@@ -480,49 +418,49 @@ fn functions<'a>(src: &str, tokens: &'a [Token<'a>]) -> Vec<(&'a str, usize, &'a
 }
 
 /// Whether the receiver chain ending at the `.` token `dot` (`a.b.c` before
-/// `.data`) is borrowed (`&a.b.c.data`, `&mut a.data`).
-fn receiver_is_borrowed(body: &[Token<'_>], dot: usize) -> bool {
+/// `.data`) is borrowed (`&a.b.c.data`, `&mut a.data`, `&&a.data`).
+fn receiver_is_borrowed(body: &[Token], dot: usize) -> bool {
     let mut k = dot;
-    while k >= 1 && body[k].text == "." && body[k - 1].text.starts_with(is_ident_char) {
+    while k >= 1 && body[k].is(".") && body[k - 1].is_word() {
         k -= 1;
         if k == 0 {
             return false;
         }
-        if body[k - 1].text != "." {
+        if !body[k - 1].is(".") {
             break;
         }
         k -= 1;
     }
     let mut prev = k.checked_sub(1);
-    if prev.is_some_and(|p| body[p].text == "mut") {
+    if prev.is_some_and(|p| body[p].is("mut")) {
         prev = prev.and_then(|p| p.checked_sub(1));
     }
-    prev.is_some_and(|p| body[p].text == "&")
+    // `&&` counts as a borrow (`&&a.data`) as it did when it read as two `&`
+    // tokens, so a logical `ok && a.data` is a known false negative.
+    prev.is_some_and(|p| body[p].is("&") || body[p].is("&&"))
 }
 
-/// Byte offset of the first wholesale `.data` copy — `.data` followed by
+/// Line of the first wholesale `.data` copy — `.data` followed by
 /// `,` / `)` / `;` / `}`, or `.data.clone()`, on an unborrowed receiver — in
 /// a fn body that also builds a `json!` value.
-fn copies_data_into_json(body: &[Token<'_>]) -> Option<usize> {
-    let has_json = body
-        .windows(2)
-        .any(|w| w[0].text == "json" && w[1].text == "!");
+fn copies_data_into_json(body: &[Token]) -> Option<usize> {
+    let has_json = body.windows(2).any(|w| w[0].is("json") && w[1].is("!"));
     if !has_json {
         return None;
     }
     body.windows(2).enumerate().find_map(|(i, w)| {
-        if w[0].text != "." || w[1].text != "data" || receiver_is_borrowed(body, i) {
+        if !w[0].is(".") || !w[1].is("data") || receiver_is_borrowed(body, i) {
             return None;
         }
-        let wholesale = match body.get(i + 2).map(|t| t.text) {
+        let wholesale = match body.get(i + 2).map(|t| t.text.as_str()) {
             Some("," | ")" | ";" | "}") => true,
             Some(".") => {
-                body.get(i + 3).is_some_and(|t| t.text == "clone")
-                    && body.get(i + 4).is_some_and(|t| t.text == "(")
+                body.get(i + 3).is_some_and(|t| t.is("clone"))
+                    && body.get(i + 4).is_some_and(|t| t.is("("))
             }
             _ => false,
         };
-        wholesale.then_some(w[1].start)
+        wholesale.then_some(w[1].line)
     })
 }
 
@@ -641,30 +579,29 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 
 struct SourceFile {
     rel: String,
-    /// Blanked source, leaked so tokens can borrow it for the test's lifetime.
-    src: &'static str,
-    tokens: Vec<Token<'static>>,
+    tokens: Vec<Token>,
 }
 
 /// Non-test `.rs` files under `dir`, each with its non-test tokens. Files
 /// named by a sibling's `#[cfg(test)] mod name;` are dropped.
 fn scan_dir(root: &Path, dir: &str) -> Vec<SourceFile> {
     let files = rust_files(&root.join(dir));
-    let mut loaded: Vec<(PathBuf, String)> = files
+    let mut loaded: Vec<(PathBuf, Vec<Token>)> = files
         .into_iter()
-        .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)))
+        .filter_map(|p| {
+            let src = fs::read_to_string(&p).ok()?;
+            Some((p, tokenize_str(&blank_literals_and_comments(&src))))
+        })
         .collect();
     let mut test_mods: BTreeSet<PathBuf> = BTreeSet::new();
-    for (path, src) in &loaded {
-        let blanked = blank_literals_and_comments(src);
-        let tokens = tokenize(&blanked);
+    for (path, tokens) in &loaded {
         let parent = path.parent().unwrap_or(Path::new(""));
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string());
         let mod_dir = match stem.as_deref() {
             Some("mod" | "lib" | "main") | None => parent.to_path_buf(),
             Some(stem) => parent.join(stem),
         };
-        for name in cfg_test_module_decls(&tokens) {
+        for name in cfg_test_module_decls(tokens) {
             test_mods.insert(mod_dir.join(format!("{name}.rs")));
             test_mods.insert(mod_dir.join(&name).join("mod.rs"));
         }
@@ -672,14 +609,9 @@ fn scan_dir(root: &Path, dir: &str) -> Vec<SourceFile> {
     loaded.retain(|(p, _)| !test_mods.contains(p) && !is_test_path(&rel(root, p)));
     loaded
         .into_iter()
-        .map(|(path, src)| {
-            let blanked: &'static str = Box::leak(blank_literals_and_comments(&src).into());
-            let tokens = non_test_tokens(&tokenize(blanked));
-            SourceFile {
-                rel: rel(root, &path),
-                src: blanked,
-                tokens,
-            }
+        .map(|(path, tokens)| SourceFile {
+            rel: rel(root, &path),
+            tokens: non_test_tokens(tokens),
         })
         .collect()
 }
@@ -720,7 +652,7 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
     let bindings = scan_dir(root, BINDINGS_DIR);
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for file in &bindings {
-        let reader = first_reader(file.src, &file.tokens);
+        let reader = first_reader(&file.tokens);
         let scrubbed = allow.scrubbed_bindings.iter().find(|(f, _)| *f == file.rel);
         let hand_picked = allow
             .hand_picked_bindings
@@ -748,7 +680,7 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
                 let scrubs = file
                     .tokens
                     .windows(2)
-                    .any(|w| w[0].text == SCRUB_FN && w[1].text == "(");
+                    .any(|w| w[0].is(SCRUB_FN) && w[1].is("("));
                 if !scrubs {
                     failures.push(format!(
                         "{}: `SCRUBBED_BINDINGS` row but the file never calls `{SCRUB_FN}(` \
@@ -775,11 +707,10 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
     let services = scan_dir(root, SERVICES_DIR);
     let mut found_fns: BTreeSet<&str> = BTreeSet::new();
     for file in &services {
-        for (name, line, body) in functions(file.src, &file.tokens) {
-            let Some(copy_at) = copies_data_into_json(body) else {
+        for (name, line, body) in functions(&file.tokens) {
+            let Some(copy_line) = copies_data_into_json(body) else {
                 continue;
             };
-            let copy_line = line_of(file.src, copy_at);
             let builder = allow
                 .wake_metadata_builders
                 .iter()
@@ -829,14 +760,6 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
     failures.sort();
     failures.dedup();
     failures
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/intent-acp has a workspace root")
-        .to_path_buf()
 }
 
 #[test]

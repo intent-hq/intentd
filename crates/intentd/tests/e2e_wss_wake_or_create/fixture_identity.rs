@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 
+#[track_caller]
 fn assert_isolated(command: &Command, data_dir: &Path) {
     let environment: HashMap<_, _> = command.get_envs().collect();
     for key in [

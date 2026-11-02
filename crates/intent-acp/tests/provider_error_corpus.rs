@@ -42,6 +42,7 @@ fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("provider-error-corpus.json is valid JSON")
 }
 
+#[track_caller]
 fn expect_quota(entry: &Value, what: &str) -> bool {
     match entry["expect"].as_str() {
         Some("quota") => true,
@@ -114,6 +115,7 @@ fn kind_cases(corpus: &Value) -> Vec<Case> {
     cases
 }
 
+#[track_caller]
 fn rendering_cases(corpus: &Value) -> Vec<Case> {
     let renderings = corpus["renderings"]
         .as_array()

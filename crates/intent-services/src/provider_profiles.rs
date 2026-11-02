@@ -268,12 +268,15 @@ impl StoredEnv {
         }
     }
 
+    /// The wire read form: a non-empty `set` value is [`MASK`] except for
+    /// the account-folder variables ([`is_folder_path_key`]), whose saved
+    /// value is returned as stored (a leading `~` is not expanded).
     fn masked_json(&self) -> Value {
         match self {
             Self::Set { key, value } => json!({
                 "key": key,
                 "kind": "set",
-                "value": if value.is_empty() { "" } else { MASK },
+                "value": if value.is_empty() || is_folder_path_key(key) { value.as_str() } else { MASK },
             }),
             Self::Unset { key } => json!({ "key": key, "kind": "unset" }),
         }
@@ -499,30 +502,21 @@ fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-/// Account-directory variables whose leading `~` the daemon expands.
-const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
-
-/// Expand a leading `~` in an account-directory value at resolution time:
-/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
-/// ASCII case), a value of exactly `~` or
-/// one starting with `~/` is joined onto `home` (the daemon user's home).
-/// `~user`, variables and every other key stay literal, and without a home
-/// the value is used as typed. The saved value is never rewritten.
-pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
-    let Some(home) = home.and_then(Path::to_str) else {
-        return value.to_owned();
-    };
-    if !TILDE_EXPANDED_KEYS
+/// Whether `key` names an account folder (`CLAUDE_CONFIG_DIR` or
+/// `CODEX_HOME`, ignoring ASCII case). Reads return these values unmasked:
+/// a folder path is not a credential. Launch-log redaction still covers
+/// them through `ProfileEnv::secret_values`.
+fn is_folder_path_key(key: &str) -> bool {
+    intent_acp::profile_env::ACCOUNT_DIR_KEYS
         .iter()
         .any(|k| k.eq_ignore_ascii_case(key))
-    {
-        return value.to_owned();
-    }
-    match value.strip_prefix('~') {
-        Some("") => home.to_owned(),
-        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.trim_end_matches('/')),
-        _ => value.to_owned(),
-    }
+}
+
+/// Expand a leading `~` in an account-directory value at resolution time
+/// against the daemon user's home ([`intent_acp::profile_env::expand_account_dir`]).
+/// The saved value is never rewritten.
+pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
+    intent_acp::profile_env::expand_account_dir(key, value, home)
 }
 
 /// The daemon user's home directory, as the installed-CLI context resolves
@@ -1000,7 +994,7 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
     })
 }
 
-/// The wire `DefaultConfig` of one base provider (masked; no values).
+/// The wire `DefaultConfig` of one base provider (masked except folder paths).
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
     json!({
         "baseProviderId": base,
@@ -1348,17 +1342,22 @@ fn native_session_binding(stored: &intent_core::AgentSession) -> Option<&str> {
 
 /// Build the launch overlay of a saved environment document. Reserved keys
 /// are dropped even if the stored document was edited outside the daemon,
-/// and `~` in an account directory expands here, before account-home lookup,
-/// isolation and fingerprinting, so every path agrees.
-fn overlay_from(reference: &str, base: &str, doc: EnvDoc) -> intent_acp::ProfileEnv {
-    let home = daemon_home();
+/// and `~` in an account directory expands against `home` here, before
+/// account-home lookup, isolation and fingerprinting, so every path agrees.
+/// `None` keeps values as typed (a remote node expands against its own home).
+fn overlay_from(
+    reference: &str,
+    base: &str,
+    doc: EnvDoc,
+    home: Option<&Path>,
+) -> intent_acp::ProfileEnv {
     let entries = doc
         .entries
         .into_iter()
         .filter(|e| reserved_key_reason(e.key(), base).is_none())
         .map(|e| match e {
             StoredEnv::Set { key, value } => {
-                let value = expand_account_dir(&key, &value, home.as_deref());
+                let value = expand_account_dir(&key, &value, home);
                 (key, Some(value))
             }
             StoredEnv::Unset { key } => (key, None),
@@ -1415,8 +1414,35 @@ impl Services {
         &self,
         reference: &str,
     ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.resolve_profile_env_for(reference, daemon_home().as_deref())
+            .await
+    }
+
+    /// The overlay a remote node launch for `reference` must run with, under
+    /// the same selection gate as a local launch (a missing profile or a
+    /// disabled base fails with `provider-profile-replacement-required` and
+    /// never falls back). `None` means no overrides: the node uses its own
+    /// login. Account directories are returned as typed; the node expands a
+    /// leading `~` against its own home ([`intent_acp::ProfileEnv::for_node`]).
+    ///
+    /// # Errors
+    /// Replacement-required for an unselectable reference; an unreadable
+    /// environment document fails closed.
+    pub async fn resolve_remote_profile_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.ensure_provider_ref_selectable(reference)?;
+        self.resolve_profile_env_for(reference, None).await
+    }
+
+    async fn resolve_profile_env_for(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         if !is_qualified_ref(reference) {
-            return self.resolve_default_env(reference).await;
+            return self.resolve_default_env(reference, home).await;
         }
         let missing = || replacement_required(reference, "profile-missing");
         let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
@@ -1434,7 +1460,7 @@ impl Services {
                 "provider profile {reference} environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// The Default configuration's saved overlay (PROTOCOL §5.54 "Default
@@ -1443,7 +1469,11 @@ impl Services {
     /// profile file is unreadable (bare references keep today's behavior
     /// then). A recorded environment whose secret cannot be read fails
     /// closed: the Default never silently runs without its overrides.
-    async fn resolve_default_env(&self, reference: &str) -> Result<Option<intent_acp::ProfileEnv>> {
+    async fn resolve_default_env(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         let Some(base) = PROFILE_BASE_PROVIDERS
             .iter()
             .copied()
@@ -1464,7 +1494,7 @@ impl Services {
                 "the {base} Default configuration environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// Selection gate for a provider reference about to be persisted or
@@ -2174,16 +2204,22 @@ impl Services {
             }
         }
 
+        // Every saved edit resets the Default's shared quota state before
+        // anyone reads the new revision. The saved fingerprint moves first,
+        // so a process still on the earlier settings cannot mark it again
+        // (see `crate::provider_quota_cache`).
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&key, Some(&env.fingerprint))
+        });
+        self.provider_quota_cache.forget(base);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
             default_changed_event(revision, "default-updated", base, Some(env_changed)),
         )
         .await;
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&key, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&key);
@@ -2477,6 +2513,17 @@ impl Services {
             return Err(e);
         }
 
+        // Running processes keep the settings they started with; only the
+        // saved fingerprint moves. Nothing is interrupted or restarted. It
+        // moves before the profile's shared quota state is reset, so a
+        // process still on the earlier settings cannot mark it again (see
+        // `crate::provider_quota_cache`); every saved edit resets the state
+        // before anyone reads the new revision.
+        let activation = env_changed.then(|| {
+            self.profile_activation
+                .saved_changed(&profile_id, Some(&env.fingerprint))
+        });
+        self.provider_quota_cache.forget(&meta.provider_ref());
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -2489,12 +2536,7 @@ impl Services {
             ),
         )
         .await;
-        // Running processes keep the settings they started with; only the
-        // saved fingerprint moves. Nothing is interrupted or restarted.
-        if env_changed {
-            let changes = self
-                .profile_activation
-                .saved_changed(&profile_id, Some(&env.fingerprint));
+        if let Some(changes) = activation {
             self.publish_activation_changes(changes).await;
         }
         let running = self.profile_activation.running_processes(&profile_id);
@@ -2563,15 +2605,18 @@ impl Services {
             }
         }
 
+        // An in-progress turn finishes on its process; later turns need a
+        // replacement (`providerReplacementRequired`), not earlier settings.
+        // The saved fingerprint goes before the quota state, so that
+        // process cannot mark the deleted reference again.
+        let changes = self.profile_activation.saved_changed(&profile_id, None);
+        self.provider_quota_cache.forget(&reference);
         let revision = store.bump_revision();
         crate::publish_event(
             self.event_bus.as_ref(),
             profiles_changed_event(revision, "deleted", &profile_id, None, None),
         )
         .await;
-        // An in-progress turn finishes on its process; later turns need a
-        // replacement (`providerReplacementRequired`), not earlier settings.
-        let changes = self.profile_activation.saved_changed(&profile_id, None);
         self.publish_activation_changes(changes).await;
 
         // Prune the profile's `model.providerDefaults` and

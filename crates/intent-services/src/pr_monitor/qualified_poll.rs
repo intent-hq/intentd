@@ -480,8 +480,11 @@ impl Services {
                 state == "merged",
             )
         } else {
-            let checklist =
-                crate::harness::review_wake::checklist(&snapshot["requirements"], false);
+            let checklist = crate::harness::review_wake::checklist(
+                &snapshot["requirements"],
+                snapshot["headSha"].as_str(),
+                false,
+            );
             crate::harness::review_wake::changed(
                 "MR",
                 &label,

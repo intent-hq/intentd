@@ -12,7 +12,7 @@ async fn run_to_exit(services: &Services, ws: &WorkspaceId, id: &str) -> Value {
         .expect("run")
 }
 
-fn latest_pty(services: &Services, ws: &WorkspaceId, id: &str) -> PtyId {
+fn recorded_pty(services: &Services, ws: &WorkspaceId, id: &str) -> Option<PtyId> {
     services
         .script_manager()
         .scripts
@@ -20,7 +20,10 @@ fn latest_pty(services: &Services, ws: &WorkspaceId, id: &str) -> PtyId {
         .unwrap()
         .get(&(ws.clone(), id.to_string()))
         .and_then(|m| m.pty_id)
-        .expect("run recorded its pty")
+}
+
+fn latest_pty(services: &Services, ws: &WorkspaceId, id: &str) -> PtyId {
+    recorded_pty(services, ws, id).expect("run recorded its pty")
 }
 
 async fn output_text(services: &Services, ws: &WorkspaceId, id: &str, n: Option<i64>) -> String {
@@ -95,20 +98,25 @@ async fn service_pty_is_released_after_its_supervisor_settles() {
         .await
         .expect("start");
     let mgr = h.services.script_manager();
-    tokio::time::timeout(LIVENESS, async {
+    // The supervisor spawns the PTY, whose output streams to the disk log at
+    // once, and records `pty_id` only after `mark_running`'s store write; a
+    // loaded host can show the output first (intent-hq/intent#8182). Wait
+    // for both.
+    let pty = tokio::time::timeout(LIVENESS, async {
         loop {
             if output_text(&h.services, &h.ws, &id, None)
                 .await
                 .contains("svc-out")
             {
-                break;
+                if let Some(pty) = recorded_pty(&h.services, &h.ws, &id) {
+                    break pty;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("live output reaches the disk log while running");
-    let pty = latest_pty(&h.services, &h.ws, &id);
+    .expect("live output reaches the disk log and the run records its pty");
     h.services
         .script_stop(h.ws.clone(), id.clone())
         .await
@@ -123,6 +131,66 @@ async fn service_pty_is_released_after_its_supervisor_settles() {
     assert!(!mgr.is_live(&h.ws, &id).unwrap());
     let text = output_text(&h.services, &h.ws, &id, None).await;
     assert!(text.contains("svc-out"), "{text:?}");
+}
+
+/// Pins the window `service_pty_is_released_after_its_supervisor_settles`
+/// waits out (intent-hq/intent#8182): with `mark_running` parked before its
+/// store write, the service's output already reaches the disk log while the
+/// run has not recorded its pty yet. Releasing the park records it.
+#[intent_test_macros::daemon_test]
+async fn service_output_can_precede_its_recorded_pty() {
+    let data = WorktreeDir::new();
+    let mut h = harness().await;
+    let park = Arc::new(SupervisePark::default());
+    h.services = h
+        .services
+        .clone()
+        .with_script_output_dir(&data.0)
+        .with_script_mark_running_park(park.clone());
+    let id = create_simple(&h, "svc", "echo svc-out; sleep 60", ScriptMode::Service).await;
+    h.services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .expect("start");
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("mark_running parks before recording the pty");
+    tokio::time::timeout(LIVENESS, async {
+        while !output_text(&h.services, &h.ws, &id, None)
+            .await
+            .contains("svc-out")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("output reaches the disk log before mark_running records the pty");
+    assert!(
+        recorded_pty(&h.services, &h.ws, &id).is_none(),
+        "the pty is not recorded while mark_running is parked"
+    );
+    park.release.notify_one();
+    let pty = tokio::time::timeout(LIVENESS, async {
+        loop {
+            if let Some(pty) = recorded_pty(&h.services, &h.ws, &id) {
+                break pty;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("released mark_running records the pty");
+    h.services
+        .script_stop(h.ws.clone(), id.clone())
+        .await
+        .expect("stop");
+    tokio::time::timeout(LIVENESS, async {
+        while h.services.pty().scrollback(pty).is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stopped service PTY session is released");
 }
 
 #[intent_test_macros::daemon_test]

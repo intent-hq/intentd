@@ -49,7 +49,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    lex, markers_by_line, rust_files, skip_whitespace, workspace_root, Marker,
+    lex, markers_by_line, rust_files, skip_whitespace, tokenize, workspace_root, Marker, Token,
 };
 
 const TYPE_NAME: &str = "Workspace";
@@ -112,22 +112,20 @@ fn is_item_header(chars: &[char], start: usize) -> bool {
     ITEM_KEYWORDS.contains(&word.as_str())
 }
 
-/// Index of the bracket closing the one opened at `open`, if balanced.
-fn matching_close(chars: &[char], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (idx, &c) in chars.iter().enumerate().skip(open) {
-        match c {
-            '{' | '(' | '[' => depth += 1,
-            '}' | ')' | ']' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(idx);
-                }
-            }
-            _ => {}
-        }
+/// Char index of the bracket closing the one opened at char `open`, if any:
+/// the first closer of any kind back at the opener's bracket depth (shared
+/// reader's [`Token::depth`]), so a stray closer of another kind ends the
+/// body early instead of being skipped.
+fn close_of(tokens: &[Token], open: usize) -> Option<usize> {
+    let at = tokens.partition_point(|t| t.start < open);
+    if tokens.get(at)?.start != open {
+        return None;
     }
-    None
+    let depth = tokens[at].depth;
+    tokens[at + 1..]
+        .iter()
+        .find(|t| matches!(t.text.as_str(), ")" | "]" | "}") && t.depth == depth)
+        .map(|t| t.start)
 }
 
 /// The depth-0, comma-separated elements of a brace body, trimmed.
@@ -186,7 +184,7 @@ fn struct_fields(model_src: &str) -> Vec<String> {
         .position(|w| w == header.as_slice())
         .expect("`pub struct Workspace {` in model.rs");
     let open = start + header.len() - 1;
-    let close = matching_close(&chars, open).expect("balanced Workspace struct body");
+    let close = close_of(&tokenize(&chars), open).expect("balanced Workspace struct body");
     elements(&chars[open + 1..close])
         .iter()
         .filter_map(|e| {
@@ -210,6 +208,8 @@ fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
     let lexed = lex(src);
     let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let chars: Vec<char> = lexed.blanked.chars().collect();
+    // Tokenized on the first `Workspace {`: most files have none.
+    let mut tokens: Option<Vec<Token>> = None;
     let name: Vec<char> = TYPE_NAME.chars().collect();
     let mut hits = Vec::new();
     let mut used_markers = Vec::new();
@@ -228,7 +228,8 @@ fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
             continue;
         }
         let line = line_of(&chars, i);
-        let Some(close) = matching_close(&chars, open) else {
+        let tokens = tokens.get_or_insert_with(|| tokenize(&chars));
+        let Some(close) = close_of(tokens, open) else {
             hits.push(Hit {
                 line,
                 kind: HitKind::Unbalanced,

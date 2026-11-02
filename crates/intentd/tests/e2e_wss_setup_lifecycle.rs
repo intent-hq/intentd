@@ -871,6 +871,7 @@ fn read_prompt_texts(path: &Path) -> Vec<String> {
 /// with the outermost fire-once `<system>` block (the mock provider's
 /// `FirstTurnPrepend` system prompt) stripped so the assertion sees the first
 /// per-turn decoration.
+#[track_caller]
 fn prompt_after_system_block(log: &[String], user_content: &str) -> String {
     let text = log
         .iter()

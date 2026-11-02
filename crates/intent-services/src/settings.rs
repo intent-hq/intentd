@@ -1240,10 +1240,27 @@ impl SettingDefinition {
         if self.sensitive {
             m.insert("sensitive".into(), json!(true));
         }
+        // Always present (unlike the presence-detected flags above): a client
+        // reads its absence as an older daemon, not as "proposable".
+        m.insert("proposable".into(), json!(self.proposable()));
         if let Some(impact) = self.token_impact {
             m.insert("tokenImpact".into(), json!(impact));
         }
         Value::Object(m)
+    }
+
+    /// Whether an Assistant chat settings-change card may change this setting
+    /// (`proposable` on the wire, §5.12). Secrets, read-only keys and the
+    /// security-relevant families in [`PROPOSAL_EXCLUDED_PREFIXES`] /
+    /// [`PROPOSAL_EXCLUDED_PATHS`] are never proposable; clients refuse a card
+    /// change to a daemon setting unless this flag is `true`.
+    pub(crate) fn proposable(&self) -> bool {
+        !self.sensitive
+            && !self.read_only
+            && !PROPOSAL_EXCLUDED_PATHS.contains(&self.path)
+            && !PROPOSAL_EXCLUDED_PREFIXES
+                .iter()
+                .any(|prefix| self.path.starts_with(prefix))
     }
 
     /// Attach an approximate token-impact annotation (`tokenImpact` on the
@@ -1322,6 +1339,45 @@ impl SettingDefinition {
         Ok(())
     }
 }
+
+/// Setting families an Assistant chat card must never change, even though
+/// they are neither sensitive nor read-only: the listener, auth and tunnel
+/// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
+/// credential routing (`sourceControl.`), account companions of stored
+/// secrets (`accounts.`), and running agents for other daemons
+/// (`remoteAgents.`). Users change these in Settings.
+const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
+    "server.",
+    "sharing.",
+    "sourceControl.",
+    "accounts.",
+    "remoteAgents.",
+];
+
+/// Individual settings an Assistant chat card must never change: the primary
+/// identity key, the Git SSH key, executables the daemon runs (provider CLIs,
+/// auggie, the terminal shell), data/workspace locations, the command
+/// permission rules, the prompt rules injected into every agent's system
+/// prompt, opaque client/daemon state blobs and the daemon's mode.
+const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
+    "identity.provider",
+    "userRules",
+    "workspaceRules",
+    "workspace.sshKeyPath",
+    "providers.paths",
+    "context.auggiePath",
+    "workspace.defaultShell",
+    "storage.dataDir",
+    "workspaces.root",
+    "workspace.worktreesLocation",
+    "permissions.rules",
+    "quickActions.providerSettings",
+    "repos.known",
+    "workspace.changeHistory",
+    "workspaceInitializer.state",
+    "hardwareConsole.state",
+    "daemon.mode",
+];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
 pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
@@ -2689,6 +2745,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(10.0),
             Some(86_400.0),
             120.0,
+        ),
+        enumerated(
+            "remoteAgents.permission",
+            "Remote agent permissions",
+            "How provider permission prompts of remote agents are answered on this machine, since no client is attached (allowAll, autoByRisk or denyAll)",
+            "remoteAgents",
+            &["allowAll", "autoByRisk", "denyAll"],
+            "allowAll",
+        ),
+        enumerated(
+            "daemon.mode",
+            "Daemon mode",
+            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node selects node mode for one run without changing this",
+            "daemon",
+            &["regular", "node"],
+            "regular",
         ),
     ]
 }
@@ -4370,6 +4442,157 @@ mod tests {
         assert!(def.default_value.is_none());
     }
 
+    /// Every setting an Assistant chat card may change, pinned so that adding
+    /// a daemon setting is a reviewed decision: a new non-sensitive setting is
+    /// proposable by default and lands in this list, unless it belongs in
+    /// `PROPOSAL_EXCLUDED_PREFIXES` / `PROPOSAL_EXCLUDED_PATHS` because it
+    /// controls access, credentials, executables, locations or opaque state.
+    /// Clients apply any proposable path through `settings.update`, so this
+    /// list is also the set chat cards must be able to apply.
+    #[test]
+    fn proposable_settings_are_pinned() {
+        let expected: &[&str] = &[
+            "providers.enabled",
+            "providers.fastMode",
+            "model.default",
+            "model.defaultProvider",
+            "model.providerDefaults",
+            "model.defaultReasoningEffort",
+            "quickActions.defaultModel",
+            "quickActions.typeOverrides",
+            "quickActions.defaultReasoningEffort",
+            "quickActions.typeReasoningEffortOverrides",
+            "specialists.default",
+            "workspace.branchPrefix",
+            "git.autoCommit",
+            "workspace.cowIsolation",
+            "workspace.autoArchiveIdleAfterDays",
+            "workspace.purgeArchivedAfterDays",
+            "mcp.enableUserServers",
+            "mcp.disabledServers",
+            "notifications.enabled",
+            "notifications.soundEnabled",
+            "notifications.soundOnlyWhenUnfocused",
+            "notifications.volume",
+            "rtk.enabled",
+            "voice.provider",
+            "voice.language",
+            "voice.openai.model",
+            "voice.workspaceVocabulary.maxTerms",
+            "voice.vocabulary",
+            "context.enabled",
+            "context.allowIndexing",
+            "logging.level",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "agents.acpNodeMaxOldSpaceMb",
+            "agents.maxConcurrentAdapters",
+            "agents.maxTopLevelAgents",
+            "agents.idleReapMinutes",
+            "agents.reportToParentDebounceSeconds",
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+            "agents.resumeInterruptedOnStart",
+            "events.streamRetentionHours",
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+            "workspaceApi.maxOutputChars",
+            "workspaceApi.toonOutput",
+            "agentFeatures.backgroundHooks",
+            "agentFeatures.hostExec",
+            "agentFeatures.scripts",
+            "agentFeatures.terminalAccess",
+            "agentFeatures.browserAutomation",
+            "agentFeatures.desktopControl",
+            "agentFeatures.richChatBlocks",
+            "agentFeatures.structuredQuestions",
+            "agentFeatures.secretRequests",
+            "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
+            "agentFeatures.prMonitor",
+            "agentFeatures.taskGraph",
+            "agentFeatures.peerAgents",
+            "agentFeatures.mcpTools",
+            "prMonitor.maxPerAgent",
+            "prMonitor.debounceSeconds",
+            "prMonitor.pollSeconds",
+            "prMonitor.hourlyRequestBudget",
+            "prMonitor.quotaSharePercent",
+            "prCache.maxAgeSeconds",
+            "updates.checkOnIdle",
+            "updates.idleCheckIntervalMinutes",
+            "updates.idleGraceSeconds",
+        ];
+        let actual: Vec<&str> = definitions()
+            .iter()
+            .filter(|def| def.proposable())
+            .map(|def| def.path)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "classify the new or changed setting: add it to this list if a chat \
+             card may change it, or to PROPOSAL_EXCLUDED_PATHS / \
+             PROPOSAL_EXCLUDED_PREFIXES if it is security-relevant"
+        );
+    }
+
+    /// Sensitive, read-only and excluded settings are never proposable, and
+    /// the wire definition always carries the flag so a client can tell a
+    /// refusal apart from an older daemon that omits it.
+    #[test]
+    fn proposable_flag_is_on_the_wire_and_excludes_security_relevant_settings() {
+        for def in definitions() {
+            let wire = def.definition_json();
+            assert_eq!(
+                wire.get("proposable"),
+                Some(&json!(def.proposable())),
+                "{} must always carry proposable",
+                def.path
+            );
+            if def.sensitive || def.read_only {
+                assert!(!def.proposable(), "{} must not be proposable", def.path);
+            }
+        }
+        for path in [
+            "server.port",
+            "server.bindAddress",
+            "server.auth.enabled",
+            "server.auth.token",
+            "server.originAllowList",
+            "sharing.maxGuestConnections",
+            "sourceControl.github.apiBaseUrl",
+            "sourceControl.github.exposeGitCredentialToChildren",
+            "accounts.sentry.organization",
+            "identity.provider",
+            "workspace.sshKeyPath",
+            "workspace.defaultShell",
+            "providers.paths",
+            "context.auggiePath",
+            "storage.dataDir",
+            "permissions.rules",
+            "userRules",
+            "workspaceRules",
+            "specialists.dir",
+            "linear.token",
+            "remoteAgents.permission",
+            "daemon.mode",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.proposable(), "{path} must not be proposable");
+            assert_eq!(def.definition_json()["proposable"], json!(false), "{path}");
+        }
+        for path in [
+            "agentFeatures.hostExec",
+            "prMonitor.pollSeconds",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "workspace.purgeArchivedAfterDays",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.definition_json()["proposable"], json!(true), "{path}");
+        }
+    }
+
     /// `accounts.sentry.token` must be sensitive so `settings.update` persists
     /// it to the shared secrets store under account = setting path (never the
     /// DB) and every wire read (`settings.list` / `settings.get`) redacts it to
@@ -4553,20 +4776,48 @@ mod tests {
     /// before returning `None` — models a locked / prompting OS keychain that
     /// used to hang `settings.list` indefinitely.
     #[derive(Debug)]
-    struct HangingSecretStore {
-        hang_for: Duration,
+    /// A wedged keychain: every call blocks until the test opens the gate.
+    /// An answer that arrives while the gate is still shut came from the
+    /// wrapper's timeout, never from the store — proof with no clock. Hold
+    /// [`GatedSecretStore::open_on_drop`] so the parked blocking-pool threads
+    /// exit when the test ends.
+    #[derive(Default)]
+    struct GatedSecretStore {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
     }
-    impl SecretStore for HangingSecretStore {
+    impl GatedSecretStore {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+        /// Opens the gate when dropped — also on a failed assertion, whose
+        /// runtime shutdown would otherwise wait on the parked threads.
+        fn open_on_drop(self: &Arc<Self>) -> impl Drop {
+            struct OpenOnDrop(Arc<GatedSecretStore>);
+            impl Drop for OpenOnDrop {
+                fn drop(&mut self) {
+                    self.0.open();
+                }
+            }
+            OpenOnDrop(Arc::clone(self))
+        }
+        fn wait(&self) {
+            let open = self.open.lock().unwrap();
+            drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        }
+    }
+    impl SecretStore for GatedSecretStore {
         fn load(&self, _account: &str) -> Result<Option<String>> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(None)
         }
         fn store(&self, _account: &str, _value: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
         fn delete(&self, _account: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
     }
@@ -4583,15 +4834,13 @@ mod tests {
         // Compressed load budget (`with_timings`) so the timeout path runs in
         // milliseconds instead of the production 3s default.
         let load_timeout = Duration::from_millis(100);
-        // Hang for well over the per-op budget so a naive implementation would
-        // stall for `N_sensitive * hang_for` and blow past the test's outer
-        // timeout — but short enough that the blocking-pool shutdown at
-        // end-of-test doesn't hold up the whole test binary.
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // The keychain stays wedged until the list has answered, so a list
+        // that waits on the store instead of its load budget hangs into the
+        // guard below.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             load_timeout,
             DEFAULT_WRITE_TIMEOUT,
             DEFAULT_CACHE_TTL,
@@ -4599,17 +4848,13 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // Outer cap: single-flight + TTL cache in AsyncSecretStore bounds the
-        // total latency to ONE keychain budget — well under the per-call
-        // stall the store models. A generous slack absorbs task-spawn
-        // overhead on cold runners.
-        let cap = load_timeout + Duration::from_secs(2);
-        let list = timeout(cap, svc.list())
-            .await
-            .expect("settings.list must not hang when the keychain stalls")
-            .expect("settings.list must not return a domain error");
-        let elapsed = started.elapsed();
+        let list = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.list(),
+        )
+        .await
+        .expect("settings.list must not hang when the keychain stalls")
+        .expect("settings.list must not return a domain error");
 
         // Every sensitive entry MUST redact to `null` (absent) — the timed-out
         // load is treated as "not present" so the response is well-formed.
@@ -4627,10 +4872,6 @@ mod tests {
             }
         }
         assert!(sensitive_seen > 0, "catalog must contain sensitive entries");
-        assert!(
-            elapsed < cap,
-            "settings.list took {elapsed:?} — timeout cap was {cap:?}",
-        );
 
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
@@ -4655,11 +4896,12 @@ mod tests {
         // stays well over the budget but short enough that the blocking-pool
         // shutdown at end-of-test doesn't hold up the whole test binary.
         let write_timeout = Duration::from_millis(150);
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // Wedged until the update has answered: only the write budget can end
+        // it, and an update that waits on the store hangs into the guard.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             DEFAULT_LOAD_TIMEOUT,
             write_timeout,
             DEFAULT_CACHE_TTL,
@@ -4667,25 +4909,16 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // AsyncSecretStore's write budget is `write_timeout`; use it plus a
-        // small slack so the assertion measures the bounded write path.
-        let cap = write_timeout + Duration::from_secs(2);
         let err = timeout(
-            cap,
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),
         )
         .await
         .expect("settings.update must not hang past the budget")
         .expect_err("hung keychain must surface an error, not success");
-        let elapsed = started.elapsed();
         assert!(
             matches!(err, Error::Internal(_)),
             "expected Error::Internal, got {err:?}",
-        );
-        assert!(
-            elapsed < cap,
-            "settings.update took {elapsed:?}, cap {cap:?}"
         );
 
         for suffix in ["", "-wal", "-shm"] {
@@ -5964,15 +6197,15 @@ mod tests {
         let svc = SettingsService::new(&store, &secrets, None);
 
         let entries = json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]);
-        let started = Instant::now();
-        let err = svc
-            .update(&entries)
-            .await
-            .expect_err("the timed-out sibling clear must surface");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "update must return once the settle cap expires, not wait for the delete"
-        );
+        // The delete stays parked until after the update has answered, so an
+        // update that waits for it instead of the settle cap hangs here.
+        let err = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.update(&entries),
+        )
+        .await
+        .expect("update must return once the settle cap expires, not wait for the delete")
+        .expect_err("the timed-out sibling clear must surface");
         match &err {
             Error::Internal(msg) => assert!(
                 msg.contains("credential state is unknown"),
@@ -7878,6 +8111,92 @@ mod tests {
         assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
     }
 
+    /// Daemon-to-daemon remote agents: `remoteAgents.permission` (default
+    /// `allowAll`) on the machine and `daemon.mode`. Both are TOML-backed,
+    /// owner-editable and round-trip through the registry; no setting
+    /// switches remote agents on or off.
+    #[tokio::test]
+    async fn remote_agents_settings_round_trip_via_registry() {
+        for (path, category, default) in [
+            ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
+            ("daemon.mode", "daemon", json!("regular")),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must be editable");
+            assert_eq!(def.category, category, "{path} category");
+            assert_eq!(def.default_value, Some(default), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        for retired in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert!(find_definition(retired).is_none(), "{retired} is retired");
+            assert!(!KNOWN_PATHS.contains(&retired), "{retired} is retired");
+        }
+        let SettingType::Enum(values) = find_definition("remoteAgents.permission").unwrap().ty
+        else {
+            panic!("remoteAgents.permission must be an enum");
+        };
+        assert_eq!(values, ["allowAll", "autoByRisk", "denyAll"]);
+        let SettingType::Enum(values) = find_definition("daemon.mode").unwrap().ty else {
+            panic!("daemon.mode must be an enum");
+        };
+        assert_eq!(values, ["regular", "node"]);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::AllowAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Regular
+        );
+
+        svc.update(&json!([
+            { "path": "remoteAgents.permission", "value": "denyAll" },
+            { "path": "daemon.mode", "value": "node" },
+        ]))
+        .await
+        .expect("update");
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Node
+        );
+        for path in ["remoteAgents.permission", "daemon.mode"] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+        }
+        let err = svc
+            .update(&json!([{ "path": "remoteAgents.permission", "value": "ask" }]))
+            .await
+            .expect_err("an unknown permission must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("remoteAgents.permission").await.expect("reset");
+        assert_eq!(reset["value"], json!("allowAll"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&config_path);
+    }
+
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
     /// on) and two numbers: `idleCheckIntervalMinutes` (default 60, floor 5)
     /// and `idleGraceSeconds` (default 120, floor 10). All round-trip through
@@ -9118,6 +9437,62 @@ mod tests {
                 .expect("no-op import"),
             Vec::<String>::new()
         );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// A file from a build that still had the remote-agent switches
+    /// (`remoteAgents.enabled`, `experimental.remoteAgents`) loads: both are
+    /// discarded (no catalog entry), stripped from the file, and
+    /// `remoteAgents.permission` is kept.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_retired_remote_agent_switches() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("retired keys must load");
+        assert_eq!(
+            registry.snapshot().effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert!(find_definition("remoteAgents.enabled").is_none());
+        assert!(find_definition("experimental.remoteAgents").is_none());
+
+        let mut stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        stripped.sort();
+        assert_eq!(
+            stripped,
+            vec![
+                "experimental".to_string(),
+                "remoteAgents.enabled".to_string()
+            ]
+        );
+        for path in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert_eq!(store.get_setting(path).await.expect("read"), None, "{path}");
+        }
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("enabled"), "{text}");
+        assert!(!text.contains("experimental"), "{text}");
+        assert!(text.contains("permission = \"denyAll\""), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

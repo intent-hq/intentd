@@ -246,6 +246,7 @@ impl Drop for HeldGenkey {
 }
 
 /// Whether `pid` still names a process (signal 0 probe), zombies included.
+#[track_caller]
 fn process_alive(pid: u32) -> bool {
     match kill(Pid::from_raw(pid.cast_signed()), None) {
         Ok(()) => true,

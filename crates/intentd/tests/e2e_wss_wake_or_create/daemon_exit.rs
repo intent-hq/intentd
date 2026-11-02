@@ -153,6 +153,7 @@ pub(super) fn report(prefix: &str, row: &Value) -> io::Result<()> {
     output.flush()
 }
 
+#[track_caller]
 pub(super) fn propagate_teardown_outcome<T>(
     was_panicking: bool,
     attempt: std::thread::Result<io::Result<()>>,
@@ -250,6 +251,7 @@ fn teardown_failure_priority_preserves_original_outcome() {
     #[derive(Debug)]
     struct PanickingDisplay(std::sync::Arc<std::sync::atomic::AtomicUsize>);
     impl std::fmt::Display for PanickingDisplay {
+        #[track_caller]
         fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("synthetic metadata formatter panic")
@@ -1059,6 +1061,7 @@ impl ControlShell {
         Ok(())
     }
 
+    #[track_caller]
     fn wait_with_release(&mut self, deadline: Instant) -> io::Result<()> {
         let input = self
             .input

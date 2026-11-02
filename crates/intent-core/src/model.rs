@@ -139,6 +139,23 @@ pub struct PullRequestWorkspace {
     pub linked_at: String,
 }
 
+/// `ws.crossWorkspace.search` input: free text and/or a pull-request
+/// reference, scoped to the caller's sibling workspaces (the
+/// `crossWorkspace.*` same-repository rule). When both are set a workspace
+/// must match both. `limit` caps the returned workspaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossWorkspaceSearch {
+    /// Case-insensitive free text: every whitespace-separated term must
+    /// appear in the workspace's metadata, or the note index must match it.
+    pub query: Option<String>,
+    /// A pull-request reference resolved against the PR link index.
+    pub pr: Option<crate::PullRequestSelector>,
+    /// Include retired siblings (archived siblings are always searched).
+    pub include_retired: bool,
+    /// Maximum workspaces returned.
+    pub limit: usize,
+}
+
 /// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
 /// (§7.6; TS `PullRequestInfo` in `src/shared/types.ts`). A focused subset of
 /// the TS shape populated from the host-agnostic forge `PullRequest`; required
@@ -321,6 +338,8 @@ pub enum WorkspaceDisplayStatus {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub title: String,
+    /// The workspace's working branch. Empty (`""`) for plain-folder
+    /// workspaces (§5.1 "Plain-folder workspaces"), which have no git branch.
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
@@ -350,6 +369,15 @@ pub struct Workspace {
     /// { autoArchiveDisabled }` (owner-only). Omitted (not `false`) while off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_archive_disabled: bool,
+    /// Plain-folder workspace (§5.1 "Plain-folder workspaces"): the workspace
+    /// works directly in the ordinary, non-git folder at `repositoryPath`
+    /// with no checkout and no forge. Set only by `workspace.create
+    /// { plainFolder: true }` and never changed afterwards (it stays `true`
+    /// if a `.git` later appears); it is the single source of truth for the
+    /// mode — never infer it from `worktreePath`, `checkoutMode` or
+    /// `skipWorktree`. Omitted (not `false`) on every other workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain_folder: bool,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -661,6 +689,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "statusImageAssetId",
     "label",
     "autoArchiveDisabled",
+    "plainFolder",
     "activity",
     "attention",
     "createdAt",
@@ -1482,6 +1511,13 @@ pub struct WorkspaceCreate {
     /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
     /// an existing git repo is a no-op.
     pub is_new_repo: Option<bool>,
+    /// Plain-folder mode (§5.1 "Plain-folder workspaces"): `true` creates a
+    /// workspace that works directly in the non-git folder named by
+    /// `repositoryPath` — an existing folder (row only) or a new one (the
+    /// daemon creates that one directory, no `.git`). Refused with git-only
+    /// options or a path the folder cannot live at. `false` / absent keeps
+    /// the legacy behavior exactly.
+    pub plain_folder: Option<bool>,
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
@@ -1665,6 +1701,17 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_present_field"
     )]
     pub auto_archive_disabled: Option<bool>,
+    /// `Workspace.plainFolder` is create-only (§5.1 "Plain-folder
+    /// workspaces"): any `plainFolder` key on an update fails
+    /// deserialization (`-32602`, `error.data.code = "invalid-params"`), so
+    /// nothing is written. Never set on a successful parse and never
+    /// serialized, so `workspace:updated` carries no `plainFolder` change.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "reject_plain_folder_update"
+    )]
+    pub plain_folder: Option<serde::de::IgnoredAny>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1737,6 +1784,19 @@ pub struct WorkspaceUpdate {
     pub attention: Option<WorkspaceAttention>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): reject the key
+/// whatever its value.
+fn reject_plain_folder_update<'de, D>(
+    _deserializer: D,
+) -> std::result::Result<Option<serde::de::IgnoredAny>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "plainFolder is set only by workspace.create and cannot be changed",
+    ))
 }
 
 /// A field that is optional but, when present, must hold a non-null `T`:
@@ -3630,7 +3690,14 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// (`lastAgentResponseTruncated` …
 /// `metadata.attentionRequestReasonTruncated`, all set on the worst-case
 /// row) add ≈ 190 B, putting the measured row at ≈ 6,030 B — inside the
-/// budget with ≈ 2% margin left. Typical rows are far smaller (the issue's 404-row
+/// budget with ≈ 2% margin left. Placed-agent rows then gained the remote
+/// placement (`nodeId`, `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`],
+/// `placement`, `effectiveIsolation`, and `placementError` at its write-time
+/// caps) so the agent list can show a remote agent's node and provisioning
+/// state without opening it: ≈ 1,110 B more, a measured ≈ 7,160 B worst case,
+/// and the budget rose to 7.5 KiB (≈ 7% margin). Only remote agents carry
+/// these fields, and only a failed start carries the ≈ 570 B
+/// `placementError`. Typical rows are far smaller (the issue's 404-row
 /// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
 /// attention request, sandbox fields, hooks AND monitors at once, and
 /// previews rarely all hit the cap), and the per-key allowlist
@@ -3641,7 +3708,7 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// paging `agent.list` — separate protocol decisions. The response-level
 /// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
 /// it lowers the preview cap per response when the row count demands it.
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 7 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array
 /// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the
@@ -3801,7 +3868,13 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "retiredAt",
     "notificationsMuted",
+    "pinned",
     "harnessVersion",
+    "nodeId",
+    "nodeName",
+    "placement",
+    "effectiveIsolation",
+    "placementError",
     "metadata",
 ];
 
@@ -3963,7 +4036,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.6";
+pub const CURRENT_HARNESS_VERSION: &str = "3.7";
 
 /// Harness versions that receive repository guidance, oldest first. The single
 /// source for every admission gate and boundary test: bumping
@@ -3972,13 +4045,13 @@ pub const CURRENT_HARNESS_VERSION: &str = "3.6";
 /// check below fails the build until that is done. Exact strings only, so
 /// malformed or unknown stamps are never admitted.
 pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6"];
+    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.2", "3.3", "3.4", "3.5", "3.6"];
+    &["3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -4446,6 +4519,14 @@ pub struct AgentSession {
     /// `ws.event.*` MCP result).
     #[serde(default)]
     pub notifications_muted: bool,
+    /// Daemon-owned per-session sidebar pin, so every client lists the same
+    /// agents first. Toggled through `agent.update { pinned }`. The session
+    /// wire form serves it only when `true` (absent means unpinned), while
+    /// `AgentLite.pinned` is always present. A user preference, not agent
+    /// activity: toggling it never advances `updated_at`, and ordinary
+    /// full-row session writes never revert it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -4962,6 +5043,11 @@ pub struct AgentLite {
     /// `metadata.isBackground`) so clients can gate alerts from the list row.
     #[serde(default)]
     pub notifications_muted: bool,
+    /// Per-session sidebar pin; mirrors [`AgentSession::pinned`]. Always
+    /// emitted (like `notificationsMuted`), so its presence tells clients the
+    /// daemon accepts `agent.update { pinned }`; older daemons omit it.
+    #[serde(default)]
+    pub pinned: bool,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -4973,6 +5059,26 @@ pub struct AgentLite {
     /// from `agent.list` rows by [`Self::strip_detail_only_fields`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_features: Option<serde_json::Value>,
+    /// Execution node of a remote agent (PROTOCOL `methods/nodes.md`
+    /// placed-agent projection). Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Lease the remote agent runs under. Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    /// The configured display name of the remote agent's node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// The resolved `placement` of a remote agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::placement::AgentPlacement>,
+    /// `pending` until the remote agent's isolated checkout is ready, then
+    /// `isolated`. Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_isolation: Option<crate::remote_launch::EffectiveIsolation>,
+    /// Why the remote agent could not start on its node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_error: Option<crate::remote_launch::PlacementError>,
     pub metadata: AgentMetadata,
 }
 
@@ -5002,6 +5108,8 @@ impl AgentLite {
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
         let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
+        let remote =
+            crate::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref());
         let metadata = AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,
@@ -5079,16 +5187,24 @@ impl AgentLite {
             provider_replacement_required: None,
             retired_at: session.retired_at,
             notifications_muted: session.notifications_muted,
+            pinned: session.pinned,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
+            node_id: remote.as_ref().map(|r| r.node_id.clone()),
+            lease_id: remote.as_ref().map(|r| r.lease_id.clone()),
+            node_name: remote.as_ref().map(|r| r.node_name.clone()),
+            placement: remote.as_ref().map(|r| r.placement.clone()),
+            effective_isolation: remote.as_ref().map(|r| r.effective_isolation),
+            placement_error: remote.and_then(|r| r.placement_error),
             metadata,
         }
     }
 
     /// List-path detail-field strip (intent-hq/intent#5383): drop the fields
     /// that only the open-agent (detail) UI reads — `harnessFeatures`,
-    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`,
-    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — so an
+    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`, the
+    /// placed agent's `leaseId`, `metadata.pendingProposals`,
+    /// `metadata.proposalResolutions` — so an
     /// `agent.list` row carries only what list contexts render. Every one of
     /// these is presence-detected on the wire (`skip_serializing_if`), so a
     /// stripped row simply omits the key (absent, never `null`). `agent.list`
@@ -5097,8 +5213,15 @@ impl AgentLite {
     /// serving the full values. Serve-time projection only — nothing changes
     /// at write time. The key allowlist goldens [`AGENT_LIST_ROW_KEYS`] /
     /// [`AGENT_LIST_ROW_METADATA_KEYS`] pin the resulting shape.
+    ///
+    /// The other placed-agent fields (`nodeId`, `nodeName`, `placement`,
+    /// `effectiveIsolation`, `placementError`) stay on the row: the agent
+    /// list badges remote agents and shows their provisioning state, which
+    /// must follow `effectiveIsolation` from `pending` to `isolated` without
+    /// the agent being opened.
     pub fn strip_detail_only_fields(&mut self) {
         self.harness_features = None;
+        self.lease_id = None;
         self.effort_levels = None;
         self.context_references = None;
         self.file_blocks = None;
@@ -5117,10 +5240,12 @@ impl AgentLite {
     /// list row carries get the same truncation at a cap sized for
     /// the field — `metadata.attentionRequestReason` (a long reason blew
     /// the row budget in production, intent-hq/intent#5383) at the preview
-    /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
-    /// `metadata.sandboxPath` / `metadata.sandboxBranch` at
+    /// budget, `name` / `model` / `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`],
+    /// and `metadata.sandboxPath` / `metadata.sandboxBranch` at
     /// [`AGENT_LIST_PATH_CAP_BYTES`] — so every free-text string a list row
-    /// carries is bounded (`lastToolUse.name` is the one string left
+    /// carries is bounded (`placementError` is capped at write time,
+    /// [`crate::remote_launch::PLACEMENT_ERROR_DETAIL_MAX_BYTES`];
+    /// `lastToolUse.name` is the one string left
     /// untouched: it is a tool identifier, not free text, and the FE keys
     /// its tool classification on it). `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
@@ -5135,7 +5260,8 @@ impl AgentLite {
     /// `metadata.completionReportTruncated`,
     /// `metadata.attentionRequestReasonTruncated`; intent-hq/intent#7250
     /// follow-up) so clients never mistake a prefix for the full value; the
-    /// identifier-sized `name` / `model` / sandbox caps stay unflagged.
+    /// identifier-sized `name` / `model` / `nodeName` / sandbox caps stay
+    /// unflagged.
     /// `name` is never touched, so the FE's tool
     /// classification keeps working. These fields exist to render a one-line
     /// summary in list contexts, so `agent.list` applies this to every row;
@@ -5234,6 +5360,7 @@ impl AgentLite {
         // Identifier-sized caps stay unflagged: realistic values never reach them.
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.node_name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_branch, AGENT_LIST_PATH_CAP_BYTES);
         match self.last_tool_use.as_mut() {
@@ -5298,6 +5425,11 @@ pub struct AgentCreateExtra {
     /// like send/queue.
     pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
+    /// The documented `placement` object (PROTOCOL `model-platform-routing`):
+    /// present only when the caller chose one, so an omitted placement keeps
+    /// today's local launch. `null` is rejected rather than read as omitted.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
     /// Internal override for the created session's `nameExplicitlySet` flag.
     /// Not accepted from the wire (`#[serde(skip)]`): `agent_delegate_op`
     /// sets `Some(false)` so a delegated child keeps its task-derived name
@@ -5344,6 +5476,11 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+    /// The documented `placement` object for the delegated child; single
+    /// delegation only (a batch with a placement is rejected). `null` is
+    /// rejected rather than read as omitted.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
@@ -5442,6 +5579,10 @@ pub struct AgentWakeCreateOptions {
     pub context_references: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub skip_auto_commit: Option<bool>,
+    /// The documented `placement` object, used only when a new agent is
+    /// created; an existing assigned agent keeps where it runs.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
 }
 
 /// Wire input for `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a).
@@ -8498,6 +8639,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: true,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -8597,6 +8739,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -8621,6 +8764,7 @@ mod tests {
         }));
         let long_reason = format!("blocked on {}", "q".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES));
         lite.metadata.attention_request_reason = Some(long_reason.clone());
+        lite.node_name = Some("N".repeat(AGENT_LIST_NAME_CAP_BYTES * 2));
 
         lite.cap_list_previews();
 
@@ -8661,6 +8805,10 @@ mod tests {
         // The non-preview strings land on their own smaller caps; realistic
         // values (a model slug, a short branch) pass through untouched.
         assert_eq!(lite.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+        assert_eq!(
+            lite.node_name.as_deref().map(str::len),
+            Some(AGENT_LIST_NAME_CAP_BYTES)
+        );
         assert_eq!(lite.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
         assert_eq!(
             lite.metadata.sandbox_path.as_deref().map(str::len),
@@ -8745,6 +8893,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
                 sandbox_id: None,
@@ -8835,6 +8984,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -8924,6 +9074,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
                 created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
                 updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
                 sandbox_id: None,
@@ -9076,6 +9227,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -9336,6 +9488,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

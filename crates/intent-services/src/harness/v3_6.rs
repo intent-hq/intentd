@@ -1,10 +1,15 @@
-//! Source-aligned Developer and Lead workflows with minimal verification.
+//! Harness v3.6 adds a "Long-running Processes" common section that steers
+//! dev servers, watchers and long builds to Intent scripts (`ws.script.*`)
+//! instead of provider-native background shells such as Claude Code's
+//! `Bash` `run_in_background` and `Monitor`. Every other body, text surfaces,
+//! specialists and defaults stay v3.5's, and earlier sessions keep their
+//! prompts byte for byte.
 
 use super::{Doctrine, HarnessEntry};
 
 static DOCTRINE: Doctrine = Doctrine {
-    instructions: super::v3_5::ENTRY.doctrine.instructions,
-    specialists: crate::specialists::EMBEDDED_BUNDLED_V3_6,
+    instructions: &crate::instructions::V3_6,
+    specialists: super::v3_5::ENTRY.doctrine.specialists,
 };
 
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
@@ -17,90 +22,139 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
+    use intent_core::{settings_file::AgentFeaturesSettings, AgentId};
 
-    use sha2::{Digest, Sha256};
+    use crate::v1_goldens::{seed_agent, setup};
 
-    #[test]
-    fn golden_v3_6_specialist_bytes() {
-        for (id, expected) in [
-            (
-                "developer",
-                "78a5c202fb320a498445e02c88459035b2976f26b303986346c28ca7437fa51e",
-            ),
-            (
-                "implementor",
-                "88eba423004822b1fa6320f10f1a9c80d71783774957b9313e123c665d2a32b8",
-            ),
-            (
-                "spec-writer",
-                "ea4d894f36a2863db0738045f326b2c502cc4b35003efa053209d3a6fc3ed903",
-            ),
-            (
-                "pr-reviewer",
-                "0ca55d5b0bd14f942cea27f96b6f5e5a3a3115e86c25229b65845a55045729a7",
-            ),
-        ] {
-            let content = super::ENTRY
-                .doctrine
-                .specialists
-                .iter()
-                .find_map(|(candidate, content)| (*candidate == id).then_some(*content))
-                .expect("versioned specialist");
-            let actual = Sha256::digest(content)
-                .iter()
-                .fold(String::new(), |mut hex, byte| {
-                    let _ = write!(hex, "{byte:02x}");
-                    hex
-                });
-            assert_eq!(actual, expected, "{id}");
-        }
+    const HEADING: &str = "## Long-running Processes\n";
+
+    /// Split `common` into (text without the v3.6 section, the section).
+    fn split_section(common: &str) -> (String, &str) {
+        let start = common.find(HEADING).expect("v3.6 section");
+        let body = start + HEADING.len();
+        let end = common[body..].find("\n## ").expect("next section") + body + 1;
+        (
+            format!("{}{}", &common[..start], &common[end..]),
+            &common[start..end],
+        )
     }
 
     #[test]
-    fn v3_6_versions_workflows_and_removes_verifier() {
-        let current = super::super::resolve_entry("3.6");
-        let previous = super::super::resolve_entry("3.5");
-        assert_eq!(current.version, "3.6");
-        assert!(std::ptr::eq(
+    fn v3_6_only_adds_the_long_running_processes_section() {
+        let current = &super::ENTRY;
+        let previous = crate::harness::resolve_entry("3.5");
+        let common = current.doctrine.instructions.common;
+        let (rest, section) = split_section(common);
+        assert_eq!(rest, previous.doctrine.instructions.common);
+        assert!(!previous.doctrine.instructions.common.contains(HEADING));
+        for guidance in [
+            "ws.script.create",
+            "ws.script.start",
+            "ws.script.monitor",
+            "ws.script.stop",
+            "autoMonitor.ok",
+            "autoMonitorError",
+            "run_in_background",
+            "`Monitor`",
+            "nohup",
+        ] {
+            assert!(section.contains(guidance), "{guidance}");
+        }
+        assert!(
+            common.contains("## Waiting on External Conditions")
+                && common.find("## Waiting on External Conditions").unwrap()
+                    < common.find(HEADING).unwrap(),
+            "the section follows the waiting guidance"
+        );
+        let (now, then) = (
             current.doctrine.instructions,
-            previous.doctrine.instructions
+            previous.doctrine.instructions,
+        );
+        assert_eq!(now.workspace, then.workspace);
+        assert_eq!(now.workspace_agent, then.workspace_agent);
+        assert_eq!(now.assistant, then.assistant);
+        assert_eq!(
+            now.single_workspace_fallback,
+            then.single_workspace_fallback
+        );
+        assert!(std::ptr::eq(
+            now.plain_folder.expect("plain-folder doctrine"),
+            then.plain_folder.expect("plain-folder doctrine")
         ));
+        // Trait-object vtables can be duplicated across codegen units.
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
+        assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
+    }
+
+    #[test]
+    fn heading_constant_matches_the_bundled_section() {
         assert_eq!(
-            current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len() - 1
+            format!(
+                "## {}\n",
+                crate::instructions::COMMON_LONG_RUNNING_PROCESSES
+            ),
+            HEADING
         );
-        for (old_id, old) in previous.doctrine.specialists {
-            let replacement = current
-                .doctrine
-                .specialists
-                .iter()
-                .find(|(id, _)| id == old_id);
-            if *old_id == "verifier" {
-                assert!(replacement.is_none());
-                continue;
-            }
-            let (new_id, new) = replacement.expect("retained specialist");
-            if matches!(
-                *new_id,
-                "developer" | "spec-writer" | "implementor" | "pr-reviewer"
-            ) {
-                assert_ne!(old, new, "{new_id}");
-                let (old_meta, _) = crate::specialists::parse_frontmatter(old);
-                let (new_meta, _) = crate::specialists::parse_frontmatter(new);
-                let keys = if *new_id == "spec-writer" {
-                    &["icon", "model"][..]
-                } else {
-                    &["name", "role", "teamAgents", "icon", "aliases", "model"][..]
-                };
-                for key in keys {
-                    assert_eq!(old_meta.get(*key), new_meta.get(*key), "{new_id}: {key}");
+    }
+
+    #[tokio::test]
+    async fn script_guidance_is_session_pinned_and_scripts_gated() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = AgentId::from("agent-long-running-guidance");
+        seed_agent(&svc, &ws, &id).await;
+        let mut current = svc.store().get_agent_session(&id).await.unwrap();
+        current.harness_version = "3.6".into();
+        let mut previous = current.clone();
+        previous.harness_version = "3.5".into();
+        for scripts in [true, false] {
+            let features = AgentFeaturesSettings {
+                scripts,
+                ..AgentFeaturesSettings::default()
+            };
+            for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+                let mut prompts = Vec::new();
+                for session in [&current, &previous] {
+                    prompts.push(
+                        crate::rules::assemble_system_prompt(
+                            svc.store(),
+                            None,
+                            agent_type,
+                            None,
+                            false,
+                            false,
+                            false,
+                            &features,
+                            None,
+                            Some(session),
+                            None,
+                        )
+                        .await
+                        .expect("assembled prompt"),
+                    );
                 }
-            } else {
-                assert_eq!(old, new, "{new_id}");
+                assert_eq!(
+                    prompts[0].contains(HEADING),
+                    scripts,
+                    "{agent_type}: section follows agentFeatures.scripts"
+                );
+                assert!(
+                    !prompts[1].contains(HEADING),
+                    "{agent_type}: 3.5 stays frozen"
+                );
+                let without_section = if scripts {
+                    let start = prompts[0].find(HEADING).unwrap();
+                    let body = start + HEADING.len();
+                    let end = prompts[0][body..].find("\n## ").unwrap() + body + 1;
+                    format!("{}{}", &prompts[0][..start], &prompts[0][end..])
+                } else {
+                    prompts[0].clone()
+                };
+                assert_eq!(
+                    without_section, prompts[1],
+                    "{agent_type}: 3.6 differs from 3.5 only by the section"
+                );
             }
         }
     }

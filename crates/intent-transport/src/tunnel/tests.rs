@@ -261,6 +261,7 @@ async fn connect_success_before_deadline_relays() {
     assert_eq!(t.receive().await, Frame::OpenOk { stream_id: 7 });
     t.dropped.try_recv().expect("completed connect dropped");
     let elapsed = started.elapsed();
+    // elapsed-assert: allow — tokio::time::pause(): Instant is virtual
     assert!(
         elapsed < TEST_CONNECT_TIMEOUT,
         "OPEN_OK must arrive before {TEST_CONNECT_TIMEOUT:?}, got {elapsed:?}"

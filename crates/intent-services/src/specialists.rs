@@ -216,7 +216,7 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_6;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_7;
 
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
@@ -233,24 +233,24 @@ pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V2_5[8],
 ];
 
-pub(crate) const EMBEDDED_BUNDLED_V3_6: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_BUNDLED_V3_7: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_1[0],
     (
         "developer",
-        include_str!("../resources/specialists/v3.6/developer.md"),
+        include_str!("../resources/specialists/v3.7/developer.md"),
     ),
     (
         "implementor",
-        include_str!("../resources/specialists/v3.6/implementor.md"),
+        include_str!("../resources/specialists/v3.7/implementor.md"),
     ),
     (
         "pr-reviewer",
-        include_str!("../resources/specialists/v3.6/pr-reviewer.md"),
+        include_str!("../resources/specialists/v3.7/pr-reviewer.md"),
     ),
     EMBEDDED_BUNDLED_V3_1[4],
     (
         "spec-writer",
-        include_str!("../resources/specialists/v3.6/spec-writer.md"),
+        include_str!("../resources/specialists/v3.7/spec-writer.md"),
     ),
     EMBEDDED_BUNDLED_V3_1[6],
     EMBEDDED_BUNDLED_V3_1[8],

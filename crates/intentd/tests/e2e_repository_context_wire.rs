@@ -119,6 +119,7 @@ impl Drop for Harness {
         let _ = self.child.wait();
     }
 }
+#[track_caller]
 fn git(root: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -480,10 +481,12 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
 }
+#[track_caller]
 fn refused(value: &Value) {
     assert_eq!(value["error"]["code"], -32003, "{value}");
 }

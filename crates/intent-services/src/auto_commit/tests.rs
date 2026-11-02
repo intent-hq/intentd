@@ -148,6 +148,7 @@ fn session(
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
@@ -796,15 +797,19 @@ async fn generation_timeout_falls_back_to_subject() {
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
-    let started = std::time::Instant::now();
+    let warnings = crate::test_tracing::Warnings::default();
+    let guard = warnings.install();
     svc.handle_agent_idle_auto_commit(&event).await;
+    drop(guard);
     // monorepo#4032: a stalled CLI must be cut off at the auto-commit budget
     // (250 ms here) — not any interactive-enhancement default — and still
-    // yield a non-error commit. Generous slack for slow CI.
+    // yield a non-error commit. The CLI hangs, so only a budget can end the
+    // run, and the failure names the budget that did.
+    let failures = warnings.containing("generate_auto_commit_message: generation failed");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "auto-commit was not bounded by its own budget: {:?}",
-        started.elapsed()
+        matches!(failures.as_slice(), [line]
+            if line.contains("One-shot completion timed out after 250ms")),
+        "auto-commit was not cut off by its own 250 ms budget: {failures:?}"
     );
     let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
@@ -1459,5 +1464,36 @@ printf '{"subject": "feat: committed after remount"}'"#,
     assert_eq!(
         capture.count(tracing::Level::WARN, "workspace checkout missing"),
         1
+    );
+}
+
+/// Plain-folder workspaces (PROTOCOL §5.1 "Plain-folder workspaces") never
+/// auto-commit, even when the folder later gained a `.git` and holds an
+/// attributed change: the persisted flag decides, not the folder contents.
+#[intent_test_macros::daemon_test]
+async fn plain_folder_workspace_never_auto_commits() {
+    let repo = init_git_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace_with_repo(&ws_id, &repo);
+    ws.plain_folder = true;
+    store.insert_workspace(&ws).await.expect("insert ws");
+    std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+
+    let agent = session("agent-p1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-p1").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-p1", "end_turn"))
+        .await;
+
+    let (agent_id, _, message) = last_commit_trailers(&repo.dir);
+    assert_eq!(agent_id, None, "no agent commit in a plain folder");
+    assert_eq!(message.trim(), "seed", "HEAD is still the seed commit");
+    assert!(
+        repo.dir.join("change.txt").exists(),
+        "the user's file is untouched"
     );
 }

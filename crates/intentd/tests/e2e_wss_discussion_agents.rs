@@ -412,6 +412,7 @@ async fn assert_no_turn(sub: &mut common::TlsWs) -> Vec<Value> {
     seen
 }
 
+#[track_caller]
 fn prompt_log(path: &Path) -> Vec<Value> {
     match std::fs::read_to_string(path) {
         Ok(text) => text
@@ -423,6 +424,7 @@ fn prompt_log(path: &Path) -> Vec<Value> {
     }
 }
 
+#[track_caller]
 fn assert_discussion_event(events: &[Value], message: &Value) {
     let event = events
         .iter()

@@ -532,6 +532,12 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // change — never on the implicit refresh (the identity lock blocks those).
 // Payload `{ principalId, identity: { provider, host, externalUserId },
 // login? }`; owner-only, like `sourceControl:auth-changed`.
+// Daemon-to-daemon remote agents, backend side: an exposed machine was
+// added, removed, changed state or reported new capabilities. Payload
+// `{ machine: RemoteMachine }` or `{ machineId, removed: true }`; global and
+// owner-only, never the executor token.
+pub const REMOTE_MACHINE_CHANGED: &str = "remoteMachine:changed";
+
 pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
 pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
 pub const HOST_EXECUTION_CONTEXT_CHANGED: &str = "host:execution-context-changed";
@@ -767,6 +773,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOST_MEMBERS_CHANGED,
     HOST_INVITES_CHANGED,
     HOST_EXECUTION_CONTEXT_CHANGED,
+    REMOTE_MACHINE_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,

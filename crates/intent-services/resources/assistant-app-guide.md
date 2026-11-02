@@ -106,7 +106,7 @@ supports them. A newer daemon or agent instruction version does not prove suppor
 in the installed client.
 
 For development testing, run both component branches and create a new agent with
-harness 3.5. Existing agents retain their creation-time prompts. If controls do
+harness 3.5 or later. Existing agents retain their creation-time prompts. If controls do
 not respond in a scaled embedded-browser preview, choose **Fit panel** in its size
 menu and retry.
 
@@ -182,17 +182,13 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ConnectionsSettings,GitLabAuthConnection,GitLabChildGitSetting}.svelte; messages/en.json. -->
+When the user asks the Assistant to change a setting, `ws.app.settings.propose` shows a
+change card the user applies or discards; the card can be undone. It accepts only
+settings whose definition has `proposable: true`. Credentials, remote access and
+sharing, forge connections, executable and folder paths, command permissions, and
+global or workspace instructions are refused: send the user to the matching Settings section above instead.
 
-When explicitly asked about experimental GitLab terminal access, open **Connections
-→ Accounts → GitLab → Use GitLab account for terminal Git**. Only the connected
-host's owner can change this choice, and the daemon must support it. It defaults
-off for a new account or instance. Wait for the saved acknowledgement; an unavailable
-status does not mean off. Use **Refresh** to check the current choice after an error.
-Intent's own authorized Git operations work with this off. Enabling it lets terminal
-and agent Git commands request credentials for that account and full instance; it
-does not sign in `glab`. The GitLab section can remain visible for a configured
-account even when Labs is off; do not infer permission or readiness from visibility.
+<!-- Sources: packages/intentd/crates/intent-services/src/settings.rs (PROPOSAL_EXCLUDED_*); packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/settings.rs; packages/cloudlands-fe/src/lib/components/chat/proposals/{settings-proposal-actions,settings-proposal-definitions}.ts. -->
 
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
@@ -278,7 +274,7 @@ of the rendered result. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
-<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.6/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_6.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.7/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_7.rs}. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
@@ -314,12 +310,27 @@ for an installed Auggie to appear.
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
-Claude Code and choose **Add profile**: enter a name and environment variables
-(literal values, **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
-the provider host user's home folder (`~user` stays literal). The user signs in or
-prepares that account outside Intent. Credentials inherited from the environment can still
-apply: for a Claude Code profile that should use another account (or none), set
+Claude Code and choose **Add profile**, then a kind: **Different login**, **API key**
+(Claude Code only), **Token**, or **Advanced**. **Different login** creates a new
+sign-in folder under `~/intent/profiles/` on the daemon host. **Create & sign in**
+closes the dialog and runs the sign-in in the bottom terminal; the profile row shows
+**Waiting for sign-in…**, then a **Signed in** toast. When the daemon runs on another
+machine, Codex shows a one-time device code instead of a browser sign-in; device code
+login must first be turned on in ChatGPT → **Settings → Security** (or allowed by a
+workspace admin). The folder starts without the user's usual Claude Code or Codex
+settings (instructions, MCP servers, skills). Later, ⋯ → **Log In** on a Different-login
+profile signs in again to the same folder. Removing that profile leaves its folder,
+with its saved login, on disk. **API key** saves an Anthropic key (optionally a custom
+endpoint); **Token** saves a `claude setup-token` token, or a Codex access token
+(ChatGPT Business or Enterprise only). After **Create**, Intent runs a test prompt and
+shows **Key works** or **Key was rejected**. These kinds also unset inherited
+credentials that would otherwise win. **Advanced** is the raw editor: a name and
+environment variables (literal values, **Empty value**, or **Unset**; no shell
+expansion). Use `CODEX_HOME` or `CLAUDE_CONFIG_DIR` to choose an account folder; there
+only, a leading `~` or `~/` means the provider host user's home folder (`~user` stays
+literal), and the saved folder path is shown as typed while other saved values stay
+hidden. Credentials inherited from the environment can still apply to an Advanced
+profile: for a Claude Code profile that should use another account (or none), set
 inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
 **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
 custom base URL from the environment; for a different endpoint, give the profile
@@ -350,6 +361,8 @@ notice; if that one is still out of quota, Intent tries again later with growing
 waits. Conversations share what they learn: once one finds a configuration out of
 quota, others skip it on their next turn (until its reset time, or 5 hours), and once
 one succeeds on it again, conversations that left it go back on their next turn.
+Saving a change to a profile or to a Default configuration (for example a new API key
+or account folder) clears what was learned about it, so it is no longer skipped.
 Choosing a model or profile yourself makes that the new starting point. When every
 option is out of quota, Intent still tries them, and the usual quota message appears.
 
@@ -407,7 +420,31 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+
+## Use Intent from a browser on another device (experimental)
+
+Browser access is experimental and hidden until the user runs **Enable experimental
+browser access** from Cmd+K (Labs). Do not offer it as a normal option; describe it only
+when the user asks about it, and say it is experimental. **Disable experimental browser
+access** hides the section and turns the server off.
+
+Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
+a browser on another device, such as a laptop, use the desktop app, including every
+backend that desktop connects to. It is off by default and the desktop app must stay
+open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
+user reaches it through a private HTTPS front-end they set up themselves; with
+Tailscale that is `tailscale serve --bg <port>` on the desktop, then the desktop's
+Tailscale address in the browser. Never suggest Tailscale Funnel or another public tunnel.
+
+The browser asks once for the **Access key** shown in that section; **Reset key** signs
+out every browser. In the browser, opening a saved connection opens that backend in a
+new tab; adding or forgetting connections stays on the desktop. Desktop-only features
+such as native file dialogs and window controls are unavailable in the browser. If the
+section shows the port is in use, change **Port**. If it says the build does not
+include the browser version, the installed app predates the feature.
+
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -429,6 +466,13 @@ status is unavailable. For **Startup Failed**, use **Retry Connection** after
 checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
+
+When a new workspace uses a remote-tracking base branch from a local repository,
+Intent fetches that branch before creating the checkout. If the fetch fails,
+creation stops; restore access to the remote and retry. Explicit commits, tags,
+and local-only branches still use their local state.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/lib.rs; packages/intentd/crates/intent-git/src/fetch.rs. -->
 
 Legacy workspace import has been retired. Settings no longer offers the Data import
 section, and a fresh daemon does not discover or import old Electron workspace
@@ -467,13 +511,18 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector}.svelte; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
 agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
+The repository picker's tabs are **Clone** (a repository from a connected forge
+account), **Existing folder** (a folder on the machine), and **New**. **Clone** is
+hidden only once Intent has confirmed no forge account is connected; to clone, use
+the picker's connect link or **Settings → Connections**. Onboarding's project step
+uses the same tab names.
 Selecting a repository restores the agent setup last used to create a workspace
 there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
 reasoning effort. A repository with no saved setup uses the most recent setup.
@@ -496,6 +545,15 @@ order. From **Home**, next opens the first workspace tab and previous opens the
 last, regardless of which workspace was selected before Home. With no open
 workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
 and shortcuts → Keyboard shortcuts**.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
+
+To keep an agent at the top of a workspace's agent list, right-click it in the
+sidebar and choose **Pin to top**. Pinned agents are listed first, most recent
+activity first, with a divider below them; choose **Unpin** to return an agent to
+the normal order. Pins are saved by Intent, so they appear on every device
+connected to the same Intent. Only foreground agents that were not started by
+another agent can be pinned.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
@@ -595,12 +653,14 @@ window finishes. Older clients may show the initial messages together.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; src/lib/components/chat/AssistantThreadTitle.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/{ChiefCard.svelte,chief-thread-starter.svelte.ts}; src/lib/components/chat/AssistantThreadTitle.svelte. -->
 
-In **Home → Assistant**, select a thread in the sidebar. To rename it, click its
-title in the conversation header. The title field uses the available header width.
-Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
-select conversations and cannot be edited there.
+In **Home → Assistant**, click **New chat** at the top of the sidebar to start a
+chat; a blank chat is reused rather than duplicated. Select a thread in the
+sidebar to open it. To rename it, click its title in the conversation header.
+The title field uses the available header width. Press **Enter** or click away
+to save; press **Escape** to cancel. Sidebar titles select conversations and
+cannot be edited there.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 
@@ -626,23 +686,7 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeIntegrations,HomeRepositorySummary,HomeReviewConversation}.svelte; src/features/home/{home-repository-discovery-saga,home-integrations-saga,home-review-threads}.ts; messages/en.json. -->
-
-For the experimental GitLab review flow, open **Home → Pull requests**. The inner
-list is labeled **Merge requests** for GitLab alone or **Pull and merge requests**
-with both forges. It reads selected, known repositories through the current
-connection. **Closed / merged** includes merged and unmerged-closed MRs. Use
-**Load more** when offered, including after an empty filtered page. **Summary**
-shows the qualified project, description, available checks and approvals, merge
-requirements, and discussions with replies. Restricted, unknown, partial or
-unsupported information does not establish merge readiness. **Review head** and
-**Note diff head** distinguish the current review from a note's code position.
-The GitLab preview has no **Code** tab. Use **Review on GitLab** for provider-side
-actions. **Start workspace** opens the existing creation form with the qualified
-item; it does not automatically check out the MR source head. The separate
-**Linear issues** section is unchanged.
-
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, packages/intentd/crates/intent-store/migrations/0161_pull_request_workspace.sql. -->
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
 behavior** is **Show choices**, the default). If another workspace worked on that
@@ -691,14 +735,33 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
+## Set aside workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceList,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-menu,home-workspaces-persistence,home-workspaces-saga,home-set-aside-shortcut}.ts. -->
+
+**Set aside** is available in alpha builds starting with v2.262.0. Use **Set aside**
+on a Home workspace row, card or menu. List view moves it into a collapsed
+**Set aside** section; board view shows it in the
+**Set aside** column on the right, and dragging a card into that column also sets it
+aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
+action. Searching includes set-aside workspaces. With a Home
+row or card focused, **Cmd/Ctrl+Shift+S** toggles its state; customize the shortcut
+in **Settings → Input**.
+
+Setting aside keeps agents, scripts, hooks and PR monitors running. Reading its
+history keeps it aside; a new instruction or a new question, blocker, failure or
+review request brings it back. Ordinary background updates do not. This is personal
+Home organization, saved in this app for the current account and daemon; it does
+not hide the workspace for collaborators or mark its work complete.
+
 ## Archive, auto-archive and disk cleanup
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
-Archive is the one way to put a workspace away. In **Home → Workspaces**,
-right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
-and PR monitors and keeps its folder. Archived workspaces appear under the
-**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
+In **Home → Workspaces**, right-click a workspace and choose **Archive**.
+Archiving stops its agents, hooks and PR monitors and keeps its folder. Archived
+workspaces appear under the **Archived** filter. Choose **Unarchive**, or send an
+agent a message, to continue.
 
 Intent can archive idle workspaces automatically. It is off by default; turn on
 **Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
@@ -712,13 +775,16 @@ made after the merge still do.
 
 To keep one workspace from being archived automatically, right-click it in **Home →
 Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
-off for every workspace by default, only the workspace owner sees it, and it does not
-stop you archiving the workspace yourself.
+off for every workspace by default, only the workspace owner sees it, it appears only
+while **Archive idle workspaces** is on, and it does not stop you archiving the
+workspace yourself.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and
 untracked files, but keeps conversations, notes, tasks and the git branch. The
-workspace card's status then reads "Workspace folder purged to free disk space."
+workspace card's status then reads "Workspace folder purged to free disk space.",
+and under the **Archived** filter its row and board card show a **Workspace purged**
+pill.
 Workspaces whose folder is the repository itself and remote workspaces cannot be
 purged. To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
@@ -866,20 +932,6 @@ fails (for example, offline or without npm), Codex launches report the
 installed version, the required minimum, and the download error; Claude Code
 keeps using the installed CLI.
 
-## Missed display updates
-
-<!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
-
-When the app and connected daemon support recovery, detected gaps in state
-updates trigger a refresh of affected visible data. Inactive cached views refresh
-when next used. Recovery respects current access; it does not repeat commands or
-replay notifications, chat transcripts, or terminal output. Temporary terminal
-directory, title, and command indicators may clear until live updates resume.
-
-Older daemons retain their existing reconnect and refresh behavior; do not promise
-recovery from a missed final update. If a view stays stale, use its refresh action
-where available or reconnect, and check the app and daemon versions.
-
 ## Restore workspace browser use
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
@@ -935,22 +987,30 @@ a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
 available space. Moving the pointer between tabs smoothly switches the preview
 without changing your remembered section. In the expanded sidebar, selecting a
-different section leaves your open content in place. Click the already-selected
+different section leaves your open content in place. **Shift-click** a section
+tab to add or remove its pane; selected panes stack in sidebar order, and at least
+one stays open. Your selection is remembered per workspace. Hold **Shift** while
+using arrow keys to move focus without changing the selection, then use
+**Shift+Enter** or **Shift+Space** to add or remove that pane. A normal click returns to one pane.
+The collapsed rail still previews one section at a time; expanding restores the
+selected panes. Click the sole selected
 tab to open its default
 content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
 changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
 opens the first terminal, creating one when none exists. A click in the collapsed
-rail opens the section's default content immediately. Moving keyboard focus
-across the expanded row only selects the sidebar section; its focus ring stays
-inside the tab when the row scrolls. Enter or Space acts
-like a click in either layout. The rail's toggle stays visible as its tabs scroll
+rail opens the section's default content immediately. With one pane selected,
+arrow keys select a section without opening main content. With multiple panes
+selected, arrow keys move focus without changing the selection. The focus ring
+stays inside the tab as the row scrolls. Enter or Space acts like a click in either
+layout. The rail's toggle stays visible as its tabs scroll
 and pins the sidebar open;
 the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
 Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
-When collapsed, this opens the matching floating section beside the rail.
+This keeps other selected panes open. When collapsed, it opens the matching
+floating section beside the rail.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
@@ -965,16 +1025,6 @@ With a supporting daemon, the desktop app shows a note over 500 KB truncated and
 render-only, with a banner, so the user cannot edit it there. Agents still read
 and write the full content; make large-note edits with note tools rather than
 asking the user to edit them in the app.
-
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
-
-When testing experimental GitLab context suggestions, choose **GL Issues** or
-**GL MRs** in workspace creation or the workspace context picker. Search the
-selected projects; **Use link** accepts an explicit project URL where offered.
-**Refresh** and **Load more** operate on that selection. Unsupported filters and
-partial results remain explicit. Selecting an item attaches its qualified context;
-it does not automatically check out the MR's source branch. Availability depends
-on the current connection, repository access and supported daemon.
 
 In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
 in a note's **…** menu to edit Markdown directly; large notes otherwise stay
@@ -1014,6 +1064,10 @@ A missing-file or access error is different: check the path and access rather th
 assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{ToolCall,ChatImageBlock}.svelte; packages/cloudlands-fe/src/lib/components/chat/block-hydration.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-session/sagas/regenerate-from-message-saga.ts; packages/cloudlands-fe/messages/en.json (chat_toolCall_outputTruncated_label, chat_toolCall_outputTooLarge_label, chat_imageBlock_tooLarge_label). Test-build behavior pending its frontend release. -->
 
 Agents mention another workspace as a link showing its title rather than its internal ID.
 Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant

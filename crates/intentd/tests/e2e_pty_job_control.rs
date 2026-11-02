@@ -346,6 +346,7 @@ impl Harness {
         )
     }
 
+    #[track_caller]
     fn fail(&self, msg: &str, procs: &[ProcStat]) -> ! {
         panic!("{msg}\n{}", self.diag(procs));
     }
@@ -825,6 +826,7 @@ mod helper_tests {
             .contains("controlling tty"));
     }
 
+    #[track_caller]
     fn poll_until(what: &str, mut ok: impl FnMut() -> bool) {
         let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !ok() {

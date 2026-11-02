@@ -18,6 +18,20 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / '.github/workflows/release-cache.yml'
 MAIN_ONLY = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
+# A release-metadata push (release-plz version bumps on the tree the previous
+# push already warmed) changes only workspace crate versions, which the tag's
+# release build compiles at the same time, so warming it buys nothing. Pushes
+# of that shape skip the build jobs; workflow_dispatch always warms.
+NOT_RELEASE_PUSH = "needs.plan.outputs.release_push != 'true'"
+CLASSIFY_RUN = '''# Same classifier and contract as ci.yml's release-fast-path job: any
+# failure or unknown shape is a miss, so the warm still runs.
+git fetch --no-tags --depth=2 origin "$GITHUB_SHA" || true
+out=$(./scripts/release-pr-fast-path.sh --exact-parent "$BASE_SHA" HEAD) || out="fast_path=false"
+printf '%s\\n' "$out"
+line=$(printf '%s\\n' "$out" | grep -E '^fast_path=(true|false)$' | tail -n1 || true)
+line=${line:-fast_path=false}
+echo "release_push=${line#fast_path=}" >> "$GITHUB_OUTPUT"
+'''
 CACHE_RUN = 'python3 scripts/setup-sccache.py'
 # Producers run on main with secrets, so they write the self-hosted cache when
 # INTENT_SCCACHE_ENDPOINT is set (INTENT_SCCACHE_MODE unset means READ_WRITE).
@@ -93,8 +107,11 @@ def generate():
         'jobs': {
             'plan': {
                 'if': MAIN_ONLY, 'runs-on': 'ubuntu-24.04', 'timeout-minutes': 10,
-                'outputs': {'matrix': '${{ steps.plan.outputs.matrix }}'},
+                'outputs': {'matrix': '${{ steps.plan.outputs.matrix }}',
+                            'release_push': '${{ steps.release.outputs.release_push }}'},
                 'steps': [deepcopy(CHECKOUT),
+                          {'id': 'release', 'name': 'Classify release-metadata push', 'if': "github.event_name == 'push'",
+                           'shell': 'bash', 'env': {'BASE_SHA': '${{ github.event.before }}'}, 'run': CLASSIFY_RUN},
                           {'name': 'Install dist', 'shell': 'bash', 'run': install},
                           {'id': 'plan', 'name': 'Plan build-only matrix', 'shell': 'bash',
                            'run': '''dist plan --output-format=json > cache-plan.json
@@ -103,7 +120,7 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
 '''}],
             },
             'daemon': {
-                'if': MAIN_ONLY, 'needs': 'plan',
+                'if': f'{MAIN_ONLY} && {NOT_RELEASE_PUSH}', 'needs': 'plan',
                 'strategy': {'fail-fast': False, 'matrix': '${{ fromJson(needs.plan.outputs.matrix) }}'},
                 'runs-on': '${{ matrix.runner }}', 'timeout-minutes': 60,
                 'steps': [{'name': 'Enable Windows long paths', 'shell': 'bash', 'run': 'git config --global core.longpaths true'}, deepcopy(CHECKOUT), *daemon_setup,
@@ -115,7 +132,7 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
                                          'run': 'dist build --output-format=json ${{ matrix.dist_args }} > cache-build-manifest.json'}])],
             },
             'sitter': {
-                'if': MAIN_ONLY, 'strategy': sitter_strategy,
+                'if': f'{MAIN_ONLY} && {NOT_RELEASE_PUSH}', 'needs': 'plan', 'strategy': sitter_strategy,
                 'runs-on': '${{ matrix.os }}', 'timeout-minutes': 30,
                 'env': deepcopy(sitter_source.get('env', {})),
                 'steps': [*sitter_setup,

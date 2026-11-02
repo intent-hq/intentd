@@ -204,17 +204,20 @@ async fn request_timeout_includes_outbound_queue_wait() {
         .await
         .expect("fill outbound queue");
 
-    let started = tokio::time::Instant::now();
-    let err = reverse
-        .request(
+    // Nothing drains the full queue until the request has answered, so a
+    // timeout that did not cover the queue wait hangs into this guard.
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        reverse.request(
             "browser.exec",
             json!({ "actions": [{ "action": "screenshot" }] }),
             Duration::from_millis(30),
-        )
-        .await
-        .expect_err("queue wait must time out");
+        ),
+    )
+    .await
+    .expect("the request budget must cover the outbound queue wait")
+    .expect_err("queue wait must time out");
     assert!(err.message.contains("timed out"));
-    assert!(started.elapsed() < Duration::from_secs(1));
     assert!(reverse.pending.lock().unwrap().requests.is_empty());
     assert_eq!(out_rx.recv().await.as_deref(), Some("occupied"));
     assert!(out_rx.try_recv().is_err(), "timed-out frame was cancelled");

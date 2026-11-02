@@ -219,6 +219,7 @@ async fn wss_rpc(
     val["result"].clone()
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git")
         .args(args)

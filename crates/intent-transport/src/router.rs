@@ -121,6 +121,30 @@ pub(crate) fn max_content_bytes_param(
     }
 }
 
+/// `offset` / `maxBytes` on `agent.getMessageBlock` (capped and paged block
+/// reads, PROTOCOL §5.5): absent or `null` → the default; `offset` a
+/// non-negative integer, `maxBytes` a positive integer (clamped later);
+/// anything else → the documented `-32602`.
+fn parse_message_block_page(
+    params: &Map<String, Value>,
+) -> std::result::Result<intent_core::MessageBlockPage, RpcErr> {
+    let offset = match params.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 0)
+                .ok_or_else(|| invalid_params("offset must be a non-negative integer"))?,
+        ),
+    };
+    let max_bytes = match params.get("maxBytes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 1)
+                .ok_or_else(|| invalid_params("maxBytes must be a positive integer"))?,
+        ),
+    };
+    Ok(intent_core::MessageBlockPage { offset, max_bytes })
+}
+
 fn parse_max_content_bytes(
     params: &Map<String, Value>,
 ) -> std::result::Result<Option<usize>, RpcErr> {
@@ -206,11 +230,45 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
         // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
-        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
+        // No node can run the requested placement: the documented -32602
+        // with `data.code: "placement-unavailable"` and the alternatives.
+        ref e @ Error::PlacementUnavailable(ref failure) => RpcErr {
             code: e.code(),
-            message: failure.message.clone(),
-            data: Some(failure.data.clone()),
+            message: failure.message(),
+            data: Some(failure.data()),
         },
+        // No exposed machine offers the requested model: -32602 with
+        // `data.code: "model-unavailable"` and what each machine has.
+        ref e @ Error::ModelUnavailable(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
+        // Backend and machine share no node-link version: -32602 with
+        // `data.code: "machine-update-required"` and the side to update.
+        ref e @ Error::MachineUpdateRequired(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
+        // The WSS listener is stopped (`executor.mint` has no routes to
+        // report): -32603 with `data.code: "listener-down"`, as on
+        // `pairing.getInfo`.
+        ref e @ Error::ListenerDown => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "listener-down" })),
+        },
+        // An exposed-machine request failed (`machine-unreachable` with the
+        // routes tried, `machine-revoked`, `machine-in-use`): the
+        // service-built `data` verbatim.
+        ref e @ (Error::RemoteMachine(ref failure) | Error::ProviderProfile(ref failure)) => {
+            RpcErr {
+                code: e.code(),
+                message: failure.message.clone(),
+                data: Some(failure.data.clone()),
+            }
+        }
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
         // category so clients stop showing a bare "Internal error"
@@ -251,11 +309,49 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // `workspace.retire` on a non-worktree checkout (§5.1): -32602 with
         // `data = { code: "retire-unsupported", checkoutMode? }`.
         ref e @ Error::RetireUnsupported {
-            ref checkout_mode, ..
+            ref checkout_mode,
+            plain_folder,
+            ..
         } => {
             let mut data = json!({ "code": "retire-unsupported" });
             if let Some(mode) = checkout_mode {
                 data["checkoutMode"] = json!(mode);
+            }
+            if plain_folder {
+                data["plainFolder"] = json!(true);
+            }
+            RpcErr {
+                code: e.code(),
+                message: e.to_string(),
+                data: Some(data),
+            }
+        }
+        // An operation needing git or a forge on a plain-folder workspace
+        // (§5.1 "Plain-folder workspaces"): -32602 with `data = { code:
+        // "plain-folder-unsupported", operation }`.
+        ref e @ Error::PlainFolderUnsupported { operation } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "plain-folder-unsupported", "operation": operation })),
+        },
+        // Plain-folder create shape rejection (§5.1 "Plain-folder
+        // workspaces"): -32602 with `data = { code: "invalid-params" }`.
+        ref e @ Error::PlainFolderInvalidParams(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "invalid-params" })),
+        },
+        // Plain-folder create path rejection (§5.1): -32602 with
+        // `data = { code: "plain-folder-path-rejected", reason, path,
+        // repositoryRoot? }`.
+        ref e @ Error::PlainFolderPathRejected(ref rejection) => {
+            let mut data = json!({
+                "code": "plain-folder-path-rejected",
+                "reason": rejection.reason.as_str(),
+                "path": rejection.path,
+            });
+            if let Some(root) = &rejection.repository_root {
+                data["repositoryRoot"] = json!(root);
             }
             RpcErr {
                 code: e.code(),
@@ -350,6 +446,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: crate::catalog::FORBIDDEN_ERROR_CODE,
             message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
             data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
+        // Node mode: the same `-32003` envelope the connection-level
+        // node-mode gate emits, `data.code: "node-mode"`.
+        Error::NodeMode(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::NODE_MODE_ERROR_MESSAGE.to_string(),
+            data: Some(crate::catalog::node_mode_error_data(&detail)),
         },
         // Invite / identity-only join refusal (multiplayer w4): the kind's
         // own code with the stable `data.code` so an invite client can route
@@ -606,9 +709,13 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        // Retired workspaces are read-only (§5.1): refuse gated writes
-        // before any handler runs.
-        let result = match crate::retired_gate::check(api, method, &params).await {
+        // Retired workspaces are read-only and plain-folder workspaces have
+        // no git or forge (§5.1): refuse gated writes before any handler runs.
+        let gate = match crate::retired_gate::check(api, method, &params).await {
+            Ok(()) => crate::plain_folder_gate::check(api, method, &params).await,
+            Err(e) => Err(e),
+        };
+        let result = match gate {
             Ok(()) => dispatch(api, method, &params).await,
             Err(e) => Err(domain_to_rpc(e)),
         };
@@ -1416,6 +1523,27 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Daemon-to-daemon executor credentials (nodes.md "Machine methods:
+        // executor credentials"): owner-only, daemon-global. The services
+        // recheck the owner role; the minted token is in the result only.
+        "executor.mint" => api
+            .executor_mint(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "executor.list" => api.executor_list().await.map_err(domain_to_rpc),
+        "executor.revoke" => api
+            .executor_revoke(require_str_param(params, "credentialId")?)
+            .await
+            .map_err(domain_to_rpc),
+        // Daemon-to-daemon exposed machines (nodes.md "Backend methods:
+        // exposed machines"): owner-only, daemon-global. The services
+        // recheck the owner role; `add` carries the executor token, which no
+        // result or error ever echoes.
+        "remoteMachines.backendInfo" => remote_machines(api, "backendInfo", params).await,
+        "remoteMachines.add" => remote_machines(api, "add", params).await,
+        "remoteMachines.list" => remote_machines(api, "list", params).await,
+        "remoteMachines.remove" => remote_machines(api, "remove", params).await,
+        "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -2348,8 +2476,10 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
             let preview_chars = opt_int(params, "previewChars");
+            let limit = opt_int(params, "limit");
+            let next_token = opt_str_strict(params, "nextToken")?;
             match api
-                .agent_list_user_messages(agent_id, ws, preview_chars)
+                .agent_list_user_messages(agent_id, ws, preview_chars, limit, next_token)
                 .await
             {
                 Ok(v) => Ok(v),
@@ -2362,8 +2492,9 @@ async fn dispatch(
             let message_id = require_str_param(params, "messageId")?;
             let block_id = require_str_param(params, "blockId")?;
             let ws = opt_workspace_id(params);
+            let page = parse_message_block_page(params)?;
             match api
-                .agent_get_message_block(agent_id, message_id, block_id, ws)
+                .agent_get_message_block(agent_id, message_id, block_id, ws, page)
                 .await
             {
                 Ok(v) => Ok(v),
@@ -2491,6 +2622,13 @@ async fn dispatch(
                 file_blocks: opt_value(params, "fileBlocks"),
                 is_background: opt_bool(params, "isBackground"),
                 name_explicitly_set,
+                // The documented placement object; omitted means local,
+                // `null` or an invalid object is `-32602`.
+                placement: params
+                    .get("placement")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|e| invalid_params(format!("placement: {e}")))?,
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
@@ -5634,6 +5772,17 @@ fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, Rp
             "{name} must be a nonempty string of at most 256 bytes without control characters"
         ))),
     }
+}
+
+/// `remoteMachines.<method>` with the request's params object.
+async fn remote_machines(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.remote_machines(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
 }
 
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {

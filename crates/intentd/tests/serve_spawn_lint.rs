@@ -33,7 +33,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    classify_marker, lex, rust_files, split_statements, word_at, workspace_root, Literal, Marker,
+    classify_marker, lex, rust_files, split_statements, workspace_root, Literal, Marker, Statement,
+    Token, TokenKind,
 };
 
 const ALLOW_MARKER: &str = "// serve-spawn: allow";
@@ -95,38 +96,24 @@ impl Offense {
     }
 }
 
-#[derive(Debug)]
-struct Token {
-    text: String,
-    line: usize,
-}
+/// First character of the private-use range standing in for string literals:
+/// the literal numbered `n` in source order is `LITERAL_SENTINEL + n` at its
+/// opening quote, so it stays one token in statement splitting.
+const LITERAL_SENTINEL: u32 = 0xf0000;
 
-// Rule-specific tokens over the shared lexer output. Literals have already been
-// blanked; a one-character sentinel retains their position for statement splitting.
-fn statement_tokens(text: &str, first_line: usize, literals: &[String]) -> Vec<Token> {
-    let chars: Vec<_> = text.trim_start().chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut line = first_line;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\n' {
-            line += 1;
-        } else if !c.is_whitespace() {
-            let (text, next) = if (c as u32) >= 0xf0000 {
-                (format!("\"{}", literals[c as usize - 0xf0000]), i + 1)
-            } else if let Some(word) = word_at(&chars, i) {
-                word
-            } else {
-                (c.to_string(), i + 1)
-            };
-            out.push(Token { text, line });
-            i = next;
+// Rule-specific tokens over the shared reader. A literal's sentinel reads as a
+// one-character punctuation token; its text becomes `"` plus the decoded value.
+fn statement_tokens(statement: &Statement, literals: &[String]) -> Vec<Token> {
+    let mut tokens = statement.tokens();
+    for token in &mut tokens {
+        let Some(c) = token.text.chars().next() else {
             continue;
+        };
+        if token.kind == TokenKind::Punct && u32::from(c) >= LITERAL_SENTINEL {
+            token.text = format!("\"{}", literals[(u32::from(c) - LITERAL_SENTINEL) as usize]);
         }
-        i += 1;
     }
-    out
+    tokens
 }
 
 fn matches_at(tokens: &[Token], i: usize, words: &[&str]) -> bool {
@@ -190,7 +177,7 @@ fn classify(src: &str) -> Vec<Offense> {
     let literals: Vec<_> = parsed.literals.iter().map(Literal::cooked).collect();
     for (i, literal) in parsed.literals.iter().enumerate() {
         chars[literal.offset] =
-            char::from_u32(0xf0000 + u32::try_from(i).expect("literal count fits u32"))
+            char::from_u32(LITERAL_SENTINEL + u32::try_from(i).expect("literal count fits u32"))
                 .expect("literal sentinel");
     }
     let mut port_markers = BTreeMap::new();
@@ -224,7 +211,7 @@ fn classify(src: &str) -> Vec<Offense> {
     let mut has_builder = false;
     let mut wss_line = None;
     for statement in split_statements(&chars.into_iter().collect::<String>()) {
-        let tokens = statement_tokens(&statement.text, statement.line, &literals);
+        let tokens = statement_tokens(&statement, &literals);
         if tokens.is_empty() {
             continue;
         }
@@ -263,8 +250,7 @@ fn classify(src: &str) -> Vec<Offense> {
                 i,
                 &[
                     "Command",
-                    ":",
-                    ":",
+                    "::",
                     "new",
                     "(",
                     "env",

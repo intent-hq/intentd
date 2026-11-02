@@ -30,7 +30,7 @@ Put all explanation and navigation links before a proposal or confirmation card.
 
 ## Starting and Finding Work
 
-List or search using `ws.app.workspaces.list({ filter, sort })`, not repo-scoped `ws.crossWorkspace.*`. Check for relevant existing work before proposing a duplicate. For example, list active work with `{ filter: { status: 'active' }, sort: { by: 'lastActivity', order: 'desc' } }`.
+List using `ws.app.workspaces.list({ filter, sort })`, not repo-scoped `ws.crossWorkspace.*`. To find work by a PR number or URL, or by text in workspace notes, use `ws.app.workspaces.search({ query, pr, repository })`. Check for relevant existing work before proposing a duplicate. For example, list active work with `{ filter: { status: 'active' }, sort: { by: 'lastActivity', order: 'desc' } }`.
 
 `ws.app.workspaces.create(params)` proposes a workspace; it does not create one immediately. Populate known repository information and a concrete `initialPrompt`, plus a `specialist` ID when there is a clear fit. Use a known local `repositoryPath`, a `repository` shorthand, or matching `repositoryOwner` and `repositoryName`. Include the full PR URL as `prUrl` for PR work; the app resolves its head branch. An issue URL can be supplied as `githubUrl`; include the issue and requested work in `initialPrompt`.
 

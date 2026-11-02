@@ -19,6 +19,10 @@ pub struct NoteFtsOptions<'a> {
     pub include_archived: bool,
     /// `None` is unlimited, zero is empty. Negative values are rejected.
     pub limit: Option<i64>,
+    /// Best hits kept per workspace, applied BEFORE `limit`, so one workspace
+    /// with many strong hits cannot crowd others out. `None` keeps every hit;
+    /// zero is empty. Negative values are rejected.
+    pub per_workspace_limit: Option<i64>,
 }
 
 impl Default for NoteFtsOptions<'_> {
@@ -29,6 +33,7 @@ impl Default for NoteFtsOptions<'_> {
             allowed_workspace_ids: None,
             include_archived: true,
             limit: None,
+            per_workspace_limit: None,
         }
     }
 }
@@ -50,7 +55,8 @@ pub struct NoteFtsMatch {
 
 /// Shared with the query-plan regression guard. Binding order: preferred
 /// workspace, MATCH expression, optional hard scope, optional permissions JSON,
-/// limit. Values are bound, never interpolated into SQL.
+/// optional per-workspace limit, limit. Values are bound, never interpolated
+/// into SQL.
 pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
     let mut filters = String::new();
     if options.workspace_id.is_some() {
@@ -62,25 +68,48 @@ pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
     if !options.include_archived {
         filters.push_str(" AND c.is_archived = 0");
     }
+    let ranked = format!(
+        "SELECT c.note_id, c.workspace_id, c.updated_at, \
+                w.archived AS workspace_archived, \
+                bm25(note_fts, 5.0, 1.0, 2.0) \
+                  - CASE WHEN c.workspace_id = ? THEN 1.0 ELSE 0.0 END \
+                  + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END AS adjusted_rank \
+         FROM note_fts \
+         JOIN note_search_ctx c ON c.search_id = note_fts.rowid \
+         JOIN workspace w ON w.id = c.workspace_id \
+         WHERE note_fts MATCH ?{filters}"
+    );
+    // Optional per-workspace cap: rank within each workspace with the same
+    // tie-breaks as the global order, keep the best N, then apply the global
+    // limit. Without the cap the SQL is unchanged (query-plan guard).
+    let candidates = if options.per_workspace_limit.is_some() {
+        format!(
+            "SELECT note_id, workspace_id, updated_at, workspace_archived, adjusted_rank \
+             FROM ( \
+                 SELECT r.*, ROW_NUMBER() OVER ( \
+                     PARTITION BY r.workspace_id \
+                     ORDER BY r.adjusted_rank ASC, r.updated_at DESC, r.note_id ASC \
+                 ) AS workspace_position \
+                 FROM ({ranked}) r \
+             ) \
+             WHERE workspace_position <= ? \
+             ORDER BY adjusted_rank ASC, updated_at DESC, workspace_id ASC, note_id ASC \
+             LIMIT ?"
+        )
+    } else {
+        format!(
+            "{ranked} \
+             ORDER BY adjusted_rank ASC, c.updated_at DESC, c.workspace_id ASC, c.note_id ASC \
+             LIMIT ?"
+        )
+    };
     // The LIMIT subquery prevents SQLite flattening it into a full note-table
     // join. Every tie-break is inside the limit as well as the outer ordering,
     // so the chosen subset is stable across insertion order/import/VACUUM.
     format!(
         "SELECT n.id AS note_id, n.workspace_id, n.title, n.content, n.tags, \
                 n.updated_at, n.is_archived, top.workspace_archived, top.adjusted_rank \
-         FROM ( \
-             SELECT c.note_id, c.workspace_id, c.updated_at, \
-                    w.archived AS workspace_archived, \
-                    bm25(note_fts, 5.0, 1.0, 2.0) \
-                      - CASE WHEN c.workspace_id = ? THEN 1.0 ELSE 0.0 END \
-                      + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END AS adjusted_rank \
-             FROM note_fts \
-             JOIN note_search_ctx c ON c.search_id = note_fts.rowid \
-             JOIN workspace w ON w.id = c.workspace_id \
-             WHERE note_fts MATCH ?{filters} \
-             ORDER BY adjusted_rank ASC, c.updated_at DESC, c.workspace_id ASC, c.note_id ASC \
-             LIMIT ? \
-         ) top \
+         FROM ({candidates}) top \
          JOIN note n ON n.id = top.note_id AND n.workspace_id = top.workspace_id \
          ORDER BY top.adjusted_rank ASC, top.updated_at DESC, top.workspace_id ASC, top.note_id ASC"
     )
@@ -104,13 +133,16 @@ impl Store {
         match_expr: &str,
         options: &NoteFtsOptions<'_>,
     ) -> Result<Vec<NoteFtsMatch>> {
-        if options.limit.is_some_and(|limit| limit < 0) {
+        if options.limit.is_some_and(|limit| limit < 0)
+            || options.per_workspace_limit.is_some_and(|limit| limit < 0)
+        {
             return Err(Error::InvalidParams(
                 "note search limit must be nonnegative".into(),
             ));
         }
         if match_expr.trim().is_empty()
             || options.limit == Some(0)
+            || options.per_workspace_limit == Some(0)
             || options
                 .allowed_workspace_ids
                 .is_some_and(<[WorkspaceId]>::is_empty)
@@ -130,6 +162,9 @@ impl Store {
             query = query.bind(serde_json::to_string(&ids).map_err(|e| {
                 Error::Internal(format!("encode note search permissions failed: {e}"))
             })?);
+        }
+        if let Some(per_workspace) = options.per_workspace_limit {
+            query = query.bind(per_workspace);
         }
         let rows = query
             .bind(options.limit.unwrap_or(-1))
