@@ -2284,6 +2284,21 @@ jobs:
       # until intentd#2911). Qualifying a real bundle stays an explicit run.
       - name: Test review runtime descriptor refusal (no bundle)
         run: python3 -I -B scripts/test-prepare-claude-review-runtime.py
+      # Offline cases only: fake bytes, never the packaged runtime. -S is
+      # required, as each suite asserts it runs without site instrumentation.
+      - name: Test callback runtime installer and native probe runner (offline)
+        run: |
+          python3 -I -S -B scripts/test-prepare-claude-callback-runtime.py
+          python3 -I -S -B scripts/test-probe-claude-callback-native.py
+      - name: Test daemon lifecycle evidence capture
+        run: python3 -I -B scripts/test-daemon-lifecycle-proof.py
+      # A scripts/test-* suite that nothing runs breaks silently (the review
+      # runtime suite until intentd#2921). Wire new suites above, or list them
+      # as manual-only with a reason in the check.
+      - name: Check every scripts/test-* suite is run or listed as manual-only
+        run: python3 -I -B scripts/check-test-scripts-wired.py
+      - name: Test the unrun test-suite check
+        run: python3 -I -B scripts/test-check-test-scripts-wired.py
       - name: Test obsolete merge-run policy and workflow integration (offline)
         run: |
           python3 -I -B scripts/test-retire-obsolete-merge-runs.py

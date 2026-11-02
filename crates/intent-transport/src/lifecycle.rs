@@ -222,6 +222,11 @@ impl WsInner {
             for task in running.accept_tasks.drain(..) {
                 let _ = task.await;
             }
+            // After the accept loops are gone: close executor links and
+            // fence out every connection accepted before now.
+            if let Some(links) = &self.executor_links {
+                links.close_all().await;
+            }
             let _ = running.heartbeat_task.await;
         }
         let mut st = self.state.lock().await;

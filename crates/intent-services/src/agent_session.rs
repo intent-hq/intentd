@@ -1765,7 +1765,7 @@ pub(crate) fn no_default_provider_error(context: &str) -> Error {
 /// gracefully to today's opaque `Internal` error — the transient classifiers
 /// keep their broader match because their retry/fail-fast outcome is cheap
 /// to get wrong in comparison.
-fn is_acp_auth_required(e: &AcpError) -> bool {
+pub(crate) fn is_acp_auth_required(e: &AcpError) -> bool {
     match e {
         AcpError::Auth(_) => true,
         AcpError::Rpc(rpc) => {

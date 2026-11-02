@@ -27,7 +27,7 @@ use intent_core::{AgentId, AgentReverseDispatch};
 use intent_sourcecontrol::SourceControl;
 
 use crate::delivery_tasks::DeliveryTasks;
-use crate::feature_ports::{AgentWakePort, RuntimePort, TransferPort};
+use crate::feature_ports::{AgentWakePort, RemoteLaunchPort, RuntimePort, TransferPort};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::model_catalog::ModelCatalogCache;
 use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
@@ -100,8 +100,9 @@ pub mod delivery_tasks {
 pub mod feature_ports {
     pub use crate::feature_ports::{
         monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity, MergeOutcome,
-        ProvisionOutcome, RuntimePort, ScriptsClosing, SetupScriptRun, TransferPort,
-        UnavailableAgentWake, IMPORT_MAX_CHUNK_BYTES,
+        ProvisionOutcome, RemoteLaunchPort, RemoteRuntime, RuntimePort, ScriptsClosing,
+        SetupScriptRun, TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch,
+        IMPORT_MAX_CHUNK_BYTES,
     };
 }
 
@@ -154,12 +155,14 @@ pub mod events {
 
 /// Workspace file locations.
 pub mod file_ops {
-    pub use crate::file_ops::{resolve_attachment_source, workspace_root};
+    pub use crate::file_ops::{
+        delete, list, mkdir, read, rename, resolve_attachment_source, workspace_root, write,
+    };
 }
 
 /// Workspace git locations.
 pub mod git_ops {
-    pub use crate::git_ops::worktree_path;
+    pub use crate::git_ops::{assert_agent_commit_allowed, worktree_path};
 }
 
 /// The hook wake and notice framing of the latest harness.
@@ -402,6 +405,12 @@ impl Services {
     #[must_use]
     pub fn feature_transfer_port(&self) -> &dyn TransferPort {
         self.ports.transfer()
+    }
+
+    /// The registered remote-launch feature.
+    #[must_use]
+    pub fn feature_remote_launch_port(&self) -> &dyn RemoteLaunchPort {
+        self.ports.remote_launch()
     }
 
     /// Test seam: the model catalog cache, for seeding entries.

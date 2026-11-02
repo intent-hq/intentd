@@ -63,7 +63,10 @@ mod agent_wake;
 mod agent_workers;
 mod auto_archive;
 mod auto_retire;
+mod executor_capabilities;
+mod executor_ops;
 mod plain_folder;
+mod remote_machine_ops;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -106,6 +109,7 @@ mod event_ops;
 mod event_subscriptions;
 pub mod events;
 mod execution_call;
+mod executor_link;
 #[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
@@ -339,8 +343,9 @@ pub mod auggie_discovery {
 }
 
 pub use agent_manager::{
-    compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    AgentMemorySnapshot, BusEventSink, ProcessRegistry, ProcessSample, TreeMemoryProbe, TreeSample,
+    compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
+    resolve_provider_launch, AgentManager, AgentMemorySnapshot, BusEventSink, ProcessRegistry,
+    ProcessSample, ProviderLaunchSpec, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -1295,6 +1300,15 @@ pub struct Services {
     /// (`principal.revokeSelf`), consumed by the transport to close their
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
+    /// Live feed of executor credentials just revoked, consumed by the
+    /// transport to close their `/node/*` connections with `1008`.
+    executor_revocations: executor_link::ExecutorRevocations,
+    /// Where the executor link can be dialed (`executor.mint`), attached by
+    /// the composition root; the transport owns the listener.
+    machine_routes: Arc<OnceLock<Arc<dyn intent_core::machines::MachineRoutesSource>>>,
+    /// Live status of executor credentials (`executor.list`), attached by
+    /// the executor link; unset reads every credential as disconnected.
+    executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
     discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
@@ -1399,6 +1413,10 @@ pub struct Services {
     /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
     /// composition root via [`Services::with_hooks_max_per_agent`].
     hooks_max_per_agent: u32,
+    /// Node mode (`intentd serve --node` or `daemon.mode = "node"`): the
+    /// daemon's own orchestration is off. Fixed by the composition root via
+    /// [`Services::with_node_mode`] before any listener serves.
+    node_mode: bool,
     /// Wall-clock budget for one hook script run (60 s in production). Tests
     /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
     /// timeout-eviction coverage completes in milliseconds.
@@ -1871,6 +1889,12 @@ impl Services {
                 invite_ops::REVOCATION_CHANNEL_CAPACITY,
             )
             .0,
+            executor_revocations: tokio::sync::broadcast::channel(
+                invite_ops::REVOCATION_CHANNEL_CAPACITY,
+            )
+            .0,
+            machine_routes: Arc::new(OnceLock::new()),
+            executor_liveness: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
@@ -1891,6 +1915,7 @@ impl Services {
             git_status_scan_probe: None,
             ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            node_mode: false,
             hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
@@ -1972,29 +1997,81 @@ impl Services {
     }
 
     /// Pin the PR-monitor poll cadence, bypassing the live
-    /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
-    /// are clamped when read.
+    /// `prMonitor.pollSeconds` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `seconds` is below
+    /// [`intent_core::config::MIN_PR_MONITOR_POLL_SECONDS`], which the
+    /// cadence is read through (see [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_poll_seconds",
+            seconds,
+            (intent_core::config::MIN_PR_MONITOR_POLL_SECONDS, None),
+            "s",
+            "Pass at least MIN_PR_MONITOR_POLL_SECONDS; to poll now, call \
+             `poll_pr_monitors()` directly.",
+        );
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
 
     /// Pin the PR-monitor hourly forge request budget, bypassing the live
-    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values outside
-    /// [floor, ceiling] are clamped when read.
+    /// `prMonitor.hourlyRequestBudget` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `budget` is outside
+    /// [[`intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET`],
+    /// [`intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET`]], the
+    /// range the budget is read through (see
+    /// [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_hourly_request_budget",
+            budget,
+            (
+                intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+                Some(intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+            ),
+            " requests/hour",
+            "Pass a value within MIN_/MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET; to test the \
+             clamp itself, set `prMonitor.hourlyRequestBudget` through a config file.",
+        );
         self.pr_monitor_hourly_request_budget = Some(budget);
         self
     }
 
     /// Pin the share of the remaining forge quota the PR-monitor loop may
     /// plan to spend, bypassing the live `prMonitor.quotaSharePercent`
-    /// setting (test wiring). Values outside [floor, ceiling] are clamped
-    /// when read.
+    /// setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `percent` is outside
+    /// [[`intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT`],
+    /// [`intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT`]], the
+    /// range the share is read through (see
+    /// [`assert_pr_monitor_override_honoured`]).
     #[cfg(test)]
+    #[track_caller]
     pub(crate) fn with_pr_monitor_quota_share_percent(mut self, percent: u64) -> Self {
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_quota_share_percent",
+            percent,
+            (
+                intent_core::config::MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
+                Some(intent_core::config::MAX_PR_MONITOR_QUOTA_SHARE_PERCENT),
+            ),
+            "%",
+            "Pass a value within MIN_/MAX_PR_MONITOR_QUOTA_SHARE_PERCENT; to test the \
+             clamp itself, set `prMonitor.quotaSharePercent` through a config file.",
+        );
         self.pr_monitor_quota_share_percent = Some(percent);
         self
     }
@@ -2005,22 +2082,22 @@ impl Services {
     /// # Panics
     ///
     /// When `seconds` is below
-    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. The window
-    /// is read through the same floor as the live setting, so a smaller
-    /// value would silently become the floor: a test expecting an immediate
-    /// wake would see the change stay pending and mistake it for a delivery
-    /// bug. A test that wants delivery now pins a long window and calls
-    /// `pr_monitor_flush_op`.
+    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`], which the
+    /// window is read through (see [`assert_pr_monitor_override_honoured`]).
+    /// A test expecting an immediate wake would otherwise see the change
+    /// stay pending and mistake it for a delivery bug; a test that wants
+    /// delivery now pins a long window and calls `pr_monitor_flush_op`.
     #[must_use]
     #[track_caller]
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
-        let floor = intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS;
-        assert!(
-            seconds >= floor,
-            "with_pr_monitor_debounce_seconds({seconds}) is below the {floor}s floor the daemon \
-             enforces, so it would silently wait {floor}s instead. To deliver pending changes \
-             immediately, pin a long window (e.g. 3600) and call `pr_monitor_flush_op`; \
-             otherwise pass at least MIN_PR_MONITOR_DEBOUNCE_SECONDS."
+        assert_pr_monitor_override_honoured(
+            "with_pr_monitor_debounce_seconds",
+            seconds,
+            (intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS, None),
+            "s",
+            "To deliver pending changes immediately, pin a long window (e.g. 3600) and \
+             call `pr_monitor_flush_op`; otherwise pass at least \
+             MIN_PR_MONITOR_DEBOUNCE_SECONDS.",
         );
         self.pr_monitor_debounce_seconds = Some(seconds);
         self
@@ -2069,6 +2146,64 @@ impl Services {
     pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
         self.hooks_max_per_agent = cap;
         self
+    }
+
+    /// Run in node mode: the transport serves only the node-mode method list,
+    /// `settings.*` is limited to the node-mode key families, and the agent
+    /// manager's local front doors refuse with `node-mode`. Set once by the
+    /// composition root, before any listener serves.
+    #[must_use]
+    pub fn with_node_mode(mut self, node_mode: bool) -> Self {
+        self.node_mode = node_mode;
+        self
+    }
+
+    /// Whether this daemon runs in node mode.
+    #[must_use]
+    pub fn node_mode(&self) -> bool {
+        self.node_mode
+    }
+
+    /// The node-mode refusal of a local front door that would start work.
+    pub(crate) fn refuse_in_node_mode(&self, what: &str) -> Result<()> {
+        if self.node_mode {
+            return Err(Error::NodeMode(format!(
+                "{what} is off: this daemon runs in node mode"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The node-mode and `daemon.mode` guards of `settings.get` / `update` /
+    /// `reset`: in node mode only the `remoteAgents.*`, `daemon.*` and
+    /// `server.*` keys are served, and `daemon.mode` changes only over the
+    /// local UDS seat (fail-closed when the transport is unknown).
+    fn check_settings_paths<'a>(
+        &self,
+        method: &str,
+        paths: impl IntoIterator<Item = &'a str>,
+        write: bool,
+    ) -> Result<()> {
+        Self::require_administrator(method)?;
+        for path in paths {
+            if self.node_mode && !intent_core::settings_file::node_mode_setting_allowed(path) {
+                return Err(Error::NodeMode(format!(
+                    "{method} {path}: in node mode only the remoteAgents.*, daemon.* and server.* settings are served"
+                )));
+            }
+            if write
+                && path == intent_core::settings_file::DAEMON_MODE_SETTING
+                && self
+                    .server_control
+                    .get()
+                    .is_none_or(|control| control.is_tcp_connection())
+            {
+                return Err(Error::Forbidden(
+                    "daemon.mode can only be changed over the local socket".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Test-only: compress the hook script eval budget so timeout-eviction
@@ -2242,7 +2377,7 @@ impl Services {
     /// excluded from reads and never seeded with an override) and lookup
     /// failures fall back to the global value so the gate never hard-fails on
     /// resolution.
-    pub(crate) async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
+    pub async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
         match self.store.workspace_auto_commit(workspace_id).await {
             Ok(Some(enabled)) => enabled,
             Ok(None) => self.effective_settings().git.auto_commit,
@@ -5174,6 +5309,26 @@ impl Services {
     /// [`attach_server_control`](Self::attach_server_control).
     pub fn attach_invite_link_builder(&self, builder: Arc<dyn intent_core::InviteLinkBuilder>) {
         let _ = self.invite_links.set(builder);
+    }
+
+    /// Attach where this machine's executor link can be dialed, for
+    /// `executor.mint` (daemon-to-daemon remote agents). Idempotent like
+    /// [`attach_invite_link_builder`](Self::attach_invite_link_builder).
+    pub fn attach_machine_routes(
+        &self,
+        routes: Arc<dyn intent_core::machines::MachineRoutesSource>,
+    ) {
+        let _ = self.machine_routes.set(routes);
+    }
+
+    /// Attach the executor link's live credential status, for
+    /// `executor.list`. Idempotent; without it every credential reads as
+    /// disconnected with no running agents.
+    pub fn attach_executor_liveness(
+        &self,
+        liveness: Arc<dyn intent_core::machines::ExecutorLiveness>,
+    ) {
+        let _ = self.executor_liveness.set(liveness);
     }
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
@@ -19123,6 +19278,14 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn node_mode(&self) -> bool {
+        self.node_mode
+    }
+
+    fn remote_machines_capability(&self) -> bool {
+        !self.node_mode && self.ports.remote_launch().manages_machines()
+    }
+
     fn desktop_agent_call(
         &self,
         workspace: WorkspaceId,
@@ -19416,7 +19579,7 @@ impl WorkspaceApi for Services {
 
     fn settings_get(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            Self::require_administrator("settings.get")?;
+            self.check_settings_paths("settings.get", [path.as_str()], false)?;
             let _secret_guards = self.settings_secret_gates.read(Some(&path)).await;
             let _revision_guard = self.settings_revision_gate.read().await;
             let mut result = self.settings_service().get(&path).await?;
@@ -19429,11 +19592,23 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.settings_update_checking_profiles(changes))
+        Box::pin(async move {
+            let paths = changes
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str));
+            self.check_settings_paths("settings.update", paths, true)?;
+            self.settings_update_checking_profiles(changes).await
+        })
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(serde_json::Value::Null, Some(path)))
+        Box::pin(async move {
+            self.check_settings_paths("settings.reset", [path.as_str()], true)?;
+            self.owned_settings_mutation(serde_json::Value::Null, Some(path))
+                .await
+        })
     }
 
     fn settings_heal_default_provider(
@@ -31432,6 +31607,13 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await.ok()?;
+            self.ports.remote_launch().placement_help(self).await
+        })
+    }
+
     fn agent_get_creation_preferences(
         &self,
         workspace_id: WorkspaceId,
@@ -34818,6 +35000,55 @@ impl WorkspaceApi for Services {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>> {
         Some(self.principal_revocations.subscribe())
+    }
+
+    fn subscribe_executor_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<intent_core::ExecutorCredentialId>> {
+        Some(self.executor_revocations.subscribe())
+    }
+
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<intent_core::machines::ExecutorCredential>>> {
+        let store = self.store.clone();
+        // One atomic resolve+touch so a concurrent revoke never still admits.
+        Box::pin(async move { store.resolve_active_executor_credential(&token_hash).await })
+    }
+
+    fn bind_executor(
+        &self,
+        credential_id: intent_core::ExecutorCredentialId,
+        node_id: String,
+        offered: intent_core::node_link::LeaseBinding,
+    ) -> BoxFuture<'_, Result<intent_core::node_link::BindDecision>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store
+                .bind_executor(&credential_id, &node_id, &offered)
+                .await
+        })
+    }
+
+    fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.executor_mint_op(params))
+    }
+
+    fn executor_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.executor_list_op())
+    }
+
+    fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.executor_revoke_op(&credential_id).await })
+    }
+
+    fn remote_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.remote_machines_op(method, params))
     }
 
     // Presence (multiplayer w5) — see `presence`.
@@ -38415,6 +38646,8 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+#[cfg(test)]
+mod node_mode_tests;
 mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
@@ -39848,5 +40081,36 @@ impl Services {
             self.attach_workspace_membership(&mut ws).await;
             Ok(Some(ws))
         })
+    }
+}
+
+/// Refuse a PR-monitor test override the daemon would not honour.
+///
+/// Each override is read through the same `[floor, ceiling]` clamp as its
+/// live `prMonitor.*` setting, so an out-of-range value would silently read
+/// as the nearest bound: a `0` debounce became a 10s wait and the test that
+/// expected an immediate wake saw nothing (intentd#2915). Panicking at the
+/// caller (`#[track_caller]` on every override) names the bad line instead.
+/// The clamp itself stays covered through a config file, which is the input
+/// it exists to guard.
+#[track_caller]
+fn assert_pr_monitor_override_honoured(
+    setter: &str,
+    value: u64,
+    (floor, ceiling): (u64, Option<u64>),
+    unit: &str,
+    hint: &str,
+) {
+    assert!(
+        value >= floor,
+        "{setter}({value}) is below the {floor}{unit} floor the daemon enforces, so it would \
+         silently read as {floor}{unit} instead. {hint}"
+    );
+    if let Some(ceiling) = ceiling {
+        assert!(
+            value <= ceiling,
+            "{setter}({value}) is above the {ceiling}{unit} ceiling the daemon enforces, so it \
+             would silently read as {ceiling}{unit} instead. {hint}"
+        );
     }
 }

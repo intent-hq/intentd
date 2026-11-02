@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    model::{AgentDelegateInput, BatchTaskEntry},
+    model::{AgentDelegateInput, AgentWakeCreateOptions, BatchTaskEntry},
+    placement::AgentPlacement,
     AgentCreateExtra, AgentId, AgentStatus, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId,
     WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
@@ -219,8 +220,8 @@ pub(crate) const PRELUDE: &str = r"
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
         snapshot: () => host({ method: 'agent.snapshot', args: {} }),
-        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort) =>
-            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
+        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, options) =>
+            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, options } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
         getMessageBlock: (agentId, messageId, blockId) =>
@@ -347,6 +348,36 @@ async fn dispatch_inner(
     }
 }
 
+/// The optional `placement` argument: absent means a local agent; `null`
+/// and anything that is not a valid placement object are rejected.
+fn placement_arg(args: &Value) -> Result<Option<AgentPlacement>, String> {
+    match args.get("placement") {
+        None => Ok(None),
+        Some(Value::Null) => Err(
+            "placement must be an object such as { target: \"remote\", os: \"macos\" }; omit it for a local agent".to_string(),
+        ),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|e| format!("invalid placement: {e}")),
+    }
+}
+
+/// Copy a remote launch's notice and node into a binding result.
+fn remote_fields(created: &Value, out: &mut Value) {
+    let Some(out) = out.as_object_mut() else {
+        return;
+    };
+    if let Some(notice) = created.get("notice").filter(|v| v.is_string()) {
+        out.insert("notice".to_string(), notice.clone());
+    }
+    let agent = created.get("agent").unwrap_or(created);
+    for key in ["nodeId", "nodeName"] {
+        if let Some(value) = agent.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 async fn create(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -398,6 +429,7 @@ async fn create(
         is_background: Some(is_background),
         provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
+        placement: placement_arg(args)?,
         ..AgentCreateExtra::default()
     };
     let created = api
@@ -483,13 +515,15 @@ async fn create(
     {
         tracing::warn!(agent = %agent_id, error = %e, "agent.create: failed to start child turn");
     }
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "id": agent_id,
         "agentId": agent_id,
         "name": agent_name,
         "subscriptionId": subscription_id,
-    }))
+    });
+    remote_fields(&created, &mut out);
+    Ok(out)
 }
 
 /// Cap on live top-level agents for `ws.agent.create({ topLevel: true })`,
@@ -638,6 +672,7 @@ async fn create_top_level(
         is_background: Some(is_background),
         provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
+        placement: placement_arg(args)?,
         ..AgentCreateExtra::default()
     };
     // `parent_agent_id: None` is the independence seam: the new agent is
@@ -694,13 +729,15 @@ async fn create_top_level(
     {
         tracing::warn!(agent = %agent_id, error = %e, "agent.create(topLevel): failed to start agent turn");
     }
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "id": agent_id,
         "agentId": agent_id,
         "name": agent_name,
         "sponsorAgentId": caller.as_str(),
-    }))
+    });
+    remote_fields(&created, &mut out);
+    Ok(out)
 }
 
 async fn delegate(
@@ -740,6 +777,7 @@ async fn delegate(
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
+        placement: placement_arg(args)?,
         tasks,
         // Presence-sensitive: `greedy` is REMOVED and any supplied value
         // (even `null`) must reach the service layer for its rejection.
@@ -1494,6 +1532,26 @@ async fn wake_or_create(
     // depth-guard lookup's name (no second `agent_get` round-trip).
     let message_metadata =
         merge_sender_attribution(explicit_metadata(args), caller, caller_name.as_deref());
+    // Optional sixth argument `{ create? }`: the public create options,
+    // used only when a new agent is created.
+    let create = match args.get("options") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(options)) => {
+            if let Some(key) = options.keys().find(|k| k.as_str() != "create") {
+                return Err(format!(
+                    "wakeOrCreate options accept only `create`, not `{key}`"
+                ));
+            }
+            match options.get("create") {
+                None | Some(Value::Null) => None,
+                Some(create) => Some(
+                    serde_json::from_value::<AgentWakeCreateOptions>(create.clone())
+                        .map_err(|e| format!("invalid wakeOrCreate options.create: {e}"))?,
+                ),
+            }
+        }
+        Some(_) => return Err("wakeOrCreate options must be an object".to_string()),
+    };
     let v = api
         .agent_wake_or_create(
             ws.clone(),
@@ -1504,6 +1562,7 @@ async fn wake_or_create(
                 reasoning_effort: opt_str(args, "reasoningEffort"),
                 caller_agent_id: caller.cloned(),
                 message_metadata,
+                create,
                 ..Default::default()
             },
         )

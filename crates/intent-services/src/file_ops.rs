@@ -245,7 +245,11 @@ pub fn resolve_attachment_source(canonical_root: &str, stored_path: &str) -> Res
 }
 
 /// `file.read` → bare UTF-8 string.
-pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let content = std::fs::read_to_string(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(Value::String(content))
@@ -313,7 +317,11 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
 
 /// `file.write` → `{ ok, path, size }` (size = UTF-16 code-unit length, matching
 /// JS `content.length`). Parent directories are created.
-pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn write(root: &str, path: &str, content: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e: std::io::Error| io_err(&e))?;
@@ -570,7 +578,11 @@ pub(crate) fn get_attachment(
 }
 
 /// `file.list` → bare array of `{ name, type }`.
-pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| io_err(&e))? {
@@ -624,7 +636,11 @@ pub(crate) fn tree(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.delete` → `{ ok, path, deleted: true }` (rejects directories).
-pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn delete(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if !full.exists() {
         return Err(Error::Internal(format!("File not found: {path}")));
@@ -639,7 +655,11 @@ pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.mkdir` → `{ ok, path, created: true }` or `{ ok, path, existed: true }`.
-pub(crate) fn mkdir(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn mkdir(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if full.exists() {
         if full.is_dir() {
@@ -743,7 +763,11 @@ fn permissions_octal(_md: &std::fs::Metadata) -> String {
 /// Both endpoints go through [`resolve_within`], so the symlink-aware gate
 /// covers the source and the destination (a rename through an out-of-root
 /// symlinked directory is denied on either side).
-pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
     let old_full = resolve_within(root, old_path)?;
     let new_full = resolve_within(root, new_path)?;
     if !old_full.exists() {

@@ -99,6 +99,10 @@ pub struct WorkspaceMcpServer {
     /// docs. Only specialists that carry options appear; empty — the default
     /// — leaves the description byte-identical.
     specialist_model_options: Vec<tools::SpecialistModelOptions>,
+    /// Remote-placement discovery for the `ws.agent.create` docs, captured
+    /// at bridge creation: present only when the daemon has a configured
+    /// execution node, so the default description stays byte-identical.
+    remote_placement_help: Option<String>,
     /// Whether this server front-doors a sub-agent (a session with a
     /// `parent_agent_id` or `is_background`), captured once at bridge
     /// creation like `agent_features`. Sub-agents don't own a user-facing
@@ -118,6 +122,22 @@ pub struct WorkspaceMcpServer {
     repository_guidance: Option<GuidanceBinding>,
     /// Original endpoint context; no runtime construction path installs it yet.
     request_context: Option<Arc<dyn McpRequestContext>>,
+    /// Sees every `host({method, args})` frame before the local dispatch;
+    /// `None` (every head-side bridge) dispatches all frames locally.
+    frame_router: Option<Arc<dyn HostFrameRouter>>,
+}
+
+/// Decides, per `host({method, args})` frame, whether the bridge handles it
+/// itself. A remote agent's node uses it to forward control-plane calls to
+/// head and refuse the namespaces a node cannot serve.
+pub trait HostFrameRouter: Send + Sync {
+    /// The frame's result when the router handles it; `None` dispatches the
+    /// frame to the bridge's `WorkspaceApi` as usual.
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<intent_core::BoxFuture<'static, std::result::Result<Value, String>>>;
 }
 
 impl WorkspaceMcpServer {
@@ -136,10 +156,12 @@ impl WorkspaceMcpServer {
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
+            remote_placement_help: None,
             is_sub_agent: false,
             compact_tool_descriptions: false,
             repository_guidance: None,
             request_context: None,
+            frame_router: None,
         }
     }
 
@@ -184,6 +206,14 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_request_context(mut self, context: Arc<dyn McpRequestContext>) -> Self {
         self.request_context = Some(context);
+        self
+    }
+
+    /// Route `host` frames through `router` before the local dispatch (the
+    /// remote node's wiring point).
+    #[must_use]
+    pub fn with_frame_router(mut self, router: Arc<dyn HostFrameRouter>) -> Self {
+        self.frame_router = Some(router);
         self
     }
 
@@ -253,6 +283,15 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Set the remote-placement discovery text appended to the
+    /// `ws.agent.create` docs (the spawn-time wiring point). `None` — no
+    /// configured execution node — keeps the default description.
+    #[must_use]
+    pub fn with_remote_placement_help(mut self, help: Option<String>) -> Self {
+        self.remote_placement_help = help;
+        self
+    }
+
     /// Mark this bridge as serving a sub-agent (the spawn-time wiring point —
     /// derived once at bridge creation from the session:
     /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
@@ -281,13 +320,16 @@ impl WorkspaceMcpServer {
     /// what a non-truncating provider's `tools/list` serves.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
-        tools::workspace_api_description_with_model_options(
+        let description = tools::workspace_api_description_with_model_options(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
             self.is_sub_agent,
-        )
-        .into_owned()
+        );
+        match &self.remote_placement_help {
+            Some(help) => tools::inject_remote_placement_help(&description, help),
+            None => description.into_owned(),
+        }
     }
 
     /// The condensed `workspace_api` reference for THIS bridge — the same
@@ -299,11 +341,15 @@ impl WorkspaceMcpServer {
     /// variant.
     #[must_use]
     pub fn condensed_workspace_api_description(&self) -> String {
-        tools::condensed_workspace_api_description(
+        let description = tools::condensed_workspace_api_description(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
-        )
+        );
+        match &self.remote_placement_help {
+            Some(help) => tools::inject_remote_placement_help(&description, help),
+            None => description,
+        }
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
