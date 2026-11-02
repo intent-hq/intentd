@@ -810,8 +810,11 @@ fn golden_pr_monitor_unmergeable_queue_entry() {
         vec![
             "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of it and \
              will not merge. Its branch is locked while queued, so a push is rejected — remove \
-             it from the queue first (GraphQL dequeuePullRequest), fix the branch, then enqueue \
-             it again"
+             it from the queue first (GraphQL dequeuePullRequest), then git fetch origin and \
+             check the conflict is real: git merge-tree --write-tree <entry ahead's merge-group branch \
+             origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is ahead> <this \
+             head>. If that is clean the flag was stale: enqueue the same commit again; otherwise fix the \
+             branch, then enqueue it again"
                 .to_string()
         ]
     );
@@ -829,7 +832,8 @@ fn golden_pr_monitor_unmergeable_queue_entry() {
          - branch ancestry: unknown\n\
          - forge branch-update requirement: unknown\n\
          - in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
-         dequeue it, fix the branch, then enqueue again"
+         dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
+         origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
     );
 }
 
