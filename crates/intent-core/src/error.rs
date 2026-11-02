@@ -130,6 +130,37 @@ pub enum Error {
         resolved_base_bytes: Option<u64>,
     },
 
+    /// No node can run the requested agent placement. Surfaces as `-32602`
+    /// with [`crate::placement::PlacementUnavailable::message`] and the
+    /// documented `error.data = { code: "placement-unavailable", requested,
+    /// reason, availablePlatforms, supportedPlatforms, availableOs,
+    /// retryable, observedAt }`. The text form carries the data too, for MCP.
+    #[error("{0}")]
+    PlacementUnavailable(Box<crate::placement::PlacementUnavailable>),
+
+    /// No exposed machine offers the requested model. Surfaces as `-32602`
+    /// with [`crate::machines::ModelUnavailable::message`] and `error.data =
+    /// { code: "model-unavailable", provider, model, machines, retryable }`.
+    #[error("{0}")]
+    ModelUnavailable(Box<crate::machines::ModelUnavailable>),
+
+    /// A backend and a machine share no node-link protocol version.
+    /// Surfaces as `-32602` with
+    /// [`crate::machines::MachineUpdateRequired::message`] and `error.data =
+    /// { code: "machine-update-required", machineVersion, backendVersion,
+    /// update }`.
+    #[error("{0}")]
+    MachineUpdateRequired(Box<crate::machines::MachineUpdateRequired>),
+
+    /// The daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): its own orchestration is off, so a method
+    /// outside the node-mode list, or a front door that would start local
+    /// work, is refused. Surfaces as `-32003` with `error.data = { code:
+    /// "node-mode", detail }`, the same envelope the transport's node-mode
+    /// gate emits.
+    #[error("not available in node mode: {0}")]
+    NodeMode(String),
+
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
     /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
@@ -139,6 +170,14 @@ pub enum Error {
     /// nor `data` ever carries an environment value.
     #[error("{}", .0.message)]
     ProviderProfile(Box<ProviderProfileFailure>),
+
+    /// A `remoteMachines.*` request about an exposed machine failed
+    /// (`machine-unreachable` with the routes tried, `machine-revoked`,
+    /// `machine-in-use`). `data` (`data.code` plus details) is passed through
+    /// verbatim as `error.data`; `internal` selects `-32603`, otherwise
+    /// `-32602`. Neither carries the executor token.
+    #[error("{}", .0.message)]
+    RemoteMachine(Box<ProviderProfileFailure>),
 
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
@@ -621,7 +660,7 @@ impl Error {
                 _ => -32603,
             },
 
-            Error::ProviderProfile(failure) => {
+            Error::ProviderProfile(failure) | Error::RemoteMachine(failure) => {
                 if failure.internal {
                     -32603
                 } else {
@@ -641,6 +680,9 @@ impl Error {
             | Error::SecretRequest { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
+            | Error::PlacementUnavailable(_)
+            | Error::ModelUnavailable(_)
+            | Error::MachineUpdateRequired(_)
             | Error::ContentBaseMismatch { .. }
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
@@ -670,7 +712,7 @@ impl Error {
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Forbidden(_) => -32003,
+            Error::Forbidden(_) | Error::NodeMode(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
     }
@@ -766,6 +808,22 @@ impl Error {
         data: serde_json::Value,
     ) -> Self {
         Self::ProviderProfile(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
+    }
+}
+
+impl Error {
+    /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.
+    #[must_use]
+    pub fn remote_machine(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::RemoteMachine(Box::new(ProviderProfileFailure {
             internal,
             message: message.into(),
             data,

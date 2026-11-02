@@ -38,6 +38,7 @@ mod discussion_repo;
 mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
+mod executor_repo;
 mod hook_repo;
 mod host_membership_repo;
 mod idempotency_repo;
@@ -98,11 +99,13 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
-    PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
-    ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
-    MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP, PROVIDER_RETURN_METADATA_KEY,
+    normalize_compound_model, project_user_message_index_metadata, AgentTurnEffort,
+    AgentUsageCellRow, ChildAgentCounts, MessageFtsMatch, MonitorMessageProvenance,
+    PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
+    ReviewContextEnrollment, ReviewContextEnrollmentIntent, ReviewContextOwnerKey,
+    SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem, UserMessageIndexPage,
+    UserMessageIndexPageRequest, MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP,
+    PROVIDER_RETURN_METADATA_KEY,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -113,6 +116,7 @@ pub use discussion_activity_repo::DiscussionActivityReceipt;
 pub use discussion_agent_repo::DiscussionDelivery;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use executor_repo::ExecutorRevocation;
 pub use hook_repo::ActiveHookMetadata;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,

@@ -183,6 +183,7 @@ impl RepositoryAuthorityFacts {
                 }
             },
             Caller::Agent { .. } | Caller::Daemon => self.internal_stages.contains(&stage),
+            Caller::Executor { .. } => false,
         }
     }
 

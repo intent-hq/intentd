@@ -43,6 +43,7 @@ mod e2e_wss_priority_lanes;
 mod e2e_wss_prompt_error_transcript;
 mod e2e_wss_provider_profiles;
 mod e2e_wss_question_ask;
+mod e2e_wss_remote_machines;
 mod e2e_wss_report_debounce;
 mod e2e_wss_resolve_interrupted;
 mod e2e_wss_restart_tail_recap;

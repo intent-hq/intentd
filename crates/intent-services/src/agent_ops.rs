@@ -91,6 +91,23 @@ enum AgentListScope {
 /// Terminal statuses the retire cascade never touches (the same set
 /// `count_child_agents` treats as terminal). Also the "owner can no longer
 /// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
+/// Copy a remote agent's launch notice and node (`notice`, `nodeId`,
+/// `nodeName`, `effectiveIsolation`) from a create result into a delegate or
+/// wakeOrCreate result. Local agents have none of them.
+pub(crate) fn copy_remote_launch_fields(created: &Value, result: &mut Value) {
+    let Some(out) = result.as_object_mut() else {
+        return;
+    };
+    if let Some(notice) = created.get("notice").filter(|v| v.is_string()) {
+        out.insert("notice".to_string(), notice.clone());
+    }
+    for key in ["nodeId", "nodeName", "effectiveIsolation"] {
+        if let Some(value) = created["agent"].get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
@@ -389,6 +406,23 @@ pub(crate) struct AssignedAgentScan {
 
 mod batch;
 
+/// Prefix of the opaque `agent.listUserMessages` `nextToken` (PROTOCOL
+/// §5.5). The token names the `seq` the next older page reads below; it is
+/// minted only by the daemon and clients pass it back verbatim.
+const USER_MESSAGE_INDEX_TOKEN_PREFIX: &str = "um1:";
+
+fn encode_user_message_index_token(before_seq: i64) -> String {
+    format!("{USER_MESSAGE_INDEX_TOKEN_PREFIX}{before_seq}")
+}
+
+fn decode_user_message_index_token(token: &str) -> Result<i64> {
+    token
+        .strip_prefix(USER_MESSAGE_INDEX_TOKEN_PREFIX)
+        .and_then(|seq| seq.parse::<i64>().ok())
+        .filter(|seq| *seq >= 0)
+        .ok_or_else(|| Error::InvalidParams(format!("invalid nextToken: {token}")))
+}
+
 // Delivery-time ready-set delta for completion wakes
 // (intent-hq/monorepo#2044): enqueue-time trigger stamping + the pure delta
 // helper the delivery paths render fresh at flush time.
@@ -406,6 +440,9 @@ mod shutdown_queue_tests;
 
 #[cfg(test)]
 mod tests_stab28;
+
+#[cfg(test)]
+mod tests_remote_launch;
 
 #[cfg(test)]
 mod tests_stab115;
@@ -587,6 +624,12 @@ pub(crate) struct AgentCreatePlan {
     pub(crate) file_blocks: Option<Value>,
     pub(crate) is_background: bool,
     pub(crate) remember_specialist: bool,
+    /// The caller's `placement`, validated by the create seam before any
+    /// effect (only `agent.create` / delegate / wakeOrCreate carry one).
+    pub(crate) placement: Option<intent_core::placement::AgentPlacement>,
+    /// Where the admitted remote agent runs, persisted as its daemon-owned
+    /// `remotePlacement` metadata. Set only after admission.
+    pub(crate) remote: Option<intent_core::remote_launch::RemotePlacementView>,
 }
 
 /// Why [`Services::persist_agent_create`] could not persist a planned session.
@@ -2982,6 +3025,32 @@ pub(crate) fn reject_self_targeted_send(
     Ok(())
 }
 
+/// Refuse a message carrying attachments to a remote agent: attachments are
+/// stored on head and its provider runs on the execution node, which cannot
+/// read them yet. Checked before any state change. An empty list is no
+/// attachment.
+pub(crate) fn reject_remote_attachments(
+    session: &AgentSession,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Result<()> {
+    let carries = |blocks: Option<&Value>| match blocks {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    };
+    if (carries(image_blocks) || carries(file_blocks))
+        && intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+    {
+        return Err(Error::InvalidParams(format!(
+            "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
+            intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
 /// entry must carry a non-empty attachment-registry `attachmentId`
 /// reference. Inline file `data` is no longer accepted: an entry carrying
@@ -4063,7 +4132,8 @@ impl Services {
     /// cannot decode). Respawns read this instead of the live settings so a
     /// settings change never alters an existing session's tools/prompt —
     /// matching what `harnessFeatures` reports on the wire.
-    pub(crate) fn session_agent_features(
+    #[must_use]
+    pub fn session_agent_features(
         &self,
         session: &AgentSession,
     ) -> intent_core::settings_file::AgentFeaturesSettings {
@@ -4833,23 +4903,38 @@ impl Services {
         Ok(json!({ "block": block }))
     }
 
-    /// `agent.listUserMessages` (PROTOCOL §5.5): all user-role messages of
-    /// one agent as lightweight index items, oldest→newest. Previews are
-    /// bounded to `preview_chars` characters (absent → 300, clamped into
-    /// [1, 2000]); `metadata` is passed through verbatim when present so
-    /// clients can distinguish automated rows. Bounded cost (RPC cost
-    /// contract): a metadata-only session read plus ONE role-filtered index
-    /// read whose previews are extracted and truncated inside SQL — full
-    /// content blobs never leave the database and the transcript is never
-    /// hydrated.
-    pub(crate) async fn agent_list_user_messages_op(
+    /// `agent.listUserMessages` (PROTOCOL §5.5): user-role messages of one
+    /// agent as lightweight index items, oldest→newest. Previews are bounded
+    /// to `preview_chars` characters (absent → 300, clamped into [1, 2000]);
+    /// `metadata` is projected to the classification fields clients use to
+    /// tell automated rows apart (`intent_store::project_user_message_index_metadata`,
+    /// intent-hq/intent#8278) and omitted when none survive.
+    ///
+    /// Paging is opt-in: with `limit` (clamped into [1, 500]) or
+    /// `next_token` (default limit 100) only the newest rows older than the
+    /// token are read and the result carries `nextToken` — the opaque cursor
+    /// for the next older page, `null` once none remain. Without either, the
+    /// whole index is served and `nextToken` is absent (the pre-paging
+    /// shape). Bounded cost (RPC cost contract): a metadata-only session
+    /// read plus ONE role-filtered index read whose previews and metadata
+    /// are trimmed inside SQL — full content and metadata blobs never leave
+    /// the database and the transcript is never hydrated.
+    pub(crate) async fn agent_list_user_messages_page_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> Result<Value> {
         const DEFAULT_PREVIEW_CHARS: i64 = 300;
         const MAX_PREVIEW_CHARS: i64 = 2000;
+        const DEFAULT_PAGE_LIMIT: i64 = 100;
+        const MAX_PAGE_LIMIT: i64 = 500;
+        let before_seq = next_token
+            .as_deref()
+            .map(decode_user_message_index_token)
+            .transpose()?;
         // Metadata-only scope check — same fail-closed contract as
         // `agent_get_message_block_op`: a cross-workspace mismatch is
         // `NotFound`, indistinguishable from an unknown agent.
@@ -4865,15 +4950,24 @@ impl Services {
                 .clamp(1, MAX_PREVIEW_CHARS),
         )
         .expect("clamped to [1, MAX_PREVIEW_CHARS]");
-        let items = self
+        let page = (limit.is_some() || next_token.is_some()).then(|| {
+            intent_store::UserMessageIndexPageRequest {
+                limit: usize::try_from(
+                    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT),
+                )
+                .expect("clamped to [1, MAX_PAGE_LIMIT]"),
+                before_seq,
+            }
+        });
+        let index = self
             .store
-            .get_agent_user_message_index(&agent_id, preview_chars)
+            .get_agent_user_message_index_page(&agent_id, preview_chars, page)
             .await?;
         let items = crate::repository_native_wire::monitor::history_index(
             self,
             &session.workspace_id,
             &agent_id,
-            items,
+            index.items,
             preview_chars,
         )
         .await?;
@@ -4894,7 +4988,13 @@ impl Services {
                 obj
             })
             .collect();
-        Ok(json!({ "agentId": agent_id.0, "items": items, "total": total }))
+        let mut result = json!({ "agentId": agent_id.0, "items": items, "total": total });
+        if page.is_some() {
+            result["nextToken"] = index.next_before_seq.map_or(Value::Null, |seq| {
+                Value::String(encode_user_message_index_token(seq))
+            });
+        }
+        Ok(result)
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
@@ -5345,7 +5445,7 @@ impl Services {
         } else {
             None
         };
-        let plan = self
+        let mut plan = self
             .plan_agent_create(
                 "agent.create",
                 name,
@@ -5359,9 +5459,112 @@ impl Services {
                 model_origin,
             )
             .await?;
-        Ok(self
-            .persist_agent_create(plan, workspace_id, spec_wp)
-            .await?)
+        if let Some(placement) = plan.placement.take() {
+            plan.remote = Some(
+                self.admit_remote_agent(
+                    &workspace_id,
+                    &plan.provider,
+                    plan.model.as_deref(),
+                    &placement,
+                )
+                .await?,
+            );
+        }
+        let remote = plan.remote.clone();
+        let mut created = self
+            .persist_agent_create(plan, workspace_id.clone(), spec_wp)
+            .await?;
+        if let Some(view) = remote {
+            self.launch_remote_agent(&workspace_id, &mut created, view)
+                .await?;
+        }
+        Ok(created)
+    }
+
+    /// Admission of a create with a `placement`, before anything is
+    /// written: the documented subset only, a provider selection whose
+    /// profile environment resolves (a missing or unselectable profile fails
+    /// here, never falling back to the node's own login; the overlay itself
+    /// is resolved again when the agent starts), then a machine that runs
+    /// the platform, offers the provider and `model` and has capacity.
+    async fn admit_remote_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+        provider: &str,
+        model: Option<&str>,
+        placement: &intent_core::placement::AgentPlacement,
+    ) -> Result<intent_core::remote_launch::RemotePlacementView> {
+        placement.check_remote_supported()?;
+        let profile = self.resolve_remote_profile_env(provider).await?;
+        let needs = intent_core::remote_launch::RemoteLaunchNeeds {
+            provider: crate::provider_profiles::parse_profile_ref(provider)
+                .map_or(provider, |(base, _)| base)
+                .to_owned(),
+            // The `"default"` sentinel asks for the provider's default.
+            model: model.filter(|model| *model != "default").map(str::to_owned),
+            with_profile: profile.is_some(),
+        };
+        self.ports
+            .remote_launch()
+            .admit(self, workspace_id, placement, &needs)
+            .await
+    }
+
+    /// Place a just-created remote agent on its node and add the launch
+    /// notice to the create result. On failure the agent keeps its
+    /// `remotePlacement` (so it can never run locally) with a
+    /// `placementError`, and the error is returned.
+    async fn launch_remote_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: &mut Value,
+        mut view: intent_core::remote_launch::RemotePlacementView,
+    ) -> Result<()> {
+        let agent_id = AgentId::from(created["agent"]["id"].as_str().unwrap_or_default());
+        let launched = self
+            .ports
+            .remote_launch()
+            .launch(
+                self,
+                intent_core::remote_launch::RemoteLaunchRequest {
+                    workspace_id: workspace_id.clone(),
+                    agent_id: agent_id.clone(),
+                    view: view.clone(),
+                },
+            )
+            .await;
+        if let Err(error) = launched {
+            view.placement_error = Some(intent_core::remote_launch::PlacementError::new(
+                "remote-launch-failed",
+                &error.to_string(),
+            ));
+            if let Ok(encoded) = serde_json::to_string(&view) {
+                if let Err(e) = self
+                    .store
+                    .set_agent_session_metadata_key_json(
+                        workspace_id,
+                        &agent_id,
+                        intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+                        &encoded,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "remote launch: could not record the placement error");
+                }
+            }
+            return Err(error);
+        }
+        if let Some(obj) = created.as_object_mut() {
+            obj.insert(
+                "notice".into(),
+                json!(intent_core::remote_launch::launch_notice(
+                    &view.node_name,
+                    &view.base_commit
+                )),
+            );
+        }
+        Ok(())
     }
 
     /// Plan half of an agent create: runs, in order, every `-32602` producer
@@ -5500,6 +5703,7 @@ impl Services {
             file_blocks,
             is_background,
             name_explicitly_set: _,
+            placement,
         } = extra;
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -5614,6 +5818,8 @@ impl Services {
             image_blocks,
             file_blocks,
             is_background,
+            placement,
+            remote: None,
         })
     }
 
@@ -5665,6 +5871,8 @@ impl Services {
             image_blocks,
             file_blocks,
             is_background,
+            placement: _,
+            remote,
         } = plan;
         let now = now_iso();
         let id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -5685,6 +5893,32 @@ impl Services {
         // Strip caller provenance even for General agents with an override.
         if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
             obj.remove("specialistGeneratedBehaviorPrompt");
+            // Only the daemon places an agent on a node.
+            obj.remove(intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY);
+        }
+        if let Some(view) = &remote {
+            let view = serde_json::to_value(view).map_err(|e| {
+                AgentPersistError::Internal(format!(
+                    "{method}: encode remote placement failed: {e}"
+                ))
+            })?;
+            // The placement must land whatever the caller's metadata is: a
+            // non-object document is kept under `priorNonObjectMetadata`
+            // (the single-key writers' convention), never left without it.
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY.to_string(),
+                view,
+            );
+            metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
             // Both snapshot resolutions below walk the specialist tier
@@ -5927,6 +6161,16 @@ impl Services {
         provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
+        // A remote agent's provider process runs on its node with the
+        // identity it was launched with; switching it there is not supported
+        // yet, so refuse rather than report a switch that never happens.
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return Err(Error::InvalidParams(
+                "remote-model-change-unsupported: a remote agent keeps the provider and model it was launched with; create a new agent to use another".into(),
+            ));
+        }
         // An explicit providerId must be a registered provider before any
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).
@@ -8670,6 +8914,7 @@ impl Services {
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        reject_remote_attachments(&session, image_blocks.as_ref(), file_blocks.as_ref())?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // Image references must name registered attachments
         // (monorepo#3338) — rejected before any state change.
@@ -11532,6 +11777,16 @@ impl Services {
                 "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
+        if input.placement.is_some() && input.tasks.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: placement applies to a single delegation; delegate each task that needs one on its own".to_string(),
+            ));
+        }
+        if input.placement.is_some() && input.isolation.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
+            ));
+        }
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
@@ -11823,6 +12078,18 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        // A placed (remote) child's instructions are assembled from its
+        // session on head, so an explicit `behaviorPrompt` must be stored
+        // there (it overrides the specialist body, as on `agent.create`).
+        if input.placement.is_some() {
+            if let Some(bp) = input
+                .behavior_prompt
+                .as_deref()
+                .filter(|bp| !bp.trim().is_empty())
+            {
+                extra_metadata.insert("behaviorPrompt".to_string(), json!(bp));
+            }
+        }
         let extra = AgentCreateExtra {
             remember_specialist: false,
             provider: delegate_provider,
@@ -11833,6 +12100,7 @@ impl Services {
             // (`skipIfExplicitlySet: true`) — mirror the reference which
             // does not set `nameExplicitlySet` at delegate-time creation.
             name_explicitly_set: Some(false),
+            placement: input.placement.clone(),
             ..AgentCreateExtra::default()
         };
         let created = self
@@ -11872,7 +12140,9 @@ impl Services {
         // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
         // isolation parameter was provided (Task 5).
         let mut isolation = input.isolation.clone();
-        if isolation.is_none() {
+        // A placed agent never takes the legacy CoW path: its node gives it
+        // its own checkout.
+        if isolation.is_none() && input.placement.is_none() {
             // Check workspace.cowIsolation setting
             // `settings_get` returns the `{ path, value, definition }`
             // envelope (§5.9) — read the nested `value`.
@@ -12053,6 +12323,7 @@ impl Services {
                 .unwrap()
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
+        copy_remote_launch_fields(&created, &mut result);
         Ok(result)
     }
 
@@ -15571,6 +15842,7 @@ impl Services {
             file_blocks: None,
             is_background: None,
             name_explicitly_set: None,
+            placement: create_opts.placement.clone(),
         };
         // monorepo#3442: the resolved live caller (`caller_parent`, derived
         // from the single `caller_session` lookup — never the raw wire
@@ -15661,6 +15933,7 @@ impl Services {
             &result,
             &cleaned_up,
         );
+        copy_remote_launch_fields(&created, &mut response);
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
         // child id was freshly minted this call, so no live watch can exist

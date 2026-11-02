@@ -43,6 +43,22 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Whether this daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): the transport then serves only
+    /// `NODE_MODE_METHODS` and refuses everything else with `node-mode`.
+    /// Fixed for the process lifetime; `false` by default.
+    fn node_mode(&self) -> bool {
+        false
+    }
+
+    /// Whether `client.hello` advertises `remoteMachines: 1`: this daemon
+    /// is a backend that can place agents on exposed machines, which needs
+    /// the remote feature and node mode off.
+    /// `false` by default.
+    fn remote_machines_capability(&self) -> bool {
+        false
+    }
+
     fn desktop_agent_call(
         &self,
         _workspace: WorkspaceId,
@@ -2134,24 +2150,29 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.listUserMessages`: all user-role messages of an agent as
+    /// `agent.listUserMessages`: user-role messages of an agent as
     /// lightweight index items, oldest→newest —
-    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`
-    /// (PROTOCOL §5.5). `preview` is the extracted plain text bounded to
-    /// `preview_chars` characters (`None` → server default, server-clamped);
-    /// `metadata` is the persisted row metadata verbatim when present.
-    /// Non-user rows are never included. Bounded cost: one role-filtered
-    /// SQL read whose previews are extracted and truncated inside SQL —
-    /// full content blobs never leave the database and the transcript is
-    /// never hydrated. `NotFound` on an unknown agent or a workspace
-    /// mismatch.
+    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total,
+    /// nextToken? }` (PROTOCOL §5.5). `preview` is the extracted plain text
+    /// bounded to `preview_chars` characters (`None` → server default,
+    /// server-clamped); `metadata` is the row metadata projected to its
+    /// classification fields when any survive. With `limit` or `next_token`
+    /// the read is paged newest-first and the result carries `nextToken`
+    /// (`null` once no older rows remain). Non-user rows are never included.
+    /// Bounded cost: one role-filtered SQL read whose previews and metadata
+    /// are trimmed inside SQL — full content and metadata blobs never leave
+    /// the database and the transcript is never hydrated. `NotFound` on an
+    /// unknown agent or a workspace mismatch; `InvalidParams` on a malformed
+    /// `next_token`.
     fn agent_list_user_messages(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, workspace_id, preview_chars);
+        let _ = (agent_id, workspace_id, preview_chars, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list_user_messages not implemented".to_string(),
@@ -2336,6 +2357,15 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_create not implemented".to_string(),
             ))
         })
+    }
+
+    /// Remote-placement discovery for agents in `workspace_id` (the
+    /// `ws.help("agent")` and tool-description text): the configured
+    /// execution node, its platforms and how to place an agent on it.
+    /// `None` when the daemon has no execution node.
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        let _ = workspace_id;
+        Box::pin(async { None })
     }
 
     /// Read the workspace's last explicitly remembered manual specialist.
@@ -5999,6 +6029,57 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `executor.mint` (daemon-to-daemon remote agents, owner-only): params
+    /// `{ backendId, backendName, backendFingerprint? }` → `{ credentialId,
+    /// token, machine }`. The token is returned once and never logged.
+    fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_mint not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.list` (owner-only): `{ backends }`, the unrevoked
+    /// credentials with live status, never tokens.
+    fn executor_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.revoke` (owner-only): `{ ok: true }`; an already revoked id
+    /// is a no-op, an unknown id is `Error::NotFound`.
+    fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = credential_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_revoke not implemented".into(),
+            ))
+        })
+    }
+
+    /// `remoteMachines.*` (daemon-to-daemon remote agents, backend side,
+    /// owner-only): `method` is the part after `remoteMachines.`
+    /// (`backendInfo`, `add`, `list`, `remove`, `refresh`) and `params` the
+    /// request's params object. Results and errors as documented in monorepo
+    /// `docs/protocol/methods/nodes.md`; never returns the executor token.
+    fn remote_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::remote_machines({method}) not implemented"
+            )))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
@@ -6140,6 +6221,44 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<Option<PrincipalId>>> {
         let _ = token_hash;
         Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam (daemon-to-daemon executor link): resolve a presented
+    /// `/node/*` bearer token, already hashed (hex SHA-256), to its **active**
+    /// executor credential, touching its last use. Only the `/node/*` gate
+    /// calls this; executor credentials are never looked up on `/ws`,
+    /// `/tunnel` or `/invite`. `None` for an unknown or revoked hash.
+    /// Default: no executor credentials exist.
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<crate::machines::ExecutorCredential>>> {
+        let _ = token_hash;
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam (executor link): decide a backend's bind offer on this
+    /// machine (`node_id`) for one executor credential and, when accepted,
+    /// durably store it as that credential's binding before returning.
+    /// `NotFound` when the credential is unknown or revoked. Default: refuse.
+    fn bind_executor(
+        &self,
+        credential_id: crate::ids::ExecutorCredentialId,
+        node_id: String,
+        offered: crate::node_link::LeaseBinding,
+    ) -> BoxFuture<'_, Result<crate::node_link::BindDecision>> {
+        let _ = (credential_id, node_id, offered);
+        Box::pin(async { Err(Error::NotFound("executor credential".into())) })
+    }
+
+    /// Transport seam (executor link): a live feed of executor credentials
+    /// just revoked, so the listener closes their `/node/*` connections with
+    /// `1008`. A lagged or closed feed must fail closed. `None` when the
+    /// implementation has no executor store (test stubs).
+    fn subscribe_executor_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::ids::ExecutorCredentialId>> {
+        None
     }
 
     /// Transport seam: resolve a credential-bound principal's current host

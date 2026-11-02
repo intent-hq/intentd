@@ -1343,15 +1343,22 @@ impl SettingDefinition {
 /// Setting families an Assistant chat card must never change, even though
 /// they are neither sensitive nor read-only: the listener, auth and tunnel
 /// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
-/// credential routing (`sourceControl.`), and account companions of stored
-/// secrets (`accounts.`). Users change these in Settings.
-const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &["server.", "sharing.", "sourceControl.", "accounts."];
+/// credential routing (`sourceControl.`), account companions of stored
+/// secrets (`accounts.`), and running agents for other daemons
+/// (`remoteAgents.`). Users change these in Settings.
+const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
+    "server.",
+    "sharing.",
+    "sourceControl.",
+    "accounts.",
+    "remoteAgents.",
+];
 
 /// Individual settings an Assistant chat card must never change: the primary
 /// identity key, the Git SSH key, executables the daemon runs (provider CLIs,
 /// auggie, the terminal shell), data/workspace locations, the command
 /// permission rules, the prompt rules injected into every agent's system
-/// prompt, and opaque client/daemon state blobs.
+/// prompt, opaque client/daemon state blobs and the daemon's mode.
 const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "identity.provider",
     "userRules",
@@ -1369,6 +1376,7 @@ const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "workspace.changeHistory",
     "workspaceInitializer.state",
     "hardwareConsole.state",
+    "daemon.mode",
 ];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
@@ -2737,6 +2745,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(10.0),
             Some(86_400.0),
             120.0,
+        ),
+        enumerated(
+            "remoteAgents.permission",
+            "Remote agent permissions",
+            "How provider permission prompts of remote agents are answered on this machine, since no client is attached (allowAll, autoByRisk or denyAll)",
+            "remoteAgents",
+            &["allowAll", "autoByRisk", "denyAll"],
+            "allowAll",
+        ),
+        enumerated(
+            "daemon.mode",
+            "Daemon mode",
+            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node selects node mode for one run without changing this",
+            "daemon",
+            &["regular", "node"],
+            "regular",
         ),
     ]
 }
@@ -4550,6 +4574,8 @@ mod tests {
             "workspaceRules",
             "specialists.dir",
             "linear.token",
+            "remoteAgents.permission",
+            "daemon.mode",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.proposable(), "{path} must not be proposable");
@@ -8075,6 +8101,92 @@ mod tests {
         assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
     }
 
+    /// Daemon-to-daemon remote agents: `remoteAgents.permission` (default
+    /// `allowAll`) on the machine and `daemon.mode`. Both are TOML-backed,
+    /// owner-editable and round-trip through the registry; no setting
+    /// switches remote agents on or off.
+    #[tokio::test]
+    async fn remote_agents_settings_round_trip_via_registry() {
+        for (path, category, default) in [
+            ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
+            ("daemon.mode", "daemon", json!("regular")),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must be editable");
+            assert_eq!(def.category, category, "{path} category");
+            assert_eq!(def.default_value, Some(default), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        for retired in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert!(find_definition(retired).is_none(), "{retired} is retired");
+            assert!(!KNOWN_PATHS.contains(&retired), "{retired} is retired");
+        }
+        let SettingType::Enum(values) = find_definition("remoteAgents.permission").unwrap().ty
+        else {
+            panic!("remoteAgents.permission must be an enum");
+        };
+        assert_eq!(values, ["allowAll", "autoByRisk", "denyAll"]);
+        let SettingType::Enum(values) = find_definition("daemon.mode").unwrap().ty else {
+            panic!("daemon.mode must be an enum");
+        };
+        assert_eq!(values, ["regular", "node"]);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::AllowAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Regular
+        );
+
+        svc.update(&json!([
+            { "path": "remoteAgents.permission", "value": "denyAll" },
+            { "path": "daemon.mode", "value": "node" },
+        ]))
+        .await
+        .expect("update");
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Node
+        );
+        for path in ["remoteAgents.permission", "daemon.mode"] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+        }
+        let err = svc
+            .update(&json!([{ "path": "remoteAgents.permission", "value": "ask" }]))
+            .await
+            .expect_err("an unknown permission must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("remoteAgents.permission").await.expect("reset");
+        assert_eq!(reset["value"], json!("allowAll"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&config_path);
+    }
+
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
     /// on) and two numbers: `idleCheckIntervalMinutes` (default 60, floor 5)
     /// and `idleGraceSeconds` (default 120, floor 10). All round-trip through
@@ -9315,6 +9427,62 @@ mod tests {
                 .expect("no-op import"),
             Vec::<String>::new()
         );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// A file from a build that still had the remote-agent switches
+    /// (`remoteAgents.enabled`, `experimental.remoteAgents`) loads: both are
+    /// discarded (no catalog entry), stripped from the file, and
+    /// `remoteAgents.permission` is kept.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_retired_remote_agent_switches() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("retired keys must load");
+        assert_eq!(
+            registry.snapshot().effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert!(find_definition("remoteAgents.enabled").is_none());
+        assert!(find_definition("experimental.remoteAgents").is_none());
+
+        let mut stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        stripped.sort();
+        assert_eq!(
+            stripped,
+            vec![
+                "experimental".to_string(),
+                "remoteAgents.enabled".to_string()
+            ]
+        );
+        for path in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert_eq!(store.get_setting(path).await.expect("read"), None, "{path}");
+        }
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("enabled"), "{text}");
+        assert!(!text.contains("experimental"), "{text}");
+        assert!(text.contains("permission = \"denyAll\""), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

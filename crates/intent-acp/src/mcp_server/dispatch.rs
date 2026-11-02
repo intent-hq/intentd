@@ -182,6 +182,7 @@ impl WorkspaceMcpServer {
             self.is_sub_agent,
             self.workspace_api_timeout,
             pending.clone(),
+            self.frame_router.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -830,6 +831,7 @@ pub fn make_workspace_host_for_bridge(
         is_sub_agent,
         eval_budget,
         None,
+        None,
     )
 }
 
@@ -853,6 +855,7 @@ fn make_workspace_host_with_pending(
     is_sub_agent: bool,
     eval_budget: Duration,
     pending: Option<PendingAttachments>,
+    router: Option<Arc<dyn super::HostFrameRouter>>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
@@ -863,6 +866,7 @@ fn make_workspace_host_with_pending(
         let registry = turn_attachments.clone();
         let features = features.clone();
         let pending = pending.clone();
+        let router = router.clone();
         // Take the frame's sequence number NOW — synchronously, while the JS
         // engine is invoking `host()` — so parallel calls
         // (`Promise.all([...])`) keep call order even when an earlier call's
@@ -874,17 +878,27 @@ fn make_workspace_host_with_pending(
             seq
         });
         Box::pin(async move {
-            let result = workspace_host_dispatch(
-                api,
-                workspace_id,
-                caller,
-                registry,
-                &features,
-                is_sub_agent,
-                eval_budget,
-                arg,
-            )
-            .await;
+            let claimed = router.as_ref().and_then(|router| {
+                let method = arg.get("method").and_then(Value::as_str)?;
+                let args = arg.get("args").cloned().unwrap_or(Value::Null);
+                router.route(method, &args)
+            });
+            let result = match claimed {
+                Some(claimed) => claimed.await,
+                None => {
+                    workspace_host_dispatch(
+                        api,
+                        workspace_id,
+                        caller,
+                        registry,
+                        &features,
+                        is_sub_agent,
+                        eval_budget,
+                        arg,
+                    )
+                    .await
+                }
+            };
             match (result, &pending, seq) {
                 (Ok(mut value), Some(pending), Some(seq)) => {
                     collect_binding_attachments(&mut value, pending, seq);

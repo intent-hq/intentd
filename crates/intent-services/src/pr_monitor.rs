@@ -7954,7 +7954,9 @@ mod tests {
         };
 
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        let svc = svc.with_pr_monitor_debounce_seconds(0);
+        // A window no poll here outlasts: every change stays pending until
+        // the explicit flush at the end, so each step asserts one state.
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
         forge.edit_quiet(|s| s.checks = cancelled_first.clone());
         let (monitor, requirements) = svc
             .pr_monitor_register(&ws, &owner, "o", "r", 42)
@@ -8014,15 +8016,16 @@ mod tests {
             "{checks:?}"
         );
         assert_eq!(checks.failing_required, vec!["CI Gate".to_string()]);
+        let red_line = "check CI Gate: passed → failed";
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
         let text = owner_messages(&svc, &owner).await;
-        let reported = row
-            .pending_changes
-            .iter()
-            .filter(|c| c.as_str() == "check CI Gate: passed → failed")
-            .count()
-            + text.matches("check CI Gate: passed → failed").count();
-        assert_eq!(reported, 1, "{:?}\n{text}", row.pending_changes);
+        assert!(
+            !text.contains("pr_monitor_wake"),
+            "still debouncing: {text}"
+        );
 
+        // The twins reorder while the red status holds: no new change, so
+        // the one pending line is neither duplicated nor reversed.
         red.reverse();
         forge.edit(|s| s.checks = red.clone());
         svc.poll_pr_monitors().await;
@@ -8035,15 +8038,24 @@ mod tests {
             serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
         let checks = &snapshot.requirements.checks;
         assert_eq!((checks.passed, checks.failed), (1, 1), "{checks:?}");
-        let text = owner_messages(&svc, &owner).await;
-        assert!(!text.contains("failed → passed"), "{text}");
-        assert!(
-            !row.pending_changes
-                .iter()
-                .any(|c| c.contains("CI Gate: failed")),
-            "{:?}",
-            row.pending_changes
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
+
+        // Delivered exactly once, and only the red transition.
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+                .await
+                .unwrap()["flushed"],
+            true
         );
+        let text = owner_messages(&svc, &owner).await;
+        assert_eq!(text.matches(red_line).count(), 1, "{text}");
+        assert!(!text.contains("failed → passed"), "{text}");
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty(), "{:?}", row.pending_changes);
     }
 
     #[tokio::test]
@@ -17836,16 +17848,44 @@ mod tests {
             svc.pr_monitor_debounce(),
             Duration::from_secs(DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS)
         );
-        let clamped = svc
-            .clone()
-            .with_pr_monitor_poll_seconds(1)
-            .with_pr_monitor_debounce_seconds(1);
         assert_eq!(
-            clamped.pr_monitor_poll_interval(),
+            svc.clone()
+                .with_pr_monitor_poll_seconds(1)
+                .pr_monitor_poll_interval(),
             Duration::from_secs(MIN_PR_MONITOR_POLL_SECONDS)
         );
+        // The debounce floor guards the live setting: a hand-edited config
+        // file below it reads as the floor. (The test override refuses such
+        // values instead; see the next test.)
+        let dir = crate::test_support::test_tempdir("intentd-debounce-floor-");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[prMonitor]\ndebounceSeconds = 0\n").unwrap();
+        let registry = Arc::new(crate::settings_registry::SettingsRegistry::load(&path).unwrap());
+        assert_eq!(registry.snapshot().effective.pr_monitor.debounce_seconds, 0);
         assert_eq!(
-            clamped.pr_monitor_debounce(),
+            svc.clone()
+                .with_settings_registry(registry)
+                .pr_monitor_debounce(),
+            Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+        );
+    }
+
+    /// The test override refuses a window the daemon would not honour: the
+    /// read-time floor would otherwise turn `0` into a silent wait, and a
+    /// test expecting an immediate wake would see nothing (intentd#2915).
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_debounce_seconds(0) is below the 10s floor")]
+    async fn debounce_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_debounce_seconds(0);
+    }
+
+    #[tokio::test]
+    async fn debounce_override_at_the_floor_is_honoured() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        assert_eq!(
+            svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+                .pr_monitor_debounce(),
             Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
         );
     }
