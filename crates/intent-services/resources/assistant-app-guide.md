@@ -177,7 +177,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
-| Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
+| Devices | Local machine, saved remote connections, and Browser access | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
@@ -404,6 +404,25 @@ PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL p
 the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,DevicesConnectionSections}.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+
+## Use Intent from a browser on another device
+
+**Settings → Devices → Browser access** (`/settings?tab=devices#devices`) lets
+a browser on another device, such as a laptop, use the desktop app, including every
+backend that desktop connects to. It is off by default and the desktop app must stay
+open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
+user reaches it through a private HTTPS front-end: the section shows a
+`tailscale serve --bg <port>` command to run on the desktop, after which they open the
+desktop's Tailscale address. Never suggest Tailscale Funnel or another public tunnel.
+
+The browser asks once for the **Access key** shown in that section; **Reset key** signs
+out every browser. In the browser, opening a saved connection opens that backend in a
+new tab; adding or forgetting connections stays on the desktop. Desktop-only features
+such as native file dialogs and window controls are unavailable in the browser. If the
+section shows the port is in use, change **Port**. If it says the build does not
+include the browser version, the installed app predates the feature.
 
 <!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
