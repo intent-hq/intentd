@@ -11139,7 +11139,8 @@ async fn resolve_session_is_orchestrator_gated_on_provider() {
         .get_agent_session(&agent_id)
         .await
         .expect("session");
-    // Historical orchestrator id with no snapshot: the name fallback decides.
+    // A historical bundle without a snapshot still restricts Coordinator.
+    stored.harness_version = "3.5".to_string();
     stored.specialist = Some("spec-writer".to_string());
     assert!(
         services
@@ -11154,6 +11155,13 @@ async fn resolve_session_is_orchestrator_gated_on_provider() {
             "{provider} must skip orchestrator resolution"
         );
     }
+    stored.harness_version = intent_core::CURRENT_HARNESS_VERSION.to_string();
+    assert!(
+        !services
+            .resolve_session_is_orchestrator("claude-code", &stored)
+            .await,
+        "the current Lead retains editing tools"
+    );
     // Plain agents resolve false even on claude-code.
     stored.specialist = None;
     assert!(

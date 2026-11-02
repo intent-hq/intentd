@@ -404,6 +404,16 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
     .await;
     assert!(subscribed["subscriptionId"].is_string());
 
+    let specialist = wss_rpc(&mut rpc, 39, "specialist.get", json!({"id":"implementor"})).await;
+    let reminder = specialist["specialist"]["roleReminder"]
+        .as_str()
+        .expect("bundled reminder");
+    let body = specialist["specialist"]["prompt"]
+        .as_str()
+        .expect("bundled prompt");
+    assert!(!reminder.is_empty());
+    assert!(!body.is_empty());
+
     for custom in [false, true] {
         let created = wss_rpc(
             &mut rpc,
@@ -467,11 +477,11 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
             .find(|text| text.contains(&content))
             .unwrap();
         assert!(
-            text.contains("Stay within task scope. No refactors, no scope creep."),
+            text.contains(reminder),
             "missing specialist reminder: {text}"
         );
         assert_eq!(
-            text.contains("Implement your assigned task"),
+            text.contains(body),
             !custom,
             "specialist body precedence: {text}"
         );

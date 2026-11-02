@@ -821,7 +821,7 @@ async fn omitted_name_derives_from_specialist_display_name() {
 }
 
 /// The embedded bundled `spec-writer` resolves with zero local files: a
-/// name-less create yields its frontmatter display name "Coordinator".
+/// name-less create yields its frontmatter display name "Lead".
 #[tokio::test]
 async fn omitted_name_derives_from_embedded_spec_writer() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
@@ -833,7 +833,7 @@ async fn omitted_name_derives_from_embedded_spec_writer() {
         intent_core::AgentCreateExtra::default(),
     )
     .await;
-    assert_eq!(agent["name"], "Coordinator");
+    assert_eq!(agent["name"], "Lead");
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
@@ -920,7 +920,7 @@ async fn delegate_override_keeps_derived_name_renameable() {
     };
     let agent =
         create_agent_with_optional_name(&svc, &ws, None, Some("spec-writer".into()), extra).await;
-    assert_eq!(agent["name"], "Coordinator");
+    assert_eq!(agent["name"], "Lead");
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
@@ -1191,9 +1191,9 @@ async fn alias_create_persists_canonical_specialist_id() {
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
     // Downstream resolution ran against the canonical specialist: the
     // derived display name and frozen prompt snapshot are spec-writer's.
-    assert_eq!(session.name, "Coordinator");
+    assert_eq!(session.name, "Lead");
     let meta = session.metadata.expect("metadata");
-    assert_eq!(meta["specialistName"].as_str(), Some("Coordinator"));
+    assert_eq!(meta["specialistName"].as_str(), Some("Lead"));
 
     // A directly-known canonical id is untouched.
     let extra = intent_core::AgentCreateExtra {
@@ -1386,6 +1386,32 @@ fn create_specialist_with_role(dir: &Path, id: &str, role: &str) {
         "---\nname: \"{id}\"\ndescription: \"Test specialist\"\nrole: \"{role}\"\n---\n\nTest prompt"
     );
     std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
+}
+
+#[tokio::test]
+async fn lead_creation_snapshots_editing_access_and_old_sessions_stay_restricted() {
+    let (_tmp, svc, ws, _specialists, _config) = setup().await;
+    for alias in ["spec-writer", "coordinator", "lead"] {
+        let id = create_agent(&svc, &ws, "Planning agent", None, Some(alias.into())).await;
+        let session = svc.store().get_agent_session(&id).await.unwrap();
+        assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+        assert_eq!(session.metadata.as_ref().unwrap()["specialistName"], "Lead");
+        assert_eq!(
+            session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
+            json!(false)
+        );
+        assert!(!svc.session_specialist_is_orchestrator(&session, None));
+
+        let mut legacy = session.clone();
+        legacy.harness_version = "3.5".into();
+        legacy.metadata = None;
+        assert!(svc.session_specialist_is_orchestrator(&legacy, None));
+        assert_eq!(
+            svc.session_specialist_display_name(&legacy, None)
+                .as_deref(),
+            Some("Coordinator")
+        );
+    }
 }
 
 /// The creation-time orchestrator-role decision is snapshotted into
