@@ -450,8 +450,11 @@ your repositories once each, most recently used first, with search at the top;
 new one. Open the agent picker to search by name and choose who starts the workspace.
 In **Setup script**, search the list and select the repository's config, last-used
 commands, or a template to apply it. **Edit commands** opens the selected script;
-**Create Script** starts a blank draft in the same dialog. **Done** or **Save & Done**
-keeps your edits; the back arrow returns without applying them.
+**Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
+**Done** or **Save & Done** keeps your edits; **Cancel** discards them and returns
+to the workspace form.
+For a local repository, turn off isolation in **Branch** to use its existing folder
+without creating a worktree.
 Your prompt draft stays intact. The workspace groups working files, notes, and agent
 conversations. Resolve any displayed repository, Git, or provider setup error
 before retrying. If creation succeeded but sending the first message failed, use
