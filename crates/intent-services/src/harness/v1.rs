@@ -1291,10 +1291,11 @@ impl Harness for V1 {
                     "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
                      it and will not merge. Its branch is locked while queued, so a push is \
                      rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
-                     then check the conflict is real with a local git merge-tree of main, the \
-                     entries ahead and this head. If that merges cleanly the flag was stale: \
-                     enqueue the same commit again; otherwise fix the branch, then enqueue it \
-                     again"
+                     then git fetch origin and check the conflict is real: git merge-tree \
+                     --write-tree <entry ahead's merge-group branch \
+                     origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is \
+                     ahead> <this head>. If that is clean the flag was stale: enqueue the same \
+                     commit again; otherwise fix the branch, then enqueue it again"
                         .to_string(),
                 );
             }

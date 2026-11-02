@@ -187,10 +187,11 @@ fn in_state(position: u32, state: Option<&str>) -> PrMonitorSnapshot {
 
 const UNMERGEABLE_LINE: &str = "merge queue entry is UNMERGEABLE: the PR conflicts with an entry \
      ahead of it and will not merge. Its branch is locked while queued, so a push is rejected — \
-     remove it from the queue first (GraphQL dequeuePullRequest), then check the conflict is real \
-     with a local git merge-tree of main, the entries ahead and this head. If that merges cleanly \
-     the flag was stale: enqueue the same commit again; otherwise fix the branch, then enqueue it \
-     again";
+     remove it from the queue first (GraphQL dequeuePullRequest), then git fetch origin and \
+     check the conflict is real: git merge-tree --write-tree <entry ahead's merge-group branch \
+     origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is ahead> <this \
+     head>. If that is clean the flag was stale: enqueue the same commit again; otherwise fix the \
+     branch, then enqueue it again";
 
 /// The entry turning `unmergeable` is the one queue-state change that wakes
 /// the agent (intentd#2897 sat ~55 min at position 2 as UNMERGEABLE while
@@ -247,8 +248,8 @@ fn the_wake_checklist_flags_an_unmergeable_entry() {
     assert!(
         checklist.contains(
             "- in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
-             dequeue it and check for a real conflict (merge-tree of main, the entries ahead \
-             and this head); re-enqueue the same commit if clean, else fix the branch first"
+             dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
+             origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
         ),
         "{checklist}"
     );
