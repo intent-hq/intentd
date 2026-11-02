@@ -1392,6 +1392,15 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+    );
+    let peer = wss_call(srv.port, srv.cfg.clone(), &peer_frame).await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer created: {peer}"
+    );
 
     // Subscribe to both lifecycle events on a persistent connection.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;

@@ -6809,10 +6809,9 @@ impl Services {
     /// does NOT restore the cascaded children.
     ///
     /// GUARDED on the last top-level agent: when the caller is an AGENT
-    /// (`Caller::Agent`, i.e. `ws.agent.retire`) and the target is the
-    /// workspace's only active top-level session, the call FAILS
-    /// (`InvalidParams`, nothing mutated). Wire (user) retires are not
-    /// subject to this guard.
+    /// (`ws.agent.retire`) or a USER (wire `agent.retire`) and the target is
+    /// the workspace's only active top-level session, the call FAILS
+    /// (`InvalidParams`, nothing mutated, a running target is not stopped).
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -6833,38 +6832,44 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
-        // Guard: an AGENT may not retire itself when it is the workspace's
+        // Guard: neither an agent (`ws.agent.retire`, including from its
+        // hooks) nor a user (wire `agent.retire`) may retire the workspace's
         // last active top-level agent — that would leave the workspace with
-        // no visible agent to talk to. User (wire) retires are unaffected.
-        // The workspace gate is held through the retire transition below so
-        // two top-level agents retiring concurrently cannot both pass.
-        let _last_top_level_gate = if matches!(
-            intent_core::current_caller(),
-            Some(intent_core::Caller::Agent { .. })
-        ) && is_active_top_level(&session)
-        {
-            let gate = self
-                .agent_retirement_gates
-                .for_workspace(&session.workspace_id);
-            let guard = gate.lock_owned().await;
-            let others = self
-                .store
-                .list_active_agent_session_summaries(&session.workspace_id)
-                .await?
-                .iter()
-                .filter(|s| s.id != session.id && is_active_top_level(s))
-                .count();
-            if others == 0 {
-                return Err(Error::InvalidParams(
-                    "cannot retire: this is the last active top-level agent in the workspace. \
-                     Retiring it would leave the workspace without an agent; finish your turn \
-                     normally instead."
-                        .to_string(),
-                ));
+        // no visible agent to talk to. Daemon-internal and unbound callers
+        // are not guarded. The workspace gate is held through the retire
+        // transition below so concurrent retires of the remaining top-level
+        // agents cannot all pass.
+        let refusal = match intent_core::current_caller() {
+            Some(intent_core::Caller::Agent { .. }) => Some(
+                "cannot retire: this is the last active top-level agent in the workspace. \
+                 Retiring it would leave the workspace without an agent; finish your turn \
+                 normally instead.",
+            ),
+            Some(intent_core::Caller::Wire { .. }) => Some(
+                "cannot retire: this is the last active top-level agent in the workspace. \
+                 Start another agent in this workspace first, or archive the workspace instead.",
+            ),
+            _ => None,
+        };
+        let _last_top_level_gate = match refusal {
+            Some(refusal) if is_active_top_level(&session) => {
+                let gate = self
+                    .agent_retirement_gates
+                    .for_workspace(&session.workspace_id);
+                let guard = gate.lock_owned().await;
+                let others = self
+                    .store
+                    .list_active_agent_session_summaries(&session.workspace_id)
+                    .await?
+                    .iter()
+                    .filter(|s| s.id != session.id && is_active_top_level(s))
+                    .count();
+                if others == 0 {
+                    return Err(Error::InvalidParams(refusal.to_string()));
+                }
+                Some(guard)
             }
-            Some(guard)
-        } else {
-            None
+            _ => None,
         };
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn

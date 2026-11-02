@@ -2729,6 +2729,15 @@ async fn agent_retire_stops_running_turn_over_wss() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer = wss_rpc(
+        &mut rpc,
+        9_001,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS peer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    assert!(peer["agent"]["id"].is_string(), "peer created: {peer}");
 
     let sent = wss_rpc(
         &mut rpc,
