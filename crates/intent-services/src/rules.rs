@@ -1160,6 +1160,7 @@ This is a test skill.
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
