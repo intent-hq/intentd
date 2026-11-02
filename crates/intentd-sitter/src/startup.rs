@@ -624,8 +624,8 @@ mod contention_tests {
     #[test]
     fn unix_and_windows_contention_bounds_missing_ready_failed_and_cancelled() {
         for observation in ["missing", "ready", "failed", "cancelled"] {
-            let started = Instant::now();
             let mut budget = StartupBudget::new(Duration::from_millis(100));
+            let deadline = budget.deadline;
             let result = wait_for_start_lock::<()>(
                 &mut budget,
                 || Ok(None),
@@ -639,7 +639,11 @@ mod contention_tests {
                 },
             );
             assert!(result.is_err(), "{observation} must not bypass a held lock");
-            assert!(started.elapsed() < Duration::from_secs(2));
+            // Only a fresh Starting attempt may extend the wait.
+            assert_eq!(
+                budget.deadline, deadline,
+                "{observation} must not extend the startup budget"
+            );
         }
     }
 }

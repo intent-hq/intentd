@@ -4138,23 +4138,44 @@ fn serve_stop_eof(
     listener: &std::os::unix::net::UnixListener,
     finished: &std::sync::mpsc::Receiver<()>,
 ) -> bool {
+    serve_stop_eof_outcome(listener, finished) == StopEof::Served
+}
+
+/// How [`serve_stop_eof`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum StopEof {
+    /// The CLI connected and got the EOF.
+    Served,
+    /// The CLI finished (or its signal was dropped) before connecting.
+    CliFinished,
+    /// The fixture's own hang guard expired first.
+    TimedOut,
+}
+
+#[track_caller]
+fn serve_stop_eof_outcome(
+    listener: &std::os::unix::net::UnixListener,
+    finished: &std::sync::mpsc::Receiver<()>,
+) -> StopEof {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 drop(stream); // Crash before the owned daemon has stopped.
-                return true;
+                return StopEof::Served;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("stop fixture accept failed: {error}"),
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero()
-            || finished.recv_timeout(remaining.min(Duration::from_millis(20)))
-                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        if remaining.is_zero() {
+            return StopEof::TimedOut;
+        }
+        if finished.recv_timeout(remaining.min(Duration::from_millis(20)))
+            != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         {
-            return false;
+            return StopEof::CliFinished;
         }
     }
 }
@@ -4169,11 +4190,11 @@ fn stop_eof_fixture_finishes_when_cli_exits_before_connecting() {
             finished.send(()).unwrap();
         }
         drop(finished);
-        let started = Instant::now();
-        assert!(!serve_stop_eof(&listener, &signal));
-        // The 15s deadline also returns false; only the finished signal is prompt.
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
+        // The fixture's deadline also ends it without serving; only the
+        // finished signal ends it as CliFinished.
+        assert_eq!(
+            serve_stop_eof_outcome(&listener, &signal),
+            StopEof::CliFinished,
             "fixture ignored the CLI-finished signal (disconnected: {disconnected})"
         );
     }
