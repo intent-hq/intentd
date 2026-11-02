@@ -1904,21 +1904,20 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let max_content_bytes = parse_max_content_bytes(params)?;
+            let content_offset = opt_positive_usize(params, "contentOffset")?.unwrap_or(0);
             match api.get_note(ws, note_id).await {
                 // Bounded reads: whatever `maxContentBytes` asks for, the row
-                // is cut to fit the read budget (`contentTruncated`).
+                // is cut to fit the read budget (`contentTruncated`), and
+                // `nextContentOffset` reads the rest, so nothing is lost.
                 Ok(note) => {
-                    let row = match max_content_bytes {
-                        Some(limit) => intent_core::note_bounded_row(note.clone(), limit),
-                        None => to_result_value(&note)?,
-                    };
-                    let budget = intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES;
-                    if intent_core::note_read_bounds::json_len(&row) <= budget {
-                        Ok(json!({ "note": row }))
-                    } else {
-                        let row = intent_core::note_read_bounds::note_row_within(&note, budget);
-                        Ok(json!({ "note": row }))
-                    }
+                    let row = intent_core::note_read_bounds::note_get_row(
+                        &note,
+                        max_content_bytes,
+                        content_offset,
+                        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+                    )
+                    .map_err(|e| invalid_params(e.to_string()))?;
+                    Ok(json!({ "note": row }))
                 }
                 Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),

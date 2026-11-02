@@ -4172,6 +4172,52 @@ async fn note_get_cuts_a_note_over_the_budget() {
     assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
 }
 
+/// The cut `note.get` row carries `nextContentOffset`; following it with
+/// `contentOffset` reads the rest, so the whole note is recoverable.
+#[tokio::test]
+async fn note_get_content_cursor_reads_the_rest_of_a_cut_note() {
+    let mut content = String::new();
+    let mut offset: Option<u64> = None;
+    for _ in 0..10 {
+        let params = match offset {
+            Some(o) => format!(r#""workspaceId":"ws-1","noteId":"huge","contentOffset":{o}"#),
+            None => r#""workspaceId":"ws-1","noteId":"huge""#.to_string(),
+        };
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{{params}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        let note = &v["result"]["note"];
+        assert_eq!(
+            note["contentOffset"].as_u64(),
+            Some(offset.unwrap_or(0)),
+            "{v}"
+        );
+        content.push_str(note["content"].as_str().unwrap());
+        match note["nextContentOffset"].as_u64() {
+            Some(next) => offset = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(content, "x".repeat(600 * 1024));
+}
+
+/// A `contentOffset` that is not a positive integer inside the content is
+/// `-32602`.
+#[tokio::test]
+async fn note_get_rejects_a_bad_content_offset() {
+    for bad in ["0", "-1", "\"5\"", "614400", "999999999"] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{"workspaceId":"ws-1","noteId":"huge","contentOffset":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "contentOffset={bad}: {v}");
+    }
+}
+
 /// Bounded reads (§5.2): list reads page by default; `limit` must be a
 /// positive integer, `nextToken` a non-empty string minted for this list.
 #[tokio::test]

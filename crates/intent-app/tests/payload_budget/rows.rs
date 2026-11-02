@@ -1279,6 +1279,13 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "noteId": note, "maxContentBytes": 64 * 1024 }),
                     Bytes(64 * 1024),
                 ),
+                next(
+                    "contentOffset",
+                    wn.clone(),
+                    "/note/nextContentOffset",
+                    "contentOffset",
+                    Bytes(400 * 1024),
+                ),
             ],
         ),
         row(

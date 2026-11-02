@@ -442,6 +442,92 @@ pub fn note_row_within(note: &crate::model::Note, room: usize) -> serde_json::Va
     }
 }
 
+/// A `contentOffset` that does not address the note's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidContentOffset {
+    pub offset: usize,
+    pub content_bytes: usize,
+}
+
+impl std::fmt::Display for InvalidContentOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "contentOffset ({}) is not a character boundary inside the note content ({} bytes)",
+            self.offset, self.content_bytes
+        )
+    }
+}
+
+/// The `note.get` row: the note from byte `content_offset` of its content,
+/// cut by `max_content_bytes` (when given) and to fit `budget` bytes.
+///
+/// A row that carries the whole note serializes exactly as before. Any
+/// other row adds `contentTruncated: true`, `contentBytes` (the full
+/// content's byte length), `contentOffset` (where `content` starts) and
+/// `nextContentOffset` (the `contentOffset` that reads on, on a UTF-8
+/// boundary; `null` once `content` reaches the end). Following the cursor
+/// and concatenating `content` rebuilds the note byte for byte.
+///
+/// # Errors
+/// [`InvalidContentOffset`] when a non-zero `content_offset` is not a
+/// character boundary strictly inside the content.
+pub fn note_get_row(
+    note: &crate::model::Note,
+    max_content_bytes: Option<usize>,
+    content_offset: usize,
+    budget: usize,
+) -> Result<serde_json::Value, InvalidContentOffset> {
+    let full = note.content.len();
+    if content_offset > 0
+        && (content_offset >= full || !note.content.is_char_boundary(content_offset))
+    {
+        return Err(InvalidContentOffset {
+            offset: content_offset,
+            content_bytes: full,
+        });
+    }
+    let mut rest = note.clone();
+    rest.content = note.content[content_offset..].to_string();
+    let first = match max_content_bytes {
+        Some(limit) => crate::model::note_bounded_row(rest.clone(), limit),
+        None => serde_json::to_value(&rest).unwrap_or_default(),
+    };
+    let mut row = if json_len(&first) <= budget {
+        first
+    } else {
+        note_row_within(&rest, budget)
+    };
+    let mut served = row["content"].as_str().map_or(0, str::len);
+    if served == 0 && !rest.content.is_empty() {
+        // Always make progress: serve at least one character.
+        served = rest.content.chars().next().map_or(0, char::len_utf8);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "content".into(),
+                serde_json::Value::String(rest.content[..served].to_string()),
+            );
+        }
+    }
+    let whole = content_offset == 0 && served == full;
+    if let Some(obj) = row.as_object_mut() {
+        if whole {
+            obj.remove("contentTruncated");
+            obj.remove("contentBytes");
+        } else {
+            let end = content_offset + served;
+            obj.insert("contentTruncated".into(), serde_json::Value::Bool(true));
+            obj.insert("contentBytes".into(), serde_json::json!(full));
+            obj.insert("contentOffset".into(), serde_json::json!(content_offset));
+            obj.insert(
+                "nextContentOffset".into(),
+                serde_json::json!((end < full).then_some(end)),
+            );
+        }
+    }
+    Ok(row)
+}
+
 /// Whether a default read (`note.get`, a `note.list` / `note.subscribe` full
 /// row) cuts this note's `content` to fit the read budget. Such a note's
 /// whole-content writes must carry `baseContentBytes`, so a client that
@@ -572,12 +658,18 @@ pub fn comment_list_page(
 
 /// One bounded page of a note's checkbox rows for `note.listTasks`: rows
 /// in line order after the `page` cursor, at most `page.limit` rows and
-/// `budget` bytes. A first row whose `text` alone overflows the budget is
-/// served with its `text` cut and `textTruncated: true`. Returns the rows
-/// and the `nextToken`.
+/// `budget` bytes. Returns the rows and the `nextToken`.
+///
+/// Nothing is dropped. A first row whose `text` alone overflows the budget
+/// is served with a prefix of its `text` and `textTruncated: true`, and the
+/// `nextToken` resumes inside that text: the next page starts with the same
+/// row (same `lineNumber`) carrying the rest from byte `textOffset` (a UTF-8
+/// boundary). Concatenating the `text` of consecutive rows that share a
+/// `lineNumber` rebuilds the full text.
 ///
 /// # Errors
-/// `"invalid nextToken"` for a token not minted for this note's rows.
+/// `"invalid nextToken"` for a token not minted for this note's rows, or one
+/// whose text offset is no longer a character boundary inside its row.
 pub fn note_tasks_page(
     rows: &[crate::model::NoteTaskRow],
     workspace_id: &str,
@@ -586,30 +678,100 @@ pub fn note_tasks_page(
     budget: usize,
 ) -> Result<(Vec<serde_json::Value>, Option<String>), &'static str> {
     let scope = format!("note.listTasks:{workspace_id}:{note_id}");
-    let start = match page.next_token.as_deref() {
+    let (start, mut text_offset) = match page.next_token.as_deref() {
         Some(token) => {
             let (key, _) = parse_page_token(token, &scope)?;
-            let after: usize = key.parse().map_err(|_| "invalid nextToken")?;
-            rows.partition_point(|r| r.line_number <= after)
+            match key.split_once('@') {
+                Some((line, offset)) => {
+                    let line: usize = line.parse().map_err(|_| "invalid nextToken")?;
+                    let offset: usize = offset.parse().map_err(|_| "invalid nextToken")?;
+                    let idx = rows
+                        .iter()
+                        .position(|r| r.line_number == line)
+                        .ok_or("invalid nextToken")?;
+                    let text = &rows[idx].text;
+                    if offset == 0 || offset >= text.len() || !text.is_char_boundary(offset) {
+                        return Err("invalid nextToken");
+                    }
+                    (idx, offset)
+                }
+                None => {
+                    let after: usize = key.parse().map_err(|_| "invalid nextToken")?;
+                    (rows.partition_point(|r| r.line_number <= after), 0)
+                }
+            }
         }
-        None => 0,
+        None => (0, 0),
     };
-    let rows = &rows[start..];
-    let render = |r: &crate::model::NoteTaskRow| serde_json::to_value(r).unwrap_or_default();
-    let shrink = |r: &crate::model::NoteTaskRow, room: usize| {
+    let mut out = Vec::new();
+    let mut used = 2usize;
+    for (idx, r) in rows.iter().enumerate().skip(start) {
+        if out.len() >= page.limit {
+            let prev = &rows[idx - 1];
+            return Ok((
+                out,
+                Some(page_token(&scope, &prev.line_number.to_string(), "line")),
+            ));
+        }
         let mut row = r.clone();
-        row.text.clear();
-        let overhead = json_len(&row) + json_len("textTruncated") + 6;
-        row.text = escaped_prefix(&r.text, room.saturating_sub(overhead)).to_string();
+        row.text = r.text[text_offset..].to_string();
+        let offset = text_offset;
+        text_offset = 0;
         let mut value = serde_json::to_value(&row).unwrap_or_default();
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("textTruncated".into(), serde_json::Value::Bool(true));
+        if offset > 0 {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("textOffset".into(), serde_json::json!(offset));
+            }
         }
-        value
-    };
-    let (out, last) = take_page(rows, page.limit, budget, render, shrink);
-    let next = last.map(|idx| page_token(&scope, &rows[idx].line_number.to_string(), "line"));
-    Ok((out, next))
+        let cost = json_len(&value) + 1;
+        if used + cost <= budget {
+            used += cost;
+            out.push(value);
+            continue;
+        }
+        if !out.is_empty() {
+            let prev = &rows[idx - 1];
+            return Ok((
+                out,
+                Some(page_token(&scope, &prev.line_number.to_string(), "line")),
+            ));
+        }
+        // The first row alone overflows: serve a prefix of its text and
+        // resume inside it on the next page.
+        let rest = row.text.clone();
+        row.text.clear();
+        let mut shell = serde_json::to_value(&row).unwrap_or_default();
+        if let Some(obj) = shell.as_object_mut() {
+            obj.insert("textTruncated".into(), serde_json::Value::Bool(true));
+            if offset > 0 {
+                obj.insert("textOffset".into(), serde_json::json!(offset));
+            }
+        }
+        let room = budget.saturating_sub(used + 1 + json_len(&shell));
+        let mut cut = escaped_prefix(&rest, room);
+        if cut.is_empty() {
+            let first = rest.chars().next().map_or(0, char::len_utf8);
+            cut = &rest[..first];
+        }
+        if let Some(obj) = shell.as_object_mut() {
+            obj.insert("text".into(), serde_json::Value::String(cut.to_string()));
+            if cut.len() == rest.len() {
+                obj.remove("textTruncated");
+            }
+        }
+        out.push(shell);
+        if cut.len() == rest.len() {
+            // Rounding let the whole remainder fit after all.
+            let more = idx + 1 < rows.len();
+            return Ok((
+                out,
+                more.then(|| page_token(&scope, &r.line_number.to_string(), "line")),
+            ));
+        }
+        let key = format!("{}@{}", r.line_number, offset + cut.len());
+        return Ok((out, Some(page_token(&scope, &key, "line"))));
+    }
+    Ok((out, None))
 }
 
 #[cfg(test)]
@@ -1184,15 +1346,173 @@ mod tests {
                 .map(|r| r.line_number as u64)
                 .collect::<Vec<_>>()
         );
-        let huge = vec![crate::model::NoteTaskRow {
-            text: "\"".repeat(400_000),
-            ..rows[0].clone()
-        }];
+    }
+
+    /// Follow `note.get`'s content cursor and rebuild the content.
+    fn rebuild_note_get(note: &crate::model::Note, max: Option<usize>, budget: usize) -> String {
+        let mut out = String::new();
+        let mut offset = 0;
+        for _ in 0..100_000 {
+            let row = note_get_row(note, max, offset, budget).unwrap();
+            assert!(json_len(&row) <= budget, "row over budget");
+            out.push_str(row["content"].as_str().unwrap());
+            if row.get("contentTruncated").is_none() {
+                assert_eq!(offset, 0);
+                return out;
+            }
+            assert_eq!(
+                row["contentBytes"].as_u64().unwrap() as usize,
+                note.content.len()
+            );
+            assert_eq!(row["contentOffset"].as_u64().unwrap() as usize, offset);
+            match row["nextContentOffset"].as_u64() {
+                Some(next) => {
+                    let next = next as usize;
+                    assert!(next > offset && note.content.is_char_boundary(next));
+                    offset = next;
+                }
+                None => return out,
+            }
+        }
+        panic!("cursor must make progress");
+    }
+
+    #[test]
+    fn note_get_cursor_rebuilds_an_oversized_note_byte_for_byte() {
+        let big = "aé€😀\"\\\t\r\n".repeat(120_000);
+        let one_line = "é€😀\"x".repeat(150_000);
+        for content in [big.as_str(), one_line.as_str(), "small"] {
+            let note = test_note("n", "t", content);
+            for (max, budget) in [
+                (None, NOTE_READ_BUDGET_BYTES),
+                (Some(500_000), NOTE_READ_BUDGET_BYTES),
+                (Some(4_099), NOTE_READ_BUDGET_BYTES),
+                (None, 50_003),
+            ] {
+                assert_eq!(
+                    rebuild_note_get(&note, max, budget),
+                    content,
+                    "{max:?} {budget}"
+                );
+            }
+        }
+        let small = test_note("n", "t", "small");
+        let row = note_get_row(&small, None, 0, NOTE_READ_BUDGET_BYTES).unwrap();
+        assert_eq!(row, serde_json::to_value(&small).unwrap());
+    }
+
+    #[test]
+    fn note_get_cursor_rejects_offsets_off_a_boundary_or_outside_the_content() {
+        let note = test_note("n", "t", "éab");
+        for offset in [1, 4, 5] {
+            let err = note_get_row(&note, None, offset, NOTE_READ_BUDGET_BYTES).unwrap_err();
+            assert_eq!(err.offset, offset);
+        }
+        let row = note_get_row(&note, None, 2, NOTE_READ_BUDGET_BYTES).unwrap();
+        assert_eq!(row["content"], "ab");
+        assert_eq!(row["contentOffset"], 2);
+        assert_eq!(row["nextContentOffset"], serde_json::Value::Null);
+        assert_eq!(row["contentTruncated"], true);
+    }
+
+    fn task_row(line: usize, text: String) -> crate::model::NoteTaskRow {
+        crate::model::NoteTaskRow {
+            line_number: line,
+            text,
+            status: "todo".into(),
+            task_note_id: None,
+            linked_task_note_id: None,
+            depends_on: Vec::new(),
+            conflicts_with: Vec::new(),
+            unmet_depends_on: Vec::new(),
+        }
+    }
+
+    /// Page through `rows` and rebuild each row's text by concatenating the
+    /// fragments that share its `lineNumber`.
+    fn rebuild_tasks(rows: &[crate::model::NoteTaskRow], budget: usize) -> Vec<(u64, String)> {
+        let mut rebuilt: Vec<(u64, String)> = Vec::new();
+        let mut token = None;
+        for _ in 0..100_000 {
+            let page =
+                PageRequest::new(None, NOTE_TASKS_DEFAULT_LIMIT, NOTE_TASKS_MAX_LIMIT, token);
+            let (out, next) = note_tasks_page(rows, "w", "n", &page, budget).unwrap();
+            assert!(!out.is_empty());
+            assert!(json_len(&out) <= budget, "page over budget");
+            for row in &out {
+                let line = row["lineNumber"].as_u64().unwrap();
+                let text = row["text"].as_str().unwrap();
+                match rebuilt.last_mut() {
+                    Some((last, acc)) if *last == line => {
+                        assert!(row["textOffset"].as_u64().unwrap() as usize == acc.len());
+                        acc.push_str(text);
+                    }
+                    _ => {
+                        assert!(row.get("textOffset").is_none());
+                        rebuilt.push((line, text.to_string()));
+                    }
+                }
+            }
+            match next {
+                Some(t) => token = Some(t),
+                None => return rebuilt,
+            }
+        }
+        panic!("cursor must make progress");
+    }
+
+    #[test]
+    fn an_oversized_task_text_resumes_on_the_next_page_and_rebuilds() {
+        let huge = "aé€😀\"\\\t".repeat(60_000);
+        let rows = vec![
+            task_row(1, "small".into()),
+            task_row(3, huge.clone()),
+            task_row(5, "middle".into()),
+            task_row(7, format!("{huge}{huge}")),
+            task_row(9, "last".into()),
+        ];
+        for budget in [NOTE_READ_BUDGET_BYTES, 100_003, 4_097] {
+            let rebuilt = rebuild_tasks(&rows, budget);
+            let expected: Vec<(u64, String)> = rows
+                .iter()
+                .map(|r| (r.line_number as u64, r.text.clone()))
+                .collect();
+            assert_eq!(rebuilt, expected, "budget {budget}");
+        }
+        // The first page cuts the oversized row and marks it.
         let page = PageRequest::new(None, NOTE_TASKS_DEFAULT_LIMIT, NOTE_TASKS_MAX_LIMIT, None);
-        let (out, next) = note_tasks_page(&huge, "w", "n", &page, NOTE_READ_BUDGET_BYTES).unwrap();
+        let (out, next) = note_tasks_page(&rows[1..2], "w", "n", &page, 4_097).unwrap();
         assert_eq!(out[0]["textTruncated"], true);
-        assert!(json_len(&out) <= NOTE_READ_BUDGET_BYTES);
-        assert_eq!(next, None);
+        assert!(next.is_some());
+    }
+
+    #[test]
+    fn a_task_text_cursor_off_a_boundary_or_outside_the_row_is_rejected() {
+        let rows = vec![task_row(1, "éabc".into()), task_row(3, "x".into())];
+        let scope = "note.listTasks:w:n";
+        for key in ["1@1", "1@5", "1@0", "2@1", "1@x", "x@1"] {
+            let page = PageRequest::new(
+                None,
+                NOTE_TASKS_DEFAULT_LIMIT,
+                NOTE_TASKS_MAX_LIMIT,
+                Some(page_token(scope, key, "line")),
+            );
+            assert_eq!(
+                note_tasks_page(&rows, "w", "n", &page, NOTE_READ_BUDGET_BYTES).unwrap_err(),
+                "invalid nextToken",
+                "{key}"
+            );
+        }
+        let page = PageRequest::new(
+            None,
+            NOTE_TASKS_DEFAULT_LIMIT,
+            NOTE_TASKS_MAX_LIMIT,
+            Some(page_token(scope, "1@2", "line")),
+        );
+        let (out, _) = note_tasks_page(&rows, "w", "n", &page, NOTE_READ_BUDGET_BYTES).unwrap();
+        assert_eq!(out[0]["text"], "abc");
+        assert_eq!(out[0]["textOffset"], 2);
+        assert_eq!(out[1]["text"], "x");
     }
 
     #[test]
