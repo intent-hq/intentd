@@ -2259,6 +2259,9 @@ jobs:
           python3 -I -B scripts/test-home-intent-guard.py
       - name: Test the local release-scripts runner (make test-release-scripts)
         run: python3 -I -B scripts/test-release-scripts-local.py
+      # Reporter of nightly-payload-sweep.yml (node:test, offline, no installs).
+      - name: Test the nightly payload-sweep issue reporter (offline)
+        run: ./scripts/test-nightly-payload-report.mjs
       - name: Test optional Intel cargo-dist network handling (offline)
         run: python3 -I -B scripts/test-optional-intel-dist-network.py
       - name: Test optional Intel cargo-dist publication
