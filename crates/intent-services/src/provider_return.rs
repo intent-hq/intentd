@@ -559,6 +559,16 @@ impl Services {
         let Some(current) = session.provider.clone().filter(|p| !p.trim().is_empty()) else {
             return;
         };
+        // A remote agent only goes home when home can run on its machine
+        // (`Services::remote_compatibility`); otherwise it stays away.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        )
+        .is_some();
+        if remote && !self.remote_agent_can_run(agent_id, &state.home).await {
+            return;
+        }
+        let previous_state = state.clone();
         let current_selection = provider_profiles::canonical_selection(&current);
         state.away_on = current_selection;
         state.returning = Some(ReturnMode::Timer);
@@ -580,6 +590,11 @@ impl Services {
             .await
             .unwrap_or(false);
         if landed {
+            // A remote agent's node replaces its run with one on home, or
+            // the move is undone (see `quota_failover`).
+            if remote {
+                self.note_remote_return_pending(agent_id, &session, &state.home, previous_state);
+            }
             self.invalidate_agent_list_cache(workspace_id);
             self.publish_agent_mutation_event(
                 workspace_id,

@@ -707,6 +707,8 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
         )
     );
     assert!(lines[3].starts_with("To run an agent on one, pass `placement"));
+    assert!(text.contains("`profile-not-remote-compatible`"), "{text}");
+    assert!(text.contains("`ws.agent.setModel` can switch it"), "{text}");
     for secret in ["10.0.0.1", "100.64.0.1", "7443", &"ab".repeat(32), "d-gone"] {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
     }
@@ -877,4 +879,84 @@ async fn a_stale_model_list_that_lacks_the_model_is_refreshed() {
     chosen.sort();
     assert_eq!(chosen, ["listed", "primed"]);
     assert!(fake.refreshed().is_empty());
+}
+
+fn switch_check(
+    rows: &[ExposedMachine],
+    node_id: &str,
+    provider: &str,
+    model: Option<&str>,
+    with_profile: bool,
+) -> Result<()> {
+    let placement = on(&remote(), node_id);
+    check_switch_on_machine(
+        rows,
+        node_id,
+        PlacementRequest {
+            placement: &placement,
+            provider,
+            model,
+            with_profile,
+        },
+        now(),
+    )
+}
+
+/// A running remote agent's switch is judged on its own machine's cached
+/// report, with placement's sign-in and model rules and no connect: the
+/// model listed (or an alias of it), the provider usable or a profile
+/// selected.
+#[test]
+fn a_switch_is_judged_on_the_agents_machine_report() {
+    let rows = vec![
+        machine(
+            "mac",
+            Some(report(
+                MAC,
+                STALE,
+                vec![
+                    provider(
+                        "claude-code",
+                        ProviderStatus::SignedIn,
+                        &["claude-opus-4-1"],
+                    ),
+                    provider("codex", ProviderStatus::SignedOut, &["gpt-5"]),
+                ],
+            )),
+        ),
+        machine("other", Some(report(MAC, FRESH, claude(&["sonnet"])))),
+    ];
+    switch_check(&rows, "mac", "claude-code", Some("opus"), false).expect("alias of a listed id");
+    switch_check(&rows, "mac", "claude-code", None, false).expect("provider default");
+    switch_check(&rows, "mac", "codex", Some("gpt-5"), true).expect("a profile skips sign-in");
+
+    let Err(Error::ModelUnavailable(failure)) =
+        switch_check(&rows, "mac", "claude-code", Some("sonnet"), false)
+    else {
+        panic!("expected model-unavailable");
+    };
+    assert_eq!(failure.model, "sonnet");
+    assert_eq!(failure.machines.len(), 1, "only the agent's machine");
+    assert_eq!(failure.machines[0].node_id, "mac");
+    assert!(!failure.retryable);
+
+    let Err(Error::ModelUnavailable(failure)) =
+        switch_check(&rows, "mac", "codex", Some("gpt-5"), false)
+    else {
+        panic!("expected model-unavailable for a signed-out provider");
+    };
+    assert_eq!(failure.machines[0].status, ProviderStatus::SignedOut);
+}
+
+#[test]
+fn a_switch_on_a_removed_or_revoked_machine_is_refused() {
+    let mut revoked = machine("gone", Some(report(MAC, FRESH, claude(&["opus"]))));
+    revoked.state = RemoteMachineState::Revoked;
+    let rows = vec![revoked];
+    let reason = |node_id: &str| match switch_check(&rows, node_id, "claude-code", None, false) {
+        Err(Error::PlacementUnavailable(failure)) => failure.reason,
+        other => panic!("expected placement-unavailable, got {other:?}"),
+    };
+    assert_eq!(reason("nope"), PlacementUnavailableReason::MachineUnknown);
+    assert_eq!(reason("gone"), PlacementUnavailableReason::MachineRevoked);
 }

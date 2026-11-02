@@ -70,6 +70,77 @@ struct FailoverAttempt {
 /// over.
 pub(crate) type QuotaFailoverReplays = Arc<Mutex<HashSet<AgentId>>>;
 
+/// What [`Services::try_quota_failover`] did with a quota failure.
+#[derive(Debug)]
+pub(crate) enum QuotaFailoverOutcome {
+    /// The agent moved to another configuration: swallow the failed attempt
+    /// and redrive the message there.
+    Switched,
+    /// Nothing moved: the failure stays terminal as reported.
+    Terminal,
+    /// Nothing moved and the failure stays terminal, with this actionable
+    /// error in place of the raw quota error (a remote agent whose only
+    /// backups cannot run on its machine).
+    Refused(intent_core::Error),
+}
+
+impl QuotaFailoverOutcome {
+    pub(crate) fn switched(&self) -> bool {
+        matches!(self, Self::Switched)
+    }
+
+    pub(crate) fn into_refusal(self) -> Option<intent_core::Error> {
+        match self {
+            Self::Refused(error) => Some(error),
+            Self::Switched | Self::Terminal => None,
+        }
+    }
+}
+
+/// Code prefixing the error a remote agent fails with when quota failover
+/// cannot move it (the backup cannot run on, or did not start on, its
+/// machine). The turn worker never fails such an error over again.
+pub(crate) const REMOTE_FAILOVER_UNAVAILABLE: &str = "remote-failover-unavailable:";
+
+/// Whether `err` is a [`REMOTE_FAILOVER_UNAVAILABLE`] failure.
+pub(crate) fn is_remote_failover_unavailable(err: &intent_core::Error) -> bool {
+    matches!(err, intent_core::Error::InvalidParams(msg) if msg.starts_with(REMOTE_FAILOVER_UNAVAILABLE))
+}
+
+/// Which automatic switch a [`PendingRemoteFailover`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteSwitchKind {
+    /// A quota failover onto a backup: announced by a `provider_failover`
+    /// row once the node runs it.
+    Failover,
+    /// A timed return home ([`crate::provider_return`]): announced by its
+    /// own `provider_returned` row at home's first output.
+    Return,
+}
+
+/// A remote agent's automatic provider switch (a quota failover, or the
+/// timed return home after one) that is persisted but not confirmed yet:
+/// the node replaces the agent's run with one on the new configuration, and
+/// the switch is undone if the node cannot start it (intent-hq/intent#8317).
+/// In-memory only.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRemoteFailover {
+    kind: RemoteSwitchKind,
+    /// The session's provider before the switch, as stored.
+    from: String,
+    /// The backup reference the session now names.
+    to: String,
+    /// The session's `model` column, unchanged by the switch.
+    model: Option<String>,
+    /// The return state the switch replaced.
+    previous_return_state: Option<crate::provider_return::ProviderReturnState>,
+    /// The machine the agent runs on.
+    node_name: String,
+    profiles: Vec<ProfileMeta>,
+}
+
+pub(crate) type PendingRemoteFailovers = Arc<Mutex<HashMap<AgentId, PendingRemoteFailover>>>;
+
 /// Sent to the backup in place of the original user message when the failed
 /// attempt already produced output: the user message and the partial work
 /// are in the replayed history above, so re-sending the message as new would
@@ -332,6 +403,10 @@ impl Services {
     pub(crate) fn disarm_quota_failover(&self, agent_id: &AgentId) {
         self.quota_failover_chains.lock().unwrap().remove(agent_id);
         self.quota_failover_replays.lock().unwrap().remove(agent_id);
+        self.pending_remote_failovers
+            .lock()
+            .unwrap()
+            .remove(agent_id);
         self.cancel_provider_return_announcement(agent_id);
     }
 
@@ -388,11 +463,15 @@ impl Services {
     /// on (the committed turn identity, or the spawn attempt's record). When
     /// the session already names another configuration — the user switched
     /// while the attempt was in flight — nothing fails over: the user's
-    /// choice is never overwritten. Returns `true` when the switch landed — the caller then swallows the
-    /// failed attempt and the worker redrives the same message — and `false`
-    /// when the failure must stay terminal (no armed worker, no candidate,
-    /// an unreadable session or profile list, or a concurrent provider
-    /// change that won the compare-and-set).
+    /// choice is never overwritten. Returns [`QuotaFailoverOutcome::Switched`]
+    /// when the switch landed — the caller then swallows the failed attempt
+    /// and the worker redrives the same message — and otherwise leaves the
+    /// failure terminal (no armed worker, no candidate, an unreadable
+    /// session or profile list, or a concurrent provider change that won the
+    /// compare-and-set). A remote agent only moves to a configuration that
+    /// can run on its machine; when every remaining backup is tied to this
+    /// backend the outcome is [`QuotaFailoverOutcome::Refused`] with the
+    /// actionable error to fail with instead.
     ///
     /// The switch persists the backup reference as the agent's provider with
     /// the same model, emits `agent:updated`, and persists one
@@ -404,12 +483,13 @@ impl Services {
         agent_id: &AgentId,
         failed_provider: Option<&str>,
         error_text: &str,
-    ) -> bool {
+    ) -> QuotaFailoverOutcome {
+        use QuotaFailoverOutcome::Terminal;
         let session = match self.store.get_agent_session(agent_id).await {
             Ok(session) => session,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "quota failover skipped: session read failed");
-                return false;
+                return Terminal;
             }
         };
         let now = chrono::Utc::now();
@@ -428,7 +508,7 @@ impl Services {
             .is_none()
         {
             tracing::info!(agent = %agent_id, "no armed attempt, or provider/model changed since the failed attempt; quota failover skipped");
-            return false;
+            return Terminal;
         }
         if recorded.is_none() {
             if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -436,13 +516,13 @@ impl Services {
             }
         }
         let Some(from) = session.provider.clone() else {
-            return false;
+            return Terminal;
         };
         let profiles = match self.provider_profiles.profiles() {
             Ok(profiles) => profiles,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "quota failover skipped: profiles unreadable");
-                return false;
+                return Terminal;
             }
         };
         let settings = self.effective_settings();
@@ -450,27 +530,44 @@ impl Services {
         let return_state = crate::provider_return::read_state(&session);
         let home = return_state.as_ref().map(|s| s.home.clone());
         let exhausted = self.exhausted_providers();
-        let target = {
-            let mut chains = self.quota_failover_chains.lock().unwrap();
-            let Some(chain) = chains.get_mut(agent_id) else {
-                return false;
+        // A remote agent only moves to a configuration that can run on its
+        // machine (`Services::remote_compatibility`); the others are counted
+        // as tried and passed over.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        );
+        let mut passed_over: Option<String> = None;
+        let target = loop {
+            let candidate = {
+                let mut chains = self.quota_failover_chains.lock().unwrap();
+                let Some(chain) = chains.get_mut(agent_id) else {
+                    return Terminal;
+                };
+                let tried = &mut chain.tried;
+                if !tried.contains(&from_selection) {
+                    tried.push(from_selection.clone());
+                }
+                let candidate = next_candidate_avoiding(
+                    &from_selection,
+                    home.as_deref(),
+                    tried,
+                    &exhausted,
+                    &profiles,
+                    settings.providers.enabled.as_ref(),
+                );
+                if let Some(candidate) = &candidate {
+                    tried.push(candidate.clone());
+                }
+                candidate
             };
-            let tried = &mut chain.tried;
-            if !tried.contains(&from_selection) {
-                tried.push(from_selection.clone());
+            let Some(candidate) = candidate else {
+                break None;
+            };
+            if remote.is_some() && !self.runs_remotely(agent_id, &candidate).await {
+                passed_over.get_or_insert(candidate);
+                continue;
             }
-            let target = next_candidate_avoiding(
-                &from_selection,
-                home.as_deref(),
-                tried,
-                &exhausted,
-                &profiles,
-                settings.providers.enabled.as_ref(),
-            );
-            if let Some(target) = &target {
-                tried.push(target.clone());
-            }
-            target
+            break Some(candidate);
         };
         let Some(target) = target else {
             // Nothing left to try. When this was home rejecting a return
@@ -490,19 +587,51 @@ impl Services {
                 )
                 .await;
             }
-            return false;
+            return match (remote, passed_over) {
+                (Some(view), Some(backup)) => QuotaFailoverOutcome::Refused(
+                    intent_core::Error::InvalidParams(remote_backup_incompatible_text(
+                        &from_selection,
+                        &backup,
+                        &view.node_name,
+                        &profiles,
+                    )),
+                ),
+                _ => Terminal,
+            };
         };
-        self.switch_provider_for_quota(
-            workspace_id,
-            agent_id,
-            &session,
-            &target,
-            return_state,
-            reported,
-            &profiles,
-            true,
-        )
-        .await
+        if self
+            .switch_provider_for_quota(
+                workspace_id,
+                agent_id,
+                &session,
+                &target,
+                return_state,
+                reported,
+                &profiles,
+                true,
+            )
+            .await
+        {
+            QuotaFailoverOutcome::Switched
+        } else {
+            Terminal
+        }
+    }
+
+    /// Whether `reference` can run on a remote agent's machine. An
+    /// unresolvable reference cannot run anywhere, so it is passed over too.
+    async fn runs_remotely(&self, agent_id: &AgentId, reference: &str) -> bool {
+        match self.remote_compatibility(reference).await {
+            Ok(crate::RemoteCompatibility::Compatible) => true,
+            Ok(crate::RemoteCompatibility::NotRemoteCompatible { reason, keys }) => {
+                tracing::info!(agent = %agent_id, provider = %reference, reason, ?keys, "backup cannot run on the remote agent's machine; passed over");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, provider = %reference, error = %e, "backup unresolvable for a remote agent; passed over");
+                false
+            }
+        }
     }
 
     /// Move the agent from its current configuration (`session.provider`)
@@ -539,9 +668,19 @@ impl Services {
         let Some(from) = session.provider.clone() else {
             return false;
         };
+        // A remote agent runs on its machine: failover is the one provider
+        // switch it allows (`agent.setModel` refuses any other), and only to
+        // a configuration that can run there.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        );
+        if remote.is_some() && !self.runs_remotely(agent_id, target).await {
+            return false;
+        }
         let from_selection = provider_profiles::canonical_selection(&from);
         let now = chrono::Utc::now();
         let model = session.model.clone().filter(|m| !m.is_empty());
+        let previous_return_state = return_state.clone();
         let next_state = match reported.filter(|_| !after_failed_attempt) {
             Some(until) => {
                 crate::provider_return::on_skip(return_state, &from_selection, target, until, now)
@@ -617,6 +756,24 @@ impl Services {
             json!({ "agentId": agent_id.0, "modelId": model, "providerId": target }),
         )
         .await;
+        if let Some(view) = remote {
+            // Announced once the agent produces output (or completes a turn)
+            // on `target` ([`Self::complete_remote_failover`]); undone if the
+            // node cannot run it ([`Self::fail_remote_failover`]).
+            self.pending_remote_failovers.lock().unwrap().insert(
+                agent_id.clone(),
+                PendingRemoteFailover {
+                    kind: RemoteSwitchKind::Failover,
+                    from,
+                    to: target.to_owned(),
+                    model: session.model.clone(),
+                    previous_return_state,
+                    node_name: view.node_name,
+                    profiles: profiles.to_vec(),
+                },
+            );
+            return true;
+        }
         self.persist_provider_failover_notice(
             workspace_id,
             agent_id,
@@ -627,6 +784,201 @@ impl Services {
         )
         .await;
         true
+    }
+
+    /// Record a remote agent's timed return home (`from` → `to`), persisted
+    /// with `previous_return_state` replaced, as pending its node's start.
+    pub(crate) fn note_remote_return_pending(
+        &self,
+        agent_id: &AgentId,
+        session: &intent_core::AgentSession,
+        to: &str,
+        previous_return_state: crate::provider_return::ProviderReturnState,
+    ) {
+        let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(from) = session.provider.clone() else {
+            return;
+        };
+        self.pending_remote_failovers.lock().unwrap().insert(
+            agent_id.clone(),
+            PendingRemoteFailover {
+                kind: RemoteSwitchKind::Return,
+                from,
+                to: to.to_owned(),
+                model: session.model.clone(),
+                previous_return_state: Some(previous_return_state),
+                node_name: view.node_name,
+                profiles: self
+                    .provider_profiles
+                    .profiles()
+                    .map(|p| p.to_vec())
+                    .unwrap_or_default(),
+            },
+        );
+    }
+
+    /// Whether `reference` can run on a remote agent's machine (see
+    /// [`Self::runs_remotely`]).
+    pub(crate) async fn remote_agent_can_run(&self, agent_id: &AgentId, reference: &str) -> bool {
+        self.runs_remotely(agent_id, reference).await
+    }
+
+    /// Whether a remote agent's session names the backup of a quota switch
+    /// not yet announced: the one provider change its live run may be
+    /// replaced for instead of refused.
+    pub(crate) fn remote_failover_pending(
+        &self,
+        agent_id: &AgentId,
+        session: &intent_core::AgentSession,
+    ) -> bool {
+        self.pending_remote_failovers
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .is_some_and(|p| {
+                session.provider.as_deref() == Some(p.to.as_str()) && session.model == p.model
+            })
+    }
+
+    /// Whether a remote agent has an automatic switch awaiting its node.
+    pub(crate) fn remote_switch_pending(&self, agent_id: &AgentId) -> bool {
+        self.pending_remote_failovers
+            .lock()
+            .unwrap()
+            .contains_key(agent_id)
+    }
+
+    /// The node runs the remote agent on its new configuration — it produced
+    /// output there, or completed a turn: confirm the pending switch, and
+    /// announce a quota failover now, ahead of that output. A no-op without
+    /// one. Confirmation waits for this because the node starts the agent
+    /// asynchronously: a start failure only surfaces as the first prompt
+    /// failing (`node-agent-not-running`, see
+    /// [`Self::fail_remote_failover`]).
+    pub(crate) async fn complete_remote_failover(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let Some(pending) = self
+            .pending_remote_failovers
+            .lock()
+            .unwrap()
+            .remove(agent_id)
+        else {
+            return;
+        };
+        if pending.kind != RemoteSwitchKind::Failover {
+            return;
+        }
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return;
+        };
+        if session.provider.as_deref() != Some(pending.to.as_str()) {
+            return;
+        }
+        let model = pending.model.clone().filter(|m| !m.is_empty());
+        self.persist_provider_failover_notice(
+            workspace_id,
+            agent_id,
+            &provider_profiles::canonical_selection(&pending.from),
+            &pending.to,
+            model.as_deref(),
+            &pending.profiles,
+        )
+        .await;
+    }
+
+    /// The node could not run the remote agent on its new configuration
+    /// (`reason`): the start was refused, or the first prompt failed before
+    /// any output. With an automatic switch pending, undo it — the previous
+    /// provider and return state come back, unless the session changed
+    /// since — and return the actionable [`REMOTE_FAILOVER_UNAVAILABLE`]
+    /// error the agent fails with; nothing is retried. `None` without one.
+    pub(crate) async fn fail_remote_failover(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        reason: &str,
+    ) -> Option<intent_core::Error> {
+        let pending = self
+            .pending_remote_failovers
+            .lock()
+            .unwrap()
+            .remove(agent_id)?;
+        // A failed return home is a failed return: back on the backup with
+        // the next backoff step, so the next turn does not retry it at once.
+        let previous_return_state = match pending.kind {
+            RemoteSwitchKind::Failover => pending.previous_return_state.clone(),
+            RemoteSwitchKind::Return => pending.previous_return_state.clone().map(|state| {
+                crate::provider_return::on_failed_return(state, None, chrono::Utc::now())
+            }),
+        };
+        // Home's earlier output (what made the return due early) is stale
+        // once it failed to start here: without dropping it, the next turn
+        // would bypass the backoff and retry home at once.
+        if pending.kind == RemoteSwitchKind::Return {
+            self.provider_quota_cache.clear_working(&pending.to);
+        }
+        let restored_state = json!(previous_return_state).to_string();
+        let restored = self
+            .store
+            .failover_agent_session_provider(
+                workspace_id,
+                agent_id,
+                &pending.to,
+                pending.model.as_deref(),
+                &pending.from,
+                Some((
+                    crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
+                    &restored_state,
+                )),
+                false,
+                &now_iso(),
+            )
+            .await;
+        match restored {
+            Ok(true) => {
+                self.quota_failover_replays.lock().unwrap().remove(agent_id);
+                self.cancel_provider_return_announcement(agent_id);
+                self.invalidate_agent_list_cache(workspace_id);
+                let model = pending.model.clone().filter(|m| !m.is_empty());
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": agent_id.0, "modelId": model, "providerId": pending.from }),
+                )
+                .await;
+            }
+            Ok(false) => {
+                tracing::info!(agent = %agent_id, "session changed since the remote quota switch; not restored");
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "restoring the provider after a failed remote failover failed");
+            }
+        }
+        let from = provider_profiles::canonical_selection(&pending.from);
+        Some(intent_core::Error::InvalidParams(match pending.kind {
+            RemoteSwitchKind::Failover => remote_backup_failed_text(
+                &from,
+                &pending.to,
+                &pending.node_name,
+                reason,
+                &pending.profiles,
+            ),
+            RemoteSwitchKind::Return => remote_return_failed_text(
+                &from,
+                &pending.to,
+                &pending.node_name,
+                reason,
+                &pending.profiles,
+            ),
+        }))
     }
 
     /// Persist the `provider_failover` system row for one switch and emit
@@ -727,6 +1079,61 @@ fn failed_attempt_selection(
     let session = session_provider.filter(|p| !p.trim().is_empty())?;
     let session = provider_profiles::canonical_selection(session);
     (provider_profiles::canonical_selection(failed_provider?) == session).then_some(session)
+}
+
+/// The error a remote agent fails with when its only backups cannot run on
+/// its machine (an account folder ties them to this backend).
+fn remote_backup_incompatible_text(
+    from: &str,
+    backup: &str,
+    machine: &str,
+    profiles: &[ProfileMeta],
+) -> String {
+    let from = provider_profiles::readable_selection(from, Some(profiles));
+    let backup = provider_profiles::readable_selection(backup, Some(profiles));
+    format!(
+        "{REMOTE_FAILOVER_UNAVAILABLE} {from} ran out of quota on {machine}. The backup {backup} \
+         uses an account folder on this backend, so it can't run on other machines. Create a new \
+         agent with an API-key profile or the machine's own sign-in."
+    )
+}
+
+/// The error a remote agent fails with when its machine could not start the
+/// backup it was switched to.
+fn remote_backup_failed_text(
+    from: &str,
+    backup: &str,
+    machine: &str,
+    reason: &str,
+    profiles: &[ProfileMeta],
+) -> String {
+    let from = provider_profiles::readable_selection(from, Some(profiles));
+    let backup = provider_profiles::readable_selection(backup, Some(profiles));
+    let reason = reason.trim().trim_end_matches('.');
+    format!(
+        "{REMOTE_FAILOVER_UNAVAILABLE} {from} ran out of quota on {machine}, and the backup \
+         {backup} couldn't start there: {reason}. Sign in to {backup} on {machine}, or create a \
+         new agent with another account."
+    )
+}
+
+/// The error a remote agent fails with when its machine could not start
+/// home on a timed return; it stays on the backup.
+fn remote_return_failed_text(
+    away: &str,
+    home: &str,
+    machine: &str,
+    reason: &str,
+    profiles: &[ProfileMeta],
+) -> String {
+    let away = provider_profiles::readable_selection(away, Some(profiles));
+    let home = provider_profiles::readable_selection(home, Some(profiles));
+    let reason = reason.trim().trim_end_matches('.');
+    format!(
+        "{REMOTE_FAILOVER_UNAVAILABLE} {home} couldn't start on {machine} when going back from \
+         the backup {away}: {reason}. The agent stays on {away}; send your message again to \
+         continue there, or create a new agent with another account."
+    )
 }
 
 /// The notice text: both configurations by readable label, never by

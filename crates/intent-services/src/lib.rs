@@ -323,6 +323,9 @@ pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
+pub use provider_profiles::{
+    remote_compatibility_of, RemoteCompatibility, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+};
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
     host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
@@ -1110,6 +1113,13 @@ pub struct Services {
     /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
     /// [`quota_failover::QuotaFailoverReplays`].
     quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Remote agents' quota switches awaiting their node's start
+    /// (intent-hq/intent#8317).
+    pending_remote_failovers: quota_failover::PendingRemoteFailovers,
+    /// Remote agents' accepted `agent.setModel` switches awaiting their
+    /// next start, which relaunches them on their machine: see
+    /// [`agent_ops::RemoteModelSwitches`].
+    remote_model_switches: agent_ops::RemoteModelSwitches,
     /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
     /// [`provider_return::ProviderReturnAnnouncements`].
     provider_return_announcements: provider_return::ProviderReturnAnnouncements,
@@ -1832,6 +1842,8 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            pending_remote_failovers: Arc::new(Mutex::new(HashMap::new())),
+            remote_model_switches: Arc::new(Mutex::new(HashMap::new())),
             provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             provider_quota_cache: provider_quota_cache::ProviderQuotaCache::default(),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
@@ -19659,7 +19671,13 @@ impl WorkspaceApi for Services {
             // Saved profile summaries ride alongside the per-type rows
             // (PROTOCOL §5.54); `providers` stays one row per provider type.
             let mut catalog = provider_catalog::build_providers_catalog();
-            catalog["profiles"] = serde_json::Value::Array(self.provider_profile_summaries());
+            let (profiles, default_remote_incompatibility) = self.provider_profile_catalog().await;
+            catalog["profiles"] = serde_json::Value::Array(profiles);
+            // Default configurations that cannot run on another machine
+            // (§5.54 "Remote compatibility"); omitted when none.
+            if let Some(defaults) = default_remote_incompatibility {
+                catalog["defaultRemoteIncompatibility"] = defaults;
+            }
             // Renamed Default configurations (§5.54); omitted when none is.
             if let Some(names) = self.provider_default_names() {
                 catalog["defaultNames"] = names;

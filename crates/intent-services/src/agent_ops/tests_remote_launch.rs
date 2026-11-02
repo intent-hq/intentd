@@ -328,7 +328,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
         svc.provider_profiles_create_impl(json!({
             "baseProviderId": "codex",
             "name": "Work",
-            "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }],
+            "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": "sk-test-remote" }],
         })),
     )
     .await
@@ -480,15 +480,64 @@ async fn a_placed_create_keeps_its_placement_with_non_object_metadata() {
     }
 }
 
-/// Review of intentd#2779: a remote agent's model cannot be switched (the
-/// node keeps running the launched identity), so the switch is refused.
-#[tokio::test]
-async fn a_remote_agents_model_change_is_refused() {
-    let (_t, svc, ws) = setup().await;
-    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+/// The agent's machine ("node-1"), exposed to this backend with a report
+/// listing `providers`.
+async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::ProviderCapability>) {
+    use intent_core::node_link::{MachineCapabilities, MachineCapacity};
+    let platform = intent_core::placement::AgentPlatform {
+        os: intent_core::nodes::NodeOs::Macos,
+        arch: intent_core::nodes::NodeArch::Aarch64,
+    };
+    let observed_at = intent_core::now_iso();
+    svc.store
+        .save_exposed_machine(&intent_core::machines::ExposedMachine {
+            id: "node-1".into(),
+            name: "Mac Studio".into(),
+            hosts: vec!["10.0.0.1".into()],
+            port: 7443,
+            tc_address: None,
+            fingerprint: "ab".repeat(32),
+            credential_id: intent_core::ids::ExecutorCredentialId::from("cred-1".to_string()),
+            platform: Some(platform),
+            capabilities: Some(MachineCapabilities {
+                platform,
+                intentd_version: "0.11.87".into(),
+                capacity: MachineCapacity {
+                    running_agents: 1,
+                    agent_cap: 4,
+                    charged_memory_bytes: 0,
+                    memory_budget_bytes: None,
+                },
+                providers,
+                observed_at: observed_at.clone(),
+            }),
+            observed_at: Some(observed_at),
+            state: intent_core::machines::RemoteMachineState::Disconnected,
+            added_at: intent_core::now_iso(),
+            last_connected_at: None,
+        })
+        .await
+        .unwrap();
+}
+
+fn offered(
+    id: &str,
+    status: intent_core::node_link::ProviderStatus,
+    models: &[&str],
+) -> intent_core::node_link::ProviderCapability {
+    intent_core::node_link::ProviderCapability {
+        id: id.into(),
+        visible: true,
+        status,
+        models: models.iter().map(|m| (*m).to_owned()).collect(),
+        models_stale: false,
+    }
+}
+
+async fn remote_agent(svc: &Services, ws: &WorkspaceId) -> AgentId {
     let created = create(
-        &svc,
-        &ws,
+        svc,
+        ws,
         AgentCreateExtra {
             placement: Some(placement(json!({"target": "remote"}))),
             ..Default::default()
@@ -496,14 +545,222 @@ async fn a_remote_agents_model_change_is_refused() {
     )
     .await
     .unwrap();
-    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let result = svc
-        .agent_set_model_op(id.clone(), "opus".into(), None)
-        .await;
-    assert!(
-        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-model-change-unsupported")),
-        "{result:?}"
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
+async fn daemon_profile(svc: &Services, base: &str, name: &str, env: Value) -> String {
+    let created = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_create_impl(json!({
+            "baseProviderId": base,
+            "name": name,
+            "env": env,
+        })),
+    )
+    .await
+    .expect("create profile");
+    created["profile"]["providerRef"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn assert_not_remote_compatible(
+    result: &intent_core::Result<impl std::fmt::Debug>,
+    reference: &str,
+    key: &str,
+) {
+    let Err(Error::ProviderProfile(failure)) = result else {
+        panic!("expected profile-not-remote-compatible, got {result:?}");
+    };
+    assert!(!failure.internal);
+    assert_eq!(
+        failure.data,
+        json!({
+            "code": "profile-not-remote-compatible",
+            "providerRef": reference,
+            "reason": "account-folder",
+            "keys": [key],
+        })
     );
+    assert!(
+        failure.message.contains("account folder") && failure.message.contains(key),
+        "{}",
+        failure.message
+    );
+}
+
+/// A configuration that sets an account folder never runs on another
+/// machine, so placement refuses it before asking any machine (§5.54
+/// "Remote compatibility"): a profile, or a bare base whose Default
+/// overrides set one.
+#[tokio::test]
+async fn placement_refuses_a_configuration_tied_to_this_backend() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let folder = daemon_profile(
+        &svc,
+        "codex",
+        "Work",
+        json!([{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }]),
+    )
+    .await;
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            &folder,
+            Some("gpt-5"),
+            &placement(json!({"target": "remote"})),
+        )
+        .await;
+    assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
+
+    intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-a" }],
+        })),
+    )
+    .await
+    .unwrap();
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "remote"})),
+        )
+        .await;
+    assert_not_remote_compatible(&result, "claude-code", "CLAUDE_CONFIG_DIR");
+    assert!(
+        remote.needs.lock().unwrap().is_empty(),
+        "no machine was asked"
+    );
+}
+
+/// A remote agent switches to another model its machine offers: saved, and
+/// the next start relaunches it there.
+#[tokio::test]
+async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![offered(
+            "auggie",
+            ProviderStatus::SignedIn,
+            &["sonnet4.5", "opus4.5"],
+        )],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    svc.agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await
+        .expect("a model the machine lists is accepted");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("opus4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
+/// A model the agent's machine does not list, or a provider it cannot run,
+/// is refused with `model-unavailable` naming that machine only, and nothing
+/// changes.
+#[tokio::test]
+async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![
+            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("claude-code", ProviderStatus::SignedOut, &["opus"]),
+        ],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    for (model, provider) in [("opus4.5", None), ("opus", Some("claude-code"))] {
+        let result = svc
+            .agent_set_model_op(id.clone(), model.into(), provider.map(str::to_owned))
+            .await;
+        let Err(Error::ModelUnavailable(failure)) = &result else {
+            panic!("{model}: expected model-unavailable, got {result:?}");
+        };
+        let data = failure.data();
+        assert_eq!(data["code"], "model-unavailable");
+        assert_eq!(data["model"], model);
+        let machines = data["machines"].as_array().unwrap();
+        assert_eq!(machines.len(), 1, "{data}");
+        assert_eq!(machines[0]["nodeId"], "node-1");
+    }
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
+/// Switching to a profile: an account-folder profile is refused as not
+/// remote-compatible; an API-key profile runs even where the machine's own
+/// sign-in is missing, as at placement.
+#[tokio::test]
+async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![
+            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("codex", ProviderStatus::SignedOut, &["gpt-5"]),
+        ],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    let folder = daemon_profile(
+        &svc,
+        "codex",
+        "Work",
+        json!([{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }]),
+    )
+    .await;
+    let result = svc
+        .agent_set_model_op(id.clone(), "gpt-5".into(), Some(folder.clone()))
+        .await;
+    assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+
+    let api_key = daemon_profile(
+        &svc,
+        "codex",
+        "API key",
+        json!([{ "key": "OPENAI_API_KEY", "kind": "set", "value": "sk-test-remote" }]),
+    )
+    .await;
+    svc.agent_set_model_op(id.clone(), "gpt-5".into(), Some(api_key.clone()))
+        .await
+        .expect("an API-key profile the machine's provider can run is accepted");
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some(api_key.as_str()));
+    assert_eq!(session.model.as_deref(), Some("gpt-5"));
+}
+
+/// A remote agent whose machine is no longer exposed cannot switch: there
+/// is nowhere to relaunch it.
+#[tokio::test]
+async fn a_remote_agent_on_a_removed_machine_cannot_switch() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let id = remote_agent(&svc, &ws).await;
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await;
+    let Err(Error::PlacementUnavailable(failure)) = &result else {
+        panic!("expected placement-unavailable, got {result:?}");
+    };
+    assert_eq!(failure.data()["reason"], "machine-unknown");
     let session = svc.store.get_agent_session(&id).await.unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
 }

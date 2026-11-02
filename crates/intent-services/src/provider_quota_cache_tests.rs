@@ -148,6 +148,22 @@ fn forgetting_a_configuration_clears_any_state_for_everyone() {
 }
 
 #[test]
+fn clearing_working_drops_only_a_working_observation() {
+    let cache = ProviderQuotaCache::default();
+    let now = utc("2026-10-23T10:00:00Z");
+    cache.mark_working("claude-code", now, now, || true);
+    cache.mark_exhausted("codex", None, now, || true);
+
+    cache.clear_working("claude-code");
+    cache.clear_working("codex");
+    assert!(!cache.is_known_working("claude-code"));
+    assert!(
+        cache.is_exhausted("codex", now),
+        "an exhausted mark is kept"
+    );
+}
+
+#[test]
 fn an_observation_from_outdated_settings_changes_nothing() {
     let cache = ProviderQuotaCache::default();
     let now = utc("2026-10-23T10:00:00Z");

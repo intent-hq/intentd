@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.111] - 2026-11-02
+
+### 📚 Documentation
+
+- Explain workspace sidebar controls and unread dots ([#2967](https://github.com/intent-hq/intentd/pull/2967))
+
+
+## [0.11.110] - 2026-11-02
+
+### 🚀 Features
+
+- *(remote)* Remote-compatible profiles and model switching for remote agents ([#2961](https://github.com/intent-hq/intentd/pull/2961))
+
+
+## [0.11.109] - 2026-11-02
+
+### 🐛 Bug Fixes
+
+- *(remote)* Fail over a remote agent only to a backup its machine can run ([#2957](https://github.com/intent-hq/intentd/pull/2957))
+
+
+## [0.11.108] - 2026-11-02
+
+### 🚀 Features
+
+- *(harness)* Steer long-running work to Intent scripts (harness 3.6) ([#2955](https://github.com/intent-hq/intentd/pull/2955))
+
+### 🐛 Bug Fixes
+
+- Keep placement fields on agent list rows and announce isolation changes ([#2956](https://github.com/intent-hq/intentd/pull/2956))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Browser access now lives under Settings > Mobile ([#2954](https://github.com/intent-hq/intentd/pull/2954))
+
+### 🧪 Testing
+
+- Replace elapsed-time assertions in core crates with timing-free checks ([#2948](https://github.com/intent-hq/intentd/pull/2948))
+- *(intentd)* Replace elapsed-time assertions with timing-free checks ([#2947](https://github.com/intent-hq/intentd/pull/2947))
+- Sweep every read RPC against a large state with a 500 KiB budget ([#2950](https://github.com/intent-hq/intentd/pull/2950))
+
+
 ## [0.11.107] - 2026-11-02
 
 ### 🚀 Features

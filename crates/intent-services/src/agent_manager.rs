@@ -10814,6 +10814,16 @@ impl AgentManager {
     /// as dead; a handle without an owned child trusts the connection probe
     /// alone, and an errored `try_wait` probe is treated as live so a
     /// transient wait failure never forces a spurious respawn.
+    /// The provider (as stored) and model the agent's current run was
+    /// launched with, if it has one.
+    pub(crate) fn spawned_identity(&self, agent_id: &AgentId) -> Option<(String, Option<String>)> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| (h.spawned_provider.clone(), h.spawned_model.clone()))
+    }
+
     fn handle_is_live(&self, agent_id: &AgentId) -> bool {
         let mut handles = self.handles.lock().unwrap();
         let Some(handle) = handles.get_mut(agent_id) else {
@@ -12135,18 +12145,39 @@ impl AgentManager {
         session: &AgentSession,
     ) -> Result<StartedSession> {
         let session_id = format!("remote:{agent_id}");
-        // The node runs the identity the agent was launched with. A changed
-        // provider or model is refused at `agent.setModel`; should one still
-        // reach here, stop the old run rather than keep using it silently.
+        // Backup failover (PROTOCOL §5.54): the identity this attempt starts
+        // with — a quota failure only fails over while the session still
+        // carries it.
+        self.services.note_quota_failover_attempt(
+            agent_id,
+            &crate::provider_profiles::canonical_selection(
+                session.provider.as_deref().unwrap_or_default(),
+            ),
+            session.model.as_deref(),
+        );
+        // The node runs the identity the agent was launched with. A switch
+        // `agent.setModel` accepted (checked against the machine's report)
+        // replaces the run with one on the new identity, and the fresh
+        // provider session gets the Intent history first; so does a quota
+        // switch onto a backup (intent-hq/intent#8317). Any other change of
+        // identity stops the old run rather than keep using it silently.
+        // Kept until the new run produces output or completes a turn (the
+        // node starts it asynchronously, so an installed run may still exit
+        // before starting): until then every fresh launch, including one
+        // after a failed start or for a switch made while the agent had no
+        // run, opens with the history.
+        let switched = self.services.remote_model_switch_pending(agent_id, session);
         let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
             Some(h.spawned_provider.as_str()) != session.provider.as_deref()
                 || h.spawned_model != session.model
         });
         if identity_changed {
             boxed_await(|| self.kill_child_only(agent_id)).await;
-            return Err(Error::InvalidParams(
-                "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
-            ));
+            if !switched && !self.services.remote_failover_pending(agent_id, session) {
+                return Err(Error::InvalidParams(
+                    "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
+                ));
+            }
         }
         if self.handle_is_live(agent_id) {
             return Ok(StartedSession {
@@ -12163,12 +12194,31 @@ impl AgentManager {
         // `FirstTurnPrepend` `<system>` block, as for local providers without
         // native injection. Prepared before the node starts anything: a
         // failure fails this turn, and the next one prepares again.
-        boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session)).await?;
-        let runtime = self
-            .services
-            .feature_remote_launch_port()
-            .runtime(&self.services, agent_id)
-            .await?;
+        let started = async {
+            boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session))
+                .await?;
+            self.services
+                .feature_remote_launch_port()
+                .runtime(&self.services, agent_id)
+                .await
+        };
+        let runtime = match started.await {
+            Ok(runtime) => runtime,
+            // A quota switch onto a backup the node cannot start is undone
+            // and the agent fails with what to do; nothing retries.
+            Err(e) => {
+                let reason = match &e {
+                    Error::InvalidParams(message) => message.clone(),
+                    e => e.to_string(),
+                };
+                return Err(boxed_await(|| {
+                    self.services
+                        .fail_remote_failover(workspace_id, agent_id, &reason)
+                })
+                .await
+                .unwrap_or(e));
+            }
+        };
         let origin = RepositoryOrigin::unavailable();
         let provider = session.provider.clone().unwrap_or_default();
         let handle = AgentHandle {
@@ -12226,6 +12276,9 @@ impl AgentManager {
         match self.handles.lock().unwrap().get_mut(agent_id) {
             Some(h) => h.wake_listener = Some(listener),
             None => listener.abort(),
+        }
+        if switched {
+            self.recreated.lock().unwrap().insert(agent_id.clone());
         }
         Ok(StartedSession {
             session_id,
@@ -15179,6 +15232,15 @@ async fn run_message_worker(
                         if stop_reason != StopReason::Cancelled {
                             mgr.services.note_provider_working(&agent_id);
                         }
+                        // A remote agent's automatic switch, or one its
+                        // user made, is confirmed by a completed turn on its
+                        // new configuration.
+                        mgr.services.confirm_remote_model_switch(&agent_id);
+                        boxed_await(|| {
+                            mgr.services
+                                .complete_remote_failover(&workspace_id, &agent_id)
+                        })
+                        .await;
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
                         boxed_await(|| {
@@ -15716,8 +15778,12 @@ async fn run_message_worker(
                     .get(&agent_id)
                     .cloned();
                 let error_text = e.to_string();
-                if intent_acp::message_is_quota_exceeded(&error_text)
-                    && boxed_await(|| {
+                // A remote agent's failed failover already failed with its
+                // actionable message: never fail it over again.
+                let outcome = if intent_acp::message_is_quota_exceeded(&error_text)
+                    && !crate::quota_failover::is_remote_failover_unavailable(&e)
+                {
+                    boxed_await(|| {
                         mgr.services.try_quota_failover(
                             &workspace_id,
                             &agent_id,
@@ -15726,17 +15792,24 @@ async fn run_message_worker(
                         )
                     })
                     .await
-                {
-                    mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
-                    tracing::warn!(
-                        agent = %agent_id,
-                        error = %e,
-                        "provider quota exhausted at session setup — retrying on a backup profile"
-                    );
-                    keep_failover_chain = true;
-                    boxed_await(|| mgr.kill_child_only(&agent_id)).await;
-                    continue 'outer;
-                }
+                } else {
+                    crate::quota_failover::QuotaFailoverOutcome::Terminal
+                };
+                let e = match outcome {
+                    crate::quota_failover::QuotaFailoverOutcome::Refused(refusal) => refusal,
+                    crate::quota_failover::QuotaFailoverOutcome::Terminal => e,
+                    crate::quota_failover::QuotaFailoverOutcome::Switched => {
+                        mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %e,
+                            "provider quota exhausted at session setup — retrying on a backup profile"
+                        );
+                        keep_failover_chain = true;
+                        boxed_await(|| mgr.kill_child_only(&agent_id)).await;
+                        continue 'outer;
+                    }
+                };
                 match boxed_await(|| stderr_capture_hint(&mgr, &agent_id, &e)).await {
                     Some(hint) => tracing::warn!(
                         agent = %agent_id,

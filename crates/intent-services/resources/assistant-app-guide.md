@@ -967,7 +967,7 @@ authenticated tunnel.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,WorkspaceAgentsList,WorkspaceShellList,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,WorkspaceTokenUsage,WorkspaceStatusImage,AddContextSection,ContextPanel,ContextItemRow,NotesPanel,ExpandableFileSearch,SidebarHeaderAction,SidebarActionIcon,ChangesRefreshAction,SidebarPrDropdown}.svelte; src/features/external-editors/components/OpenComboButton.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/lib/components/icons/DisclosureIcon.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 They share available width up to a compact limit, then stay grouped at the left.
@@ -1008,15 +1008,29 @@ the expanded sidebar's toggle collapses it.
 Pane menus offer **Reveal in Sidebar** to locate content in its sidebar section.
 This keeps other selected panes open. When collapsed, it opens the matching
 floating section beside the rail.
+In every sidebar section, a chevron pointing right marks a closed group, row, or
+drawer; select it to open, and the chevron points down.
+In **Agents**, the **Delegated**, **Background**, and **Retired** groups show their
+counts beside the chevron. Closed Delegated and Background groups also show how
+many agents are running.
+In **Shells**, Start and Stop stay beside each script. Open its **Actions** menu
+for Restart or to choose where its output opens.
 
 In **Files**, search and file actions sit beside the section title. Open search to
 find a file; use the arrow keys to choose a result and Enter to open it. Escape
-clears search and returns focus to its button.
+clears search and returns focus to its button. The filter shows only changed files;
+select it again to show all files.
 
 In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+A blue dot on a note's icon marks unread changes, like the dot on agent avatars.
+Open the note to clear it; task progress rings still show task status.
+Notes with child notes, including the Spec, show a chevron and start collapsed,
+with a child count. Select the chevron to show or hide the children
+without opening the note; that choice is saved for the workspace. Searching shows
+the matching children of notes you have not expanded or collapsed.
 
 With a supporting daemon, the desktop app shows a note over 500 KB truncated and
 render-only, with a banner, so the user cannot edit it there. Agents still read
@@ -1073,6 +1087,22 @@ chat it opens beside the conversation.
 <!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. Test-build behavior pending its frontend release. -->
 
 <!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
+
+
+## Review and commit workspace changes
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/sidebar/{SidebarChangesPanel,FileChangesSection,CommitDrawer,CommitsTimeline,HistoryBoundary,SecondaryRootChangesView,PRSection,WorkspacePullRequests,SidebarPrList}.svelte. -->
+
+In the workspace sidebar, open **Changes** to review files and commit history.
+Owners can toggle **Auto-commit** beside the file summary. **Unstaged** and
+**Staged** appear when they contain files; **Stage all** and **Unstage all** sit
+in their section headers. After staging files, open **Commit** to enter a message.
+An open commit draft stays available if the staged list changes.
+Expand a commit to see its files, or select its title to open the complete change.
+Open a pull request from the sidebar's **Pull requests** list.
+Line-change totals appear at the right of each row. **Workspace start**
+marks the boundary; select it to show or hide earlier commits. For a secondary Git
+root, **Root registered** marks that root's boundary.
 
 ## Daemon lifecycle from the terminal
 
