@@ -6,10 +6,13 @@
 //!   served and holds at most the cap; one byte more is refused (`-32602`).
 //! - `workspace.export.read` (server-cut chunks): every chunk of an export
 //!   of the big workspace holds at most the chunk cap.
-//! - Whole-object reads bounded by the outbound frame cap (`file.read`,
-//!   `git.showFile`, `note.readAsset`): a large
-//!   object is served in one frame under the cap, and `file.read` of a file
-//!   past the cap is answered with an error instead of an oversized frame.
+//! - `git.showFileChunk` / `note.readAssetChunk` (cap param `length`): the
+//!   same as `file.readChunk`, on a committed blob and a note asset.
+//!
+//! It also checks the default form of the capped whole-object reads
+//! (`file.read`, `git.showFile`, `note.readAsset` without `maxBytes`, which
+//! are `BoundedRead` rows): an object over the cap is refused with a small
+//! `too-large` error frame, never a shortened or oversized reply.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -23,10 +26,9 @@ use crate::rows::Ctx;
 
 /// Every `BulkTransfer` method this module checks.
 pub const METHODS: &[&str] = &[
-    "file.read",
     "file.readChunk",
-    "git.showFile",
-    "note.readAsset",
+    "git.showFileChunk",
+    "note.readAssetChunk",
     "workspace.export.read",
 ];
 
@@ -69,9 +71,6 @@ fn write_files(worktree: &std::path::Path, chunk_cap: usize, frame_cap: usize) {
         text.push_str("a generated log line that keeps going past the frame cap\n");
     }
     std::fs::write(dir.join("over-frame-cap.log"), text).expect("over-cap log");
-    // UTF-8, large but under every cap.
-    let medium: String = "a generated source line of reasonable width for a file\n".repeat(40_000);
-    std::fs::write(dir.join("medium.txt"), medium).expect("medium.txt");
 }
 
 /// Check every bulk method's declared cap; returns report lines.
@@ -84,104 +83,108 @@ pub async fn sweep(
     let mut report = String::new();
     let ws = ctx.ws.as_str();
     let frame_cap = intent_transport::MAX_OUTBOUND_MESSAGE_BYTES;
-    let (chunk_param, chunk_cap) = declared_cap("file.readChunk");
+    let (_, chunk_cap) = declared_cap("file.readChunk");
     write_files(&daemon.state.worktree, chunk_cap, frame_cap);
     let mut fail = |msg: String| failures.push(msg);
 
-    // file.readChunk: the declared cap param bounds one response.
-    assert_eq!(chunk_param, Some("length"), "file.readChunk cap param");
-    let at_cap = client
-        .call(
+    // Windowed reads: the declared cap param bounds one response.
+    let windows = [
+        (
             "file.readChunk",
-            &json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/large.bin"), "offset": 0, "length": chunk_cap }),
-        )
-        .await;
-    if let Some(e) = at_cap.error() {
-        fail(format!("bulk file.readChunk length=cap: {e}"));
-    } else {
-        let read = at_cap.result()["bytesRead"].as_u64().unwrap_or(u64::MAX);
-        if usize::try_from(read).unwrap_or(usize::MAX) > chunk_cap {
+            json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/large.bin") }),
+        ),
+        (
+            "git.showFileChunk",
+            json!({ "workspaceId": ws, "filePath": crate::seed::FULL_FILE, "ref": "HEAD" }),
+        ),
+        (
+            "note.readAssetChunk",
+            json!({ "workspaceId": ws, "asset": ctx.seeded.large_asset }),
+        ),
+    ];
+    for (method, base) in windows {
+        let (param, cap) = declared_cap(method);
+        assert_eq!(param, Some("length"), "{method} cap param");
+        let with = |length: usize| {
+            let mut p = base.clone();
+            p["offset"] = json!(0);
+            p["length"] = json!(length);
+            p
+        };
+        let at_cap = client.call(method, &with(cap)).await;
+        if let Some(e) = at_cap.error() {
+            fail(format!("bulk {method} length=cap: {e}"));
+        } else {
+            let read = at_cap.result()["bytesRead"].as_u64().unwrap_or(u64::MAX);
+            if usize::try_from(read).unwrap_or(usize::MAX) > cap {
+                fail(format!("bulk {method}: read {read} bytes, cap {cap}"));
+            } else if read < 256 * 1024 {
+                fail(format!(
+                    "bulk {method}: read only {read} bytes — the check must read a large object"
+                ));
+            }
+        }
+        line(&mut report, method, "length=cap", &at_cap);
+        let past_cap = client.call(method, &with(cap + 1)).await;
+        if past_cap.error().map(|e| e["code"].clone()) != Some(json!(-32602)) {
             fail(format!(
-                "bulk file.readChunk: read {read} bytes, cap {chunk_cap}"
+                "bulk {method} length=cap+1 must be refused with -32602, got {}",
+                past_cap
+                    .frame
+                    .to_string()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             ));
         }
     }
-    line(&mut report, "file.readChunk", "length=cap", &at_cap);
-    let past_cap = client
-        .call(
-            "file.readChunk",
-            &json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/large.bin"), "offset": 0, "length": chunk_cap + 1 }),
-        )
-        .await;
-    if past_cap.error().map(|e| e["code"].clone()) != Some(json!(-32602)) {
-        fail(format!(
-            "bulk file.readChunk length=cap+1 must be refused with -32602, got {}",
-            past_cap
-                .frame
-                .to_string()
-                .chars()
-                .take(200)
-                .collect::<String>()
-        ));
-    }
 
-    // Whole-object reads: served under the frame cap.
-    let (_, cap) = declared_cap("file.read");
-    let medium = client
-        .call(
+    // Capped whole-object reads without maxBytes: an object over the cap is
+    // refused with a small too-large frame (file.read past the frame cap too).
+    let legacy = [
+        (
             "file.read",
-            &json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/medium.txt") }),
-        )
-        .await;
-    check_whole(&mut fail, "file.read", &medium, cap);
-    line(&mut report, "file.read", "medium", &medium);
-    let over = client
-        .call(
-            "file.read",
-            &json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/over-frame-cap.log") }),
-        )
-        .await;
-    if over.error().is_none() || over.bytes > cap {
-        fail(format!(
-            "bulk file.read past the frame cap must answer an error frame under the cap, got {} bytes",
-            over.bytes
-        ));
-    }
-    line(&mut report, "file.read", "past-frame-cap", &over);
-
-    let (_, cap) = declared_cap("git.showFile");
-    let show = client
-        .call(
+            json!({ "workspaceId": ws, "path": format!("{BULK_DIR}/over-frame-cap.log") }),
+        ),
+        (
             "git.showFile",
-            &json!({ "workspaceId": ws, "filePath": "src/history/module_0.rs", "ref": "HEAD" }),
-        )
-        .await;
-    check_whole(&mut fail, "git.showFile", &show, cap);
-    line(&mut report, "git.showFile", "HEAD", &show);
-
-    let (_, cap) = declared_cap("note.readAsset");
-    let png = base64::engine::general_purpose::STANDARD.encode(vec![0x89_u8; 4 * 1024 * 1024]);
-    let saved = client
-        .call(
-            "note.saveAsset",
-            &json!({ "workspaceId": ws, "data": png, "mimeType": "image/png", "originalName": "large.png" }),
-        )
-        .await;
-    match saved.result()["url"]
-        .as_str()
-        .or_else(|| saved.result()["assetId"].as_str())
-    {
-        Some(asset) => {
-            let read = client
-                .call(
-                    "note.readAsset",
-                    &json!({ "workspaceId": ws, "asset": asset }),
-                )
-                .await;
-            check_whole(&mut fail, "note.readAsset", &read, cap);
-            line(&mut report, "note.readAsset", "4MiB", &read);
+            json!({ "workspaceId": ws, "filePath": crate::seed::FULL_FILE, "ref": "HEAD" }),
+        ),
+        (
+            "note.readAsset",
+            json!({ "workspaceId": ws, "asset": ctx.seeded.large_asset }),
+        ),
+    ];
+    // With REFUSE_OVER_CAP_WITHOUT_MAX_BYTES off the daemon serves the whole
+    // object instead (as before protocol 15.4), up to the frame cap: a file
+    // past that cap still answers an error frame, never an oversized one.
+    let refuse = intent_transport::router::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
+    let frame_cap = intent_transport::MAX_OUTBOUND_MESSAGE_BYTES;
+    for (method, params) in legacy {
+        let r = client.call(method, &params).await;
+        let code = r.error().map(|e| e["data"]["code"].clone());
+        let past_frame_cap = method == "file.read";
+        let ok = if refuse {
+            code == Some(json!("too-large")) && r.bytes <= 4 * 1024
+        } else if past_frame_cap {
+            r.error().is_some() && r.bytes <= 4 * 1024
+        } else {
+            r.error().is_none() && r.bytes > 1024 * 1024 && r.bytes <= frame_cap
+        };
+        if !ok {
+            fail(format!(
+                "bulk {method} over the cap without maxBytes (refuse={refuse}): expected {}, got {} bytes: {}",
+                if refuse || past_frame_cap { "a small error frame" } else { "the whole object under the frame cap" },
+                r.bytes,
+                r.frame.to_string().chars().take(200).collect::<String>()
+            ));
         }
-        None => fail(format!("bulk note.saveAsset: {}", saved.frame)),
+        let variant = if refuse {
+            "over-cap-refused"
+        } else {
+            "over-cap-whole"
+        };
+        line(&mut report, method, variant, &r);
     }
 
     // workspace.export.read: every server-cut chunk is under the chunk cap.
@@ -243,20 +246,4 @@ pub async fn sweep(
         .call("workspace.export.abort", &json!({ "exportId": export_id }))
         .await;
     report
-}
-
-fn check_whole(fail: &mut impl FnMut(String), method: &str, reply: &Reply, cap: usize) {
-    if let Some(e) = reply.error() {
-        fail(format!("bulk {method}: {e}"));
-    } else if reply.bytes > cap {
-        fail(format!(
-            "bulk {method}: {} bytes over the {cap} byte frame cap",
-            reply.bytes
-        ));
-    } else if reply.bytes < 4 * 1024 {
-        fail(format!(
-            "bulk {method}: only {} bytes — the check must read a large object",
-            reply.bytes
-        ));
-    }
 }

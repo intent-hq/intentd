@@ -49,7 +49,20 @@ pub struct Seeded {
     pub browser_client: String,
     /// A registered git root of the big workspace.
     pub git_root: String,
+    /// Asset URL of a note asset that fits the object read cap.
+    pub mid_asset: String,
+    /// Asset URL of a note asset far over the object read cap.
+    pub large_asset: String,
 }
+
+/// Committed text file far over the object read cap (`file.read`,
+/// `git.showFile`). Its path and text hold no `e` or `s`, so file-name and
+/// in-file search rows do not grow.
+pub const FULL_FILE: &str = "big/full.txt";
+/// Committed text file just under the object read cap.
+pub const MID_FILE: &str = "big/mid.txt";
+/// One line of the big files.
+const BIG_LINE: &str = "0123456789 abcd fghijk lmnopqr tuvwxyz 0123456789\n";
 
 /// Seeded counts, so proofs can demand pages near their limit.
 pub const GIT_COMMITS: usize = 260;
@@ -191,6 +204,19 @@ fn seed_git(worktree: &Path, seeded: &mut Seeded) {
         crate::proxies::repo_config_json(),
     )
     .expect("repo config");
+    // Committed with the import, before the branch boundary, so branch
+    // diffs and the dirty tree do not carry them.
+    std::fs::create_dir_all(worktree.join("big")).expect("big dir");
+    std::fs::write(
+        worktree.join(FULL_FILE),
+        BIG_LINE.repeat(2 * 1024 * 1024 / BIG_LINE.len()),
+    )
+    .expect("full file");
+    std::fs::write(
+        worktree.join(MID_FILE),
+        BIG_LINE.repeat(400_000 / BIG_LINE.len()),
+    )
+    .expect("mid file");
     git(worktree, &["add", "-A"]);
     git(
         worktree,
@@ -1120,6 +1146,24 @@ pub async fn runtime(
         )
         .await;
     expect_ok("workspace.updateUiContext", &r);
+    // Note assets: one under the object read cap, one far over it.
+    for (decoded, name) in [(300 * 1024, "mid.png"), (4 * 1024 * 1024, "large.png")] {
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![0x89_u8; decoded]);
+        let r = client
+            .call(
+                "note.saveAsset",
+                &json!({ "workspaceId": ws, "data": data, "mimeType": "image/png", "originalName": name }),
+            )
+            .await;
+        expect_ok("note.saveAsset", &r);
+        let url = r.result()["url"].as_str().expect("asset url").to_string();
+        if name == "mid.png" {
+            seeded.mid_asset = url;
+        } else {
+            seeded.large_asset = url;
+        }
+    }
     devices
 }
 

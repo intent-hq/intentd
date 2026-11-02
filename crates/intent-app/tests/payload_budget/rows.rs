@@ -833,6 +833,26 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             ],
         )
         .with_reason("The worktree root holds a handful of entries; the skills directory holds over a thousand."),
+        row(
+            "file.read",
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "path": seed::MID_FILE }),
+                    Bytes(380_000),
+                ),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "path": seed::FULL_FILE, "maxBytes": 100_000_000 }),
+                    Bytes(470_000),
+                ),
+                v(
+                    "gitRootId",
+                    json!({ "workspaceId": ws, "path": seed::FULL_FILE, "gitRootId": s.git_root, "maxBytes": 480_000 }),
+                    Bytes(470_000),
+                ),
+            ],
+        ),
         fixed(
             "file.stat",
             "Metadata of one path.",
@@ -1036,6 +1056,26 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             ],
         )
         .with_reason("The staged variant selects the two staged files."),
+        row(
+            "git.showFile",
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "filePath": seed::MID_FILE, "ref": "HEAD" }),
+                    Bytes(380_000),
+                ),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "filePath": seed::FULL_FILE, "ref": "HEAD", "maxBytes": 100_000_000 }),
+                    Bytes(470_000),
+                ),
+                v(
+                    "gitRootId",
+                    json!({ "workspaceId": ws, "filePath": seed::FULL_FILE, "ref": ":0", "gitRootId": s.git_root, "maxBytes": 480_000 }),
+                    Bytes(470_000),
+                ),
+            ],
+        ),
         row(
             "git.status",
             vec![
@@ -1306,6 +1346,22 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 Items("", 50),
             )],
         ),
+        row(
+            "note.readAsset",
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "asset": s.mid_asset }),
+                    Bytes(400_000),
+                ),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "asset": s.large_asset, "maxBytes": 100_000_000 }),
+                    Fixed("/truncated"),
+                ),
+            ],
+        )
+        .with_reason("An asset over maxBytes is sent without its bytes (its size and truncated flag only); the default variant reads one near the cap."),
         row(
             "prMonitor.list",
             vec![v("default", w.clone(), Items("/monitors", 200))],

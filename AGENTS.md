@@ -157,6 +157,10 @@ full-scale sweep is `#[ignore]`d and runs with `INTENTD_LARGE_STATE_SCALE=full`.
   and on a param no variant sets: router params are read from `router.rs`, a typed params
   struct from its serde fields, and an arm that hands params on names its parser with
   `parsed_by`.
+- **Bulk methods:** a `bulk(...)` row is allowed only for a method the app sends on a
+  transfer connection (cloudlands-fe `TRANSFER_METHODS`); the monorepo
+  `check-transfer-methods` consumer check fails otherwise. A whole-object read on the main
+  connection is capped instead (`router/bounded_read.rs`) with a chunk method for the rest.
 - **Baseline:** `baseline.txt` (`baseline-full.txt` for the full preset) lists today's
   offenders as `<method> <variant> <bytes>`. The sweep fails on a new offender, on growth
   over 5% above the recorded size, and on a stale line. Fixing an offender means deleting

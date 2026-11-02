@@ -32,22 +32,34 @@ const MODE_GITLINK: u32 = 0o160_000;
 ///
 /// Returns [`Error::NotAFile`] if the path resolves to a gitlink or tree entry; `Error::Internal` if another libgit2 operation fails.
 pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result<String> {
+    show_file_bytes(worktree_path, refname, file_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`show_file`] as raw blob bytes (no UTF-8 decoding), for windowed reads
+/// (`git.showFileChunk`). Same path, ref, missing-path and non-blob rules:
+/// a path missing at the ref is an empty vector.
+///
+/// # Errors
+///
+/// The same as [`show_file`].
+pub fn show_file_bytes(worktree_path: &Path, refname: &str, file_path: &str) -> Result<Vec<u8>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let rel = relative_path(worktree_path, file_path);
     if rel.is_empty() {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
 
     if let Some(stage) = index_stage(refname) {
         let index = repo.index().map_err(map_git_err)?;
         let Some(entry) = index.get_path(Path::new(&rel), stage) else {
-            return Ok(String::new());
+            return Ok(Vec::new());
         };
         if entry.mode == MODE_GITLINK {
             return Err(not_a_file(&rel, entry.mode));
         }
         let blob = repo.find_blob(entry.id).map_err(map_git_err)?;
-        return Ok(String::from_utf8_lossy(blob.content()).into_owned());
+        return Ok(blob.content().to_vec());
     }
 
     let object = repo.revparse_single(refname).map_err(map_git_err)?;
@@ -55,7 +67,7 @@ pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result
     let entry = match tree.get_path(Path::new(&rel)) {
         Ok(e) => e,
         // Missing path at the ref (new file) → empty content, not an error.
-        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(String::new()),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(map_git_err(e)),
     };
     // A gitlink's to_object() would fail (the pin commit is not in this odb),
@@ -66,7 +78,7 @@ pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result
     }
     let object = entry.to_object(&repo).map_err(map_git_err)?;
     match object.as_blob() {
-        Some(blob) => Ok(String::from_utf8_lossy(blob.content()).into_owned()),
+        Some(blob) => Ok(blob.content().to_vec()),
         // The path resolves to a tree, not file content.
         None => Err(not_a_file(&rel, mode)),
     }

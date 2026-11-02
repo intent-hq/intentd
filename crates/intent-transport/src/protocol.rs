@@ -754,9 +754,12 @@ use std::time::{Duration, Instant};
 // workspace-retired / retire-unsupported errors.
 // 15.3 adds plain-folder workspaces: Workspace.plainFolder and the workspace.create
 // plainFolder option (plain-folder-path-rejected); workspace.update refuses plainFolder.
+// 15.4 adds bounded object reads (boundedReads: 1): file.read, git.showFile and
+// note.readAsset replies stay under the read budget (maxBytes truncates, otherwise
+// too-large), and git.showFileChunk / note.readAssetChunk read whole objects in windows.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "15.3";
+pub const PROTOCOL_VERSION: &str = "15.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
@@ -796,11 +799,13 @@ const BULK_TRANSFER_METHODS: &[&str] = &[
     "file.write",
     "note.saveAsset",
     "voice.transcribe",
-    // Outbound: chunked/base64 downloads and whole-content reads.
+    // Outbound: chunked/base64 downloads. Whole-object reads (`file.read`,
+    // `git.showFile`, `note.readAsset`) are capped under the read budget and
+    // warn like any other read.
     "workspace.export.read",
-    "file.read",
     "file.readChunk",
-    "note.readAsset",
+    "git.showFileChunk",
+    "note.readAssetChunk",
     "drafts.get",
 ];
 
@@ -990,14 +995,22 @@ mod tests {
             "note.saveAsset",
             "voice.transcribe",
             "workspace.export.read",
-            "file.read",
             "file.readChunk",
-            "note.readAsset",
+            "git.showFileChunk",
+            "note.readAssetChunk",
             "drafts.get",
         ] {
             assert!(is_bulk_transfer_method(method), "{method} must be exempt");
         }
-        for method in ["git.diffs", "agent.getConversation", "workspace.list", ""] {
+        for method in [
+            "git.diffs",
+            "agent.getConversation",
+            "workspace.list",
+            "file.read",
+            "git.showFile",
+            "note.readAsset",
+            "",
+        ] {
             assert!(!is_bulk_transfer_method(method), "{method:?} must warn");
         }
     }

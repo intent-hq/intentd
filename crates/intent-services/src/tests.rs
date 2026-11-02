@@ -5981,6 +5981,40 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
 }
 
+/// `note.readAssetChunk` serves offset windows of an asset's raw bytes with
+/// the `note.readAsset` resolution and the shared chunk length cap.
+#[intent_test_macros::daemon_test]
+async fn read_asset_chunk_windows_asset_bytes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let root_guard = test_tempdir("intentd-assets-");
+    let root = root_guard.path().to_path_buf();
+    std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
+    std::fs::write(root.join(&ws.0).join("img.png"), b"hello world").expect("write asset");
+    let svc = Services::new_isolated(store).with_assets_root(root.clone());
+
+    let r = svc
+        .read_asset_chunk(ws.clone(), "workspace-asset://host/img.png".into(), 6, 100)
+        .await
+        .expect("read chunk");
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "assetId": "img.png",
+            "mimeType": "image/png",
+            "content": "d29ybGQ=",
+            "bytesRead": 5,
+            "size": 11,
+        })
+    );
+    let err = svc
+        .read_asset_chunk(ws, "img.png".into(), 0, 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+}
+
 // ---------------------------------------------------------------------------
 // task.* tests
 // ---------------------------------------------------------------------------
@@ -24280,6 +24314,88 @@ mod file_tracking {
         ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         (tmp, Services::new_isolated(store), ws_id)
+    }
+
+    /// `git.showFileChunk` serves offset windows of the raw blob bytes with
+    /// the `git.showFile` path/ref rules: HEAD and the index ref, a missing
+    /// path as an empty blob, and the shared chunk length cap.
+    #[intent_test_macros::daemon_test]
+    async fn git_show_file_chunk_windows_blob_bytes() {
+        use base64::Engine as _;
+        let repo = init_git_repo();
+        let bytes: Vec<u8> = (0..1_000_u32)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        std::fs::write(repo.dir.join("bin.dat"), &bytes).unwrap();
+        let git = Repository::open(&repo.dir).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(std::path::Path::new("bin.dat")).unwrap();
+        index.write().unwrap();
+        let (_tmp, svc, ws_id) = svc_with_repo(&repo).await;
+        let decode = |v: &serde_json::Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v["content"].as_str().unwrap())
+                .unwrap()
+        };
+
+        // The staged blob at the index ref, windowed; a window crossing the
+        // end is shortened and one past it is empty.
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), ":0".into(), None, 100, 50)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), bytes[100..150]);
+        assert_eq!(w["bytesRead"], 50);
+        assert_eq!(w["size"], 1_000);
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), ":0".into(), None, 990, 50)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), bytes[990..]);
+        let w = svc
+            .git_show_file_chunk(
+                ws_id.clone(),
+                "bin.dat".into(),
+                ":0".into(),
+                None,
+                5_000,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(w["bytesRead"], 0);
+        assert_eq!(w["size"], 1_000);
+
+        // HEAD does not have it yet: an empty blob, like git.showFile.
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), "HEAD".into(), None, 0, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            w,
+            serde_json::json!({ "content": "", "bytesRead": 0, "size": 0 })
+        );
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "seed.txt".into(), "HEAD".into(), None, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), b"seed");
+
+        // Zero and over-cap lengths are InvalidParams.
+        for length in [0, crate::feature_ports::IMPORT_MAX_CHUNK_BYTES as u64 + 1] {
+            let err = svc
+                .git_show_file_chunk(
+                    ws_id.clone(),
+                    "seed.txt".into(),
+                    "HEAD".into(),
+                    None,
+                    0,
+                    length,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        }
     }
 
     /// Agent-initiated `git.agentCommit` with no `files` commits only the

@@ -1985,8 +1985,18 @@ async fn dispatch(
         "note.readAsset" => {
             let ws = require_ws_note(params)?;
             let asset = require_str_param(params, "asset")?;
+            let max_bytes = bounded_read::max_bytes_param(params)?;
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            bounded_read::bound_asset(to_result_value(&result)?, max_bytes)
+        }
+        "note.readAssetChunk" => {
+            let ws = require_ws_note(params)?;
+            let asset = require_str_param(params, "asset")?;
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.read_asset_chunk(ws, asset, offset, length)
+                .await
+                .map_err(domain_to_rpc)
         }
         "note.saveAsset" => {
             let ws = require_ws_note(params)?;
@@ -3764,11 +3774,35 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // read to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let max_bytes = bounded_read::max_bytes_param(params)?;
             let r = api
                 .git_show_file(ws, file_path, git_ref, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(r)
+            match r.get("content").and_then(Value::as_str) {
+                Some(text) => bounded_read::bound_text(
+                    "git.showFile",
+                    "git.showFileChunk",
+                    text.to_string(),
+                    max_bytes,
+                    |content| json!({ "content": content }),
+                ),
+                None => Ok(r),
+            }
+        }
+        "git.showFileChunk" => {
+            // One offset window of the blob `git.showFile` reads (same
+            // path/ref/root rules), as base64; sent over a transfer
+            // connection when `git.showFile` reports `truncated`.
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let git_ref = require_str_param(params, "ref")?;
+            let git_root_id = opt_git_root_id(params);
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.git_show_file_chunk(ws, file_path, git_ref, git_root_id, offset, length)
+                .await
+                .map_err(domain_to_rpc)
         }
         "git.numstat" => {
             // §5.6 extension: per-file additions/deletions for a workspace's
@@ -5049,9 +5083,21 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None, opt_git_root_id(params))
+            let max_bytes = bounded_read::max_bytes_param(params)?;
+            let content = api
+                .file_read(ws, path, None, opt_git_root_id(params))
                 .await
-                .map_err(domain_to_rpc)
+                .map_err(domain_to_rpc)?;
+            match content {
+                Value::String(text) => bounded_read::bound_text(
+                    "file.read",
+                    "file.readChunk",
+                    text,
+                    max_bytes,
+                    Value::String,
+                ),
+                other => Ok(other),
+            }
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
@@ -6654,3 +6700,6 @@ mod catalog_lists;
 
 #[cfg(test)]
 mod tests;
+
+mod bounded_read;
+pub use bounded_read::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
