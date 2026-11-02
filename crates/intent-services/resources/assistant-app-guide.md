@@ -996,6 +996,23 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent-trace/components/{AgentTracePanel,AgentTraceView,TraceWaterfall,TraceDetails}.svelte; src/store/renderer/slices/agent-trace/; src/lib/utils/open-message.ts; messages/en.json. -->
+
+**Agent Overview** (**Cmd+Shift+D** on macOS, **Ctrl+Shift+D** elsewhere) shows the
+workspace's latest agent activity, however old, as one timeline: each agent, its turns,
+and its tool calls appear as bars with duration, cost, tokens, and errors. Idle time
+between bursts of work, overnight too, shrinks to a short break, so durations count
+working time, and the axis names each day where its work begins. Click a row, or press
+Enter on it, to jump to that moment in the agent's chat, which opens beside the
+overview: a turn lands on its prompt and a tool call on the call itself. The row's
+details, such as errors, input, output, and start time, open next to its bar; the arrow
+keys move them between rows. To read a long agent or turn, choose **Zoom in** in its
+details; **Show all** or Escape zooms back out. Click the error count to open each
+failed call in turn.
+Tool calls stay in the timeline for 6 hours, and cost and tokens for 3 days; older turns
+show without them, and the totals leave them out. Cost appears only when the provider
+reports it.
+
 Workspace file links open a file panel. Markdown files open in a read-only preview
 that renders Mermaid diagrams. For files in the main workspace checkout, relative image paths such as
 `charts/chart.png` resolve from the Markdown file's folder and cannot reach
