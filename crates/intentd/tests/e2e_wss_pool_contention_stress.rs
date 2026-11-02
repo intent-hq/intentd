@@ -1,16 +1,17 @@
 //! Stress test: concurrent writes must not starve reads (pool-contention fix).
 //!
-//! Drives 30+ concurrent note writes over WSS and asserts that a lightweight
-//! read RPC (`workspace.list`) issued mid-load responds within a small bound
-//! (see `contention_budget`), proving the single-writer/read pool split
-//! (fix/sqlite-pool-contention) prevents pool exhaustion and
-//! `database is locked` errors.
+//! Drives 30 concurrent note writes over WSS while the test holds the single
+//! write connection, and asserts that a lightweight read RPC
+//! (`workspace.list`) completes while every write is still waiting, proving
+//! the single-writer/read pool split (fix/sqlite-pool-contention) keeps reads
+//! off the writer. Neither test reads a clock: a timed bound on the read
+//! failed on loaded CI runners (intentd#2917).
 
 use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{now_iso, AgentId, Result as CoreResult, WorkspaceApi};
@@ -199,24 +200,19 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
-/// Latency budget for a lightweight read issued mid-storm.
-///
-/// `baseline` is the measured latency of the same lightweight RPC on this
-/// host just before the storm starts. The CI runner may be co-tenant with up
-/// to 7 other heavy jobs on one box (monorepo#1239), where scheduler + TLS
-/// contention alone pushes an unloaded lightweight WSS call into multi-second
-/// territory, so the budget scales with the observed per-call cost instead of
-/// assuming an exclusive machine. A genuine pool-starvation regression still
-/// trips the bound: it couples the read's latency to the whole storm's
-/// duration, far beyond 4x an unloaded call on the same host.
-fn contention_budget(floor: Duration, baseline: Duration) -> Duration {
-    floor.max(baseline * 4)
+/// Hang guard for one RPC. It only bounds a regression that never answers:
+/// both tests prove their point by what completes while something else is
+/// held or missing, not by how long it took.
+fn rpc_guard() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
 }
 
-/// 30 concurrent note writes + read RPC mid-load must respond within the
-/// co-tenancy-calibrated `contention_budget`. Proves the single-writer/read
-/// pool split prevents pool exhaustion and `database is locked` errors under
-/// heavy concurrent write load.
+/// 30 concurrent note writes + a read RPC issued while the test holds the
+/// single write connection: the read must complete while every write is still
+/// queued behind the writer. Proves the single-writer/read pool split
+/// prevents pool exhaustion and `database is locked` errors under heavy
+/// concurrent write load. A read that needed the writer (or a read connection
+/// a waiting write had taken) would hang into [`rpc_guard`] instead.
 #[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn concurrent_writes_do_not_starve_reads() {
     let srv = start().await;
@@ -253,20 +249,14 @@ async fn concurrent_writes_do_not_starve_reads() {
         note_ids.push(note_id);
     }
 
-    // Baseline: the same lightweight read with zero concurrent load, to
-    // calibrate the starvation bound to this host's current per-call cost.
-    let baseline_start = Instant::now();
-    let baseline_resp = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":998,"method":"workspace.list"}"#,
-    )
-    .await;
-    let baseline = baseline_start.elapsed();
-    assert!(
-        baseline_resp.get("result").is_some(),
-        "baseline workspace.list must succeed: {baseline_resp}"
-    );
+    // Hold the only write connection: every write below queues behind it
+    // until the read has answered.
+    let held = srv
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write connection");
 
     // Spawn 30 concurrent note write tasks.
     let mut write_tasks = Vec::new();
@@ -289,23 +279,23 @@ async fn concurrent_writes_do_not_starve_reads() {
 
     // Issue a lightweight read RPC mid-load (workspace.list).
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let start = Instant::now();
-    let list_resp = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":999,"method":"workspace.list"}"#,
+    let list_resp = tokio::time::timeout(
+        rpc_guard(),
+        wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            r#"{"jsonrpc":"2.0","id":999,"method":"workspace.list"}"#,
+        ),
     )
-    .await;
-    let elapsed = start.elapsed();
-
-    // Assert: the mid-load read is not latency-coupled to the write storm.
-    // A pool-exhaustion regression makes the read wait out the writers, far
-    // beyond 4x the unloaded baseline on the same host.
-    let budget = contention_budget(Duration::from_secs(2), baseline);
-    assert!(
-        elapsed < budget,
-        "workspace.list took {elapsed:?} (budget {budget:?}, unloaded baseline {baseline:?}) — read pool is blocked by writers"
+    .await
+    .expect("workspace.list must answer while the writer is held — read pool is blocked by writers");
+    let still_queued = write_tasks.iter().filter(|t| !t.is_finished()).count();
+    assert_eq!(
+        still_queued,
+        write_tasks.len(),
+        "the read must complete while every write is still queued behind the held writer"
     );
+    drop(held);
     assert_eq!(list_resp["id"], 999);
     assert!(
         list_resp.get("result").is_some(),
@@ -329,11 +319,18 @@ async fn concurrent_writes_do_not_starve_reads() {
 }
 
 /// monorepo#958 scaling regression: with 100+ agents carrying multi-KB
-/// transcripts, concurrent `agent.list` lifecycle refreshes stay fast and do
-/// NOT starve unrelated lightweight reads (`note.list`). Before the bounded
-/// projections, each `agent.list` hydrated + decoded every transcript
-/// (~6 MB of content JSON here), saturating the read pool; the issue's live
-/// evidence was note refreshes pool-timing-out behind `agent.list`.
+/// transcripts, concurrent `agent.list` lifecycle refreshes must not read the
+/// transcripts, so they cannot starve unrelated lightweight reads
+/// (`note.list`). Before the bounded projections, each `agent.list` hydrated
+/// + decoded every transcript (~6 MB of content JSON here), saturating the
+/// read pool; the issue's live evidence was note refreshes pool-timing-out
+/// behind `agent.list`.
+///
+/// After seeding, the test renames `agent_message` out of reach: the bounded
+/// projection is served from per-session columns maintained at write time,
+/// so every `agent.list` must still return the full projection, while one
+/// that touched the transcript table fails with "no such table". That proves
+/// the read cost does not scale with transcripts without timing anything.
 #[intent_test_macros::daemon_test(flavor = "multi_thread")]
 async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
     use intent_core::{AgentSession, AgentStatus, WorkspaceId};
@@ -426,22 +423,12 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             .expect("seed agent with transcript");
     }
 
-    // Baseline: the same lightweight read with zero concurrent load, to
-    // calibrate the starvation bound to this host's current per-call cost.
-    let baseline_start = Instant::now();
-    let baseline_resp = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":998,"method":"note.list","params":{{"workspaceId":"{ws_id}"}}}}"#
-        ),
-    )
-    .await;
-    let baseline = baseline_start.elapsed();
-    assert!(
-        baseline_resp["result"]["notes"].is_array(),
-        "baseline note.list must succeed: {baseline_resp}"
-    );
+    // Put the transcripts out of reach: any read of `agent_message` from here
+    // on fails, so a projection that still hydrates transcripts cannot pass.
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_out_of_reach")
+        .execute(srv.store.write_pool())
+        .await
+        .expect("hide the transcript table");
 
     // 8 concurrent agent.list refreshes (the FE lifecycle-refresh pattern).
     let mut list_tasks = Vec::new();
@@ -450,45 +437,43 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
         let cfg = srv.cfg.clone();
         let ws = ws_id.clone();
         list_tasks.push(intent_core::spawn_daemon(async move {
-            let start = Instant::now();
             let frame = format!(
                 r#"{{"jsonrpc":"2.0","id":{},"method":"agent.list","params":{{"workspaceId":"{}"}}}}"#,
                 100 + i,
                 ws,
             );
-            let resp = wss_call(port, cfg, &frame).await;
-            (resp, start.elapsed())
+            tokio::time::timeout(rpc_guard(), wss_call(port, cfg, &frame))
+                .await
+                .expect("agent.list answers")
         }));
     }
 
-    // Mid-load, the unrelated lightweight read must respond promptly.
+    // Mid-load, the unrelated lightweight read must succeed.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let start = Instant::now();
-    let notes = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":999,"method":"note.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    let notes = tokio::time::timeout(
+        rpc_guard(),
+        wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":999,"method":"note.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+            ),
         ),
     )
-    .await;
-    let note_elapsed = start.elapsed();
+    .await
+    .expect("note.list answers mid-load");
     assert!(
         notes["result"]["notes"].is_array(),
         "note.list must succeed mid-load: {notes}"
     );
-    let note_budget = contention_budget(Duration::from_secs(2), baseline);
-    assert!(
-        note_elapsed < note_budget,
-        "note.list took {note_elapsed:?} (budget {note_budget:?}, unloaded baseline {baseline:?}) — starved behind agent.list transcript reads"
-    );
 
-    // Every refresh returns the full bounded projection quickly.
+    // Every refresh returns the full bounded projection without touching a
+    // transcript row.
     for task in list_tasks {
-        let (resp, elapsed) = task.await.expect("agent.list task panicked");
-        let agents = resp["result"]["agents"]
-            .as_array()
-            .unwrap_or_else(|| panic!("agent.list must succeed: {resp}"));
+        let resp = task.await.expect("agent.list task panicked");
+        let agents = resp["result"]["agents"].as_array().unwrap_or_else(|| {
+            panic!("agent.list must succeed without reading agent_message (transcript hydration is back?): {resp}")
+        });
         assert_eq!(agents.len(), 100);
         for lite in agents {
             assert_eq!(lite["messageCount"], 60);
@@ -499,11 +484,6 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
                 "projection carries the newest assistant row: {lite}"
             );
         }
-        let list_budget = contention_budget(Duration::from_secs(5), baseline);
-        assert!(
-            elapsed < list_budget,
-            "agent.list took {elapsed:?} (budget {list_budget:?}, unloaded baseline {baseline:?}) with 100 seeded agents — transcript hydration is back"
-        );
     }
 
     srv.ws.stop().await;

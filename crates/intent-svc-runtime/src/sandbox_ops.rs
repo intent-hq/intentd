@@ -11,38 +11,49 @@ use intent_store::{Sandbox, SandboxStatus, Store};
 use intent_core::now_iso;
 use intent_services::feature_api::nested_repos::{is_dirty, stage_all_skipping_nested};
 
-/// Test hook: artificial delay (milliseconds) at the top of
-/// [`provision_sandbox`], standing in for a slow `CoW` clone of a large
-/// checkout. Lets e2e tests prove provisioning runs off the delegate
-/// critical path (monorepo#871). NOTE: this seam is compiled into release
-/// binaries too (release-mode e2e runs need it); it is inert unless the
-/// namespaced env var is set to a positive integer.
-pub(crate) const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
-
 /// Test hook: force [`provision_sandbox`] to fail with an internal error
-/// (after the optional delay above), exercising the fallback-to-shared-mode
+/// (after the optional gate below), exercising the fallback-to-shared-mode
 /// path on provisioning failure. Inert unless set to `1`.
 pub(crate) const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
 
-/// Parse the delay override in milliseconds; anything unset, non-numeric, or
-/// non-positive disables the hook.
-fn test_provision_delay_from(raw: Option<&str>) -> Option<Duration> {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
+/// Test hook: hold [`provision_sandbox`] at its top until a file appears at
+/// this path, standing in for a slow `CoW` clone of a large checkout. Lets
+/// e2e tests prove provisioning runs off the delegate critical path
+/// (monorepo#871): the test decides when provisioning settles, so it needs no
+/// clock (it replaced a 10 s delay whose wall-clock bound failed on loaded CI
+/// runners, intentd#2917). NOTE: this seam is compiled into release binaries
+/// too (release-mode e2e runs need it); it is inert unless the namespaced env
+/// var is set to a nonblank path.
+pub(crate) const TEST_PROVISION_GATE_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_GATE";
+
+/// How often the gate hook looks for its file.
+const TEST_PROVISION_GATE_POLL: Duration = Duration::from_millis(20);
+
+/// Parse the gate path; anything unset or blank disables the hook.
+fn test_provision_gate_from(raw: Option<&str>) -> Option<PathBuf> {
+    raw.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
-/// Apply the test-only provisioning seams: sleep out the configured delay,
-/// then fail if the error hook is armed. No-op when neither env var is set.
+/// Wait until `gate` exists.
+async fn wait_for_test_provision_gate(gate: &std::path::Path) {
+    while !tokio::fs::try_exists(gate).await.unwrap_or(false) {
+        tokio::time::sleep(TEST_PROVISION_GATE_POLL).await;
+    }
+}
+
+/// Apply the test-only provisioning seams: wait for the gate file, then fail
+/// if the error hook is armed. No-op when neither env var is set.
 async fn apply_test_provision_hooks() -> Result<()> {
-    if let Some(delay) =
-        test_provision_delay_from(std::env::var(TEST_PROVISION_DELAY_MS_ENV).ok().as_deref())
+    if let Some(gate) =
+        test_provision_gate_from(std::env::var(TEST_PROVISION_GATE_ENV).ok().as_deref())
     {
         tracing::warn!(
-            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            "provision_sandbox: artificial delay (test seam)"
+            gate = %gate.display(),
+            "provision_sandbox: waiting for the gate file (test seam)"
         );
-        tokio::time::sleep(delay).await;
+        wait_for_test_provision_gate(&gate).await;
     }
     if std::env::var(TEST_PROVISION_ERROR_ENV).is_ok_and(|v| v == "1") {
         return Err(Error::Internal(
@@ -1047,27 +1058,35 @@ mod test_hook_tests {
     use super::*;
 
     #[test]
-    fn unset_disables_delay() {
-        assert_eq!(test_provision_delay_from(None), None);
-    }
-
-    #[test]
-    fn positive_millis_enable_delay() {
+    fn gate_is_a_nonblank_path() {
+        assert_eq!(test_provision_gate_from(None), None);
+        assert_eq!(test_provision_gate_from(Some("  ")), None);
         assert_eq!(
-            test_provision_delay_from(Some("10000")),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(
-            test_provision_delay_from(Some(" 500 ")),
-            Some(Duration::from_millis(500))
+            test_provision_gate_from(Some(" /x/gate ")),
+            Some(PathBuf::from("/x/gate"))
         );
     }
 
-    #[test]
-    fn invalid_values_disable_delay() {
-        for raw in ["0", "-5", "abc", "", "1.5"] {
-            assert_eq!(test_provision_delay_from(Some(raw)), None, "raw={raw:?}");
+    #[tokio::test(start_paused = true)]
+    async fn gate_holds_until_its_file_appears() {
+        let dir = intent_services::feature_api::test_support::test_tempdir("intentd-provision-gate-");
+        let gate = dir.path().join("open");
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { wait_for_test_provision_gate(&gate).await }
+        });
+        for _ in 0..10 {
+            tokio::time::sleep(TEST_PROVISION_GATE_POLL).await;
         }
+        assert!(!waiter.is_finished(), "the gate must hold while its file is absent");
+        std::fs::write(&gate, b"").expect("open the gate");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            waiter,
+        )
+        .await
+        .expect("the gate opens once its file exists")
+        .expect("waiter task");
     }
 }
 

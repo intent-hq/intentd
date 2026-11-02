@@ -84,11 +84,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use intentd_test_support::source_lint::{
-    cfg_test_items, lex, markers_by_line, rust_files, skip_group, skip_whitespace, statement_line,
-    Literal, Marker,
+    markers_by_line, parse_count_baseline, skip_group, skip_whitespace, statement_line,
+    test_code_files, Marker, TestCodeText,
 };
 
 /// Opt-out tag: `// fixed-deadline: allow — <reason>`.
@@ -492,110 +492,6 @@ fn resolve<'a>(bindings: &'a [Binding], name: &str, offset: usize) -> Option<&'a
         .max_by_key(|b| (b.scope.0, b.kind == "let", b.offset))
 }
 
-/// Rewrites every `#[cfg(all(…, test, …))]` attribute in blanked `chars` to
-/// a padded `#[cfg(test)]` (length and newlines preserved), so
-/// [`cfg_test_items`] — which matches only the bare form — finds those test
-/// modules too. `any(…)` / `not(…)` predicates are left alone: they also
-/// compile outside tests.
-fn normalize_cfg_all_test(chars: &mut [char]) {
-    let mut i = 0;
-    while i < chars.len() {
-        let head = (chars[i] == '#')
-            .then(|| {
-                ["#", "[", "cfg", "(", "all", "("]
-                    .iter()
-                    .try_fold(i, |j, token| expect(chars, j, token))
-            })
-            .flatten();
-        let Some(args_start) = head else {
-            i += 1;
-            continue;
-        };
-        let args_end = skip_group(chars, args_start - 1, '(', ')');
-        let args: String = chars[args_start..args_end.saturating_sub(1)]
-            .iter()
-            .collect();
-        let mut depth = 0usize;
-        let mut has_test = false;
-        let mut current = String::new();
-        for c in args.chars().chain(std::iter::once(',')) {
-            match c {
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => {
-                    has_test |= current.trim() == "test";
-                    current.clear();
-                    continue;
-                }
-                _ => {}
-            }
-            current.push(c);
-        }
-        let Some(end) = [")", "]"]
-            .iter()
-            .try_fold(args_end, |j, token| expect(chars, j, token))
-        else {
-            i += 1;
-            continue;
-        };
-        if has_test {
-            let mut replacement = "#[cfg(test)]".chars();
-            for c in chars[i..end].iter_mut().filter(|c| **c != '\n') {
-                *c = replacement.next().unwrap_or(' ');
-            }
-        }
-        i = end;
-    }
-}
-
-/// Rewrites every `#[cfg(any(test, feature = "test-hooks"))]` attribute in
-/// blanked `chars` to a padded `#[cfg(test)]`, like
-/// [`normalize_cfg_all_test`]: the `test-hooks` feature only builds test
-/// seams for other crates' tests, and CI keeps it out of the production
-/// feature graph (scripts/check-test-hooks-feature.sh). The feature name is
-/// blanked with the literal, so it is read from `literals`.
-fn normalize_cfg_test_hooks(chars: &mut [char], literals: &[Literal]) {
-    let mut i = 0;
-    while i < chars.len() {
-        let head = (chars[i] == '#')
-            .then(|| {
-                [
-                    "#", "[", "cfg", "(", "any", "(", "test", ",", "feature", "=",
-                ]
-                .iter()
-                .try_fold(i, |j, token| expect(chars, j, token))
-            })
-            .flatten();
-        let Some(after_eq) = head else {
-            i += 1;
-            continue;
-        };
-        // The blanked literal reads as whitespace, so find it by offset: the
-        // first literal at or after `=` with only whitespace before it.
-        let end = literals
-            .iter()
-            .find(|l| l.offset >= after_eq)
-            .filter(|l| chars[after_eq..l.offset].iter().all(|c| c.is_whitespace()))
-            .filter(|l| !l.raw && l.text == "test-hooks")
-            .and_then(|l| {
-                [")", ")", "]"]
-                    .iter()
-                    .try_fold(l.offset + l.text.chars().count() + 2, |k, token| {
-                        expect(chars, k, token)
-                    })
-            });
-        let Some(end) = end else {
-            i += 1;
-            continue;
-        };
-        let mut replacement = "#[cfg(test)]".chars();
-        for c in chars[i..end].iter_mut().filter(|c| **c != '\n') {
-            *c = replacement.next().unwrap_or(' ');
-        }
-        i = end;
-    }
-}
-
 /// A fixed deadline with no reasoned marker: its 1-based line and text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Deadline {
@@ -608,67 +504,11 @@ struct Deadline {
     via: Option<String>,
 }
 
-/// What one source file contributes: its unmarked deadlines in test code,
-/// and the out-of-line modules whose files are test code too.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Scan {
-    deadlines: Vec<Deadline>,
-    /// `(name, Some(path attr))` per out-of-line test module: every
-    /// `#[cfg(test)] mod name;`, plus every `mod name;` of a whole test file.
-    test_mods: Vec<(String, Option<String>)>,
-}
-
-/// Every plain `mod name;` declaration in blanked `chars`: the char range of
-/// the item (from after the previous `;` / `{` / `}` through its `;`, so it
-/// covers any `#[path = "…"]`) and the name.
-fn out_of_line_mods(chars: &[char]) -> Vec<(usize, usize, String)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let at_word = is_ident(chars[i]) && (i == 0 || !is_ident(chars[i - 1]));
-        let Some((word, end)) = at_word.then(|| ident_at(chars, i)).flatten() else {
-            i += 1;
-            continue;
-        };
-        if word == "mod" {
-            let name_at = skip_whitespace(chars, end);
-            if let Some((name, after)) = ident_at(chars, name_at) {
-                if let Some(semi) = expect(chars, after, ";") {
-                    let start = chars[..i]
-                        .iter()
-                        .rposition(|c| matches!(c, ';' | '{' | '}'))
-                        .map_or(0, |b| b + 1);
-                    out.push((start, semi, name));
-                }
-            }
-        }
-        i = end;
-    }
-    out
-}
-
-/// The `#[path = "…"]` value inside `[start, end)` of `src`, if any.
-fn path_attr(chars: &[char], literals: &[Literal], start: usize, end: usize) -> Option<String> {
-    literals
-        .iter()
-        .filter(|lit| (start..end).contains(&lit.offset))
-        .find(|lit| {
-            let before = chars[..lit.offset]
-                .iter()
-                .rposition(|c| !c.is_whitespace())
-                .filter(|p| chars[*p] == '=');
-            before.is_some_and(|p| word_before(chars, p) == "path")
-        })
-        .map(Literal::cooked)
-}
-
-/// Scans `src`: the whole file when `whole_file_is_test`, otherwise only its
-/// `#[cfg(test)]` items.
-fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
-    let lexed = lex(src);
-    let mut chars: Vec<char> = lexed.blanked.chars().collect();
-    normalize_cfg_all_test(&mut chars);
-    normalize_cfg_test_hooks(&mut chars, &lexed.literals);
+/// The unmarked fixed deadlines in the test code of `src`: the whole file
+/// when `whole_file_is_test`, otherwise only its `#[cfg(test)]` items.
+fn scan_source(src: &str, whole_file_is_test: bool) -> Vec<Deadline> {
+    let text = TestCodeText::new(src, whole_file_is_test);
+    let chars = &text.chars;
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(
             chars
@@ -679,14 +519,8 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
         )
         .collect();
     let line_of = |offset: usize| line_starts.partition_point(|start| *start <= offset);
-    let items = cfg_test_items(&chars);
-    let in_test = |offset: usize| {
-        whole_file_is_test
-            || items
-                .iter()
-                .any(|item| (item.start..item.end).contains(&offset))
-    };
-    let markers = markers_by_line(src, &lexed.line_comments, TAG);
+    let in_test = |offset: usize| text.in_test(offset);
+    let markers = markers_by_line(src, &text.lexed.line_comments, TAG);
     let marker = |line: usize| {
         line.checked_sub(1)
             .and_then(|above| markers.get(above))
@@ -694,8 +528,8 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
             .unwrap_or(Marker::Absent)
     };
     let lines: Vec<&str> = src.lines().collect();
-    let bindings = bindings(&chars);
-    let deadlines = deadline_candidates(&chars)
+    let bindings = bindings(chars);
+    deadline_candidates(chars)
         .into_iter()
         .filter(|candidate| in_test(candidate.offset))
         .filter_map(|candidate| {
@@ -709,12 +543,12 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
             let line = line_of(candidate.offset);
             let mut consulted = vec![
                 marker(line),
-                marker(statement_line(&chars, candidate.offset)),
+                marker(statement_line(chars, candidate.offset)),
             ];
             if let Some(binding) = fixed {
                 let binding_line = line_of(binding.offset);
                 consulted.push(marker(binding_line));
-                consulted.push(marker(statement_line(&chars, binding.offset)));
+                consulted.push(marker(statement_line(chars, binding.offset)));
                 via = Some(format!(
                     "{} {} (line {binding_line})",
                     binding.kind, binding.name
@@ -730,64 +564,7 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
                 via,
             })
         })
-        .collect();
-    let mut test_mods: Vec<(String, Option<String>)> = items
-        .iter()
-        .filter_map(|item| {
-            let name = item.out_of_line_mod.clone()?;
-            Some((
-                name,
-                path_attr(&chars, &lexed.literals, item.start, item.end),
-            ))
-        })
-        .collect();
-    if whole_file_is_test {
-        for (start, end, name) in out_of_line_mods(&chars) {
-            let entry = (name, path_attr(&chars, &lexed.literals, start, end));
-            if !test_mods.contains(&entry) {
-                test_mods.push(entry);
-            }
-        }
-    }
-    Scan {
-        deadlines,
-        test_mods,
-    }
-}
-
-/// Test code by file-name convention under a crate's `src/` (`rel` is
-/// relative to that `src/`).
-fn is_conventional_test_file(rel: &Path) -> bool {
-    let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    name == "tests.rs"
-        || name.ends_with("_tests.rs")
-        || rel
-            .parent()
-            .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "tests"))
-}
-
-/// The files and directories a `#[cfg(test)] mod name;` in `file` makes
-/// test code.
-fn test_mod_targets(file: &Path, name: &str, path: Option<&str>) -> Vec<PathBuf> {
-    let dir = file.parent().unwrap_or(Path::new(""));
-    if let Some(path) = path {
-        let target = dir.join(path);
-        return vec![target.with_extension(""), target];
-    }
-    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let base = if matches!(stem, "mod" | "lib" | "main") {
-        dir.to_path_buf()
-    } else {
-        dir.join(stem)
-    };
-    vec![base.join(format!("{name}.rs")), base.join(name)]
-}
-
-fn display_rel(rel: &Path) -> String {
-    rel.components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+        .collect()
 }
 
 /// What [`scan_tree`] found.
@@ -799,120 +576,30 @@ struct Tree {
     whole: BTreeSet<String>,
 }
 
-/// Scans every crate: `tests/` files and conventional `src/` test files
-/// whole, other `src/` files for their `#[cfg(test)]` items, then — until
-/// nothing changes — promotes to whole every `src/` file an out-of-line test
-/// module resolves to (including modules declared by a promoted file).
+/// Scans the test code of every crate file (see
+/// [`intentd_test_support::source_lint::test_code_files`] for what counts).
 fn scan_tree(root: &Path) -> Tree {
-    let crates_dir = root.join("crates");
-    let mut krates: Vec<PathBuf> = fs::read_dir(&crates_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
-        .map(|entry| entry.expect("crate dir entry").path())
-        .filter(|path| path.is_dir())
-        .collect();
-    krates.sort();
-    let mut pending = Vec::new();
-    let mut partial = Vec::new();
-    for krate in &krates {
-        let tests = krate.join("tests");
-        if tests.is_dir() {
-            pending.extend(rust_files(&tests));
-        }
-        let src = krate.join("src");
-        if src.is_dir() {
-            for file in rust_files(&src) {
-                let rel = file.strip_prefix(&src).expect("under src").to_path_buf();
-                if is_conventional_test_file(&rel) {
-                    pending.push(file);
-                } else {
-                    partial.push(file);
-                }
-            }
-        }
-    }
-    let read = |file: &Path| {
-        fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()))
-    };
-    let mut scans: BTreeMap<PathBuf, Scan> = BTreeMap::new();
-    let mut targets = Vec::new();
-    let mut sources = BTreeMap::new();
-    for file in &partial {
-        let src = read(file);
-        let scan = scan_source(&src, false);
-        for (name, path) in &scan.test_mods {
-            targets.extend(test_mod_targets(file, name, path.as_deref()));
-        }
-        scans.insert(file.clone(), scan);
-        sources.insert(file.clone(), src);
-    }
-    let mut whole = BTreeSet::new();
-    loop {
-        pending.extend(
-            partial
-                .iter()
-                .filter(|file| !whole.contains(*file))
-                .filter(|file| targets.iter().any(|target| file.starts_with(target)))
-                .cloned(),
-        );
-        if pending.is_empty() {
-            break;
-        }
-        for file in std::mem::take(&mut pending) {
-            if !whole.insert(file.clone()) {
-                continue;
-            }
-            let scan = match sources.get(&file) {
-                Some(src) => scan_source(src, true),
-                None => scan_source(&read(&file), true),
-            };
-            for (name, path) in &scan.test_mods {
-                targets.extend(test_mod_targets(&file, name, path.as_deref()));
-            }
-            scans.insert(file, scan);
-        }
-    }
-    let rel = |file: &Path| display_rel(file.strip_prefix(root).expect("under root"));
+    let files = test_code_files(root);
     Tree {
-        deadlines: scans
-            .into_iter()
-            .map(|(file, scan)| (rel(&file), scan.deadlines))
+        whole: files
+            .iter()
+            .filter(|file| file.whole)
+            .map(|file| file.rel.clone())
             .collect(),
-        whole: whole.iter().map(|file| rel(file)).collect(),
+        deadlines: files
+            .into_iter()
+            .map(|file| {
+                let found = scan_source(&file.src, file.whole);
+                (file.rel, found)
+            })
+            .collect(),
     }
 }
 
 /// Parses the baseline: `<path> <count>` per line, blank lines and `#`
 /// comments ignored, paths strictly increasing, counts positive.
 fn parse_baseline(text: &str) -> Result<BTreeMap<String, usize>, String> {
-    let mut out = BTreeMap::new();
-    let mut previous: Option<String> = None;
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let n = i + 1;
-        let (path, count) = line
-            .rsplit_once([' ', '\t'])
-            .ok_or_else(|| format!("line {n}: expected `<path> <count>`, got {raw:?}"))?;
-        let path = path.trim_end();
-        let count: usize = count
-            .parse()
-            .map_err(|_| format!("line {n}: count {count:?} is not a number"))?;
-        if count == 0 {
-            return Err(format!(
-                "line {n}: a file with no fixed deadlines has no entry; remove {raw:?}"
-            ));
-        }
-        if let Some(prev) = previous.as_deref().filter(|prev| *prev >= path) {
-            return Err(format!(
-                "line {n}: entries must be sorted by path and unique, but {path:?} follows {prev:?}"
-            ));
-        }
-        previous = Some(path.to_string());
-        out.insert(path.to_string(), count);
-    }
-    Ok(out)
+    parse_count_baseline(text, "fixed deadlines")
 }
 
 /// The failure report, empty when the tree matches the baseline and every
@@ -1040,7 +727,6 @@ fn fixed_test_deadlines_use_the_timeout_multiplier() {
 
 fn lines_in(src: &str) -> Vec<usize> {
     scan_source(src, true)
-        .deadlines
         .iter()
         .map(|d| d.line)
         .collect()
@@ -1133,68 +819,20 @@ mod helpers;
 #[path = \"thing/tests/extra.rs\"]
 mod extra;
 ";
-    let scan = scan_source(src, false);
     assert_eq!(
-        scan.deadlines.iter().map(|d| d.line).collect::<Vec<_>>(),
+        scan_source(src, false)
+            .iter()
+            .map(|d| d.line)
+            .collect::<Vec<_>>(),
         vec![8]
     );
     assert_eq!(
-        scan.test_mods,
-        vec![
-            ("helpers".to_string(), None),
-            (
-                "extra".to_string(),
-                Some("thing/tests/extra.rs".to_string())
-            ),
-        ]
-    );
-    assert_eq!(
         scan_source(src, true)
-            .deadlines
             .iter()
             .map(|d| d.line)
             .collect::<Vec<_>>(),
         vec![2, 8]
     );
-}
-
-#[test]
-fn test_module_files_resolve_like_rustc() {
-    let lib = Path::new("crates/a/src/lib.rs");
-    assert_eq!(
-        test_mod_targets(lib, "helpers", None),
-        vec![
-            PathBuf::from("crates/a/src/helpers.rs"),
-            PathBuf::from("crates/a/src/helpers"),
-        ]
-    );
-    let file = Path::new("crates/a/src/store.rs");
-    assert_eq!(
-        test_mod_targets(file, "harness", None),
-        vec![
-            PathBuf::from("crates/a/src/store/harness.rs"),
-            PathBuf::from("crates/a/src/store/harness"),
-        ]
-    );
-    assert_eq!(
-        test_mod_targets(file, "x", Some("store/t/x.rs")),
-        vec![
-            PathBuf::from("crates/a/src/store/t/x"),
-            PathBuf::from("crates/a/src/store/t/x.rs"),
-        ]
-    );
-    for (rel, expected) in [
-        ("tests.rs", true),
-        ("a/tests.rs", true),
-        ("a/bus_tests.rs", true),
-        ("a/tests/mod.rs", true),
-        ("a/tests/b/c.rs", true),
-        ("a/latests.rs", false),
-        ("a/test_support.rs", false),
-        ("lib.rs", false),
-    ] {
-        assert_eq!(is_conventional_test_file(Path::new(rel)), expected, "{rel}");
-    }
 }
 
 #[test]
@@ -1214,7 +852,7 @@ async fn t() {
     timeout(Duration::from_secs(5), f);
 }
 ";
-    let found = scan_source(src, true).deadlines;
+    let found = scan_source(src, true);
     assert_eq!(
         found
             .iter()
@@ -1321,7 +959,7 @@ fn shared() { timeout(Duration::from_secs(5), f); }
 #[cfg(any(test, feature = r\"test-hooks\"))]
 fn raw() { timeout(Duration::from_secs(5), f); }
 ";
-    let found = scan_source(src, false).deadlines;
+    let found = scan_source(src, false);
     assert_eq!(found.iter().map(|d| d.line).collect::<Vec<_>>(), vec![2, 5]);
 }
 
@@ -1350,7 +988,7 @@ fn prod_unix() { timeout(Duration::from_secs(5), f); }
 #[cfg(all(testing, unix))]
 fn other() { timeout(Duration::from_secs(5), f); }
 ";
-    let found = scan_source(src, false).deadlines;
+    let found = scan_source(src, false);
     assert_eq!(
         found.iter().map(|d| d.line).collect::<Vec<_>>(),
         vec![3, 6, 12]
@@ -1374,38 +1012,8 @@ fn t() {
     assert_eq!(lines_in(src), vec![5, 7, 8, 9]);
 }
 
-#[test]
-fn a_whole_test_file_makes_its_out_of_line_modules_test_code() {
-    let src = "\
-mod helpers;
-#[path = \"shared/fixtures.rs\"]
-pub(crate) mod fixtures;
-mod inline { }
-use some::module;
-";
-    assert_eq!(
-        scan_source(src, true).test_mods,
-        vec![
-            ("helpers".to_string(), None),
-            (
-                "fixtures".to_string(),
-                Some("shared/fixtures.rs".to_string())
-            ),
-        ]
-    );
-    assert_eq!(scan_source(src, false).test_mods, vec![]);
-    assert_eq!(
-        test_mod_targets(Path::new("crates/a/src/bus_tests.rs"), "helpers", None),
-        vec![
-            PathBuf::from("crates/a/src/bus_tests/helpers.rs"),
-            PathBuf::from("crates/a/src/bus_tests/helpers"),
-        ]
-    );
-}
-
 fn hits_in(src: &str, whole_file_is_test: bool) -> Vec<(usize, Option<String>)> {
     scan_source(src, whole_file_is_test)
-        .deadlines
         .into_iter()
         .map(|d| (d.line, d.via))
         .collect()
@@ -1529,7 +1137,7 @@ async fn t() {
     timeout(window, f);
 }
 ";
-    let found = scan_source(src, true).deadlines;
+    let found = scan_source(src, true);
     assert_eq!(
         found
             .iter()

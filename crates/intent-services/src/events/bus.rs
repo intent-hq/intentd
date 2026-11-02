@@ -61,7 +61,7 @@ const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 const WRITER_CHANNEL_CAPACITY: usize = 512;
 
 /// Max events drained per batch by the writer task (to bound transaction size).
-const WRITER_BATCH_SIZE: usize = 64;
+pub(crate) const WRITER_BATCH_SIZE: usize = 64;
 
 /// How long a principal's attribution name is reused by
 /// [`EventBus::publish`] before it is re-read from the store. Sized for one
