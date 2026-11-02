@@ -476,10 +476,12 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
     let id = AgentId::from("agent-remote-return-ko");
     let primary = FakeRuntime::new();
     let backup_run = FakeRuntime::new();
+    let backup_again = FakeRuntime::new();
     let port = ScriptedRemote::new(vec![
         Launch::Runs(primary.clone()),
         Launch::Runs(backup_run.clone()),
         Launch::Fails("the provider is not signed in on this machine"),
+        Launch::Runs(backup_again.clone()),
     ]);
     let (_tmp, mgr, backup) =
         failed_over_with_return_due(port.clone(), &primary, &backup_run, &id, &ws).await;
@@ -505,6 +507,25 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
             "{needle:?} missing from {reason:?}"
         );
     }
+
+    // Review of intentd#2957: the next message continues on the backup
+    // (home's earlier output no longer skips the backoff).
+    send_as_user(&mgr, &id, &ws, "carry on").await;
+    // The backup also takes the undelivered "back home" message, so it runs
+    // two turns.
+    backup_again.finish.add_permits(2);
+    backup_again.wait_prompts(2).await;
+    wait_idle(&mgr, &id).await;
+    assert_eq!(port.asked.load(Ordering::SeqCst), 4, "home is not retried");
+    let delivered = format!("{:?}", backup_again.prompts.lock().unwrap());
+    assert!(delivered.contains("carry on"), "{delivered}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
+    let state = crate::provider_return::read_state(&session).expect("still away");
+    assert_eq!(
+        state.backoff_step, 1,
+        "home is not retried before its backoff"
+    );
 }
 
 /// Review of intentd#2957: in production the node starts the agent

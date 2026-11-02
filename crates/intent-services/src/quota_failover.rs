@@ -918,6 +918,12 @@ impl Services {
                 crate::provider_return::on_failed_return(state, None, chrono::Utc::now())
             }),
         };
+        // Home's earlier output (what made the return due early) is stale
+        // once it failed to start here: without dropping it, the next turn
+        // would bypass the backoff and retry home at once.
+        if pending.kind == RemoteSwitchKind::Return {
+            self.provider_quota_cache.clear_working(&pending.to);
+        }
         let restored_state = json!(previous_return_state).to_string();
         let restored = self
             .store
