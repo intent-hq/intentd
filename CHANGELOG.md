@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.111] - 2026-11-02
+
+### 📚 Documentation
+
+- Explain workspace sidebar controls and unread dots ([#2967](https://github.com/intent-hq/intentd/pull/2967))
+
+
 ## [0.11.110] - 2026-11-02
 
 ### 🚀 Features
