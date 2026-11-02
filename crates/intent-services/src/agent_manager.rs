@@ -12145,19 +12145,22 @@ impl AgentManager {
             ),
             session.model.as_deref(),
         );
-        // The node runs the identity the agent was launched with. A changed
-        // provider or model is refused at `agent.setModel`; should one still
-        // reach here, stop the old run rather than keep using it silently.
-        // The one exception is quota failover, the only provider switch a
-        // remote agent allows: its run is replaced by one on the backup
-        // (intent-hq/intent#8317).
+        // The node runs the identity the agent was launched with. A switch
+        // `agent.setModel` accepted (checked against the machine's report)
+        // replaces the run with one on the new identity, and the fresh
+        // provider session gets the Intent history first; so does a quota
+        // switch onto a backup (intent-hq/intent#8317). Any other change of
+        // identity stops the old run rather than keep using it silently.
+        let switched = self.services.take_remote_model_switch(agent_id, session);
         let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
             Some(h.spawned_provider.as_str()) != session.provider.as_deref()
                 || h.spawned_model != session.model
         });
+        let mut replay_history = false;
         if identity_changed {
             boxed_await(|| self.kill_child_only(agent_id)).await;
-            if !self.services.remote_failover_pending(agent_id, session) {
+            replay_history = switched;
+            if !switched && !self.services.remote_failover_pending(agent_id, session) {
                 return Err(Error::InvalidParams(
                     "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
                 ));
@@ -12260,6 +12263,9 @@ impl AgentManager {
         match self.handles.lock().unwrap().get_mut(agent_id) {
             Some(h) => h.wake_listener = Some(listener),
             None => listener.abort(),
+        }
+        if replay_history {
+            self.recreated.lock().unwrap().insert(agent_id.clone());
         }
         Ok(StartedSession {
             session_id,

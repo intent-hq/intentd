@@ -542,11 +542,27 @@ pub const REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER: &str = "account-folder";
 /// sign-in.
 #[must_use]
 pub fn remote_compatibility_of(env: Option<&intent_acp::ProfileEnv>) -> RemoteCompatibility {
-    let keys: Vec<String> = env
-        .into_iter()
-        .flat_map(intent_acp::ProfileEnv::entries)
-        .filter(|(key, value)| value.is_some() && is_folder_path_key(key))
-        .map(|(key, _)| key.to_owned())
+    classify_set_keys(
+        env.into_iter()
+            .flat_map(intent_acp::ProfileEnv::entries)
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| key),
+    )
+}
+
+/// [`RemoteCompatibility`] of a saved environment document, for reads.
+fn remote_compatibility_of_doc(env: &EnvDoc) -> RemoteCompatibility {
+    classify_set_keys(env.entries.iter().filter_map(|entry| match entry {
+        StoredEnv::Set { key, .. } => Some(key.as_str()),
+        StoredEnv::Unset { .. } => None,
+    }))
+}
+
+/// The one rule: a configuration that sets an account folder is tied here.
+fn classify_set_keys<'a>(set_keys: impl Iterator<Item = &'a str>) -> RemoteCompatibility {
+    let keys: Vec<String> = set_keys
+        .filter(|key| is_folder_path_key(key))
+        .map(str::to_owned)
         .collect();
     if keys.is_empty() {
         RemoteCompatibility::Compatible
@@ -557,6 +573,59 @@ pub fn remote_compatibility_of(env: Option<&intent_acp::ProfileEnv>) -> RemoteCo
         }
     }
 }
+
+impl RemoteCompatibility {
+    /// The wire `RemoteIncompatibility` (§5.54 "Remote compatibility"):
+    /// `{ reason, keys }`, `None` when compatible. Names only, never values.
+    #[must_use]
+    pub fn incompatibility_json(&self) -> Option<Value> {
+        match self {
+            Self::Compatible => None,
+            Self::NotRemoteCompatible { reason, keys } => {
+                Some(json!({ "reason": reason, "keys": keys }))
+            }
+        }
+    }
+
+    /// Add `remoteCompatible` and, when false, `remoteIncompatibility` to a
+    /// read row.
+    fn annotate(&self, row: &mut Value) {
+        row["remoteCompatible"] = json!(matches!(self, Self::Compatible));
+        if let Some(incompatibility) = self.incompatibility_json() {
+            row["remoteIncompatibility"] = incompatibility;
+        }
+    }
+}
+
+/// `profile-not-remote-compatible` (§5.54, nodes.md remote machine errors):
+/// `reference` (as given; `display` is its readable name) sets an account
+/// folder, so it cannot run an agent on another machine. `-32602`, with the
+/// variable names but never their values.
+pub(crate) fn not_remote_compatible_error(
+    reference: &str,
+    display: &str,
+    reason: &str,
+    keys: &[String],
+) -> Error {
+    Error::provider_profile(
+        false,
+        format!(
+            "{display} uses an account folder ({}) that only exists on this backend, so it \
+             can't run on another machine. Pick a profile that uses the machine's own sign-in \
+             or an API key.",
+            keys.join(", ")
+        ),
+        json!({
+            "code": PROFILE_NOT_REMOTE_COMPATIBLE,
+            "providerRef": reference,
+            "reason": reason,
+            "keys": keys,
+        }),
+    )
+}
+
+/// `data.code` of [`not_remote_compatible_error`].
+pub const PROFILE_NOT_REMOTE_COMPATIBLE: &str = "profile-not-remote-compatible";
 
 /// Expand a leading `~` in an account-directory value at resolution time
 /// against the daemon user's home ([`intent_acp::profile_env::expand_account_dir`]).
@@ -1026,7 +1095,7 @@ async fn load_env(secrets: &AsyncSecretStore, profile_id: &str) -> Result<Option
 }
 
 fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> Value {
-    json!({
+    let mut row = json!({
         "id": meta.id,
         "providerRef": meta.provider_ref(),
         "baseProviderId": meta.base_provider,
@@ -1037,19 +1106,23 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
         "createdAt": meta.created_at,
         "updatedAt": meta.updated_at,
         "activation": { "runningProcesses": running_processes },
-    })
+    });
+    remote_compatibility_of_doc(env).annotate(&mut row);
+    row
 }
 
 /// The wire `DefaultConfig` of one base provider (masked except folder paths).
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
-    json!({
+    let mut row = json!({
         "baseProviderId": base,
         "providerRef": base,
         "name": name.unwrap_or(DEFAULT_NAME),
         "env": env.entries.iter().map(StoredEnv::masked_json).collect::<Vec<_>>(),
         "settingsFingerprint": env.fingerprint,
         "activation": { "runningProcesses": running },
-    })
+    });
+    remote_compatibility_of_doc(env).annotate(&mut row);
+    row
 }
 
 /// Prefix of a Default configuration's activation-registry key. The `:`
@@ -1494,6 +1567,35 @@ impl Services {
         Ok(remote_compatibility_of(env.as_ref()))
     }
 
+    /// [`Self::resolve_remote_profile_env`] for a configuration about to run
+    /// an agent on another machine (placement, or a remote agent's
+    /// `agent.setModel`): refused with [`not_remote_compatible_error`] when
+    /// it sets an account folder. Returns the overlay the machine would get.
+    ///
+    /// # Errors
+    /// `profile-not-remote-compatible`, or as
+    /// [`Self::resolve_remote_profile_env`].
+    pub(crate) async fn resolve_remote_compatible_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        let env = self.resolve_remote_profile_env(reference).await?;
+        if let RemoteCompatibility::NotRemoteCompatible { reason, keys } =
+            remote_compatibility_of(env.as_ref())
+        {
+            let display = if is_qualified_ref(reference) {
+                let profiles = self.provider_profiles.profiles().ok();
+                readable_selection(reference, profiles.as_ref().map(|p| p.as_slice()))
+            } else {
+                format!("The {reference} Default configuration")
+            };
+            return Err(not_remote_compatible_error(
+                reference, &display, reason, &keys,
+            ));
+        }
+        Ok(env)
+    }
+
     async fn resolve_profile_env_for(
         &self,
         reference: &str,
@@ -1837,13 +1939,40 @@ impl Services {
         Ok(self.resolve_profile_env(reference).await?.map(Arc::new))
     }
 
-    /// `providers.catalog` `profiles`: one summary per saved profile, no env
-    /// and no counts. An unreadable profile file yields an empty list.
-    pub(crate) fn provider_profile_summaries(&self) -> Vec<Value> {
-        self.provider_profiles
-            .profiles()
-            .map(|profiles| profiles.iter().map(ProfileMeta::summary_json).collect())
-            .unwrap_or_default()
+    /// `providers.catalog` `profiles`: one summary per saved profile (no env
+    /// values and no counts; an unreadable profile file yields an empty
+    /// list) with its remote compatibility, plus `defaultRemoteIncompatibility`: the Default
+    /// configurations that cannot run on another machine, `None` when none
+    /// (§5.54 "Remote compatibility in the catalog"). A row whose saved
+    /// environment cannot be read carries neither field (clients then treat
+    /// it as compatible and placement decides).
+    pub(crate) async fn provider_profile_catalog(&self) -> (Vec<Value>, Option<Value>) {
+        let profiles = self.provider_profiles.profiles().unwrap_or_default();
+        let mut rows = Vec::with_capacity(profiles.len());
+        for meta in profiles.iter() {
+            let mut row = meta.summary_json();
+            match load_env(&self.secrets, &meta.id).await {
+                Ok(env) => remote_compatibility_of_doc(&env.unwrap_or_default()).annotate(&mut row),
+                Err(e) => {
+                    tracing::warn!(profile = %meta.id, error = %e, "catalog: profile environment unreadable; remote compatibility omitted");
+                }
+            }
+            rows.push(row);
+        }
+        let mut defaults = serde_json::Map::new();
+        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
+            let Ok(env) = self.load_default_env(saved).await else {
+                continue;
+            };
+            if let Some(incompatibility) = remote_compatibility_of_doc(&env).incompatibility_json()
+            {
+                defaults.insert(base.clone(), incompatibility);
+            }
+        }
+        (
+            rows,
+            (!defaults.is_empty()).then_some(Value::Object(defaults)),
+        )
     }
 
     /// `host.providerAuthStatus` for profile references (PROTOCOL §5.54).

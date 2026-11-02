@@ -5646,8 +5646,10 @@ impl Services {
     /// written: the documented subset only, a provider selection whose
     /// profile environment resolves (a missing or unselectable profile fails
     /// here, never falling back to the node's own login; the overlay itself
-    /// is resolved again when the agent starts), then a machine that runs
-    /// the platform, offers the provider and `model` and has capacity.
+    /// is resolved again when the agent starts) and can run on another
+    /// machine (one that sets an account folder is
+    /// `profile-not-remote-compatible`), then a machine that runs the
+    /// platform, offers the provider and `model` and has capacity.
     async fn admit_remote_agent(
         &self,
         workspace_id: &WorkspaceId,
@@ -5656,7 +5658,7 @@ impl Services {
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
         placement.check_remote_supported()?;
-        let profile = self.resolve_remote_profile_env(provider).await?;
+        let profile = self.resolve_remote_compatible_env(provider).await?;
         let needs = intent_core::remote_launch::RemoteLaunchNeeds {
             provider: crate::provider_profiles::parse_profile_ref(provider)
                 .map_or(provider, |(base, _)| base)
@@ -6323,19 +6325,12 @@ impl Services {
         provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
-        // A remote agent's provider process runs on its node with the
-        // identity it was launched with; switching it there is not supported
-        // yet, so refuse rather than report a switch that never happens.
-        // Quota failover is the only provider switch a remote agent allows
-        // (`quota_failover`): to a backup that can run on its machine,
-        // announced once the node runs it (intent-hq/intent#8317).
-        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
-            .is_some()
-        {
-            return Err(Error::InvalidParams(
-                "remote-model-change-unsupported: a remote agent keeps the provider and model it was launched with; create a new agent to use another".into(),
-            ));
-        }
+        // A remote agent switches on its own machine (§5.54 "Switching a
+        // remote agent's model"): the next turn stops its run and relaunches
+        // it there on the new identity, with the Intent history replayed.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        );
         // An explicit providerId must be a registered provider before any
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).
@@ -6400,7 +6395,10 @@ impl Services {
                     .await?
                 }
             };
-            if current_effective.as_deref() != Some(pid.as_str()) {
+            // A remote agent's provider runs on its machine, so this
+            // backend's installation and sign-in say nothing about it; the
+            // machine's report decides below.
+            if remote.is_none() && current_effective.as_deref() != Some(pid.as_str()) {
                 self.ensure_provider_available_for(
                     "agent.setModel",
                     &pid,
@@ -6448,6 +6446,10 @@ impl Services {
         // next turn then respawns the new provider's binary, opens a fresh
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
+        if let Some(view) = &remote {
+            self.check_remote_switch(view, provider.as_deref().unwrap_or_default(), &model_id)
+                .await?;
+        }
         let workspace_id = session.workspace_id;
         // A fresh token marks this write as a manual choice, in the same
         // statement as the selection (PROTOCOL §5.54 shared quota state):
@@ -6482,6 +6484,12 @@ impl Services {
         // the old one (PROTOCOL §5.54 backup failover) is dropped.
         self.clear_provider_return_state(&workspace_id, &agent_id)
             .await;
+        if remote.is_some() {
+            self.remote_model_switches
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), (provider.clone(), Some(model_id.clone())));
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -6490,6 +6498,53 @@ impl Services {
         )
         .await;
         Ok(json!({ "success": true, "modelId": model_id }))
+    }
+
+    /// Whether a remote agent can switch to `reference` and `model` on its
+    /// machine (`agent.setModel`), before anything is written: the
+    /// configuration must be remote-compatible, and the machine's cached
+    /// report must offer the provider (its own sign-in unless a profile is
+    /// selected) and the model (`"default"` skips the model).
+    ///
+    /// # Errors
+    /// `profile-not-remote-compatible`, `model-unavailable` naming the
+    /// agent's machine, or `placement-unavailable` when the machine is gone.
+    async fn check_remote_switch(
+        &self,
+        view: &intent_core::remote_launch::RemotePlacementView,
+        reference: &str,
+        model: &str,
+    ) -> Result<()> {
+        let profile = self.resolve_remote_compatible_env(reference).await?;
+        let rows = self.store.list_exposed_machines().await?;
+        let provider = crate::provider_profiles::parse_profile_ref(reference)
+            .map_or(reference, |(base, _)| base);
+        intent_core::machine_selection::check_switch_on_machine(
+            &rows,
+            &view.node_id,
+            intent_core::machine_selection::PlacementRequest {
+                placement: &view.placement,
+                provider,
+                model: Some(model).filter(|model| *model != "default"),
+                with_profile: profile.is_some(),
+            },
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    /// Take the agent's accepted remote switch, if its session still names
+    /// it: the one change of identity its live run is replaced for (besides
+    /// a quota switch) instead of refused at start.
+    pub(crate) fn take_remote_model_switch(
+        &self,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) -> bool {
+        self.remote_model_switches
+            .lock()
+            .unwrap()
+            .remove(agent_id)
+            .is_some_and(|(provider, model)| session.provider == provider && session.model == model)
     }
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When
@@ -20613,3 +20668,9 @@ pub(crate) fn agent_features_snapshot(
     }
     Ok(snapshot)
 }
+
+/// Remote agents' accepted `agent.setModel` switches (provider, model as
+/// written) awaiting the next start, which replaces the run on the agent's
+/// machine. In-memory: after a restart there is no live run to replace.
+pub(crate) type RemoteModelSwitches =
+    Arc<Mutex<HashMap<AgentId, (Option<String>, Option<String>)>>>;
