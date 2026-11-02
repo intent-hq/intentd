@@ -5,29 +5,30 @@ use intent_core::remote_launch::{RemotePlacementView, REMOTE_PLACEMENT_METADATA_
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use intent_store::Store;
 
-/// Apply `change` to the agent's view and store it. An agent without a
-/// view (not remote, or deleted) is left alone.
+/// Apply `change` to the agent's view and store it; `true` when the stored
+/// view changed. An agent without a view (not remote, or deleted) is left
+/// alone.
 pub(crate) async fn update(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
     change: impl FnOnce(&mut RemotePlacementView),
-) -> Result<()> {
+) -> Result<bool> {
     let session = match store.get_agent_session(agent_id).await {
         Ok(session) => session,
-        Err(Error::NotFound(_)) => return Ok(()),
+        Err(Error::NotFound(_)) => return Ok(false),
         Err(error) => return Err(error),
     };
     if &session.workspace_id != workspace_id {
-        return Ok(());
+        return Ok(false);
     }
     let Some(mut view) = RemotePlacementView::from_metadata(session.metadata.as_ref()) else {
-        return Ok(());
+        return Ok(false);
     };
     let before = view.clone();
     change(&mut view);
     if view == before {
-        return Ok(());
+        return Ok(false);
     }
     let encoded = serde_json::to_string(&view)
         .map_err(|e| Error::Internal(format!("encode remote placement: {e}")))?;
@@ -39,5 +40,6 @@ pub(crate) async fn update(
             &encoded,
             &intent_core::now_iso(),
         )
-        .await
+        .await?;
+    Ok(true)
 }

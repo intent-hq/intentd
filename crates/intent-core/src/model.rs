@@ -3690,7 +3690,14 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// (`lastAgentResponseTruncated` …
 /// `metadata.attentionRequestReasonTruncated`, all set on the worst-case
 /// row) add ≈ 190 B, putting the measured row at ≈ 6,030 B — inside the
-/// budget with ≈ 2% margin left. Typical rows are far smaller (the issue's 404-row
+/// budget with ≈ 2% margin left. Placed-agent rows then gained the remote
+/// placement (`nodeId`, `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`],
+/// `placement`, `effectiveIsolation`, and `placementError` at its write-time
+/// caps) so the agent list can show a remote agent's node and provisioning
+/// state without opening it: ≈ 1,110 B more, a measured ≈ 7,160 B worst case,
+/// and the budget rose to 7.5 KiB (≈ 7% margin). Only remote agents carry
+/// these fields, and only a failed start carries the ≈ 570 B
+/// `placementError`. Typical rows are far smaller (the issue's 404-row
 /// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
 /// attention request, sandbox fields, hooks AND monitors at once, and
 /// previews rarely all hit the cap), and the per-key allowlist
@@ -3701,7 +3708,7 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// paging `agent.list` — separate protocol decisions. The response-level
 /// frame fit ([`fit_agent_list_frame`]) is the non-protocol half of that:
 /// it lowers the preview cap per response when the row count demands it.
-pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 7 * 1024 + 512;
 
 /// Response-level byte budget for the serialized `agent.list` rows array
 /// (intent-hq/intent#5531, fourth recurrence of the oversize frame): the
@@ -3863,6 +3870,11 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "notificationsMuted",
     "pinned",
     "harnessVersion",
+    "nodeId",
+    "nodeName",
+    "placement",
+    "effectiveIsolation",
+    "placementError",
     "metadata",
 ];
 
@@ -5190,9 +5202,8 @@ impl AgentLite {
     /// List-path detail-field strip (intent-hq/intent#5383): drop the fields
     /// that only the open-agent (detail) UI reads — `harnessFeatures`,
     /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`, the
-    /// placed-agent fields (`nodeId`, `leaseId`, `nodeName`, `placement`,
-    /// `effectiveIsolation`, `placementError`),
-    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — so an
+    /// placed agent's `leaseId`, `metadata.pendingProposals`,
+    /// `metadata.proposalResolutions` — so an
     /// `agent.list` row carries only what list contexts render. Every one of
     /// these is presence-detected on the wire (`skip_serializing_if`), so a
     /// stripped row simply omits the key (absent, never `null`). `agent.list`
@@ -5201,16 +5212,15 @@ impl AgentLite {
     /// serving the full values. Serve-time projection only — nothing changes
     /// at write time. The key allowlist goldens [`AGENT_LIST_ROW_KEYS`] /
     /// [`AGENT_LIST_ROW_METADATA_KEYS`] pin the resulting shape.
+    ///
+    /// The other placed-agent fields (`nodeId`, `nodeName`, `placement`,
+    /// `effectiveIsolation`, `placementError`) stay on the row: the agent
+    /// list badges remote agents and shows their provisioning state, which
+    /// must follow `effectiveIsolation` from `pending` to `isolated` without
+    /// the agent being opened.
     pub fn strip_detail_only_fields(&mut self) {
         self.harness_features = None;
-        // Placed-agent fields (rung 3: no list UI reads them yet; served on
-        // agent.get / agent.getSession and create results).
-        self.node_id = None;
         self.lease_id = None;
-        self.node_name = None;
-        self.placement = None;
-        self.effective_isolation = None;
-        self.placement_error = None;
         self.effort_levels = None;
         self.context_references = None;
         self.file_blocks = None;
@@ -5229,10 +5239,12 @@ impl AgentLite {
     /// list row carries get the same truncation at a cap sized for
     /// the field — `metadata.attentionRequestReason` (a long reason blew
     /// the row budget in production, intent-hq/intent#5383) at the preview
-    /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
-    /// `metadata.sandboxPath` / `metadata.sandboxBranch` at
+    /// budget, `name` / `model` / `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`],
+    /// and `metadata.sandboxPath` / `metadata.sandboxBranch` at
     /// [`AGENT_LIST_PATH_CAP_BYTES`] — so every free-text string a list row
-    /// carries is bounded (`lastToolUse.name` is the one string left
+    /// carries is bounded (`placementError` is capped at write time,
+    /// [`crate::remote_launch::PLACEMENT_ERROR_DETAIL_MAX_BYTES`];
+    /// `lastToolUse.name` is the one string left
     /// untouched: it is a tool identifier, not free text, and the FE keys
     /// its tool classification on it). `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
@@ -5247,7 +5259,8 @@ impl AgentLite {
     /// `metadata.completionReportTruncated`,
     /// `metadata.attentionRequestReasonTruncated`; intent-hq/intent#7250
     /// follow-up) so clients never mistake a prefix for the full value; the
-    /// identifier-sized `name` / `model` / sandbox caps stay unflagged.
+    /// identifier-sized `name` / `model` / `nodeName` / sandbox caps stay
+    /// unflagged.
     /// `name` is never touched, so the FE's tool
     /// classification keeps working. These fields exist to render a one-line
     /// summary in list contexts, so `agent.list` applies this to every row;
@@ -5346,6 +5359,7 @@ impl AgentLite {
         // Identifier-sized caps stay unflagged: realistic values never reach them.
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.node_name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_branch, AGENT_LIST_PATH_CAP_BYTES);
         match self.last_tool_use.as_mut() {
@@ -8749,6 +8763,7 @@ mod tests {
         }));
         let long_reason = format!("blocked on {}", "q".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES));
         lite.metadata.attention_request_reason = Some(long_reason.clone());
+        lite.node_name = Some("N".repeat(AGENT_LIST_NAME_CAP_BYTES * 2));
 
         lite.cap_list_previews();
 
@@ -8789,6 +8804,10 @@ mod tests {
         // The non-preview strings land on their own smaller caps; realistic
         // values (a model slug, a short branch) pass through untouched.
         assert_eq!(lite.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+        assert_eq!(
+            lite.node_name.as_deref().map(str::len),
+            Some(AGENT_LIST_NAME_CAP_BYTES)
+        );
         assert_eq!(lite.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
         assert_eq!(
             lite.metadata.sandbox_path.as_deref().map(str::len),
