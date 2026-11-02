@@ -6,8 +6,10 @@
 //! CLI, so `retrieve()` degrades instantly and `search.codebase` is served by the
 //! ripgrep/symbol path. It asserts the engine reports `Available` (binary
 //! present, for `intentd doctor`) yet `search.codebase` returns ripgrep-backed
-//! results **quickly** — never the old 30s interactive-mode hang. It is
-//! **env-gated** so CI without `auggie`/credentials stays hermetic and green.
+//! results **without spawning auggie** — the old interactive-mode spawn hung
+//! until its 30s timeout. The real binary runs behind a recording shim, so the
+//! test sees every invocation. It is **env-gated** so CI without
+//! `auggie`/credentials stays hermetic and green.
 //!
 //! ## Running locally
 //!
@@ -27,10 +29,13 @@
 //! fails. This is the realistic "best-effort/local" form: CI does not provision
 //! auggie credentials, so the gated path simply does not run there.
 
+// The recording shim in front of the real binary is a POSIX shell script.
+#![cfg(unix)]
+
 use crate::common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use intent_context::{discovery, AuggieContextEngine, ContextEngine, EngineAvailability};
 use intent_core::{now_iso, Workspace, WorkspaceApi, WorkspaceId};
@@ -58,10 +63,15 @@ async fn auggie_context_engine_real_retrieve_e2e() {
     };
     eprintln!("auggie_context_e2e: using auggie at {}", bin.display());
 
+    // Drive the real binary through a shim that logs each invocation's
+    // arguments, so the test can tell which spawns the engine made.
+    let shim_dir = common::test_tempdir("intentd-auggie-shim-");
+    let (shim, invocations) = recording_shim(shim_dir.path(), &bin);
+
     // Availability is a non-error probe (§8.3); under Option A it still reports
     // binary presence for `intentd doctor`. Unavailable (incl. "needs login") →
     // skip cleanly.
-    let engine = AuggieContextEngine::new();
+    let engine = AuggieContextEngine::with_path(shim);
     match engine.availability().await {
         EngineAvailability::Available { name, version } => {
             eprintln!("auggie_context_e2e: engine available: {name} {version:?}");
@@ -103,7 +113,6 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         "auggie_context_e2e: search.codebase over {} …",
         workspace_path.display()
     );
-    let started = Instant::now();
     let r = svc
         .search_codebase(
             ws,
@@ -112,13 +121,16 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         )
         .await
         .expect("search.codebase must not error");
-    let elapsed = started.elapsed();
 
-    // The crux of M10 CE-3: no interactive-mode 30s hang. The old empty-args
-    // spawn timed out at 30s; the degraded path returns near-instantly.
+    // The crux of M10 CE-3: search never runs auggie beyond its bounded
+    // `--version` availability probe (made once above and again by the
+    // service). The old empty-args interactive spawn hung until its 30s
+    // timeout; it would show up here as a non-probe invocation.
+    let log = std::fs::read_to_string(&invocations).expect("read shim invocation log");
     assert!(
-        elapsed < Duration::from_secs(20),
-        "search.codebase took {elapsed:?}; expected a fast ripgrep-backed degrade, not a hang"
+        !log.is_empty() && log.lines().all(|line| line == "argv:--version"),
+        "search.codebase must degrade to ripgrep without spawning auggie \
+         beyond `--version` probes; shim saw:\n{log}"
     );
 
     assert_eq!(r["requestId"], "auggie-e2e");
@@ -137,11 +149,55 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         "every ripgrep match must carry a workspace-relative file: {matches:?}"
     );
     eprintln!(
-        "auggie_context_e2e: PASS — {} ripgrep-backed hit(s) in {elapsed:?}; first = {:?}",
+        "auggie_context_e2e: PASS — {} ripgrep-backed hit(s); first = {:?}",
         matches.len(),
         matches.first()
     );
 }
+
+/// Write an `auggie` shim in `dir` that appends `argv:<args>` to a log, then
+/// execs the real binary `bin`. Returns the shim path and the log path once
+/// the shim is safe to exec.
+fn recording_shim(dir: &Path, bin: &Path) -> (PathBuf, PathBuf) {
+    let shim = dir.join("auggie");
+    let log = dir.join("invocations.log");
+    std::fs::write(&log, "").expect("create shim invocation log");
+    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    // The real binary's dir leads PATH so a `#!/usr/bin/env node` launcher
+    // finds the node install it came with.
+    let bin_dir = bin.parent().unwrap_or_else(|| Path::new("/"));
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = {READY_PROBE} ] && exit 0\n\
+         printf 'argv:%s\\n' \"$*\" >> {log}\nPATH={bin_dir}:\"$PATH\" exec {bin} \"$@\"\n",
+        log = quote(&log),
+        bin_dir = quote(bin_dir),
+        bin = quote(bin),
+    );
+    std::fs::write(&shim, script).expect("write auggie shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod auggie shim");
+    // A child forked while the shim was open for writing holds that fd until
+    // its own exec, so exec of the fresh file can fail with ETXTBSY (and the
+    // engine would report auggie unavailable, skipping the test). No new
+    // copy of the closed fd can appear, so one clean exec settles it.
+    for _ in 0..400 {
+        match std::process::Command::new(&shim).arg(READY_PROBE).status() {
+            Ok(status) => {
+                assert!(status.success(), "auggie shim ready probe failed: {status}");
+                return (shim, log);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                // timing-guard: retry backoff; the next exec attempt observes readiness.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("exec auggie shim: {e}"),
+        }
+    }
+    panic!("auggie shim kept failing with ETXTBSY");
+}
+
+/// Shim argument that exits before logging or running the real binary.
+const READY_PROBE: &str = "--intentd-shim-ready";
 
 /// Build a minimal active workspace whose worktree points at `worktree` so
 /// `search.codebase` resolves its search root to that directory.

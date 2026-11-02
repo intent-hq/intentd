@@ -535,7 +535,6 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
         hello("timeout-client", true),
     )
     .await;
-    let started = Instant::now();
     let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
@@ -555,7 +554,8 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     assert_eq!(reverse["method"], "browser.exec");
     assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
     // Leave the reverse request unanswered and prove the same sticky-primary
-    // path used by ws.browser.exec reports the error inside the outer budget.
+    // path used by ws.browser.exec applies the 20s screenshot deadline, not
+    // the 30s default that would outlast the agent tool's outer budget.
     let err = timeout(
         intentd_test_support::test_timeout(Duration::from_secs(25)),
         call,
@@ -564,14 +564,16 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     .expect("inner screenshot timeout must settle first")
     .expect("join")
     .expect_err("unanswered screenshot must fail");
-    let elapsed = started.elapsed();
+    let message = err.to_string();
     assert!(
-        err.to_string()
-            .contains("reverse request timed out: browser.exec"),
+        message.contains("reverse request timed out: browser.exec"),
         "unexpected error: {err}"
     );
-    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
+    // The daemon-side timeout names the deadline it applied (§5.14).
+    assert!(
+        message.contains(" did not accept or answer the request within 20s"),
+        "screenshot must use the 20s reverse deadline: {err}"
+    );
 
     fx.ws.stop().await;
 }
