@@ -1386,27 +1386,44 @@ mod tests {
     }
 
     #[test]
-    fn paginated_read_output_cuts_an_oversized_escape_heavy_line() {
-        let quotes = "\"".repeat(300_000);
+    fn paginated_read_output_rebuilds_an_oversized_escape_heavy_line() {
+        let quotes = format!("{}é{}", "\"".repeat(300_000), "\\".repeat(100_000));
         let text = format!("older\n{quotes}\n");
         let snapshot = LineSnapshot {
-            bytes: text.into_bytes(),
+            bytes: text.clone().into_bytes(),
             total_lines: 2,
             start_line: 0,
             end_line: 2,
             retained_has_non_whitespace: true,
         };
-        let page = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
-        let size = serde_json::to_vec(&page).unwrap().len();
-        assert!(
-            size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
-            "page is {size} bytes"
-        );
-        assert_eq!(page["truncated"], true);
-        assert_eq!(page["items"].as_array().unwrap().len(), 1);
-        let token = page["nextToken"].as_str().unwrap().to_owned();
-        let next = render_output(&snapshot, "pty-1", "/tmp", Some(50), false, Some(&token));
-        assert_eq!(next["items"], serde_json::json!(["older"]));
+        let first = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        assert_eq!(first["lineContinues"], true);
+        let mut newest_first: Vec<String> = Vec::new();
+        let mut page = first;
+        let mut continues = false;
+        loop {
+            let size = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+                "page is {size} bytes"
+            );
+            for (n, item) in page["items"].as_array().unwrap().iter().enumerate() {
+                let item = item.as_str().unwrap();
+                if n == 0 && continues {
+                    let last = newest_first.last_mut().unwrap();
+                    *last = format!("{item}{last}");
+                } else {
+                    newest_first.push(item.to_owned());
+                }
+            }
+            continues = page["lineContinues"] == true;
+            let Some(token) = page["nextToken"].as_str().map(str::to_owned) else {
+                break;
+            };
+            page = render_output(&snapshot, "pty-1", "/tmp", Some(50), false, Some(&token));
+        }
+        newest_first.reverse();
+        assert_eq!(newest_first, vec!["older".to_owned(), quotes]);
     }
 
     #[tokio::test]

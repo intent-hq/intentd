@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use intent_core::{Error, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Directory under the daemon data dir that holds every script output log.
 pub(crate) const SCRIPT_OUTPUT_DIR: &str = "script-output";
@@ -834,7 +834,8 @@ fn paginate_file(
         }
         true
     })?;
-    let win = intent_services::feature_api::pagination::page_window(kept_len, limit, token);
+    let (win, cut) =
+        intent_services::feature_api::pagination::text_page_window(kept_len, limit, token);
     let mut items: Vec<String> = Vec::with_capacity(win.end - win.start);
     let mut peak = 0usize;
     if win.end > win.start {
@@ -857,6 +858,10 @@ fn paginate_file(
                 }
             }
         })?;
+    }
+    if let (Some(cut), Some(last)) = (cut, items.last_mut()) {
+        let keep = intent_services::feature_api::pagination::floor_char_boundary(last, cut);
+        last.truncate(keep);
     }
     let page = intent_services::feature_api::pagination::bound_text_page(
         &items,

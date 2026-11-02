@@ -406,6 +406,7 @@ pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
 }
 
 /// A page of items plus the opaque token for the next (older) page.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -415,6 +416,7 @@ pub struct Page<T> {
 /// Paginate a chronological (oldest→newest) slice into a newest→oldest page.
 /// Items within the returned page are ordered newest-first; `next_token` follows
 /// the contract in [`page_window`].
+#[cfg(test)]
 pub(crate) fn paginate_slice<T: Clone>(
     source: &[T],
     limit: Option<i64>,
@@ -442,17 +444,53 @@ pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) 
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    let win = page_window(lines.len(), limit, token);
-    bound_text_page(&lines[win.start..win.end], win.start, win.next_token)
+    let (win, cut) = text_page_window(lines.len(), limit, token);
+    let mut window = lines[win.start..win.end].to_vec();
+    if let (Some(cut), Some(last)) = (cut, window.last_mut()) {
+        *last = &last[..floor_char_boundary(last, cut)];
+    }
+    bound_text_page(&window, win.start, win.next_token)
 }
 
-/// The `{ items, nextToken, truncated? }` envelope for one text page window
-/// (`window` oldest→newest, starting at line `start`), within
+/// [`page_window`] for text pages, plus the in-line resume offset a
+/// [`bound_text_page`] token may carry: `{"b": end, "c": k}` means the
+/// window's newest line (index `end - 1`) still has its first `k` bytes to
+/// serve. Callers cut that line to `[..k]` (on a UTF-8 boundary) before
+/// budgeting the page.
+#[must_use]
+pub fn text_page_window(
+    len: usize,
+    limit: Option<i64>,
+    token: Option<&str>,
+) -> (PageWindow, Option<usize>) {
+    let win = page_window(len, limit, token);
+    let cut = token.and_then(decode_token).and_then(|v| {
+        let boundary = usize::try_from(v.get("b")?.as_u64()?).ok()?;
+        let cut = usize::try_from(v.get("c")?.as_u64()?).ok()?;
+        (boundary == win.end && win.end > win.start).then_some(cut)
+    });
+    (win, cut)
+}
+
+/// The largest UTF-8 boundary in `text` at or below `index`.
+#[must_use]
+pub fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut i = index.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The `{ items, nextToken, lineContinues? }` envelope for one text page
+/// window (`window` oldest→newest, starting at line `start`), within
 /// [`OUTPUT_TAIL_MAX_JSON_BYTES`] of JSON-escaped line text. Lines are taken
-/// newest first; when the budget stops the walk, `nextToken` is re-minted at
-/// the first line left out so the next page resumes there. A newest line too
-/// big on its own is cut to its first bytes that fit, with `truncated: true`
-/// (the rest of that one line is not served).
+/// newest first; when the budget stops the walk, `nextToken` resumes at the
+/// first line left out. A newest line too big on its own is served as its
+/// last bytes that fit (split on a UTF-8 boundary) with `lineContinues:
+/// true`, and `nextToken` resumes inside that line: the next page's newest
+/// item is the line's earlier part. Prepending each continued piece to the
+/// previous page's oldest item rebuilds every line exactly; no byte is lost.
 #[must_use]
 pub fn bound_text_page<S: AsRef<str>>(
     window: &[S],
@@ -462,16 +500,15 @@ pub fn bound_text_page<S: AsRef<str>>(
     let mut items: Vec<Value> = Vec::new();
     let mut used = 0usize;
     let mut first_kept = start + window.len();
-    let mut truncated = false;
+    let mut resume_in_line = None;
     for line in window.iter().rev() {
         let line = line.as_ref();
         let len = line.chars().map(json_escaped_len).sum::<usize>() + 3;
         if used + len > OUTPUT_TAIL_MAX_JSON_BYTES {
             if items.is_empty() {
-                let (head, _) = prefix_within_json_bytes(line, OUTPUT_TAIL_MAX_JSON_BYTES - 3);
-                items.push(Value::from(head));
-                first_kept -= 1;
-                truncated = true;
+                let (tail, _) = tail_within_json_bytes(line, OUTPUT_TAIL_MAX_JSON_BYTES - 3);
+                items.push(Value::from(tail));
+                resume_in_line = Some((first_kept, line.len() - tail.len()));
             }
             break;
         }
@@ -479,30 +516,16 @@ pub fn bound_text_page<S: AsRef<str>>(
         items.push(Value::from(line));
         first_kept -= 1;
     }
-    let next_token = if first_kept > start {
-        remint_backward_token(first_kept)
-    } else {
-        next_token
+    let next_token = match resume_in_line {
+        Some((end, cut)) => Some(encode_token(&json!({ "b": end, "c": cut }))),
+        None if first_kept > start => remint_backward_token(first_kept),
+        None => next_token,
     };
     let mut page = json!({ "items": items, "nextToken": next_token });
-    if truncated {
-        page["truncated"] = Value::Bool(true);
+    if resume_in_line.is_some() {
+        page["lineContinues"] = Value::Bool(true);
     }
     page
-}
-
-/// The longest prefix of `text` whose JSON-escaped size fits `budget`, and
-/// whether anything was dropped.
-fn prefix_within_json_bytes(text: &str, budget: usize) -> (&str, bool) {
-    let mut used = 0usize;
-    for (i, c) in text.char_indices() {
-        let len = json_escaped_len(c);
-        if used + len > budget {
-            return (&text[..i], true);
-        }
-        used += len;
-    }
-    (text, false)
 }
 
 /// Fit one list row in `budget` serialized bytes by dropping its largest

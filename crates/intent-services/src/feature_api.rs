@@ -206,8 +206,8 @@ pub mod tests {
 /// Cursor pagination over lists and text.
 pub mod pagination {
     pub use crate::pagination::{
-        bound_row, bound_text_page, page_window, paginate_text_lines, tail_within_json_bytes,
-        OUTPUT_TAIL_MAX_JSON_BYTES,
+        bound_row, bound_text_page, floor_char_boundary, page_window, paginate_text_lines,
+        tail_within_json_bytes, text_page_window, OUTPUT_TAIL_MAX_JSON_BYTES,
     };
 }
 

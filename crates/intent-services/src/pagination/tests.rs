@@ -495,21 +495,50 @@ fn paginate_text_lines_budgets_bytes_and_resumes_after_the_cut() {
     assert!(next["nextToken"].is_null());
 }
 
+/// Walk every page newest→oldest and rebuild the lines: a page with
+/// `lineContinues: true` ends with the tail of a line whose earlier part is
+/// the next page's newest item.
+fn rebuild(mut page_at: impl FnMut(Option<&str>) -> Value) -> Vec<String> {
+    let mut newest_first: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut continues = false;
+    loop {
+        let page = page_at(token.as_deref());
+        let size = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+            "page is {size} bytes"
+        );
+        for (n, item) in page["items"].as_array().unwrap().iter().enumerate() {
+            let item = item.as_str().unwrap();
+            if n == 0 && continues {
+                let last = newest_first.last_mut().unwrap();
+                *last = format!("{item}{last}");
+            } else {
+                newest_first.push(item.to_owned());
+            }
+        }
+        continues = page["lineContinues"] == true;
+        match page["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_owned()),
+            None => break,
+        }
+    }
+    assert!(!continues, "last page cannot continue a line");
+    newest_first.reverse();
+    newest_first
+}
+
 #[test]
-fn paginate_text_lines_cuts_an_oversized_escape_heavy_line() {
-    let quotes = "\"".repeat(300_000);
-    let text = format!("older\n{quotes}\n");
-    let env = paginate_text_lines(&text, Some(50), None);
-    let items = env["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(env["truncated"], true);
-    let size = serde_json::to_vec(&env).unwrap().len();
-    assert!(
-        size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
-        "page is {size} bytes"
-    );
-    let next = paginate_text_lines(&text, Some(50), env["nextToken"].as_str());
-    assert_eq!(next["items"], json!(["older"]));
+fn paginate_text_lines_rebuilds_an_oversized_escape_heavy_line_exactly() {
+    let quotes = format!("{}é{}", "\"".repeat(500_000), "\\".repeat(300_000));
+    let text = format!("older\n{quotes}\nnewer\n");
+    let first = paginate_text_lines(&text, Some(50), None);
+    assert_eq!(first["items"], json!(["newer"]));
+    let second = paginate_text_lines(&text, Some(50), first["nextToken"].as_str());
+    assert_eq!(second["lineContinues"], true);
+    let lines = rebuild(|token| paginate_text_lines(&text, Some(50), token));
+    assert_eq!(lines, vec!["older".to_owned(), quotes, "newer".to_owned()]);
 }
 
 #[test]
