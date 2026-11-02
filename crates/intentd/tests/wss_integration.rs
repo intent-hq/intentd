@@ -4532,6 +4532,20 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .as_str()
         .unwrap_or_else(|| panic!("agent id: {agent}"))
         .to_string();
+    // A peer top-level agent, so the guest's retire is not refused by the
+    // last-top-level-agent guard.
+    let peer = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer agent: {peer}"
+    );
     let note = wss_call(
         srv.port,
         srv.cfg.clone(),
