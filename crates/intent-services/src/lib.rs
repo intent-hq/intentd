@@ -2000,10 +2000,28 @@ impl Services {
     }
 
     /// Pin the PR-monitor debounce window, bypassing the live
-    /// `prMonitor.debounceSeconds` setting (test wiring). Values below the
-    /// floor are clamped when read.
+    /// `prMonitor.debounceSeconds` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `seconds` is below
+    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. The window
+    /// is read through the same floor as the live setting, so a smaller
+    /// value would silently become the floor: a test expecting an immediate
+    /// wake would see the change stay pending and mistake it for a delivery
+    /// bug. A test that wants delivery now pins a long window and calls
+    /// `pr_monitor_flush_op`.
     #[must_use]
+    #[track_caller]
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
+        let floor = intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS;
+        assert!(
+            seconds >= floor,
+            "with_pr_monitor_debounce_seconds({seconds}) is below the {floor}s floor the daemon \
+             enforces, so it would silently wait {floor}s instead. To deliver pending changes \
+             immediately, pin a long window (e.g. 3600) and call `pr_monitor_flush_op`; \
+             otherwise pass at least MIN_PR_MONITOR_DEBOUNCE_SECONDS."
+        );
         self.pr_monitor_debounce_seconds = Some(seconds);
         self
     }
@@ -31234,11 +31252,19 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
-            self.agent_list_user_messages_op(agent_id, workspace_id, preview_chars)
-                .await
+            self.agent_list_user_messages_page_op(
+                agent_id,
+                workspace_id,
+                preview_chars,
+                limit,
+                next_token,
+            )
+            .await
         })
     }
 

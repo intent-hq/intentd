@@ -11,7 +11,7 @@ use intent_core::{AgentId, BrowserTab, ClientId, Error, ReverseTarget, Workspace
 use serde_json::{json, Value};
 
 use super::browser_client_pin_tests::{setup, FakeRegistry};
-use intent_services::feature_api::{EventBus, Services, SubscriptionFilter};
+use intent_services::feature_api::{EventBus, Services, Subscription, SubscriptionFilter};
 
 fn agent(id: &str) -> AgentId {
     AgentId::from_string(id)
@@ -65,11 +65,22 @@ pub(super) async fn register_tab(
     .expect("tab registered")
 }
 
-async fn tab_events(bus: &EventBus, ws: &WorkspaceId, want: usize) -> Vec<Value> {
-    let mut sub = bus.subscribe(SubscriptionFilter {
+/// Subscribe to `ws`'s events. Call it before the action under test: the
+/// subscription captures everything published from here on, however long
+/// the action's store writes take on a busy runner.
+fn subscribe_tab_events(bus: &EventBus, ws: &WorkspaceId) -> Subscription {
+    bus.subscribe(SubscriptionFilter {
         workspace_id: Some(ws.0.clone()),
         ..Default::default()
-    });
+    })
+}
+
+/// The first `want` `browser:*` events on `sub`. Call it once the action
+/// has returned: `publish().await` resolves only after the event is
+/// broadcast, so the hang guard covers in-memory delivery alone, never the
+/// action's own work (which once ran the guard out on an overloaded
+/// coverage runner, intentd merge-group run 41295819142).
+async fn next_tab_events(sub: &mut Subscription, want: usize) -> Vec<Value> {
     let mut out = Vec::new();
     while out.len() < want {
         let batch = tokio::time::timeout(
@@ -390,18 +401,13 @@ async fn list_tabs_carries_displayed_as_reported() {
         out["result"][0]
     );
 
-    let events = tokio::spawn({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 1).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
     let updated = svc
         .browser_upsert_tab(host.clone(), report(Some(true)))
         .await
         .expect("re-reported with displayed");
     assert_eq!(updated.displayed, Some(true));
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 1).await;
     assert_eq!(evs[0]["type"], "browser:tab-updated");
     assert_eq!(evs[0]["data"]["changes"], json!({ "displayed": true }));
     assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
@@ -450,12 +456,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     assert_eq!(row.displayed, Some(true), "desktop-b reported the fact");
 
     // Now drive the migration the way a confirmed `claimTab` does.
-    let events = tokio::spawn({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 1).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
     svc.browser_tab_claim_migrate(
         "user-tab",
         &ClientId::from_string("desktop-a"),
@@ -475,7 +476,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
         row.displayed, None,
         "desktop-a has not reported the layout fact yet"
     );
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 1).await;
     assert_eq!(evs[0]["type"], "browser:tab-updated");
     assert_eq!(
         evs[0]["data"]["changes"],
@@ -514,12 +515,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     // owner immediately (no wait for the host's own report) with
     // `changes: { ownerAgentId }` only — the host's `displayed` stays.
     register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
-    let events = tokio::spawn({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 1).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
     svc.browser_tab_claim_migrate(
         "local-tab",
         &ClientId::from_string("desktop-a"),
@@ -536,7 +532,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
     assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
     assert_eq!(row.displayed, Some(true), "same-host claim keeps the fact");
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 1).await;
     assert_eq!(evs[0]["type"], "browser:tab-updated");
     assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
     assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
@@ -747,12 +743,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         .await
         .expect("pin a");
 
-    let events = intent_core::spawn_daemon({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 2).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
 
     // The claim dispatches to the pinned client and its reply is held.
     let claim = intent_core::spawn_daemon({
@@ -809,7 +800,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         );
         assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
     }
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 2).await;
     assert_eq!(evs[0]["type"], "browser:tab-updated");
     assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
     // The re-homed row drops desktop-a's `displayed` fact; the same-host
@@ -860,16 +851,11 @@ async fn set_browser_client_migrates_claimed_tabs() {
         .unwrap();
     register_tab(&svc, &other_ws, "elsewhere", "desktop-a", Some("agent-1")).await;
 
-    let events = tokio::spawn({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 2).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
     svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
         .await
         .expect("pin");
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 2).await;
     let mut moved: Vec<&str> = evs
         .iter()
         .map(|e| e["data"]["tab"]["tabId"].as_str().unwrap())
@@ -1015,18 +1001,13 @@ async fn close_tab_routes_online_and_force_tombstones_offline() {
         ReverseTarget::Client(ClientId::from_string("desktop-b"))
     );
 
-    let events = tokio::spawn({
-        let bus = bus.clone();
-        let ws = ws.clone();
-        async move { tab_events(&bus, &ws, 1).await }
-    });
-    tokio::task::yield_now().await;
+    let mut events = subscribe_tab_events(&bus, &ws);
     let out = svc
         .browser_close_tab("stale".into(), true)
         .await
         .expect("forced");
     assert_eq!(out, json!({ "ok": true }));
-    let evs = events.await.unwrap();
+    let evs = next_tab_events(&mut events, 1).await;
     assert_eq!(evs[0]["type"], "browser:tab-closed");
     assert_eq!(evs[0]["data"]["tab"]["tabId"], "stale");
     assert!(svc

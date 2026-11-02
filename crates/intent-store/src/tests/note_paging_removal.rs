@@ -7,7 +7,9 @@
 //! keep working afterwards, that the cleanup is resumable and does not block
 //! writes, and that a large note save no longer holds the single writer long
 //! enough to block an unrelated write.
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::*;
 
@@ -198,9 +200,99 @@ async fn drop_migration_keeps_notes_and_comments_and_comments_still_work() {
     assert_eq!(remaining, ["new", "root"]);
 }
 
+/// Rows inserted, updated or deleted on the single write connection since it
+/// opened, including rows changed by triggers (`SQLite`'s `total_changes()`).
+async fn writer_changes(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(store.write_pool())
+        .await
+        .unwrap()
+}
+
+/// Rows changed per table on the single write connection, triggers included,
+/// from `SQLite`'s update hook (which skips `WITHOUT ROWID` tables).
+#[derive(Clone, Default)]
+struct WriterRowLog(Arc<Mutex<BTreeMap<String, i64>>>);
+
+impl WriterRowLog {
+    async fn install(store: &Store) -> Self {
+        let log = Self::default();
+        let sink = Arc::clone(&log.0);
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        conn.lock_handle()
+            .await
+            .unwrap()
+            .set_update_hook(move |change| {
+                *sink
+                    .lock()
+                    .unwrap()
+                    .entry(change.table.to_string())
+                    .or_default() += 1;
+            });
+        log
+    }
+
+    /// The rows logged since the last call, leaving out the full-text index's
+    /// own tables (`note_fts*`), whose size follows the note's text.
+    fn take_outside_search(&self) -> BTreeMap<String, i64> {
+        let mut rows = std::mem::take(&mut *self.0.lock().unwrap());
+        rows.retain(|table, _| !table.starts_with("note_fts"));
+        rows
+    }
+}
+
+/// What a save and an unrelated note insert queued behind it changed
+/// together: every row (`total_changes()`), and the rows outside the
+/// full-text index, per table.
+struct SaveRows {
+    total: i64,
+    outside_search: BTreeMap<String, i64>,
+}
+
+/// Save `note` as revision `rev + 1` while an unrelated note insert queues
+/// behind it.
+async fn save_beside_an_unrelated_write(
+    store: &Store,
+    log: &WriterRowLog,
+    note: &Note,
+    rev: i64,
+) -> SaveRows {
+    let before = writer_changes(store).await;
+    log.take_outside_search();
+    let saver = store.clone();
+    let snapshot = note.clone();
+    let save = tokio::spawn(async move {
+        let lock = saver
+            .lock_note_content(&snapshot.workspace_id, &snapshot.id)
+            .await;
+        saver
+            .update_note_with_version(&lock, &snapshot, Some(rev), &version_author(), &now_iso())
+            .await
+    });
+    tokio::task::yield_now().await;
+    store
+        .insert_note(&task_note(
+            &note.workspace_id,
+            &format!("unrelated {rev}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let (saved_rev, _) = save.await.unwrap().unwrap();
+    assert_eq!(saved_rev, rev + 1);
+    SaveRows {
+        total: writer_changes(store).await - before,
+        outside_search: log.take_outside_search(),
+    }
+}
+
 /// intent-hq/intent#7515: saving a large note rebuilt its page index while
 /// holding the only write connection, so an unrelated write queued behind it
-/// for seconds. A save now writes the note row and its history only.
+/// for seconds. A save now writes the note row and its history only: outside
+/// the full-text index it changes the same rows as a one-line save. Measured
+/// in rows, never in wall-clock time: an overloaded runner stretches even a
+/// small save past any fixed wait (this test's 6 s budget failed in intentd
+/// merge-group run 41295819142).
 #[tokio::test]
 async fn large_note_save_does_not_block_an_unrelated_write() {
     const LARGE: usize = 5 * 1024 * 1024;
@@ -212,47 +304,51 @@ async fn large_note_save_does_not_block_an_unrelated_write() {
         .await
         .unwrap();
     let line = "- [ ] a task line with **markdown** and `code` 😀\n";
-    let mut note = task_note(&ws_id, "Large", None);
-    note.content = line.repeat(LARGE / line.len() + 1);
     let author = version_author();
-    store
-        .insert_note_with_version(&note, &author, &now_iso())
-        .await
-        .unwrap();
-
-    // Bounds the wait only; the save itself is a few row writes.
-    let bound = intentd_test_support::test_timeout(Duration::from_secs(2));
-    for round in 0..3_i64 {
-        note.content.push_str("round ");
-        note.content.push_str(&round.to_string());
-        note.content.push('\n');
-        let saver = store.clone();
-        let snapshot = note.clone();
-        let author = author.clone();
-        let save = tokio::spawn(async move {
-            let lock = saver
-                .lock_note_content(&snapshot.workspace_id, &snapshot.id)
-                .await;
-            saver
-                .update_note_with_version(&lock, &snapshot, Some(round), &author, &now_iso())
-                .await
-        });
-        tokio::task::yield_now().await;
-        let started = Instant::now();
+    let mut small = task_note(&ws_id, "Small", None);
+    small.content = line.to_string();
+    let mut large = task_note(&ws_id, "Large", None);
+    large.content = line.repeat(LARGE / line.len() + 1);
+    let lines = i64::try_from(large.content.lines().count()).unwrap();
+    let log = WriterRowLog::install(&store).await;
+    for note in [&small, &large] {
         store
-            .insert_note(&task_note(&ws_id, &format!("unrelated {round}"), None))
+            .insert_note_with_version(note, &author, &now_iso())
             .await
             .unwrap();
-        let waited = started.elapsed();
-        assert!(
-            waited < bound,
-            "round {round}: unrelated write waited {waited:?} behind a large note save"
-        );
-        let (rev, _) = save.await.unwrap().unwrap();
-        assert_eq!(rev, round + 1);
     }
-    let stored = store.get_note(&ws_id, &note.id).await.unwrap();
-    assert_eq!(stored.content.len(), note.content.len());
+
+    for round in 0..3_i64 {
+        for note in [&mut small, &mut large] {
+            note.content.push_str("round ");
+            note.content.push_str(&round.to_string());
+            note.content.push('\n');
+        }
+        let small_rows = save_beside_an_unrelated_write(&store, &log, &small, round).await;
+        let large_rows = save_beside_an_unrelated_write(&store, &log, &large, round).await;
+        assert!(
+            small_rows.outside_search.contains_key("note"),
+            "round {round}: the update hook saw no note write: {:?}",
+            small_rows.outside_search
+        );
+        assert_eq!(
+            large_rows.outside_search, small_rows.outside_search,
+            "round {round}: outside the search index, saving a {lines}-line note \
+             changed other rows than saving a one-line note"
+        );
+        // Backstop for tables the update hook skips: full-text indexing grows
+        // with the note (about 750 rows here), a per-line index would not fit.
+        let budget = small_rows.total + lines / 20;
+        assert!(
+            large_rows.total <= budget,
+            "round {round}: saving a {lines}-line note changed {} rows \
+             (a one-line note {}); budget {budget}",
+            large_rows.total,
+            small_rows.total
+        );
+    }
+    let stored = store.get_note(&ws_id, &large.id).await.unwrap();
+    assert_eq!(stored.content.len(), large.content.len());
 }
 
 /// Seed `rows` retired page-index rows under one head for note `n`, as a
@@ -345,8 +441,54 @@ async fn retired_paging_cleanup_resumes_after_a_restart_and_is_idempotent() {
     );
 }
 
+/// Retired entry rows a read sees now; 0 once the table is dropped.
+async fn remaining_retired_rows(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap_or(0)
+}
+
+/// Insert `note` the way [`Store::insert_note`] does (one `BEGIN IMMEDIATE`
+/// transaction on the single write connection) and return how many retired
+/// entry rows remained at the moment this write held the writer.
+async fn insert_note_counting_retired_rows(store: &Store, note: &Note) -> i64 {
+    let mut conn = store.write_pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='note_page_entry')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let remaining: i64 = if present {
+        sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    } else {
+        0
+    };
+    let inserted = crate::note_repo::exec_insert_note(&mut conn, note).await;
+    crate::commit_with_rollback_guard(conn, inserted, "commit unrelated note insert")
+        .await
+        .unwrap();
+    remaining
+}
+
+/// The cleanup hands the single writer back between short batches, so an
+/// unrelated write gets in while it runs instead of queueing behind all of
+/// it. Measured in cleanup progress (the retired rows each write sees once
+/// it holds the writer), never in wall-clock time: a busy runner stretches
+/// any step arbitrarily (one 500-row batch took 8.8 s in intentd
+/// merge-group run 41295819142, failing a 3 s step budget).
 #[tokio::test]
 async fn unrelated_writes_complete_promptly_while_the_cleanup_runs() {
+    const SEEDED: i64 = 200_000;
+    let batch = i64::from(crate::note_paging_cleanup::NOTE_PAGING_CLEANUP_BATCH_ROWS);
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     seed_retired_index(&store, 200_000).await;
@@ -358,38 +500,48 @@ async fn unrelated_writes_complete_promptly_while_the_cleanup_runs() {
             )
             .await
     });
-    // Bounds the wait only; one batch holds the writer for about 100 ms.
-    let bound = intentd_test_support::test_timeout(Duration::from_secs(1));
     let ws = WorkspaceId::from("ws");
-    let mut overlapped = 0;
-    for round in 0..10 {
-        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM note_page_entry")
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap_or(0);
-        if remaining > 0 && remaining < 200_000 {
-            overlapped += 1;
-        }
-        let started = Instant::now();
-        store
-            .insert_note(&task_note(&ws, &format!("during cleanup {round}"), None))
-            .await
-            .unwrap();
-        let waited = started.elapsed();
-        assert!(
-            waited < bound,
-            "round {round}: unrelated write waited {waited:?} behind the cleanup"
-        );
+    // (rows a read saw just before the write, rows left once it held the writer)
+    let mut writes: Vec<(i64, i64)> = Vec::new();
+    let part_way = |writes: &[(i64, i64)]| {
+        writes
+            .iter()
+            .filter(|&&(_, at_write)| at_write > 0 && at_write < SEEDED)
+            .count()
+    };
+    // A few part-way writes prove the point; more would only slow the
+    // cleanup, whose batches shrink while it waits for the writer.
+    while !cleanup.is_finished() && part_way(&writes) < 5 {
+        let before = remaining_retired_rows(&store).await;
+        let note = task_note(&ws, &format!("during cleanup {}", writes.len()), None);
+        let at_write = insert_note_counting_retired_rows(&store, &note).await;
+        writes.push((before, at_write));
+        // Pacing only: lets the cleanup run a few batches between writes.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(overlapped > 0, "writes never overlapped a running cleanup");
     let outcome = cleanup.await.unwrap();
     assert!(outcome.finished, "{outcome:?}");
     assert_eq!(outcome.rows_removed, 200_001);
+    assert_eq!(outcome.tables_dropped, 2);
     assert!(
-        outcome.max_step < intentd_test_support::test_timeout(Duration::from_secs(1)),
-        "{outcome:?}"
+        part_way(&writes) > 0,
+        "no write got the writer while the cleanup was part-way; (rows before, rows at write): {writes:?}"
     );
+    // A write waits for at most the batch in flight (plus any that commit
+    // during the read before it), never for the rest of the cleanup.
+    for (round, &(before, at_write)) in writes.iter().enumerate() {
+        if before >= 10 * batch {
+            assert!(
+                at_write > 0,
+                "round {round}: a write issued with {before} rows left waited for the whole cleanup"
+            );
+        }
+    }
+    let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM note WHERE workspace_id='ws'")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(notes, 1 + i64::try_from(writes.len()).unwrap());
 }
 
 async fn retired_rows(store: &Store, workspace: &str) -> (i64, i64) {
