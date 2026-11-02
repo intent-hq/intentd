@@ -1434,11 +1434,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "search.events",
             vec![
-                v(
-                    "default",
-                    json!({ "query": "agent" }),
-                    Cut("/matches", 500, "/truncated"),
-                ),
+                v("default", json!({ "query": "agent" }), Items("/matches", 50)),
                 v(
                     "max",
                     json!({ "query": "agent", "workspaceId": ws, "limit": 100_000, "requestId": "r-events" }),
@@ -1481,11 +1477,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "search.messages",
             vec![
-                v(
-                    "default",
-                    json!({ "query": "agent" }),
-                    Cut("/matches", 500, "/truncated"),
-                ),
+                v("default", json!({ "query": "agent" }), Items("/matches", 50)),
                 v(
                     "max",
                     json!({ "query": "agent", "workspaceId": ws, "limit": 100_000, "preferWorkspaceId": ws, "requestId": "r-messages" }),

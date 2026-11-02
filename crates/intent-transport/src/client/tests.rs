@@ -211,6 +211,7 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
             json!(1)
         );
         assert_eq!(server["capabilities"]["messageBlockPages"], json!(1));
+        assert_eq!(server["capabilities"]["boundedReads"], json!(1));
         for capability in [
             "repositoryContext",
             "repositorySelection",

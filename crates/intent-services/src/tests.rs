@@ -32327,6 +32327,11 @@ mod worktree_provisioning {
             Some(&serde_json::json!(1)),
             "capped message block reads are advertised as exact integer 1: {caps}"
         );
+        assert_eq!(
+            obj.get("boundedReads"),
+            Some(&serde_json::json!(1)),
+            "bounded read defaults are advertised as exact integer 1: {caps}"
+        );
     }
 
     /// `unsloth.status` (monorepo#878 follow-up): with no `AgentManager`

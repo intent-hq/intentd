@@ -21,21 +21,11 @@ pub(crate) const INLINE_THRESHOLD: usize = 25;
 /// Number of matches per streamed `search:result` batch.
 pub(crate) const STREAM_BATCH_SIZE: usize = 10;
 
-/// Whether this caller gets the bounded read defaults below (absent limits
-/// default to a page, explicit limits clamp to a maximum). A placeholder for
-/// the shared per-connection `boundedReads` flag: old apps cannot see a new
-/// server capability, so the count defaults stay off until that flag says
-/// the client opted in. The byte ceilings apply to every caller.
-pub(crate) fn bounded_read_defaults() -> bool {
-    false
-}
-
 /// `search.messages` / `search.events` match count when `limit` is absent
-/// and bounded defaults apply (§5.15).
+/// (§5.15). Before the read payload budget an absent limit meant no cap.
 pub(crate) const MATCH_LIMIT_DEFAULT: usize = 50;
 
-/// Largest `search.messages` / `search.events` `limit` under bounded
-/// defaults; larger values clamp.
+/// Largest `search.messages` / `search.events` `limit`; larger values clamp.
 pub(crate) const MATCH_LIMIT_MAX: usize = 200;
 
 /// Serialized-size ceiling for the matches of one inline `search.*` reply,
@@ -44,18 +34,14 @@ pub(crate) const MATCH_LIMIT_MAX: usize = 200;
 /// past it are dropped and the reply carries `truncated: true`.
 pub(crate) const INLINE_MATCHES_BUDGET_BYTES: usize = 480_000;
 
-/// Resolve a `search.messages` / `search.events` `limit`. Bounded: absent →
-/// the default, negative → 0, over the maximum → the maximum. Otherwise the
-/// caller's value passes through (absent or negative → no cap).
-pub(crate) fn match_limit(limit: Option<i64>, bounded: bool) -> Option<usize> {
-    if !bounded {
-        return limit.and_then(|n| usize::try_from(n).ok());
-    }
-    Some(limit.map_or(MATCH_LIMIT_DEFAULT, |n| {
+/// Resolve a `search.messages` / `search.events` `limit`: absent → the
+/// default, negative → 0, over the maximum → the maximum.
+pub(crate) fn match_limit(limit: Option<i64>) -> usize {
+    limit.map_or(MATCH_LIMIT_DEFAULT, |n| {
         usize::try_from(n.max(0))
             .unwrap_or(usize::MAX)
             .min(MATCH_LIMIT_MAX)
-    }))
+    })
 }
 
 /// Keep the longest prefix of `matches` whose serialized size fits
@@ -92,10 +78,10 @@ pub(crate) async fn search_root(
     Ok(crate::git_ops::worktree_path(&ws))
 }
 
-/// `search.inFiles` `opts.maxResults` when absent under bounded defaults.
+/// `search.inFiles` `opts.maxResults` when absent (§5.15).
 pub(crate) const IN_FILES_MAX_RESULTS_DEFAULT: usize = 500;
 
-/// Largest `search.inFiles` `opts.maxResults` under bounded defaults.
+/// Largest `search.inFiles` `opts.maxResults`; larger values clamp.
 pub(crate) const IN_FILES_MAX_RESULTS_MAX: usize = 2_000;
 
 /// Parse the raw `opts` object into [`SearchOpts`]; an unusable shape surfaces
@@ -108,18 +94,16 @@ pub(crate) fn parse_opts(opts: Option<Value>) -> Result<intent_search::SearchOpt
     }
 }
 
-/// Bound a `search.inFiles` request: the matches always stop at
-/// [`INLINE_MATCHES_BUDGET_BYTES`]; under bounded defaults `maxResults` also
-/// defaults to [`IN_FILES_MAX_RESULTS_DEFAULT`] and clamps to
-/// [`IN_FILES_MAX_RESULTS_MAX`]. Either cut sets `truncated`.
-pub(crate) fn bound_in_files_opts(opts: &mut intent_search::SearchOpts, bounded: bool) {
-    if bounded {
-        opts.max_results = Some(
-            opts.max_results
-                .unwrap_or(IN_FILES_MAX_RESULTS_DEFAULT)
-                .min(IN_FILES_MAX_RESULTS_MAX),
-        );
-    }
+/// Bound a `search.inFiles` request: `maxResults` defaults to
+/// [`IN_FILES_MAX_RESULTS_DEFAULT`] and clamps to
+/// [`IN_FILES_MAX_RESULTS_MAX`], and the matches stop at
+/// [`INLINE_MATCHES_BUDGET_BYTES`]. Either cut sets `truncated`.
+pub(crate) fn bound_in_files_opts(opts: &mut intent_search::SearchOpts) {
+    opts.max_results = Some(
+        opts.max_results
+            .unwrap_or(IN_FILES_MAX_RESULTS_DEFAULT)
+            .min(IN_FILES_MAX_RESULTS_MAX),
+    );
     opts.max_bytes = Some(INLINE_MATCHES_BUDGET_BYTES);
 }
 
@@ -164,12 +148,11 @@ pub(crate) fn message_fts_matches(
 
 /// Build `search.events` matches over the event log. The searchable text is the
 /// event `type` plus its JSON `data`; `limit` caps the number of matches.
-pub(crate) fn event_matches(
-    events: &[Event],
-    query: &str,
-    limit: Option<usize>,
-) -> Vec<EventMatch> {
+pub(crate) fn event_matches(events: &[Event], query: &str, limit: usize) -> Vec<EventMatch> {
     let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
     for ev in events {
         let text = format!("{} {}", ev.event_type, ev.data);
         if !contains_ci(&text, query) {
@@ -180,7 +163,7 @@ pub(crate) fn event_matches(
             preview: make_preview(&text, query),
             score: None,
         });
-        if limit.is_some_and(|n| out.len() >= n) {
+        if out.len() >= limit {
             break;
         }
     }
@@ -250,19 +233,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn match_limit_bounded_defaults_and_clamps() {
-        assert_eq!(match_limit(None, true), Some(MATCH_LIMIT_DEFAULT));
-        assert_eq!(match_limit(Some(10), true), Some(10));
-        assert_eq!(match_limit(Some(0), true), Some(0));
-        assert_eq!(match_limit(Some(-1), true), Some(0));
-        assert_eq!(match_limit(Some(100_000), true), Some(MATCH_LIMIT_MAX));
-    }
-
-    #[test]
-    fn match_limit_unbounded_keeps_the_callers_value() {
-        assert_eq!(match_limit(None, false), None);
-        assert_eq!(match_limit(Some(100_000), false), Some(100_000));
-        assert_eq!(match_limit(Some(-1), false), None);
+    fn match_limit_defaults_and_clamps() {
+        assert_eq!(match_limit(None), MATCH_LIMIT_DEFAULT);
+        assert_eq!(match_limit(Some(10)), 10);
+        assert_eq!(match_limit(Some(0)), 0);
+        assert_eq!(match_limit(Some(-1)), 0);
+        assert_eq!(match_limit(Some(100_000)), MATCH_LIMIT_MAX);
     }
 
     #[test]
@@ -281,35 +257,37 @@ mod tests {
     }
 
     #[test]
-    fn in_files_opts_bounded_default_and_clamp() {
+    fn in_files_opts_default_and_clamp_max_results() {
         let mut opts = parse_opts(None).unwrap();
-        bound_in_files_opts(&mut opts, true);
+        bound_in_files_opts(&mut opts);
         assert_eq!(opts.max_results, Some(IN_FILES_MAX_RESULTS_DEFAULT));
         assert_eq!(opts.max_bytes, Some(INLINE_MATCHES_BUDGET_BYTES));
 
         let mut opts = parse_opts(Some(serde_json::json!({ "maxResults": 100_000 }))).unwrap();
-        bound_in_files_opts(&mut opts, true);
+        bound_in_files_opts(&mut opts);
         assert_eq!(opts.max_results, Some(IN_FILES_MAX_RESULTS_MAX));
 
         let mut opts = parse_opts(Some(serde_json::json!({ "maxResults": 7 }))).unwrap();
-        bound_in_files_opts(&mut opts, true);
+        bound_in_files_opts(&mut opts);
         assert_eq!(opts.max_results, Some(7));
     }
 
     #[test]
-    fn in_files_opts_unbounded_keep_max_results_but_cap_bytes() {
-        let mut opts = parse_opts(None).unwrap();
-        bound_in_files_opts(&mut opts, false);
-        assert_eq!(opts.max_results, None);
-        assert_eq!(opts.max_bytes, Some(INLINE_MATCHES_BUDGET_BYTES));
-
-        let mut opts = parse_opts(Some(serde_json::json!({ "maxResults": 100_000 }))).unwrap();
-        bound_in_files_opts(&mut opts, false);
-        assert_eq!(opts.max_results, Some(100_000));
-    }
-
-    #[test]
-    fn bounded_read_defaults_stay_off_until_the_client_opts_in() {
-        assert!(!bounded_read_defaults());
+    fn event_matches_honour_limit() {
+        let events: Vec<Event> = (0..5)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("e-{i}"),
+                    "workspaceId": "ws-1",
+                    "type": "agent:idle",
+                    "timestamp": "2026-11-02T00:00:00Z",
+                    "actor": { "type": "system" },
+                    "data": {},
+                }))
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(event_matches(&events, "agent", 3).len(), 3);
+        assert!(event_matches(&events, "agent", 0).is_empty());
     }
 }

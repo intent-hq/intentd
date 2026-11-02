@@ -19661,6 +19661,9 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             caps.insert("messageBlockPages".into(), serde_json::json!(1));
+            // Reads answer bounded pages by default (default page sizes,
+            // maximums and byte budgets), so a new app pages them.
+            caps.insert("boundedReads".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -20451,7 +20454,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let mut opts = search_ops::parse_opts(opts)?;
-            search_ops::bound_in_files_opts(&mut opts, search_ops::bounded_read_defaults());
+            search_ops::bound_in_files_opts(&mut opts);
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({
@@ -20562,15 +20565,10 @@ impl WorkspaceApi for Services {
                     _ => vec![workspace_id.clone()],
                 };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            // Bounded defaults: absent → MATCH_LIMIT_DEFAULT, clamped to
-            // MATCH_LIMIT_MAX. Otherwise the caller's value reaches SQL as
-            // before (a negative LIMIT means no limit there).
-            let limit = if search_ops::bounded_read_defaults() {
-                search_ops::match_limit(limit, true)
-                    .map(|n| i64::try_from(n).expect("limit fits in i64"))
-            } else {
-                limit
-            };
+            // Absent → MATCH_LIMIT_DEFAULT, clamped to MATCH_LIMIT_MAX (a
+            // negative SQL LIMIT would otherwise mean no limit).
+            let limit =
+                Some(i64::try_from(search_ops::match_limit(limit)).expect("limit fits in i64"));
             let token = registry.register_as(&request_id, capability::search_owner()?);
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
@@ -20624,7 +20622,7 @@ impl WorkspaceApi for Services {
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register_as(&request_id, capability::search_owner()?);
-            let limit = search_ops::match_limit(limit, search_ops::bounded_read_defaults());
+            let limit = search_ops::match_limit(limit);
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
                 ..Default::default()
