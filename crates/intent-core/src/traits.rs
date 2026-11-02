@@ -9048,14 +9048,26 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `crossWorkspace.readNote`: one note in a sibling workspace as
     /// `{ id, title, content, numberedContent, sourceWorkspaceId,
-    /// sourceWorkspaceTitle, branch, lineCount }`.
+    /// sourceWorkspaceTitle, branch, lineCount }`. With a line `window`, or
+    /// with `bounded_default` set, the read is bounded to the window and the
+    /// [`crate::note_read_bounds::NOTE_READ_BUDGET_BYTES`] budget and a
+    /// partial page adds `startLine` / `endLine` / `truncated` /
+    /// `nextStartLine`; otherwise the whole note is served.
     fn cross_workspace_read_note(
         &self,
         workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: crate::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, target_workspace_id, note_id);
+        let _ = (
+            workspace_id,
+            target_workspace_id,
+            note_id,
+            window,
+            bounded_default,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_read_note not implemented".to_string(),

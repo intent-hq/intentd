@@ -10026,6 +10026,7 @@ mod wsapi6_bindings_tests {
         cross_list_siblings_calls: Mutex<u32>,
         cross_list_siblings_include_retired: Mutex<Vec<bool>>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
+        cross_read_note_windows: Mutex<Vec<intent_core::note_read_bounds::LineWindow>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
         /// When set, `browser_exec` shapes this raw FE envelope through the
@@ -10100,7 +10101,11 @@ mod wsapi6_bindings_tests {
             _ws: WorkspaceId,
             target: WorkspaceId,
             note_id: NoteId,
+            window: intent_core::note_read_bounds::LineWindow,
+            bounded_default: bool,
         ) -> BoxFuture<'_, Result<Value>> {
+            assert!(bounded_default, "agents get bounded defaults");
+            self.cross_read_note_windows.lock().unwrap().push(window);
             self.cross_read_note_calls
                 .lock()
                 .unwrap()
@@ -10348,6 +10353,41 @@ mod wsapi6_bindings_tests {
             *api.cross_read_note_calls.lock().unwrap(),
             vec![("sibling-1".to_string(), "n-1".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_read_note_forwards_line_window() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 4, maxLines: 9 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let windows = api.cross_read_note_windows.lock().unwrap().clone();
+        assert_eq!(
+            windows,
+            vec![
+                intent_core::note_read_bounds::LineWindow {
+                    start_line: Some(4),
+                    max_lines: Some(9),
+                },
+                intent_core::note_read_bounds::LineWindow::default(),
+            ]
+        );
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 0 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("startLine must be a positive integer"));
     }
 
     #[tokio::test]

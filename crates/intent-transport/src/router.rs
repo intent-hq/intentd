@@ -151,6 +151,72 @@ fn parse_max_content_bytes(
     max_content_bytes_param(params).map_err(invalid_params)
 }
 
+/// The page a list read serves (bounded reads, `server.capabilities.boundedReads`):
+/// `limit` is clamped into `1..=max` (default `default`); `nextToken` must be
+/// a non-empty string.
+fn parse_page_request(
+    params: &Map<String, Value>,
+    default: usize,
+    max: usize,
+) -> std::result::Result<intent_core::note_read_bounds::PageRequest, RpcErr> {
+    let limit = opt_positive_usize(params, "limit")?;
+    let next_token = match params.get("nextToken") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => return Err(invalid_params("nextToken must be a non-empty string")),
+    };
+    Ok(intent_core::note_read_bounds::PageRequest::new(
+        limit, default, max, next_token,
+    ))
+}
+
+/// Bounded-reads write guard: a whole-content write (`note.setContent`, the
+/// content arm of `note.update`) to a note whose default read is cut
+/// ([`intent_core::note_read_bounds::note_default_read_is_cut`]) must send
+/// `baseContentBytes`. A client that read the note by default saw only the
+/// cut prefix; without the guard its save would replace the full text.
+/// `-32602` with `error.data.code: "content-base-required"`; a note that
+/// cannot be read is left to the write's own error.
+async fn require_base_for_cut_note(
+    api: &dyn WorkspaceApi,
+    ws: &WorkspaceId,
+    note_id: &NoteId,
+    base_content_bytes: Option<u64>,
+) -> std::result::Result<(), RpcErr> {
+    if base_content_bytes.is_some() {
+        return Ok(());
+    }
+    let Ok(note) = api.get_note(ws.clone(), note_id.clone()).await else {
+        return Ok(());
+    };
+    if !intent_core::note_read_bounds::note_default_read_is_cut(&note) {
+        return Ok(());
+    }
+    Err(RpcErr {
+        code: INVALID_PARAMS,
+        message: "baseContentBytes is required to replace the content of a note larger than the read budget".to_string(),
+        data: Some(json!({
+            "code": "content-base-required",
+            "contentBytes": note.content.len(),
+        })),
+    })
+}
+
+/// An optional positive integer param (`startLine`, `maxLines`, `limit`):
+/// absent or `null` → `None`; a positive integer → its value; anything else
+/// → `-32602 "<name> must be a positive integer"`.
+fn opt_positive_usize(
+    params: &Map<String, Value>,
+    name: &str,
+) -> std::result::Result<Option<usize>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or_else(|| invalid_params(format!("{name} must be a positive integer"))),
+    }
+}
+
 /// `baseContentBytes` on whole-content note writes (truncated-read write
 /// guard): absent or `null` → unguarded; a non-negative integer → the
 /// writer's base size; anything else → the documented `-32602`.
@@ -1817,29 +1883,43 @@ async fn dispatch(
                 _ => return Err(invalid_params("workspaceId is required")),
             };
             let projection = parse_note_list_projection(params)?;
+            let page = parse_page_request(
+                params,
+                intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
+                intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
+            )?;
             let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
-            match projection {
-                Some(intent_core::NoteListProjection::Slim) => {
-                    let rows: Vec<Value> = notes
-                        .into_iter()
-                        .map(intent_core::note_list_slim_row)
-                        .collect();
-                    Ok(json!({ "notes": rows }))
-                }
-                None => Ok(json!({ "notes": notes })),
-            }
+            let (rows, next) = intent_core::note_read_bounds::note_list_page(
+                notes,
+                ws_id.as_str(),
+                projection,
+                None,
+                &page,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(invalid_params)?;
+            Ok(json!({ "notes": rows, "nextToken": next }))
         }
         "note.get" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let max_content_bytes = parse_max_content_bytes(params)?;
             match api.get_note(ws, note_id).await {
-                Ok(note) => match max_content_bytes {
-                    Some(limit) => {
-                        Ok(json!({ "note": intent_core::note_bounded_row(note, limit) }))
+                // Bounded reads: whatever `maxContentBytes` asks for, the row
+                // is cut to fit the read budget (`contentTruncated`).
+                Ok(note) => {
+                    let row = match max_content_bytes {
+                        Some(limit) => intent_core::note_bounded_row(note.clone(), limit),
+                        None => to_result_value(&note)?,
+                    };
+                    let budget = intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES;
+                    if intent_core::note_read_bounds::json_len(&row) <= budget {
+                        Ok(json!({ "note": row }))
+                    } else {
+                        let row = intent_core::note_read_bounds::note_row_within(&note, budget);
+                        Ok(json!({ "note": row }))
                     }
-                    None => Ok(json!({ "note": note })),
-                },
+                }
                 Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1875,6 +1955,9 @@ async fn dispatch(
                 expected_version: opt_int(params, "expectedVersion"),
                 base_content_bytes: parse_base_content_bytes(params)?,
             };
+            if input.content.is_some() {
+                require_base_for_cut_note(api, &ws, &note_id, input.base_content_bytes).await?;
+            }
             let note = api
                 .update_note(ws, note_id, input)
                 .await
@@ -1936,6 +2019,7 @@ async fn dispatch(
             let confirm = parse_confirm(params);
             let expected_version = opt_int(params, "expectedVersion");
             let base_content_bytes = parse_base_content_bytes(params)?;
+            require_base_for_cut_note(api, &ws, &note_id, base_content_bytes).await?;
             let result = api
                 .set_note_content_guarded(
                     ws,
@@ -1975,12 +2059,27 @@ async fn dispatch(
         "note.listTasks" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
+            let page = parse_page_request(
+                params,
+                intent_core::note_read_bounds::NOTE_TASKS_DEFAULT_LIMIT,
+                intent_core::note_read_bounds::NOTE_TASKS_MAX_LIMIT,
+            )?;
+            let ws_key = ws.as_str().to_string();
+            let note_key = note_id.as_str().to_string();
             let tasks = api
                 .list_note_tasks(ws, note_id)
                 .await
                 .map_err(domain_to_rpc)?;
-            // The TS peer returns a bare array.
-            to_result_value(&tasks)
+            // Bounded reads: one page as `{ tasks, nextToken }`.
+            let (rows, next) = intent_core::note_read_bounds::note_tasks_page(
+                &tasks,
+                &ws_key,
+                &note_key,
+                &page,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(invalid_params)?;
+            Ok(json!({ "tasks": rows, "nextToken": next }))
         }
         "note.readAsset" => {
             let ws = require_ws_note(params)?;
@@ -2032,13 +2131,34 @@ async fn dispatch(
         "note.lineAttribution.load" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
+            let window = intent_core::note_read_bounds::LineWindow {
+                start_line: opt_positive_usize(params, "startLine")?,
+                max_lines: opt_positive_usize(params, "maxLines")?,
+            };
             let data = api
                 .line_attribution_load(ws, note_id)
                 .await
                 .map_err(domain_to_rpc)?;
             // Bare LineAttributionData | null so the FE gutter’s
-            // `line-attribution:load` decoder round-trips as-is.
-            to_result_value(&data)
+            // `line-attribution:load` decoder round-trips as-is. A page
+            // that holds fewer than every attributed line (a window, or the
+            // read budget) adds `truncated` and `nextStartLine`.
+            let Some(mut data) = data else {
+                return Ok(Value::Null);
+            };
+            let page = intent_core::note_read_bounds::line_attribution_page(
+                &mut data,
+                window,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            );
+            let mut value = to_result_value(&data)?;
+            if page.truncated {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("truncated".into(), Value::Bool(true));
+                    obj.insert("nextStartLine".into(), json!(page.next_start_line));
+                }
+            }
+            Ok(value)
         }
         "note.lineAttribution.computeNow" => {
             let ws = require_ws_note(params)?;
@@ -2260,11 +2380,32 @@ async fn dispatch(
             let author_type = opt_str(params, "authorType");
             let status = opt_str(params, "status");
             let include_comments = parse_bool(params, "includeComments");
+            let page = parse_page_request(
+                params,
+                intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
+                intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
+            )?;
+            let ws_key = ws.as_str().to_string();
+            let note_key = note_id.as_str().to_string();
             let result = api
                 .comment_list(ws, note_id, since, author_type, status, include_comments)
                 .await
                 .map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            // Totals count every thread the filters keep, not just this page.
+            let (rows, next) = intent_core::note_read_bounds::comment_list_page(
+                result.threads,
+                &ws_key,
+                &note_key,
+                &page,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(invalid_params)?;
+            Ok(json!({
+                "threads": rows,
+                "totalThreads": result.total_threads,
+                "totalComments": result.total_comments,
+                "nextToken": next,
+            }))
         }
         "comment.getThread" => {
             let ws = require_ws_note(params)?;
@@ -5238,7 +5379,11 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
             let note_id = require_note_id(params)?;
-            api.cross_workspace_read_note(ws, target, note_id)
+            let window = intent_core::note_read_bounds::LineWindow {
+                start_line: opt_positive_usize(params, "startLine")?,
+                max_lines: opt_positive_usize(params, "maxLines")?,
+            };
+            api.cross_workspace_read_note(ws, target, note_id, window, true)
                 .await
                 .map_err(domain_to_rpc)
         }

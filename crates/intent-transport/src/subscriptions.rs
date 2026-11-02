@@ -98,6 +98,10 @@ pub(crate) struct NoteSubscribeParams {
     /// the subscription's lifetime, it bounds every full row's `content`
     /// with [`intent_core::note_bounded_row`]. `None` keeps rows unchanged.
     pub max_content_bytes: Option<usize>,
+    /// Note-channel-only snapshot page size (bounded reads): the seq-0
+    /// snapshot carries the first [`intent_core::note_read_bounds::note_list_page`]
+    /// of this many notes and the push adds `nextToken` for `note.list`.
+    pub snapshot_limit: usize,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
@@ -119,6 +123,10 @@ pub(crate) struct CommentSubscribeParams {
     pub workspace_id: String,
     pub note_id: String,
     pub replace_group: Option<String>,
+    /// Comment-channel snapshot page size (bounded reads): the seq-0
+    /// snapshot is the first `comment.list` page of this many threads and the
+    /// push adds `nextToken`. Ignored by the note-presence channel.
+    pub snapshot_limit: usize,
 }
 
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
@@ -264,6 +272,7 @@ pub(crate) fn parse_subscribe_params(
         replace_group: replace_group(params),
         projection: None,
         max_content_bytes: None,
+        snapshot_limit: intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
     })
 }
 
@@ -285,7 +294,30 @@ pub(crate) fn parse_note_subscribe_params(
     };
     parsed.max_content_bytes =
         crate::router::max_content_bytes_param(params).map_err(str::to_string)?;
+    parsed.snapshot_limit = snapshot_limit_param(
+        params,
+        intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
+    )?;
     Ok(parsed)
+}
+
+/// The snapshot `limit` of a paged collection channel (bounded reads):
+/// absent / `null` → `default`; a positive integer → clamped to `max`;
+/// anything else → `-32602`.
+fn snapshot_limit_param(
+    params: &Map<String, Value>,
+    default: usize,
+    max: usize,
+) -> Result<usize, String> {
+    match params.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(max))
+            .ok_or_else(|| "limit must be a positive integer".to_string()),
+    }
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
@@ -323,6 +355,11 @@ pub(crate) fn parse_comment_subscribe_params(
         workspace_id,
         note_id,
         replace_group: replace_group(params),
+        snapshot_limit: snapshot_limit_param(
+            params,
+            intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
+            intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
+        )?,
     })
 }
 
@@ -1043,6 +1080,41 @@ pub(crate) async fn channel_snapshot(
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
         Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
+    }
+}
+
+/// The `comment` channel's paged seq-0 snapshot (bounded reads): the first
+/// `comment.list` page of `limit` threads (comments included) and its
+/// `nextToken`. On a read error the snapshot degrades to the empty array.
+pub(crate) async fn comment_snapshot_page(
+    api: &dyn WorkspaceApi,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    limit: usize,
+) -> (Value, Option<String>) {
+    let Ok(result) = api
+        .comment_list(
+            workspace_id.clone(),
+            note_id.clone(),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+    else {
+        return (Value::Array(Vec::new()), None);
+    };
+    let page = intent_core::note_read_bounds::PageRequest::new(Some(limit), limit, limit, None);
+    match intent_core::note_read_bounds::comment_list_page(
+        result.threads,
+        workspace_id.as_str(),
+        note_id.as_str(),
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    ) {
+        Ok((rows, next)) => (Value::Array(rows), next),
+        Err(_) => (Value::Array(Vec::new()), None),
     }
 }
 

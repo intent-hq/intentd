@@ -593,12 +593,24 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "authorType=user",
                     json!({ "workspaceId": ws, "noteId": note, "authorType": "user" }),
-                    Items("/threads", seed::USER_THREADS),
+                    Items("/threads", 100),
                 ),
                 v(
                     "authorType=agent",
                     json!({ "workspaceId": ws, "noteId": note, "authorType": "agent" }),
-                    Items("/threads", seed::AGENT_THREADS),
+                    Items("/threads", 100),
+                ),
+                v(
+                    "limit",
+                    json!({ "workspaceId": ws, "noteId": note, "includeComments": true, "limit": 100_000 }),
+                    Bytes(400 * 1024),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "noteId": note, "includeComments": true, "limit": 50 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/threads", 50),
                 ),
             ],
         ),
@@ -623,11 +635,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         ),
         row(
             "crossWorkspace.readNote",
-            vec![v(
-                "default",
-                json!({ "workspaceId": ws, "targetWorkspaceId": ws, "noteId": note }),
-                Bytes(1024 * 1024),
-            )],
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "targetWorkspaceId": ws, "noteId": note }),
+                    Bytes(400 * 1024),
+                ),
+                v(
+                    "window",
+                    json!({ "workspaceId": ws, "targetWorkspaceId": ws, "noteId": note, "startLine": 2, "maxLines": 100_000 }),
+                    Bytes(400 * 1024),
+                ),
+            ],
         ),
         fixed(
             "debug.sampleStacks",
@@ -1254,7 +1273,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "note.get",
             vec![
-                v("default", wn.clone(), Bytes(1024 * 1024)),
+                v("default", wn.clone(), Bytes(400 * 1024)),
                 v(
                     "maxContentBytes",
                     json!({ "workspaceId": ws, "noteId": note, "maxContentBytes": 64 * 1024 }),
@@ -1272,12 +1291,19 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         ),
         row(
             "note.lineAttribution.load",
-            vec![v("default", wn.clone(), Bytes(256 * 1024))],
+            vec![
+                v("default", wn.clone(), Bytes(256 * 1024)),
+                v(
+                    "window",
+                    json!({ "workspaceId": ws, "noteId": note, "startLine": 2, "maxLines": 100_000 }),
+                    Bytes(256 * 1024),
+                ),
+            ],
         ),
         row(
             "note.list",
             vec![
-                v("default", w.clone(), Items("/notes", 200)),
+                v("default", w.clone(), Bytes(300 * 1024)),
                 v(
                     "projection=slim",
                     json!({ "workspaceId": ws, "projection": "slim" }),
@@ -1286,7 +1312,24 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "projection=full",
                     json!({ "workspaceId": ws, "projection": "full" }),
+                    Bytes(300 * 1024),
+                ),
+                v(
+                    "limit",
+                    json!({ "workspaceId": ws, "projection": "slim", "limit": 100_000 }),
                     Items("/notes", 200),
+                ),
+                v(
+                    "limit+full",
+                    json!({ "workspaceId": ws, "projection": "full", "limit": 100_000 }),
+                    Bytes(300 * 1024),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "projection": "slim", "limit": 50 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/notes", 50),
                 ),
             ],
         ),
@@ -1295,7 +1338,19 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v(
                 "default",
                 json!({ "workspaceId": ws, "noteId": s.checklist_note }),
-                Items("", seed::CHECKLIST_TASKS),
+                Items("/tasks", 1_000),
+            ),
+            v(
+                "limit",
+                json!({ "workspaceId": ws, "noteId": s.checklist_note, "limit": 100_000 }),
+                Items("/tasks", 1_000),
+            ),
+            next(
+                "nextToken",
+                json!({ "workspaceId": ws, "noteId": s.checklist_note, "limit": 1_000 }),
+                "/nextToken",
+                "nextToken",
+                Items("/tasks", 1_000),
             )],
         ),
         row(
@@ -1944,7 +1999,7 @@ pub fn snapshot_golden_params(c: &Ctx<'_>, channel: &str) -> Value {
 /// One row per channel in `SNAPSHOT_CHANNELS`; proofs point into the
 /// snapshot (`params.snapshot` of the seq-0 push).
 pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
-    use Proof::{Fixed, Items};
+    use Proof::{Bytes, Fixed, Items};
     let ws = c.ws.as_str();
     let agent = c.agent.as_str();
     let w = json!({ "workspaceId": ws });
@@ -1979,11 +2034,18 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
         .with_reason("Progressive history sends only the newest message in the snapshot and streams the rest."),
         row(
             "comment.subscribe",
-            vec![v(
-                "default",
-                json!({ "workspaceId": ws, "noteId": c.note }),
-                Items("", 100),
-            )],
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "noteId": c.note }),
+                    Items("", 100),
+                ),
+                v(
+                    "limit",
+                    json!({ "workspaceId": ws, "noteId": c.note, "limit": 100_000 }),
+                    Bytes(400 * 1024),
+                ),
+            ],
         ),
         row(
             "note.presence.subscribe",
@@ -1996,7 +2058,7 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "note.subscribe",
             vec![
-                v("default", w.clone(), Items("", 200)),
+                v("default", w.clone(), Bytes(300 * 1024)),
                 v(
                     "projection=slim",
                     json!({ "workspaceId": ws, "projection": "slim" }),
@@ -2005,7 +2067,17 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "maxContentBytes",
                     json!({ "workspaceId": ws, "projection": "full", "maxContentBytes": 4096 }),
+                    Bytes(300 * 1024),
+                ),
+                v(
+                    "limit",
+                    json!({ "workspaceId": ws, "projection": "slim", "limit": 100_000 }),
                     Items("", 200),
+                ),
+                v(
+                    "limit+full",
+                    json!({ "workspaceId": ws, "projection": "full", "limit": 100_000 }),
+                    Bytes(300 * 1024),
                 ),
             ],
         ),

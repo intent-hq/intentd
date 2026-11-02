@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use intent_core::note_read_bounds::LineWindow;
 use intent_core::{CrossWorkspaceSearch, NoteId, PullRequestSelector, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
@@ -19,8 +20,10 @@ pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.crossWorkspace = {
         listSiblings: (options) => host({ method: 'crossWorkspace.listSiblings', args: options || {} }),
-        readNote: (targetWorkspaceId, noteId) =>
-            host({ method: 'crossWorkspace.readNote', args: { targetWorkspaceId, noteId } }),
+        readNote: (targetWorkspaceId, noteId, options) => host({
+            method: 'crossWorkspace.readNote',
+            args: { ...(options || {}), targetWorkspaceId, noteId },
+        }),
         listNotes: (targetWorkspaceId) =>
             host({ method: 'crossWorkspace.listNotes', args: { targetWorkspaceId } }),
         search: (options) => host({
@@ -73,10 +76,16 @@ async fn read_note(
         .map_err(|_| "Both workspaceId and noteId are required".to_string())?;
     let note_id = req_str(args, "noteId")
         .map_err(|_| "Both workspaceId and noteId are required".to_string())?;
+    let window = LineWindow {
+        start_line: super::note::opt_positive_line(args, "startLine")?,
+        max_lines: super::note::opt_positive_line(args, "maxLines")?,
+    };
     api.cross_workspace_read_note(
         ws.clone(),
         WorkspaceId::from_string(target),
         NoteId::from_string(&note_id),
+        window,
+        true,
     )
     .await
     .map_err(map_err)

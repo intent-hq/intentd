@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use intent_core::note_read_bounds::LineWindow;
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, Error, MessageOrigin, Note,
     NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput,
@@ -3498,7 +3499,13 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
 
     // Same-repo sibling read: full shape with numbered content + line count.
     let v = svc
-        .cross_workspace_read_note(caller.clone(), sibling.clone(), NoteId::from("sib-note"))
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow::default(),
+            true,
+        )
         .await
         .expect("read");
     assert_eq!(v["id"], "sib-note");
@@ -3506,6 +3513,102 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
     assert_eq!(v["numberedContent"], "   1 | l1\n   2 | l2");
     assert_eq!(v["sourceWorkspaceId"], "ws-sibling");
     assert_eq!(v["lineCount"], 2);
+    assert!(
+        v.get("truncated").is_none(),
+        "a note that fits keeps its shape"
+    );
+
+    // A window serves just those lines plus the page fields.
+    let v = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow {
+                start_line: Some(2),
+                max_lines: Some(5),
+            },
+            false,
+        )
+        .await
+        .expect("window");
+    assert_eq!(v["content"], "l2");
+    assert_eq!(v["numberedContent"], "   2 | l2");
+    assert_eq!(v["startLine"], 2);
+    assert_eq!(v["endLine"], 2);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["nextStartLine"], serde_json::Value::Null);
+    let err = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow {
+                start_line: Some(3),
+                max_lines: None,
+            },
+            false,
+        )
+        .await
+        .expect_err("past end");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("exceeds total lines")),
+        "{err:?}"
+    );
+
+    // A note larger than the read budget pages: every reply fits the
+    // 500 KiB budget and the pages rebuild the note exactly.
+    let big: String = (0..12_000)
+        .map(|i| format!("line {i} {}", "\"quoted\" ".repeat(12)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    svc.store
+        .insert_note(&note(&sibling, "big-note", &big))
+        .await
+        .unwrap();
+    let mut pages = Vec::new();
+    let mut start = None;
+    loop {
+        let v = svc
+            .cross_workspace_read_note(
+                caller.clone(),
+                sibling.clone(),
+                NoteId::from("big-note"),
+                LineWindow {
+                    start_line: start,
+                    max_lines: None,
+                },
+                true,
+            )
+            .await
+            .expect("page");
+        assert!(
+            serde_json::to_string(&v).unwrap().len() < 500 * 1024,
+            "page over budget"
+        );
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["lineCount"], 12_000);
+        pages.push(v["content"].as_str().unwrap().to_string());
+        match v["nextStartLine"].as_u64() {
+            Some(next) => start = Some(usize::try_from(next).unwrap()),
+            None => break,
+        }
+    }
+    assert!(pages.len() > 1);
+    assert_eq!(pages.join("\n"), big);
+    // A caller without bounded defaults and no window keeps the whole note.
+    let v = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("big-note"),
+            LineWindow::default(),
+            false,
+        )
+        .await
+        .expect("whole");
+    assert_eq!(v["content"].as_str(), Some(big.as_str()));
+    assert!(v.get("truncated").is_none());
 
     // listNotes for the sibling returns the bare-array shape.
     let v = svc
@@ -3528,7 +3631,13 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
 
     // A missing note in a valid sibling surfaces the "Note not found" message.
     let err = svc
-        .cross_workspace_read_note(caller, sibling, NoteId::from("nope"))
+        .cross_workspace_read_note(
+            caller,
+            sibling,
+            NoteId::from("nope"),
+            LineWindow::default(),
+            true,
+        )
         .await
         .expect_err("missing");
     match err {
