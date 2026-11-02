@@ -567,7 +567,14 @@ struct Client {
 }
 impl Client {
     async fn next(&mut self) -> Value {
-        tokio::time::timeout(acquire(), async {
+        self.try_next(acquire())
+            .await
+            .expect("no original frame within the acquire budget")
+    }
+    /// One frame, or `None` when none arrives within `budget`. Only call again
+    /// after `None` when nothing can have been partially read (a stalled peer).
+    async fn try_next(&mut self, budget: Duration) -> Option<Value> {
+        tokio::time::timeout(budget, async {
             loop {
                 match &mut self.socket {
                     Socket::Uds(s) => {
@@ -585,9 +592,48 @@ impl Client {
             }
         })
         .await
-        .unwrap()
+        .ok()
     }
     async fn rpc(&mut self, method: &str, params: Value) -> Value {
+        self.send(method, params).await;
+        loop {
+            let result = self.next().await;
+            eprintln!("resource original response {result}");
+            if result["id"] == self.id {
+                assert_eq!(result["jsonrpc"], "2.0");
+                return result;
+            }
+            self.notices.push(result);
+        }
+    }
+    /// [`Client::rpc`] that, when no frame arrives within `budget`, runs `probe`
+    /// and returns its report instead of a bare `Elapsed` (intent-hq/intent#8252).
+    /// The probe runs only on that failure path.
+    async fn try_rpc_probed(
+        &mut self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+        probe: impl FnOnce() -> String,
+    ) -> Result<Value, String> {
+        self.send(method, params).await;
+        loop {
+            let Some(result) = self.try_next(budget).await else {
+                let report = probe();
+                return Err(format!(
+                    "no reply to {method} id {} within {budget:?}; {report}",
+                    self.id
+                ));
+            };
+            eprintln!("resource original response {result}");
+            if result["id"] == self.id {
+                assert_eq!(result["jsonrpc"], "2.0");
+                return Ok(result);
+            }
+            self.notices.push(result);
+        }
+    }
+    async fn send(&mut self, method: &str, params: Value) {
         self.id += 1;
         let request = json!({"jsonrpc":"2.0","id":self.id,"method":method,"params":params});
         eprintln!("resource original request {request}");
@@ -600,15 +646,6 @@ impl Client {
                 .unwrap(),
             Socket::Ws(s) => s.send(Message::Text(line.into())).await.unwrap(),
         }
-        loop {
-            let result = self.next().await;
-            eprintln!("resource original response {result}");
-            if result["id"] == self.id {
-                assert_eq!(result["jsonrpc"], "2.0");
-                return result;
-            }
-            self.notices.push(result);
-        }
     }
     async fn close(mut self) {
         match &mut self.socket {
@@ -617,6 +654,7 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]

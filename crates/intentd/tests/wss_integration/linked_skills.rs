@@ -30,6 +30,7 @@ async fn list(srv: &Server, id: &WorkspaceId) -> Value {
     reply["result"].clone()
 }
 
+#[track_caller]
 fn named<'a>(skills: &'a Value, name: &str) -> &'a Value {
     let matches: Vec<_> = skills
         .as_array()

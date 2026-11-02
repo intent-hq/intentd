@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
     clippy::must_use_candidate,
     reason = "test fixture for feature-crate tests, not a public library API"
 )]
+#[track_caller]
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")

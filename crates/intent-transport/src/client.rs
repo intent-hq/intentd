@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
-use crate::reverse::ReverseClientIdentity;
+use crate::reverse::{ClaimedHello, HelloClaim};
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
@@ -115,7 +115,7 @@ pub(crate) fn server_json(
     build_commit: Option<&str>,
     is_local: bool,
 ) -> Value {
-    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1, "workspaceLabels": 1, "secretRequests": 1 });
+    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1, "workspaceLabels": 1, "secretRequests": 1, "workspaceAutoArchiveOptOut": 1, "messageBlockPages": 1 });
     let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,
@@ -131,6 +131,33 @@ pub(crate) fn server_json(
             .insert("buildCommit".into(), build_commit.into());
     }
     server
+}
+
+/// Add the capabilities that depend on the running daemon to a successful
+/// hello `frame`: `startupStatus: 1` when the full composition tracks
+/// startup, `remoteMachines: 1` when this backend places agents on exposed
+/// machines (the remote feature, not node mode).
+pub(crate) fn with_runtime_capabilities(
+    frame: Option<String>,
+    startup_status: bool,
+    remote_machines: bool,
+) -> Option<String> {
+    if !startup_status && !remote_machines {
+        return frame;
+    }
+    frame.map(|frame| {
+        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
+        if value.get("result").is_some() {
+            let capabilities = &mut value["result"]["server"]["capabilities"];
+            if startup_status {
+                capabilities["startupStatus"] = json!(1);
+            }
+            if remote_machines {
+                capabilities["remoteMachines"] = json!(1);
+            }
+        }
+        value.to_string()
+    })
 }
 
 /// A deliberately compiled test host can exercise the real negotiation path.
@@ -165,10 +192,13 @@ fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
 
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
-/// task binds onto its reverse-registry entry (REV-2).
+/// task binds onto its reverse-registry entry (REV-2). It comes from the
+/// hello's [`HelloClaim`], so it names the claimed id: reserved, and so
+/// bindable, only as [`ClaimedHello::Reserved`] — a detached guard's claim
+/// reserves nothing.
 pub(crate) struct HelloOutcome {
     pub frame: Option<String>,
-    pub bound: Option<ReverseClientIdentity>,
+    pub bound: Option<ClaimedHello>,
 }
 
 pub(crate) fn reject_role(req: &ClientRequest) -> Option<String> {
@@ -236,12 +266,20 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// host identification and re-returns the same `server` block (PROTOCOL
 /// §5.17). `version` is the daemon binary's version
 /// ([`crate::SystemControl::daemon_version`]), never this crate's own.
+///
+/// `claim` claims the resolved id for the connection
+/// ([`crate::reverse::PrimaryReverseGuard::claim_hello`]) before the client
+/// row is persisted, so the id is active for the superseded-id rehome
+/// throughout (intent-hq/intent#8045) — a server-generated id too, before the
+/// response reveals it. The claim alone supplies the id this hello persists,
+/// replies with and binds; a failed hello drops it, releasing any reservation.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
     version: &str,
+    claim: impl FnOnce(ClientId) -> HelloClaim,
 ) -> HelloOutcome {
     if req.connection_role != ConnectionRole::Ordinary {
         return HelloOutcome {
@@ -266,7 +304,10 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
-    let resolved = scope_to_caller(req.client_id.map(ClientId::from_string).unwrap_or_default());
+    let claim = claim(scope_to_caller(
+        req.client_id.map(ClientId::from_string).unwrap_or_default(),
+    ));
+    let resolved = claim.client_id().clone();
     if let Err(e) = api
         .upsert_client(
             resolved.clone(),
@@ -309,12 +350,11 @@ pub(crate) async fn handle(
                 "server": server,
             })),
         ),
-        bound: Some(ReverseClientIdentity {
-            client_id: resolved,
-            name: req.name,
-            capabilities: req.capabilities.unwrap_or_else(|| json!({})),
-            host: req.host,
-        }),
+        bound: Some(claim.complete(
+            req.name,
+            req.capabilities.unwrap_or_else(|| json!({})),
+            req.host,
+        )),
     }
 }
 

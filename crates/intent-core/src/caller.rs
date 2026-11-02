@@ -35,6 +35,16 @@ pub enum Caller {
     Agent { agent_id: AgentId },
     /// Daemon-internal background work (hook runs).
     Daemon,
+    /// A backend daemon on a `/node/*` link, admitted with the executor
+    /// credential this machine minted for it. It may send only the
+    /// [`crate::node_link::EXECUTOR_LINK_REQUESTS`] frames; the JSON-RPC
+    /// router never sees it, and it is neither a principal nor an
+    /// administrator.
+    Executor {
+        credential_id: crate::ids::ExecutorCredentialId,
+        /// The backend's head id the credential was minted for.
+        backend_id: String,
+    },
 }
 
 /// Queue contents reach the recipient through normal delivery, never through
@@ -109,7 +119,7 @@ impl Caller {
     pub fn principal_id(&self) -> Option<&PrincipalId> {
         match self {
             Caller::Wire { principal_id, .. } => Some(principal_id),
-            Caller::Agent { .. } | Caller::Daemon => None,
+            Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. } => None,
         }
     }
 
@@ -120,7 +130,7 @@ impl Caller {
         match self {
             Caller::Wire { host_role, .. } => *host_role == crate::HostRole::Owner,
             Caller::Daemon => true,
-            Caller::Agent { .. } => false,
+            Caller::Agent { .. } | Caller::Executor { .. } => false,
         }
     }
 }
@@ -859,4 +869,15 @@ mod tests {
         assert!(!agent.is_administrator());
         assert_eq!(agent.principal_id(), None);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn executors_are_neither_principals_nor_administrators() {
+    let executor = Caller::Executor {
+        credential_id: crate::ids::ExecutorCredentialId::new(),
+        backend_id: "backend-1".into(),
+    };
+    assert_eq!(executor.principal_id(), None);
+    assert!(!executor.is_administrator());
 }

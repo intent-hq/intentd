@@ -380,6 +380,7 @@ async fn provider_profiles_crud_contract_over_wss() {
             "id",
             "name",
             "providerRef",
+            "remoteCompatible",
             "settingsFingerprint",
             "updatedAt"
         ]
@@ -708,6 +709,7 @@ async fn provider_profiles_backup_and_reorder_contract_over_wss() {
             "id",
             "name",
             "providerRef",
+            "remoteCompatible",
             "settingsFingerprint",
             "updatedAt"
         ]
@@ -817,6 +819,7 @@ async fn provider_profile_selection_surfaces_over_wss() {
             "baseProviderId": "codex",
             "name": "Work",
             "backup": false,
+            "remoteCompatible": true,
         }])
     );
 
@@ -952,6 +955,7 @@ async fn provider_default_overrides_contract_over_wss() {
             "env": [],
             "settingsFingerprint": "",
             "activation": { "runningProcesses": 0 },
+            "remoteCompatible": true,
         })
     };
     let list = ok(&mut ws, 1, "providers.profiles.list", json!({})).await;
@@ -1029,6 +1033,7 @@ async fn provider_default_overrides_contract_over_wss() {
                 ],
                 "settingsFingerprint": fingerprint,
                 "activation": { "runningProcesses": 0 },
+                "remoteCompatible": true,
             },
             "revision": 1,
             "activation": { "envChanged": true, "runningProcesses": 0 },

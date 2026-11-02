@@ -15,6 +15,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod auto_archive_workspace;
+mod cross_workspace_search;
 mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;
@@ -23,8 +24,16 @@ pub(crate) mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
+mod workspace_auto_archive_disabled;
+// Budgets are debug-profile future sizes measured on x86_64 Linux (CI).
+#[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+mod workspace_create_future_size;
+mod workspace_create_stack;
 pub(crate) mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
+mod workspace_plain_folder_events;
+mod workspace_plain_folder_safety;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -376,6 +385,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -603,6 +613,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -774,6 +785,8 @@ async fn worst_case_workspace_list_row() -> Workspace {
     );
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
     row.label = Some("Customer escalations for later".to_string());
+    row.auto_archive_disabled = true;
+    row.plain_folder = true;
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(
@@ -887,6 +900,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
             })
             .await
             .expect("session");
@@ -1189,6 +1203,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store.insert_agent_session(&owner).await.expect("owner");
     for n in 0..8_i64 {
@@ -1439,6 +1454,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
 
     for i in 0..WORKSPACES {
@@ -1791,6 +1807,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store
         .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
@@ -2143,6 +2160,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2976,6 +2994,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -5596,6 +5615,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .expect("session");
@@ -7728,6 +7748,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     svc.store
         .insert_agent_session(&session)
@@ -10320,6 +10341,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .expect("insert agent session");
@@ -10708,6 +10730,7 @@ mod change_event_parity {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -10792,6 +10815,7 @@ mod change_event_parity {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         let task_id = intent_core::NoteId::from("task-guard");
         // `linked-session` is linked via its session row; `linked-assigned`
@@ -11117,6 +11141,7 @@ mod change_event_parity {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -11272,6 +11297,7 @@ mod change_event_parity {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -13489,6 +13515,7 @@ mod change_event_parity {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -17325,6 +17352,7 @@ mod mcp_callback {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -28831,6 +28859,7 @@ mod search_adapters {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -30062,6 +30091,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30178,6 +30208,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30284,6 +30315,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30386,6 +30418,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30488,6 +30521,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30594,6 +30628,7 @@ mod rules {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -32281,6 +32316,16 @@ mod worktree_provisioning {
             obj.get("workspaceLabels"),
             Some(&serde_json::json!(1)),
             "workspace labels are advertised as exact integer 1: {caps}"
+        );
+        assert_eq!(
+            obj.get("workspaceAutoArchiveOptOut"),
+            Some(&serde_json::json!(1)),
+            "the auto-archive opt-out is advertised as exact integer 1: {caps}"
+        );
+        assert_eq!(
+            obj.get("messageBlockPages"),
+            Some(&serde_json::json!(1)),
+            "capped message block reads are advertised as exact integer 1: {caps}"
         );
     }
 
@@ -36157,6 +36202,7 @@ mod heal_stale_agent_sessions {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -38314,6 +38360,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         is_background: false,
         metadata: None,
     };
@@ -38361,6 +38408,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         is_background: false,
         metadata: None,
     };
@@ -38487,6 +38535,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         is_background: false,
         metadata: None,
     };
@@ -39845,6 +39894,7 @@ mod last_activity_events {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -40542,6 +40592,7 @@ mod turn_token_usage {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -44309,6 +44360,7 @@ mod agent_delete_grace_window {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -45471,6 +45523,7 @@ mod derived_workspace_unread {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 

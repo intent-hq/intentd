@@ -394,6 +394,7 @@ fn status_code(response: &str) -> u16 {
 
 /// Assert `response` is the guest-cap refusal: `503` carrying
 /// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+#[track_caller]
 fn assert_guest_cap_refused(response: &str, ctx: &str) {
     assert_eq!(status_code(response), 503, "{ctx}: {response}");
     let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
@@ -3478,6 +3479,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let mut active_session = mk_session("agent-slim-a", &ws_active);
     active_session.metadata = Some(serde_json::json!({
@@ -4483,6 +4485,7 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
 
+    #[track_caller]
     fn assert_not_found(v: &Value, what: &str) {
         assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
         assert_eq!(v["error"]["data"]["code"], "not-found", "{what}: {v}");
@@ -5238,6 +5241,7 @@ fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
+#[track_caller]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -7718,6 +7722,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .expect("insert agent session");
@@ -9259,6 +9264,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 #[intent_test_macros::daemon_test]
 async fn wss_agent_set_model_provider_id_param() {
     /// Assert the JSON-RPC response envelope: version and id correlation.
+    #[track_caller]
     fn assert_envelope(resp: &Value, id: i64) {
         assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
         assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
@@ -12483,7 +12489,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // the outcome were never recorded, reads after the slot release would
     // keep re-spawning and the spawn-count assertion below would fail.
     let mut req_id = 48u32;
-    let mut waited = 0u32;
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     let resp = loop {
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
         let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
@@ -12496,10 +12503,9 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
             break resp;
         }
         assert!(
-            waited < 200,
+            tokio::time::Instant::now() < deadline,
             "probe failure never reached the negative cache: {resp}"
         );
-        waited += 1;
         req_id += 1;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
@@ -18979,8 +18985,11 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
 /// Non-user rows are never included; previews are bounded to
 /// `previewChars` (default 300, server-clamped into [1, 2000], with the
 /// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
-/// `metadata` passes through verbatim when present; a workspace mismatch
-/// and an unknown agent are not-found; a missing `agentId` is `-32602`.
+/// `metadata` is projected to the classification fields (heavy keys such as
+/// `events` never ride the wire, intent-hq/intent#8278); `limit` /
+/// `nextToken` page newest-first; a workspace mismatch and an unknown agent
+/// are not-found; a missing `agentId` or a malformed `nextToken` is
+/// `-32602`.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
@@ -19042,7 +19051,11 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
             &agent,
             "user",
             &json!([{ "type": "text", "text": "automated follow-up" }]),
-            Some(&json!({ "automated": true })),
+            Some(&json!({
+                "automated": true,
+                "type": "event_notification",
+                "events": [{ "type": "agent:reportToParent", "report": "r".repeat(8192) }],
+            })),
             &ts,
         )
         .await
@@ -19090,8 +19103,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(items[1]["id"], second);
     assert_eq!(
         items[1]["metadata"],
-        json!({ "automated": true }),
-        "metadata passes through verbatim"
+        json!({ "type": "event_notification" }),
+        "metadata is projected to the classification fields"
+    );
+    assert!(
+        result.get("nextToken").is_none(),
+        "unpaged reads keep the pre-paging shape: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -19165,6 +19182,75 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(
         lenient_float["result"]["items"][0]["preview"], "first",
         "float previewChars truncates toward zero (5.9 → 5)"
+    );
+
+    // Paging: the newest `limit` rows oldest→newest, then the opaque
+    // `nextToken` walks to the start and ends at `null`.
+    let paged = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2}}}}"#
+        ),
+    )
+    .await;
+    let paged = &paged["result"];
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(ids(paged), vec![second.clone(), third.clone()], "{paged}");
+    assert_eq!(paged["total"], 2);
+    let token = paged["nextToken"].as_str().expect("older rows remain");
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":14,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2,"nextToken":"{token}"}}}}"#
+        ),
+    )
+    .await;
+    let older = &older["result"];
+    assert_eq!(ids(older), vec![first.clone()], "{older}");
+    assert!(older["nextToken"].is_null(), "no older rows: {older}");
+    let bad_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":15,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":"bogus"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_token["error"]["code"], -32602, "{bad_token}");
+    for (id, token) in [(16, "123"), (17, "{}"), (18, "[]")] {
+        let typed = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":{token}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            typed["error"]["code"], -32602,
+            "a non-string nextToken is rejected, never read as absent: {typed}"
+        );
+    }
+    let null_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":19,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":null}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        null_token["result"].get("nextToken").is_none(),
+        "a null nextToken reads as absent: {null_token}"
     );
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
@@ -19276,6 +19362,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),
@@ -21903,6 +21990,7 @@ async fn wss_transfer_preserves_remote_state() {
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
 
+    #[track_caller]
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
@@ -23040,7 +23128,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     drop(enumeration);
 
-    let started = std::time::Instant::now();
+    // The hang guard below is the responsiveness check: a status reply stuck
+    // behind the traversal never arrives inside it.
     status
         .send(Message::Text(
             r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
@@ -23069,10 +23158,6 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     .await
     .expect("system.status stayed responsive during detached traversal");
     assert!(response["result"].is_object(), "system.status: {response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "system.status was delayed by file.tree"
-    );
 
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));

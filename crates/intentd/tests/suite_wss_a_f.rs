@@ -36,4 +36,5 @@ mod e2e_wss_display_status_hooks;
 mod e2e_wss_display_status_needs_attention;
 mod e2e_wss_egress_conflation;
 mod e2e_wss_event_subscription;
+mod e2e_wss_executor_credentials;
 mod e2e_wss_flush_queued_messages;

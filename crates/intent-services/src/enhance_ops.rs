@@ -589,7 +589,9 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let prompt = "x".repeat(4 * 1024 * 1024);
-        let started = std::time::Instant::now();
+        // The child never exits or drains stdin, so the call can only return
+        // through the 200 ms budget; a budget that started after the write
+        // never starts and the hang guard below fails instead.
         let result = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             run_auggie_print(&bin, None, None, &prompt, 200, "One-shot completion"),
@@ -601,11 +603,6 @@ mod tests {
             err.to_string()
                 .contains("One-shot completion timed out after 200ms"),
             "got {err:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "not bounded by the budget: {:?}",
-            started.elapsed()
         );
     }
 

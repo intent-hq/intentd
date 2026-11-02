@@ -23,16 +23,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(index, next(i for i, s in enumerate(steps) if s.get('name') == 'Resolve pinned Rust channel'))
         self.assertFalse(any('cargo ' in s.get('run', '') for s in steps[:index]))
 
-    def test_lifecycle_preflight_precedes_toolchain_and_compilation(self):
-        steps = workflow('ci.yml')['jobs']['daemon-lifecycle']['steps']
-        matches = [(i, s) for i, s in enumerate(steps) if s.get('name') == 'Ensure macOS CI disk headroom']
-        self.assertEqual(len(matches), 1)
-        index, step = matches[0]
-        self.assertEqual(step['run'], 'python3 -I -B scripts/macos-ci-cleanup.py --apply')
-        self.assertIn("runner.os == 'macOS'", step['if'])
-        self.assertIn("contains(matrix.os, 'self-hosted')", step['if'])
-        self.assertLess(index, next(i for i, s in enumerate(steps) if s.get('name') == 'Resolve pinned Rust channel'))
-        self.assertFalse(any('cargo ' in s.get('run', '') for s in steps[:index]))
+    def test_macos_queue_proofs_share_the_build_preflight(self):
+        # The macOS lifecycle proof and Services runtime steps run in `build`,
+        # after its single preflight and in its target dir; no other ci.yml job
+        # requests a macOS runner or prunes the m1mac target roots.
+        jobs = workflow('ci.yml')['jobs']
+        steps = jobs['build']['steps']
+        preflight = next(i for i, s in enumerate(steps) if s.get('name') == 'Ensure macOS CI disk headroom')
+        lifecycle = next(i for i, s in enumerate(steps) if s.get('name') == 'Native lifecycle runtime proof (macOS)')
+        self.assertLess(preflight, lifecycle)
+        self.assertEqual(steps[lifecycle]['env'], {'CARGO_BUILD_TARGET': '${{ matrix.target }}'})
+        self.assertNotIn('macos-services-runtime', jobs)
+        self.assertEqual([row['platform'] for row in jobs['daemon-lifecycle']['strategy']['matrix']['include']], ['linux'])
+        for name, job in jobs.items():
+            if name == 'build':
+                continue
+            with self.subTest(job=name):
+                self.assertNotIn('macos_labels', str(job.get('runs-on', '')) + str(job.get('strategy', '')))
+                self.assertFalse(any('scripts/macos-ci-cleanup.py --apply' in s.get('run', '') for s in job.get('steps', [])))
 
     def test_maintenance_is_serialized_and_manual_defaults_to_dry_run(self):
         data = workflow('macos-prune.yml')

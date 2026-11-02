@@ -63,6 +63,9 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The agent→BE MCP server: a fixed workspace context, the shared service
 /// surface, and the set of tool names denied for this agent's type.
+// Each bool is an independent spawn-time capture (chief-ness, sub-agent,
+// compact descriptions, plain folder), not a state machine.
+#[expect(clippy::struct_excessive_bools)]
 pub struct WorkspaceMcpServer {
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -99,6 +102,10 @@ pub struct WorkspaceMcpServer {
     /// docs. Only specialists that carry options appear; empty — the default
     /// — leaves the description byte-identical.
     specialist_model_options: Vec<tools::SpecialistModelOptions>,
+    /// Remote-placement discovery for the `ws.agent.create` docs, captured
+    /// at bridge creation: present only when the daemon has a configured
+    /// execution node, so the default description stays byte-identical.
+    remote_placement_help: Option<String>,
     /// Whether this server front-doors a sub-agent (a session with a
     /// `parent_agent_id` or `is_background`), captured once at bridge
     /// creation like `agent_features`. Sub-agents don't own a user-facing
@@ -114,10 +121,33 @@ pub struct WorkspaceMcpServer {
     /// every non-flagged provider keeps today's full description
     /// byte-identical.
     compact_tool_descriptions: bool,
+    /// Whether this server front-doors a plain-folder workspace
+    /// (`Workspace.plainFolder`, §5.1), captured at bridge creation. Its
+    /// `workspace_api` description leaves out the git and forge surfaces
+    /// (`ws.git.*`, `ws.pr.*`, `ws.mr.*`, `ws.workspace.proposeSibling`);
+    /// dispatch and `ws.help` read the persisted flag themselves. Defaults
+    /// to `false`, which keeps every description byte-identical.
+    plain_folder: bool,
     /// Optional trusted producer; disabled for all existing construction paths.
     repository_guidance: Option<GuidanceBinding>,
     /// Original endpoint context; no runtime construction path installs it yet.
     request_context: Option<Arc<dyn McpRequestContext>>,
+    /// Sees every `host({method, args})` frame before the local dispatch;
+    /// `None` (every head-side bridge) dispatches all frames locally.
+    frame_router: Option<Arc<dyn HostFrameRouter>>,
+}
+
+/// Decides, per `host({method, args})` frame, whether the bridge handles it
+/// itself. A remote agent's node uses it to forward control-plane calls to
+/// head and refuse the namespaces a node cannot serve.
+pub trait HostFrameRouter: Send + Sync {
+    /// The frame's result when the router handles it; `None` dispatches the
+    /// frame to the bridge's `WorkspaceApi` as usual.
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<intent_core::BoxFuture<'static, std::result::Result<Value, String>>>;
 }
 
 impl WorkspaceMcpServer {
@@ -136,10 +166,13 @@ impl WorkspaceMcpServer {
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
+            remote_placement_help: None,
             is_sub_agent: false,
             compact_tool_descriptions: false,
+            plain_folder: false,
             repository_guidance: None,
             request_context: None,
+            frame_router: None,
         }
     }
 
@@ -184,6 +217,14 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_request_context(mut self, context: Arc<dyn McpRequestContext>) -> Self {
         self.request_context = Some(context);
+        self
+    }
+
+    /// Route `host` frames through `router` before the local dispatch (the
+    /// remote node's wiring point).
+    #[must_use]
+    pub fn with_frame_router(mut self, router: Arc<dyn HostFrameRouter>) -> Self {
+        self.frame_router = Some(router);
         self
     }
 
@@ -253,6 +294,15 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Set the remote-placement discovery text appended to the
+    /// `ws.agent.create` docs (the spawn-time wiring point). `None` — no
+    /// configured execution node — keeps the default description.
+    #[must_use]
+    pub fn with_remote_placement_help(mut self, help: Option<String>) -> Self {
+        self.remote_placement_help = help;
+        self
+    }
+
     /// Mark this bridge as serving a sub-agent (the spawn-time wiring point —
     /// derived once at bridge creation from the session:
     /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
@@ -275,19 +325,50 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Mark this bridge as serving a plain-folder workspace (the spawn-time
+    /// wiring point, read from the persisted `Workspace.plainFolder`): the
+    /// `workspace_api` description in every variant (full, compact,
+    /// condensed) leaves out the git and forge surfaces.
+    #[must_use]
+    pub fn with_plain_folder(mut self, plain_folder: bool) -> Self {
+        self.plain_folder = plain_folder;
+        self
+    }
+
+    /// A description variant as THIS bridge serves it: unchanged, or with
+    /// the plain-folder surfaces removed.
+    fn shape_description(&self, desc: String) -> String {
+        if self.plain_folder {
+            tools::plain_folder_description(&desc)
+        } else {
+            desc
+        }
+    }
+
     /// The fully assembled `workspace_api` description for THIS bridge —
     /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
     /// gate folded in), and specialist model options all applied — exactly
     /// what a non-truncating provider's `tools/list` serves.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
-        tools::workspace_api_description_with_model_options(
+        let description = tools::workspace_api_description_with_model_options(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
             self.is_sub_agent,
+        );
+        // Remote agents start from a git commit, so a plain folder (§5.1)
+        // never lists placement.
+        self.shape_description(
+            match self
+                .remote_placement_help
+                .as_ref()
+                .filter(|_| !self.plain_folder)
+            {
+                Some(help) => tools::inject_remote_placement_help(&description, help),
+                None => description.into_owned(),
+            },
         )
-        .into_owned()
     }
 
     /// The condensed `workspace_api` reference for THIS bridge — the same
@@ -299,10 +380,22 @@ impl WorkspaceMcpServer {
     /// variant.
     #[must_use]
     pub fn condensed_workspace_api_description(&self) -> String {
-        tools::condensed_workspace_api_description(
+        let description = tools::condensed_workspace_api_description(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
+        );
+        // Remote agents start from a git commit, so a plain folder (§5.1)
+        // never lists placement.
+        self.shape_description(
+            match self
+                .remote_placement_help
+                .as_ref()
+                .filter(|_| !self.plain_folder)
+            {
+                Some(help) => tools::inject_remote_placement_help(&description, help),
+                None => description,
+            },
         )
     }
 
@@ -471,10 +564,10 @@ impl WorkspaceMcpServer {
                 // (`condensed_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
                     if self.compact_tool_descriptions {
-                        tools::compact_workspace_api_description(
+                        self.shape_description(tools::compact_workspace_api_description(
                             self.is_chief,
                             &self.effective_agent_features(),
-                        )
+                        ))
                     } else {
                         self.full_workspace_api_description()
                     }

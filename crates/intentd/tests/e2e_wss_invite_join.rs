@@ -467,6 +467,7 @@ impl MockGithub {
     /// Authorise device flow `n` as the account behind `token`. The flow
     /// must already have been started (a `/login/device/code` call minted
     /// it), so a stale index is a test bug rather than a silent no-op.
+    #[track_caller]
     fn authorize(&self, n: usize, token: &'static str) {
         let started = self.flows.load(Ordering::SeqCst);
         assert!(

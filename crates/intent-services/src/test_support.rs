@@ -9,6 +9,7 @@ pub mod capability_fixtures;
 pub(crate) mod fake_runtime;
 pub mod fixtures;
 pub mod goldens;
+pub mod large_state;
 #[cfg(test)]
 pub(crate) mod provider_installed;
 #[cfg(test)]

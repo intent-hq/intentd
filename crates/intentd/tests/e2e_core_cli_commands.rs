@@ -576,6 +576,7 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
 
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,
 /// returning the printed result object.
+#[track_caller]
 fn call_json(data_dir: &Path, method: &str) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("call")

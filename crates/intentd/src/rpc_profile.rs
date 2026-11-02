@@ -93,10 +93,14 @@ pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
 /// WARN. Higher than [`DEFAULT_DURATION_WARN_MS`] so normal upstream latency
 /// doesn't trip the guardrail.
 pub const DEFAULT_NETWORK_DURATION_WARN_MS: u64 = 10_000;
-/// Fixed soft response-size threshold. This is deliberately far below the
-/// transport's 40 MiB hard cap so unexpectedly large hot-path responses are
-/// visible before they approach frame rejection.
-pub const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: u64 = 1024 * 1024;
+/// Fixed soft response-size threshold: the read payload budget
+/// ([`intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES`], 500 KiB) that
+/// the payload sweep in `crates/intent-app/tests/payload_budget/` enforces on
+/// the large fixture. Far below the transport's 40 MiB hard cap, so a read
+/// that outgrows its budget in the field is visible long before it
+/// approaches frame rejection.
+pub const RESPONSE_SIZE_WARN_THRESHOLD_BYTES: u64 =
+    intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES as u64;
 /// Env override for the statement-count threshold (u64).
 pub const STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_STATEMENT_WARN_THRESHOLD";
 /// Env override for the compound-op-tier statement-count threshold (u64).
@@ -782,6 +786,34 @@ mod tests {
             )),
             "{warns:?}"
         );
+    }
+
+    /// The soft limit is the 500 KiB read payload budget the payload sweep
+    /// enforces: a reply of exactly the budget stays quiet, one byte more
+    /// warns (a 600 KB reply, under the old 1 MiB limit, now warns).
+    #[test]
+    fn response_size_soft_limit_is_the_read_payload_budget() {
+        assert_eq!(RESPONSE_SIZE_WARN_THRESHOLD_BYTES, 500 * 1024);
+        for (bytes, expected) in [
+            (RESPONSE_SIZE_WARN_THRESHOLD_BYTES, 0),
+            (RESPONSE_SIZE_WARN_THRESHOLD_BYTES + 1, 1),
+            (600_000, 1),
+        ] {
+            let layer = RpcProfileLayer::new(
+                u64::MAX,
+                u64::MAX,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            );
+            let warns = run_dispatch(layer, "agent.list", || {
+                let span = tracing::Span::current();
+                span.record("response_bytes", bytes);
+                span.record("encode_elapsed_ms", 1_u64);
+                span.record("oversized_replacement", false);
+                span.record("encode_failed", false);
+            });
+            assert_eq!(warns.len(), expected, "{bytes} bytes: {warns:?}");
+        }
     }
 
     /// intent-hq/intent#5531: a handler-recorded request variant rides the

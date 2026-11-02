@@ -1274,17 +1274,21 @@ async fn failed_wake_storage_retains_outbox_without_duplicate_memory_deliveries(
     let pending = h.agent("startControl", json!({})).await.unwrap();
     let request = pending["requestId"].as_str().unwrap();
     let payload = json!({"type":"desktop_control","requestId":request,"outcome":"denied","state":{"status":"inactive"},"message":"denied"});
-    h.services
-        .store
-        .desktop_resolve_request(request, &h.workspace, &h.agent, "denied", &payload)
-        .await
-        .unwrap();
+    // Inject the storage failure BEFORE the outcome reaches the outbox: the
+    // startControl task and the watchdog flush the outbox in the background,
+    // and one landing between the resolve and the triggers would deliver the
+    // wake normally (a timing race, 15/20 under stress on a slower schema).
     for sql in [
         "CREATE TRIGGER reject_desktop_message BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT,'injected failure'); END",
         "CREATE TRIGGER reject_desktop_queue BEFORE INSERT ON agent_queue BEGIN SELECT RAISE(ABORT,'injected failure'); END",
     ] {
         sqlx::query(sql).execute(h.services.store.write_pool()).await.unwrap();
     }
+    h.services
+        .store
+        .desktop_resolve_request(request, &h.workspace, &h.agent, "denied", &payload)
+        .await
+        .unwrap();
     h.services.desktop_flush_outbox().await;
     assert_eq!(h.services.store.desktop_outbox().await.unwrap().len(), 1);
     h.services.desktop_flush_outbox().await;

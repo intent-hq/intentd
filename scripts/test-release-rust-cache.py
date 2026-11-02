@@ -52,6 +52,39 @@ class ManagedCache(unittest.TestCase):
         for forbidden in ['gh release', 'dist host', 'dist publish', 'git push', 'repository_dispatch']:
             self.assertNotIn(forbidden, text)
 
+    def test_warming_skips_release_metadata_pushes(self):
+        # release-plz version bumps touch Cargo.toml/Cargo.lock on every
+        # release, but the tree was already warmed and the tag's release build
+        # compiles the new versions itself; dispatch always warms.
+        warm = workflow('release-cache.yml')
+        plan = warm['jobs']['plan']
+        classify = next(step for step in plan['steps'] if step.get('id') == 'release')
+        self.assertEqual(classify['if'], "github.event_name == 'push'")
+        self.assertEqual(classify['env'], {'BASE_SHA': '${{ github.event.before }}'})
+        self.assertIn('./scripts/release-pr-fast-path.sh --exact-parent "$BASE_SHA" HEAD', classify['run'])
+        self.assertIn('|| out="fast_path=false"', classify['run'])
+        self.assertEqual(plan['outputs']['release_push'], '${{ steps.release.outputs.release_push }}')
+        for name in ('daemon', 'sitter'):
+            job = warm['jobs'][name]
+            self.assertIn('plan', job['needs'])
+            self.assertTrue(job['if'].endswith("&& needs.plan.outputs.release_push != 'true'"), name)
+        # The classifier's output line maps onto release_push; a miss or an
+        # unparseable result keeps warming.
+        body = classify['run'].replace('git fetch --no-tags --depth=2 origin "$GITHUB_SHA" || true\n', '')
+        for script, expected in (('echo fast_path=true', 'true'), ('echo fast_path=false', 'false'),
+                                 ('exit 3', 'false'), ('echo nonsense', 'false')):
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                (tmp / 'scripts').mkdir()
+                fake = tmp / 'scripts' / 'release-pr-fast-path.sh'
+                fake.write_text('#!/usr/bin/env bash\n' + script + '\n')
+                fake.chmod(0o755)
+                out = tmp / 'out'
+                subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', body], cwd=tmp, check=True,
+                               env={'PATH': os.environ['PATH'], 'GITHUB_OUTPUT': str(out), 'BASE_SHA': 'a' * 40,
+                                    **{k: v for k, v in os.environ.items() if k == 'LD_LIBRARY_PATH'}})
+                self.assertEqual(out.read_text(), f'release_push={expected}\n')
+
     def test_release_and_warming_use_identical_setup_and_targets(self):
         source = yaml.safe_load((ROOT / '.github/dist-build-setup.yml').read_text())
         daemon = workflow('v-release.yml')['jobs']['build-local-artifacts']['steps']

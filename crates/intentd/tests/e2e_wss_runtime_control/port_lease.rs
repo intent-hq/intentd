@@ -36,6 +36,7 @@ pub(super) fn acquire() -> Flock<File> {
     acquire_bounded(open())
 }
 
+#[track_caller]
 fn acquire_bounded(mut file: File) -> Flock<File> {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {

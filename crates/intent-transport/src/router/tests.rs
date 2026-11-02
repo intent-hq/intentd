@@ -164,8 +164,19 @@ impl WorkspaceApi for FakeApi {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
             }
+            if id.as_str() == "ws-plain" {
+                return Ok(Workspace {
+                    branch: String::new(),
+                    worktree_path: None,
+                    plain_folder: true,
+                    ..ws_with(&id)
+                });
+            }
             Ok(ws_with(&id))
         })
+    }
+    fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { id.as_str() == "ws-plain" })
     }
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
@@ -2639,6 +2650,86 @@ async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() 
     );
 }
 
+#[test]
+fn placement_unavailable_maps_to_the_documented_error() {
+    // The first `errors` case of monorepo
+    // docs/protocol/fixtures/nodes/platform-routing.json.
+    use intent_core::nodes::{NodeArch, NodeOs};
+    use intent_core::placement::{AgentPlatform, PlatformAvailability};
+    let failure = PlatformAvailability::new(
+        [AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64,
+        }],
+        [],
+        "2026-10-01T00:00:00Z".into(),
+    )
+    .unavailable(serde_json::from_str(r#"{"arch":"x86_64"}"#).unwrap());
+    let rpc = super::domain_to_rpc(intent_core::Error::PlacementUnavailable(Box::new(failure)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "No capacity for x86_64; available: none; supported: linux/x86_64"
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "placement-unavailable",
+            "requested": { "arch": "x86_64" },
+            "reason": "no-capacity",
+            "availablePlatforms": [],
+            "supportedPlatforms": [{ "os": "linux", "arch": "x86_64" }],
+            "availableOs": [],
+            "retryable": true,
+            "observedAt": "2026-10-01T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
+    use intent_core::machines::{MachineUpdateRequired, ModelUnavailable, UpdateSide};
+    let model = ModelUnavailable::new("claude", "opus", [], false);
+    let rpc = super::domain_to_rpc(intent_core::Error::ModelUnavailable(Box::new(model)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Model \"opus\" (claude) isn't available: no machine is exposed to this backend."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "model-unavailable",
+            "provider": "claude",
+            "model": "opus",
+            "machines": [],
+            "retryable": false
+        })
+    );
+
+    let update = MachineUpdateRequired {
+        machine_name: "mac-mini".into(),
+        machine_version: "0.11.0".into(),
+        backend_version: "0.12.0".into(),
+        update: UpdateSide::Machine,
+    };
+    let rpc = super::domain_to_rpc(intent_core::Error::MachineUpdateRequired(Box::new(update)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Update Intent on mac-mini (it runs 0.11.0; this backend needs 0.12.0 or newer)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "machine-update-required",
+            "machineVersion": "0.11.0",
+            "backendVersion": "0.12.0",
+            "update": "machine"
+        })
+    );
+}
+
 #[tokio::test]
 async fn clone_failed_maps_to_structured_error_data() {
     // A classified clone failure (clone failure taxonomy, PROTOCOL §9.1;
@@ -3497,6 +3588,7 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: Some(intent_core::CheckoutMode::Cow),
+        plain_folder: false,
     });
     assert_eq!(rpc.code, -32602);
     assert_eq!(
@@ -3506,10 +3598,176 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: None,
+        plain_folder: false,
     });
     assert_eq!(
         rpc.data,
         Some(serde_json::json!({ "code": "retire-unsupported" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+        plain_folder: true,
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "plainFolder": true }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.retire is not available in plain-folder workspaces"
+    );
+}
+
+/// An operation needing git or a forge on a plain-folder workspace (§5.1)
+/// carries `plain-folder-unsupported` with the refused operation.
+#[test]
+fn plain_folder_unsupported_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderUnsupported {
+        operation: "workspace.duplicate",
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-unsupported",
+            "operation": "workspace.duplicate",
+        }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.duplicate is not available in plain-folder workspaces"
+    );
+}
+
+/// Plain-folder create rejections (§5.1 "Plain-folder workspaces") carry the
+/// documented machine-readable `error.data`.
+#[test]
+fn plain_folder_errors_map_to_machine_readable_codes() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderInvalidParams(
+        "isNewRepo cannot be combined with plainFolder".to_string(),
+    ));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "invalid-params" }))
+    );
+    assert!(rpc.message.contains("isNewRepo"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+        intent_core::PlainFolderPathRejection {
+            reason: intent_core::PlainFolderPathReason::InsideGitRepo,
+            path: "/home/u/repo/docs".to_string(),
+            repository_root: Some("/home/u/repo".to_string()),
+        },
+    )));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-path-rejected",
+            "reason": "inside-git-repo",
+            "path": "/home/u/repo/docs",
+            "repositoryRoot": "/home/u/repo",
+        }))
+    );
+    assert!(rpc.message.contains("/home/u/repo"), "{}", rpc.message);
+
+    for (reason, wire) in [
+        (
+            intent_core::PlainFolderPathReason::InsideWorkspacesRoot,
+            "inside-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ContainsWorkspacesRoot,
+            "contains-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::NotADirectory,
+            "not-a-directory",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ParentMissing,
+            "parent-missing",
+        ),
+    ] {
+        let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+            intent_core::PlainFolderPathRejection {
+                reason,
+                path: "/p".to_string(),
+                repository_root: None,
+            },
+        )));
+        assert_eq!(
+            rpc.data,
+            Some(serde_json::json!({
+                "code": "plain-folder-path-rejected", "reason": wire, "path": "/p",
+            })),
+            "{wire}"
+        );
+    }
+}
+
+/// Explicit git and accept-changes mutations on a plain-folder workspace
+/// (§5.1) are refused at the front door with `plain-folder-unsupported`
+/// naming the method; the same call on a git workspace still dispatches.
+#[tokio::test]
+async fn plain_folder_git_mutations_are_refused_at_the_front_door() {
+    for (method, extra) in [
+        ("git.stage", r#","paths":["a.txt"]"#),
+        ("git.push", ""),
+        ("git.createBranch", r#","branchName":"topic""#),
+        (
+            "accept-changes.addRemote",
+            r#","remoteUrl":"https://github.com/o/r.git""#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-plain"{extra}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}: {v}");
+        assert_eq!(
+            v["error"]["data"],
+            serde_json::json!({ "code": "plain-folder-unsupported", "operation": method }),
+            "{method}"
+        );
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(format!(
+                "{method} is not available in plain-folder workspaces"
+            ))
+        );
+    }
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["a.txt"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ok.get("error").is_none(), "{ok}");
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): the key is refused
+/// with `-32602 { code: "invalid-params" }`.
+#[tokio::test]
+async fn workspace_update_rejects_plain_folder() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.update","params":{"workspaceId":"ws-1","plainFolder":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("plainFolder")),
+        "{v}"
     );
 }
 

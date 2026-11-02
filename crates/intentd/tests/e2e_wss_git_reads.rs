@@ -213,6 +213,7 @@ fn gate() -> bool {
     }
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git")
         .args(args)

@@ -168,6 +168,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-ghdf-")
 }
 
+#[track_caller]
 fn mock_device_flow_command(
     data_dir: &Path,
     listen: &str,

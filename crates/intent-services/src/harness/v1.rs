@@ -1065,6 +1065,7 @@ impl Harness for V1 {
         }
         super::review_wake::checklist(
             &requirements,
+            s.head_sha.as_deref(),
             crate::pr_monitor::requirements_ready(&s.requirements),
         )
     }
@@ -1268,6 +1269,43 @@ impl Harness for V1 {
                     None => "removed from the merge queue".to_string(),
                 });
             }
+        }
+        // The queue entry's state is otherwise informational (position,
+        // size, estimate), but `unmergeable` strands the PR: it conflicts
+        // with an entry ahead and will never merge on its own, and its
+        // branch is locked while queued (intentd#2897 sat ~55 min). The
+        // forge can also raise the flag with no real conflict (intentd#2937
+        // re-enqueued unchanged and merged), so the advice checks before
+        // fixing anything. Recovery
+        // reports only while the entry is still read with a known state;
+        // leaving the queue reports itself.
+        let entry_state = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue
+                .as_ref()
+                .filter(|_| r.is_in_merge_queue == Some(true))
+                .and_then(|e| e.state.clone())
+        };
+        match (entry_state(o).as_deref(), entry_state(n).as_deref()) {
+            (before, Some("unmergeable")) if before != Some("unmergeable") => {
+                changes.push(
+                    "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
+                     it and will not merge. Its branch is locked while queued, so a push is \
+                     rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
+                     then git fetch origin and check the conflict is real: git merge-tree \
+                     --write-tree <entry ahead's merge-group branch \
+                     origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is \
+                     ahead> <this head>. If that is clean the flag was stale: enqueue the same \
+                     commit again; otherwise fix the branch, then enqueue it again"
+                        .to_string(),
+                );
+            }
+            (Some("unmergeable"), Some(after)) if after != "unmergeable" => {
+                changes.push(format!(
+                    "merge queue entry is no longer unmergeable (now {})",
+                    after.replace('_', " ")
+                ));
+            }
+            _ => {}
         }
         if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(

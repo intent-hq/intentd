@@ -709,6 +709,7 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
 }
 
 /// Run `git` in `cwd` with a hermetic identity, asserting success.
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) {
     let out = Command::new("git")
         .args(args)

@@ -75,6 +75,8 @@ enum WorkspaceVariant {
     #[default]
     Titled,
     AutoTitled,
+    /// A plain-folder workspace (§5.1): no branch, no worktree.
+    PlainFolder,
     NotFound,
 }
 
@@ -82,6 +84,18 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
     let (title, worktree) = match variant {
         WorkspaceVariant::Titled => ("Hello".to_string(), Some("/tmp/hello".to_string())),
         WorkspaceVariant::AutoTitled => (id.to_string(), None),
+        WorkspaceVariant::PlainFolder => {
+            return Workspace {
+                id: WorkspaceId::from_string(id),
+                title: "Notes".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                repository_path: Some("/tmp/notes".to_string()),
+                repository_name: Some("notes".to_string()),
+                plain_folder: true,
+                ..Default::default()
+            };
+        }
         WorkspaceVariant::NotFound => unreachable!(),
     };
     Workspace {
@@ -120,6 +134,14 @@ impl WorkspaceApi for FakeApi {
             .unwrap()
             .clone()
             .unwrap_or_else(WorkspaceSetupStatus::unknown)
+    }
+
+    fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
+        let plain = matches!(
+            *self.workspace_variant.lock().unwrap(),
+            WorkspaceVariant::PlainFolder
+        );
+        Box::pin(async move { plain })
     }
 
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -583,6 +605,20 @@ async fn workspace_details_returns_reference_shape() {
     assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
 }
 
+/// A plain-folder workspace has no branch (§5.1): `details()` omits the key,
+/// while a git workspace keeps it (see `workspace_details_returns_reference_shape`).
+#[tokio::test]
+async fn workspace_details_omits_branch_for_plain_folders() {
+    let (srv, api) = server();
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert!(v.get("branch").is_none(), "branch omitted: {v}");
+    assert_eq!(v["title"], json!("Notes"));
+    assert_eq!(v["repositoryName"], json!("notes"));
+}
+
 #[tokio::test]
 async fn workspace_details_not_found_returns_defaults() {
     let (srv, api) = server();
@@ -863,6 +899,12 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
+        node_id: None,
+        lease_id: None,
+        node_name: None,
+        placement: None,
+        effective_isolation: None,
+        placement_error: None,
         id: AgentId::from_string(id),
         workspace_id: WorkspaceId::from_string("ws-1"),
         parent_agent_id: None,
@@ -909,6 +951,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         metadata: AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,
@@ -1714,4 +1757,296 @@ async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope()
         api.script_monitor_calls.lock().unwrap()[0]["workspaceId"],
         CHIEF_WORKSPACE_ID
     );
+}
+
+/// Git and forge API names a plain-folder surface must never carry (§5.1).
+/// `ws.primitive` is stripped first so the `ws.pr` probe only hits the
+/// pull-request namespace.
+fn plain_folder_leaks(text: &str) -> Vec<&'static str> {
+    let text = text.replace("ws.primitive", "");
+    [
+        "ws.git",
+        "ws.pr",
+        "ws.mr",
+        "proposeSibling",
+        "pr.snapshot",
+        "pr.monitor",
+    ]
+    .into_iter()
+    .filter(|needle| text.contains(needle))
+    .collect()
+}
+
+/// In a plain-folder workspace every `ws.git.*`, `ws.pr.*`, `ws.mr.*` and
+/// `ws.workspace.proposeSibling` call fails with the documented refusal and
+/// never reaches the service.
+#[tokio::test]
+async fn plain_folder_refuses_git_and_forge_bindings() {
+    let (srv, api) = server_with_caller("agent-1");
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    for (code, binding) in [
+        ("return await ws.git.commit('msg');", "ws.git.commit"),
+        ("return await ws.git.listRoots();", "ws.git.listRoots"),
+        (
+            "return await ws.git.registerRoot('sub');",
+            "ws.git.registerRoot",
+        ),
+        (
+            "return await ws.git.unregisterRoot('sub');",
+            "ws.git.unregisterRoot",
+        ),
+        ("return await ws.pr.snapshot(7);", "ws.pr.snapshot"),
+        ("return await ws.pr.monitor(7);", "ws.pr.monitor"),
+        ("return await ws.pr.unmonitor(7);", "ws.pr.unmonitor"),
+        ("return await ws.pr.monitors();", "ws.pr.monitors"),
+        // The `ws.mr.*` aliases send the `pr.*` frames, so the refusal names
+        // the canonical binding.
+        ("return await ws.mr.snapshot(7);", "ws.pr.snapshot"),
+        ("return await ws.mr.monitors();", "ws.pr.monitors"),
+        (
+            "return await ws.workspace.proposeSibling({ title: 't', initialPrompt: 'p' });",
+            "ws.workspace.proposeSibling",
+        ),
+    ] {
+        let resp = call(&srv, code).await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{binding}: {resp}");
+        let expected = format!("{binding} is not available in plain-folder workspaces");
+        assert!(
+            text(&resp).contains(&expected),
+            "{binding}: {}",
+            text(&resp)
+        );
+    }
+    assert!(api.agent_commit_calls.lock().unwrap().is_empty());
+    assert_eq!(*api.git_root_list_calls.lock().unwrap(), 0);
+    assert!(api.git_root_register_calls.lock().unwrap().is_empty());
+    assert!(api.git_root_unregister_calls.lock().unwrap().is_empty());
+    // Other namespaces still work in a plain folder.
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+}
+
+/// A git workspace keeps the bindings (the refusal keys on the persisted
+/// `plainFolder` flag only).
+#[tokio::test]
+async fn git_workspace_keeps_git_bindings() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.listRoots();").await;
+    assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+    assert_eq!(*api.git_root_list_calls.lock().unwrap(), 1);
+}
+
+/// `ws.help` in a plain folder: the index and every namespace page leave out
+/// the git and forge surfaces, and the git/pr/mr namespaces are refused.
+#[tokio::test]
+async fn plain_folder_help_omits_git_and_forge_surfaces() {
+    let (srv, api) = server();
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::PlainFolder;
+    let index = body(&call(&srv, "return await ws.help();").await)
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(index.starts_with("Namespaces"), "{index}");
+    assert!(plain_folder_leaks(&index).is_empty(), "{index}");
+    assert!(index.contains("ws.workspace.*"), "{index}");
+    for ns in ["workspace", "hook", "agent", "event", "note"] {
+        let resp = call(&srv, &format!("return await ws.help('{ns}');")).await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{ns}: {resp}");
+        let page = body(&resp).as_str().unwrap().to_string();
+        assert!(
+            plain_folder_leaks(&page).is_empty(),
+            "{ns}: {:?}",
+            plain_folder_leaks(&page)
+        );
+    }
+    for ns in ["git", "pr", "ws.mr", "pr.*"] {
+        let resp = call(&srv, &format!("return await ws.help('{ns}');")).await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{ns}: {resp}");
+        assert!(
+            text(&resp).contains("is not available in plain-folder workspaces"),
+            "{ns}: {}",
+            text(&resp)
+        );
+    }
+    // A git workspace keeps them.
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::Titled;
+    let pr = body(&call(&srv, "return await ws.help('pr');").await)
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(pr.contains("ws.pr.snapshot("), "{pr}");
+}
+
+/// The advertised `workspace_api` description — full, compact (truncating
+/// providers' `tools/list`) and condensed (their system-prompt copy) —
+/// leaves out the git and forge surfaces on a plain-folder bridge, under
+/// every feature combination that rewrites the cross-references, and is
+/// byte-identical on a git bridge.
+#[tokio::test]
+async fn plain_folder_description_omits_git_and_forge_surfaces() {
+    use intent_core::settings_file::AgentFeaturesSettings;
+    let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+    let ws = WorkspaceId::from_string("ws-1");
+    let feature_sets = [
+        AgentFeaturesSettings::default(),
+        AgentFeaturesSettings {
+            host_exec: false,
+            ..AgentFeaturesSettings::default()
+        },
+        AgentFeaturesSettings {
+            pr_monitor: false,
+            ..AgentFeaturesSettings::default()
+        },
+        AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        },
+    ];
+    for features in feature_sets {
+        for is_sub_agent in [false, true] {
+            let bridge = |plain: bool, compact: bool| {
+                WorkspaceMcpServer::new(api.clone(), ws.clone())
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .with_compact_tool_descriptions(compact)
+                    .with_plain_folder(plain)
+            };
+            let full = bridge(true, false).full_workspace_api_description();
+            let condensed = bridge(true, true).condensed_workspace_api_description();
+            let listed = bridge(true, true)
+                .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+                .await
+                .unwrap();
+            let compact = listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "workspace_api")
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for (variant, desc) in [
+                ("full", &full),
+                ("condensed", &condensed),
+                ("compact", &compact),
+            ] {
+                assert!(
+                    plain_folder_leaks(desc).is_empty(),
+                    "{variant} (sub-agent {is_sub_agent}): {:?}",
+                    plain_folder_leaks(desc)
+                );
+                assert!(desc.contains("ws.note."), "{variant}");
+            }
+            // The git bridge is unchanged by the flag's default.
+            assert_eq!(
+                bridge(false, false).full_workspace_api_description(),
+                WorkspaceMcpServer::new(api.clone(), ws.clone())
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .full_workspace_api_description()
+            );
+            assert!(bridge(false, false)
+                .full_workspace_api_description()
+                .contains("ws.git.commit("));
+        }
+    }
+}
+
+// ============================================================================
+// Frame router (remote agents)
+// ============================================================================
+
+/// Answers `note.*` itself, refuses `script.*`, and leaves the rest to the
+/// bridge's `WorkspaceApi`; records every frame it saw.
+#[derive(Default)]
+struct RecordingRouter {
+    seen: Mutex<Vec<(String, Value)>>,
+}
+
+impl crate::HostFrameRouter for RecordingRouter {
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<BoxFuture<'static, std::result::Result<Value, String>>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), args.clone()));
+        if method.starts_with("note.") {
+            let echoed = json!({ "routed": method, "args": args });
+            return Some(Box::pin(async move { Ok(echoed) }));
+        }
+        if method.starts_with("script.") {
+            return Some(Box::pin(async { Err("refused by the router".to_owned()) }));
+        }
+        None
+    }
+}
+
+#[tokio::test]
+async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest() {
+    let api = Arc::new(FakeApi::default());
+    let router = Arc::new(RecordingRouter::default());
+    let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+        .with_caller_agent_id(Some(AgentId::from_string("agent-1")))
+        .with_frame_router(router.clone());
+
+    let answered = call(&srv, r#"return await ws.note.read("n-1");"#).await;
+    assert_eq!(answered["result"]["isError"], json!(false), "{answered}");
+    let answered = body(&answered);
+    assert_eq!(answered["routed"], json!("note.read"));
+    assert_eq!(answered["args"]["id"], json!("n-1"));
+
+    let refused = call(&srv, "return await ws.script.list();").await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        text(&refused).contains("refused by the router"),
+        "{refused}"
+    );
+    assert_eq!(*api.script_list_calls.lock().unwrap(), 0);
+
+    let local = call(&srv, r#"return await ws.file.read("a.txt");"#).await;
+    assert_eq!(local["result"]["isError"], json!(false), "{local}");
+    assert_eq!(
+        *api.file_read_calls.lock().unwrap(),
+        vec!["a.txt".to_owned()]
+    );
+
+    let seen: Vec<String> = router
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect();
+    assert_eq!(seen, ["note.read", "script.list", "file.read"]);
+}
+
+/// Remote agents start from a git commit, so a plain-folder bridge (§5.1)
+/// leaves the remote-placement discovery out of every description variant,
+/// while a git bridge keeps it.
+#[test]
+fn plain_folder_description_omits_remote_placement_help() {
+    let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+    let bridge = |plain: bool| {
+        WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+            .with_remote_placement_help(Some(
+                "Remote placement (experimental): pushes its commits to head.".into(),
+            ))
+            .with_plain_folder(plain)
+    };
+    for desc in [
+        bridge(true).full_workspace_api_description(),
+        bridge(true).condensed_workspace_api_description(),
+    ] {
+        assert!(!desc.contains("Remote placement"), "{desc}");
+    }
+    for desc in [
+        bridge(false).full_workspace_api_description(),
+        bridge(false).condensed_workspace_api_description(),
+    ] {
+        assert!(desc.contains("Remote placement (experimental)"), "{desc}");
+    }
 }

@@ -1666,11 +1666,13 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
     let mut sibling = workspace(&sibling_id, None);
     sibling.repository_owner = caller.repository_owner.clone();
     sibling.repository_name = caller.repository_name.clone();
+    sibling.pr_url = Some("https://github.com/intent-hq/binding-fixture/pull/42".into());
     store.insert_workspace(&sibling).await.unwrap();
     let other_id = WorkspaceId::new();
     let mut other = workspace(&other_id, None);
     other.repository_owner = caller.repository_owner.clone();
     other.repository_name = Some("unrelated-repo".into());
+    other.pr_url = Some("https://github.com/intent-hq/unrelated-repo/pull/42".into());
     store.insert_workspace(&other).await.unwrap();
     let sibling_note = services
         .create_note(
@@ -1744,6 +1746,17 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
         try {{ await ws.crossWorkspace.readNote('{other_id}', '{sibling_note_id}'); }}
         catch (e) {{ denied = String(e).includes('same repository'); }}
         if (!denied) throw new Error('foreign workspace read was not denied');
+        const byText = await ws.crossWorkspace.search('sibling content');
+        if (byText.matches.length !== 1 || byText.matches[0].id !== '{sibling_id}'
+            || byText.matches[0].notes[0].noteId !== '{sibling_note_id}'
+            || !byText.matches[0].markdownLink) throw new Error('wrong text search: ' + JSON.stringify(byText));
+        const byPr = await ws.crossWorkspace.search({{ pr: '#42' }});
+        if (byPr.matches.length !== 1 || byPr.matches[0].id !== '{sibling_id}'
+            || byPr.matches[0].pullRequests[0].number !== 42) throw new Error('wrong PR search: ' + JSON.stringify(byPr));
+        let rejected = false;
+        try {{ await ws.crossWorkspace.search({{}}); }}
+        catch (e) {{ rejected = String(e).includes('non-empty query'); }}
+        if (!rejected) throw new Error('empty search was not rejected');
         await ws.note.add('{note_id}', {{ content: 'cross-workspace checks passed' }});
         return {{ content: updated.content }};
         ",

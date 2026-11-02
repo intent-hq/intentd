@@ -1,6 +1,6 @@
 [package]
 name = "intent-app"
-version = "0.11.82"
+version = "0.11.110"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,22 +8,37 @@ license.workspace = true
 description = "Composition root for intentd: registers the feature crates on the core services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.82" }
-intent-svc-runtime = { path = "../intent-svc-runtime", version = "0.11.82" }
-intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.82" }
+intent-services = { path = "../intent-services", version = "0.11.110" }
+intent-svc-remote = { path = "../intent-svc-remote", version = "0.11.110" }
+intent-svc-runtime = { path = "../intent-svc-runtime", version = "0.11.110" }
+intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.110" }
 
 [dev-dependencies]
 base64 = { workspace = true }
-intent-core = { path = "../intent-core", version = "0.11.82" }
+intent-core = { path = "../intent-core", version = "0.11.110" }
 # Disposable secret stores for the end-to-end tests (`Services::new_repository_fixture`).
-intent-services = { path = "../intent-services", version = "0.11.82", features = ["repository-test-fixtures"] }
-intent-store = { path = "../intent-store", version = "0.11.82" }
-intent-transport = { path = "../intent-transport", version = "0.11.82" }
+intent-services = { path = "../intent-services", version = "0.11.110", features = ["repository-test-fixtures"] }
+intent-store = { path = "../intent-store", version = "0.11.110" }
+intent-transport = { path = "../intent-transport", version = "0.11.110" }
 serde_json = { workspace = true }
 sha2 = "0.11"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+# Payload-budget sweep (`tests/payload_budget/`). Kept apart from the
+# versioned lines above, which release-plz rewrites on every release: path
+# dev-dependencies need no version, and Cargo merges this always-true target
+# table into `[dev-dependencies]`, so `test-hooks` (the sweep's large-state
+# fixture and stub forge) is added to `intent-services` without editing its
+# versioned line.
+[target.'cfg(all())'.dev-dependencies]
+async-trait = "0.1"
+intent-linear = { path = "../intent-linear" }
+intent-sentry = { path = "../intent-sentry" }
+intent-services = { path = "../intent-services", features = ["test-hooks"] }
+intent-sourcecontrol = { path = "../intent-sourcecontrol" }
+intentd-test-support = { path = "../intentd-test-support" }
 
 [lints]
 workspace = true

@@ -94,6 +94,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
+#[track_caller]
 fn assert_no_dummy(v: &Value, ctx: &str) {
     assert!(
         !serde_json::to_string(v).unwrap().contains(DUMMY),

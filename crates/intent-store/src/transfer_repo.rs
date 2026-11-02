@@ -181,6 +181,26 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          rows alone would create dangling recovery pointers and cannot transfer ownership",
     ),
     (
+        "remote_agent",
+        "binds agents to a source-head node lease; the target head has its own node and lease, \
+         and an imported agent does not run on the source head's node",
+    ),
+    (
+        "executor_credential",
+        "credentials this machine minted for backends are daemon-wide execution authority \
+         bound to this installation's owner, not workspace state; a target must mint its own",
+    ),
+    (
+        "executor_binding",
+        "per-credential link bindings and generations of this machine's executor credentials; \
+         they follow the credentials, which never transfer",
+    ),
+    (
+        "exposed_machine",
+        "machines exposed to this backend: routes, pins and credentials minted for this \
+         backend's head id; the target is a different backend and holds no such credential",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",
@@ -2079,7 +2099,7 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized, retired_at, label
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized, retired_at, label, auto_archive_disabled, plain_folder
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
@@ -2090,7 +2110,7 @@ discussion_participant: conversation_id, workspace_id, source_principal_id, prin
 workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json, principal_mentions_json
 discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto, pinned
 script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
 script_notification_job: wake_id, workspace_id, agent_id, script_id, run_id, metadata, body, phase, created_at
 agent_queue_admission: id, agent_id, workspace_id, turn_id, payload, created_at, phase

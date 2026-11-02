@@ -318,6 +318,7 @@ async fn await_profile_rows(log_path: &Path, offset: usize, methods: &[&str]) ->
 
 /// The profiler already excludes lazy pool connection setup. Use its count
 /// unchanged: subtracting setup rows again would hide real handler work.
+#[track_caller]
 fn plan_statements(segment: &str, method: &str) -> u64 {
     let rows = statement_counts(segment, method);
     assert_eq!(

@@ -757,7 +757,7 @@ impl PrimaryReverseRegistry {
     }
 
     /// Whether `client_id` has a live hello'd connection or a `client.hello`
-    /// in flight ([`PrimaryReverseGuard::reserve_binding`]). A hello reserves
+    /// in flight ([`PrimaryReverseGuard::claim_hello`]). A hello reserves
     /// its id before it persists the client row, and the store serializes that
     /// write with the rehome's transaction, so a host this reports inactive
     /// inside the rehome's write transaction can only bind after the commit.
@@ -1048,9 +1048,9 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
 }
 
 /// A `client.hello` in flight for one `clientId`
-/// ([`PrimaryReverseGuard::reserve_binding`]); released on drop. Owned by the
+/// ([`PrimaryReverseGuard::claim_hello`]); released on drop. Owned by the
 /// connection that took it: only that connection can bind with it
-/// ([`Self::into_hello_binding`], [`PrimaryReverseGuard::bind`]).
+/// ([`HelloClaim::complete`], [`PrimaryReverseGuard::bind`]).
 pub struct BindingReservation {
     inner: Arc<Inner>,
     connection: u64,
@@ -1064,25 +1064,105 @@ impl BindingReservation {
         &self.client_id
     }
 
-    /// Pair this reservation with the identity a successful `client.hello`
-    /// resolved, producing the only value [`PrimaryReverseGuard::bind`]
-    /// accepts. Refused — the reservation is handed back — when `identity`
-    /// names a different `clientId` than the one reserved, so a bound host is
-    /// always one [`PrimaryReverseRegistry::client_active`] already reports
-    /// (intent-hq/intent#8045).
-    ///
-    /// # Errors
-    ///
-    /// Returns the reservation unchanged when `identity.client_id` differs
-    /// from [`Self::client_id`].
-    pub fn into_hello_binding(self, identity: ReverseClientIdentity) -> Result<HelloBinding, Self> {
-        if identity.client_id != self.client_id {
-            return Err(self);
-        }
-        Ok(HelloBinding {
+    /// Pair this reservation with the profile a successful `client.hello`
+    /// presented, producing the only value [`PrimaryReverseGuard::bind`]
+    /// accepts. The bound identity takes its `clientId` from the reservation
+    /// itself, so a bound host is always one
+    /// [`PrimaryReverseRegistry::client_active`] already reports
+    /// (intent-hq/intent#8045) — there is no identity to mismatch.
+    fn into_hello_binding(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> HelloBinding {
+        let identity = ReverseClientIdentity {
+            client_id: self.client_id.clone(),
+            name,
+            capabilities,
+            host,
+        };
+        HelloBinding {
             reservation: self,
             identity,
-        })
+        }
+    }
+}
+
+/// The `clientId` a `client.hello` resolved, claimed for this connection
+/// ([`PrimaryReverseGuard::claim_hello`]) before the hello persists its client
+/// row. Holds the id's [`BindingReservation`] — none for a detached guard —
+/// and is the only source of the identity the hello binds
+/// ([`Self::complete`]), so the bound, reserved and persisted ids are one
+/// value by construction. Dropping it releases the reservation.
+#[must_use = "dropping a claim releases its reservation"]
+pub struct HelloClaim(Claim);
+
+/// A [`HelloClaim`]'s id: the reservation carries it when there is one, so
+/// the claimed and reserved ids cannot differ.
+enum Claim {
+    Reserved(BindingReservation),
+    Unreserved(ClientId),
+}
+
+impl HelloClaim {
+    /// A claim that reserves nothing, as a detached guard's claim does. Its
+    /// hello completes without a [`HelloBinding`], so it can never bind.
+    #[cfg(test)]
+    pub(crate) fn unreserved(client_id: ClientId) -> Self {
+        Self(Claim::Unreserved(client_id))
+    }
+
+    /// The claimed `clientId`.
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        match &self.0 {
+            Claim::Reserved(reservation) => &reservation.client_id,
+            Claim::Unreserved(client_id) => client_id,
+        }
+    }
+
+    /// Finish a successful hello with the profile it presented: the claimed
+    /// id plus that profile, paired with the claim's reservation when it has
+    /// one.
+    pub fn complete(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> ClaimedHello {
+        match self.0 {
+            Claim::Reserved(reservation) => {
+                ClaimedHello::Reserved(reservation.into_hello_binding(name, capabilities, host))
+            }
+            Claim::Unreserved(client_id) => ClaimedHello::Unreserved(ReverseClientIdentity {
+                client_id,
+                name,
+                capabilities,
+                host,
+            }),
+        }
+    }
+}
+
+/// A successful `client.hello`'s identity ([`HelloClaim::complete`]):
+/// bindable when its claim held a reservation.
+#[must_use = "dropping a reserved hello releases its reservation before it binds"]
+pub enum ClaimedHello {
+    /// Reserved: the connection may bind it ([`PrimaryReverseGuard::bind`]).
+    Reserved(HelloBinding),
+    /// Unreserved (a detached guard): never bound as a browser host.
+    Unreserved(ReverseClientIdentity),
+}
+
+impl ClaimedHello {
+    /// The hello'd identity.
+    #[must_use]
+    pub fn identity(&self) -> &ReverseClientIdentity {
+        match self {
+            Self::Reserved(hello) => hello.identity(),
+            Self::Unreserved(identity) => identity,
+        }
     }
 }
 
@@ -1092,8 +1172,8 @@ impl BindingReservation {
 /// takes one, so every bind path — the hello itself and a later role change —
 /// necessarily holds the reservation the superseded-id tab rehome relies on
 /// (intent-hq/intent#8045): a bind path without one does not compile.
-/// Built only by [`BindingReservation::into_hello_binding`]; dropping it
-/// releases the reservation.
+/// Built only by [`HelloClaim::complete`], which takes its
+/// `clientId` from the reservation; dropping it releases the reservation.
 pub struct HelloBinding {
     reservation: BindingReservation,
     identity: ReverseClientIdentity,
@@ -1135,13 +1215,24 @@ impl PrimaryReverseGuard {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
-    pub fn reserve_binding(&self, client_id: ClientId) -> Option<BindingReservation> {
+    fn reserve_binding(&self, client_id: ClientId) -> Option<BindingReservation> {
         let inner = self.registry.as_ref()?;
         *inner.lock().binding.entry(client_id.clone()).or_insert(0) += 1;
         Some(BindingReservation {
             inner: Arc::clone(inner),
             connection: self.id,
             client_id,
+        })
+    }
+
+    /// Claim `client_id` for this connection's `client.hello`
+    /// ([`HelloClaim`]): reserve it ([`Self::reserve_binding`]) and carry it
+    /// as the id the hello persists and binds. A detached guard's claim is
+    /// unreserved.
+    pub fn claim_hello(&self, client_id: ClientId) -> HelloClaim {
+        HelloClaim(match self.reserve_binding(client_id.clone()) {
+            Some(reservation) => Claim::Reserved(reservation),
+            None => Claim::Unreserved(client_id),
         })
     }
 
@@ -1188,7 +1279,7 @@ impl PrimaryReverseGuard {
     /// Attach (or replace, on re-hello) this connection's logical identity
     /// after a successful `client.hello`. Requires the connection's own
     /// [`HelloBinding`], so the bound `clientId` is reserved
-    /// ([`Self::reserve_binding`]) for as long as the caller keeps it; a
+    /// ([`Self::claim_hello`]) for as long as the caller keeps it; a
     /// binding reserved by another connection or registry is refused.
     /// Queues the resulting logical-client
     /// transitions (a `Disconnected` for a previous `clientId` this
@@ -1265,10 +1356,9 @@ impl PrimaryReverseGuard {
     /// Panics on a detached guard, which has no registry to reserve in.
     pub(crate) fn bind_hello(&self, identity: ReverseClientIdentity) -> HelloBinding {
         let hello = self
-            .reserve_binding(identity.client_id.clone())
+            .reserve_binding(identity.client_id)
             .expect("registered guard")
-            .into_hello_binding(identity)
-            .unwrap_or_else(|_| unreachable!("reserved the identity's own id"));
+            .into_hello_binding(identity.name, identity.capabilities, identity.host);
         self.bind(&hello);
         hello
     }

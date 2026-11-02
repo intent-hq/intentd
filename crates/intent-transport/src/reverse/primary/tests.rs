@@ -27,6 +27,12 @@ fn idle_channel() -> (ReverseChannel, mpsc::Receiver<crate::OutboundFrame>) {
     (ReverseChannel::new(tx), rx)
 }
 
+/// Complete `reservation` with [`identity`]'s profile for its own id.
+fn complete(reservation: super::BindingReservation, browser_exec: bool) -> super::HelloBinding {
+    let profile = identity(reservation.client_id().as_str(), browser_exec);
+    reservation.into_hello_binding(profile.name, profile.capabilities, profile.host)
+}
+
 /// A `client.hello` identity for logical client `id`, advertising (or not)
 /// the `browserExec` capability, with a `hostname` derived from `id`.
 fn identity(id: &str, browser_exec: bool) -> ReverseClientIdentity {
@@ -1715,9 +1721,7 @@ fn client_active_covers_in_flight_hellos_and_bound_clients() {
     assert!(reg.client_active(&id), "reserved before the hello persists");
     drop(first);
     assert!(reg.client_active(&id), "reservations are counted");
-    let hello = second
-        .into_hello_binding(identity("dev-1", true))
-        .unwrap_or_else(|_| panic!("matching id"));
+    let hello = complete(second, true);
     guard.bind(&hello);
     drop(hello);
     assert!(reg.client_active(&id), "bound after the reservation");
@@ -1725,32 +1729,81 @@ fn client_active_covers_in_flight_hellos_and_bound_clients() {
     assert!(!reg.client_active(&id), "gone with its last connection");
 }
 
-/// A reservation only pairs with an identity for the `clientId` it reserved,
-/// so a [`super::HelloBinding`] never binds an id `client_active` does not
-/// already report (intent-hq/intent#8045).
+/// The [`super::HelloBinding`] a reservation produces takes its `clientId`
+/// from the reservation, so a bound id is always one `client_active` already
+/// reports (intent-hq/intent#8045).
 #[test]
-fn into_hello_binding_refuses_an_identity_for_another_client_id() {
+fn hello_binding_takes_the_reserved_client_id() {
     let reg = PrimaryReverseRegistry::new();
     let (desktop, _rx) = idle_channel();
     let guard = reg.register(desktop, ReverseTransport::Wss);
-    let reservation = guard
-        .reserve_binding(ClientId::from_string("dev-1"))
-        .expect("registered guard");
-    let Err(reservation) = reservation.into_hello_binding(identity("dev-2", true)) else {
-        panic!("a mismatched identity must be refused");
-    };
-    assert_eq!(
-        reservation.client_id().as_str(),
-        "dev-1",
-        "handed back intact"
+    let hello = complete(
+        guard
+            .reserve_binding(ClientId::from_string("dev-1"))
+            .expect("registered guard"),
+        true,
     );
-    assert!(reg.client_active(&ClientId::from_string("dev-1")));
-    assert!(!reg.client_active(&ClientId::from_string("dev-2")));
-    let hello = reservation
-        .into_hello_binding(identity("dev-1", true))
-        .unwrap_or_else(|_| panic!("matching id"));
     assert_eq!(hello.client_id().as_str(), "dev-1");
     assert_eq!(hello.identity().client_id.as_str(), "dev-1");
+    assert_eq!(hello.identity().name.as_deref(), Some("client dev-1"));
+    guard.bind(&hello);
+    assert_eq!(
+        guard.bound_client_id().as_ref().map(ClientId::as_str),
+        Some("dev-1")
+    );
+    assert!(reg.client_active(&ClientId::from_string("dev-1")));
+}
+
+/// A [`super::HelloClaim`] reserves its id for as long as it — and the
+/// binding it completes into — lives, and completes into a bindable identity
+/// for that same id.
+#[test]
+fn hello_claim_reserves_and_completes_into_its_own_id() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desktop, _rx) = idle_channel();
+    let guard = reg.register(desktop, ReverseTransport::Wss);
+    let id = ClientId::from_string("dev-1");
+    let claim = guard.claim_hello(id.clone());
+    assert_eq!(claim.client_id(), &id);
+    assert!(reg.client_active(&id), "claimed before the hello persists");
+    let profile = identity("dev-1", true);
+    let super::ClaimedHello::Reserved(hello) =
+        claim.complete(profile.name, profile.capabilities, profile.host)
+    else {
+        panic!("a registered guard's claim is reserved");
+    };
+    assert_eq!(hello.client_id(), &id);
+    guard.bind(&hello);
+    assert_eq!(guard.bound_client_id().as_ref(), Some(&id));
+    drop(hello);
+    assert!(reg.client_active(&id), "bound after the claim is released");
+
+    let failed = guard.claim_hello(ClientId::from_string("dev-2"));
+    assert!(reg.client_active(&ClientId::from_string("dev-2")));
+    drop(failed);
+    assert!(
+        !reg.client_active(&ClientId::from_string("dev-2")),
+        "a failed hello's dropped claim releases its id"
+    );
+}
+
+/// A detached guard's claim — like [`super::HelloClaim::unreserved`] —
+/// reserves nothing and completes into an identity that cannot be bound.
+#[test]
+fn detached_guard_claim_completes_unreserved() {
+    let reg = PrimaryReverseRegistry::new();
+    reg.begin_shutdown();
+    let (channel, _rx) = idle_channel();
+    let guard = reg.register(channel, ReverseTransport::Wss);
+    let profile = identity("dev-1", true);
+    let claimed = guard.claim_hello(ClientId::from_string("dev-1")).complete(
+        profile.name,
+        profile.capabilities,
+        profile.host,
+    );
+    assert!(matches!(claimed, super::ClaimedHello::Unreserved(_)));
+    assert_eq!(claimed.identity().client_id.as_str(), "dev-1");
+    assert_eq!(guard.bound_client_id(), None);
 }
 
 /// Only the connection that reserved an id can bind with it: another live
@@ -1762,11 +1815,11 @@ fn foreign_reservation_cannot_bind_another_connection() {
     let (b_channel, _b_rx) = idle_channel();
     let a = reg.register(a_channel, ReverseTransport::Wss);
     let b = reg.register(b_channel, ReverseTransport::Wss);
-    let hello = a
-        .reserve_binding(ClientId::from_string("dev-1"))
-        .expect("registered guard")
-        .into_hello_binding(identity("dev-1", true))
-        .unwrap_or_else(|_| panic!("matching id"));
+    let hello = complete(
+        a.reserve_binding(ClientId::from_string("dev-1"))
+            .expect("registered guard"),
+        true,
+    );
     b.bind(&hello);
     assert_eq!(b.bound_client_id(), None, "b never reserved dev-1");
     assert!(reg.live_clients().is_empty());

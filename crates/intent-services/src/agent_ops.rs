@@ -91,6 +91,23 @@ enum AgentListScope {
 /// Terminal statuses the retire cascade never touches (the same set
 /// `count_child_agents` treats as terminal). Also the "owner can no longer
 /// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
+/// Copy a remote agent's launch notice and node (`notice`, `nodeId`,
+/// `nodeName`, `effectiveIsolation`) from a create result into a delegate or
+/// wakeOrCreate result. Local agents have none of them.
+pub(crate) fn copy_remote_launch_fields(created: &Value, result: &mut Value) {
+    let Some(out) = result.as_object_mut() else {
+        return;
+    };
+    if let Some(notice) = created.get("notice").filter(|v| v.is_string()) {
+        out.insert("notice".to_string(), notice.clone());
+    }
+    for key in ["nodeId", "nodeName", "effectiveIsolation"] {
+        if let Some(value) = created["agent"].get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
 pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
@@ -103,19 +120,46 @@ pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
 #[derive(Clone, Default)]
 pub(crate) struct AgentRetirementGates {
     gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    /// Per-workspace serialization of agent self-retires of top-level
+    /// sessions, so the last-top-level-agent guard in
+    /// [`Services::agent_retire_op`] cannot be raced by two top-level agents
+    /// retiring at once (each would otherwise see the other still active).
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AgentRetirementGates {
     pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.gates.lock().expect("retirement gate map poisoned");
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
-        gate
+        weak_gate(&self.gates, agent_id)
     }
+
+    pub(crate) fn for_workspace(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        weak_gate(&self.workspaces, workspace_id)
+    }
+}
+
+fn weak_gate<K: std::hash::Hash + Eq + Clone>(
+    map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    key: &K,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = map.lock().expect("retirement gate map poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(key.clone(), Arc::downgrade(&gate));
+    gate
+}
+
+/// A visible top-level session: no parent, not a background agent, not
+/// deleted, not soft-retired — the agents the user sees in the workspace's
+/// agent list (same predicate as the unread top-level derivation, plus the
+/// retired filter).
+fn is_active_top_level(session: &AgentSession) -> bool {
+    session.parent_agent_id.is_none()
+        && !session.is_background
+        && session.retired_at.is_none()
+        && !matches!(session.status, AgentStatus::Deleted)
 }
 
 /// Order attention persistence, deferred surfacing and matching clear events
@@ -389,6 +433,23 @@ pub(crate) struct AssignedAgentScan {
 
 mod batch;
 
+/// Prefix of the opaque `agent.listUserMessages` `nextToken` (PROTOCOL
+/// §5.5). The token names the `seq` the next older page reads below; it is
+/// minted only by the daemon and clients pass it back verbatim.
+const USER_MESSAGE_INDEX_TOKEN_PREFIX: &str = "um1:";
+
+fn encode_user_message_index_token(before_seq: i64) -> String {
+    format!("{USER_MESSAGE_INDEX_TOKEN_PREFIX}{before_seq}")
+}
+
+fn decode_user_message_index_token(token: &str) -> Result<i64> {
+    token
+        .strip_prefix(USER_MESSAGE_INDEX_TOKEN_PREFIX)
+        .and_then(|seq| seq.parse::<i64>().ok())
+        .filter(|seq| *seq >= 0)
+        .ok_or_else(|| Error::InvalidParams(format!("invalid nextToken: {token}")))
+}
+
 // Delivery-time ready-set delta for completion wakes
 // (intent-hq/monorepo#2044): enqueue-time trigger stamping + the pure delta
 // helper the delivery paths render fresh at flush time.
@@ -401,9 +462,14 @@ mod tests;
 mod queue_merge_tests;
 #[cfg(test)]
 mod queue_visibility_contract_tests;
+#[cfg(test)]
+mod shutdown_queue_tests;
 
 #[cfg(test)]
 mod tests_stab28;
+
+#[cfg(test)]
+mod tests_remote_launch;
 
 #[cfg(test)]
 mod tests_stab115;
@@ -585,6 +651,12 @@ pub(crate) struct AgentCreatePlan {
     pub(crate) file_blocks: Option<Value>,
     pub(crate) is_background: bool,
     pub(crate) remember_specialist: bool,
+    /// The caller's `placement`, validated by the create seam before any
+    /// effect (only `agent.create` / delegate / wakeOrCreate carry one).
+    pub(crate) placement: Option<intent_core::placement::AgentPlacement>,
+    /// Where the admitted remote agent runs, persisted as its daemon-owned
+    /// `remotePlacement` metadata. Set only after admission.
+    pub(crate) remote: Option<intent_core::remote_launch::RemotePlacementView>,
 }
 
 /// Why [`Services::persist_agent_create`] could not persist a planned session.
@@ -2045,6 +2117,24 @@ impl Drop for DrainingGuard {
     }
 }
 
+/// Whether a durable queue already holds `live` in the same order (same ids,
+/// payloads and correlation), so shutdown reconciliation can skip it.
+/// Absolute positions are not compared: rehydration skips undecodable rows and
+/// `queue_rows` renumbers the rest, so an untouched queue with a skipped row
+/// before or between valid ones must still compare equal and keep that row.
+fn same_queue_rows(
+    durable: &[intent_store::AgentQueueRow],
+    live: &[intent_store::AgentQueueRow],
+) -> bool {
+    durable.len() == live.len()
+        && durable.iter().zip(live).all(|(d, l)| {
+            d.id == l.id
+                && d.payload == l.payload
+                && d.created_at == l.created_at
+                && d.turn_id == l.turn_id
+        })
+}
+
 /// Combined-delivery carry-over bundle (monorepo#1014 / monorepo#1034): the
 /// preempted message's content threaded from the caller's `TurnOptions` into
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
@@ -2962,6 +3052,32 @@ pub(crate) fn reject_self_targeted_send(
     Ok(())
 }
 
+/// Refuse a message carrying attachments to a remote agent: attachments are
+/// stored on head and its provider runs on the execution node, which cannot
+/// read them yet. Checked before any state change. An empty list is no
+/// attachment.
+pub(crate) fn reject_remote_attachments(
+    session: &AgentSession,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Result<()> {
+    let carries = |blocks: Option<&Value>| match blocks {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    };
+    if (carries(image_blocks) || carries(file_blocks))
+        && intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+    {
+        return Err(Error::InvalidParams(format!(
+            "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
+            intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
 /// entry must carry a non-empty attachment-registry `attachmentId`
 /// reference. Inline file `data` is no longer accepted: an entry carrying
@@ -3004,6 +3120,13 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
 /// (skipped downstream like every other malformed attachment entry) so
 /// legacy callers keep their fail-soft behavior — mirrors
 /// [`validate_file_blocks`].
+/// `-32602` for a malformed `agent.editAndRegenerate` block reference entry.
+fn malformed_image_block_reference(method: &str, index: usize) -> Error {
+    Error::InvalidParams(format!(
+        "{method}: imageBlocks[{index}] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`"
+    ))
+}
+
 pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) -> Result<()> {
     let Some(imgs) = image_blocks.and_then(Value::as_array) else {
         return Ok(());
@@ -4043,7 +4166,8 @@ impl Services {
     /// cannot decode). Respawns read this instead of the live settings so a
     /// settings change never alters an existing session's tools/prompt —
     /// matching what `harnessFeatures` reports on the wire.
-    pub(crate) fn session_agent_features(
+    #[must_use]
+    pub fn session_agent_features(
         &self,
         session: &AgentSession,
     ) -> intent_core::settings_file::AgentFeaturesSettings {
@@ -4736,7 +4860,134 @@ impl Services {
     /// `outputPruned: true` so a client can tell "the full output is no
     /// longer retained" from "the fetch returned the full body" and does not
     /// re-request in a loop.
+    ///
+    /// Capped and paged (`messageBlockPages: 1`): the served block is bounded
+    /// by [`intent_core::MESSAGE_BLOCK_MAX_BYTES`] under the default page —
+    /// see [`Self::agent_get_message_block_page_op`]. Test-only shorthand.
+    #[cfg(test)]
     pub(crate) async fn agent_get_message_block_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        self.agent_get_message_block_page_op(
+            agent_id,
+            message_id,
+            block_id,
+            workspace_id,
+            intent_core::MessageBlockPage::default(),
+        )
+        .await
+    }
+
+    /// `agent.getMessageBlock` with an explicit page (PROTOCOL §5.5 "Capped
+    /// and paged block reads"): resolves the full served block
+    /// ([`Self::agent_message_block_full_op`]) and applies
+    /// [`intent_core::page_message_block`], so every response stays under
+    /// the 500 KiB read budget and large bodies page by `offset` /
+    /// `nextOffset`.
+    pub(crate) async fn agent_get_message_block_page_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+        page: intent_core::MessageBlockPage,
+    ) -> Result<Value> {
+        let block = self
+            .agent_message_block_full_op(agent_id, message_id, block_id, workspace_id)
+            .await?;
+        intent_core::page_message_block(block, &page)
+    }
+
+    /// Resolve `agent.editAndRegenerate` stored image block references
+    /// (PROTOCOL §5.5 "Image block references in `agent.editAndRegenerate`",
+    /// `messageBlockPages: 1`): each `{ type: "image", messageId, blockId }`
+    /// entry is replaced by a copy of the stored image — `{ type, data,
+    /// mimeType? }` with the full original bytes, or `{ type, attachmentId,
+    /// mimeType? }` — read from the SAME agent's transcript through the
+    /// uncapped block read. Runs before any state change (so before the
+    /// truncation drops the edited message). Entries without `messageId` /
+    /// `blockId` pass through untouched; the ordinary `imageBlocks` rules
+    /// then apply to the resolved array.
+    pub(crate) async fn resolve_image_block_references(
+        &self,
+        method: &str,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        image_blocks: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let mut imgs = match image_blocks {
+            Some(Value::Array(imgs)) => imgs,
+            other => return Ok(other),
+        };
+        for (i, img) in imgs.iter_mut().enumerate() {
+            let Some(obj) = img.as_object() else {
+                continue;
+            };
+            if !obj.contains_key("messageId") && !obj.contains_key("blockId") {
+                continue;
+            }
+            let nonempty = |key: &str| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let (Some(message_id), Some(block_id)) = (nonempty("messageId"), nonempty("blockId"))
+            else {
+                return Err(malformed_image_block_reference(method, i));
+            };
+            if obj.contains_key("data") || obj.contains_key("attachmentId") {
+                return Err(malformed_image_block_reference(method, i));
+            }
+            let block = self
+                .agent_message_block_full_op(
+                    agent_id.clone(),
+                    message_id,
+                    block_id.clone(),
+                    Some(workspace_id.clone()),
+                )
+                .await?;
+            let not_image = || {
+                Error::InvalidParams(format!(
+                    "{method}: imageBlocks[{i}] references block {block_id}, which is not an image with stored bytes"
+                ))
+            };
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                return Err(not_image());
+            }
+            let stored = |key: &str| {
+                block
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| Value::String(s.to_string()))
+            };
+            let mut resolved = serde_json::Map::new();
+            resolved.insert("type".to_string(), json!("image"));
+            if let Some(data) = stored("data") {
+                resolved.insert("data".to_string(), data);
+            } else if let Some(attachment_id) = stored("attachmentId") {
+                resolved.insert("attachmentId".to_string(), attachment_id);
+            } else {
+                return Err(not_image());
+            }
+            if let Some(mime) = stored("mimeType") {
+                resolved.insert("mimeType".to_string(), mime);
+            }
+            *img = Value::Object(resolved);
+        }
+        Ok(Some(Value::Array(imgs)))
+    }
+
+    /// The FULL served block behind `agent.getMessageBlock`, uncapped — the
+    /// read the cap is applied to, and the resolver for
+    /// `agent.editAndRegenerate` stored image block references (which need
+    /// the original bytes, never a cut).
+    pub(crate) async fn agent_message_block_full_op(
         &self,
         agent_id: AgentId,
         message_id: String,
@@ -4810,26 +5061,41 @@ impl Services {
             })
             .cloned()
             .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
-        Ok(json!({ "block": block }))
+        Ok(block)
     }
 
-    /// `agent.listUserMessages` (PROTOCOL §5.5): all user-role messages of
-    /// one agent as lightweight index items, oldest→newest. Previews are
-    /// bounded to `preview_chars` characters (absent → 300, clamped into
-    /// [1, 2000]); `metadata` is passed through verbatim when present so
-    /// clients can distinguish automated rows. Bounded cost (RPC cost
-    /// contract): a metadata-only session read plus ONE role-filtered index
-    /// read whose previews are extracted and truncated inside SQL — full
-    /// content blobs never leave the database and the transcript is never
-    /// hydrated.
-    pub(crate) async fn agent_list_user_messages_op(
+    /// `agent.listUserMessages` (PROTOCOL §5.5): user-role messages of one
+    /// agent as lightweight index items, oldest→newest. Previews are bounded
+    /// to `preview_chars` characters (absent → 300, clamped into [1, 2000]);
+    /// `metadata` is projected to the classification fields clients use to
+    /// tell automated rows apart (`intent_store::project_user_message_index_metadata`,
+    /// intent-hq/intent#8278) and omitted when none survive.
+    ///
+    /// Paging is opt-in: with `limit` (clamped into [1, 500]) or
+    /// `next_token` (default limit 100) only the newest rows older than the
+    /// token are read and the result carries `nextToken` — the opaque cursor
+    /// for the next older page, `null` once none remain. Without either, the
+    /// whole index is served and `nextToken` is absent (the pre-paging
+    /// shape). Bounded cost (RPC cost contract): a metadata-only session
+    /// read plus ONE role-filtered index read whose previews and metadata
+    /// are trimmed inside SQL — full content and metadata blobs never leave
+    /// the database and the transcript is never hydrated.
+    pub(crate) async fn agent_list_user_messages_page_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> Result<Value> {
         const DEFAULT_PREVIEW_CHARS: i64 = 300;
         const MAX_PREVIEW_CHARS: i64 = 2000;
+        const DEFAULT_PAGE_LIMIT: i64 = 100;
+        const MAX_PAGE_LIMIT: i64 = 500;
+        let before_seq = next_token
+            .as_deref()
+            .map(decode_user_message_index_token)
+            .transpose()?;
         // Metadata-only scope check — same fail-closed contract as
         // `agent_get_message_block_op`: a cross-workspace mismatch is
         // `NotFound`, indistinguishable from an unknown agent.
@@ -4845,15 +5111,24 @@ impl Services {
                 .clamp(1, MAX_PREVIEW_CHARS),
         )
         .expect("clamped to [1, MAX_PREVIEW_CHARS]");
-        let items = self
+        let page = (limit.is_some() || next_token.is_some()).then(|| {
+            intent_store::UserMessageIndexPageRequest {
+                limit: usize::try_from(
+                    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT),
+                )
+                .expect("clamped to [1, MAX_PAGE_LIMIT]"),
+                before_seq,
+            }
+        });
+        let index = self
             .store
-            .get_agent_user_message_index(&agent_id, preview_chars)
+            .get_agent_user_message_index_page(&agent_id, preview_chars, page)
             .await?;
         let items = crate::repository_native_wire::monitor::history_index(
             self,
             &session.workspace_id,
             &agent_id,
-            items,
+            index.items,
             preview_chars,
         )
         .await?;
@@ -4874,7 +5149,13 @@ impl Services {
                 obj
             })
             .collect();
-        Ok(json!({ "agentId": agent_id.0, "items": items, "total": total }))
+        let mut result = json!({ "agentId": agent_id.0, "items": items, "total": total });
+        if page.is_some() {
+            result["nextToken"] = index.next_before_seq.map_or(Value::Null, |seq| {
+                Value::String(encode_user_message_index_token(seq))
+            });
+        }
+        Ok(result)
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
@@ -5325,7 +5606,7 @@ impl Services {
         } else {
             None
         };
-        let plan = self
+        let mut plan = self
             .plan_agent_create(
                 "agent.create",
                 name,
@@ -5339,9 +5620,114 @@ impl Services {
                 model_origin,
             )
             .await?;
-        Ok(self
-            .persist_agent_create(plan, workspace_id, spec_wp)
-            .await?)
+        if let Some(placement) = plan.placement.take() {
+            plan.remote = Some(
+                self.admit_remote_agent(
+                    &workspace_id,
+                    &plan.provider,
+                    plan.model.as_deref(),
+                    &placement,
+                )
+                .await?,
+            );
+        }
+        let remote = plan.remote.clone();
+        let mut created = self
+            .persist_agent_create(plan, workspace_id.clone(), spec_wp)
+            .await?;
+        if let Some(view) = remote {
+            self.launch_remote_agent(&workspace_id, &mut created, view)
+                .await?;
+        }
+        Ok(created)
+    }
+
+    /// Admission of a create with a `placement`, before anything is
+    /// written: the documented subset only, a provider selection whose
+    /// profile environment resolves (a missing or unselectable profile fails
+    /// here, never falling back to the node's own login; the overlay itself
+    /// is resolved again when the agent starts) and can run on another
+    /// machine (one that sets an account folder is
+    /// `profile-not-remote-compatible`), then a machine that runs the
+    /// platform, offers the provider and `model` and has capacity.
+    async fn admit_remote_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+        provider: &str,
+        model: Option<&str>,
+        placement: &intent_core::placement::AgentPlacement,
+    ) -> Result<intent_core::remote_launch::RemotePlacementView> {
+        placement.check_remote_supported()?;
+        let profile = self.resolve_remote_compatible_env(provider).await?;
+        let needs = intent_core::remote_launch::RemoteLaunchNeeds {
+            provider: crate::provider_profiles::parse_profile_ref(provider)
+                .map_or(provider, |(base, _)| base)
+                .to_owned(),
+            // The `"default"` sentinel asks for the provider's default.
+            model: model.filter(|model| *model != "default").map(str::to_owned),
+            with_profile: profile.is_some(),
+        };
+        self.ports
+            .remote_launch()
+            .admit(self, workspace_id, placement, &needs)
+            .await
+    }
+
+    /// Place a just-created remote agent on its node and add the launch
+    /// notice to the create result. On failure the agent keeps its
+    /// `remotePlacement` (so it can never run locally) with a
+    /// `placementError`, and the error is returned.
+    async fn launch_remote_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: &mut Value,
+        mut view: intent_core::remote_launch::RemotePlacementView,
+    ) -> Result<()> {
+        let agent_id = AgentId::from(created["agent"]["id"].as_str().unwrap_or_default());
+        let launched = self
+            .ports
+            .remote_launch()
+            .launch(
+                self,
+                intent_core::remote_launch::RemoteLaunchRequest {
+                    workspace_id: workspace_id.clone(),
+                    agent_id: agent_id.clone(),
+                    view: view.clone(),
+                },
+            )
+            .await;
+        if let Err(error) = launched {
+            view.placement_error = Some(intent_core::remote_launch::PlacementError::new(
+                "remote-launch-failed",
+                &error.to_string(),
+            ));
+            if let Ok(encoded) = serde_json::to_string(&view) {
+                if let Err(e) = self
+                    .store
+                    .set_agent_session_metadata_key_json(
+                        workspace_id,
+                        &agent_id,
+                        intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+                        &encoded,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "remote launch: could not record the placement error");
+                }
+            }
+            return Err(error);
+        }
+        if let Some(obj) = created.as_object_mut() {
+            obj.insert(
+                "notice".into(),
+                json!(intent_core::remote_launch::launch_notice(
+                    &view.node_name,
+                    &view.base_commit
+                )),
+            );
+        }
+        Ok(())
     }
 
     /// Plan half of an agent create: runs, in order, every `-32602` producer
@@ -5480,6 +5866,7 @@ impl Services {
             file_blocks,
             is_background,
             name_explicitly_set: _,
+            placement,
         } = extra;
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -5594,6 +5981,8 @@ impl Services {
             image_blocks,
             file_blocks,
             is_background,
+            placement,
+            remote: None,
         })
     }
 
@@ -5645,6 +6034,8 @@ impl Services {
             image_blocks,
             file_blocks,
             is_background,
+            placement: _,
+            remote,
         } = plan;
         let now = now_iso();
         let id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -5665,6 +6056,32 @@ impl Services {
         // Strip caller provenance even for General agents with an override.
         if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
             obj.remove("specialistGeneratedBehaviorPrompt");
+            // Only the daemon places an agent on a node.
+            obj.remove(intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY);
+        }
+        if let Some(view) = &remote {
+            let view = serde_json::to_value(view).map_err(|e| {
+                AgentPersistError::Internal(format!(
+                    "{method}: encode remote placement failed: {e}"
+                ))
+            })?;
+            // The placement must land whatever the caller's metadata is: a
+            // non-object document is kept under `priorNonObjectMetadata`
+            // (the single-key writers' convention), never left without it.
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY.to_string(),
+                view,
+            );
+            metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
             // Both snapshot resolutions below walk the specialist tier
@@ -5802,6 +6219,7 @@ impl Services {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -5907,6 +6325,12 @@ impl Services {
         provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
+        // A remote agent switches on its own machine (§5.54 "Switching a
+        // remote agent's model"): the next turn stops its run and relaunches
+        // it there on the new identity, with the Intent history replayed.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        );
         // An explicit providerId must be a registered provider before any
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).
@@ -5971,7 +6395,10 @@ impl Services {
                     .await?
                 }
             };
-            if current_effective.as_deref() != Some(pid.as_str()) {
+            // A remote agent's provider runs on its machine, so this
+            // backend's installation and sign-in say nothing about it; the
+            // machine's report decides below.
+            if remote.is_none() && current_effective.as_deref() != Some(pid.as_str()) {
                 self.ensure_provider_available_for(
                     "agent.setModel",
                     &pid,
@@ -6019,6 +6446,10 @@ impl Services {
         // next turn then respawns the new provider's binary, opens a fresh
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
+        if let Some(view) = &remote {
+            self.check_remote_switch(view, provider.as_deref().unwrap_or_default(), &model_id)
+                .await?;
+        }
         let workspace_id = session.workspace_id;
         // A fresh token marks this write as a manual choice, in the same
         // statement as the selection (PROTOCOL §5.54 shared quota state):
@@ -6053,6 +6484,12 @@ impl Services {
         // the old one (PROTOCOL §5.54 backup failover) is dropped.
         self.clear_provider_return_state(&workspace_id, &agent_id)
             .await;
+        if remote.is_some() {
+            self.remote_model_switches
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), (provider.clone(), Some(model_id.clone())));
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -6061,6 +6498,88 @@ impl Services {
         )
         .await;
         Ok(json!({ "success": true, "modelId": model_id }))
+    }
+
+    /// Whether a remote agent can switch to `reference` and `model` on its
+    /// machine (`agent.setModel`), before anything is written: the
+    /// configuration must be remote-compatible, and the machine's cached
+    /// report must offer the provider (its own sign-in unless a profile is
+    /// selected) and the model (`"default"` skips the model).
+    ///
+    /// # Errors
+    /// `profile-not-remote-compatible`, `model-unavailable` naming the
+    /// agent's machine, or `placement-unavailable` when the machine is gone.
+    async fn check_remote_switch(
+        &self,
+        view: &intent_core::remote_launch::RemotePlacementView,
+        reference: &str,
+        model: &str,
+    ) -> Result<()> {
+        let profile = self.resolve_remote_compatible_env(reference).await?;
+        let rows = self.store.list_exposed_machines().await?;
+        let provider = crate::provider_profiles::parse_profile_ref(reference)
+            .map_or(reference, |(base, _)| base);
+        intent_core::machine_selection::check_switch_on_machine(
+            &rows,
+            &view.node_id,
+            intent_core::machine_selection::PlacementRequest {
+                placement: &view.placement,
+                provider,
+                model: Some(model).filter(|model| *model != "default"),
+                with_profile: profile.is_some(),
+            },
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    /// Whether the agent has an accepted remote switch its session still
+    /// names: the one change of identity its live run is replaced for
+    /// (besides a quota switch) instead of refused at start, and whose
+    /// next successful start replays the Intent history. A switch the
+    /// session no longer names (a later change) is dropped.
+    pub(crate) fn remote_model_switch_pending(
+        &self,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) -> bool {
+        let mut switches = self.remote_model_switches.lock().unwrap();
+        let named = switches.get(agent_id).is_some_and(|(provider, model)| {
+            session.provider == *provider && session.model == *model
+        });
+        if !named {
+            switches.remove(agent_id);
+        }
+        named
+    }
+
+    /// Confirm the agent's accepted remote switch: its run produced output
+    /// or completed a turn. Only a run launched with the switched identity
+    /// confirms it; the old run, still finishing a turn that was in flight
+    /// when the switch was made, does not.
+    pub(crate) fn confirm_remote_model_switch(&self, agent_id: &AgentId) {
+        if !self
+            .remote_model_switches
+            .lock()
+            .unwrap()
+            .contains_key(agent_id)
+        {
+            return;
+        }
+        let Some((provider, model)) = self
+            .agent_manager()
+            .and_then(|mgr| mgr.spawned_identity(agent_id))
+        else {
+            return;
+        };
+        let mut switches = self.remote_model_switches.lock().unwrap();
+        if switches
+            .get(agent_id)
+            .is_some_and(|(switched_provider, switched_model)| {
+                switched_provider.as_deref() == Some(provider.as_str()) && *switched_model == model
+            })
+        {
+            switches.remove(agent_id);
+        }
     }
 
     /// `agent.delete`: idempotent session delete (PROTOCOL §5.5). When
@@ -6381,6 +6900,12 @@ impl Services {
     /// is still running a turn. On success the whole descendant subtree is
     /// cascade-retired (see the inline comments), and restoring the parent
     /// does NOT restore the cascaded children.
+    ///
+    /// GUARDED on the last top-level agent: when the caller is an AGENT
+    /// (`Caller::Agent`, i.e. `ws.agent.retire`) and the target is the
+    /// workspace's only active top-level session, the call FAILS
+    /// (`InvalidParams`, nothing mutated). Wire (user) retires are not
+    /// subject to this guard.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -6401,6 +6926,39 @@ impl Services {
         if let Some(existing) = session.retired_at {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
+        // Guard: an AGENT may not retire itself when it is the workspace's
+        // last active top-level agent — that would leave the workspace with
+        // no visible agent to talk to. User (wire) retires are unaffected.
+        // The workspace gate is held through the retire transition below so
+        // two top-level agents retiring concurrently cannot both pass.
+        let _last_top_level_gate = if matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Agent { .. })
+        ) && is_active_top_level(&session)
+        {
+            let gate = self
+                .agent_retirement_gates
+                .for_workspace(&session.workspace_id);
+            let guard = gate.lock_owned().await;
+            let others = self
+                .store
+                .list_active_agent_session_summaries(&session.workspace_id)
+                .await?
+                .iter()
+                .filter(|s| s.id != session.id && is_active_top_level(s))
+                .count();
+            if others == 0 {
+                return Err(Error::InvalidParams(
+                    "cannot retire: this is the last active top-level agent in the workspace. \
+                     Retiring it would leave the workspace without an agent; finish your turn \
+                     normally instead."
+                        .to_string(),
+                ));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn
         // (pending/active/Processing). NOTHING is mutated on rejection (no
@@ -6826,6 +7384,7 @@ impl Services {
             "fileBlocks",
             "isBackground",
             "notificationsMuted",
+            "pinned",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -7035,6 +7594,11 @@ impl Services {
                         )
                     })?;
                 }
+                "pinned" => {
+                    session.pinned = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams("agent.update: `pinned` must be a boolean".to_string())
+                    })?;
+                }
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
@@ -7082,7 +7646,11 @@ impl Services {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
             }
         }
-        let mute_only = obj.len() == 1 && obj.contains_key("notificationsMuted");
+        // User preferences (mute, sidebar pin) are not agent activity.
+        let preference_only = !obj.is_empty()
+            && obj
+                .keys()
+                .all(|key| key == "notificationsMuted" || key == "pinned");
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -7096,7 +7664,7 @@ impl Services {
         };
         // A preference-only request is not agent activity. Skip the full-row
         // write entirely so it cannot overwrite concurrent session progress.
-        if !mute_only {
+        if !preference_only {
             session.updated_at = now_iso();
             self.store
                 .update_agent_session_with_preferences(
@@ -7105,6 +7673,7 @@ impl Services {
                     remember_specialist && is_manual_foreground_agent(&session),
                     obj.contains_key("notificationsMuted")
                         .then_some(session.notifications_muted),
+                    obj.contains_key("pinned").then_some(session.pinned),
                     // An explicit effort choice — even the level an
                     // Auto-pinned session already carries — clears the Auto
                     // pin in this same write, so the next model switch keeps
@@ -7113,20 +7682,28 @@ impl Services {
                 )
                 .await?;
         }
-        // Mute-only requests retain their narrow write without advancing
-        // activity. Mixed requests apply an explicit mute patch in the session
-        // transaction above; ordinary row writes still exclude this column so
-        // stale sessions cannot revert a toggle. Same-value patches are no-ops.
-        if mute_only {
-            self.store
-                .set_agent_notifications_muted(
-                    &workspace_id,
-                    &agent_id,
-                    session.notifications_muted,
-                )
-                .await?;
+        // Preference-only requests retain their narrow writes without
+        // advancing activity. Mixed requests apply explicit preference patches
+        // in the session transaction above; ordinary row writes still exclude
+        // these columns so stale sessions cannot revert a toggle. Same-value
+        // patches are no-ops.
+        if preference_only {
+            if obj.contains_key("notificationsMuted") {
+                self.store
+                    .set_agent_notifications_muted(
+                        &workspace_id,
+                        &agent_id,
+                        session.notifications_muted,
+                    )
+                    .await?;
+            }
+            if obj.contains_key("pinned") {
+                self.store
+                    .set_agent_pinned(&workspace_id, &agent_id, session.pinned)
+                    .await?;
+            }
         }
-        if mute_only {
+        if preference_only {
             // Return current activity and preference state, including any
             // genuine session update that raced the scoped preference write.
             session = self.store.get_agent_session(&agent_id).await?;
@@ -8650,6 +9227,7 @@ impl Services {
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        reject_remote_attachments(&session, image_blocks.as_ref(), file_blocks.as_ref())?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // Image references must name registered attachments
         // (monorepo#3338) — rejected before any state change.
@@ -11512,6 +12090,16 @@ impl Services {
                 "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
+        if input.placement.is_some() && input.tasks.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: placement applies to a single delegation; delegate each task that needs one on its own".to_string(),
+            ));
+        }
+        if input.placement.is_some() && input.isolation.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
+            ));
+        }
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
@@ -11803,6 +12391,18 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        // A placed (remote) child's instructions are assembled from its
+        // session on head, so an explicit `behaviorPrompt` must be stored
+        // there (it overrides the specialist body, as on `agent.create`).
+        if input.placement.is_some() {
+            if let Some(bp) = input
+                .behavior_prompt
+                .as_deref()
+                .filter(|bp| !bp.trim().is_empty())
+            {
+                extra_metadata.insert("behaviorPrompt".to_string(), json!(bp));
+            }
+        }
         let extra = AgentCreateExtra {
             remember_specialist: false,
             provider: delegate_provider,
@@ -11813,6 +12413,7 @@ impl Services {
             // (`skipIfExplicitlySet: true`) — mirror the reference which
             // does not set `nameExplicitlySet` at delegate-time creation.
             name_explicitly_set: Some(false),
+            placement: input.placement.clone(),
             ..AgentCreateExtra::default()
         };
         let created = self
@@ -11852,7 +12453,9 @@ impl Services {
         // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
         // isolation parameter was provided (Task 5).
         let mut isolation = input.isolation.clone();
-        if isolation.is_none() {
+        // A placed agent never takes the legacy CoW path: its node gives it
+        // its own checkout.
+        if isolation.is_none() && input.placement.is_none() {
             // Check workspace.cowIsolation setting
             // `settings_get` returns the `{ path, value, definition }`
             // envelope (§5.9) — read the nested `value`.
@@ -12033,6 +12636,7 @@ impl Services {
                 .unwrap()
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
+        copy_remote_launch_fields(&created, &mut result);
         Ok(result)
     }
 
@@ -15551,6 +16155,7 @@ impl Services {
             file_blocks: None,
             is_background: None,
             name_explicitly_set: None,
+            placement: create_opts.placement.clone(),
         };
         // monorepo#3442: the resolved live caller (`caller_parent`, derived
         // from the single `caller_session` lookup — never the raw wire
@@ -15641,6 +16246,7 @@ impl Services {
             &result,
             &cleaned_up,
         );
+        copy_remote_launch_fields(&created, &mut response);
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
         // child id was freshly minted this call, so no live watch can exist
@@ -17384,6 +17990,156 @@ impl Services {
             .remove(agent_id);
     }
 
+    /// The position of `message_id` in `queue` when it is still exactly the
+    /// automatic wake the daemon queued, so a newer wake may replace it: in
+    /// the live queue and NOT popped for delivery (a draining entry is being
+    /// processed, and may already be in the transcript), with no user origin,
+    /// edit, hold, merge, retry, attachment or prepend state, and metadata
+    /// `supersedes` confirms. Shared by
+    /// [`Services::replace_pending_wake_at_tail`] and
+    /// [`Services::rewrite_pending_wake`]; callers hold the drain lock
+    /// and the queue lock, so the check and the mutation are one step.
+    fn replaceable_pending_wake(
+        queue: &[QueuedMessage],
+        draining: &[QueuedMessage],
+        message_id: &str,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> Option<usize> {
+        let index = queue.iter().position(|m| m.id == message_id)?;
+        let entry = &queue[index];
+        let in_delivery = draining
+            .iter()
+            .any(|d| d.id == entry.id || d.turn_id == entry.turn_id);
+        let untouched = entry.monitor_turn.is_none()
+            && !entry.user_origin
+            && !entry.is_human_queue_entry()
+            && !entry.editing
+            && entry.editing_message_id.is_none()
+            && entry.edit_appended.is_empty()
+            && entry.edit_prepended.is_empty()
+            && !entry.persisted
+            && !entry.requeued_after_failure
+            && !entry.provisional
+            && !entry.interrupt_priority
+            && entry.hold_kind.is_none()
+            && entry.delivery_groups.is_none()
+            && entry.prepend_delivery_groups.is_none()
+            && entry.prepend_content.is_none()
+            && !entry.has_attachments()
+            && entry.merged_submission_ids.is_empty()
+            && entry.recovery_sources.is_empty();
+        (!in_delivery && untouched && entry.message_metadata.as_ref().is_some_and(supersedes))
+            .then_some(index)
+    }
+
+    /// Replace a still-UNDELIVERED automatic wake (see
+    /// [`Services::replaceable_pending_wake`] for which entries qualify)
+    /// with a NEW entry at the back of the queue, in one step: the old entry
+    /// is removed and the new one appended while the drain lock is held
+    /// throughout, so no pop ([`Services::pop_draining`]), snapshot or
+    /// write-through ever sees neither. (Direct queue mutations that skip the
+    /// drain lock — clear, delete, held-message enqueue — can interleave, as
+    /// they already can with an ordinary wake delivery.) The
+    /// PR monitor uses this for a newer CHANGE update, so the owner never
+    /// reads the stale one and the replacement waits behind work queued
+    /// after it.
+    ///
+    /// The new entry carries `content` (with the same sender attribution a
+    /// queued wake delivery adds) and `message_metadata`, automatic origin.
+    /// Returns it, or `None` when nothing qualified and nothing changed.
+    /// The caller publishes `agent:queue:updated` (one write-through of the
+    /// swapped queue) and kicks the drain in case the owner went idle.
+    pub(crate) fn replace_pending_wake_at_tail(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        content: &str,
+        message_metadata: &Value,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> Option<QueuedMessage> {
+        let mut content = content.to_string();
+        annotate_sender_attribution(&mut content, Some(message_metadata));
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        {
+            let mut live = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = live.get_mut(agent_id)?;
+            let in_flight = draining
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let index = Self::replaceable_pending_wake(queue, in_flight, message_id, supersedes)?;
+            queue.remove(index);
+        }
+        // Still under the drain lock: no pop can run between the removal
+        // and the append.
+        let (queued, _) = self.enqueue_message_with_id_locked(
+            agent_id,
+            None,
+            content,
+            None,
+            None,
+            Some(message_metadata.clone()),
+            None,
+            false,
+            MessageOrigin::Automatic,
+            &draining,
+            None,
+        );
+        Some(queued)
+    }
+
+    /// Rewrite a still-UNDELIVERED automatic wake IN PLACE (see
+    /// [`Services::replaceable_pending_wake`] for which entries qualify):
+    /// same id and queue position, new `content` and `messageMetadata`, and
+    /// a refreshed `queued_at` so the dequeue-wait note dates the new
+    /// content. The PR monitor uses this for the merged/closed FINAL update,
+    /// which takes over the older queued update's place instead of waiting
+    /// behind work queued after it.
+    ///
+    /// Returns whether the entry was rewritten. The caller publishes
+    /// `agent:queue:updated` (which also writes the queue through).
+    pub(crate) fn rewrite_pending_wake(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        content: &str,
+        message_metadata: &Value,
+        supersedes: impl FnOnce(&Value) -> bool,
+    ) -> bool {
+        let mut content = content.to_string();
+        annotate_sender_attribution(&mut content, Some(message_metadata));
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let mut live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let Some(queue) = live.get_mut(agent_id) else {
+            return false;
+        };
+        let draining = draining
+            .get(agent_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(index) = Self::replaceable_pending_wake(queue, draining, message_id, supersedes)
+        else {
+            return false;
+        };
+        let entry = &mut queue[index];
+        entry.content = content;
+        entry.message_metadata = Some(message_metadata.clone());
+        entry.queued_at = now_iso();
+        true
+    }
+
     /// `true` iff the agent has at least one queued message that is **not**
     /// under edit and **not** under an unexpired debounce hold (i.e. the
     /// "ready-to-send" queue is non-empty). Drives the self-drain trigger and
@@ -18097,19 +18853,62 @@ impl Services {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Called after delivery/worker joins. Keep the overlay frozen for any
-    /// previously admitted request still unwinding; subsequent queue writes
-    /// must not overwrite its payloads either.
-    pub(crate) async fn persist_shutdown_drains(&self) {
-        let ids: Vec<_> = self
+    /// Called after delivery/worker joins, and again by final shutdown:
+    /// reconcile every agent's durable queue with its in-memory snapshot
+    /// (frozen draining overlay included) in one pass under the persist gate.
+    ///
+    /// Write-through persistence runs AFTER its in-memory mutation, inside the
+    /// mutating task, and shutdown aborts turn workers. A cancelled persist
+    /// leaves the durable queue one mutation behind memory: a failed delivery
+    /// requeued in memory after its dequeue already deleted the row would be
+    /// lost by a clean restart. Only agents whose rows differ are rewritten,
+    /// and rows this daemon cannot decode are left out of the comparison, so
+    /// an agent nobody mutated keeps them.
+    pub(crate) async fn persist_shutdown_queues(&self) {
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let mut agents: HashSet<AgentId> = self
             .draining_queue_entries
             .lock()
             .unwrap()
             .keys()
             .cloned()
             .collect();
-        for id in ids {
-            self.persist_queue_snapshot(&id).await;
+        agents.extend(self.agent_queues.lock().unwrap().keys().cloned());
+        let durable = match self.store.load_all_agent_queues().await {
+            Ok(rows) => {
+                let mut by_agent: HashMap<AgentId, Vec<intent_store::AgentQueueRow>> =
+                    HashMap::new();
+                for row in rows {
+                    if row.position >= 0
+                        && serde_json::from_value::<QueuedMessage>(row.payload.clone()).is_ok()
+                    {
+                        by_agent.entry(row.agent_id.clone()).or_default().push(row);
+                    }
+                }
+                Some(by_agent)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "shutdown queue reconcile could not read durable queues; rewriting all");
+                None
+            }
+        };
+        for agent_id in agents {
+            let rows = self.queue_rows(&agent_id);
+            let unchanged = durable.as_ref().is_some_and(|durable| {
+                same_queue_rows(
+                    durable
+                        .get(&agent_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    &rows,
+                )
+            });
+            if unchanged {
+                continue;
+            }
+            if let Err(e) = self.store.replace_agent_queue(&agent_id, &rows).await {
+                tracing::warn!(agent = %agent_id, error = %e, "shutdown queue reconcile failed");
+            }
         }
     }
 
@@ -19904,3 +20703,9 @@ pub(crate) fn agent_features_snapshot(
     }
     Ok(snapshot)
 }
+
+/// Remote agents' accepted `agent.setModel` switches (provider, model as
+/// written) awaiting the next start, which replaces the run on the agent's
+/// machine. In-memory: after a restart there is no live run to replace.
+pub(crate) type RemoteModelSwitches =
+    Arc<Mutex<HashMap<AgentId, (Option<String>, Option<String>)>>>;

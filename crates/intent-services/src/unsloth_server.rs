@@ -2126,6 +2126,24 @@ mod tests {
             (port, handle)
         }
 
+        /// Wait until an in-flight startup has registered its starting server
+        /// (identity mirror set): under full parallel-suite load the spawned
+        /// task may not have got that far yet, making `stop()` report `false`
+        /// (monorepo#972). Reads only the lock-free identity mirror — the
+        /// in-flight startup holds `state`'s lock for its whole window.
+        async fn wait_for_starting_server(mgr: &UnslothServerManager) {
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    while lock_ignore_poison(&mgr.identity).is_none() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                },
+            )
+            .await
+            .expect("startup never registered a starting server");
+        }
+
         /// Write an executable stub `unsloth` script into `dir`. `run` logs
         /// its argv and sleeps; `start opencode` writes the generated config
         /// fixture (with the loopback port + key patched in) under the fake
@@ -2698,10 +2716,12 @@ mod tests {
             assert_eq!(mgr.resolve_quant_variant(REPO).await, "UD-Q4_K_XL");
         }
 
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn quant_lookup_stalled_hf_degrades_within_the_timeout_budget() {
             // HF accepts the connection but never answers: resolution must
-            // return the CLI default within hf_files_timeout, not hang.
+            // return the CLI default within hf_files_timeout, not hang. The
+            // clock is paused, so the first pending timer fires as soon as the
+            // runtime idles and `elapsed` is the virtual time to that timer.
             let hf_port = spawn_stub_hf_stalled().await;
             let mut config = test_config(
                 PathBuf::from("/nonexistent/unsloth"),
@@ -2711,7 +2731,7 @@ mod tests {
             config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
             config.hf_files_timeout = Duration::from_millis(200);
             let mgr = UnslothServerManager::with_config(config);
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let quant = tokio::time::timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
                 mgr.resolve_quant_variant(REPO),
@@ -2720,6 +2740,7 @@ mod tests {
             .expect("resolution must not hang past the timeout budget");
             assert_eq!(quant, "UD-Q4_K_XL");
             assert!(
+                // elapsed-assert: allow — paused tokio clock: the elapsed time is virtual, so it names the timer that fired, not host speed
                 started.elapsed() < Duration::from_secs(2),
                 "degraded well within budget, took {:?}",
                 started.elapsed()
@@ -2815,21 +2836,22 @@ mod tests {
             // unless shutdown aborts it.
             let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
             let mut config = test_config(binary, dir.path().to_path_buf(), 1);
-            config.server_up_timeout = Duration::from_secs(600);
+            // A startup window no test outlives: a shutdown that waits it out
+            // hangs into the guard below instead of passing slowly.
+            config.server_up_timeout = Duration::from_secs(24 * 60 * 60);
             let mgr = Arc::new(UnslothServerManager::with_config(config));
 
             let m2 = mgr.clone();
             let startup =
                 tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
-            // Give the startup time to spawn the child and enter the loop.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            wait_for_starting_server(&mgr).await;
 
-            let start = tokio::time::Instant::now();
-            mgr.shutdown().await;
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "shutdown must not wait out the startup window"
-            );
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                mgr.shutdown(),
+            )
+            .await
+            .expect("shutdown must not wait out the startup window");
             let err = startup.await.expect("join").unwrap_err();
             assert!(err.to_string().contains("shutting down"), "got: {err}");
             assert!(mgr.state.lock().await.is_none(), "no server left tracked");
@@ -2926,37 +2948,23 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
             let mut config = test_config(binary, dir.path().to_path_buf(), 1);
-            config.server_up_timeout = Duration::from_secs(600);
+            // A startup window no test outlives: a stop that waits it out
+            // hangs into the guard below instead of passing slowly.
+            config.server_up_timeout = Duration::from_secs(24 * 60 * 60);
             let mgr = Arc::new(UnslothServerManager::with_config(config));
 
             let m2 = mgr.clone();
             let startup =
                 tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
-            // Wait until the startup has actually registered the starting
-            // server (identity mirror set) rather than sleeping a fixed
-            // 200ms: under full parallel-suite load the spawned task may not
-            // have progressed that far yet, making `stop()` report `false`
-            // (monorepo#972). Reads only the lock-free identity mirror — the
-            // in-flight startup holds `state`'s lock for its whole window.
-            let registered = tokio::time::Instant::now()
-                + intentd_test_support::test_timeout(Duration::from_secs(30));
-            while lock_ignore_poison(&mgr.identity).is_none() {
-                assert!(
-                    tokio::time::Instant::now() < registered,
-                    "startup never registered a starting server"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            wait_for_starting_server(&mgr).await;
 
-            let start = tokio::time::Instant::now();
-            assert!(
-                mgr.stop().await,
-                "stop reports true when a server was starting"
-            );
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "stop must abort the in-flight startup, not wait out its timeout"
-            );
+            let stopped = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                mgr.stop(),
+            )
+            .await
+            .expect("stop must abort the in-flight startup, not wait out its timeout");
+            assert!(stopped, "stop reports true when a server was starting");
             let err = startup.await.expect("join").unwrap_err();
             assert!(err.to_string().contains("unsloth.stop"), "got: {err}");
             assert!(mgr.status_snapshot().await.is_none(), "no server tracked");

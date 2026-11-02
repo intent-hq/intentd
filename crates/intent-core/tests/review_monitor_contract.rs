@@ -250,6 +250,7 @@ fn capability_absence_is_unsupported_and_declarations_do_not_advertise_it() {
 async fn old_workspace_api_implementations_refuse_addressed_calls_without_legacy_fallback() {
     struct OldApi;
     impl WorkspaceApi for OldApi {
+        #[track_caller]
         fn pr_state(
             &self,
             _: WorkspaceId,
@@ -258,6 +259,7 @@ async fn old_workspace_api_implementations_refuse_addressed_calls_without_legacy
         ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
             panic!("must not fall back to legacy GitHub")
         }
+        #[track_caller]
         fn pr_monitor_start(
             &self,
             _: WorkspaceId,
@@ -267,6 +269,7 @@ async fn old_workspace_api_implementations_refuse_addressed_calls_without_legacy
         ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
             panic!("must not create a legacy monitor")
         }
+        #[track_caller]
         fn pr_monitor_stop(
             &self,
             _: WorkspaceId,

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+#[track_caller]
 fn git(repo: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .current_dir(repo)
@@ -29,6 +30,7 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(ok, "git {args:?} failed");
 }
 
+#[track_caller]
 fn git_out(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(repo)

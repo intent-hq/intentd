@@ -761,10 +761,12 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
 }
+#[track_caller]
 fn git(path: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         // Keep automatic maintenance within the original owned command's wait.
@@ -837,6 +839,7 @@ async fn run_in_tls_process(name: &str) -> bool {
     drop(directory);
     true
 }
+#[track_caller]
 fn make_fixture_certificate(directory: &std::path::Path) {
     let cert = directory.join("ca.pem");
     let key = directory.join("key.pem");
@@ -2386,6 +2389,7 @@ impl DriverTest {
         )
         .unwrap()
     }
+    #[track_caller]
     fn record(&self, name: &str, value: &Value) {
         assert!(driver_safe(value));
         private_json(&self.directory.path().join(name), value).unwrap();
@@ -3486,8 +3490,9 @@ while True:signal.pause()
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
+    #[track_caller]
     fn observed_json(path: &std::path::Path) -> Value {
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(15));
         loop {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(value) = serde_json::from_slice(&bytes) {
@@ -3495,7 +3500,7 @@ while True:signal.pause()
                 }
             }
             assert!(
-                started.elapsed() < Duration::from_secs(15),
+                Instant::now() < deadline,
                 "missing owned observation {}",
                 path.display()
             );
@@ -3788,9 +3793,12 @@ while True:signal.pause()
             .arg(directory.path().join("writer-ready")).stdout(Stdio::from(pipe)).stderr(Stdio::inherit());
         let mut writer = Allocation::spawn(&mut command).unwrap();
         drop(command); // Command's Stdio must not retain a copy of the writer.
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         while !directory.path().join("writer-ready").exists() {
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(
+                Instant::now() < deadline,
+                "writer transfer never acknowledged"
+            );
             // timing-guard: writer transfer is acknowledged before its owned death
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3825,20 +3833,18 @@ while True:
             .stderr(Stdio::inherit());
         Allocation::spawn(&mut command).unwrap()
     }
+    #[track_caller]
     fn nonce(directory: &std::path::Path) -> String {
         let challenge = uuid::Uuid::new_v4().to_string();
         std::fs::write(directory.join("nonce"), &challenge).unwrap();
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         loop {
             if std::fs::read_to_string(directory.join("response"))
                 .is_ok_and(|value| value == challenge)
             {
                 return challenge;
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "independent sentinel response"
-            );
+            assert!(Instant::now() < deadline, "independent sentinel response");
             // timing-guard: original sentinel must answer this fresh nonce
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3859,9 +3865,9 @@ while True:
         let alive = allocation.observe().unwrap();
         assert!(!terminal(alive));
         std::fs::write(directory.path().join("exit-release"), "release").unwrap();
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         while !allocation.exit_ready().unwrap() {
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(Instant::now() < deadline, "allocation exit never observed");
             // timing-guard: nonconsuming original allocation exit observation
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4253,6 +4259,7 @@ async fn metadata_effects(h: &Harness) -> Value {
         "unsupportedCalls":h.metadata.unsupported_calls.load(std::sync::atomic::Ordering::SeqCst),
         "tokenWrites":h.metadata_token.writes.load(std::sync::atomic::Ordering::SeqCst)})
 }
+#[track_caller]
 fn metadata_public(frame: &Value) {
     let text = frame.to_string();
     for token in [TOKEN, MEMBER, GUEST] {

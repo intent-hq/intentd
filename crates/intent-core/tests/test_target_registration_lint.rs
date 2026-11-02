@@ -52,6 +52,7 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Canonical `src_path` of every cargo test target of the workspace at `root`.
+#[track_caller]
 fn test_target_sources(root: &Path) -> BTreeSet<PathBuf> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])

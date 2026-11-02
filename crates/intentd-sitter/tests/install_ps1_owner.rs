@@ -68,6 +68,7 @@ fn ps_region(name: &str) -> String {
 /// that marker a missing PowerShell panics instead of skipping, so a broken
 /// provisioning step fails the suite loudly. Local runs without the marker
 /// keep today's skip.
+#[track_caller]
 fn pwsh() -> Option<PathBuf> {
     for name in ["pwsh", "powershell"] {
         let Ok(output) = Command::new("sh")

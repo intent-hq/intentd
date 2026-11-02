@@ -352,6 +352,7 @@ async fn set_debounce(rpc: &mut TlsWs, id: i64, seconds: u64) {
 }
 
 /// Rendered text only: content-block metadata is not part of the message body.
+#[track_caller]
 fn blocks_text(message: &Value) -> String {
     let blocks = message["contentBlocks"]
         .as_array()
@@ -373,6 +374,7 @@ fn blocks_text(message: &Value) -> String {
     text
 }
 
+#[track_caller]
 fn assert_report_metadata(row: &Value, event_type: &str, report: &str) {
     let events = row["metadata"]["events"]
         .as_array()
