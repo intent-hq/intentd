@@ -2000,10 +2000,28 @@ impl Services {
     }
 
     /// Pin the PR-monitor debounce window, bypassing the live
-    /// `prMonitor.debounceSeconds` setting (test wiring). Values below the
-    /// floor are clamped when read.
+    /// `prMonitor.debounceSeconds` setting (test wiring).
+    ///
+    /// # Panics
+    ///
+    /// When `seconds` is below
+    /// [`intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. The window
+    /// is read through the same floor as the live setting, so a smaller
+    /// value would silently become the floor: a test expecting an immediate
+    /// wake would see the change stay pending and mistake it for a delivery
+    /// bug. A test that wants delivery now pins a long window and calls
+    /// `pr_monitor_flush_op`.
     #[must_use]
+    #[track_caller]
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
+        let floor = intent_core::config::MIN_PR_MONITOR_DEBOUNCE_SECONDS;
+        assert!(
+            seconds >= floor,
+            "with_pr_monitor_debounce_seconds({seconds}) is below the {floor}s floor the daemon \
+             enforces, so it would silently wait {floor}s instead. To deliver pending changes \
+             immediately, pin a long window (e.g. 3600) and call `pr_monitor_flush_op`; \
+             otherwise pass at least MIN_PR_MONITOR_DEBOUNCE_SECONDS."
+        );
         self.pr_monitor_debounce_seconds = Some(seconds);
         self
     }
