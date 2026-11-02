@@ -405,7 +405,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte, command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
 
 ## Use Intent from a browser on another device (experimental)
 
