@@ -13,7 +13,7 @@
 //! grandfathered by the committed baseline.
 //!
 //! - **Fix — assert what the limit stood for**, with no clock:
-//!   - *work done*: count rows changed (SQLite's update hook,
+//!   - *work done*: count rows changed (the `SQLite` update hook,
 //!     `total_changes()`), rows left in a cleanup at each step, batches or
 //!     calls made, bytes read — and compare with the count the cheap case
 //!     produces (intentd#2925);
