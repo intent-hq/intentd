@@ -3093,6 +3093,13 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
 /// (skipped downstream like every other malformed attachment entry) so
 /// legacy callers keep their fail-soft behavior — mirrors
 /// [`validate_file_blocks`].
+/// `-32602` for a malformed `agent.editAndRegenerate` block reference entry.
+fn malformed_image_block_reference(method: &str, index: usize) -> Error {
+    Error::InvalidParams(format!(
+        "{method}: imageBlocks[{index}] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`"
+    ))
+}
+
 pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) -> Result<()> {
     let Some(imgs) = image_blocks.and_then(Value::as_array) else {
         return Ok(());
@@ -4826,7 +4833,134 @@ impl Services {
     /// `outputPruned: true` so a client can tell "the full output is no
     /// longer retained" from "the fetch returned the full body" and does not
     /// re-request in a loop.
+    ///
+    /// Capped and paged (`messageBlockPages: 1`): the served block is bounded
+    /// by [`intent_core::MESSAGE_BLOCK_MAX_BYTES`] under the default page —
+    /// see [`Self::agent_get_message_block_page_op`]. Test-only shorthand.
+    #[cfg(test)]
     pub(crate) async fn agent_get_message_block_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        self.agent_get_message_block_page_op(
+            agent_id,
+            message_id,
+            block_id,
+            workspace_id,
+            intent_core::MessageBlockPage::default(),
+        )
+        .await
+    }
+
+    /// `agent.getMessageBlock` with an explicit page (PROTOCOL §5.5 "Capped
+    /// and paged block reads"): resolves the full served block
+    /// ([`Self::agent_message_block_full_op`]) and applies
+    /// [`intent_core::page_message_block`], so every response stays under
+    /// the 500 KiB read budget and large bodies page by `offset` /
+    /// `nextOffset`.
+    pub(crate) async fn agent_get_message_block_page_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+        page: intent_core::MessageBlockPage,
+    ) -> Result<Value> {
+        let block = self
+            .agent_message_block_full_op(agent_id, message_id, block_id, workspace_id)
+            .await?;
+        intent_core::page_message_block(block, &page)
+    }
+
+    /// Resolve `agent.editAndRegenerate` stored image block references
+    /// (PROTOCOL §5.5 "Image block references in `agent.editAndRegenerate`",
+    /// `messageBlockPages: 1`): each `{ type: "image", messageId, blockId }`
+    /// entry is replaced by a copy of the stored image — `{ type, data,
+    /// mimeType? }` with the full original bytes, or `{ type, attachmentId,
+    /// mimeType? }` — read from the SAME agent's transcript through the
+    /// uncapped block read. Runs before any state change (so before the
+    /// truncation drops the edited message). Entries without `messageId` /
+    /// `blockId` pass through untouched; the ordinary `imageBlocks` rules
+    /// then apply to the resolved array.
+    pub(crate) async fn resolve_image_block_references(
+        &self,
+        method: &str,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        image_blocks: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let mut imgs = match image_blocks {
+            Some(Value::Array(imgs)) => imgs,
+            other => return Ok(other),
+        };
+        for (i, img) in imgs.iter_mut().enumerate() {
+            let Some(obj) = img.as_object() else {
+                continue;
+            };
+            if !obj.contains_key("messageId") && !obj.contains_key("blockId") {
+                continue;
+            }
+            let nonempty = |key: &str| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let (Some(message_id), Some(block_id)) = (nonempty("messageId"), nonempty("blockId"))
+            else {
+                return Err(malformed_image_block_reference(method, i));
+            };
+            if obj.contains_key("data") || obj.contains_key("attachmentId") {
+                return Err(malformed_image_block_reference(method, i));
+            }
+            let block = self
+                .agent_message_block_full_op(
+                    agent_id.clone(),
+                    message_id,
+                    block_id.clone(),
+                    Some(workspace_id.clone()),
+                )
+                .await?;
+            let not_image = || {
+                Error::InvalidParams(format!(
+                    "{method}: imageBlocks[{i}] references block {block_id}, which is not an image with stored bytes"
+                ))
+            };
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                return Err(not_image());
+            }
+            let stored = |key: &str| {
+                block
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| Value::String(s.to_string()))
+            };
+            let mut resolved = serde_json::Map::new();
+            resolved.insert("type".to_string(), json!("image"));
+            if let Some(data) = stored("data") {
+                resolved.insert("data".to_string(), data);
+            } else if let Some(attachment_id) = stored("attachmentId") {
+                resolved.insert("attachmentId".to_string(), attachment_id);
+            } else {
+                return Err(not_image());
+            }
+            if let Some(mime) = stored("mimeType") {
+                resolved.insert("mimeType".to_string(), mime);
+            }
+            *img = Value::Object(resolved);
+        }
+        Ok(Some(Value::Array(imgs)))
+    }
+
+    /// The FULL served block behind `agent.getMessageBlock`, uncapped — the
+    /// read the cap is applied to, and the resolver for
+    /// `agent.editAndRegenerate` stored image block references (which need
+    /// the original bytes, never a cut).
+    pub(crate) async fn agent_message_block_full_op(
         &self,
         agent_id: AgentId,
         message_id: String,
@@ -4900,7 +5034,7 @@ impl Services {
             })
             .cloned()
             .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
-        Ok(json!({ "block": block }))
+        Ok(block)
     }
 
     /// `agent.listUserMessages` (PROTOCOL §5.5): user-role messages of one

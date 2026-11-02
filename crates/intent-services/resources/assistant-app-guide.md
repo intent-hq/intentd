@@ -1026,6 +1026,10 @@ assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
 
+With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{ToolCall,ChatImageBlock}.svelte; packages/cloudlands-fe/src/lib/components/chat/block-hydration.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-session/sagas/regenerate-from-message-saga.ts; packages/cloudlands-fe/messages/en.json (chat_toolCall_outputTruncated_label, chat_toolCall_outputTooLarge_label, chat_imageBlock_tooLarge_label). Test-build behavior pending its frontend release. -->
+
 Agents mention another workspace as a link showing its title rather than its internal ID.
 Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant
 chat it opens beside the conversation.

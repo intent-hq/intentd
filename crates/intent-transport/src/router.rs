@@ -121,6 +121,30 @@ pub(crate) fn max_content_bytes_param(
     }
 }
 
+/// `offset` / `maxBytes` on `agent.getMessageBlock` (capped and paged block
+/// reads, PROTOCOL §5.5): absent or `null` → the default; `offset` a
+/// non-negative integer, `maxBytes` a positive integer (clamped later);
+/// anything else → the documented `-32602`.
+fn parse_message_block_page(
+    params: &Map<String, Value>,
+) -> std::result::Result<intent_core::MessageBlockPage, RpcErr> {
+    let offset = match params.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 0)
+                .ok_or_else(|| invalid_params("offset must be a non-negative integer"))?,
+        ),
+    };
+    let max_bytes = match params.get("maxBytes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 1)
+                .ok_or_else(|| invalid_params("maxBytes must be a positive integer"))?,
+        ),
+    };
+    Ok(intent_core::MessageBlockPage { offset, max_bytes })
+}
+
 fn parse_max_content_bytes(
     params: &Map<String, Value>,
 ) -> std::result::Result<Option<usize>, RpcErr> {
@@ -2468,8 +2492,9 @@ async fn dispatch(
             let message_id = require_str_param(params, "messageId")?;
             let block_id = require_str_param(params, "blockId")?;
             let ws = opt_workspace_id(params);
+            let page = parse_message_block_page(params)?;
             match api
-                .agent_get_message_block(agent_id, message_id, block_id, ws)
+                .agent_get_message_block(agent_id, message_id, block_id, ws, page)
                 .await
             {
                 Ok(v) => Ok(v),

@@ -487,9 +487,15 @@ async fn get_message_block(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
     api.agent_get(agent_id.clone(), Some(workspace_id.clone()))
         .await
         .map_err(map_err)?;
-    api.agent_get_message_block(agent_id, message_id, block_id, Some(workspace_id))
-        .await
-        .map_err(map_err)
+    api.agent_get_message_block(
+        agent_id,
+        message_id,
+        block_id,
+        Some(workspace_id),
+        intent_core::MessageBlockPage::default(),
+    )
+    .await
+    .map_err(map_err)
 }
 
 /// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
