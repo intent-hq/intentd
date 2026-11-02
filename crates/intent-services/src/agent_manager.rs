@@ -12151,9 +12151,11 @@ impl AgentManager {
         // provider session gets the Intent history first; so does a quota
         // switch onto a backup (intent-hq/intent#8317). Any other change of
         // identity stops the old run rather than keep using it silently.
-        // Kept until the replacement run is installed, so a failed start
-        // (or a switch made while the agent had no run) still opens the
-        // next run with the history.
+        // Kept until the new run produces output or completes a turn (the
+        // node starts it asynchronously, so an installed run may still exit
+        // before starting): until then every fresh launch, including one
+        // after a failed start or for a switch made while the agent had no
+        // run, opens with the history.
         let switched = self.services.remote_model_switch_pending(agent_id, session);
         let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
             Some(h.spawned_provider.as_str()) != session.provider.as_deref()
@@ -12168,10 +12170,6 @@ impl AgentManager {
             }
         }
         if self.handle_is_live(agent_id) {
-            // The live run already has the switched identity.
-            if switched {
-                self.services.clear_remote_model_switch(agent_id);
-            }
             return Ok(StartedSession {
                 session_id,
                 turn: self.capture_turn(agent_id)?,
@@ -12270,7 +12268,6 @@ impl AgentManager {
             None => listener.abort(),
         }
         if switched {
-            self.services.clear_remote_model_switch(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
         }
         Ok(StartedSession {
@@ -15225,8 +15222,10 @@ async fn run_message_worker(
                         if stop_reason != StopReason::Cancelled {
                             mgr.services.note_provider_working(&agent_id);
                         }
-                        // A remote agent's automatic switch is confirmed
-                        // by a completed turn on its new configuration.
+                        // A remote agent's automatic switch, or one its
+                        // user made, is confirmed by a completed turn on its
+                        // new configuration.
+                        mgr.services.clear_remote_model_switch(&agent_id);
                         boxed_await(|| {
                             mgr.services
                                 .complete_remote_failover(&workspace_id, &agent_id)

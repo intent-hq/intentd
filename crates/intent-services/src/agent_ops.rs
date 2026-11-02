@@ -6552,7 +6552,8 @@ impl Services {
         named
     }
 
-    /// The agent's accepted remote switch is running on its machine.
+    /// The agent's accepted remote switch is confirmed: its new run produced
+    /// output or completed a turn on the machine.
     pub(crate) fn clear_remote_model_switch(&self, agent_id: &AgentId) {
         self.remote_model_switches.lock().unwrap().remove(agent_id);
     }

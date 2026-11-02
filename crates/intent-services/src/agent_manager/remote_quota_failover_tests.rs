@@ -760,3 +760,54 @@ async fn a_switch_of_a_stopped_remote_agent_replays_history_at_its_next_start() 
     let session = mgr.services.store.get_agent_session(&id).await.unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet"));
 }
+
+/// In production the node starts the agent asynchronously: `runtime()`
+/// returns at once, and a run that exits before starting only surfaces as
+/// its first prompt failing, after which the turn is driven again on a
+/// fresh launch. The switch stays pending until the new run produces output,
+/// so that launch still opens with the Intent history (review of
+/// intentd#2961).
+#[intent_test_macros::daemon_test]
+async fn a_switched_run_that_exits_before_starting_still_replays_history_next_time() {
+    let ws = WorkspaceId::from("ws-remote-switch-exit");
+    let id = AgentId::from("agent-remote-switch-exit");
+    let first = FakeRuntime::new();
+    let dead = FakeRuntime::new();
+    *dead.exited.lock().unwrap() = Some("provider-start-failed: the node is restarting".into());
+    let second = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(first.clone()),
+        Launch::Runs(dead.clone()),
+        Launch::Runs(second.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    expose_claude_node(&mgr, &["opus", "sonnet"]).await;
+
+    send(&mgr, &id, &ws, "remember the word kumquat").await;
+    first.wait_prompts(1).await;
+    first.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    mgr.services
+        .agent_set_model_op(id.clone(), "sonnet".into(), None)
+        .await
+        .unwrap();
+    send(&mgr, &id, &ws, "what was the word?").await;
+    // The dead run fails the prompt before any output; the turn is driven
+    // again on a fresh launch.
+    second.wait_prompts(1).await;
+    second.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        dead.prompts.lock().unwrap().len(),
+        1,
+        "the switched run failed first"
+    );
+    assert_eq!(port.asked.load(Ordering::SeqCst), 3);
+    let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
+    assert!(replayed.contains("what was the word?"), "{replayed}");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet"));
+}
