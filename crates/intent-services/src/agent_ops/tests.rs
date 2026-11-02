@@ -1101,11 +1101,14 @@ async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
     };
     // The late call holds its own handle on the gate once it has read the
     // (still unretired) target and is about to wait on the lock.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while Arc::strong_count(&gate) < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while Arc::strong_count(&gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("late retire reaches the workspace gate");
     for id in [&target, &peer] {
