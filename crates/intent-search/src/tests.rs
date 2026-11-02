@@ -184,9 +184,13 @@ fn content_search_windows_long_lines_around_the_match() {
 #[test]
 fn content_search_stops_at_max_bytes_and_sets_truncated() {
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (0..2_000)
-        .map(|i| format!("hit {i} {}\n", "x".repeat(300)))
-        .collect();
+    let line = format!(" {}\n", "x".repeat(300));
+    let mut body = String::new();
+    for i in 0..2_000 {
+        body.push_str("hit ");
+        body.push_str(&i.to_string());
+        body.push_str(&line);
+    }
     std::fs::write(dir.path().join("big.txt"), body).unwrap();
     let opts = SearchOpts {
         max_bytes: Some(64 * 1024),
