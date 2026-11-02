@@ -28,3 +28,18 @@ fn checkout_resource_url_uses_target_project_and_full_instance_boundary() {
         assert!(project_from_url(root, url).is_err(), "{url}");
     }
 }
+
+/// The payload sweep cannot reach the checkout reads (they need a live
+/// checkout lease), so their page-size clamp is pinned here: one page is
+/// 1–100 items, default 50.
+#[test]
+fn checkout_page_size_is_capped_at_100() {
+    assert_eq!(page_scope(None, None, None, false).unwrap().limit, 50);
+    assert_eq!(page_scope(None, None, Some(100), false).unwrap().limit, 100);
+    for limit in [0, 101, 1_000, u32::MAX] {
+        assert!(
+            page_scope(None, None, Some(limit), false).is_err(),
+            "limit {limit} must be refused"
+        );
+    }
+}
