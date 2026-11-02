@@ -994,28 +994,44 @@ async fn last_top_level_guard_skips_children_and_non_agent_callers() {
         .expect("a non-agent caller may retire the last top-level agent");
 }
 
-/// Two top-level agents self-retiring at the same time: exactly one wins and
-/// the workspace keeps one active top-level agent.
-#[tokio::test]
+/// Two top-level agents self-retiring at the same time on separate worker
+/// threads: exactly one wins and the workspace keeps one active top-level
+/// agent. Repeated so a missing workspace gate shows up as a flake-free
+/// failure rather than a lucky interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_self_retires_leave_one_top_level_agent() {
     let (_t, svc, ws) = setup().await;
-    let a = create_agent(&svc, &ws, "A").await;
-    let b = create_agent(&svc, &ws, "B").await;
-
-    let (ra, rb) = tokio::join!(self_retire(&svc, &ws, &a), self_retire(&svc, &ws, &b));
-    assert_eq!(
-        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
-        1,
-        "exactly one self-retire may win: {ra:?} / {rb:?}"
-    );
-    let loser = ra.err().or(rb.err()).expect("one refusal");
-    assert_last_top_level_refusal(&loser);
-    let active = svc
-        .store()
-        .list_active_agent_session_summaries(&ws)
-        .await
-        .expect("list");
-    assert_eq!(active.len(), 1, "one top-level agent survives");
+    let mut survivor = create_agent(&svc, &ws, "A0").await;
+    for round in 1..=8 {
+        let rival = create_agent(&svc, &ws, &format!("B{round}")).await;
+        let spawn_retire = |id: AgentId| {
+            let (svc, ws) = (svc.clone(), ws.clone());
+            tokio::spawn(async move { self_retire(&svc, &ws, &id).await })
+        };
+        let (ra, rb) = tokio::join!(spawn_retire(survivor.clone()), spawn_retire(rival.clone()));
+        let (ra, rb) = (ra.expect("join a"), rb.expect("join b"));
+        assert_eq!(
+            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+            1,
+            "round {round}: exactly one self-retire may win: {ra:?} / {rb:?}"
+        );
+        if ra.is_ok() {
+            survivor = rival;
+        }
+        let loser = ra.err().or(rb.err()).expect("one refusal");
+        assert_last_top_level_refusal(&loser);
+        let active = svc
+            .store()
+            .list_active_agent_session_summaries(&ws)
+            .await
+            .expect("list");
+        assert_eq!(
+            active.len(),
+            1,
+            "round {round}: one top-level agent survives"
+        );
+        assert_eq!(active[0].id, survivor);
+    }
 }
 
 /// Cascade: retiring the parent retires every settled/idle descendant with
