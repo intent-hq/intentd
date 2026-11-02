@@ -42,11 +42,16 @@ pub async fn fixture(scale: &LargeStateScale) -> LargeState {
 /// on a fresh socket.
 pub async fn serve(state: LargeState) -> Daemon {
     let bus = EventBus::new(state.store.clone());
+    // One reverse registry shared by the listener and the services, as the
+    // composition root wires it: `client.list` reads its live clients.
+    let registry = Arc::new(intent_transport::PrimaryReverseRegistry::new());
     let services = intent_app::compose(state.services.clone())
         .with_event_bus(bus.clone())
         .with_source_control(Arc::new(crate::proxies::OversizedForge::default()))
         .with_linear_engine(Arc::new(crate::proxies::OversizedLinear))
-        .with_sentry_engine(Arc::new(crate::proxies::OversizedSentry));
+        .with_sentry_engine(Arc::new(crate::proxies::OversizedSentry))
+        .with_context_engine(Arc::new(crate::proxies::OversizedContext))
+        .with_reverse_dispatch(registry.clone());
     // What the daemon does at startup: load the stored scripts.
     intent_core::with_caller(intent_core::Caller::Daemon, services.hydrate_scripts())
         .await
@@ -62,9 +67,18 @@ pub async fn serve(state: LargeState) -> Daemon {
     intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
-            let _ = intent_transport::serve_uds(api, bus, &socket, None, async {
-                let _ = rx.await;
-            })
+            let _ = intent_transport::serve_uds_with_reverse(
+                api,
+                bus,
+                &socket,
+                None,
+                None,
+                registry,
+                intent_transport::RpcLimiter::unlimited(),
+                async {
+                    let _ = rx.await;
+                },
+            )
             .await;
         }
     });
@@ -117,7 +131,7 @@ pub async fn ctx<'a>(client: &mut Client, daemon: &Daemon, seeded: &'a Seeded) -
         worktree: daemon.state.worktree.display().to_string(),
         specialist: "large-specialist-0".into(),
         message_id,
-        owner_principal: ids.owner_principal.0.clone(),
+        member_principal: ids.member_principals[0].0.clone(),
         seeded,
     }
 }

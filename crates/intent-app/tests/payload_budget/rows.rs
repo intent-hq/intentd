@@ -92,6 +92,13 @@ pub struct Row {
     pub small_by_design: Option<&'static str>,
     /// Router params no variant sets, with the reason.
     pub unexercised: &'static [(&'static str, &'static str)],
+    /// For an arm that hands its whole params object on (not a typed
+    /// struct): the function that reads it, as `(path from crates/, fn,
+    /// variable)`. Its literal key reads are derived from source.
+    pub parse: Option<(&'static str, &'static str, &'static str)>,
+    /// Keys that function reads through a variable, which the scanner
+    /// cannot see, each with where it comes from.
+    pub declared: &'static [(&'static str, &'static str)],
 }
 
 /// Golden: `BoundedRead` methods this harness cannot drive to real data,
@@ -150,14 +157,29 @@ pub const CANNOT_EXERCISE: &[(&str, &str, &str)] = &[
         "Permission prompts live in the agent manager's registry, filled only by live ACP sessions.",
     ),
     (
+        "agent.getModels",
+        "ok",
+        "Model options come from the installed provider CLI's model probe; the test host has no provider CLI, so the list is empty.",
+    ),
+    (
+        "agent.workers.list",
+        "ok",
+        "Background workers are reported only by a live ACP agent process (agent_workers is fed from its frames); without one the reply is the no-session projection.",
+    ),
+    (
         "desktop.getState",
-        "-32603",
+        "-32602",
         "Needs a desktop client that sent client.hello with the desktop capability (Electron only).",
     ),
     (
         "invite.inspect",
         "-32601",
         "Served only to the guest invite handshake on the WSS listener, not on UDS.",
+    ),
+    (
+        "models.list",
+        "ok",
+        "The model catalog comes from the provider's live model probe; the test host has no provider CLI, so the catalog is empty.",
     ),
     (
         "pairing.getInfo",
@@ -168,11 +190,6 @@ pub const CANNOT_EXERCISE: &[(&str, &str, &str)] = &[
         "pairing.getSelfInfo",
         "-32601",
         "Served only on the WSS pairing handshake, not on UDS.",
-    ),
-    (
-        "providers.setup.status",
-        "-32001",
-        "Needs an authorized local app connection (Electron) and a provider setup session.",
     ),
 ];
 
@@ -212,7 +229,8 @@ pub struct Ctx<'a> {
     /// block's id (`agent.getMessageBlock`).
     pub tool_message_id: String,
     pub tool_block_id: String,
-    pub owner_principal: String,
+    /// A member principal with live presence (seeded).
+    pub member_principal: String,
     pub seeded: &'a Seeded,
 }
 
@@ -248,19 +266,33 @@ fn row(method: &'static str, variants: Vec<Variant>) -> Row {
         variants,
         small_by_design: None,
         unexercised: &[],
+        parse: None,
+        declared: &[],
     }
 }
 
 fn fixed(method: &'static str, why: &'static str, variants: Vec<Variant>) -> Row {
     Row {
-        method,
-        variants,
         small_by_design: Some(why),
-        unexercised: &[],
+        ..row(method, variants)
     }
 }
 
+/// `ScriptListOptions::parse`, which `script.list` and `scriptMonitor.list`
+/// hand their params to.
+const SCRIPT_LIST_PARSE: (&str, &str, &str) = ("intent-core/src/script_lists.rs", "parse", "value");
+
 impl Row {
+    fn parsed_by(
+        mut self,
+        parse: (&'static str, &'static str, &'static str),
+        declared: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.parse = Some(parse);
+        self.declared = declared;
+        self
+    }
+
     fn skip(mut self, unexercised: &'static [(&'static str, &'static str)]) -> Self {
         self.unexercised = unexercised;
         self
@@ -338,12 +370,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         fixed(
             "agent.getCreationPreferences",
             "One workspace's specialist preference.",
-            vec![v("default", w.clone(), Fixed(""))],
-        ),
-        fixed(
-            "agent.getModels",
-            "Model options of the configured provider; not daemon state.",
-            vec![v("default", wa.clone(), Fixed("/models"))],
+            vec![v("default", w.clone(), Fixed("/specialistId"))],
         ),
         row(
             "agent.getQueue",
@@ -383,7 +410,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "retiredOnly",
                     json!({ "workspaceId": ws, "retiredOnly": true }),
-                    Fixed("/agents"),
+                    Items("/agents", seed::RETIRED_AGENTS),
                 ),
                 v(
                     "scope=delegated",
@@ -393,16 +420,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "scope=delegated+orphanedOnly",
                     json!({ "workspaceId": ws, "scope": "delegated", "orphanedOnly": true }),
-                    Fixed("/agents"),
+                    Items("/agents", seed::ORPHANED_AGENTS),
                 ),
                 v(
                     "scope=topLevel",
                     json!({ "workspaceId": ws, "scope": "topLevel" }),
-                    Fixed("/agents"),
+                    Items("/agents", seed::TOP_LEVEL_AGENTS),
                 ),
             ],
-        )
-        .with_reason("retiredOnly, orphanedOnly and topLevel bins are empty: the fixture's agents are all live children of the big agent."),
+        ),
         row(
             "agent.listInterrupted",
             vec![v("default", json!({}), Items("/agents", 1_000))],
@@ -430,11 +456,6 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v("default", wa.clone(), Bytes(1024))],
         )
         .with_reason("A fixed-shape digest: counters plus the last message preview."),
-        fixed(
-            "agent.workers.list",
-            "Background workers of one live agent process; none without a running agent.",
-            vec![v("default", wa.clone(), Fixed("/agentId"))],
-        ),
         row(
             "browser.listTabs",
             vec![
@@ -443,8 +464,8 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         ),
         fixed(
             "client.list",
-            "One row per live authenticated connection; bounded by connected devices, not by stored state.",
-            vec![v("default", json!({}), Fixed("/clients"))],
+            "One row per live authenticated connection; seeded with many connected devices.",
+            vec![v("default", json!({}), Items("/clients", seed::DEVICES))],
         ),
         row(
             "comment.getThread",
@@ -478,16 +499,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "authorType=user",
                     json!({ "workspaceId": ws, "noteId": note, "authorType": "user" }),
-                    Fixed("/threads"),
+                    Items("/threads", seed::USER_THREADS),
                 ),
                 v(
                     "authorType=agent",
                     json!({ "workspaceId": ws, "noteId": note, "authorType": "agent" }),
-                    Fixed("/threads"),
+                    Items("/threads", seed::AGENT_THREADS),
                 ),
             ],
-        )
-        .with_reason("authorType keeps threads whose latest comment has that author; which bin holds them depends on the preset's reply count."),
+        ),
         row(
             "crossWorkspace.listNotes",
             vec![v(
@@ -536,14 +556,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "limit": 100 }),
                     Items("/conversations", 100),
                 ),
-                v(
+                next(
                     "beforeId",
-                    json!({ "workspaceId": ws, "limit": 100, "beforeId": "zzzzzzzz" }),
-                    Fixed("/conversations"),
+                    json!({ "workspaceId": ws, "limit": 50 }),
+                    "/conversations/49/id",
+                    "beforeId",
+                    Items("/conversations", 50),
                 ),
             ],
         )
-        .with_reason("A cursor past every conversation id returns an empty page by design.")
         .skip(&[
             ("query", "Read only by discussion.recipients (shared router arm)."),
             ("afterPrincipalId", "Read only by discussion.recipients (shared router arm)."),
@@ -578,14 +599,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "limit": 100, "query": "" }),
                     Items("/members", 50),
                 ),
-                v(
-                    "query",
-                    json!({ "workspaceId": ws, "limit": 100, "query": "member", "afterPrincipalId": c.owner_principal }),
-                    Fixed("/members"),
+                next(
+                    "query+afterPrincipalId",
+                    json!({ "workspaceId": ws, "limit": 20, "query": "member" }),
+                    "/members/19/principalId",
+                    "afterPrincipalId",
+                    Items("/members", 20),
                 ),
             ],
         )
-        .with_reason("A narrowing query after the owner selects a few members.")
         .skip(&[("beforeId", "Read only by discussion.conversations (shared router arm).")]),
         row(
             "drafts.get",
@@ -603,11 +625,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "agent",
                     json!({ "workspaceId": ws, "agentId": agent, "minutesAgo": 100_000_000 }),
-                    Fixed(""),
+                    Items("", 100),
                 ),
             ],
-        )
-        .with_reason("One agent's activity: the fixture spreads events over a thousand agents."),
+        ),
         row(
             "event.query",
             vec![
@@ -619,8 +640,8 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
                 v(
                     "filters",
-                    json!({ "workspaceId": ws, "limit": 100_000, "eventType": "file.changed", "actorType": "agent", "actorId": agent, "path": "src/file_0.rs", "minutesAgo": 100_000_000 }),
-                    Fixed(""),
+                    json!({ "workspaceId": ws, "limit": 100_000, "eventType": intent_core::events::FILE_CHANGED, "actorType": "agent", "actorId": agent, "path": seed::HOT_FILE, "minutesAgo": 100_000_000 }),
+                    Items("", 200),
                 ),
                 v(
                     "paginate",
@@ -635,20 +656,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("/items", 100),
                 ),
             ],
-        )
-        .with_reason("The all-filters variant narrows to one agent's events on one path."),
+        ),
         row(
             "event.workspaceSummary",
             vec![
-                v("default", w.clone(), Fixed("/recentFiles")),
+                v("default", w.clone(), Items("/recentFiles", 1)),
                 v(
                     "minutesAgo",
                     json!({ "workspaceId": ws, "minutesAgo": 100_000_000 }),
                     Bytes(32 * 1024),
                 ),
             ],
-        )
-        .with_reason("Default window is recent minutes; the fixture's events are older."),
+        ),
         row(
             "file-tracking.getAgentLocks",
             vec![v("default", w.clone(), Items("/lockedFilePaths", 100))],
@@ -660,11 +679,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "filter",
                     json!({ "workspaceId": ws, "filter": { "agentId": agent } }),
-                    Fixed("/changes"),
+                    Items("/changes", 200),
                 ),
             ],
-        )
-        .with_reason("The filtered variant narrows to one agent's changes."),
+        ),
         row(
             "file-tracking.loadCommits",
             vec![
@@ -672,12 +690,12 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "limit=100000",
                     json!({ "workspaceId": ws, "limit": 100_000 }),
-                    Items("/commits", 200),
+                    Items("/commits", seed::BOUNDARY_DEPTH),
                 ),
                 v(
                     "includeOlder",
                     json!({ "workspaceId": ws, "limit": 100_000, "includeOlder": true }),
-                    Fixed("/commits"),
+                    Items("/commits", seed::BOUNDARY_DEPTH),
                 ),
                 next(
                     "nextToken",
@@ -687,8 +705,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("/commits", 50),
                 ),
             ],
-        )
-        .with_reason("includeOlder pages the history before the workspace boundary: the one import commit."),
+        ),
         fixed(
             "file.exists",
             "Three flags for one path.",
@@ -1001,7 +1018,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         fixed(
             "host.invite.list",
             "Pending host invites; created one at a time by the owner.",
-            vec![v("default", json!({}), Fixed("/invites"))],
+            vec![v("default", json!({}), Items("/invites", seed::HOST_INVITES))],
         ),
         fixed(
             "host.invite.searchAccounts",
@@ -1118,18 +1135,6 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "Three counters.",
             vec![v("default", json!({ "agentId": agent }), Fixed("/additions"))],
         ),
-        fixed(
-            "models.list",
-            "The provider's model catalog; not daemon state.",
-            vec![
-                v("default", json!({}), Fixed("/models")),
-                v(
-                    "max",
-                    json!({ "providerId": "auggie", "forceRefresh": true }),
-                    Fixed("/models"),
-                ),
-            ],
-        ),
         row(
             "note.get",
             vec![
@@ -1189,10 +1194,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "prMonitor.list",
             vec![v("default", w.clone(), Items("/monitors", 200))],
         ),
-        fixed(
+        row(
             "presence.snapshot",
-            "One row per connected member of one workspace.",
-            vec![v("default", w.clone(), Fixed("/members"))],
+            vec![v("default", w.clone(), Items("/members", 40))],
         ),
         row(
             "principal.list",
@@ -1209,14 +1213,19 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v("default", json!({}), Fixed("/providers"))],
         ),
         fixed(
+            "providers.setup.status",
+            "One provider-setup operation's phase; the connection authorizes setup in its client.hello (`antigravitySetup: 1`).",
+            vec![v("default", json!({ "providerId": "antigravity" }), Fixed("/phase"))],
+        ),
+        fixed(
             "providers.profiles.list",
             "Administrator-defined provider profiles; a handful.",
             vec![
-                v("default", json!({}), Fixed("/profiles")),
+                v("default", json!({}), Items("/profiles", 2 * seed::PROFILES_PER_PROVIDER)),
                 v(
                     "baseProviderId",
                     json!({ "baseProviderId": "codex" }),
-                    Fixed("/profiles"),
+                    Items("/profiles", seed::PROFILES_PER_PROVIDER),
                 ),
             ],
         ),
@@ -1227,7 +1236,7 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         fixed(
             "repoConfig.get",
             "One repository config file.",
-            vec![v("default", w.clone(), Fixed("/config"))],
+            vec![v("default", w.clone(), Bytes(16 * 1024))],
         ),
         fixed(
             "repoConfig.has",
@@ -1282,7 +1291,8 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("/scripts", 100),
                 ),
             ],
-        ),
+        )
+        .parsed_by(SCRIPT_LIST_PARSE, &[("archive", "parse reads `value.get(filter)` with filter = \"archive\" for script lists")]),
         row(
             "script.output",
             vec![
@@ -1350,14 +1360,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("/monitors", 50),
                 ),
             ],
-        ),
+        )
+        .parsed_by(SCRIPT_LIST_PARSE, &[("state", "parse reads `value.get(filter)` with filter = \"state\" for monitor lists")]),
         fixed(
             "search.codebase",
-            "Context-engine hits; the engine caps them. No engine runs here, so this proves only the degraded reply.",
+            "Context-engine hits: at most the inline threshold (25) in the reply, more stream as events; the stub engine answers exactly the inline maximum.",
             vec![v(
                 "default",
                 json!({ "workspaceId": ws, "query": "payload budget", "requestId": "r-codebase" }),
-                Fixed("/matches"),
+                Items("/matches", crate::proxies::SEARCH_INLINE_MAX),
             )],
         ),
         row(
@@ -1599,8 +1610,8 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         ),
         fixed(
             "voice.getWorkspaceVocabulary",
-            "Derived vocabulary terms; capped by the deriver.",
-            vec![v("default", w.clone(), Fixed("/terms"))],
+            "Derived vocabulary terms; capped by the deriver (default 50).",
+            vec![v("default", w.clone(), Items("/terms", 40))],
         ),
         fixed(
             "workspace.detectProjectType",
@@ -1710,6 +1721,30 @@ impl Row {
     }
 }
 
+/// Golden: snapshot channels whose seq-0 snapshot cannot carry large data
+/// here, with why. The sweep still subscribes with
+/// [`snapshot_golden_params`] and requires the snapshot to arrive.
+pub const SNAPSHOT_CANNOT_EXERCISE: &[(&str, &str)] = &[
+    (
+        "agent.workers.subscribe",
+        "Background workers are reported only by a live ACP agent process; without one the snapshot is the no-session projection.",
+    ),
+    (
+        "presence.focus.subscribe",
+        "One resolved focus target for one (viewer, principal) pair by design; it does not grow with daemon state.",
+    ),
+];
+
+/// Subscribe params for a [`SNAPSHOT_CANNOT_EXERCISE`] channel.
+pub fn snapshot_golden_params(c: &Ctx<'_>, channel: &str) -> Value {
+    match channel {
+        "presence.focus.subscribe" => {
+            json!({ "workspaceId": c.ws, "principalId": c.member_principal })
+        }
+        _ => json!({ "workspaceId": c.ws, "agentId": c.agent }),
+    }
+}
+
 /// One row per channel in `SNAPSHOT_CHANNELS`; proofs point into the
 /// snapshot (`params.snapshot` of the seq-0 push).
 pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
@@ -1719,11 +1754,6 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
     let w = json!({ "workspaceId": ws });
     vec![
         row("agent.subscribe", vec![v("default", w.clone(), Items("", 500))]),
-        fixed(
-            "agent.workers.subscribe",
-            "Background workers of one live agent process; none without a running agent.",
-            vec![v("default", json!({ "workspaceId": ws, "agentId": agent }), Fixed(""))],
-        ),
         row(
             "chat.subscribe",
             vec![
@@ -1759,10 +1789,13 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
                 Items("", 100),
             )],
         ),
-        fixed(
+        row(
             "note.presence.subscribe",
-            "Current viewers of one note: one row per connected member.",
-            vec![v("default", json!({ "workspaceId": ws, "noteId": c.note }), Fixed(""))],
+            vec![v(
+                "default",
+                json!({ "workspaceId": ws, "noteId": c.note }),
+                Items("/viewers", 40),
+            )],
         ),
         row(
             "note.subscribe",
@@ -1779,15 +1812,6 @@ pub fn snapshot_rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("", 200),
                 ),
             ],
-        ),
-        fixed(
-            "presence.focus.subscribe",
-            "Focus presence of one workspace: one row per connected member.",
-            vec![v(
-                "default",
-                json!({ "workspaceId": ws, "principalId": c.owner_principal }),
-                Fixed(""),
-            )],
         ),
         row("task.subscribe", vec![v("default", w, Items("", 50))]),
         row(
@@ -1996,7 +2020,7 @@ pub fn proxy_rows() -> Vec<Row> {
             vec![v(
                 "default",
                 with(json!({ "ref": "main" })),
-                Fixed("/config"),
+                Bytes(16 * 1024),
             )],
         ),
         fixed(

@@ -210,3 +210,206 @@ pub fn router_params(methods: &[&str]) -> BTreeMap<String, ArmParams> {
     }
     out
 }
+
+/// Where an opaque arm's params are read, derived mechanically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpaqueSource {
+    /// The arm deserializes the params into this `intent-core` struct (the
+    /// parameter type of the `WorkspaceApi` method it calls); its keys are
+    /// the struct's serde field names.
+    Struct {
+        name: String,
+        keys: BTreeSet<String>,
+    },
+    /// The arm hands the params on and `parse_fn` reads them; its keys are
+    /// the literal reads in that function, and `dynamic` is set when it
+    /// also reads a key through a variable.
+    ParseFn {
+        keys: BTreeSet<String>,
+        dynamic: bool,
+    },
+    /// Neither: the scanner cannot tell which params the arm reads.
+    Unknown,
+}
+
+fn crate_dir(krate: &str) -> String {
+    format!("{}/../{krate}/src", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Convert a Rust field name per a serde `rename_all` rule.
+fn rename(field: &str, rule: Option<&str>) -> String {
+    let field = field.trim_start_matches("r#");
+    match rule {
+        Some("camelCase") => {
+            let mut out = String::new();
+            let mut upper = false;
+            for c in field.chars() {
+                if c == '_' {
+                    upper = true;
+                } else if upper {
+                    out.extend(c.to_uppercase());
+                    upper = false;
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        Some("kebab-case") => field.replace('_', "-"),
+        _ => field.to_string(),
+    }
+}
+
+/// The quoted value of `key = "..."` inside a `#[serde(...)]` attribute.
+fn serde_attr<'a>(attr: &'a str, key: &str) -> Option<&'a str> {
+    let at = attr.find(&format!("{key} = \""))? + key.len() + 4;
+    attr[at..].split('"').next()
+}
+
+/// The serde field names of `pub struct name` in `intent-core`, or `None`
+/// when no such struct exists.
+pub fn struct_keys(name: &str) -> Option<BTreeSet<String>> {
+    let mut files = Vec::new();
+    rust_files(std::path::Path::new(&crate_dir("intent-core")), &mut files);
+    for file in files {
+        let src = std::fs::read_to_string(&file).expect("read source");
+        let lines: Vec<&str> = src.lines().collect();
+        let Some(start) = lines.iter().position(|l| {
+            l.trim_start()
+                .strip_prefix(&format!("pub struct {name}"))
+                .is_some_and(|rest| rest.starts_with([' ', '{']))
+        }) else {
+            continue;
+        };
+        // Struct-level attributes sit directly above the declaration.
+        let mut rule = None;
+        for attr in lines[..start].iter().rev() {
+            let t = attr.trim();
+            if !t.starts_with("#[") && !t.starts_with("///") {
+                break;
+            }
+            if let Some(r) = serde_attr(t, "rename_all") {
+                rule = Some(r);
+            }
+        }
+        let mut keys = BTreeSet::new();
+        if lines[start].trim_end().ends_with("{}") {
+            return Some(keys);
+        }
+        let mut pending: Vec<&str> = Vec::new();
+        for line in &lines[start + 1..] {
+            let t = line.trim();
+            if t == "}" {
+                break;
+            }
+            if t.starts_with("#[") {
+                pending.push(t);
+                continue;
+            }
+            if let Some(field) = t.strip_prefix("pub ").and_then(|f| f.split(':').next()) {
+                let attrs = pending.join(" ");
+                let skipped = attrs.contains("skip)")
+                    || attrs.contains("skip,")
+                    || attrs.contains("skip_deserializing");
+                if !skipped {
+                    let key = serde_attr(&attrs, "rename")
+                        .map_or_else(|| rename(field.trim(), rule), str::to_string);
+                    keys.insert(key);
+                }
+            }
+            if !t.starts_with("///") && !t.is_empty() {
+                pending.clear();
+            }
+        }
+        return Some(keys);
+    }
+    None
+}
+
+/// The parameter type (last path segment) of `WorkspaceApi::fn_name`.
+fn api_param_type(fn_name: &str) -> Option<String> {
+    let src = std::fs::read_to_string(format!("{}/traits.rs", crate_dir("intent-core")))
+        .expect("read traits.rs");
+    let at = src.find(&format!("fn {fn_name}("))?;
+    let sig = src[at..].split(") ->").next()?;
+    let ty = sig.rsplit(':').next()?.trim().trim_end_matches(',').trim();
+    Some(ty.rsplit("::").next()?.trim().to_string())
+}
+
+/// Literal keys `parse_fn` in `file` reads from `var`, and whether it also
+/// reads a key through a variable (`var.get(name)`).
+pub fn parse_fn_keys(file: &str, parse_fn: &str, var: &str) -> (BTreeSet<String>, bool) {
+    let path = format!("{}/../{file}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let at = src
+        .find(&format!("fn {parse_fn}("))
+        .unwrap_or_else(|| panic!("{path}: no fn {parse_fn}"));
+    let body: String = src[at..]
+        .split("\n    }\n")
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let prefix = format!("{var}.get(\"");
+    let mut keys = BTreeSet::new();
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find(&prefix) {
+        rest = &rest[i + prefix.len()..];
+        if let Some(end) = rest.find('"') {
+            keys.insert(rest[..end].to_string());
+        }
+    }
+    let dynamic = body
+        .match_indices(&format!("{var}.get("))
+        .any(|(i, m)| !body[i + m.len()..].starts_with('"'));
+    (keys, dynamic)
+}
+
+/// How an opaque arm's params are derived: a typed struct when the arm
+/// deserializes into the parameter of the `WorkspaceApi` method it calls,
+/// otherwise the row-declared parse function (`parse`), otherwise unknown.
+pub fn opaque_source(method: &str, parse: Option<(&str, &str, &str)>) -> OpaqueSource {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../intent-transport/src/router.rs"
+    );
+    let src = std::fs::read_to_string(path).expect("read router.rs");
+    let body: String = arm_body(dispatch_body(&src), method)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if body.contains("serde_json::from_value(Value::Object(params.clone()))") {
+        let called = body.split("api.").nth(1).and_then(|rest| {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        });
+        if let Some(name) = called.as_deref().and_then(api_param_type) {
+            if let Some(keys) = struct_keys(&name) {
+                return OpaqueSource::Struct { name, keys };
+            }
+        }
+    }
+    match parse {
+        Some((file, parse_fn, var)) => {
+            let (keys, dynamic) = parse_fn_keys(file, parse_fn, var);
+            OpaqueSource::ParseFn { keys, dynamic }
+        }
+        None => OpaqueSource::Unknown,
+    }
+}

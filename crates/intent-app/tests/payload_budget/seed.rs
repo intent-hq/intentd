@@ -67,6 +67,28 @@ pub const PR_LINKED_WORKSPACES: usize = 300;
 pub const GIT_ROOTS: usize = 20;
 pub const OAUTH_TOKENS: usize = 120;
 pub const WATCHES: usize = 120;
+const WATCH_CONCURRENCY: usize = 4;
+/// Commits of the big repository above the workspace boundary.
+pub const BOUNDARY_DEPTH: usize = GIT_COMMITS / 2;
+/// Agents in each of the `agent.list` bins the fixture leaves empty.
+pub const RETIRED_AGENTS: usize = 300;
+pub const ORPHANED_AGENTS: usize = 300;
+pub const TOP_LEVEL_AGENTS: usize = 300;
+/// Comment threads whose latest comment is by a user, and by an agent.
+pub const USER_THREADS: usize = 150;
+pub const AGENT_THREADS: usize = 150;
+/// `file:changed` events by the big agent, all on [`HOT_FILE`].
+pub const AGENT_FILE_EVENTS: usize = 300;
+pub const HOT_FILE: &str = "src/large_state/hot_file.rs";
+/// Tracked changes owned by the big agent.
+pub const AGENT_TRACKED_CHANGES: usize = 500;
+/// Provider profiles per base provider (the daemon's cap is 32).
+pub const PROFILES_PER_PROVIDER: usize = 32;
+/// Pending host invites.
+pub const HOST_INVITES: usize = 40;
+/// Extra hello'd device connections kept open for `client.list`.
+pub const DEVICES: usize = 30;
+const DEVICE_KINDS: [&str; 3] = ["desktop", "laptop", "phone"];
 pub const SCRIPT_MONITORS: usize = 250;
 /// Idempotency key bound to the seeded attachment.
 pub const ATTACHMENT_KEY: &str = "large-state-attachment-key";
@@ -143,6 +165,21 @@ fn seed_git(worktree: &Path, seeded: &mut Seeded) {
         ],
     );
     std::fs::write(worktree.join(".gitignore"), "ignored/\n").expect("gitignore");
+    // A README naming many project terms (the voice vocabulary source).
+    let mut readme = String::from("# Large state\n\n");
+    for i in 0..400 {
+        let _ = writeln!(
+            readme,
+            "- `PayloadBudget{i}Sweep` drives `LargeState{i}Fixture` through `IntentDaemon{}`.",
+            i % 37
+        );
+    }
+    std::fs::write(worktree.join("README.md"), readme).expect("readme");
+    std::fs::write(
+        worktree.join(".intent/config.json"),
+        crate::proxies::repo_config_json(),
+    )
+    .expect("repo config");
     git(worktree, &["add", "-A"]);
     git(
         worktree,
@@ -150,12 +187,6 @@ fn seed_git(worktree: &Path, seeded: &mut Seeded) {
     );
     seeded.base_branch = "large-state-base".into();
     git(worktree, &["branch", &seeded.base_branch]);
-    // The workspace's base ref is `origin/main`: point it at the import so
-    // history and ahead/behind reads have a boundary.
-    git(
-        worktree,
-        &["update-ref", "refs/remotes/origin/main", "HEAD"],
-    );
     // History in one fast-import: each commit adds a 6 KiB source file and
     // carries an agent-written multi-paragraph message.
     let mut stream = String::new();
@@ -202,6 +233,17 @@ fn seed_git(worktree: &Path, seeded: &mut Seeded) {
         "fast-import failed"
     );
     git(worktree, &["reset", "-q", "--hard", "main"]);
+    // The workspace's base ref is `origin/main`: point it halfway up the
+    // history, so the workspace has commits on both sides of its boundary
+    // (`file-tracking.loadCommits` with and without `includeOlder`).
+    git(
+        worktree,
+        &[
+            "update-ref",
+            "refs/remotes/origin/main",
+            &format!("main~{BOUNDARY_DEPTH}"),
+        ],
+    );
     seeded.mid_commit = git(
         worktree,
         &["rev-parse", &format!("main~{}", GIT_COMMITS / 2)],
@@ -543,6 +585,126 @@ pub async fn store(state: &LargeState) -> Seeded {
         .await
         .expect("checklist note");
 
+    // `agent.list` bins: retired sessions, delegated sessions whose parent
+    // is gone, and top-level sessions.
+    for i in 0..RETIRED_AGENTS + ORPHANED_AGENTS + TOP_LEVEL_AGENTS {
+        let id = intent_core::AgentId::from_string(format!("agent-large-state-bin-{i:04}"));
+        let mut s = intent_services::test_support::fixtures::session(&id, big_ws);
+        s.name = format!("Bin agent {i}");
+        s.created_at = format!("2026-02-01T00:{:02}:{:02}.000Z", (i / 60) % 60, i % 60);
+        s.updated_at.clone_from(&s.created_at);
+        s.completion_report = Some(prose(i, 1_500));
+        if i < RETIRED_AGENTS {
+            s.retired_at = Some("2026-03-01T00:00:00.000Z".into());
+        } else if i < RETIRED_AGENTS + ORPHANED_AGENTS {
+            s.parent_agent_id = Some(intent_core::AgentId::from_string(format!(
+                "agent-large-state-deleted-parent-{}",
+                i % 7
+            )));
+            s.specialist = Some("implementor".into());
+        }
+        store.insert_agent_session(&s).await.expect("bin agent");
+    }
+
+    // Root-only comment threads: half end with a user, half with an agent.
+    for t in 0..USER_THREADS + AGENT_THREADS {
+        let id = format!("large-state-thread-{t:04}");
+        let by_user = t < USER_THREADS;
+        store
+            .insert_comment(
+                big_ws,
+                &intent_core::Comment {
+                    id: id.clone(),
+                    thread_id: id,
+                    note_id: Some(ids.big_note.clone()),
+                    kind: intent_core::CommentType::Comment,
+                    content: prose(t, 1_000),
+                    author: if by_user {
+                        "owner".into()
+                    } else {
+                        "Agent 0".into()
+                    },
+                    author_type: if by_user {
+                        intent_core::AuthorType::User
+                    } else {
+                        intent_core::AuthorType::Agent
+                    },
+                    author_principal_id: None,
+                    author_identity: None,
+                    status: intent_core::CommentStatus::Open,
+                    parent_id: None,
+                    anchor: None,
+                    anchor_text: Some(prose(t + 1, 80)),
+                    anchor_before: None,
+                    anchor_after: None,
+                    suggestion_original: None,
+                    suggestion_proposed: None,
+                    agent_id: (!by_user).then(|| ids.big_agent.clone()),
+                    is_orphaned: None,
+                    created_at: "2026-02-01T00:00:00.000Z".into(),
+                    updated_at: "2026-02-01T00:00:00.000Z".into(),
+                },
+            )
+            .await
+            .expect("thread");
+    }
+
+    // The big agent's current file activity: many edits of one hot file,
+    // stamped now so the default recent-activity windows see them.
+    let now = intent_core::clock::now_iso();
+    let events: Vec<intent_store::NewEvent> = (0..AGENT_FILE_EVENTS)
+        .map(|i| intent_store::NewEvent {
+            workspace_id: big_ws.clone(),
+            timestamp: now.clone(),
+            event_type: intent_core::events::FILE_CHANGED.to_string(),
+            actor: intent_core::EventActor {
+                actor_type: intent_core::ActorType::Agent,
+                id: Some(ids.big_agent.0.clone()),
+                name: Some("Agent 0".into()),
+                ..Default::default()
+            },
+            session_id: Some(ids.big_agent.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({ "path": HOT_FILE, "summary": prose(i, 300) }),
+        })
+        .collect();
+    store
+        .insert_events(&events)
+        .await
+        .expect("agent file events");
+
+    // Tracked changes owned by the big agent.
+    for i in 0..AGENT_TRACKED_CHANGES {
+        store
+            .upsert_tracked_change(&intent_store::NewTrackedChange {
+                workspace_id: big_ws.clone(),
+                path: format!("packages/app/src/agent_zero/module_{i}.tsx"),
+                stage: "unstaged".into(),
+                status: "modified".into(),
+                agent_id: Some(ids.big_agent.0.clone()),
+                session_id: None,
+                turn: Some(1),
+                commit_hash: None,
+                old_blob_sha: Some(format!("{i:040x}")),
+                new_blob_sha: Some(format!("{:040x}", i + 1)),
+                additions: 10,
+                deletions: 3,
+            })
+            .await
+            .expect("agent tracked change");
+    }
+
+    // The workspace's remembered specialist choice.
+    store
+        .set_setting(
+            &format!("workspace.agentCreationPreferences:{}", big_ws.0),
+            &json!({ "specialistId": "implementor" }).to_string(),
+        )
+        .await
+        .expect("creation preferences");
+
     // Many workspaces linked to one PR.
     for ws_id in ids.workspaces.iter().take(PR_LINKED_WORKSPACES) {
         let mut ws = store.get_workspace(ws_id).await.expect("workspace");
@@ -586,20 +748,29 @@ fn expect_ok(method: &str, reply: &crate::harness::Reply) {
 }
 
 /// Runtime seeds over RPC (and the services API, for state no RPC writes)
-/// once the daemon serves.
+/// once the daemon serves. Returns device connections the caller keeps open
+/// for the whole sweep.
 pub async fn runtime(
     client: &mut Client,
     services: &intent_services::Services,
     state: &LargeState,
+    socket: &Path,
     seeded: &mut Seeded,
-) {
+) -> Vec<Client> {
     let ws = state.ids.big_workspace.0.clone();
 
     // The big agent watches the completion of many delegated children.
     // Even-indexed fixture agents live in the big workspace. Each watch
-    // persists and publishes, so register them concurrently.
-    let mut watches = tokio::task::JoinSet::new();
+    // persists and publishes, so register a few at a time: unbounded
+    // concurrency exhausts the store's read pool at full scale.
+    let mut watches: tokio::task::JoinSet<intent_core::Result<serde_json::Value>> =
+        tokio::task::JoinSet::new();
     for child in state.ids.agents.iter().skip(2).step_by(2).take(WATCHES) {
+        if watches.len() >= WATCH_CONCURRENCY {
+            if let Some(done) = watches.join_next().await {
+                done.expect("watch task").expect("completion watch");
+            }
+        }
         let services = services.clone();
         let ws_id = state.ids.big_workspace.clone();
         let parent = state.ids.big_agent.clone();
@@ -614,6 +785,98 @@ pub async fn runtime(
     }
     while let Some(done) = watches.join_next().await {
         done.expect("watch task").expect("completion watch");
+    }
+
+    // Many hello'd devices (desktop, laptop, phone) connected at once.
+    let mut devices = Vec::new();
+    for i in 0..DEVICES {
+        let mut device = Client::connect_socket(socket).await;
+        let r = device
+            .call(
+                "client.hello",
+                &json!({
+                    "clientId": format!("large-state-device-{i:02}"),
+                    "name": format!("Intent on device {i} — {}", prose(i, 60).replace('\n', " ")),
+                    "hostname": format!("large-state-host-{i}"),
+                    "prettyHostname": format!("Large state host {i}"),
+                    "deviceKind": DEVICE_KINDS[i % DEVICE_KINDS.len()],
+                }),
+            )
+            .await;
+        expect_ok("client.hello", &r);
+        devices.push(device);
+    }
+
+    // Provider profiles, the most each base provider allows.
+    for base in ["codex", "claude-code"] {
+        for i in 0..PROFILES_PER_PROVIDER {
+            let r = client
+                .call(
+                    "providers.profiles.create",
+                    &json!({ "baseProviderId": base, "name": format!("{base} account {i}") }),
+                )
+                .await;
+            expect_ok("providers.profiles.create", &r);
+        }
+    }
+
+    // Pending host invites, created by the owner.
+    let owner = intent_core::Caller::Wire {
+        principal_id: state.ids.owner_principal.clone(),
+        host_role: intent_core::HostRole::Owner,
+    };
+    for i in 0..HOST_INVITES {
+        intent_core::with_caller(
+            owner.clone(),
+            intent_core::WorkspaceApi::host_invite_create(
+                services,
+                intent_core::InvitePin {
+                    login: format!("invitee-{i}"),
+                    provider: Some("github".into()),
+                    host: None,
+                },
+            ),
+        )
+        .await
+        .expect("host invite");
+    }
+
+    // Every member principal is connected, viewing the big note and
+    // focused on the big agent: one presence row per member.
+    for (i, member) in state.ids.member_principals.iter().enumerate() {
+        let connection = format!("large-state-presence-{i}");
+        let caller = intent_core::Caller::Wire {
+            principal_id: member.clone(),
+            host_role: intent_core::HostRole::Guest,
+        };
+        let api: &dyn intent_core::WorkspaceApi = services;
+        intent_core::with_caller(caller.clone(), api.presence_connect(connection.clone()))
+            .await
+            .expect("presence connect");
+        intent_core::with_caller(
+            caller.clone(),
+            api.note_presence_join(
+                connection.clone(),
+                format!("lease-{i}"),
+                state.ids.big_workspace.clone(),
+                state.ids.big_note.clone(),
+            ),
+        )
+        .await
+        .expect("note presence join");
+        intent_core::with_caller(
+            caller,
+            api.presence_update(
+                connection,
+                json!({ "focus": [{
+                    "workspaceId": ws,
+                    "agentId": state.ids.big_agent.0,
+                    "noteId": state.ids.big_note.0,
+                }] }),
+            ),
+        )
+        .await
+        .expect("presence update");
     }
 
     // Script monitors (the fixture's rows are settled by the startup
@@ -771,6 +1034,7 @@ pub async fn runtime(
         )
         .await;
     expect_ok("workspace.updateUiContext", &r);
+    devices
 }
 
 /// Wait until the runtime seeds stop producing state: the loud script has

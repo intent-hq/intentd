@@ -119,6 +119,17 @@ impl SourceControl for OversizedForge {
     async fn get_user(&self) -> ScResult<UserIdentity> {
         self.inner.get_user().await
     }
+    async fn get_user_by_login(&self, login: &str) -> ScResult<UserIdentity> {
+        let n = login
+            .rsplit('-')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        Ok(UserIdentity {
+            login: login.to_string(),
+            ..user(10_000 + n)
+        })
+    }
     async fn search_users(&self, _query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
         Ok((0..usize::from(limit)).map(user).collect())
     }
@@ -158,13 +169,7 @@ impl SourceControl for OversizedForge {
         _path: &str,
         _git_ref: Option<&str>,
     ) -> ScResult<Option<String>> {
-        Ok(Some(format!(
-            "{{\"scripts\":[{}]}}",
-            (0..40)
-                .map(|i| format!("{{\"name\":\"s{i}\",\"command\":\"{}\"}}", text(i, 400)))
-                .collect::<Vec<_>>()
-                .join(",")
-        )))
+        Ok(Some(repo_config_json()))
     }
     async fn create_pr(&self, repo: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
         self.inner.create_pr(repo, input).await
@@ -618,5 +623,60 @@ impl intent_sentry::SentryEngine for OversizedSentry {
         _assigned_to: Option<&str>,
     ) -> intent_sentry::Result<intent_sentry::SentryIssueResult> {
         Ok(sentry_issue(0))
+    }
+}
+
+/// A long `.intent/config.json`: every documented field filled, with long
+/// agent instructions and many shared scripts. Served by the forge stub
+/// and written into the big worktree.
+pub fn repo_config_json() -> String {
+    serde_json::json!({
+        "branchPrefix": "agent/",
+        "setupScript": text(1, 4 * 1024),
+        "instructions": text(2, LONG_TEXT),
+        "runScript": text(3, 1_024),
+        "archiveScript": text(4, 1_024),
+        "scripts": (0..40).map(|i| serde_json::json!({
+            "name": format!("script-{i}"),
+            "command": text(i, 400),
+            "mode": "command",
+            "cwd": "packages/app",
+        })).collect::<Vec<_>>(),
+        "cowCloneExclude": (0..20).map(|i| format!("cache/dir-{i}")).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// Inline replies carry at most this many codebase hits; more stream as
+/// events (`search_ops::INLINE_THRESHOLD`).
+pub const SEARCH_INLINE_MAX: usize = 25;
+
+/// A context engine answering the largest inline page: exactly
+/// [`SEARCH_INLINE_MAX`] hits with long previews.
+pub struct OversizedContext;
+
+#[async_trait]
+impl intent_core::ContextEngine for OversizedContext {
+    async fn availability(&self) -> intent_core::EngineAvailability {
+        intent_core::EngineAvailability::Available {
+            name: "large-state".into(),
+            version: None,
+        }
+    }
+    async fn retrieve(
+        &self,
+        _req: intent_core::RetrieveRequest,
+    ) -> Result<intent_core::RetrieveResult, intent_core::ContextError> {
+        Ok(intent_core::RetrieveResult {
+            items: (0..SEARCH_INLINE_MAX)
+                .map(|i| intent_core::RetrievedItem {
+                    file: format!("src/history/module_{i}.rs"),
+                    symbol: Some(format!("render_payload_{i}")),
+                    line: Some(i as u64 + 1),
+                    preview: text(i, 2 * 1024),
+                    score: Some(1.0 / f64::from(u32::try_from(i + 1).unwrap_or(u32::MAX))),
+                })
+                .collect(),
+        })
     }
 }

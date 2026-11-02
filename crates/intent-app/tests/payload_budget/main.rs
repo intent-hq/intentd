@@ -69,7 +69,7 @@ fn placeholder_ctx(seeded: &seed::Seeded) -> rows::Ctx<'_> {
         message_id: "message".into(),
         tool_message_id: "message".into(),
         tool_block_id: "block".into(),
-        owner_principal: "owner".into(),
+        member_principal: "member".into(),
         seeded,
     }
 }
@@ -97,6 +97,16 @@ fn table_problems(
         }
         if !covered.insert(method) {
             problems.push(format!("{method}: both a row and a cannot-exercise golden"));
+        }
+    }
+    for (method, _, _) in goldens {
+        if derived_opaque(method)
+            && params_scan::opaque_source(method, None) == params_scan::OpaqueSource::Unknown
+        {
+            problems.push(format!(
+                "{method}: golden whose router arm passes its params on with no typed struct \
+                 to derive them from"
+            ));
         }
     }
     for m in universe_set.difference(&covered) {
@@ -140,7 +150,39 @@ fn table_problems(
         if row.variants.is_empty() {
             problems.push(format!("{}: row has no variants", row.method));
         }
-        if let Some(arm) = derived.get(row.method) {
+        if let Some(arm) = derived.get(row.method).filter(|a| a.opaque) {
+            let mut needed: Vec<String> = Vec::new();
+            match params_scan::opaque_source(row.method, row.parse) {
+                params_scan::OpaqueSource::Struct { keys, .. } => needed.extend(keys),
+                params_scan::OpaqueSource::ParseFn { keys, dynamic } => {
+                    needed.extend(keys);
+                    if dynamic && row.declared.is_empty() {
+                        problems.push(format!(
+                            "{}: its parse fn reads a key through a variable; name it in the \
+                             row's `declared` keys with where it comes from",
+                            row.method
+                        ));
+                    }
+                }
+                params_scan::OpaqueSource::Unknown => problems.push(format!(
+                    "{}: the router arm passes its params object on and they cannot be \
+                     derived — deserialize into a typed struct, or name the function that \
+                     reads them with `parsed_by`",
+                    row.method
+                )),
+            }
+            needed.extend(row.declared.iter().map(|(k, _)| (*k).to_string()));
+            needed.extend(arm.keys.iter().cloned());
+            for key in needed {
+                if !set.contains(&key) && !row.unexercised.iter().any(|(k, _)| *k == key) {
+                    problems.push(format!(
+                        "{}: the handler reads param `{key}` but no variant sets it — add it \
+                         to a variant (or to `unexercised` with a reason)",
+                        row.method
+                    ));
+                }
+            }
+        } else if let Some(arm) = derived.get(row.method) {
             for key in &arm.keys {
                 let skipped = row.unexercised.iter().any(|(k, _)| k == key);
                 if !set.contains(key) && !skipped {
@@ -165,6 +207,12 @@ fn table_problems(
         }
     }
     problems
+}
+
+fn derived_opaque(method: &str) -> bool {
+    params_scan::router_params(&[method])
+        .get(method)
+        .is_some_and(|a| a.opaque)
 }
 
 fn class_methods(pick: fn(&PayloadClass) -> bool) -> Vec<&'static str> {
@@ -196,7 +244,14 @@ fn payload_budget_rows_cover_the_catalog() {
     ));
 
     let snapshot_rows = rows::snapshot_rows(&ctx);
-    let swept: BTreeSet<&str> = snapshot_rows.iter().map(|r| r.method).collect();
+    let mut swept: BTreeSet<&str> = snapshot_rows.iter().map(|r| r.method).collect();
+    for (channel, reason) in rows::SNAPSHOT_CANNOT_EXERCISE {
+        if reason.trim().is_empty() || !swept.insert(channel) {
+            problems.push(format!(
+                "{channel}: SNAPSHOT_CANNOT_EXERCISE needs a reason and must not also have a row"
+            ));
+        }
+    }
     for (channel, _) in SNAPSHOT_CHANNELS {
         if !swept.contains(channel) {
             problems.push(format!(
@@ -324,9 +379,13 @@ fn check_proof(proof: &Proof, result: &Value) -> Result<(), String> {
                 Err(format!("result is {n} bytes, expected at least {min}"))
             }
         }
+        // Small by design is still not empty: an empty list or object
+        // would pass on a bin the fixture never filled.
         Proof::Fixed(at) => match result.pointer(at) {
-            Some(v) if !v.is_null() => Ok(()),
-            _ => Err(format!("nothing at `{at}`")),
+            None | Some(Value::Null) => Err(format!("nothing at `{at}`")),
+            Some(Value::Array(a)) if a.is_empty() => Err(format!("empty array at `{at}`")),
+            Some(Value::Object(o)) if o.is_empty() => Err(format!("empty object at `{at}`")),
+            Some(_) => Ok(()),
         },
     }
 }
@@ -415,10 +474,16 @@ async fn sweep_rows(
     }
 }
 
-/// Bind the fixture's draft client, so `drafts.get` reads its drafts.
+/// Bind the fixture's draft client, so `drafts.get` reads its drafts, and
+/// authorize the provider-setup surface.
 async fn hello(client: &mut harness::Client) {
     let hello = client
-        .call("client.hello", &json!({ "clientId": "large-state-client" }))
+        .call(
+            "client.hello",
+            // `antigravitySetup` authorizes the local-app provider setup
+            // surface (`providers.setup.status`) on this connection.
+            &json!({ "clientId": "large-state-client", "capabilities": { "antigravitySetup": 1 } }),
+        )
         .await;
     assert!(hello.error().is_none(), "client.hello: {}", hello.frame);
 }
@@ -483,11 +548,19 @@ async fn sweep_lane(
 async fn sweep_goldens(
     client: &mut harness::Client,
     goldens: &[(&str, &str, &str)],
-    ws: &str,
+    ctx: &rows::Ctx<'_>,
     failures: &mut Vec<String>,
 ) {
     for (method, expected, _) in goldens {
-        let reply = client.call(method, &json!({ "workspaceId": ws })).await;
+        // The ids a reachable method would need, so a changed outcome means
+        // the method itself changed, not that the params were too thin.
+        let params = json!({
+            "workspaceId": ctx.ws,
+            "agentId": ctx.agent,
+            "noteId": ctx.note,
+            "principalId": ctx.member_principal,
+        });
+        let reply = client.call(method, &params).await;
         let got = outcome(&reply);
         if probe_mode() {
             eprintln!(
@@ -501,6 +574,44 @@ async fn sweep_goldens(
                  it may be reachable now: give it a sweep row, or update the golden"
             ));
         }
+    }
+}
+
+/// Subscribe to each [`rows::SNAPSHOT_CANNOT_EXERCISE`] channel: the
+/// handshake must succeed and the seq-0 snapshot arrive. Measured for the
+/// report, never ratcheted.
+async fn sweep_snapshot_goldens(
+    daemon: &harness::Daemon,
+    ctx: &rows::Ctx<'_>,
+    measured: &mut Vec<Measurement>,
+    failures: &mut Vec<String>,
+) {
+    for (channel, _) in rows::SNAPSHOT_CANNOT_EXERCISE {
+        let mut client = harness::Client::connect(daemon).await;
+        let ack = client
+            .call(channel, &rows::snapshot_golden_params(ctx, channel))
+            .await;
+        if let Some(e) = ack.error() {
+            failures.push(format!("{channel}: golden subscribe errored {e}"));
+            continue;
+        }
+        let frame = loop {
+            let f = client.read_frame().await;
+            if f.frame["params"]["seq"] == json!(0) {
+                break f;
+            }
+        };
+        if probe_mode() {
+            eprintln!(
+                "PROBE {channel:45} {:28} {:>9} golden snapshot",
+                "golden", frame.bytes
+            );
+        }
+        measured.push(Measurement {
+            method: (*channel).into(),
+            variant: "golden".into(),
+            bytes: frame.bytes,
+        });
     }
 }
 
@@ -636,7 +747,14 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
     let daemon = harness::serve(state).await;
     let mut client = harness::Client::connect(&daemon).await;
     hello(&mut client).await;
-    seed::runtime(&mut client, &daemon.services, &daemon.state, &mut seeded).await;
+    let _devices = seed::runtime(
+        &mut client,
+        &daemon.services,
+        &daemon.state,
+        &daemon.socket,
+        &mut seeded,
+    )
+    .await;
     let ctx = harness::ctx(&mut client, &daemon, &seeded).await;
     let setup = started.elapsed();
     eprintln!(
@@ -659,14 +777,15 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
     sweep_lane(&mut client, &event_rows, &mut measured, &mut failures).await;
     sweep_rows(&daemon, &table, &mut measured, &mut failures).await;
     let rows_done = started.elapsed();
-    sweep_goldens(&mut client, CANNOT_EXERCISE, &ctx.ws, &mut failures).await;
+    sweep_goldens(&mut client, CANNOT_EXERCISE, &ctx, &mut failures).await;
     sweep_goldens(
         &mut client,
         rows::PROXY_CANNOT_EXERCISE,
-        &ctx.ws,
+        &ctx,
         &mut failures,
     )
     .await;
+    sweep_snapshot_goldens(&daemon, &ctx, &mut measured, &mut failures).await;
     sweep_snapshots(
         &daemon,
         &rows::snapshot_rows(&ctx),
@@ -701,6 +820,7 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
         .iter()
         .filter(|m| m.bytes > READ_PAYLOAD_BUDGET_BYTES)
         .filter(|m| !rows::VOLATILE.iter().any(|(v, _)| *v == m.method))
+        .filter(|m| m.variant != "golden")
         .map(|m| ((m.method.clone(), m.variant.clone()), m.bytes))
         .collect();
     let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -794,4 +914,48 @@ fn payload_budget_proxy_page_caps() {
         );
         assert_eq!(list.is_ok(), ok, "list limit {limit}: {list:?}");
     }
+}
+
+/// Typed params structs and pass-through parse functions are derived from
+/// source; pin a few known shapes so the derivation cannot silently match
+/// nothing.
+#[test]
+fn payload_budget_opaque_params_are_derived() {
+    use params_scan::OpaqueSource;
+    let set = |keys: &[&str]| keys.iter().map(|k| (*k).to_string()).collect();
+    assert_eq!(
+        params_scan::opaque_source("workspace.repositoryContext", None),
+        OpaqueSource::Struct {
+            name: "RepositoryContextBoundQuery".into(),
+            keys: set(&["workspaceId", "gitRootId", "repositoryLifetimeId"]),
+        }
+    );
+    assert_eq!(
+        params_scan::opaque_source("sourceControl.read.resolveKnownRepository", None),
+        OpaqueSource::Struct {
+            name: "RepositoryKnownQuery".into(),
+            keys: set(&["context", "readLifetimeId", "path"]),
+        }
+    );
+    assert_eq!(
+        params_scan::opaque_source("sourceControl.gitlab.childGit.get", None),
+        OpaqueSource::Struct {
+            name: "GitlabChildGitPolicyQuery".into(),
+            keys: set(&[]),
+        }
+    );
+    assert_eq!(
+        params_scan::opaque_source(
+            "script.list",
+            Some(("intent-core/src/script_lists.rs", "parse", "value"))
+        ),
+        OpaqueSource::ParseFn {
+            keys: set(&["view", "limit", "cursor"]),
+            dynamic: true,
+        }
+    );
+    assert_eq!(
+        params_scan::opaque_source("script.list", None),
+        OpaqueSource::Unknown
+    );
 }
