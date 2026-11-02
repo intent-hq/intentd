@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.106] - 2026-11-02
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe Browser access from the desktop app ([#2944](https://github.com/intent-hq/intentd/pull/2944))
+
+
 ## [0.11.105] - 2026-11-02
 
 ### 🚀 Features
