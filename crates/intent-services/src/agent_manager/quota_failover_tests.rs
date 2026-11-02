@@ -719,7 +719,8 @@ async fn a_user_switch_during_the_failing_attempt_is_never_overridden() {
         !fx.mgr
             .services
             .try_quota_failover(&fx.ws, &fx.agent, Some("claude-code"), "429")
-            .await,
+            .await
+            .switched(),
         "the failed attempt ran on Default, not on the user's new choice"
     );
     assert_eq!(fx.row().await.provider.as_deref(), Some(chosen.as_str()));

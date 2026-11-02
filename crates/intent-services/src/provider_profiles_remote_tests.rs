@@ -183,3 +183,100 @@ async fn remote_overlay_never_carries_reserved_launch_keys() {
         vec![("CODEX_ACCESS_TOKEN".into(), Some("kept".into()))]
     );
 }
+
+/// Remote compatibility (intent-hq/intent#8317): a configuration that sets
+/// an account folder is tied to this backend and never runs on another
+/// machine; the machine's own sign-in (no overrides), an environment of
+/// other values (API keys), and unsetting a folder all run anywhere.
+#[intent_test_macros::daemon_test]
+async fn only_a_set_account_folder_makes_a_configuration_backend_only() {
+    let fx = Fixture::new().await;
+    let reference = |created: Value| {
+        created["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let folder = reference(
+        fx.create(
+            "claude-code",
+            "Work account",
+            json!([{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-work" }]),
+        )
+        .await,
+    );
+    let codex_folder = reference(
+        fx.create(
+            "codex",
+            "Codex work",
+            json!([{ "key": "codex_home", "kind": "set", "value": "/accounts/b" }]),
+        )
+        .await,
+    );
+    let api_key = reference(
+        fx.create(
+            "claude-code",
+            "API key",
+            json!([{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": SECRET }]),
+        )
+        .await,
+    );
+    let unset = reference(
+        fx.create(
+            "claude-code",
+            "Machine login",
+            json!([{ "key": "CLAUDE_CONFIG_DIR", "kind": "unset" }]),
+        )
+        .await,
+    );
+
+    assert_eq!(
+        fx.svc.remote_compatibility(&folder).await.unwrap(),
+        RemoteCompatibility::NotRemoteCompatible {
+            reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+            keys: vec!["CLAUDE_CONFIG_DIR".into()],
+        }
+    );
+    assert_eq!(
+        fx.svc.remote_compatibility(&codex_folder).await.unwrap(),
+        RemoteCompatibility::NotRemoteCompatible {
+            reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+            keys: vec!["codex_home".into()],
+        }
+    );
+    for compatible in [api_key.as_str(), unset.as_str(), "claude-code", "codex"] {
+        assert_eq!(
+            fx.svc.remote_compatibility(compatible).await.unwrap(),
+            RemoteCompatibility::Compatible,
+            "{compatible}"
+        );
+    }
+    assert!(
+        fx.svc
+            .remote_compatibility("claude-code@p0000000000000")
+            .await
+            .is_err(),
+        "an unknown profile is not classified"
+    );
+}
+
+/// The Default configuration's overrides count like a profile's.
+#[intent_test_macros::daemon_test]
+async fn default_overrides_with_an_account_folder_are_backend_only() {
+    let fx = Fixture::new().await;
+    fx.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-a" }],
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fx.svc.remote_compatibility("claude-code").await.unwrap(),
+        RemoteCompatibility::NotRemoteCompatible { .. }
+    ));
+    assert_eq!(
+        fx.svc.remote_compatibility("codex").await.unwrap(),
+        RemoteCompatibility::Compatible
+    );
+}

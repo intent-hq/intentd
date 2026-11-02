@@ -134,6 +134,18 @@ impl ProviderQuotaCache {
         }
     }
 
+    /// Drop a working observation of `selection` (an exhausted mark is
+    /// kept): an attempt that never got going proves the earlier output no
+    /// longer says it is usable, so a return to it waits for its backoff
+    /// instead of being retried on the next turn.
+    pub(crate) fn clear_working(&self, selection: &str) {
+        let selection = provider_profiles::canonical_selection(selection);
+        let mut entries = self.entries.lock().unwrap();
+        if matches!(entries.get(&selection), Some(QuotaHealth::Working)) {
+            entries.remove(&selection);
+        }
+    }
+
     /// The time `selection`'s exhausted mark lasts until, while it is live at
     /// `now`. An expired mark is pruned and reads as unknown.
     pub(crate) fn exhausted_until(

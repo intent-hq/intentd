@@ -6326,6 +6326,9 @@ impl Services {
         // A remote agent's provider process runs on its node with the
         // identity it was launched with; switching it there is not supported
         // yet, so refuse rather than report a switch that never happens.
+        // Quota failover is the only provider switch a remote agent allows
+        // (`quota_failover`): to a backup that can run on its machine,
+        // announced once the node runs it (intent-hq/intent#8317).
         if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
             .is_some()
         {

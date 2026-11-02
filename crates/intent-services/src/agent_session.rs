@@ -4354,9 +4354,29 @@ impl Services {
         // BEFORE the terminal emits below, so a redriven attempt never
         // flashes a failed turn at the FE. Any error after streamed content
         // keeps the existing terminal emit path unchanged.
+        // A remote agent's automatic switch (quota failover, or the timed
+        // return home) is unconfirmed until the node runs it: the node
+        // starts the agent asynchronously, so a start failure (a backup not
+        // signed in there, a failed checkout) surfaces as this first prompt
+        // failing before any output. Undo the switch and fail with what to
+        // do — never a silent redrive or a further failover
+        // (intent-hq/intent#8317).
+        let remote_switch_failed = match &result {
+            Err(e)
+                if !updates_applied
+                    && blocks.is_empty()
+                    && !matches!(e, AcpError::PromptIdleTimeout(_))
+                    && self.remote_switch_pending(agent_id) =>
+            {
+                self.fail_remote_failover(workspace_id, agent_id, &e.to_string())
+                    .await
+            }
+            _ => None,
+        };
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
-            && blocks.is_empty();
+            && blocks.is_empty()
+            && remote_switch_failed.is_none();
         // Stale-cancel classification (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
         // `redrive_spurious_cancel` is set only when the turn worker took a
         // fresh stale-cancel mark for this attempt. A client request
@@ -4934,8 +4954,9 @@ impl Services {
             }
             _ => None,
         };
-        let prompt_actionable_error =
-            prompt_auth_error.or_else(|| result.as_ref().err().and_then(prompt_size_error));
+        let prompt_actionable_error = remote_switch_failed
+            .or(prompt_auth_error)
+            .or_else(|| result.as_ref().err().and_then(prompt_size_error));
         // Quota-exhaustion observation: resolved in the SAME pre-persist seam
         // as the auth mapping above, for the same reason — this is the last
         // place the structured `AcpError` still exists, before the final
@@ -4971,20 +4992,26 @@ impl Services {
         // redrives the same user message on the backup. Output this attempt
         // already persisted stays in the transcript. Only a worker-armed turn
         // can fail over, and the chain is bounded per user turn.
-        let quota_failover = prompt_quota_failure
-            && prompt_actionable_error.is_none()
-            && self
-                .try_quota_failover(
-                    workspace_id,
-                    agent_id,
-                    prompt_quota_provider.as_deref(),
-                    &result
-                        .as_ref()
-                        .err()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                )
-                .await;
+        let quota_outcome = if prompt_quota_failure && prompt_actionable_error.is_none() {
+            self.try_quota_failover(
+                workspace_id,
+                agent_id,
+                prompt_quota_provider.as_deref(),
+                &result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+            .await
+        } else {
+            crate::quota_failover::QuotaFailoverOutcome::Terminal
+        };
+        let quota_failover = quota_outcome.switched();
+        // A remote agent whose backups cannot run on its machine fails with
+        // the actionable message instead of the raw quota error.
+        let prompt_actionable_error =
+            prompt_actionable_error.or_else(|| quota_outcome.into_refusal());
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
@@ -6410,6 +6437,9 @@ impl Services {
                 transcript.provider_output_seen = true;
                 self.note_provider_working(agent_id);
             }
+            // A remote agent's pending quota failover is confirmed (and
+            // announced) by its first output on the backup.
+            Box::pin(self.complete_remote_failover(workspace_id, agent_id)).await;
             Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
         let message_id = transcript.message_id.clone();

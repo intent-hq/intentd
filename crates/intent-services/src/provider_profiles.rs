@@ -512,6 +512,52 @@ fn is_folder_path_key(key: &str) -> bool {
         .any(|k| k.eq_ignore_ascii_case(key))
 }
 
+/// Whether a provider reference can run on a machine other than this
+/// backend (a remote agent's execution node). The one classifier for this
+/// question: remote quota failover asks it today, and agent placement and
+/// the provider picker are meant to share it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteCompatibility {
+    /// Runs anywhere: the machine's own sign-in (no overrides) or an
+    /// environment that only carries values such as API keys.
+    Compatible,
+    /// Tied to this backend.
+    NotRemoteCompatible {
+        /// Why; [`REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER`] today.
+        reason: &'static str,
+        /// The variables that tie it here, as saved.
+        keys: Vec<String>,
+    },
+}
+
+/// [`RemoteCompatibility::NotRemoteCompatible`] reason: the configuration
+/// sets an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The folder is
+/// signed in on this backend; another machine may lack it or hold a
+/// different account under the same path, so such a configuration never
+/// runs remotely, whether or not the folder exists there.
+pub const REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER: &str = "account-folder";
+
+/// [`RemoteCompatibility`] of a resolved overlay (`None` = no overrides).
+/// Only a set account folder counts; unsetting one keeps the machine's own
+/// sign-in.
+#[must_use]
+pub fn remote_compatibility_of(env: Option<&intent_acp::ProfileEnv>) -> RemoteCompatibility {
+    let keys: Vec<String> = env
+        .into_iter()
+        .flat_map(intent_acp::ProfileEnv::entries)
+        .filter(|(key, value)| value.is_some() && is_folder_path_key(key))
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    if keys.is_empty() {
+        RemoteCompatibility::Compatible
+    } else {
+        RemoteCompatibility::NotRemoteCompatible {
+            reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+            keys,
+        }
+    }
+}
+
 /// Expand a leading `~` in an account-directory value at resolution time
 /// against the daemon user's home ([`intent_acp::profile_env::expand_account_dir`]).
 /// The saved value is never rewritten.
@@ -1434,6 +1480,18 @@ impl Services {
     ) -> Result<Option<intent_acp::ProfileEnv>> {
         self.ensure_provider_ref_selectable(reference)?;
         self.resolve_profile_env_for(reference, None).await
+    }
+
+    /// Whether `reference` (a bare base id for its Default configuration,
+    /// overrides included, or a profile reference) can run on another
+    /// machine: [`remote_compatibility_of`] its saved overlay.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_remote_profile_env`]: an unknown or unselectable
+    /// reference, or an unreadable environment document.
+    pub async fn remote_compatibility(&self, reference: &str) -> Result<RemoteCompatibility> {
+        let env = self.resolve_remote_profile_env(reference).await?;
+        Ok(remote_compatibility_of(env.as_ref()))
     }
 
     async fn resolve_profile_env_for(
