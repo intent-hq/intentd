@@ -20,6 +20,9 @@
 //! (`--run-ignored only`). `PAYLOAD_BUDGET_UPDATE=1` rewrites the baseline
 //! from the measured offenders instead of comparing.
 
+// The sweep speaks JSON-RPC over a Unix-domain socket, like the UDS suites.
+#![cfg(unix)]
+
 mod bulk;
 mod harness;
 mod params_scan;
