@@ -208,8 +208,11 @@ fn spawn_daemon(
     log_name: &str,
 ) -> GuardedChild {
     common::enable_ws_api(data_dir);
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("MOCK_AGENT_SCRIPT_PATH", script)

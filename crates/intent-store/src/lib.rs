@@ -28,6 +28,7 @@ mod desktop_repo;
 mod diagnostics;
 mod store_pool;
 pub use store_pool::{StorePool, StorePoolOptions};
+mod attention_reminder_repo;
 mod diffs_repo;
 mod discussion_activity_repo;
 mod discussion_agent_repo;
@@ -410,6 +411,9 @@ pub struct Store {
     #[cfg(test)]
     desktop_delete_barrier:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_repo::DeleteBarrier>>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    transcript_delete_test_pause:
+        std::sync::Arc<std::sync::Mutex<Option<agent_repo::WorkspaceTranscriptDeletePause>>>,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-note content-write locks; see `note_write_lock`.
@@ -491,6 +495,8 @@ impl Store {
             desktop_writes: desktop_repo::DesktopWrites::default(),
             #[cfg(test)]
             desktop_delete_barrier: std::sync::Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            transcript_delete_test_pause: std::sync::Arc::default(),
             #[cfg(test)]
             export_author_barrier: std::sync::Arc::default(),
         })

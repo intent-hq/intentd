@@ -275,6 +275,7 @@ mod truncated_read_guard_tests;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_attention_reminders;
 mod workspace_branch;
 mod workspace_check_cadence;
 mod workspace_status;
@@ -532,6 +533,8 @@ struct WorkspaceAggregateSnapshot {
     /// `pullRequests` merge. Empty lists are never inserted.
     git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     legacy_question_holds: HashSet<AgentId>,
+    legacy_question_reasons: HashMap<AgentId, String>,
+    reminder_state: Option<HashMap<WorkspaceId, HashMap<String, serde_json::Value>>>,
     cow_supported: Option<bool>,
 }
 
@@ -1190,6 +1193,8 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
+    last_attention_reminder_inputs:
+        Arc<Mutex<HashMap<WorkspaceId, workspace_attention_reminders::AttentionReminderInputs>>>,
     /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1):
     /// the recompute-and-compare seam behind
     /// [`Services::maybe_emit_waiting_changed`]. See
@@ -1826,6 +1831,7 @@ impl Services {
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
+            last_attention_reminder_inputs: Arc::new(Mutex::new(HashMap::new())),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
@@ -3504,6 +3510,8 @@ impl Services {
         // [`Services::enrich_display_status`] (workspace_status module).
         self.enrich_display_status(ws, sessions.as_deref(), unread, external_prs)
             .await;
+        self.enrich_attention_reminder(ws, sessions.as_deref(), None, None)
+            .await;
     }
 
     /// Load every store-backed list aggregate in a constant number of
@@ -3624,15 +3632,22 @@ impl Services {
             .flat_map(|by_workspace| by_workspace.values().flatten())
             .map(|session| (&session.id, session))
             .collect();
+        let reminder_legacy_reliable = legacy_question_tails.is_ok();
+        let mut legacy_question_reasons = HashMap::new();
         let legacy_question_holds = match legacy_question_tails {
             Ok(tails) => tails
                 .into_iter()
                 .filter_map(|(agent_id, message_id, role, content)| {
                     let session = sessions_by_agent.get(&agent_id)?;
-                    (role == "assistant"
+                    if role == "assistant"
                         && agent_ops::has_question_blocks(&content)
-                        && session.dismissed_questions_message_id() != Some(message_id.as_str()))
-                    .then_some(agent_id)
+                        && session.dismissed_questions_message_id() != Some(message_id.as_str())
+                    {
+                        legacy_question_reasons.insert(agent_id.clone(), message_id);
+                        Some(agent_id)
+                    } else {
+                        None
+                    }
                 })
                 .collect(),
             Err(error) => {
@@ -3653,6 +3668,12 @@ impl Services {
                 let mut holds = HashSet::new();
                 for agent_id in legacy_agent_ids {
                     if self.questions_pending(&agent_id).await {
+                        if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                            if let Some(message) = session.pending_questions_message_id() {
+                                legacy_question_reasons
+                                    .insert(agent_id.clone(), message.to_string());
+                            }
+                        }
                         holds.insert(agent_id);
                     }
                 }
@@ -3660,6 +3681,16 @@ impl Services {
             }
         };
 
+        let reminder_state = if let Some(intent_core::Caller::Wire { principal_id, .. }) =
+            intent_core::current_caller().filter(|_| reminder_legacy_reliable)
+        {
+            self.store
+                .workspace_reminder_state(workspace_ids, Some(&principal_id))
+                .await
+                .ok()
+        } else {
+            None
+        };
         WorkspaceAggregateSnapshot {
             max_note_updated_at: max_note_updated_at.unwrap_or_default(),
             task_stats,
@@ -3670,6 +3701,8 @@ impl Services {
             monitor_rows,
             git_root_prs,
             legacy_question_holds,
+            legacy_question_reasons,
+            reminder_state,
             cow_supported,
         }
     }
@@ -3758,6 +3791,17 @@ impl Services {
             }),
         )
         .await;
+        if let Some(state) = &snapshot.reminder_state {
+            let empty = HashMap::new();
+            let workspace_state = state.get(&ws.id).unwrap_or(&empty);
+            self.enrich_attention_reminder(
+                ws,
+                sessions,
+                Some(workspace_state),
+                Some(&snapshot.legacy_question_reasons),
+            )
+            .await;
+        }
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -4600,6 +4644,9 @@ impl Services {
             .store
             .set_workspace_attention(workspace_id, level, Some(&now_iso()), expected)
             .await?;
+        if level == WorkspaceAttention::ReviewRequired {
+            self.emit_attention_reminder_raise(workspace_id).await;
+        }
         if !changed {
             return Ok(());
         }
@@ -24151,6 +24198,7 @@ impl WorkspaceApi for Services {
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
             let attention_changed = update.attention.is_some();
+            let raise_review = update.attention == Some(WorkspaceAttention::ReviewRequired);
             let repository_path_changed = update.repository_path.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
@@ -24304,7 +24352,11 @@ impl WorkspaceApi for Services {
                 ws.activity = this.workspace_activity(&ws.id);
             } else {
                 ws.branch = store
-                    .update_workspace_with_branch(&ws, branch_update.as_deref())
+                    .update_workspace_with_reminder_generation(
+                        &ws,
+                        branch_update.as_deref(),
+                        raise_review,
+                    )
                     .await?;
                 // The full-row write leaves `label` alone so a stale snapshot
                 // elsewhere cannot revert it; persist an explicit change here.
@@ -24364,8 +24416,20 @@ impl WorkspaceApi for Services {
             // recompute-and-compare after the persist so the transition
             // emits (§6.5). Chief is skipped — virtual, never listed,
             // nothing derives.
+            if raise_review && !ws.id.is_chief() {
+                this.emit_attention_reminder_raise(&ws.id).await;
+            }
             if !ws.id.is_chief() && (pr_fields_changed || attention_changed) {
                 this.maybe_emit_display_status_changed(&ws.id).await;
+            }
+            if !ws.id.is_chief()
+                && matches!(
+                    intent_core::current_caller(),
+                    Some(intent_core::Caller::Wire { .. })
+                )
+            {
+                this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
+                    .await;
             }
             this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
@@ -24481,6 +24545,15 @@ impl WorkspaceApi for Services {
             self.require_workspace_manager(&id, "workspace.unarchive")
                 .await?;
             let (mut ws, _) = this.unarchive_workspace_inner(id, None).await?;
+            if !ws.id.is_chief()
+                && matches!(
+                    intent_core::current_caller(),
+                    Some(intent_core::Caller::Wire { .. })
+                )
+            {
+                this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
+                    .await;
+            }
             this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
@@ -25287,9 +25360,24 @@ impl WorkspaceApi for Services {
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire { .. })
+            ) {
+                this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
+                    .await;
+            }
             this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })
+    }
+
+    fn dismiss_attention_reasons(
+        &self,
+        id: WorkspaceId,
+        reasons: Vec<intent_core::AttentionReminderReason>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        Box::pin(self.dismiss_attention_reasons_op(id, reasons))
     }
 
     fn mark_seen(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -25371,6 +25459,13 @@ impl WorkspaceApi for Services {
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire { .. })
+            ) {
+                this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
+                    .await;
+            }
             this.attach_workspace_membership(&mut ws).await;
             Ok(ws)
         })

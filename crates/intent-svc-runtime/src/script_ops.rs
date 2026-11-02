@@ -5142,6 +5142,11 @@ mod tests {
             workspace_id: Some(h.ws.0.clone()),
             ..Default::default()
         });
+        let mut settlements = bus2.subscribe(SubscriptionFilter {
+            event_types: vec![SCRIPT_CHANGED.to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
         let st = svc2
             .script_status(h.ws.clone(), id.clone())
@@ -5170,6 +5175,27 @@ mod tests {
                 .is_empty(),
             "a failed relaunch durably clears the lost marker"
         );
+
+        // Terminal state and marker clearing precede asynchronous archival settlement.
+        tokio::time::timeout(LIVENESS, async {
+            loop {
+                for event in settlements
+                    .recv()
+                    .await
+                    .expect("settlement subscription open")
+                {
+                    let event = serde_json::to_value(event).expect("serialize settlement");
+                    if event["data"]["scriptId"] == id
+                        && event["data"]["action"] == "updated"
+                        && event["data"]["script"]["archivedAt"].is_string()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("failed command durably archived before restart");
 
         // Archived commands are loaded only on known-ID access after boot.
         let svc3 = crate::test_runtime::with_runtime(Services::new_isolated(store.clone()));

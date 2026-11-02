@@ -561,6 +561,7 @@ impl Services {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
         };
+        self.maybe_emit_attention_reminder_changed(&ws).await;
         let Ok(notes) = self.store.list_notes(workspace_id).await else {
             return;
         };
@@ -673,6 +674,9 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
+        if let Ok(mut cache) = self.last_attention_reminder_inputs.lock() {
+            cache.remove(workspace_id);
+        }
         self.scripts_running_state.evict(workspace_id);
     }
 
@@ -959,13 +963,10 @@ impl Services {
         // or lost on restart, and a card dropped with a cancelled turn never
         // strands the workspace.
         if !signals.needs_attention {
-            if let Some(first) = top_level.first() {
-                let awaiting = self.secret_vault.agents_awaiting_user(&first.workspace_id);
-                signals.needs_attention = !awaiting.is_empty()
-                    && top_level
-                        .iter()
-                        .any(|session| awaiting.contains(&session.id));
-            }
+            signals.needs_attention = top_level.iter().any(|session| {
+                self.secret_vault
+                    .has_surfaced_pending(workspace_id, &session.id)
+            });
         }
         signals
     }
@@ -4016,8 +4017,44 @@ mod workspace_needs_attention {
     #[intent_test_macros::daemon_test]
     async fn pending_secret_request_drives_needs_attention() {
         let (svc, ws, _tmp) = setup().await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
         let session = mk_session(&ws, "agent-secret");
         svc.store.insert_agent_session(&session).await.unwrap();
+        let principal = svc.store.get_primary_principal().await.unwrap().id;
+        let caller = intent_core::Caller::Wire {
+            principal_id: principal.clone(),
+            host_role: intent_core::HostRole::Owner,
+        };
+        // Acknowledging an older review must not hide an unrelated new secret
+        // request. The canonical review remains raised throughout the case.
+        let reviewed = intent_core::with_caller(
+            caller.clone(),
+            svc.update_workspace(
+                ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    attention: Some(WorkspaceAttention::ReviewRequired),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let reasons = reviewed.attention_reminder.unwrap().reasons;
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].id, "review");
+        let dismissed = intent_core::with_caller(
+            caller.clone(),
+            svc.dismiss_attention_reasons_op(ws.clone(), reasons.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(dismissed.attention_reminder.unwrap().dismissed);
+        let receipt = svc
+            .store
+            .workspace_reminder_state(std::slice::from_ref(&ws), Some(&principal))
+            .await
+            .unwrap();
         let ticket = svc
             .secret_request_op(ws.clone(), session.id.clone(), "KEY".into(), "tests".into())
             .await
@@ -4027,9 +4064,52 @@ mod workspace_needs_attention {
             !signals(&svc, &ws).await.needs_attention,
             "an unsurfaced card (still in the turn, or dropped) does not need the user"
         );
-        svc.secret_vault
-            .mark_surfaced(&ws, &session.id, std::slice::from_ref(&request_id));
+        let unsurfaced = intent_core::with_caller(caller.clone(), svc.get_workspace(ws.clone()))
+            .await
+            .unwrap();
+        assert!(unsurfaced.attention_reminder.unwrap().dismissed);
+        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec!["workspace:updated".into()],
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+        svc.surface_secret_requests(&ws, &session.id, std::slice::from_ref(&request_id))
+            .await;
         assert!(signals(&svc, &ws).await.needs_attention);
+        let surfaced = intent_core::with_caller(caller.clone(), svc.get_workspace(ws.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            surfaced.display_status,
+            Some(WorkspaceDisplayStatus::NeedsAttention)
+        );
+        assert!(
+            surfaced.attention_reminder.is_none(),
+            "a surfaced secret request must not be hidden by the old review acknowledgement"
+        );
+        // A menu opened before the request surfaced still acknowledges only
+        // its observed reasons; it never declines the secret or hides it.
+        let stale_ack = intent_core::with_caller(
+            caller.clone(),
+            svc.dismiss_attention_reasons_op(ws.clone(), reasons.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(stale_ack.attention_reminder.is_none());
+        assert!(svc.secret_vault.has_pending(&ws, &session.id));
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("surfacing invalidates the personal projection even while raw status stays raised")
+        .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&batch[0]).unwrap()["data"]["changes"],
+            json!({"attentionReminder": true}),
+            "the invalidation carries neither secret data nor private receipts"
+        );
 
         svc.secret_answer_op(
             ws.clone(),
@@ -4040,6 +4120,39 @@ mod workspace_needs_attention {
         .await
         .unwrap();
         assert!(!signals(&svc, &ws).await.needs_attention);
+        let answered = intent_core::with_caller(caller, svc.get_workspace(ws.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            answered.display_status,
+            Some(WorkspaceDisplayStatus::NeedsAttention)
+        );
+        let restored = answered.attention_reminder.unwrap();
+        assert_eq!(restored.reasons, reasons);
+        assert!(
+            restored.dismissed,
+            "answering restores the existing personal receipt"
+        );
+        assert_eq!(
+            svc.store
+                .workspace_reminder_state(std::slice::from_ref(&ws), Some(&principal))
+                .await
+                .unwrap(),
+            receipt,
+            "secret lifecycle and stale-menu acknowledgement preserve old reason revisions and receipts"
+        );
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("answering invalidates while the old review remains raised")
+        .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&batch[0]).unwrap()["data"]["changes"],
+            json!({"attentionReminder": true})
+        );
     }
 
     /// `agent.dismissQuestions` on the carrying message declines its pending
