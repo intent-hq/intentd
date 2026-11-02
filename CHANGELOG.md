@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.107] - 2026-11-02
+
+### 🚀 Features
+
+- Cap and page agent.getMessageBlock, regenerate by block reference ([#2949](https://github.com/intent-hq/intentd/pull/2949))
+
+### 🐛 Bug Fixes
+
+- *(agents)* Refuse self-retire of the last top-level agent ([#2951](https://github.com/intent-hq/intentd/pull/2951))
+
+### 🧪 Testing
+
+- *(sitter)* Replace elapsed-time assertions with timing-free checks ([#2946](https://github.com/intent-hq/intentd/pull/2946))
+- *(services)* Replace elapsed-time assertions with timing-free checks ([#2945](https://github.com/intent-hq/intentd/pull/2945))
+
+
 ## [0.11.106] - 2026-11-02
 
 ### 📚 Documentation
