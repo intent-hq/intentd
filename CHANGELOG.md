@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.110] - 2026-11-02
+
+### 🚀 Features
+
+- *(remote)* Remote-compatible profiles and model switching for remote agents ([#2961](https://github.com/intent-hq/intentd/pull/2961))
+
+
 ## [0.11.109] - 2026-11-02
 
 ### 🐛 Bug Fixes
