@@ -10921,6 +10921,8 @@ mod wsapi4_bindings_tests {
         placements: Mutex<Vec<(&'static str, Option<Value>)>>,
         /// What `agent_placement_help` answers.
         placement_help: Mutex<Option<String>>,
+        /// What `is_plain_folder_workspace` answers.
+        plain_folder: Mutex<bool>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
         /// calls — `create({ topLevel: true })` must never make one.
         agent_watch_completion_calls: Mutex<u32>,
@@ -11396,6 +11398,11 @@ mod wsapi4_bindings_tests {
         fn agent_placement_help(&self, _ws: WorkspaceId) -> BoxFuture<'_, Option<String>> {
             let help = self.placement_help.lock().unwrap().clone();
             Box::pin(async move { help })
+        }
+
+        fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
+            let plain = *self.plain_folder.lock().unwrap();
+            Box::pin(async move { plain })
         }
 
         fn agent_watch_completion(
@@ -13365,6 +13372,13 @@ mod wsapi4_bindings_tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Remote placement (experimental)"), "{text}");
         let resp = call(&srv, "return await ws.help('note');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
+
+        // Remote agents start from a git commit: a plain folder (§5.1)
+        // never lists placement.
+        *api.plain_folder.lock().unwrap() = true;
+        let resp = call(&srv, "return await ws.help('agent');").await;
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("Remote placement"), "{text}");
     }

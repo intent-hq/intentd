@@ -3609,6 +3609,9 @@ impl AgentManager {
             .services
             .specialist_model_options_for_workspace(&workspace_id)
             .await;
+        // Plain-folder workspaces (§5.1) get a `workspace_api` description
+        // without the git and forge surfaces.
+        let plain_folder = self.services.is_plain_folder(&workspace_id).await;
         // Platform discovery for remote placement; `None` (the default
         // description) unless an execution node is configured.
         let remote_placement_help = self
@@ -3650,6 +3653,7 @@ impl AgentManager {
                             .collect(),
                     )
                     .with_compact_tool_descriptions(compact)
+                    .with_plain_folder(plain_folder)
                     .with_remote_placement_help(remote_placement_help.clone())
             })
             .with_original_services(original_services, session.clone())
