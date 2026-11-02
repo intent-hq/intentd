@@ -5376,6 +5376,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     .await
     .expect("batch stop finishes once its grace window ends")
     .expect("stop task");
+    assert_eq!(gate.windows(), 1, "the whole batch shares one grace window");
 
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");

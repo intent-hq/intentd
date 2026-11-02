@@ -13310,27 +13310,43 @@ async fn shared_grace_window(deadline: tokio::time::Instant) {
 #[cfg(all(test, unix))]
 pub(crate) mod term_grace_gate {
     use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use tokio::sync::watch;
 
     tokio::task_local! { static GATE: TermGraceGate; }
 
-    /// The gate; clones share it.
+    /// The gate; clones share it and its window count.
     #[derive(Clone)]
-    pub(crate) struct TermGraceGate(watch::Sender<bool>);
+    pub(crate) struct TermGraceGate {
+        open: watch::Sender<bool>,
+        windows: Arc<AtomicUsize>,
+    }
 
     impl TermGraceGate {
         pub(crate) fn new() -> Self {
-            Self(watch::Sender::new(false))
+            Self {
+                open: watch::Sender::new(false),
+                windows: Arc::new(AtomicUsize::new(0)),
+            }
         }
 
         /// End every grace window held by this gate.
         pub(crate) fn open(&self) {
-            self.0.send_replace(true);
+            self.open.send_replace(true);
+        }
+
+        /// How many grace windows sweeps under this gate have started. Once
+        /// the gate is open every later window ends at once, so a sweep that
+        /// waits one window per child would still finish: count them.
+        pub(crate) fn windows(&self) -> usize {
+            self.windows.load(Ordering::SeqCst)
         }
 
         pub(super) async fn opened(&self) {
-            let _ = self.0.subscribe().wait_for(|open| *open).await;
+            self.windows.fetch_add(1, Ordering::SeqCst);
+            let _ = self.open.subscribe().wait_for(|open| *open).await;
         }
     }
 
@@ -13536,6 +13552,7 @@ mod kill_sweep_tests {
         .await
         .expect("the sweep finishes once its grace window ends")
         .expect("sweep task");
+        assert_eq!(gate.windows(), 1, "the whole batch shares one grace window");
         for &pid in &pids {
             wait_until_reaped(pid).await;
         }
