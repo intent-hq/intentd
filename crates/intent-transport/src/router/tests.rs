@@ -2639,6 +2639,86 @@ async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() 
     );
 }
 
+#[test]
+fn placement_unavailable_maps_to_the_documented_error() {
+    // The first `errors` case of monorepo
+    // docs/protocol/fixtures/nodes/platform-routing.json.
+    use intent_core::nodes::{NodeArch, NodeOs};
+    use intent_core::placement::{AgentPlatform, PlatformAvailability};
+    let failure = PlatformAvailability::new(
+        [AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64,
+        }],
+        [],
+        "2026-10-01T00:00:00Z".into(),
+    )
+    .unavailable(serde_json::from_str(r#"{"arch":"x86_64"}"#).unwrap());
+    let rpc = super::domain_to_rpc(intent_core::Error::PlacementUnavailable(Box::new(failure)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "No capacity for x86_64; available: none; supported: linux/x86_64"
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "placement-unavailable",
+            "requested": { "arch": "x86_64" },
+            "reason": "no-capacity",
+            "availablePlatforms": [],
+            "supportedPlatforms": [{ "os": "linux", "arch": "x86_64" }],
+            "availableOs": [],
+            "retryable": true,
+            "observedAt": "2026-10-01T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
+    use intent_core::machines::{MachineUpdateRequired, ModelUnavailable, UpdateSide};
+    let model = ModelUnavailable::new("claude", "opus", [], false);
+    let rpc = super::domain_to_rpc(intent_core::Error::ModelUnavailable(Box::new(model)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Model \"opus\" (claude) isn't available: no machine is exposed to this backend."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "model-unavailable",
+            "provider": "claude",
+            "model": "opus",
+            "machines": [],
+            "retryable": false
+        })
+    );
+
+    let update = MachineUpdateRequired {
+        machine_name: "mac-mini".into(),
+        machine_version: "0.11.0".into(),
+        backend_version: "0.12.0".into(),
+        update: UpdateSide::Machine,
+    };
+    let rpc = super::domain_to_rpc(intent_core::Error::MachineUpdateRequired(Box::new(update)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Update Intent on mac-mini (it runs 0.11.0; this backend needs 0.12.0 or newer)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "machine-update-required",
+            "machineVersion": "0.11.0",
+            "backendVersion": "0.12.0",
+            "update": "machine"
+        })
+    );
+}
+
 #[tokio::test]
 async fn clone_failed_maps_to_structured_error_data() {
     // A classified clone failure (clone failure taxonomy, PROTOCOL §9.1;

@@ -627,6 +627,13 @@ async fn process_captured_frame(
             &method,
             raw.len(),
         );
+        // Node mode — the daemon's own orchestration is off, so only
+        // `NODE_MODE_METHODS` are served, on every transport and to every
+        // caller. Runs before the caller allowlists and every classify and
+        // dispatch path, so no fast path is reachable outside the list.
+        if !method.is_empty() && api.node_mode() && !catalog::node_mode_may_call(&method) {
+            return refuse_node_mode(&method, rpc_id, out_tx).await;
+        }
         // Multiplayer w3 — default-deny allowlist for non-administrator
         // connections. Runs before every classify and dispatch path (control,
         // server/pairing, provider setup, host, browser, client,
@@ -984,18 +991,11 @@ async fn process_captured_frame(
                 )
                 .await;
                 bound = outcome.bound;
-                if control.and_then(|c| c.startup_status()).is_some() {
-                    outcome.frame.map(|frame| {
-                        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
-                        if value.get("result").is_some() {
-                            value["result"]["server"]["capabilities"]["startupStatus"] =
-                                serde_json::json!(1);
-                        }
-                        value.to_string()
-                    })
-                } else {
-                    outcome.frame
-                }
+                client::with_runtime_capabilities(
+                    outcome.frame,
+                    control.and_then(|c| c.startup_status()).is_some(),
+                    api.remote_machines_capability(),
+                )
             })
             .await;
             // REV-2: bind the hello'd identity onto the registry entry; the
@@ -1367,6 +1367,26 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
                 &id,
                 catalog::FORBIDDEN_ERROR_CODE,
                 catalog::FORBIDDEN_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
+}
+
+/// Refuse one frame outside [`catalog::NODE_MODE_METHODS`] on a daemon in
+/// node mode: a request echoes `-32003` with `data.code: "node-mode"`, a
+/// notification is dropped without a response. Returns `false` only when the
+/// outbound channel is closed.
+async fn refuse_node_mode(method: &str, rpc_id: Option<Value>, out_tx: &OutboundSender) -> bool {
+    tracing::debug!(method, "refusing RPC: not on the node-mode list");
+    match rpc_id {
+        Some(id) => out_tx
+            .send_priority(events::error_frame_with_data(
+                &id,
+                catalog::FORBIDDEN_ERROR_CODE,
+                catalog::NODE_MODE_ERROR_MESSAGE,
+                &catalog::node_mode_error_data(&format!("{method} is not served in node mode")),
             ))
             .await
             .is_ok(),

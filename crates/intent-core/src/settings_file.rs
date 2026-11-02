@@ -93,6 +93,8 @@ pub struct SettingsFile {
     pub pr_monitor: PrMonitorSettings,
     pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
+    pub remote_agents: RemoteAgentsSettings,
+    pub daemon: DaemonSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -1248,6 +1250,62 @@ impl Default for PrCacheSettings {
     }
 }
 
+/// `[remoteAgents]` — machine side of daemon-to-daemon remote agents
+/// (`remoteAgents.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteAgentsSettings {
+    /// `remoteAgents.permission` — how remote agents' provider permission
+    /// prompts are answered, since no client is attached.
+    pub permission: RemoteAgentPermission,
+}
+
+/// `remoteAgents.permission` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteAgentPermission {
+    #[default]
+    AllowAll,
+    AutoByRisk,
+    DenyAll,
+}
+
+/// `[daemon]` — how this daemon runs (`daemon.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct DaemonSettings {
+    /// `daemon.mode` — `regular` (default) or `node`. Changeable only over the
+    /// local UDS seat; read once at startup.
+    pub mode: DaemonMode,
+}
+
+/// Wire path of the `daemon.mode` setting.
+pub const DAEMON_MODE_SETTING: &str = "daemon.mode";
+
+/// The `settings.*` key families a daemon in node mode reads and writes;
+/// any other key is refused with `node-mode`.
+pub const NODE_MODE_SETTING_PREFIXES: &[&str] = &["remoteAgents.", "daemon.", "server."];
+
+/// Whether a daemon in node mode reads and writes the setting at `path`.
+#[must_use]
+pub fn node_mode_setting_allowed(path: &str) -> bool {
+    NODE_MODE_SETTING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// `daemon.mode` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DaemonMode {
+    /// The full daemon: workspaces, local agents and their background work.
+    #[default]
+    Regular,
+    /// Orchestration off: the daemon serves only the node-mode method list
+    /// and runs agents for the backends it is exposed to.
+    Node,
+}
+
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
 /// values are kept as parsed; consumers read them through the `effective_*`
 /// accessors, which clamp sub-floor values up to their floors (mirroring the
@@ -1347,7 +1405,9 @@ where
 /// feature was removed) — discarded and stripped. `backgroundAgents` covers
 /// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
 /// values are migrated into the `quickActions.*` keys at boot and the table is
-/// then stripped.
+/// then stripped. `remoteAgents.enabled` and the `[experimental]` table (its
+/// only key was `remoteAgents`) are the retired remote-agent switches: remote
+/// agents need no daemon setting, so both are discarded and stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
@@ -1355,6 +1415,8 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "workspace.autoFetch",
     "backgroundAgents",
     "agents.flushQueuedMessages",
+    "remoteAgents.enabled",
+    "experimental",
 ];
 
 /// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
@@ -2890,6 +2952,32 @@ mod tests {
         assert_eq!(legacy.len(), 1);
     }
 
+    /// The retired remote-agent switches (`remoteAgents.enabled`,
+    /// `experimental.remoteAgents`) still load from an older file: they are
+    /// captured as legacy keys (logged once, then stripped at boot) while
+    /// `remoteAgents.permission` keeps parsing. The strict parse refuses
+    /// them like any other unknown key.
+    #[test]
+    fn legacy_parse_tolerates_retired_remote_agent_switches() {
+        let text = "[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(
+            file.remote_agents.permission,
+            RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            legacy.get("remoteAgents.enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            legacy.get("experimental"),
+            Some(&serde_json::json!({ "remoteAgents": true }))
+        );
+        assert_eq!(legacy.len(), 2);
+        assert!(SettingsFile::parse_str("[remoteAgents]\nenabled = true\n").is_err());
+        assert!(SettingsFile::parse_str("[experimental]\nremoteAgents = true\n").is_err());
+    }
+
     #[test]
     fn legacy_parse_captures_and_tolerates_listen_mode() {
         let text = "[server]\nlistenMode = \"both\"\nport = 5181\n";
@@ -3810,5 +3898,37 @@ mod tests {
             Some(&serde_json::json!({ "ws1": "m1" }))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn node_mode_settings_are_limited_to_three_families() {
+        for path in [
+            "remoteAgents.permission",
+            "daemon.mode",
+            "server.wsApi.enabled",
+            "server.tunnel.enabled",
+        ] {
+            assert!(node_mode_setting_allowed(path), "{path} must be allowed");
+        }
+        for path in [
+            "",
+            "remoteAgents",
+            "daemonx.mode",
+            "experimental.remoteAgents",
+            "agents.maxConcurrent",
+            "sourceControl.github.token",
+            "providers.active",
+            "serverx.port",
+        ] {
+            assert!(!node_mode_setting_allowed(path), "{path} must be refused");
+        }
+    }
+
+    #[test]
+    fn daemon_mode_defaults_to_regular_and_parses_node() {
+        assert_eq!(SettingsFile::default().daemon.mode, DaemonMode::Regular);
+        let parsed: SettingsFile = toml::from_str("[daemon]\nmode = \"node\"\n").unwrap();
+        assert_eq!(parsed.daemon.mode, DaemonMode::Node);
+        assert!(toml::from_str::<SettingsFile>("[daemon]\nmode = \"hub\"\n").is_err());
     }
 }

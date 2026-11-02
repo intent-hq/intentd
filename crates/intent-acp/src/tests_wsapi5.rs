@@ -891,6 +891,12 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
+        node_id: None,
+        lease_id: None,
+        node_name: None,
+        placement: None,
+        effective_isolation: None,
+        placement_error: None,
         id: AgentId::from_string(id),
         workspace_id: WorkspaceId::from_string("ws-1"),
         parent_agent_id: None,
@@ -1742,4 +1748,75 @@ async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope()
         api.script_monitor_calls.lock().unwrap()[0]["workspaceId"],
         CHIEF_WORKSPACE_ID
     );
+}
+
+// ============================================================================
+// Frame router (remote agents)
+// ============================================================================
+
+/// Answers `note.*` itself, refuses `script.*`, and leaves the rest to the
+/// bridge's `WorkspaceApi`; records every frame it saw.
+#[derive(Default)]
+struct RecordingRouter {
+    seen: Mutex<Vec<(String, Value)>>,
+}
+
+impl crate::HostFrameRouter for RecordingRouter {
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<BoxFuture<'static, std::result::Result<Value, String>>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), args.clone()));
+        if method.starts_with("note.") {
+            let echoed = json!({ "routed": method, "args": args });
+            return Some(Box::pin(async move { Ok(echoed) }));
+        }
+        if method.starts_with("script.") {
+            return Some(Box::pin(async { Err("refused by the router".to_owned()) }));
+        }
+        None
+    }
+}
+
+#[tokio::test]
+async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest() {
+    let api = Arc::new(FakeApi::default());
+    let router = Arc::new(RecordingRouter::default());
+    let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+        .with_caller_agent_id(Some(AgentId::from_string("agent-1")))
+        .with_frame_router(router.clone());
+
+    let answered = call(&srv, r#"return await ws.note.read("n-1");"#).await;
+    assert_eq!(answered["result"]["isError"], json!(false), "{answered}");
+    let answered = body(&answered);
+    assert_eq!(answered["routed"], json!("note.read"));
+    assert_eq!(answered["args"]["id"], json!("n-1"));
+
+    let refused = call(&srv, "return await ws.script.list();").await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        text(&refused).contains("refused by the router"),
+        "{refused}"
+    );
+    assert_eq!(*api.script_list_calls.lock().unwrap(), 0);
+
+    let local = call(&srv, r#"return await ws.file.read("a.txt");"#).await;
+    assert_eq!(local["result"]["isError"], json!(false), "{local}");
+    assert_eq!(
+        *api.file_read_calls.lock().unwrap(),
+        vec!["a.txt".to_owned()]
+    );
+
+    let seen: Vec<String> = router
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect();
+    assert_eq!(seen, ["note.read", "script.list", "file.read"]);
 }

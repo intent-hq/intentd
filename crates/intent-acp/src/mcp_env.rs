@@ -58,7 +58,9 @@ const SECRET_DELIMITED_WORDS: &[&str] = &["SECRET", "TOKEN"];
 
 /// Whether an env key name looks like a host secret that should not leak into
 /// MCP children via the inherited baseline (port of `isLikelySecretEnvKey`).
-pub(crate) fn is_likely_secret_env_key(key: &str) -> bool {
+/// Remote nodes also use it to mask credential values of any length.
+#[must_use]
+pub fn is_likely_secret_env_key(key: &str) -> bool {
     if SECRET_ENV_KEY_DENYLIST.contains(&key) {
         return true;
     }

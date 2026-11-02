@@ -721,6 +721,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "events.fence",
     "events.subscribe",
     "events.unsubscribe",
+    "executor.list",
+    "executor.mint",
+    "executor.revoke",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -914,6 +917,11 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteMachines.add",
+    "remoteMachines.backendInfo",
+    "remoteMachines.list",
+    "remoteMachines.refresh",
+    "remoteMachines.remove",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
@@ -1318,7 +1326,7 @@ fn extract_subscription_channel_methods() -> HashSet<String> {
 
 /// Every method a client can put on the wire: router arms, fast paths, and
 /// the subscription channels.
-fn client_callable_universe() -> BTreeSet<String> {
+pub(super) fn client_callable_universe() -> BTreeSet<String> {
     ROUTER_METHODS
         .iter()
         .chain(FASTPATH_METHODS.iter())
@@ -1377,6 +1385,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "desktop.getState",
     "desktop.respondPermission",
     "desktop.setPermission",
+    "executor.list",
+    "executor.mint",
+    "executor.revoke",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -1492,6 +1503,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteMachines.add",
+    "remoteMachines.backendInfo",
+    "remoteMachines.list",
+    "remoteMachines.refresh",
+    "remoteMachines.remove",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
@@ -1803,6 +1819,9 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "agent.replaceMessages",
         "agent.reportToParent",
         "debug.sampleStacks",
+        "executor.list",
+        "executor.mint",
+        "executor.revoke",
         "github.authStatus",
         "github.cancelAuth",
         "github.connect",
@@ -1867,6 +1886,11 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "providers.setup.login",
         "providers.setup.start",
         "providers.setup.status",
+        "remoteMachines.add",
+        "remoteMachines.backendInfo",
+        "remoteMachines.list",
+        "remoteMachines.refresh",
+        "remoteMachines.remove",
         "repo.remove",
         "rules.update",
         "sentry.authStatus",

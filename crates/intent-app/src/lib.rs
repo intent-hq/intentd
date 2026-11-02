@@ -20,6 +20,10 @@ use intent_services::Services;
 /// its integration tests.
 pub use intent_svc_transfer as transfer;
 
+/// Remote agents on a configured execution node, re-exported for the daemon
+/// and its integration tests.
+pub use intent_svc_remote as remote;
+
 /// Runtime (scripts, hooks, terminals, browser tabs, sandboxes) entry points
 /// the daemon calls on [`Services`] at startup.
 pub use intent_svc_runtime::RuntimeServicesExt;
@@ -38,6 +42,7 @@ pub use intent_svc_runtime::RuntimeServicesExt;
 pub fn compose(services: Services) -> Services {
     let services = intent_svc_runtime::register(services);
     let services = intent_svc_transfer::register(services);
+    let services = intent_svc_remote::register(services);
     assert_feature_ports_registered(&services);
     services
 }
@@ -62,10 +67,27 @@ pub trait StartupExt {
     /// Delete export staging directories left behind by a previous daemon
     /// run. Called once at boot.
     fn sweep_stale_export_staging(&self) -> impl Future<Output = ()> + Send;
+
+    /// Give the remote feature the tailcat binary used to reach exposed
+    /// machines over their tailcat address. Nothing is dialed until a
+    /// machine is needed.
+    fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>);
+
+    /// Start the connector to every exposed machine that may still run this
+    /// backend's agents, so it reconnects in the background and claims them.
+    fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send;
 }
 
 impl StartupExt for Services {
     fn sweep_stale_export_staging(&self) -> impl Future<Output = ()> + Send {
         intent_svc_transfer::TransferServicesExt::sweep_stale_export_staging(self)
+    }
+
+    fn configure_remote_machines(&self, tailcat_bin: Option<std::path::PathBuf>) {
+        intent_svc_remote::RemoteServicesExt::configure_remote_machines(self, tailcat_bin);
+    }
+
+    fn resume_exposed_machines(&self) -> impl Future<Output = Vec<String>> + Send {
+        intent_svc_remote::RemoteServicesExt::resume_exposed_machines(self)
     }
 }
