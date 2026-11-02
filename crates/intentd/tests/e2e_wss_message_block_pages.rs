@@ -417,15 +417,15 @@ async fn get_message_block_rejects_bad_paging_params() {
         ),
         (
             json!({ "blockId": text, "offset": 9 }),
-            "offset 9 is past the end of the block body (3 bytes)",
+            "invalid params: offset 9 is past the end of the block body (3 bytes)",
         ),
         (
             json!({ "blockId": text, "offset": 2 }),
-            "offset 2 is not on a UTF-8 character boundary",
+            "invalid params: offset 2 is not on a UTF-8 character boundary",
         ),
         (
             json!({ "blockId": img, "offset": 1 }),
-            "offset is not supported for this block",
+            "invalid params: offset is not supported for this block",
         ),
     ];
     for (i, (mut params, want)) in cases.into_iter().enumerate() {
@@ -434,6 +434,7 @@ async fn get_message_block_rejects_bad_paging_params() {
         let (reply, _) = block_raw(&mut rpc, 20 + i64::try_from(i).unwrap(), params.clone()).await;
         assert_eq!(reply["error"]["code"], -32602, "{params}: {reply}");
         assert_eq!(reply["error"]["message"], want, "{params}: {reply}");
+        assert_eq!(reply["error"]["data"]["code"], "invalid-params", "{reply}");
     }
 }
 
@@ -473,9 +474,10 @@ async fn edit_and_regenerate_by_block_reference_over_wss() {
     )
     .await;
     assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params", "{bad}");
     assert_eq!(
         bad["error"]["message"],
-        format!("agent.editAndRegenerate: imageBlocks[0] references block {message_id}:0, which is not an image with stored bytes"),
+        format!("invalid params: agent.editAndRegenerate: imageBlocks[0] references block {message_id}:0, which is not an image with stored bytes"),
     );
 
     let edited = wss_rpc(
