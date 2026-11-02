@@ -41,7 +41,7 @@ impl RuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    /// A runtime with no local resources: a remote agent's, or a test's.
     pub(super) fn custom(runtime: Arc<Runtime<'static>>) -> Self {
         Self {
             runtime,

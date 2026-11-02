@@ -9,9 +9,12 @@ description = "Node provider contracts and static host adapter"
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.103" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

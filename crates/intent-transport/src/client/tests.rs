@@ -958,3 +958,35 @@ async fn invalid_hello_claims_nothing() {
     assert!(outcome.bound.is_none());
     assert!(api.active_during_upsert.lock().unwrap().is_none());
 }
+
+/// `remoteMachines: 1` and `startupStatus: 1` are added only when the
+/// running daemon supports them, and only to a successful hello.
+#[test]
+fn runtime_capabilities_are_added_only_when_on() {
+    let ok = json!({ "jsonrpc": "2.0", "id": 1, "result": {
+        "server": { "capabilities": { "liveState": true } } } })
+    .to_string();
+    let caps = |frame: Option<String>| -> Value {
+        serde_json::from_str::<Value>(&frame.unwrap()).unwrap()["result"]["server"]["capabilities"]
+            .clone()
+    };
+    assert_eq!(
+        caps(with_runtime_capabilities(Some(ok.clone()), false, false)),
+        json!({ "liveState": true })
+    );
+    assert_eq!(
+        caps(with_runtime_capabilities(Some(ok.clone()), false, true)),
+        json!({ "liveState": true, "remoteMachines": 1 })
+    );
+    assert_eq!(
+        caps(with_runtime_capabilities(Some(ok.clone()), true, true)),
+        json!({ "liveState": true, "remoteMachines": 1, "startupStatus": 1 })
+    );
+    let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602 } }).to_string();
+    let patched = with_runtime_capabilities(Some(error.clone()), true, true).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&patched).unwrap(),
+        serde_json::from_str::<Value>(&error).unwrap()
+    );
+    assert_eq!(with_runtime_capabilities(None, true, true), None);
+}

@@ -9,6 +9,7 @@ description = "Composition root for intentd: registers the feature crates on the
 
 [dependencies]
 intent-services = { path = "../intent-services", version = "0.11.103" }
+intent-svc-remote = { path = "../intent-svc-remote", version = "0.11.103" }
 intent-svc-runtime = { path = "../intent-svc-runtime", version = "0.11.103" }
 intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.103" }
 

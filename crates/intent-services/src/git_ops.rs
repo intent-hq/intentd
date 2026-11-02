@@ -44,10 +44,11 @@ with `userRequested: true` only if the user has explicitly asked you to commit."
 /// when persisted, else the effective `git.autoCommit` setting — see
 /// `Services::effective_auto_commit`), whose schema default is `true` so the
 /// established behavior is preserved when nothing is set.
-pub(crate) fn assert_agent_commit_allowed(
-    auto_commit_enabled: bool,
-    user_requested: bool,
-) -> Result<()> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn assert_agent_commit_allowed(auto_commit_enabled: bool, user_requested: bool) -> Result<()> {
     if user_requested || auto_commit_enabled {
         return Ok(());
     }
