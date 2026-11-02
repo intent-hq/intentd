@@ -1253,7 +1253,18 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Terminate => Signal::SIGTERM,
         PtySignal::Kill => Signal::SIGKILL,
     };
+    #[cfg(test)]
+    SENT_SIGNALS.with_borrow_mut(|sent| sent.push((pid, signal)));
     killpg(Pid::from_raw(pid.cast_signed()), signal)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Every `(pgid, signal)` [`kill_group`] delivered from this thread, so a
+    /// test can assert which signals a synchronous sweep sent instead of
+    /// timing it. Per-thread so concurrent tests never see each other's kills.
+    static SENT_SIGNALS: std::cell::RefCell<Vec<(u32, nix::sys::signal::Signal)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
@@ -2086,11 +2097,21 @@ mod tests {
             "descendant alive before kill_all_sync"
         );
 
-        let started = Instant::now();
+        let plain_leader = host.pid(plain).expect("plain pid");
+        SENT_SIGNALS.with_borrow_mut(Vec::clear);
         assert_eq!(host.kill_all_sync(), 2);
-        assert!(
-            started.elapsed() < TERM_GRACE,
-            "kill_all_sync must not await the TERM grace"
+        // Only a SIGTERM opens a TERM grace: a sweep that sends nothing but
+        // one SIGKILL per group never waits on one, however long it runs.
+        let mut sent = SENT_SIGNALS.with_borrow_mut(std::mem::take);
+        sent.sort_unstable_by_key(|(pgid, _)| *pgid);
+        let mut expected = vec![
+            (plain_leader, nix::sys::signal::Signal::SIGKILL),
+            (leader, nix::sys::signal::Signal::SIGKILL),
+        ];
+        expected.sort_unstable_by_key(|(pgid, _)| *pgid);
+        assert_eq!(
+            sent, expected,
+            "kill_all_sync must SIGKILL each group once, with no SIGTERM grace"
         );
         assert_eq!(host.count(), 2, "sessions stay registered");
 
