@@ -502,6 +502,15 @@ last, regardless of which workspace was selected before Home. With no open
 workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
 and shortcuts → Keyboard shortcuts**.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
+
+To keep an agent at the top of a workspace's agent list, right-click it in the
+sidebar and choose **Pin to top**. Pinned agents are listed first, most recent
+activity first, with a divider below them; choose **Unpin** to return an agent to
+the normal order. Pins are saved by Intent, so they appear on every device
+connected to the same Intent. Only foreground agents that were not started by
+another agent can be pinned.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
 When an agent monitors a GitHub pull request, its conversation shows the monitored

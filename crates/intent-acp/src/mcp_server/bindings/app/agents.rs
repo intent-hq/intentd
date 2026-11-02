@@ -838,6 +838,7 @@ mod tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,

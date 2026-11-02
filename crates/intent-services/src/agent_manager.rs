@@ -19157,6 +19157,7 @@ mod role_reminder_tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -23809,6 +23810,7 @@ mod agent_retry_tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 

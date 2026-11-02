@@ -3861,6 +3861,7 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "retiredAt",
     "notificationsMuted",
+    "pinned",
     "harnessVersion",
     "metadata",
 ];
@@ -4505,6 +4506,14 @@ pub struct AgentSession {
     /// `ws.event.*` MCP result).
     #[serde(default)]
     pub notifications_muted: bool,
+    /// Daemon-owned per-session sidebar pin, so every client lists the same
+    /// agents first. Toggled through `agent.update { pinned }`. The session
+    /// wire form serves it only when `true` (absent means unpinned), while
+    /// `AgentLite.pinned` is always present. A user preference, not agent
+    /// activity: toggling it never advances `updated_at`, and ordinary
+    /// full-row session writes never revert it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -5021,6 +5030,11 @@ pub struct AgentLite {
     /// `metadata.isBackground`) so clients can gate alerts from the list row.
     #[serde(default)]
     pub notifications_muted: bool,
+    /// Per-session sidebar pin; mirrors [`AgentSession::pinned`]. Always
+    /// emitted (like `notificationsMuted`), so its presence tells clients the
+    /// daemon accepts `agent.update { pinned }`; older daemons omit it.
+    #[serde(default)]
+    pub pinned: bool,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -5138,6 +5152,7 @@ impl AgentLite {
             provider_replacement_required: None,
             retired_at: session.retired_at,
             notifications_muted: session.notifications_muted,
+            pinned: session.pinned,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
@@ -8557,6 +8572,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: true,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -8656,6 +8672,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -8804,6 +8821,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
                 sandbox_id: None,
@@ -8894,6 +8912,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -8983,6 +9002,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
                 created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
                 updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
                 sandbox_id: None,
@@ -9135,6 +9155,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -9395,6 +9416,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

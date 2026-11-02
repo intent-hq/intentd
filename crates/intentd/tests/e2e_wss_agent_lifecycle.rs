@@ -2519,6 +2519,161 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     );
 }
 
+/// Per-agent sidebar `pinned` (PROTOCOL §5.5): `agent.update { changes:
+/// { pinned } }` persists the daemon-owned pin, returns it on the
+/// `AgentLite`, emits `agent:updated` carrying the change, never advances
+/// `updatedAt` (a preference, not activity), and rejects a non-boolean with
+/// `-32602`. `AgentLite` (`agent.create` / `agent.update` / `agent.get` /
+/// `agent.list`) always carries the boolean — its presence is the support
+/// signal — while `agent.getSession` serves it only when `true`.
+#[tokio::test]
+async fn agent_pinned_round_trip_over_wss() {
+    let Some(script) = gate("WSS pinned E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 2] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Pinned", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert_eq!(
+        created["agent"]["pinned"],
+        json!(false),
+        "fresh agent is unpinned and the field is present: {created}"
+    );
+    let fresh_session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        fresh_session["session"].get("pinned").is_none(),
+        "agent.getSession omits an unset pin: {fresh_session}"
+    );
+
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": "yes" } }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "non-boolean pinned is -32602: {rejected}"
+    );
+
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let id = intent_core::AgentId(agent_id.clone());
+    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let old = "2020-01-01T00:00:00.000Z";
+    seeded.updated_at = old.to_string();
+    store
+        .update_agent_session(&seeded.workspace_id, &seeded)
+        .await
+        .unwrap();
+
+    for (rpc_id, pinned) in [(20, true), (21, true), (22, false), (23, true)] {
+        let response = wss_rpc_envelope(
+            &mut rpc,
+            rpc_id,
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": pinned } }),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], rpc_id);
+        assert_eq!(response["result"]["success"], true, "{response}");
+        let agent = &response["result"]["agent"];
+        assert_eq!(agent["updatedAt"], old, "pin is not activity: {agent}");
+        assert_eq!(agent["pinned"], json!(pinned), "{agent}");
+        let mut received = false;
+        for _ in 0..40 {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+                assert_eq!(ev["data"]["pinned"], json!(pinned), "{ev}");
+                assert!(ev["data"].get("updatedAt").is_none());
+                received = true;
+                break;
+            }
+        }
+        assert!(received, "pin change emits agent:updated");
+    }
+
+    let got = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(got["agent"]["pinned"], json!(true), "{got}");
+    assert_eq!(got["agent"]["updatedAt"], old, "{got}");
+    let list = wss_rpc(&mut rpc, 31, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("pinned agent listed")
+        .clone();
+    assert_eq!(listed["pinned"], json!(true), "{listed}");
+    let session = wss_rpc(
+        &mut rpc,
+        32,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(session["session"]["pinned"], json!(true), "{session}");
+}
+
 /// Direct user retirement cancels a real parked ACP turn over authenticated
 /// WSS and preserves the streamed conversation without sending a model message.
 #[intent_test_macros::daemon_test]

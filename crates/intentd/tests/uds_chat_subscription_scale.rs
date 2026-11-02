@@ -237,6 +237,7 @@ fn seed_agent_session(ws_id: &WorkspaceId, idx: usize) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
