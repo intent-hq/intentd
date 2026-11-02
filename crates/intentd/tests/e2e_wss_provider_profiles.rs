@@ -380,6 +380,7 @@ async fn provider_profiles_crud_contract_over_wss() {
             "id",
             "name",
             "providerRef",
+            "remoteCompatible",
             "settingsFingerprint",
             "updatedAt"
         ]
@@ -708,6 +709,7 @@ async fn provider_profiles_backup_and_reorder_contract_over_wss() {
             "id",
             "name",
             "providerRef",
+            "remoteCompatible",
             "settingsFingerprint",
             "updatedAt"
         ]
@@ -817,6 +819,7 @@ async fn provider_profile_selection_surfaces_over_wss() {
             "baseProviderId": "codex",
             "name": "Work",
             "backup": false,
+            "remoteCompatible": true,
         }])
     );
 
