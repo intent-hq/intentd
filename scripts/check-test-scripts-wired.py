@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fail when a scripts/test-* suite is run by nothing.
 
-A suite counts as wired when its file name appears in .github/workflows or
-.github/actions, the Makefile, or another scripts/test-* file (a harness that
-runs it). Otherwise it must be on MANUAL_ONLY below, with the reason it stays
-out of CI. An unwired suite breaks silently: the review runtime suite went
+A suite counts as wired when its file name appears outside a comment in
+.github/workflows or .github/actions, the Makefile, or another wired
+scripts/test-* file (a harness that runs it). A mention from a suite that is
+itself unwired or manual-only does not count, and neither does a whole-line
+`#` comment. Otherwise the suite must be on MANUAL_ONLY below, with the
+reason it stays out of CI. An unwired suite breaks silently: the review runtime suite went
 unrun until intentd#2921, and its scratch-copy file list lost two files that
 nobody saw until intentd#2911 fixed it by hand.
 
@@ -25,6 +27,9 @@ MANUAL_ONLY = {
     "test-transfer-selection-contract.sh":
         "entry script for exporting or regenerating the transfer-selection fixtures; "
         "the contract test it wraps (public_import_matches_contract) runs in the nextest suite",
+    "test-without-provider-clis.sh":
+        "local wrapper that runs another command with provider CLIs hidden, as on a CI runner "
+        "(the monorepo Makefile's HERMETIC=1); CI itself has no provider CLIs to hide",
 }
 
 REFERENCE_DIRS = (".github/workflows", ".github/actions")
@@ -39,37 +44,62 @@ def mentions(name):
     return re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
 
 
-def reference_texts(root, names):
-    """(label, text) for every file that can wire a suite."""
+def code(text):
+    """`text` without whole-line `#` comments, so a note naming a suite is not wiring."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def read(path):
+    return code(path.read_text(errors="replace"))
+
+
+def root_texts(root):
+    """(label, text) for every file outside scripts/ that can wire a suite."""
     texts = []
     for directory in REFERENCE_DIRS:
         base = root / directory
         if base.is_dir():
             for path in sorted(base.rglob("*")):
                 if path.is_file():
-                    texts.append((str(path.relative_to(root)), path.read_text(errors="replace")))
+                    texts.append((str(path.relative_to(root)), read(path)))
     for name in REFERENCE_FILES:
         path = root / name
         if path.is_file():
-            texts.append((name, path.read_text(errors="replace")))
-    for name in names:
-        texts.append(("scripts/" + name, (root / "scripts" / name).read_text(errors="replace")))
+            texts.append((name, read(path)))
     return texts
+
+
+def wiring(root, names, manual_only):
+    """name -> the first file that wires it. Suites propagate only once wired
+    themselves; a manual-only suite never wires another."""
+    suite_texts = {name: read(root / "scripts" / name) for name in names}
+    patterns = {name: mentions(name) for name in names}
+    wired = {}
+    for label, text in root_texts(root):
+        for name in names:
+            if name not in wired and patterns[name].search(text):
+                wired[name] = label
+    frontier = [name for name in names if name in wired and name not in manual_only]
+    while frontier:
+        caller = frontier.pop()
+        for name in names:
+            if name not in wired and name != caller and patterns[name].search(suite_texts[caller]):
+                wired[name] = "scripts/" + caller
+                if name not in manual_only:
+                    frontier.append(name)
+    return wired
 
 
 def problems(root, manual_only=MANUAL_ONLY):
     names = suites(root)
-    texts = reference_texts(root, names)
+    wired = wiring(root, names, manual_only)
     found = []
     for name in names:
-        pattern = mentions(name)
-        wired = [label for label, text in texts
-                 if label != "scripts/" + name and pattern.search(text)]
-        if wired and name in manual_only:
-            found.append((name, f"listed as manual-only but referenced by {wired[0]}; "
+        if name in wired and name in manual_only:
+            found.append((name, f"listed as manual-only but referenced by {wired[name]}; "
                                 "remove its MANUAL_ONLY entry"))
-        elif not wired and name not in manual_only:
-            found.append((name, "no workflow, Makefile target or other test script runs it; "
+        elif name not in wired and name not in manual_only:
+            found.append((name, "no workflow, Makefile target or other wired test script runs it; "
                                 "wire it into CI or add it to MANUAL_ONLY in "
                                 "scripts/check-test-scripts-wired.py with a reason"))
     for name in sorted(set(manual_only) - set(names)):

@@ -59,6 +59,28 @@ class FixtureTests(unittest.TestCase):
                    "run: |\n  ./scripts/test-x.py-extra\n  ./scripts/test-x-caller.py\n  ./scripts/pre-test-x.py\n")
         self.assertEqual(self.names(), ["test-x.py"])
 
+    def test_a_comment_is_not_wiring(self):
+        self.write("scripts/test-noted.sh")
+        self.write("scripts/test-run.py")
+        self.write(".github/workflows/ci.yml",
+                   "      # Locally: scripts/test-noted.sh\n      run: ./scripts/test-run.py\n")
+        self.write("Makefile", "\t# see scripts/test-noted.sh\n")
+        self.assertEqual(self.names(), ["test-noted.sh"])
+
+    def test_wiring_is_transitive_from_ci_only(self):
+        self.write("scripts/test-root.py", "run('scripts/test-child.sh')")
+        self.write("scripts/test-child.sh", "./scripts/test-grandchild.py")
+        self.write("scripts/test-grandchild.py")
+        self.write("scripts/test-island-a.py", "run('scripts/test-island-b.py')")
+        self.write("scripts/test-island-b.py", "run('scripts/test-island-a.py')")
+        self.write(".github/workflows/ci.yml", "run: ./scripts/test-root.py\n")
+        self.assertEqual(self.names(), ["test-island-a.py", "test-island-b.py"])
+
+    def test_a_manual_only_suite_does_not_wire_another(self):
+        self.write("scripts/test-manual.sh", "./scripts/test-callee.py")
+        self.write("scripts/test-callee.py")
+        self.assertEqual(self.names({"test-manual.sh": "needs real artifacts"}), ["test-callee.py"])
+
     def test_manual_only_entry_excuses_an_orphan(self):
         self.write("scripts/test-manual.sh")
         self.assertEqual(self.names({"test-manual.sh": "needs real artifacts"}), [])
