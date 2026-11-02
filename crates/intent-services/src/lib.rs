@@ -323,6 +323,9 @@ pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
+pub use provider_profiles::{
+    remote_compatibility_of, RemoteCompatibility, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+};
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
     host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
@@ -1110,6 +1113,9 @@ pub struct Services {
     /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
     /// [`quota_failover::QuotaFailoverReplays`].
     quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Remote agents' quota switches awaiting their node's start
+    /// (intent-hq/intent#8317).
+    pending_remote_failovers: quota_failover::PendingRemoteFailovers,
     /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
     /// [`provider_return::ProviderReturnAnnouncements`].
     provider_return_announcements: provider_return::ProviderReturnAnnouncements,
@@ -1832,6 +1838,7 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            pending_remote_failovers: Arc::new(Mutex::new(HashMap::new())),
             provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             provider_quota_cache: provider_quota_cache::ProviderQuotaCache::default(),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),

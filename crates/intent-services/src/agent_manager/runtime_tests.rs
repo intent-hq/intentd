@@ -19,6 +19,8 @@ struct FakeRuntime {
     cancels: AtomicUsize,
     stops: AtomicUsize,
     responses: AtomicUsize,
+    /// Prompts still to reject with a provider quota error, before output.
+    quota_failures: AtomicUsize,
 }
 
 impl FakeRuntime {
@@ -34,6 +36,7 @@ impl FakeRuntime {
             cancels: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
+            quota_failures: AtomicUsize::new(0),
         })
     }
 
@@ -69,6 +72,20 @@ impl AgentRuntime for FakeRuntime {
                 .lock()
                 .unwrap()
                 .push((session_id.to_owned(), prompt));
+            if self
+                .quota_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.entered.notify_one();
+                return Err(AcpError::Rpc(intent_acp::JsonRpcError {
+                    code: -32603,
+                    message: "Internal error".into(),
+                    data: Some(json!(
+                        "{\"type\":\"rate_limit_error\",\"message\":\"usage limit reached\"}"
+                    )),
+                }));
+            }
             self.updates
                 .send(IncomingNotification {
                     method: "session/update".into(),
@@ -725,3 +742,6 @@ async fn a_remote_agent_refuses_a_message_with_attachments() {
         .unwrap()
         .is_empty());
 }
+
+#[path = "remote_quota_failover_tests.rs"]
+mod remote_quota_failover_tests;

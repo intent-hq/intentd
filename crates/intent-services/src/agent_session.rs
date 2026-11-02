@@ -4971,20 +4971,26 @@ impl Services {
         // redrives the same user message on the backup. Output this attempt
         // already persisted stays in the transcript. Only a worker-armed turn
         // can fail over, and the chain is bounded per user turn.
-        let quota_failover = prompt_quota_failure
-            && prompt_actionable_error.is_none()
-            && self
-                .try_quota_failover(
-                    workspace_id,
-                    agent_id,
-                    prompt_quota_provider.as_deref(),
-                    &result
-                        .as_ref()
-                        .err()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                )
-                .await;
+        let quota_outcome = if prompt_quota_failure && prompt_actionable_error.is_none() {
+            self.try_quota_failover(
+                workspace_id,
+                agent_id,
+                prompt_quota_provider.as_deref(),
+                &result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+            .await
+        } else {
+            crate::quota_failover::QuotaFailoverOutcome::Terminal
+        };
+        let quota_failover = quota_outcome.switched();
+        // A remote agent whose backups cannot run on its machine fails with
+        // the actionable message instead of the raw quota error.
+        let prompt_actionable_error =
+            prompt_actionable_error.or_else(|| quota_outcome.into_refusal());
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
