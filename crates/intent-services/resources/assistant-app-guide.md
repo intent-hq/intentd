@@ -178,7 +178,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
 | Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
-| Mobile | Intent Mobile pairing, Remote Access, and Browser access | `/settings?tab=mobile#mobile` |
+| Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
@@ -407,9 +407,13 @@ Read current state and respect the user's requested scope.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
 
-## Use Intent from a browser on another device
+## Use Intent from a browser on another device (experimental)
 
-**Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
+Browser access is experimental and hidden until its feature code is entered with
+Cmd+K. Do not offer it as a normal option; describe it only when the user asks about
+it, and say it is experimental. Do not reveal or guess the feature code.
+
+Once unlocked, **Settings → Mobile → Browser access** (`/settings?tab=mobile#mobile`) lets
 a browser on another device, such as a laptop, use the desktop app, including every
 backend that desktop connects to. It is off by default and the desktop app must stay
 open. Intent listens only on this machine (`127.0.0.1`, port 47120 by default), so the
