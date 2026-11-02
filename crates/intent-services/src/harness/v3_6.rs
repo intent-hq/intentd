@@ -52,6 +52,8 @@ mod tests {
             "ws.script.start",
             "ws.script.monitor",
             "ws.script.stop",
+            "autoMonitor.ok",
+            "autoMonitorError",
             "run_in_background",
             "`Monitor`",
             "nohup",
