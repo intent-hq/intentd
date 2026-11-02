@@ -669,6 +669,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             ],
         ),
         row(
+            "executor.list",
+            vec![v("default", json!({}), Items("/backends", seed::EXECUTOR_BACKENDS))],
+        ),
+        row(
             "file-tracking.getAgentLocks",
             vec![v("default", w.clone(), Items("/lockedFilePaths", 100))],
         ),
@@ -1228,6 +1232,15 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Items("/profiles", seed::PROFILES_PER_PROVIDER),
                 ),
             ],
+        ),
+        fixed(
+            "remoteMachines.backendInfo",
+            "This backend's own id, name and certificate pin.",
+            vec![v("default", json!({}), Fixed("/backendId"))],
+        ),
+        row(
+            "remoteMachines.list",
+            vec![v("default", json!({}), Items("/machines", seed::EXPOSED_MACHINES))],
         ),
         row(
             "repo.list",

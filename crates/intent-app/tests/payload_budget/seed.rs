@@ -86,6 +86,10 @@ pub const AGENT_TRACKED_CHANGES: usize = 500;
 pub const PROFILES_PER_PROVIDER: usize = 32;
 /// Pending host invites.
 pub const HOST_INVITES: usize = 40;
+/// Backends with an executor credential on this machine, and machines
+/// exposed to this backend.
+pub const EXECUTOR_BACKENDS: usize = 30;
+pub const EXPOSED_MACHINES: usize = 30;
 /// Extra hello'd device connections kept open for `client.list`.
 pub const DEVICES: usize = 30;
 const DEVICE_KINDS: [&str; 3] = ["desktop", "laptop", "phone"];
@@ -694,6 +698,50 @@ pub async fn store(state: &LargeState) -> Seeded {
             })
             .await
             .expect("agent tracked change");
+    }
+
+    // Daemon-to-daemon machines: backends this machine admits, and
+    // machines exposed to this backend (each with several routes).
+    for i in 0..EXECUTOR_BACKENDS {
+        store
+            .insert_executor_credential(
+                &intent_core::machines::ExecutorCredential {
+                    id: intent_core::ExecutorCredentialId::from(format!(
+                        "large-state-credential-{i:02}"
+                    )),
+                    backend_id: format!("large-state-backend-{i:02}"),
+                    backend_name: format!("Backend {i} — {}", prose(i, 60).replace('\n', " ")),
+                    backend_fingerprint: Some(format!("{i:064x}")),
+                    created_at: "2026-01-01T00:00:00.000Z".into(),
+                    last_used_at: Some("2026-01-02T00:00:00.000Z".into()),
+                    revoked_at: None,
+                },
+                &format!("{:064x}", i + 1_000),
+            )
+            .await
+            .expect("executor credential");
+    }
+    for i in 0..EXPOSED_MACHINES {
+        store
+            .save_exposed_machine(&intent_core::machines::ExposedMachine {
+                id: format!("large-state-machine-{i:02}"),
+                name: format!("Machine {i} — {}", prose(i + 1, 60).replace('\n', " ")),
+                hosts: (0..6).map(|h| format!("10.{i}.{h}.1")).collect(),
+                port: 7443,
+                tc_address: Some(format!("tc{i:032x}")),
+                fingerprint: format!("{:064x}", i + 2_000),
+                credential_id: intent_core::ExecutorCredentialId::from(format!(
+                    "remote-credential-{i:02}"
+                )),
+                platform: None,
+                capabilities: None,
+                observed_at: None,
+                state: intent_core::machines::RemoteMachineState::Disconnected,
+                added_at: "2026-01-01T00:00:00.000Z".into(),
+                last_connected_at: None,
+            })
+            .await
+            .expect("exposed machine");
     }
 
     // The workspace's remembered specialist choice.
