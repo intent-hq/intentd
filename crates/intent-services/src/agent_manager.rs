@@ -12191,11 +12191,16 @@ impl AgentManager {
             // A quota switch onto a backup the node cannot start is undone
             // and the agent fails with what to do; nothing retries.
             Err(e) => {
+                let reason = match &e {
+                    Error::InvalidParams(message) => message.clone(),
+                    e => e.to_string(),
+                };
                 return Err(boxed_await(|| {
                     self.services
-                        .fail_remote_failover(workspace_id, agent_id, e)
+                        .fail_remote_failover(workspace_id, agent_id, &reason)
                 })
-                .await)
+                .await
+                .unwrap_or(e));
             }
         };
         let origin = RepositoryOrigin::unavailable();
@@ -12256,13 +12261,6 @@ impl AgentManager {
             Some(h) => h.wake_listener = Some(listener),
             None => listener.abort(),
         }
-        // The node runs the agent on its current configuration: a quota
-        // switch onto it is announced only now.
-        boxed_await(|| {
-            self.services
-                .complete_remote_failover(workspace_id, agent_id, session)
-        })
-        .await;
         Ok(StartedSession {
             session_id,
             turn: self.capture_turn(agent_id)?,
@@ -15039,6 +15037,13 @@ async fn run_message_worker(
                         if stop_reason != StopReason::Cancelled {
                             mgr.services.note_provider_working(&agent_id);
                         }
+                        // A remote agent's automatic switch is confirmed
+                        // by a completed turn on its new configuration.
+                        boxed_await(|| {
+                            mgr.services
+                                .complete_remote_failover(&workspace_id, &agent_id)
+                        })
+                        .await;
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
                         boxed_await(|| {

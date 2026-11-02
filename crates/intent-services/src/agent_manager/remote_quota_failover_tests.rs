@@ -370,3 +370,189 @@ async fn a_remote_agent_never_fails_over_to_an_account_folder_backup() {
         .unwrap();
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
 }
+
+/// Make the agent's recorded return home (after a failover) due now, with
+/// home's quota reset (the failover marked it exhausted for everyone).
+async fn make_return_due(mgr: &AgentManager, id: &AgentId, ws: &WorkspaceId) {
+    let later = chrono::Utc::now() + chrono::Duration::seconds(1);
+    mgr.services
+        .provider_quota_cache
+        .mark_working("claude-code", later, later, || true);
+    let session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let mut state = crate::provider_return::read_state(&session).expect("away after failover");
+    state.return_after = (chrono::Utc::now() - chrono::Duration::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    mgr.services
+        .store
+        .set_agent_session_metadata_key_json(
+            ws,
+            id,
+            crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
+            &json!(state).to_string(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn send_as_user(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId, text: &str) {
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        text.into(),
+        None,
+        super::super::super::TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Fail over onto the backup (live afterwards), then make the return due.
+async fn failed_over_with_return_due(
+    port: Arc<ScriptedRemote>,
+    primary: &Arc<FakeRuntime>,
+    backup_run: &Arc<FakeRuntime>,
+    id: &AgentId,
+    ws: &WorkspaceId,
+) -> (TempDb, Arc<AgentManager>, String) {
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let (tmp, mgr, backup) = remote_agent_with_backup(port, id, ws).await;
+    send(&mgr, id, ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, id).await;
+    assert!(mgr.contains(id), "the backup run stays live");
+    make_return_due(&mgr, id, ws).await;
+    (tmp, mgr, backup)
+}
+
+/// Review of intentd#2957: a remote agent's due return home replaces its
+/// live backup run with one on home instead of refusing the turn as
+/// `remote-model-change-unsupported`.
+#[intent_test_macros::daemon_test]
+async fn a_remote_agents_due_return_home_replaces_the_live_backup_run() {
+    let ws = WorkspaceId::from("ws-remote-return-ok");
+    let id = AgentId::from("agent-remote-return-ok");
+    let primary = FakeRuntime::new();
+    let backup_run = FakeRuntime::new();
+    let home_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+        Launch::Runs(home_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) =
+        failed_over_with_return_due(port.clone(), &primary, &backup_run, &id, &ws).await;
+
+    send_as_user(&mgr, &id, &ws, "back home").await;
+    home_run.wait_prompts(1).await;
+    home_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        backup_run.stops.load(Ordering::SeqCst),
+        1,
+        "the backup run stops"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some("claude-code"));
+    assert_ne!(
+        session.status,
+        AgentStatus::Error,
+        "{:?}",
+        session.stop_reason
+    );
+}
+
+/// A due return home the node cannot start leaves the agent on the backup,
+/// with the return backed off, and fails the turn saying so.
+#[intent_test_macros::daemon_test]
+async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
+    let ws = WorkspaceId::from("ws-remote-return-ko");
+    let id = AgentId::from("agent-remote-return-ko");
+    let primary = FakeRuntime::new();
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+        Launch::Fails("the provider is not signed in on this machine"),
+    ]);
+    let (_tmp, mgr, backup) =
+        failed_over_with_return_due(port.clone(), &primary, &backup_run, &id, &ws).await;
+
+    send_as_user(&mgr, &id, &ws, "back home").await;
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 3, "no silent retry");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
+    assert_eq!(session.status, AgentStatus::Error);
+    let state = crate::provider_return::read_state(&session).expect("still away");
+    assert_eq!(state.backoff_step, 1, "the failed return backs off");
+    assert!(state.returning.is_none());
+    let reason = session.stop_reason.unwrap_or_default();
+    for needle in [
+        "couldn't start on Mac when going back",
+        "not signed in on this machine",
+        "The agent stays on",
+    ] {
+        assert!(
+            reason.contains(needle),
+            "{needle:?} missing from {reason:?}"
+        );
+    }
+}
+
+/// Review of intentd#2957: in production the node starts the agent
+/// asynchronously (`runtime()` returns before the provider is up), so a
+/// backup the node cannot start surfaces as the first prompt failing before
+/// any output. That still undoes the switch and fails with what to do,
+/// without a silent redrive or a failover row.
+#[intent_test_macros::daemon_test]
+async fn a_backup_that_exits_before_starting_on_the_node_undoes_the_switch() {
+    let ws = WorkspaceId::from("ws-remote-failover-exit");
+    let id = AgentId::from("agent-remote-failover-exit");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    *backup_run.exited.lock().unwrap() =
+        Some("provider-start-failed: Claude Code is not signed in".into());
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+
+    send(&mgr, &id, &ws, "hello").await;
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 2, "no silent redrive");
+    assert_eq!(backup_run.prompts.lock().unwrap().len(), 1);
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.provider.as_deref(), Some("claude-code"));
+    assert_eq!(session.status, AgentStatus::Error);
+    assert!(crate::provider_return::read_state(&session).is_none());
+    let reason = session.stop_reason.unwrap_or_default();
+    for needle in [
+        "ran out of quota on Mac",
+        "couldn't start there",
+        "Claude Code is not signed in",
+        "Sign in to",
+    ] {
+        assert!(
+            reason.contains(needle),
+            "{needle:?} missing from {reason:?}"
+        );
+    }
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
+}

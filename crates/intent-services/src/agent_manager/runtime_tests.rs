@@ -21,6 +21,9 @@ struct FakeRuntime {
     responses: AtomicUsize,
     /// Prompts still to reject with a provider quota error, before output.
     quota_failures: AtomicUsize,
+    /// When set, the node reported the agent exited before it started:
+    /// every prompt fails before output, as the production runtime does.
+    exited: Mutex<Option<String>>,
 }
 
 impl FakeRuntime {
@@ -37,6 +40,7 @@ impl FakeRuntime {
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
             quota_failures: AtomicUsize::new(0),
+            exited: Mutex::new(None),
         })
     }
 
@@ -72,6 +76,12 @@ impl AgentRuntime for FakeRuntime {
                 .lock()
                 .unwrap()
                 .push((session_id.to_owned(), prompt));
+            if let Some(error) = self.exited.lock().unwrap().clone() {
+                self.entered.notify_one();
+                return Err(AcpError::Transport(format!(
+                    "node-agent-not-running: {error}"
+                )));
+            }
             if self
                 .quota_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
