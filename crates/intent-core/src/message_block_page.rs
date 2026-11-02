@@ -94,12 +94,17 @@ fn result(
     Value::Object(out)
 }
 
-/// The `{ id, type }` stub served when nothing else fits.
-fn stub(block: &Value) -> Value {
+/// The `{ id, type }` stub served when nothing else fits. `id`, then
+/// `type`, is kept only while the stub still fits `cap`, so an oversized
+/// identity field is omitted rather than breaking the cap.
+fn stub(block: &Value, cap: usize) -> Value {
     let mut out = serde_json::Map::new();
     for key in ["id", "type"] {
         if let Some(v) = block.get(key) {
             out.insert(key.to_string(), v.clone());
+            if serialized_len(&Value::Object(out.clone())) > cap {
+                out.remove(key);
+            }
         }
     }
     result(Value::Object(out), true, None, None, None, None)
@@ -135,7 +140,7 @@ pub fn page_message_block(mut block: Value, page: &MessageBlockPage) -> Result<V
         if serialized_len(&block) <= cap {
             return Ok(result(block, true, field, None, Some(data_len), None));
         }
-        return Ok(stub(&block));
+        return Ok(stub(&block, cap));
     }
 
     let Some(field) = field else {
@@ -175,7 +180,7 @@ pub fn page_message_block(mut block: Value, page: &MessageBlockPage) -> Result<V
     block[field] = Value::String(String::new());
     let overhead = serialized_len(&block);
     if overhead > cap {
-        return Ok(stub(&block));
+        return Ok(stub(&block, cap));
     }
     let mut room = cap - overhead;
     let mut end = offset;
@@ -188,7 +193,7 @@ pub fn page_message_block(mut block: Value, page: &MessageBlockPage) -> Result<V
         end += c.len_utf8();
     }
     if end == offset && offset < total {
-        return Ok(stub(&block));
+        return Ok(stub(&block, cap));
     }
     block[field] = Value::String(text[offset..end].to_string());
     let next = (end < total).then_some(end);
@@ -210,7 +215,7 @@ fn unpaged(block: Value, offset: usize, cap: usize) -> Result<Value> {
     if serialized_len(&block) <= cap {
         return Ok(result(block, false, None, None, None, None));
     }
-    Ok(stub(&block))
+    Ok(stub(&block, cap))
 }
 
 fn offset_unsupported() -> Error {
@@ -369,6 +374,37 @@ mod tests {
             json!({"id": "u", "type": "resource", "resource": {"text": "z".repeat(600_000)}});
         let r = page_message_block(unknown, &MessageBlockPage::default()).unwrap();
         assert_eq!(r["block"], json!({"id": "u", "type": "resource"}));
+    }
+
+    #[test]
+    fn oversized_identity_fields_never_exceed_the_cap() {
+        let huge = "x".repeat(600_000);
+        let blocks = [
+            json!({"id": huge, "type": "text", "text": "a"}),
+            json!({"id": "b", "type": huge, "text": "a"}),
+            json!({"id": huge, "type": huge}),
+            json!({"id": huge, "type": "image", "data": "AAAA"}),
+            json!({"id": huge, "type": "tool_result", "output": {"k": 1}}),
+        ];
+        for max in [None, Some(4_096), Some(100_000)] {
+            let p = MessageBlockPage {
+                offset: None,
+                max_bytes: max,
+            };
+            for block in &blocks {
+                let r = page_message_block(block.clone(), &p).expect("served");
+                assert!(serialized_len(&r["block"]) <= p.cap(), "block fits {max:?}");
+                assert_eq!(r["truncated"], true);
+            }
+        }
+        let r = page_message_block(blocks[0].clone(), &page(0, 4_096)).unwrap();
+        assert_eq!(r["block"], json!({"type": "text"}));
+        assert_eq!(r["field"], Value::Null);
+        assert_eq!(r["nextOffset"], Value::Null);
+        let r = page_message_block(blocks[1].clone(), &page(0, 4_096)).unwrap();
+        assert_eq!(r["block"], json!({"id": "b"}));
+        let r = page_message_block(blocks[2].clone(), &page(0, 4_096)).unwrap();
+        assert_eq!(r["block"], json!({}));
     }
 
     #[test]
