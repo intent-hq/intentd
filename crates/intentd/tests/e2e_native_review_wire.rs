@@ -3492,7 +3492,7 @@ while True:signal.pause()
     }
     #[track_caller]
     fn observed_json(path: &std::path::Path) -> Value {
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(15));
         loop {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(value) = serde_json::from_slice(&bytes) {
@@ -3500,7 +3500,7 @@ while True:signal.pause()
                 }
             }
             assert!(
-                started.elapsed() < Duration::from_secs(15),
+                Instant::now() < deadline,
                 "missing owned observation {}",
                 path.display()
             );
@@ -3793,9 +3793,12 @@ while True:signal.pause()
             .arg(directory.path().join("writer-ready")).stdout(Stdio::from(pipe)).stderr(Stdio::inherit());
         let mut writer = Allocation::spawn(&mut command).unwrap();
         drop(command); // Command's Stdio must not retain a copy of the writer.
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         while !directory.path().join("writer-ready").exists() {
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(
+                Instant::now() < deadline,
+                "writer transfer never acknowledged"
+            );
             // timing-guard: writer transfer is acknowledged before its owned death
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3834,17 +3837,14 @@ while True:
     fn nonce(directory: &std::path::Path) -> String {
         let challenge = uuid::Uuid::new_v4().to_string();
         std::fs::write(directory.join("nonce"), &challenge).unwrap();
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         loop {
             if std::fs::read_to_string(directory.join("response"))
                 .is_ok_and(|value| value == challenge)
             {
                 return challenge;
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "independent sentinel response"
-            );
+            assert!(Instant::now() < deadline, "independent sentinel response");
             // timing-guard: original sentinel must answer this fresh nonce
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3865,9 +3865,9 @@ while True:
         let alive = allocation.observe().unwrap();
         assert!(!terminal(alive));
         std::fs::write(directory.path().join("exit-release"), "release").unwrap();
-        let started = Instant::now();
+        let deadline = Instant::now() + common::test_timeout(Duration::from_secs(10));
         while !allocation.exit_ready().unwrap() {
-            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(Instant::now() < deadline, "allocation exit never observed");
             // timing-guard: nonconsuming original allocation exit observation
             std::thread::sleep(Duration::from_millis(10));
         }

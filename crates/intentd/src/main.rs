@@ -6739,13 +6739,17 @@ fn spawn_sandbox_merge_retry_loop(
     })
 }
 
-/// Test hook: artificial delay (milliseconds) before the watcher registry is
-/// started, standing in for a macOS `fseventsd` that takes seconds per
-/// `FSEventStreamStart` registration. Lets e2e tests prove the listeners bind
-/// off the watcher-init critical path (monorepo#1581). NOTE: this seam is
+/// Test hook: a gate file the watcher registry start blocks on — the thread,
+/// not the task — until it exists, standing in for a macOS `fseventsd` that
+/// takes seconds per `FSEventStreamStart` registration. Lets e2e tests prove
+/// the listeners bind off the watcher-init critical path (monorepo#1581)
+/// while init is provably still held, with no clock. NOTE: this seam is
 /// compiled into release binaries too (release-mode e2e runs need it); it is
-/// inert unless the namespaced env var is set to a positive integer.
-const TEST_WATCHER_INIT_DELAY_MS_ENV: &str = "INTENTD_TEST_WATCHER_INIT_DELAY_MS";
+/// inert unless the namespaced env var names a path.
+const TEST_WATCHER_INIT_GATE_ENV: &str = "INTENTD_TEST_WATCHER_INIT_GATE";
+
+/// How often the watcher-init gate hook looks for its file.
+const TEST_WATCHER_INIT_GATE_POLL: Duration = Duration::from_millis(20);
 
 /// Join admitted MCP startup and health work before the final hub reap.
 async fn settle_mcp_background(
@@ -6768,12 +6772,12 @@ async fn settle_mcp_background(
     }
 }
 
-/// Parse the watcher-init delay override; anything unset, non-numeric, or
-/// non-positive disables the hook.
-fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
+/// Parse the watcher-init gate path; anything unset or blank disables the
+/// hook.
+fn test_watcher_init_gate(raw: Option<&str>) -> Option<PathBuf> {
+    raw.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Start the watcher registry (#611) in the background and hold it for the
@@ -6809,19 +6813,19 @@ fn spawn_watcher_registry_init(
         // worker's remaining tasks to another thread for the duration.
         let registry = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                if let Some(delay) = test_watcher_init_delay(
-                    std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
-                        .ok()
-                        .as_deref(),
+                if let Some(gate) = test_watcher_init_gate(
+                    std::env::var(TEST_WATCHER_INIT_GATE_ENV).ok().as_deref(),
                 ) {
                     tracing::warn!(
-                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        "watcher registry startup: artificial delay (test seam)"
+                        gate = %gate.display(),
+                        "watcher registry startup: waiting for the gate file (test seam)"
                     );
-                    // A *blocking* sleep, standing in for the synchronous
+                    // A *blocking* wait, standing in for the synchronous
                     // FSEvents call: a yielding `tokio::time::sleep` would not
                     // exercise worker starvation at all.
-                    std::thread::sleep(delay);
+                    while !gate.exists() {
+                        std::thread::sleep(TEST_WATCHER_INIT_GATE_POLL);
+                    }
                 }
                 WatcherRegistry::start_with_health(
                     &hub,
@@ -10963,28 +10967,21 @@ for line in sys.stdin:
         assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
     }
 
-    // test_watcher_init_delay takes the raw env value as a parameter, so the
+    // test_watcher_init_gate takes the raw env value as a parameter, so the
     // seam is testable without process-env mutation races.
     #[test]
-    fn watcher_init_delay_parses_positive_milliseconds() {
+    fn watcher_init_gate_parses_a_path() {
         assert_eq!(
-            test_watcher_init_delay(Some("250")),
-            Some(Duration::from_millis(250))
-        );
-        assert_eq!(
-            test_watcher_init_delay(Some(" 5000 ")),
-            Some(Duration::from_secs(5))
+            test_watcher_init_gate(Some(" /tmp/gate ")),
+            Some(PathBuf::from("/tmp/gate"))
         );
     }
 
     #[test]
-    fn watcher_init_delay_inert_unless_positive_integer() {
-        // Unset, non-numeric, negative, and zero all leave the hook off.
-        assert_eq!(test_watcher_init_delay(None), None);
-        assert_eq!(test_watcher_init_delay(Some("")), None);
-        assert_eq!(test_watcher_init_delay(Some("soon")), None);
-        assert_eq!(test_watcher_init_delay(Some("-1")), None);
-        assert_eq!(test_watcher_init_delay(Some("0")), None);
+    fn watcher_init_gate_inert_unless_a_path_is_set() {
+        assert_eq!(test_watcher_init_gate(None), None);
+        assert_eq!(test_watcher_init_gate(Some("")), None);
+        assert_eq!(test_watcher_init_gate(Some("  ")), None);
     }
 
     // resolve_ws_listener_port is pure (the env value is a parameter), so the
@@ -11957,13 +11954,14 @@ for line in sys.stdin:
             freelist,
             "no vacuum chunk may run during the startup delay"
         );
-        let started = std::time::Instant::now();
-        store.close().await;
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "close waited {:?}",
-            started.elapsed()
-        );
+        // An aborted retention loop must not leave close waiting on a drain
+        // or a checked-out connection.
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            store.close(),
+        )
+        .await
+        .expect("close waited on the aborted retention loop");
     }
 
     /// The first retention tick (sweeps and vacuum drain) fires after

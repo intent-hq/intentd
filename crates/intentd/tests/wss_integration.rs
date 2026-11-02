@@ -12489,7 +12489,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // the outcome were never recorded, reads after the slot release would
     // keep re-spawning and the spawn-count assertion below would fail.
     let mut req_id = 48u32;
-    let mut waited = 0u32;
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     let resp = loop {
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
         let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
@@ -12502,10 +12503,9 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
             break resp;
         }
         assert!(
-            waited < 200,
+            tokio::time::Instant::now() < deadline,
             "probe failure never reached the negative cache: {resp}"
         );
-        waited += 1;
         req_id += 1;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
@@ -23128,7 +23128,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     drop(enumeration);
 
-    let started = std::time::Instant::now();
+    // The hang guard below is the responsiveness check: a status reply stuck
+    // behind the traversal never arrives inside it.
     status
         .send(Message::Text(
             r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
@@ -23157,10 +23158,6 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     .await
     .expect("system.status stayed responsive during detached traversal");
     assert!(response["result"].is_object(), "system.status: {response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "system.status was delayed by file.tree"
-    );
 
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));

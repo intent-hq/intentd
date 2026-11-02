@@ -30,7 +30,7 @@
 use crate::common;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use intent_context::{discovery, AuggieContextEngine, ContextEngine, EngineAvailability};
 use intent_core::{now_iso, Workspace, WorkspaceApi, WorkspaceId};
@@ -103,23 +103,20 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         "auggie_context_e2e: search.codebase over {} …",
         workspace_path.display()
     );
-    let started = Instant::now();
-    let r = svc
-        .search_codebase(
+    // The crux of M10 CE-3: no interactive-mode hang. The old empty-args
+    // spawn hung until its 30s timeout; the degraded path returns at once, so
+    // a hang guard inside that window catches the regression.
+    let r = tokio::time::timeout(
+        common::test_timeout(Duration::from_secs(20)),
+        svc.search_codebase(
             ws,
             "AuggieContextEngine".to_string(),
             Some("auggie-e2e".to_string()),
-        )
-        .await
-        .expect("search.codebase must not error");
-    let elapsed = started.elapsed();
-
-    // The crux of M10 CE-3: no interactive-mode 30s hang. The old empty-args
-    // spawn timed out at 30s; the degraded path returns near-instantly.
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "search.codebase took {elapsed:?}; expected a fast ripgrep-backed degrade, not a hang"
-    );
+        ),
+    )
+    .await
+    .expect("expected a fast ripgrep-backed degrade, not a hang")
+    .expect("search.codebase must not error");
 
     assert_eq!(r["requestId"], "auggie-e2e");
     let matches = r["matches"].as_array().expect("matches array");
@@ -137,7 +134,7 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         "every ripgrep match must carry a workspace-relative file: {matches:?}"
     );
     eprintln!(
-        "auggie_context_e2e: PASS — {} ripgrep-backed hit(s) in {elapsed:?}; first = {:?}",
+        "auggie_context_e2e: PASS — {} ripgrep-backed hit(s); first = {:?}",
         matches.len(),
         matches.first()
     );
