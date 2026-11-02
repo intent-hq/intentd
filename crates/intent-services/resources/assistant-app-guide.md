@@ -1013,6 +1013,8 @@ In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+A blue dot on a note's icon marks unread changes, like the dot on agent avatars.
+Open the note to clear it; task progress rings still show task status.
 Notes with child notes, including the Spec, show a chevron and start collapsed,
 with a child count. Select the chevron to show or hide the children
 without opening the note; that choice is saved for the workspace. Searching shows
