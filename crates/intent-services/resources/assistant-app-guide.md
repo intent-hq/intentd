@@ -106,7 +106,7 @@ supports them. A newer daemon or agent instruction version does not prove suppor
 in the installed client.
 
 For development testing, run both component branches and create a new agent with
-harness 3.5. Existing agents retain their creation-time prompts. If controls do
+harness 3.5 or later. Existing agents retain their creation-time prompts. If controls do
 not respond in a scaled embedded-browser preview, choose **Fit panel** in its size
 menu and retry.
 
