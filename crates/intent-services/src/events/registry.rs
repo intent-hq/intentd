@@ -1626,6 +1626,7 @@ mod tests {
         let err = try_wait_for_root(&registry, never, true, budget.remaining())
             .await
             .expect_err("a root the registry never saw cannot become established");
+        // elapsed-assert: allow — tokio::time::pause(): Instant is virtual
         assert!(
             started.elapsed().abs_diff(remainder) <= tick,
             "the wait must take only the budget's remainder, not a fresh {LIVENESS:?}: took {:?}",

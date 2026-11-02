@@ -1,0 +1,42 @@
+# Grandfathered elapsed-time assertions per file: `<path> <count>`, sorted by path.
+# Checked by `cargo test -p intent-core --test elapsed_assert_lint`. Entries only ratchet
+# down: assert what the time limit stood for (rows changed, calls made, a write that got in
+# while other work was held, event order) instead of how long the step took, or mark a
+# measurement under a paused tokio clock with `// elapsed-assert: allow — <reason>`.
+crates/intent-core/src/path_utils.rs 1
+crates/intent-git/src/fetch.rs 1
+crates/intent-js/tests/engine.rs 3
+crates/intent-pty/src/host.rs 1
+crates/intent-pty/src/host/unix_io.rs 1
+crates/intent-services/src/agent_manager.rs 1
+crates/intent-services/src/agent_manager/tests.rs 1
+crates/intent-services/src/auto_commit/tests.rs 1
+crates/intent-services/src/codex_diagnostics/catalog_tests.rs 1
+crates/intent-services/src/enhance_ops.rs 1
+crates/intent-services/src/events/root_watch.rs 1
+crates/intent-services/src/mcp_servers.rs 1
+crates/intent-services/src/one_shot_acp/tests.rs 2
+crates/intent-services/src/provider_models/tests.rs 1
+crates/intent-services/src/settings.rs 3
+crates/intent-services/src/test_support/quota_script.rs 1
+crates/intent-services/src/unsloth_server.rs 3
+crates/intent-transport/src/accept_backoff.rs 1
+crates/intent-transport/src/reverse/tests.rs 1
+crates/intentd-sitter/src/readiness.rs 1
+crates/intentd-sitter/src/startup.rs 1
+crates/intentd-sitter/tests/install_sh_startup.rs 3
+crates/intentd-sitter/tests/supervisor_e2e.rs 1
+crates/intentd-sitter/tests/updater_http.rs 1
+crates/intentd/src/main.rs 1
+crates/intentd/tests/auggie_context_e2e.rs 1
+crates/intentd/tests/e2e_detached_lifecycle.rs 2
+crates/intentd/tests/e2e_native_review_wire.rs 4
+crates/intentd/tests/e2e_startup_ordering.rs 1
+crates/intentd/tests/e2e_wss_agent_lifecycle.rs 1
+crates/intentd/tests/e2e_wss_agent_midturn_failure.rs 1
+crates/intentd/tests/e2e_wss_browser_exec.rs 1
+crates/intentd/tests/e2e_wss_primary_identity_refresh.rs 1
+crates/intentd/tests/e2e_wss_shutdown_reaps_provider_tree.rs 1
+crates/intentd/tests/e2e_wss_shutdown_reaps_pty_sessions.rs 1
+crates/intentd/tests/e2e_wss_sticky_reverse.rs 1
+crates/intentd/tests/wss_integration.rs 2

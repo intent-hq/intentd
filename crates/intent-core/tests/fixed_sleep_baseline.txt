@@ -142,7 +142,7 @@ crates/intentd/tests/uds_sentry.rs 1
 crates/intentd/tests/uds_server_control.rs 1
 crates/intentd/tests/uds_settings.rs 2
 crates/intentd/tests/uds_settings_atomic_rollback.rs 1
-crates/intentd/tests/uds_settings_nonblocking.rs 2
+crates/intentd/tests/uds_settings_nonblocking.rs 1
 crates/intentd/tests/uds_specialist.rs 1
 crates/intentd/tests/wss_integration.rs 15
 crates/intentd/tests/wss_port_setting.rs 1

@@ -38,6 +38,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use intentd_test_support::source_lint::parse_count_baseline;
+
 /// Marker that exempts a fixed sleep when it sits in a `//` comment, followed
 /// by a reason, on the sleep's line or the one above.
 const TIMING_GUARD_MARKER: &str = "timing-guard:";
@@ -180,35 +182,7 @@ fn unannotated_sleeps(source: &str) -> Vec<Sleep> {
 /// comments ignored, paths strictly increasing (sorted, unique), counts
 /// positive — a file with no unannotated sleeps has no entry.
 fn parse_baseline(text: &str) -> Result<BTreeMap<String, usize>, String> {
-    let mut out = BTreeMap::new();
-    let mut previous: Option<String> = None;
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let n = i + 1;
-        let (path, count) = line
-            .rsplit_once([' ', '\t'])
-            .ok_or_else(|| format!("line {n}: expected `<path> <count>`, got {raw:?}"))?;
-        let path = path.trim_end();
-        let count: usize = count
-            .parse()
-            .map_err(|_| format!("line {n}: count {count:?} is not a number"))?;
-        if count == 0 {
-            return Err(format!(
-                "line {n}: a file with no unannotated sleeps has no entry; remove {raw:?}"
-            ));
-        }
-        if let Some(prev) = previous.as_deref().filter(|prev| *prev >= path) {
-            return Err(format!(
-                "line {n}: entries must be sorted by path and unique, but {path:?} follows {prev:?}"
-            ));
-        }
-        previous = Some(path.to_string());
-        out.insert(path.to_string(), count);
-    }
-    Ok(out)
+    parse_count_baseline(text, "unannotated sleeps")
 }
 
 /// One way a scanned tree disagrees with the baseline.
