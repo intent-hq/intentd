@@ -160,6 +160,52 @@ async fn exec_rejects_empty_actions_before_forwarding() {
     ));
 }
 
+/// Client-triggered `browser.exec` must arm the 20s screenshot deadline at
+/// its own call site, not the 30s default, so an unanswered screenshot fails
+/// inside the agent JavaScript tool's 30s outer budget. The paused clock
+/// makes this exact: the screenshot settles by the screenshot deadline, while
+/// a request without a screenshot is still waiting then. No wall time passes.
+#[tokio::test(start_paused = true)]
+async fn exec_arms_the_screenshot_deadline_for_an_unanswered_screenshot() {
+    let just_past = crate::reverse::SCREENSHOT_REVERSE_TIMEOUT + Duration::from_millis(1);
+    assert!(just_past < crate::reverse::DEFAULT_REVERSE_TIMEOUT);
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let reverse = ReverseChannel::new(out_tx);
+    let actions = |action: &str| {
+        serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "actions": [{ "action": action }]
+        }))
+        .unwrap()
+    };
+
+    let screenshot = actions("screenshot");
+    let err = tokio::time::timeout(just_past, exec(&screenshot, &reverse))
+        .await
+        .expect("an unanswered screenshot must settle on the screenshot deadline")
+        .expect_err("an unanswered screenshot must fail");
+    assert!(
+        err.to_string()
+            .contains("reverse request timed out: browser.exec"),
+        "unexpected error: {err}"
+    );
+
+    let list_tabs = actions("listTabs");
+    assert!(
+        tokio::time::timeout(just_past, exec(&list_tabs, &reverse))
+            .await
+            .is_err(),
+        "a request without a screenshot keeps the longer default deadline"
+    );
+
+    // Both requests really went out and sat unanswered; neither failed early
+    // on a closed channel.
+    for action in ["screenshot", "listTabs"] {
+        let frame: Value = serde_json::from_str(&out_rx.try_recv().expect("forwarded frame"))
+            .expect("valid JSON frame");
+        assert_eq!(frame["params"]["actions"][0]["action"], action);
+    }
+}
+
 #[tokio::test]
 async fn handle_frames_invalid_params_with_data_code() {
     let (out_tx, _out_rx) = mpsc::channel(8);

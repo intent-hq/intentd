@@ -380,47 +380,36 @@ async fn browser_exec_fe_json_rpc_error_surfaces_as_internal_error() {
         .contains("CDP not attached"));
 }
 
-/// A client-triggered screenshot must settle on the 20s screenshot reverse
-/// deadline, inside the JavaScript tool's 30s outer budget, not the 30s
-/// default. Two unanswered requests race: one without a screenshot (default
-/// deadline) is forwarded first, the screenshot a second later. The later
-/// request can time out first only on the shorter deadline — about nine
-/// seconds ahead — while a screenshot on the default deadline would lose by
-/// a second.
+/// An unanswered client-triggered screenshot comes back over WSS as the
+/// daemon's reverse timeout (`-32603`), not a hang. Which deadline it gets
+/// (20s, inside the JavaScript tool's 30s outer budget, rather than the 30s
+/// default) is pinned without wall-clock timing on a paused clock at the
+/// `browser::exec` call site:
+/// intent-transport `browser::tests::exec_arms_the_screenshot_deadline_for_an_unanswered_screenshot`.
 #[tokio::test]
-async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss() {
+async fn browser_exec_unanswered_screenshot_times_out_over_wss() {
     let (_daemon, port, cfg) = boot().await;
     let mut ws = connect_ws(port, cfg).await;
-    let mut forward_unanswered = async |id: i64, action: &str| {
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "browser.exec",
-            "params": { "actions": [{ "action": action }] },
-        });
-        ws.send(Message::Text(frame.to_string().into()))
-            .await
-            .unwrap();
-        // The reverse request is forwarded only after its deadline is armed.
-        let reverse = read_text(&mut ws).await;
-        assert_eq!(reverse["method"], "browser.exec");
-        assert_eq!(reverse["params"]["actions"][0]["action"], action);
-    };
-    forward_unanswered(32, "listTabs").await;
-    // Response order, not this duration, is what the test asserts.
-    // timing-guard: offsets the two deadlines so equal ones cannot tie.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    forward_unanswered(33, "screenshot").await;
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "browser.exec",
+        "params": { "actions": [{ "action": "screenshot" }] },
+    });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
 
+    let reverse = read_text(&mut ws).await;
+    assert_eq!(reverse["method"], "browser.exec");
+    assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
+    // Do not answer the reverse request; the daemon's own deadline settles it.
     let response = read_text_with_timeout(
         &mut ws,
         intentd_test_support::test_timeout(Duration::from_secs(40)),
     )
     .await;
-    assert_eq!(
-        response["id"], 33,
-        "the screenshot must time out before the earlier default-deadline request: {response}"
-    );
+    assert_eq!(response["id"], 32);
     assert_eq!(response["error"]["code"], -32603);
     assert!(response["error"]["message"]
         .as_str()
