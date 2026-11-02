@@ -183,7 +183,9 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
             intentd_test_support::test_timeout(Duration::from_secs(30)),
         )
         .await;
-        let id = frame["id"].as_u64().unwrap_or_else(|| panic!("reply id: {frame}"));
+        let id = frame["id"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("reply id: {frame}"));
         assert!(replies.insert(id, frame).is_none(), "one reply per request");
     }
     let first = &replies[&2];

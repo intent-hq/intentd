@@ -726,10 +726,7 @@ fn fixed_test_deadlines_use_the_timeout_multiplier() {
 // ---- fixtures ---------------------------------------------------------------
 
 fn lines_in(src: &str) -> Vec<usize> {
-    scan_source(src, true)
-        .iter()
-        .map(|d| d.line)
-        .collect()
+    scan_source(src, true).iter().map(|d| d.line).collect()
 }
 
 #[test]

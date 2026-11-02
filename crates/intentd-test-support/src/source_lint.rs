@@ -2562,7 +2562,10 @@ use some::module;
             fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
             fs::write(path, body).expect("write");
         };
-        write("crates/a/src/lib.rs", "mod store;\n#[cfg(test)]\nmod harness;\n");
+        write(
+            "crates/a/src/lib.rs",
+            "mod store;\n#[cfg(test)]\nmod harness;\n",
+        );
         write("crates/a/src/store.rs", "fn prod() {}\n");
         write("crates/a/src/harness.rs", "mod nested;\n");
         write("crates/a/src/harness/nested.rs", "fn helper() {}\n");

@@ -1069,7 +1069,8 @@ mod test_hook_tests {
 
     #[tokio::test(start_paused = true)]
     async fn gate_holds_until_its_file_appears() {
-        let dir = intent_services::feature_api::test_support::test_tempdir("intentd-provision-gate-");
+        let dir =
+            intent_services::feature_api::test_support::test_tempdir("intentd-provision-gate-");
         let gate = dir.path().join("open");
         let waiter = tokio::spawn({
             let gate = gate.clone();
@@ -1078,7 +1079,10 @@ mod test_hook_tests {
         for _ in 0..10 {
             tokio::time::sleep(TEST_PROVISION_GATE_POLL).await;
         }
-        assert!(!waiter.is_finished(), "the gate must hold while its file is absent");
+        assert!(
+            !waiter.is_finished(),
+            "the gate must hold while its file is absent"
+        );
         std::fs::write(&gate, b"").expect("open the gate");
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(5)),

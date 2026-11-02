@@ -288,7 +288,9 @@ async fn concurrent_writes_do_not_starve_reads() {
         ),
     )
     .await
-    .expect("workspace.list must answer while the writer is held — read pool is blocked by writers");
+    .expect(
+        "workspace.list must answer while the writer is held — read pool is blocked by writers",
+    );
     let still_queued = write_tasks.iter().filter(|t| !t.is_finished()).count();
     assert_eq!(
         still_queued,
