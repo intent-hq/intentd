@@ -880,8 +880,8 @@ blocker notice can remain in the conversation after the current warning clears.
 
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
-whose usage limit was reached, and **Retry** tries the same provider again once
-its limit resets. For sign-in errors, including an expired Claude
+whose usage limit was reached, and **Retry** lets you try the same provider
+again after its limit resets. For sign-in errors, including an expired Claude
 OAuth login, run the displayed CLI login command on the host running the agent,
 complete sign-in, then retry. Signing in to the Claude desktop app does not sign
 in its CLI. For **Agent session corrupted**, retry starts a fresh session and
