@@ -443,7 +443,7 @@ includes the other linked PRs, even when their details are not loaded.
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. The settings beside the prompt (below it on narrow
 windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
-Use **+** below the prompt to add context.
+Use **+** below the prompt to add context, or the microphone on the right to dictate.
 These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
 the selected codebase is included even if it has not reached your history yet.
