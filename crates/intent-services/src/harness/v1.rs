@@ -1273,7 +1273,10 @@ impl Harness for V1 {
         // The queue entry's state is otherwise informational (position,
         // size, estimate), but `unmergeable` strands the PR: it conflicts
         // with an entry ahead and will never merge on its own, and its
-        // branch is locked while queued (intentd#2897 sat ~55 min). Recovery
+        // branch is locked while queued (intentd#2897 sat ~55 min). The
+        // forge can also raise the flag with no real conflict (intentd#2937
+        // re-enqueued unchanged and merged), so the advice checks before
+        // fixing anything. Recovery
         // reports only while the entry is still read with a known state;
         // leaving the queue reports itself.
         let entry_state = |r: &crate::pr_ops::MergeRequirements| {
@@ -1288,7 +1291,10 @@ impl Harness for V1 {
                     "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
                      it and will not merge. Its branch is locked while queued, so a push is \
                      rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
-                     fix the branch, then enqueue it again"
+                     then check the conflict is real with a local git merge-tree of main, the \
+                     entries ahead and this head. If that merges cleanly the flag was stale: \
+                     enqueue the same commit again; otherwise fix the branch, then enqueue it \
+                     again"
                         .to_string(),
                 );
             }

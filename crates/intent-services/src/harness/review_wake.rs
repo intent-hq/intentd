@@ -193,7 +193,8 @@ pub(crate) fn checklist(r: &Value, head: Option<&str>, ready: bool) -> String {
     if r["isInMergeQueue"] == true {
         lines.push(if r["mergeQueue"]["state"] == "unmergeable" {
             "in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
-             dequeue it, fix the branch, then enqueue again"
+             dequeue it and check for a real conflict (merge-tree of main, the entries ahead \
+             and this head); re-enqueue the same commit if clean, else fix the branch first"
                 .into()
         } else {
             "in merge queue".into()

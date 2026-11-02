@@ -187,7 +187,9 @@ fn in_state(position: u32, state: Option<&str>) -> PrMonitorSnapshot {
 
 const UNMERGEABLE_LINE: &str = "merge queue entry is UNMERGEABLE: the PR conflicts with an entry \
      ahead of it and will not merge. Its branch is locked while queued, so a push is rejected — \
-     remove it from the queue first (GraphQL dequeuePullRequest), fix the branch, then enqueue it \
+     remove it from the queue first (GraphQL dequeuePullRequest), then check the conflict is real \
+     with a local git merge-tree of main, the entries ahead and this head. If that merges cleanly \
+     the flag was stale: enqueue the same commit again; otherwise fix the branch, then enqueue it \
      again";
 
 /// The entry turning `unmergeable` is the one queue-state change that wakes
@@ -245,7 +247,8 @@ fn the_wake_checklist_flags_an_unmergeable_entry() {
     assert!(
         checklist.contains(
             "- in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
-             dequeue it, fix the branch, then enqueue again"
+             dequeue it and check for a real conflict (merge-tree of main, the entries ahead \
+             and this head); re-enqueue the same commit if clean, else fix the branch first"
         ),
         "{checklist}"
     );
@@ -315,6 +318,9 @@ async fn a_queued_pr_turning_unmergeable_wakes_the_owner() {
     );
     let text = owner_messages(&held, &owner).await;
     assert!(text.contains("GraphQL dequeuePullRequest"), "{text}");
+    // A stale flag (intentd#2937) needs no branch change: the wake says to
+    // verify the conflict and re-enqueue the same commit when it is clean.
+    assert!(text.contains("enqueue the same commit again"), "{text}");
     assert!(text.contains("the entry is UNMERGEABLE"), "{text}");
     let row = held
         .store()
