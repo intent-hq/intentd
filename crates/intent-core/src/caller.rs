@@ -9,7 +9,10 @@
 //! - WSS listener: `Wire` for the principal the upgrade credential resolved
 //!   to; identity is bound at upgrade, never taken from `client.hello`.
 //! - `workspace_api` MCP tool: `Agent` for the calling agent session.
-//! - Hook runner: `Daemon`.
+//! - Hook runner: `Daemon` for the run itself, while every `ws.*` call the
+//!   script makes is `Agent` for the hook's owner (the host binds it per
+//!   frame), so a hook can never act with more — or other — authority than
+//!   its owner.
 //!
 //! [`current_caller`] returns `None` outside an established scope. This is
 //! fail-closed: consumers treat an absent caller as forbidden, never as the
@@ -33,7 +36,9 @@ pub enum Caller {
     },
     /// An agent session calling back through the `workspace_api` bridge.
     Agent { agent_id: AgentId },
-    /// Daemon-internal background work (hook runs).
+    /// Daemon-internal background work (timers, refreshers, the hook
+    /// runner's own bookkeeping — not a hook script's `ws.*` calls, which
+    /// act as the owning [`Caller::Agent`]).
     Daemon,
     /// A backend daemon on a `/node/*` link, admitted with the executor
     /// credential this machine minted for it. It may send only the

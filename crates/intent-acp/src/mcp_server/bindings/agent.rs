@@ -284,22 +284,9 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let read = dispatch_inner(api, ws, caller, eval_budget, method, args);
-    // Hooks evaluate as Daemon, but these agent-facing reads belong to the
-    // hook owner just as they do in a live MCP turn.
-    let mut out = if let Some(agent_id) =
-        caller.filter(|_| matches!(method, "status" | "getQueue" | "diagnostics"))
-    {
-        intent_core::with_caller(
-            intent_core::Caller::Agent {
-                agent_id: agent_id.clone(),
-            },
-            read,
-        )
-        .await?
-    } else {
-        read.await?
-    };
+    // No caller re-scope here: the host binds the frame's agent as the
+    // ambient caller for every binding, hooks included.
+    let mut out = dispatch_inner(api, ws, caller, eval_budget, method, args).await?;
     strip_agent_hidden_fields(&mut out);
     Ok(out)
 }
@@ -1741,20 +1728,13 @@ async fn retire(
         reason = reason.as_deref().unwrap_or("(none)"),
         "agent.retire: soft-retiring agent session"
     );
-    // Always retire AS the agent, even from a hook (which evaluates as
-    // `Caller::Daemon`): the service's last-top-level-agent guard keys on
-    // `Caller::Agent`, so a hook must not be a way around it.
-    let v = intent_core::with_caller(
-        intent_core::Caller::Agent {
-            agent_id: caller.clone(),
-        },
-        async {
-            api.agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
-                .await
-        },
-    )
-    .await
-    .map_err(map_err)?;
+    // The service's last-top-level-agent guard keys on `Caller::Agent`; the
+    // host binds the frame's agent around every binding, so a hook retire
+    // reaches it as the owner (dispatch `owner_scope_tests`).
+    let v = api
+        .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
+        .await
+        .map_err(map_err)?;
     let mut out = merge_ok(v);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("agentId".to_string(), json!(caller.as_str()));
@@ -2558,60 +2538,6 @@ mod tests {
             })),
             None
         );
-    }
-
-    mod retire_caller_scope {
-        use super::super::*;
-        use intent_core::{BoxFuture, Caller, Result};
-
-        /// Records the ambient caller each `agent_retire` call sees.
-        #[derive(Default)]
-        struct FakeApi {
-            seen: std::sync::Mutex<Vec<Option<Caller>>>,
-        }
-
-        impl WorkspaceApi for FakeApi {
-            fn agent_retire(
-                &self,
-                _agent_id: AgentId,
-                _workspace_id: Option<WorkspaceId>,
-                _reason: Option<String>,
-            ) -> BoxFuture<'_, Result<Value>> {
-                self.seen
-                    .lock()
-                    .unwrap()
-                    .push(intent_core::current_caller());
-                Box::pin(async { Ok(json!({ "success": true, "retiredAt": "t" })) })
-            }
-        }
-
-        /// A hook evaluates as `Caller::Daemon` with the owner as binding
-        /// caller; the retire must still reach the service as
-        /// `Caller::Agent { owner }` so the last-top-level guard applies.
-        #[tokio::test]
-        async fn hook_retire_reaches_the_service_as_the_agent_caller() {
-            let fake = Arc::new(FakeApi::default());
-            let api: Arc<dyn WorkspaceApi> = fake.clone();
-            let ws = WorkspaceId::from_string("ws-1");
-            let owner = AgentId::from("hook-owner");
-            intent_core::with_caller(
-                Caller::Daemon,
-                dispatch(
-                    &api,
-                    &ws,
-                    Some(&owner),
-                    EvalBudget::starting_now(Duration::from_secs(30)),
-                    "retire",
-                    &json!({}),
-                ),
-            )
-            .await
-            .expect("retire");
-            assert_eq!(
-                *fake.seen.lock().unwrap(),
-                vec![Some(Caller::Agent { agent_id: owner })]
-            );
-        }
     }
 
     mod list_specialists {

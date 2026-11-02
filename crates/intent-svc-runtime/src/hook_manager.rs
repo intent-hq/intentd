@@ -13,11 +13,12 @@
 //! Scripts evaluate in `QuickJS` via `intent_js::eval` with the exact same
 //! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs —
 //! gated by the same `[agentFeatures]` toggles (e.g. no `ws.host.exec` when
-//! `agentFeatures.hostExec` is off; with all defaults on the environment is
-//! byte-identical to the ungated one) — a 60 s wall-clock budget, and the
-//! hook's workspace/agent pinned as the caller. The script's return value is
-//! the
-//! contract: `{ dispatch: true, message }` wakes the owning agent (queued
+//! `agentFeatures.hostExec` is off), minus the hook-only exceptions in
+//! `hook_agent_features` (no `ws.secret`, no `ws.desktop`) — a 60 s
+//! wall-clock budget, and the hook's workspace pinned. Every `ws.*` call
+//! acts as the hook's owning agent (`Caller::Agent`), so agent-only service
+//! checks apply exactly as in the owner's turn. The script's return value is
+//! the contract: `{ dispatch: true, message }` wakes the owning agent (queued
 //! behind an in-flight turn via the automatic-delivery `agent.sendMessage`
 //! path) and terminates the hook — unless the hook is `perpetual`, in which
 //! case it counts the fire (`dispatch_count`) and returns to `scheduled`,
@@ -526,8 +527,8 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
 
 /// Evaluate one hook script in `QuickJS` with the `ws.*` environment gated by
 /// the same `[agentFeatures]` toggles as the `workspace_api` tool (prelude
-/// pruning + dispatch deny; all-defaults is byte-identical to the ungated
-/// environment) and interpret its return value against the script contract.
+/// pruning + dispatch deny; callers pass [`hook_agent_features`]) and
+/// interpret its return value against the script contract.
 /// `is_sub_agent` mirrors the owning session's bridge derivation
 /// (`parent_agent_id.is_some() || is_background`): a sub-agent-owned hook
 /// gets the same `ws.app.question.*` pruning + top-level-only dispatch
@@ -544,10 +545,14 @@ async fn run_hook_script(
     is_sub_agent: bool,
     cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> RunOutcome {
+    // The host binds `Caller::Agent { owner }` around every frame, so each
+    // `ws.*` call acts as the hook's owner — the same identity and the same
+    // agent-only service checks as the owner's own turn — even though the
+    // run itself is daemon work (the `Caller::Daemon` scope below).
     let host = intent_acp::make_workspace_host_for_bridge(
         api,
         hook.workspace_id.clone(),
-        Some(hook.agent_id.clone()),
+        hook.agent_id.clone(),
         None,
         agent_features.clone(),
         is_sub_agent,
@@ -650,8 +655,9 @@ async fn run_hook_script(
         timeout,
         ..intent_js::EvalOptions::default()
     };
-    // Hook runs are daemon-internal work: every `ws.*` call the script makes
-    // is bound to the `Daemon` caller (multiplayer w1).
+    // The run is daemon-internal work, bound to the `Daemon` caller
+    // (multiplayer w1); each `ws.*` frame the script makes re-binds the
+    // owning agent inside the host, so no call reaches a service as `Daemon`.
     let depth = HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
     let eval = HOOK_EVAL_DEPTH.scope(
         depth + 1,
@@ -855,12 +861,20 @@ fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     v
 }
 
-/// The `[agentFeatures]` a hook run sees: the live settings, with agent
-/// secret requests (PROTOCOL §5.56) always off. Secrets are transient,
-/// held for the agent's own interactive work, so a background hook can
-/// neither request nor use one (`ws.secret` and `secretEnv` are absent).
+/// The `[agentFeatures]` a hook run sees: the live settings, with the two
+/// capabilities reserved for the agent's own interactive turn always off.
+/// A hook's `ws.*` calls act as its owning agent (the run's host binds the
+/// owner's identity on every frame), so these are the explicit hook-only
+/// exceptions to "a hook can do what its owner can":
+/// - agent secret requests (PROTOCOL §5.56): secrets are transient, held for
+///   the agent's own interactive work, so a background hook can neither
+///   request nor use one (`ws.secret` and `secretEnv` are absent);
+/// - desktop control: a hook must not drive the user's mouse and keyboard
+///   with no turn running (`ws.desktop` is absent and its frames are denied,
+///   except the always-allowed `desktop.endControl` release).
 fn hook_agent_features(mut live: AgentFeaturesSettings) -> AgentFeaturesSettings {
     live.secret_requests = false;
+    live.desktop_control = false;
     live
 }
 
@@ -2491,33 +2505,35 @@ mod tests {
     use super::*;
     use intent_services::feature_api::events::EventBus;
 
-    /// Hook runs never get agent secret requests (PROTOCOL §5.56), whatever
-    /// the live setting: no `ws.secret` in the prelude, every other toggle
-    /// passed through unchanged.
+    /// Hook runs never get agent secret requests (PROTOCOL §5.56) or desktop
+    /// control, whatever the live settings — the explicit exceptions to a
+    /// hook acting with its owner's identity: no `ws.secret` / `ws.desktop`
+    /// in the prelude, every other toggle passed through unchanged.
     #[test]
-    fn hook_runs_never_get_secret_requests() {
+    fn hook_runs_never_get_secret_requests_or_desktop_control() {
         let live = AgentFeaturesSettings {
             secret_requests: true,
+            desktop_control: true,
             ..AgentFeaturesSettings::default()
         };
         let hook = hook_agent_features(live.clone());
         assert!(!hook.secret_requests);
+        assert!(!hook.desktop_control);
         assert_eq!(
             hook,
             AgentFeaturesSettings {
                 secret_requests: false,
+                desktop_control: false,
                 ..live.clone()
             }
         );
         let workspace = WorkspaceId::from_string("ws-hook");
-        assert!(
-            intent_acp::bindings_prelude_for_workspace(&live, false, &workspace)
-                .contains("ws.secret = {")
-        );
-        assert!(
-            !intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace)
-                .contains("ws.secret = {")
-        );
+        let live_prelude = intent_acp::bindings_prelude_for_workspace(&live, false, &workspace);
+        let hook_prelude = intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace);
+        for installer in ["ws.secret = {", "ws.desktop = Object"] {
+            assert!(live_prelude.contains(installer), "{installer}");
+            assert!(!hook_prelude.contains(installer), "{installer}");
+        }
     }
 
     struct TempDb {
@@ -3918,36 +3934,67 @@ mod tests {
         }
     }
 
-    /// Multiplayer w1: every `ws.*` call a hook script makes runs with the
-    /// task-local `Caller::Daemon` bound (hook runs are daemon-internal
-    /// work, never the owning agent's wire identity).
+    /// Every `ws.*` call a hook script makes reaches the service as the
+    /// hook's owning agent (`Caller::Agent { owner }`), even though the run
+    /// itself is bound to `Caller::Daemon`: agent-only checks (the
+    /// last-top-level retire guard, self-queue redaction, …) must hold from
+    /// a hook exactly as in the owner's own turn. The probe covers frames
+    /// from several namespaces, including ones the retired per-method
+    /// allowlist never re-scoped (`workspace.info`, `note.list`).
     #[tokio::test]
-    async fn hook_run_binds_daemon_caller() {
+    async fn hook_calls_reach_the_service_as_the_owning_agent() {
         struct ProbeApi {
             ws: Workspace,
-            seen: std::sync::Mutex<(bool, Option<intent_core::Caller>)>,
+            seen: std::sync::Mutex<Vec<(&'static str, Option<intent_core::Caller>)>>,
+        }
+        impl ProbeApi {
+            fn record(&self, what: &'static str) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((what, intent_core::current_caller()));
+            }
         }
         impl WorkspaceApi for ProbeApi {
             fn get_workspace(
                 &self,
                 _id: WorkspaceId,
             ) -> intent_core::BoxFuture<'_, intent_core::Result<Workspace>> {
-                *self.seen.lock().unwrap() = (true, intent_core::current_caller());
+                self.record("get_workspace");
                 let snapshot = self.ws.clone();
                 Box::pin(async move { Ok(snapshot) })
             }
+            fn list_notes<'a>(
+                &'a self,
+                _workspace_id: &'a WorkspaceId,
+            ) -> intent_core::BoxFuture<'a, intent_core::Result<Vec<intent_core::Note>>> {
+                self.record("list_notes");
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn agent_retire(
+                &self,
+                _agent_id: AgentId,
+                _workspace_id: Option<WorkspaceId>,
+                _reason: Option<String>,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+                self.record("agent_retire");
+                Box::pin(async { Ok(json!({ "success": true, "retiredAt": "t" })) })
+            }
         }
         let ws = WorkspaceId::new();
+        let owner = AgentId::from("agent-hooks");
         let api = Arc::new(ProbeApi {
             ws: workspace(&ws),
-            seen: std::sync::Mutex::new((false, None)),
+            seen: std::sync::Mutex::new(Vec::new()),
         });
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws,
-            agent_id: AgentId::from("agent-hooks"),
+            agent_id: owner.clone(),
             name: "caller-probe".to_string(),
-            code: "await ws.workspace.info(); return { dispatch: false };".to_string(),
+            code: "await ws.workspace.info(); await ws.note.list(); \
+                   await ws.agent.retire('probe'); return { dispatch: false };"
+                .to_string(),
             delay_ms: 10_000,
             cron: None,
             run_at: None,
@@ -3967,7 +4014,7 @@ mod tests {
             api.clone(),
             &hook,
             Duration::from_secs(10),
-            &AgentFeaturesSettings::default(),
+            &hook_agent_features(AgentFeaturesSettings::default()),
             false,
             None,
         )
@@ -3976,10 +4023,67 @@ mod tests {
             matches!(outcome, RunOutcome::Continue { .. }),
             "probe script must complete without dispatching"
         );
-        assert_eq!(
-            api.seen.lock().unwrap().clone(),
-            (true, Some(intent_core::Caller::Daemon))
+        let seen = api.seen.lock().unwrap().clone();
+        let reached: Vec<_> = seen.iter().map(|(what, _)| *what).collect();
+        for what in ["get_workspace", "list_notes", "agent_retire"] {
+            assert!(reached.contains(&what), "{what} not reached: {seen:?}");
+        }
+        let owner_caller = Some(intent_core::Caller::Agent { agent_id: owner });
+        assert!(
+            seen.iter().all(|(_, caller)| caller == &owner_caller),
+            "a hook call reached the service without the owner's identity: {seen:?}"
         );
+    }
+
+    /// `ws.desktop` is a hook-only exception: absent from the prelude and its
+    /// frames refused, so a background hook never drives the desktop even
+    /// though it otherwise acts as its owner.
+    #[tokio::test]
+    async fn hook_runs_cannot_control_the_desktop() {
+        let ws = WorkspaceId::new();
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws,
+            agent_id: AgentId::from("agent-hooks"),
+            name: "desktop-probe".to_string(),
+            code: "const installed = typeof ws.desktop; \
+                   let refused = ''; \
+                   try { await host({ method: 'desktop.startControl', args: {} }); } \
+                   catch (e) { refused = String(e); } \
+                   return { dispatch: true, message: installed + '|' + refused };"
+                .to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: None,
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        struct NoApi;
+        impl WorkspaceApi for NoApi {}
+        let outcome = run_hook_script(
+            Arc::new(NoApi),
+            &hook,
+            Duration::from_secs(10),
+            &hook_agent_features(AgentFeaturesSettings::default()),
+            false,
+            None,
+        )
+        .await;
+        let RunOutcome::Dispatch { message, .. } = outcome else {
+            panic!("desktop probe must dispatch its findings");
+        };
+        let (installed, refused) = message.split_once('|').expect("probe message");
+        assert_eq!(installed, "undefined");
+        assert!(refused.contains("desktopControl = false"), "{refused}");
     }
 
     #[tokio::test]
