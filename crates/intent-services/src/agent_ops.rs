@@ -6056,6 +6056,7 @@ impl Services {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -7090,6 +7091,7 @@ impl Services {
             "fileBlocks",
             "isBackground",
             "notificationsMuted",
+            "pinned",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -7299,6 +7301,11 @@ impl Services {
                         )
                     })?;
                 }
+                "pinned" => {
+                    session.pinned = value.as_bool().ok_or_else(|| {
+                        Error::InvalidParams("agent.update: `pinned` must be a boolean".to_string())
+                    })?;
+                }
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
@@ -7346,7 +7353,11 @@ impl Services {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
             }
         }
-        let mute_only = obj.len() == 1 && obj.contains_key("notificationsMuted");
+        // User preferences (mute, sidebar pin) are not agent activity.
+        let preference_only = !obj.is_empty()
+            && obj
+                .keys()
+                .all(|key| key == "notificationsMuted" || key == "pinned");
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -7360,7 +7371,7 @@ impl Services {
         };
         // A preference-only request is not agent activity. Skip the full-row
         // write entirely so it cannot overwrite concurrent session progress.
-        if !mute_only {
+        if !preference_only {
             session.updated_at = now_iso();
             self.store
                 .update_agent_session_with_preferences(
@@ -7369,6 +7380,7 @@ impl Services {
                     remember_specialist && is_manual_foreground_agent(&session),
                     obj.contains_key("notificationsMuted")
                         .then_some(session.notifications_muted),
+                    obj.contains_key("pinned").then_some(session.pinned),
                     // An explicit effort choice — even the level an
                     // Auto-pinned session already carries — clears the Auto
                     // pin in this same write, so the next model switch keeps
@@ -7377,20 +7389,28 @@ impl Services {
                 )
                 .await?;
         }
-        // Mute-only requests retain their narrow write without advancing
-        // activity. Mixed requests apply an explicit mute patch in the session
-        // transaction above; ordinary row writes still exclude this column so
-        // stale sessions cannot revert a toggle. Same-value patches are no-ops.
-        if mute_only {
-            self.store
-                .set_agent_notifications_muted(
-                    &workspace_id,
-                    &agent_id,
-                    session.notifications_muted,
-                )
-                .await?;
+        // Preference-only requests retain their narrow writes without
+        // advancing activity. Mixed requests apply explicit preference patches
+        // in the session transaction above; ordinary row writes still exclude
+        // these columns so stale sessions cannot revert a toggle. Same-value
+        // patches are no-ops.
+        if preference_only {
+            if obj.contains_key("notificationsMuted") {
+                self.store
+                    .set_agent_notifications_muted(
+                        &workspace_id,
+                        &agent_id,
+                        session.notifications_muted,
+                    )
+                    .await?;
+            }
+            if obj.contains_key("pinned") {
+                self.store
+                    .set_agent_pinned(&workspace_id, &agent_id, session.pinned)
+                    .await?;
+            }
         }
-        if mute_only {
+        if preference_only {
             // Return current activity and preference state, including any
             // genuine session update that raced the scoped preference write.
             session = self.store.get_agent_session(&agent_id).await?;
