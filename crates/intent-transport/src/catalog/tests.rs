@@ -2105,11 +2105,12 @@ fn payload_class_parameters_are_well_formed() {
     }
 }
 
-/// Regression: every bulk row's cap matches what its handler enforces.
-/// `terminal.getBuffer` has no hard ring cap (an ACP terminal's
-/// `outputByteLimit` sizes the ring unclamped, and an omitted `maxBytes`
-/// returns all of it), and `workspace.export.read`'s `seq` selects a chunk
-/// rather than sizing it. Update this list together with the handler.
+/// Regression: every bulk row's cap matches what its handler enforces, and
+/// only intentional downloads are bulk. `workspace.export.read`'s `seq`
+/// selects a chunk rather than sizing it. `terminal.getBuffer` must stay a
+/// `BoundedRead`: scrollback replay runs on every terminal open, so moving
+/// it to bulk would silently drop it from the payload sweep. Update this
+/// list together with the handler.
 #[test]
 fn bulk_transfer_caps_match_handlers() {
     let chunk = intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
@@ -2120,7 +2121,6 @@ fn bulk_transfer_caps_match_handlers() {
         ("file.readChunk", Some("length"), chunk),
         ("git.showFile", None, frame),
         ("note.readAsset", None, frame),
-        ("terminal.getBuffer", Some("maxBytes"), frame),
         ("workspace.export.read", None, chunk),
     ]
     .into_iter()
@@ -2138,6 +2138,15 @@ fn bulk_transfer_caps_match_handlers() {
     assert_eq!(
         actual, expected,
         "BulkTransfer rows changed: check each cap against its handler and update this list"
+    );
+    let terminal = PAYLOAD_CLASSES
+        .iter()
+        .find(|row| row.method == "terminal.getBuffer")
+        .expect("terminal.getBuffer is classified");
+    assert_eq!(
+        terminal.class,
+        PayloadClass::BoundedRead,
+        "terminal.getBuffer is a normal operation (replay on every terminal open); keep it BoundedRead so the payload sweep covers it"
     );
 }
 

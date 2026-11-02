@@ -1656,7 +1656,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("task.updateNoteStatus", "Writes task state."),
     mutation("task.updateStatus", "Writes task state."),
     mutation("terminal.create", "Spawns a terminal."),
-    bulk("terminal.getBuffer", Some("maxBytes"), crate::MAX_OUTBOUND_MESSAGE_BYTES, "Raw scrollback replay; maxBytes keeps the tail, and an omitted or negative maxBytes returns the whole ring. The ring defaults to 512 KiB, but an ACP terminal's outputByteLimit sets it without a clamp, so only the outbound frame cap is a hard bound."),
+    bounded("terminal.getBuffer", "Scrollback replay on every terminal open or reconnect, so a normal operation, not a download. maxBytes keeps the tail, but an omitted or negative maxBytes returns the whole ring, which defaults to 512 KiB and an ACP terminal's outputByteLimit sets without a clamp. A known budget offender until maxBytes gets a default and maximum."),
     mutation("terminal.kill", "Kills a terminal."),
     bounded("terminal.list", "Terminals of one workspace."),
     bounded("terminal.readOutput", "Terminal output page (maxLines, paginated)."),
