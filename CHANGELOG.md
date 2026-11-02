@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.104] - 2026-11-02
+
+### 🚀 Features
+
+- Daemon-to-daemon remote agents ([#2910](https://github.com/intent-hq/intentd/pull/2910))
+
+### 📚 Documentation
+
+- *(guide)* Describe the renamed New Workspace source tabs ([#2926](https://github.com/intent-hq/intentd/pull/2926))
+
+### 🧪 Testing
+
+- Refuse out-of-range PR monitor test overrides ([#2937](https://github.com/intent-hq/intentd/pull/2937))
+
+
 ## [0.11.103] - 2026-11-02
 
 ### 🐛 Bug Fixes
