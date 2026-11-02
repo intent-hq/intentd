@@ -43,9 +43,6 @@ pub struct Seeded {
     pub terminal: String,
     /// Script whose output buffer is large.
     pub loud_script: String,
-    /// Script whose escape-heavy, multibyte `command` is larger than one
-    /// reply (`script.get` serves it in parts).
-    pub huge_script: String,
     /// One seeded MCP server id.
     pub mcp_server: String,
     /// The browser-tab host client id.
@@ -1069,25 +1066,6 @@ pub async fn runtime(
         )
         .await;
     expect_ok("script.start", &r);
-
-    // A saved script whose command alone is over the read budget.
-    let r = client
-        .call(
-            "script.create",
-            &json!({
-                "workspaceId": ws,
-                "name": "large-state-huge-command",
-                "command": format!("echo '{}' # {}", "\"".repeat(300_000), "é".repeat(150_000)),
-                "mode": "command",
-            }),
-        )
-        .await;
-    expect_ok("script.create", &r);
-    seeded.huge_script = r.result()["id"]
-        .as_str()
-        .or_else(|| r.result()["script"]["id"].as_str())
-        .unwrap_or_else(|| panic!("script id: {}", r.frame))
-        .to_string();
 
     // MCP servers with long launch configs.
     for i in 0..MCP_SERVERS {

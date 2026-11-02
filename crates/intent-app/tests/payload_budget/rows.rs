@@ -238,6 +238,8 @@ pub struct Ctx<'a> {
     pub thread: String,
     pub conversation: String,
     pub script: String,
+    /// A saved script whose `command` is over one reply (`script.get`).
+    pub huge_script: String,
     pub monitor: String,
     pub worktree: String,
     pub specialist: String,
@@ -1401,12 +1403,12 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 // A command over the budget is served in parts.
                 v(
                     "oversized command",
-                    json!({ "workspaceId": ws, "scriptId": s.huge_script }),
+                    json!({ "workspaceId": ws, "scriptId": c.huge_script }),
                     Bytes(400 * 1024),
                 ),
                 next(
                     "commandOffset",
-                    json!({ "workspaceId": ws, "scriptId": s.huge_script }),
+                    json!({ "workspaceId": ws, "scriptId": c.huge_script }),
                     "/nextCommandOffset",
                     "commandOffset",
                     Bytes(256 * 1024),
