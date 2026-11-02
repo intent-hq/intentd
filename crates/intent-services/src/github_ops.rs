@@ -20,6 +20,10 @@ use intent_sourcecontrol::{
 };
 use serde_json::{json, Value};
 
+/// §5.5 pagination: default page size and the inclusive cap.
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 200;
+
 /// Cap on the repositories one `github.*.search` call may span: the addressed
 /// repo plus the `repos` extras (§5.27).
 pub(crate) const MAX_SEARCH_REPOS: usize = 6;
@@ -91,11 +95,13 @@ pub(crate) fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
     Some(RepoRef::new(owner, repo))
 }
 
-/// Clamp an optional `limit` / `perPage` into the §5.27 `[1, 100]` window
-/// (default 50; GitHub's own `per_page` maximum) and cast to the engine's
-/// `u8` query width.
+/// Clamp an optional `limit` / `perPage` into the §5.5 `[1, 200]` window
+/// (default 50) and cast to the engine's `u8` query width. The engine itself
+/// sends at most 100 per page to GitHub. The byte-budgeted list reads use
+/// [`crate::proxy_page::clamp_page_limit`] (`[1, 100]`) instead; this wider
+/// window also bounds the pages the PR-monitor summary cache accepts.
 pub(crate) fn clamp_limit(limit: Option<i64>) -> u8 {
-    crate::proxy_page::clamp_page_limit(limit)
+    u8::try_from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).expect("clamped to [1, 200]")
 }
 
 /// Wrap an engine-native cursor (a REST page number or a GraphQL end-cursor)
@@ -458,7 +464,7 @@ mod tests {
 
         assert_eq!(clamp_limit(None), 50);
         assert_eq!(clamp_limit(Some(0)), 1);
-        assert_eq!(clamp_limit(Some(9000)), 100);
+        assert_eq!(clamp_limit(Some(9000)), 200);
         assert_eq!(clamp_limit(Some(30)), 30);
     }
 
