@@ -50073,7 +50073,11 @@ async fn mcp_get_message_block_binding_pages_with_next_offset() {
         .await
         .expect("disable toonOutput");
     let id = create_agent(&svc, &ws, "BindingPages").await;
-    let text: String = (0..120_000).map(|i| format!("{i}\n")).collect();
+    let text = (0..120_000).fold(String::new(), |mut out, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "{i}");
+        out
+    });
     let row = svc
         .store()
         .append_agent_message(

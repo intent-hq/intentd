@@ -66,7 +66,7 @@ fn serialized_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
 }
 
-/// Bytes one character costs inside a serde_json string literal.
+/// Bytes one character costs inside a `serde_json` string literal.
 fn escaped_len(c: char) -> usize {
     match c {
         '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
@@ -84,14 +84,14 @@ fn result(
     total_bytes: Option<usize>,
     next_offset: Option<usize>,
 ) -> Value {
-    json!({
-        "block": block,
-        "truncated": truncated,
-        "field": field,
-        "encoding": encoding,
-        "totalBytes": total_bytes,
-        "nextOffset": next_offset,
-    })
+    let mut out = serde_json::Map::new();
+    out.insert("block".to_string(), block);
+    out.insert("truncated".to_string(), json!(truncated));
+    out.insert("field".to_string(), json!(field));
+    out.insert("encoding".to_string(), json!(encoding));
+    out.insert("totalBytes".to_string(), json!(total_bytes));
+    out.insert("nextOffset".to_string(), json!(next_offset));
+    Value::Object(out)
 }
 
 /// The `{ id, type }` stub served when nothing else fits.
@@ -141,7 +141,9 @@ pub fn page_message_block(mut block: Value, page: &MessageBlockPage) -> Result<V
     let Some(field) = field else {
         return unpaged(block, offset, cap);
     };
-    let body = block.get(field).expect("field present");
+    let Some(body) = block.get(field) else {
+        return unpaged(block, offset, cap);
+    };
     let (text, encoding) = match body {
         Value::String(s) => (s.clone(), "text"),
         other => (
