@@ -165,3 +165,37 @@ async fn purged_custom_scripts_stay_empty_before_first_repository_list() {
         "scoped removal must preserve intentional emptiness even without a prior list"
     );
 }
+
+/// Repo-config seeding applies the save-time field caps: an over-cap entry is
+/// skipped (and logged) while the other entries still seed.
+#[intent_test_macros::daemon_test]
+async fn repo_config_scripts_over_the_field_caps_are_skipped() {
+    let h = harness().await;
+    let repo = WorktreeDir::new();
+    std::fs::create_dir_all(repo.0.join(".intent")).unwrap();
+    let config = json!({ "scripts": [
+        { "name": "n".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES + 1), "command": "true", "mode": "command" },
+        { "name": "env-heavy", "command": "true", "mode": "command",
+          "env": { "K": "v".repeat(SCRIPT_ENV_MAX_BYTES) } },
+        { "name": "ok", "command": "true", "mode": "command" },
+    ]});
+    std::fs::write(repo.0.join(".intent/config.json"), config.to_string()).unwrap();
+    sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
+        .bind(repo.0.to_str().unwrap())
+        .bind(h.ws.as_str())
+        .execute(h.services.store().write_pool())
+        .await
+        .unwrap();
+
+    let listed = h.services.script_list(h.ws.clone()).await.unwrap();
+    let names: Vec<&str> = listed["scripts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(names, ["ok"]);
+    let stored = h.services.store().list_all_scripts().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].name, "ok");
+}

@@ -243,6 +243,8 @@ pub struct Ctx<'a> {
     pub thread: String,
     pub conversation: String,
     pub script: String,
+    /// A saved script whose `command` is over one reply (`script.get`).
+    pub huge_script: String,
     pub monitor: String,
     pub worktree: String,
     pub specialist: String,
@@ -1058,13 +1060,31 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         row(
             "hook.list",
             vec![
-                v("default", w.clone(), Items("/hooks", 200)),
+                // Pages stop at `limit` rows (default 100) or the page byte
+                // budget (fewer than 100 of the fixture's hooks).
+                v("default", w.clone(), Items("/hooks", 50)),
                 v(
                     "includeRetired",
                     json!({ "workspaceId": ws, "includeRetired": true }),
-                    Items("/hooks", 200),
+                    Items("/hooks", 50),
+                ),
+                v(
+                    "limit=200",
+                    json!({ "workspaceId": ws, "limit": 200 }),
+                    Items("/hooks", 50),
+                ),
+                next(
+                    "cursor",
+                    json!({ "workspaceId": ws, "limit": 50 }),
+                    "/nextCursor",
+                    "cursor",
+                    Items("/hooks", 50),
                 ),
             ],
+        )
+        .parsed_by(
+            ("intent-svc-runtime/src/hook_manager.rs", "hook_list_page_params", "wire"),
+            &[],
         ),
         fixed(
             "host.checkAuggie",
@@ -1379,21 +1399,49 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         .with_reason("Unscoped, only the global user-override rules are listed."),
         row(
             "script.get",
-            vec![v(
-                "default",
-                json!({ "workspaceId": ws, "scriptId": c.script }),
-                Bytes(1024),
-            )],
+            vec![
+                v(
+                    "default",
+                    json!({ "workspaceId": ws, "scriptId": c.script }),
+                    Bytes(1024),
+                ),
+                // A command over the budget is served in parts.
+                v(
+                    "oversizedCommand",
+                    json!({ "workspaceId": ws, "scriptId": c.huge_script }),
+                    Bytes(400 * 1024),
+                ),
+                next(
+                    "commandOffset",
+                    json!({ "workspaceId": ws, "scriptId": c.huge_script }),
+                    "/nextCommandOffset",
+                    "commandOffset",
+                    Bytes(256 * 1024),
+                ),
+            ],
         )
         .with_reason("One script definition."),
         row(
             "script.list",
             vec![
-                v("default", w.clone(), Items("/scripts", 200)),
+                // Full-view pages: default 100 rows within the byte budget.
+                v("default", w.clone(), Items("/scripts", 100)),
                 v(
                     "view=full",
                     json!({ "workspaceId": ws, "view": "full", "archive": "active" }),
-                    Items("/scripts", 200),
+                    Items("/scripts", 100),
+                ),
+                v(
+                    "view=full+limit=200",
+                    json!({ "workspaceId": ws, "view": "full", "limit": 200 }),
+                    Items("/scripts", 150),
+                ),
+                next(
+                    "view=full+cursor",
+                    json!({ "workspaceId": ws, "view": "full", "limit": 100 }),
+                    "/nextCursor",
+                    "cursor",
+                    Items("/scripts", 100),
                 ),
                 v(
                     "view=summary",

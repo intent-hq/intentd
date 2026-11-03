@@ -24,6 +24,9 @@ use intent_core::{
     ScriptStatus, WorkspaceId,
 };
 use intent_pty::{OutputSink, PtyExit, PtyHost, PtyId, SpawnSpec};
+use intent_services::feature_api::pagination::{
+    tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
+};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -95,6 +98,12 @@ const SCRIPT_SCROLLBACK_BYTES: usize = 64 * 1024;
 /// Trailing bytes of the run log returned as `script.run`'s `output` (the
 /// former whole-scrollback bound).
 const RUN_RESULT_OUTPUT_BYTES: u64 = 512 * 1024;
+/// Row JSON a full-view `script.list` page may carry (always at least one
+/// row), keeping the frame under the 500 KiB read payload budget.
+const FULL_PAGE_MAX_BYTES: usize = 480_000;
+/// Room left for the page envelope (`{"scripts":[…],"nextCursor":…}`)
+/// when one oversized row is fitted on its own.
+const LIST_ENVELOPE_RESERVE: usize = 1024;
 
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
@@ -434,6 +443,55 @@ impl Drop for RunReservation {
     }
 }
 
+/// Largest saved `name`, `cwd` or `category`, in UTF-8 bytes. `command` is
+/// not capped: `script.get` serves an oversized command in parts.
+pub(crate) const SCRIPT_TEXT_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Largest saved `env`: all keys plus all values, in UTF-8 bytes.
+pub(crate) const SCRIPT_ENV_MAX_BYTES: usize = 64 * 1024;
+
+/// Write-time size caps for a script definition. Rows saved before the caps
+/// existed are not rewritten; reads keep serving them as stored.
+fn check_script_field_sizes(params: &ScriptCreateParams) -> Result<()> {
+    check_script_fields(
+        &params.name,
+        params.cwd.as_deref(),
+        params.category.as_deref(),
+        params.env.as_ref(),
+    )
+}
+
+/// The caps behind [`check_script_field_sizes`], shared with repo-config
+/// seeding (which builds rows directly instead of going through create).
+fn check_script_fields(
+    name: &str,
+    cwd: Option<&str>,
+    category: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<()> {
+    let text_fields = [("name", Some(name)), ("cwd", cwd), ("category", category)];
+    for (field, value) in text_fields {
+        let bytes = value.map_or(0, str::len);
+        if bytes > SCRIPT_TEXT_FIELD_MAX_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "script.create: `{field}` is {bytes} bytes; the limit is \
+                 {SCRIPT_TEXT_FIELD_MAX_BYTES} bytes (UTF-8)"
+            )));
+        }
+    }
+    let env_bytes: usize = env
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    if env_bytes > SCRIPT_ENV_MAX_BYTES {
+        return Err(Error::InvalidParams(format!(
+            "script.create: `env` keys and values total {env_bytes} bytes; the limit is \
+             {SCRIPT_ENV_MAX_BYTES} bytes (UTF-8)"
+        )));
+    }
+    Ok(())
+}
+
 impl ScriptManager {
     /// Wire the manager over the shared host/bus/store/registry/bootstrap-locks.
     pub(crate) fn new(
@@ -630,6 +688,8 @@ impl ScriptManager {
         params: ScriptCreateParams,
         scoped: bool,
     ) -> Result<Value> {
+        // Refuse oversized fields before taking any lock or writing anything.
+        check_script_field_sizes(&params)?;
         let id = params
             .script_id
             .filter(|s| !s.is_empty())
@@ -1154,6 +1214,72 @@ impl ScriptManager {
         Ok(page)
     }
 
+    /// One full-view `script.list` page: unarchived definitions plus runtime
+    /// in ascending `(createdAt, id)` order, at most `options.limit` rows and
+    /// [`FULL_PAGE_MAX_BYTES`] of row JSON (always at least one row; a row too
+    /// big on its own drops its largest fields as `<field>Omitted` /
+    /// `<field>Bytes`, read whole via `script.get`), with
+    /// `nextCursor` while more rows follow.
+    pub(crate) async fn full_page(
+        &self,
+        ws: &WorkspaceId,
+        options: &intent_core::script_lists::ScriptListOptions,
+    ) -> Result<Value> {
+        let scope = intent_core::script_lists::full_scope(ws.as_str());
+        let boundary = options.boundary(&scope)?;
+        self.list_filtered_inner(ws, intent_core::ScriptArchiveFilter::Active, false)
+            .await?;
+        let saved_only = self.saved_only(ws).await?;
+        let guard = self.scripts.lock().unwrap();
+        let mut rows: Vec<&ManagedScript> = guard
+            .iter()
+            .filter(|((w, _), m)| {
+                w == ws
+                    && m.def.archived_at.is_none()
+                    && (!saved_only || m.def.purpose == intent_core::ScriptPurpose::Saved)
+            })
+            .map(|(_, m)| m)
+            .filter(|m| {
+                boundary.as_ref().is_none_or(|(created, id)| {
+                    (m.def.created_at.as_str(), m.def.id.as_str()) > (created.as_str(), id.as_str())
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            (a.def.created_at.as_str(), a.def.id.as_str())
+                .cmp(&(b.def.created_at.as_str(), b.def.id.as_str()))
+        });
+        let mut scripts = Vec::new();
+        let mut bytes = 0usize;
+        for m in &rows {
+            let mut row = with_runtime(&m.def, &m.state);
+            intent_services::feature_api::pagination::bound_row(
+                &mut row,
+                FULL_PAGE_MAX_BYTES - LIST_ENVELOPE_RESERVE,
+                &["id", "workspaceId", "createdAt"],
+            );
+            let len = serde_json::to_vec(&row).map_or(0, |v| v.len()) + 1;
+            if scripts.len() == options.limit
+                || (!scripts.is_empty() && bytes + len > FULL_PAGE_MAX_BYTES)
+            {
+                break;
+            }
+            bytes += len;
+            scripts.push(row);
+        }
+        let mut page = json!({ "scripts": [] });
+        if scripts.len() < rows.len() {
+            let last = rows[scripts.len() - 1];
+            page["nextCursor"] = json!(intent_core::script_lists::cursor(
+                &scope,
+                &last.def.created_at,
+                &last.def.id
+            ));
+        }
+        page["scripts"] = Value::Array(scripts);
+        Ok(page)
+    }
+
     pub(crate) async fn get(&self, ws: &WorkspaceId, id: &str) -> Result<Value> {
         let def = self
             .store
@@ -1284,6 +1410,27 @@ impl ScriptManager {
                             let now = now_iso();
                             let scripts: Vec<Script> = repo_scripts
                                 .into_iter()
+                                // Repo config is user-supplied: apply the same
+                                // save-time caps, skipping (not failing on) an
+                                // over-cap entry so the others still seed.
+                                .filter(|repo_script| {
+                                    match check_script_fields(
+                                        &repo_script.name,
+                                        repo_script.cwd.as_deref(),
+                                        None,
+                                        repo_script.env.as_ref(),
+                                    ) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                workspace = %workspace_id,
+                                                error = %e,
+                                                "skipping repo-config script over the field size limit"
+                                            );
+                                            false
+                                        }
+                                    }
+                                })
                                 .map(|repo_script| Script {
                                     purpose: intent_core::ScriptPurpose::Saved,
                                     archived_at: None,
@@ -1637,13 +1784,11 @@ impl ScriptManager {
             if tail.text.trim().is_empty() {
                 return Ok(Value::String("No output yet.".to_string()));
             }
-            let total = tail.total_lines;
-            let header = if total > line_count {
-                format!("[showing last {line_count} of {total} lines]")
-            } else {
-                format!("[{total} lines]")
-            };
-            Ok(Value::String(format!("{header}\n{}", tail.text)))
+            Ok(Value::String(format_output_tail(
+                &tail.text,
+                tail.total_lines,
+                line_count,
+            )))
         })
         .await
         .map_err(|e| Error::Internal(format!("script output read failed: {e}")))?
@@ -2359,11 +2504,11 @@ impl ScriptManager {
         if let Some(n) = max_lines.filter(|n| *n > 0) {
             output = last_n_lines(&output, usize::try_from(n).expect("value fits in usize"));
         }
-        Ok(json!({
-            "exitCode": terminal_exit_code(exit.as_ref()),
-            "output": output,
-            "timedOut": timed_out,
-        }))
+        Ok(run_result(
+            terminal_exit_code(exit.as_ref()),
+            &output,
+            timed_out,
+        ))
     }
 
     /// Once a launch error is observed, its publication and settlement must
@@ -3181,6 +3326,45 @@ fn clamp_line_count(max_lines: Option<i64>, fallback: usize) -> usize {
     .expect("value fits in usize")
 }
 
+/// Header note for a text tail cut to [`OUTPUT_TAIL_MAX_JSON_BYTES`].
+const OUTPUT_TAIL_TRUNCATED_NOTE: &str = "older output omitted to fit the reply size limit";
+
+/// The newest part of `text` that fits [`OUTPUT_TAIL_MAX_JSON_BYTES`] once
+/// JSON-escaped, and whether older output was dropped.
+fn output_tail_within_budget(text: &str) -> (&str, bool) {
+    tail_within_json_bytes(text, OUTPUT_TAIL_MAX_JSON_BYTES)
+}
+
+/// `script.output`'s text: a line-count header, then the tail (already
+/// clamped to `line_count` lines) cut to the newest bytes within the budget.
+fn format_output_tail(tail: &str, total: usize, line_count: usize) -> String {
+    let (text, cut) = output_tail_within_budget(tail);
+    let header = if cut {
+        let shown = text.split('\n').count();
+        format!("[showing last {shown} of {total} lines; {OUTPUT_TAIL_TRUNCATED_NOTE}]")
+    } else if total > line_count {
+        format!("[showing last {line_count} of {total} lines]")
+    } else {
+        format!("[{total} lines]")
+    };
+    format!("{header}\n{text}")
+}
+
+/// `script.run`'s reply: `output` keeps the newest bytes within the reply
+/// budget; `outputTruncated: true` (absent otherwise) marks a cut.
+fn run_result(exit_code: i64, output: &str, timed_out: bool) -> Value {
+    let (output, cut) = output_tail_within_budget(output);
+    let mut reply = json!({
+        "exitCode": exit_code,
+        "output": output,
+        "timedOut": timed_out,
+    });
+    if cut {
+        reply["outputTruncated"] = json!(true);
+    }
+    reply
+}
+
 /// The trailing `n` newline-delimited lines of `text` (mirrors `getLastText`).
 fn last_n_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
@@ -3526,6 +3710,46 @@ mod tests {
              nextest's terminate budget {budget:?} (slow-timeout period {period:?} × \
              terminate-after {terminate_after} in {path}); nextest would SIGKILL a \
              stalled test before the harness deadline fires"
+        );
+    }
+
+    #[test]
+    fn output_tail_keeps_newest_bytes_within_the_reply_budget() {
+        let line = "y".repeat(195);
+        let tail = (0..10_000)
+            .map(|i| format!("{i:05}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = format_output_tail(&tail, 20_000, 10_000);
+        assert!(serde_json::to_string(&out).unwrap().len() <= OUTPUT_TAIL_MAX_JSON_BYTES + 256);
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.starts_with("[showing last ")
+                && header.contains("of 20000 lines; older output omitted"),
+            "{header}"
+        );
+        assert!(out.ends_with(&format!("09999{line}")));
+        assert_eq!(out.lines().nth(1).unwrap().len(), 200);
+        // Short tails are unchanged.
+        assert_eq!(
+            format_output_tail("a\nb", 5, 2),
+            "[showing last 2 of 5 lines]\na\nb"
+        );
+        assert_eq!(format_output_tail("a\nb", 2, 100), "[2 lines]\na\nb");
+    }
+
+    #[test]
+    fn run_result_caps_output_and_flags_the_cut() {
+        // Escape-heavy output: ESC serializes as six bytes.
+        let output = "\u{1b}[0m\n".repeat(200_000);
+        let reply = run_result(0, &output, false);
+        assert_eq!(reply["outputTruncated"], json!(true));
+        assert!(serde_json::to_string(&reply).unwrap().len() < OUTPUT_TAIL_MAX_JSON_BYTES + 256);
+        assert!(output.ends_with(reply["output"].as_str().unwrap()));
+        let small = run_result(-1, "done\n", true);
+        assert_eq!(
+            small,
+            json!({ "exitCode": -1, "output": "done\n", "timedOut": true })
         );
     }
 
@@ -4061,6 +4285,183 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    fn sized_params(
+        name: String,
+        cwd: Option<String>,
+        category: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
+    ) -> ScriptCreateParams {
+        ScriptCreateParams {
+            name,
+            command: "echo sized".into(),
+            mode: ScriptMode::Command,
+            cwd,
+            category,
+            env,
+            ..Default::default()
+        }
+    }
+
+    fn env_of_bytes(total: usize) -> std::collections::BTreeMap<String, String> {
+        // One key `K` plus a value filling the rest, counted in UTF-8 bytes.
+        std::collections::BTreeMap::from([("K".to_string(), "v".repeat(total - 1))])
+    }
+
+    /// Each capped field one byte over its limit is refused with -32602
+    /// naming the field and limit, and nothing is written.
+    #[intent_test_macros::daemon_test]
+    async fn script_create_refuses_each_oversized_field_and_writes_nothing() {
+        let h = harness().await;
+        let over = "a".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES + 1);
+        let cases = [
+            ("name", sized_params(over.clone(), None, None, None)),
+            (
+                "cwd",
+                sized_params("n".into(), Some(over.clone()), None, None),
+            ),
+            (
+                "category",
+                sized_params("n".into(), None, Some(over.clone()), None),
+            ),
+            (
+                "env",
+                sized_params(
+                    "n".into(),
+                    None,
+                    None,
+                    Some(env_of_bytes(SCRIPT_ENV_MAX_BYTES + 1)),
+                ),
+            ),
+        ];
+        for (field, params) in cases {
+            let err = h
+                .services
+                .script_create(h.ws.clone(), params)
+                .await
+                .expect_err(field);
+            let limit = if field == "env" {
+                SCRIPT_ENV_MAX_BYTES
+            } else {
+                SCRIPT_TEXT_FIELD_MAX_BYTES
+            };
+            match &err {
+                Error::InvalidParams(m) => {
+                    assert!(m.contains(&format!("`{field}`")), "{field}: {m}");
+                    assert!(m.contains(&format!("{limit} bytes")), "{field}: {m}");
+                }
+                other => panic!("{field}: expected InvalidParams, got {other:?}"),
+            }
+        }
+        assert!(h
+            .services
+            .store()
+            .list_all_scripts()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Exactly at each limit is accepted, and multi-byte text is counted in
+    /// UTF-8 bytes rather than characters.
+    #[intent_test_macros::daemon_test]
+    async fn script_create_accepts_fields_at_the_limit_and_counts_utf8_bytes() {
+        let h = harness().await;
+        let at = "a".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES);
+        let id = create(
+            &h,
+            sized_params(
+                at.clone(),
+                Some(at.clone()),
+                Some(at.clone()),
+                Some(env_of_bytes(SCRIPT_ENV_MAX_BYTES)),
+            ),
+        )
+        .await;
+        let got = h.services.script_get(h.ws.clone(), id).await.expect("get");
+        assert_eq!(
+            got["name"].as_str().map(str::len),
+            Some(SCRIPT_TEXT_FIELD_MAX_BYTES)
+        );
+        assert_eq!(
+            got["cwd"].as_str().map(str::len),
+            Some(SCRIPT_TEXT_FIELD_MAX_BYTES)
+        );
+
+        // `é` is two bytes: 2048 of them fit exactly, 2049 do not, even
+        // though 2049 characters is far under 4096.
+        let fits = "é".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES / 2);
+        create(&h, sized_params(fits, None, None, None)).await;
+        let over = "é".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES / 2 + 1);
+        let err = h
+            .services
+            .script_create(h.ws.clone(), sized_params(over, None, None, None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("`name`")),
+            "{err:?}"
+        );
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("K".to_string(), "é".repeat(SCRIPT_ENV_MAX_BYTES / 2));
+        let err = h
+            .services
+            .script_create(
+                h.ws.clone(),
+                sized_params("n".into(), None, None, Some(env)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("`env`")),
+            "{err:?}"
+        );
+    }
+
+    /// A row saved before the caps existed is not rewritten: `script.get`
+    /// and `script.list` still serve it as stored.
+    #[intent_test_macros::daemon_test]
+    async fn script_rows_over_the_new_caps_stay_readable() {
+        let h = harness().await;
+        let name = "n".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES * 2);
+        let env = env_of_bytes(SCRIPT_ENV_MAX_BYTES * 2);
+        h.services
+            .store()
+            .upsert_script(&Script {
+                purpose: intent_core::ScriptPurpose::Saved,
+                archived_at: None,
+                last_run: None,
+                id: "legacy-over-cap".into(),
+                workspace_id: h.ws.0.clone(),
+                name: name.clone(),
+                command: "echo legacy".into(),
+                cwd: None,
+                env: Some(env.clone()),
+                mode: ScriptMode::Command,
+                category: None,
+                source: "user".into(),
+                auto_start: Some(false),
+                created_at: now_iso(),
+                updated_at: None,
+            })
+            .await
+            .unwrap();
+        // A restart reloads stored rows into the registry `script.list` reads.
+        h.services.hydrate_scripts().await.expect("hydrate");
+        let got = h
+            .services
+            .script_get(h.ws.clone(), "legacy-over-cap".into())
+            .await
+            .expect("legacy row readable");
+        assert_eq!(got["name"], name);
+        assert_eq!(got["env"]["K"].as_str().map(str::len), Some(env["K"].len()));
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        assert!(listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "legacy-over-cap"));
     }
 
     #[intent_test_macros::daemon_test]

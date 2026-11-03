@@ -470,6 +470,14 @@ pub trait RuntimePort: Send + Sync + 'static {
         include_retired: bool,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    /// Wire `hook.list`: one page of the workspace's hooks.
+    fn hook_list_page<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
     /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
     /// or terminal; hooks from other workspaces read as `NotFound`.
     fn hook_get<'a>(
@@ -1602,6 +1610,15 @@ impl RuntimePort for UnavailableRuntime {
         include_retired: bool,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         DEFAULT_WORKSPACE_API.hook_list(workspace_id, agent_id, include_retired)
+    }
+
+    fn hook_list_page<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_list_page(workspace_id, params)
     }
 
     fn hook_get<'a>(

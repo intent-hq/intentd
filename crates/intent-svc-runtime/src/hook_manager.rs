@@ -87,6 +87,46 @@ pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
+/// Largest `cron` expression `hook.schedule` stores, in UTF-8 bytes. A valid
+/// five-field expression is far shorter; padding (repeated list items,
+/// inner whitespace) must not make the stored row unbounded.
+const HOOK_CRON_MAX_BYTES: usize = 4 * 1024;
+/// Wire `hook.list` page params from `wire`: `includeRetired` (lenient as
+/// before paging: a non-boolean reads as `false`), `limit` (1–200, default
+/// 100) and a nonempty `cursor`. The payload sweep scans this function for
+/// the keys it reads.
+fn hook_list_page_params(wire: &Value) -> Result<(bool, usize, Option<String>)> {
+    let invalid = |what: &str| Error::InvalidParams(format!("hook.list: {what}"));
+    let include_retired = wire
+        .get("includeRetired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let limit = match wire.get("limit") {
+        None => HOOK_LIST_PAGE_DEFAULT_LIMIT,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=HOOK_LIST_PAGE_MAX_LIMIT).contains(n))
+            .ok_or_else(|| invalid("limit must be an integer from 1 to 200"))?,
+    };
+    let cursor = match wire.get("cursor") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| invalid("cursor must be a nonempty string"))?
+                .to_owned(),
+        ),
+    };
+    Ok((include_retired, limit, cursor))
+}
+
+/// Default and maximum rows per wire `hook.list` page.
+const HOOK_LIST_PAGE_DEFAULT_LIMIT: usize = 100;
+const HOOK_LIST_PAGE_MAX_LIMIT: usize = 200;
+/// Row JSON one wire `hook.list` page may carry (always at least one row),
+/// keeping the frame under the 500 KiB read payload budget.
+const HOOK_LIST_PAGE_MAX_BYTES: usize = 480_000;
 
 // Validation runs are inline: their ws.hook.schedule calls re-enter the
 // service before any hook is persisted. Bound the evaluation chain, allowing
@@ -421,6 +461,13 @@ fn parse_schedule_kind(params: &Value) -> Result<ScheduleKind> {
         return Ok(ScheduleKind::Delay(delay_ms));
     }
     if let Some(v) = params.get("cron") {
+        let bytes = v.as_str().map_or(0, str::len);
+        if bytes > HOOK_CRON_MAX_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "hook.schedule: `cron` is {bytes} bytes; the limit is {HOOK_CRON_MAX_BYTES} \
+                 bytes (UTF-8)"
+            )));
+        }
         let expr = v
             .as_str()
             .map(str::trim)
@@ -899,6 +946,7 @@ pub(crate) trait HookServicesExt {
         agent_id: Option<&AgentId>,
         include_retired: bool,
     ) -> Result<Value>;
+    async fn hook_list_page_op(&self, workspace_id: &WorkspaceId, params: &Value) -> Result<Value>;
     async fn hook_get_op(&self, workspace_id: &WorkspaceId, hook_id: &HookId) -> Result<Value>;
     async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value>;
     async fn active_hooks_by_agent(
@@ -1291,6 +1339,62 @@ impl HookServicesExt for Services {
             .list_hook_rows(workspace_id, agent_id, include_retired)
             .await?;
         Ok(json!({ "hooks": hooks }))
+    }
+
+    /// Wire `hook.list`: [`Self::hook_list_op`]'s workspace rows one page at
+    /// a time — `limit?` (1–200, default 100) rows and at most
+    /// [`HOOK_LIST_PAGE_MAX_BYTES`] of row JSON (always at least one row; a
+    /// row too big on its own drops its largest fields as `<field>Omitted` /
+    /// `<field>Bytes`),
+    /// oldest first, with `nextCursor` while more rows follow. The cursor is
+    /// bound to the workspace and `includeRetired`.
+    async fn hook_list_page_op(&self, workspace_id: &WorkspaceId, params: &Value) -> Result<Value> {
+        let (include_retired, limit, cursor) = hook_list_page_params(params)?;
+        let scope = json!(["hook.list", workspace_id.as_str(), include_retired]).to_string();
+        let boundary = intent_core::script_lists::ScriptListOptions {
+            summary: false,
+            limit,
+            cursor,
+        }
+        .boundary(&scope)
+        .map_err(|_| Error::InvalidParams("hook.list: invalid or mismatched cursor".into()))?;
+        let rows = self
+            .store()
+            .list_hook_rows_page(
+                workspace_id,
+                include_retired,
+                boundary.as_ref().map(|(c, id)| (c.as_str(), id.as_str())),
+                limit + 1,
+            )
+            .await?;
+        let mut hooks = Vec::new();
+        let mut bytes = 0usize;
+        for (_, row) in &rows {
+            let mut value =
+                serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))?;
+            intent_services::feature_api::pagination::bound_row(
+                &mut value,
+                HOOK_LIST_PAGE_MAX_BYTES - 1024,
+                &["hookId", "workspaceId", "agentId", "createdAt", "status"],
+            );
+            let len = serde_json::to_vec(&value).map_or(0, |v| v.len()) + 1;
+            if hooks.len() == limit || (!hooks.is_empty() && bytes + len > HOOK_LIST_PAGE_MAX_BYTES)
+            {
+                break;
+            }
+            bytes += len;
+            hooks.push(value);
+        }
+        let mut page = json!({ "hooks": [] });
+        if hooks.len() < rows.len() {
+            let created_at = &rows[hooks.len() - 1].0;
+            let id = hooks[hooks.len() - 1]["hookId"]
+                .as_str()
+                .unwrap_or_default();
+            page["nextCursor"] = json!(intent_core::script_lists::cursor(&scope, created_at, id));
+        }
+        page["hooks"] = Value::Array(hooks);
+        Ok(page)
     }
 
     /// `hook.get` (MCP-only): one hook row by id — the full row including
@@ -3264,6 +3368,78 @@ mod tests {
         assert_eq!(stored.run_at, None);
     }
 
+    /// `cron` is capped at 4 KiB of UTF-8 before parsing. The padded
+    /// expressions here are valid (inner whitespace), so only the size
+    /// decides: one byte over is refused and nothing is stored; exactly at
+    /// the limit schedules.
+    #[tokio::test]
+    async fn schedule_caps_cron_expression_bytes() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let padded = |total: usize| {
+            let tail = "* * * *";
+            format!("0{}{tail}", " ".repeat(total - 1 - tail.len()))
+        };
+        let over = padded(HOOK_CRON_MAX_BYTES + 1);
+        assert_eq!(over.len(), HOOK_CRON_MAX_BYTES + 1);
+        parse_cron(&over).expect("padding keeps the expression valid");
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "big-cron", "code": "return;", "cron": over }),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`cron`") && msg.contains(&format!("{HOOK_CRON_MAX_BYTES} bytes")),
+            "{msg}"
+        );
+        assert!(svc
+            .store()
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let at = padded(HOOK_CRON_MAX_BYTES);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "max-cron", "code": "return { dispatch: false };", "cron": at }),
+            )
+            .await
+            .expect("cron at the limit schedules");
+        assert_eq!(
+            out["hook"]["cron"].as_str().map(str::len),
+            Some(HOOK_CRON_MAX_BYTES)
+        );
+
+        // A row stored before the cap is not rewritten and stays readable.
+        let scheduled: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        let legacy = Hook {
+            hook_id: HookId::new(),
+            name: "legacy-cron".into(),
+            cron: Some(padded(HOOK_CRON_MAX_BYTES * 2)),
+            ..scheduled
+        };
+        svc.store().insert_hook(&legacy).await.unwrap();
+        let stored = svc.store().get_hook(&legacy.hook_id).await.unwrap();
+        assert_eq!(stored.cron, legacy.cron);
+        let listed = svc.hook_list_op(&ws, None, false).await.unwrap();
+        let row = listed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == "legacy-cron")
+            .expect("legacy hook listed");
+        assert_eq!(
+            row["cron"].as_str().map(str::len),
+            Some(HOOK_CRON_MAX_BYTES * 2)
+        );
+    }
+
     /// runAt-kind validation: non-RFC3339 and past timestamps are rejected,
     /// as are `perpetual` and `ttlMs` combinations; a valid future timestamp
     /// schedules with `runAt` normalized to UTC and expiry = fire + 1h.
@@ -3391,6 +3567,128 @@ mod tests {
             .expect("schedule cron hook");
         assert_eq!(out["hook"]["cron"], json!("0 * * * *"));
         assert!(!out["hook"].as_object().unwrap().contains_key("runAt"));
+    }
+
+    #[tokio::test]
+    async fn hook_list_pages_follow_cursors_and_respect_the_byte_budget() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let pad = "x".repeat(200 * 1024);
+        for i in 0..5 {
+            let code = if i < 3 {
+                format!("return {{ dispatch: false }}; // {pad}")
+            } else {
+                "return { dispatch: false };".to_string()
+            };
+            svc.hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": format!("h{i}"), "code": code, "delayMs": 60_000 }),
+            )
+            .await
+            .expect("schedule");
+        }
+        let all = svc.hook_list_op(&ws, None, false).await.unwrap();
+        let ids: Vec<Value> = all["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["hookId"].clone())
+            .collect();
+        assert_eq!(ids.len(), 5);
+
+        // Three 200 KiB hooks: the byte budget stops the first page at two.
+        let first = svc.hook_list_page_op(&ws, &json!({})).await.unwrap();
+        let mut seen: Vec<Value> = first["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["hookId"].clone())
+            .collect();
+        assert_eq!(seen.len(), 2);
+        assert!(serde_json::to_vec(&first).unwrap().len() < 500 * 1024);
+        let mut cursor = first["nextCursor"].as_str().expect("more pages").to_owned();
+        loop {
+            let page = svc
+                .hook_list_page_op(&ws, &json!({ "limit": 2, "cursor": cursor }))
+                .await
+                .unwrap();
+            let rows = page["hooks"].as_array().unwrap();
+            assert!(!rows.is_empty() && rows.len() <= 2);
+            seen.extend(rows.iter().map(|h| h["hookId"].clone()));
+            match page.get("nextCursor") {
+                Some(next) => cursor = next.as_str().unwrap().to_owned(),
+                None => break,
+            }
+        }
+        let key = |v: &Value| v.as_str().unwrap().to_owned();
+        let mut got: Vec<String> = seen.iter().map(key).collect();
+        let mut want: Vec<String> = ids.iter().map(key).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "pages cover every hook exactly once");
+
+        for bad in [
+            json!({ "limit": 0 }),
+            json!({ "limit": 201 }),
+            json!({ "cursor": "" }),
+            json!({ "cursor": "not-a-cursor" }),
+            json!({ "includeRetired": true, "cursor": first["nextCursor"] }),
+        ] {
+            assert!(
+                matches!(
+                    svc.hook_list_page_op(&ws, &bad).await,
+                    Err(Error::InvalidParams(_))
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_list_bounds_an_oversized_singleton_row() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let quotes = "\"".repeat(300_000);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let code = if i == 1 {
+                format!("return {{ dispatch: false }}; // {quotes}")
+            } else {
+                "return { dispatch: false };".to_string()
+            };
+            let out = svc
+                .hook_schedule_op(
+                    &ws,
+                    &owner,
+                    &json!({ "name": format!("h{i}"), "code": code, "delayMs": 60_000 }),
+                )
+                .await
+                .expect("schedule");
+            ids.push(out["hook"]["hookId"].as_str().unwrap().to_owned());
+        }
+        let mut seen = Vec::new();
+        let mut params = json!({});
+        loop {
+            let page = svc.hook_list_page_op(&ws, &params).await.unwrap();
+            let size = serde_json::to_vec(&page).unwrap().len();
+            assert!(size <= HOOK_LIST_PAGE_MAX_BYTES, "page is {size} bytes");
+            for row in page["hooks"].as_array().unwrap() {
+                seen.push(row["hookId"].as_str().unwrap().to_owned());
+                if row["name"] == "h1" {
+                    assert!(row.get("code").is_none(), "oversized code omitted");
+                    assert_eq!(row["codeOmitted"], true);
+                    assert!(row["codeBytes"].as_u64().unwrap() > 300_000);
+                } else {
+                    assert!(row["code"].is_string());
+                }
+            }
+            match page.get("nextCursor") {
+                Some(next) => params = json!({ "limit": 1, "cursor": next }),
+                None => break,
+            }
+        }
+        seen.sort();
+        ids.sort();
+        assert_eq!(seen, ids, "pages cover every hook exactly once");
     }
 
     #[tokio::test]

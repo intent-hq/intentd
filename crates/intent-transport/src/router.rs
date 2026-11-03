@@ -864,6 +864,39 @@ fn discussion_limit(params: &Map<String, Value>) -> std::result::Result<u32, Rpc
         .map(|v| v.unwrap_or(50))
 }
 
+/// Bytes a single-definition read may carry: the shared 480,000-byte page
+/// budget, so the frame stays under the 500 KiB read payload budget.
+const SINGLE_READ_BUDGET_BYTES: usize = 480_000;
+
+/// `script.get` (bounded reads, §5.8): one definition, with a `command`
+/// too big for one reply served in parts (`commandOffset` in,
+/// `nextCommandOffset` out). Kept out of [`dispatch`] and awaited boxed, so
+/// its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_script_get(
+    params: &Map<String, Value>,
+    api: &dyn WorkspaceApi,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let offset = match params.get("commandOffset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .ok_or_else(|| invalid_params("commandOffset must be a positive integer"))?,
+    };
+    let mut row = api
+        .script_get(ws, require_str_param(params, "scriptId")?)
+        .await
+        .map_err(domain_to_rpc)?;
+    intent_core::text_field_page::page_text_field(
+        &mut row,
+        "command",
+        offset,
+        SINGLE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(row)
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
 async fn dispatch(
     api: &dyn WorkspaceApi,
@@ -5222,12 +5255,7 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
-        "script.get" => {
-            let ws = require_ws_note(params)?;
-            api.script_get(ws, require_str_param(params, "scriptId")?)
-                .await
-                .map_err(domain_to_rpc)
-        }
+        "script.get" => crate::stack_frame::boxed_await(|| bounded_script_get(params, api)).await,
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
@@ -5394,8 +5422,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             // Active hooks only by default; `includeRetired` appends the
             // terminal rows as a light projection (no code/lastState/lastLogs).
-            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
-            api.hook_list(ws, None, include_retired)
+            // Paged: `limit?` (1–200, default 100), `cursor?`, plus a byte
+            // budget per page; `nextCursor` while more rows follow.
+            api.hook_list_page(ws, Value::Object(params.clone()))
                 .await
                 .map_err(domain_to_rpc)
         }

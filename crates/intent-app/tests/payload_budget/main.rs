@@ -66,6 +66,7 @@ fn placeholder_ctx(seeded: &seed::Seeded) -> rows::Ctx<'_> {
         thread: "thread".into(),
         conversation: "conversation".into(),
         script: "script".into(),
+        huge_script: "huge-script".into(),
         monitor: "monitor".into(),
         worktree: "/tmp".into(),
         specialist: "specialist".into(),

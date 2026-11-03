@@ -9242,6 +9242,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Wire `hook.list`: one page of [`Self::hook_list`]'s workspace rows.
+    /// `params` carries `includeRetired?`, `limit?` (1–200, default 100) and
+    /// `cursor?`; the reply is `{ hooks, nextCursor? }`.
+    fn hook_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_list_page not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `ws.hook.get` (MCP-only, no wire method): one hook row by id — the
     /// full row including `code`, for active AND terminal (retired) hooks,
     /// so an agent can recover a retired hook's script to re-arm it. Hooks

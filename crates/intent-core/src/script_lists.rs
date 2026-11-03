@@ -57,6 +57,26 @@ impl ScriptListOptions {
             cursor,
         })
     }
+    /// [`Self::parse`] for `script.list` on the wire, which also pages the
+    /// full view: `limit` (1–200, default 100) and `cursor` are accepted with
+    /// an omitted or `"full"` view. Other views parse as [`Self::parse`].
+    /// # Errors
+    /// Returns invalid parameters for unsupported filters or paging inputs.
+    pub fn parse_full_pages(value: &Value) -> Result<Self> {
+        if value
+            .get("view")
+            .is_some_and(|v| v.as_str() != Some("full"))
+        {
+            return Self::parse(value, false);
+        }
+        let mut summary = value.clone();
+        if let Some(map) = summary.as_object_mut() {
+            map.insert("view".into(), json!("summary"));
+        }
+        let mut options = Self::parse(&summary, false)?;
+        options.summary = false;
+        Ok(options)
+    }
     /// Decode a keyset scoped to its collection and effective owner.
     /// # Errors
     /// Rejects malformed or differently scoped cursors.
@@ -90,6 +110,11 @@ struct Cursor {
 #[must_use]
 pub fn scope(method: &str, workspace: &str, owner: Option<&str>) -> String {
     json!([method, workspace, "summary", "active", owner]).to_string()
+}
+/// Cursor scope of a full-view `script.list` page.
+#[must_use]
+pub fn full_scope(workspace: &str) -> String {
+    json!(["script.list", workspace, "full", "active", null]).to_string()
 }
 #[must_use]
 pub fn cursor(scope: &str, created_at: &str, id: &str) -> String {
@@ -142,6 +167,43 @@ mod tests {
         ] {
             assert!(ScriptListOptions::parse(&value, true).is_err());
         }
+    }
+    #[test]
+    fn full_pages_accept_limit_and_cursor_only_on_the_wire_parser() {
+        for value in [
+            json!({}),
+            json!({"view":"full"}),
+            json!({"limit":10}),
+            json!({"view":"full","limit":200,"cursor":"c"}),
+        ] {
+            let options = ScriptListOptions::parse_full_pages(&value).unwrap();
+            assert!(!options.summary, "{value}");
+        }
+        assert_eq!(
+            ScriptListOptions::parse_full_pages(&json!({}))
+                .unwrap()
+                .limit,
+            100
+        );
+        for value in [
+            json!({"limit":0}),
+            json!({"limit":201}),
+            json!({"cursor":""}),
+            json!({"view":"bogus"}),
+            json!({"archive":"all"}),
+        ] {
+            assert!(
+                ScriptListOptions::parse_full_pages(&value).is_err(),
+                "{value}"
+            );
+        }
+        assert!(
+            ScriptListOptions::parse_full_pages(&json!({"view":"summary"}))
+                .unwrap()
+                .summary
+        );
+        assert!(ScriptListOptions::parse(&json!({"limit":10}), false).is_err());
+        assert_ne!(full_scope("a"), scope("script.list", "a", None));
     }
     #[test]
     fn keysets_are_scoped_and_unicode_prefixes_are_byte_bounded() {

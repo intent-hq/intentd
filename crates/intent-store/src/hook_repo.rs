@@ -320,6 +320,54 @@ impl Store {
         rows.iter().map(hook_list_row_from_row).collect()
     }
 
+    /// One `hook.list` page: [`Self::list_hook_rows`]' rows (whole workspace)
+    /// in ascending `(created_at, hook_id)` order, strictly after `after`,
+    /// at most `limit` rows. Callers read `limit + 1` to learn whether
+    /// another page follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_hook_rows_page(
+        &self,
+        workspace_id: &WorkspaceId,
+        include_retired: bool,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(String, HookListRow)>> {
+        let state_clause = if include_retired {
+            ""
+        } else {
+            " AND state IN ('scheduled', 'running')"
+        };
+        let after_clause = if after.is_some() {
+            " AND (created_at, hook_id) > (?, ?)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {LIST_COLUMNS} FROM hook WHERE workspace_id = ?{state_clause}{after_clause} \
+             ORDER BY created_at, hook_id LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        if let Some((created_at, hook_id)) = after {
+            query = query.bind(created_at).bind(hook_id);
+        }
+        let rows = query
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("list hook page failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.get::<String, _>("created_at"),
+                    hook_list_row_from_row(row)?,
+                ))
+            })
+            .collect()
+    }
+
     /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
     /// a count-only aggregate for per-turn surfaces (the agent state
     /// snapshot): no `code`/`last_state` blob hydration and no dependence on

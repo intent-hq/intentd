@@ -68,6 +68,7 @@ pub mod settings_file;
 pub mod slug;
 pub mod startup;
 pub mod test_isolation;
+pub mod text_field_page;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;

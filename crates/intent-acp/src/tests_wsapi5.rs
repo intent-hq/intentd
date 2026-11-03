@@ -33,6 +33,8 @@ struct FakeApi {
     script_list_calls: Mutex<u32>,
     script_monitor_calls: Mutex<Vec<Value>>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
+    /// When set, `script_create` fails with this `InvalidParams` message.
+    script_create_error: Mutex<Option<String>>,
     script_start_calls: Mutex<Vec<String>>,
     script_start_monitor_calls: Mutex<Vec<Value>>,
     script_output_calls: Mutex<Vec<(String, Option<i64>)>>,
@@ -359,7 +361,13 @@ impl WorkspaceApi for FakeApi {
             .lock()
             .unwrap()
             .push(params.clone());
-        Box::pin(async move { Ok(json!({ "id": "s-1" })) })
+        let refused = self.script_create_error.lock().unwrap().clone();
+        Box::pin(async move {
+            match refused {
+                Some(message) => Err(Error::InvalidParams(message)),
+                None => Ok(json!({ "id": "s-1" })),
+            }
+        })
     }
 
     fn script_monitor(
@@ -1300,6 +1308,19 @@ async fn script_create_rejects_non_object_env() {
     assert_eq!(resp["result"]["isError"], json!(true));
     assert!(text(&resp).contains("env must be an object"));
     assert!(api.script_create_calls.lock().unwrap().is_empty());
+}
+
+/// A daemon refusal (here the write-time size cap) reaches the agent as a
+/// tool error carrying the daemon's message, naming the field and limit.
+#[tokio::test]
+async fn script_create_surfaces_the_daemon_size_cap_error() {
+    let (srv, api) = server();
+    let message = "script.create: `name` is 4097 bytes; the limit is 4096 bytes (UTF-8)";
+    *api.script_create_error.lock().unwrap() = Some(message.to_string());
+    let resp = call(&srv, "return await ws.script.create('n', 'c', 'command');").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let t = text(&resp);
+    assert!(t.contains(message), "unexpected error: {t}");
 }
 
 #[tokio::test]

@@ -21711,6 +21711,11 @@ impl WorkspaceApi for Services {
                 agent_id: Option<AgentId>,
                 include_retired: bool,
             ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_list;
+            fn hook_list_page(
+                &self,
+                workspace_id: WorkspaceId,
+                params: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_list_page;
             fn hook_get(&self, workspace_id: WorkspaceId, hook_id: intent_core::HookId)
                 -> BoxFuture<'_, Result<serde_json::Value>> => hook_get;
             fn hook_cancel(

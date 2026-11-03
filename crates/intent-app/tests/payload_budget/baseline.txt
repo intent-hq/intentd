@@ -6,8 +6,6 @@ crossWorkspace.readNote default 2592598
 git.branchDiff baseCommitSha 819758
 git.branchDiff baseRef 1639071
 git.diffs default 3370597
-hook.list default 1446613
-hook.list includeRetired 1446613
 note.get default 1243703
 note.lineAttribution.load default 2095568
 note.list default 2971285
@@ -15,8 +13,3 @@ note.list projection=full 2971285
 note.listTasks default 594422
 note.subscribe default 2971364
 note.subscribe maxContentBytes 957071
-script.list default 1404298
-script.list view=full 1404298
-script.output maxLines=100000 779996
-terminal.getBuffer default 699219
-terminal.readOutput maxLines=100000 541323

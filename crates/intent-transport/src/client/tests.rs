@@ -159,6 +159,7 @@ async fn mints_client_id_when_omitted() {
     assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
     assert_eq!(server["capabilities"]["scriptMonitors"], 2);
     assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
+    assert_eq!(server["capabilities"]["boundedReads"], 1);
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(
         server["version"],
