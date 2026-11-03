@@ -18,8 +18,8 @@ use tokio_tungstenite::WebSocketStream;
 
 use intent_core::link_traffic::{LinkTap, TrafficDirection};
 use intent_core::node_link::{
-    LeaseBinding, LinkChannel, LinkFrame, LinkId, LinkOutcome, LinkRequest, LinkRpcError,
-    ScriptOutput, StopId, StopOutcome, SCRIPT_OUTPUT_QUEUE_BYTES,
+    FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkId, LinkOutcome, LinkRequest,
+    LinkRpcError, ScriptOutput, StopId, StopOutcome, SCRIPT_OUTPUT_QUEUE_BYTES,
 };
 use intent_core::{AgentId, Error, Result};
 
@@ -175,7 +175,16 @@ fn closed_error() -> Error {
 /// The callers waiting for one stop's acknowledgement.
 struct PendingStop {
     agent_id: AgentId,
-    waiters: Vec<oneshot::Sender<StopOutcome>>,
+    waiters: Vec<oneshot::Sender<StopAcked>>,
+}
+
+/// What a machine's `stopAck` reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopAcked {
+    pub outcome: StopOutcome,
+    /// How a final stop's WIP push went; `None` on a plain stop's ack (and
+    /// from a machine below nodeProtocol 9).
+    pub final_push: Option<FinalPush>,
 }
 
 /// Withdraws a [`NodeLink::stop`] caller's waiter when it gives up (timeout,
@@ -615,6 +624,24 @@ impl NodeLink {
         stop_id: StopId,
         timeout: Duration,
     ) -> Result<StopOutcome> {
+        self.stop_with(agent_id, stop_id, false, timeout)
+            .await
+            .map(|acked| acked.outcome)
+    }
+
+    /// [`Self::stop`], sending a final stop (nodeProtocol 9) when
+    /// `final_stop`; the acknowledgement reports how its push went.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stop`].
+    pub async fn stop_with(
+        &self,
+        agent_id: AgentId,
+        stop_id: StopId,
+        final_stop: bool,
+        timeout: Duration,
+    ) -> Result<StopAcked> {
         if self.is_closed() {
             return Err(closed_error());
         }
@@ -637,7 +664,11 @@ impl NodeLink {
         if self.is_closed() {
             return Err(closed_error());
         }
-        let frame = LinkFrame::Stop { agent_id, stop_id };
+        let frame = LinkFrame::Stop {
+            agent_id,
+            stop_id,
+            final_stop,
+        };
         let exchange = async {
             self.send_any(&frame, None).await?;
             rx.await.map_err(|_| closed_error())
@@ -859,13 +890,17 @@ async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<I
             stop_id,
             agent_id,
             outcome,
+            final_push,
         } => {
             let mut stops = lock(&inner.stops);
             match stops.get(&stop_id) {
                 Some(pending) if pending.agent_id == agent_id => {
                     if let Some(pending) = stops.remove(&stop_id) {
                         for waiter in pending.waiters {
-                            let _ = waiter.send(outcome);
+                            let _ = waiter.send(StopAcked {
+                                outcome,
+                                final_push,
+                            });
                         }
                     }
                 }

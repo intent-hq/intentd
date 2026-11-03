@@ -186,6 +186,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          and an imported agent does not run on the source head's node",
     ),
     (
+        "remote_final_stop",
+        "pending final stops this head owes a machine under its own lease (stop ids, a local \
+         repository path); the target head has no such lease, so it could neither send nor \
+         receive them",
+    ),
+    (
         "executor_credential",
         "credentials this machine minted for backends are daemon-wide execution authority \
          bound to this installation's owner, not workspace state; a target must mint its own",

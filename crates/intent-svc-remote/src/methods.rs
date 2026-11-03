@@ -435,11 +435,24 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         if running > 0 && !stop_agents {
             return Err(in_use(&row.name, running));
         }
-        let stopped = node.stop_all();
+        let stopped = node.stop_all().await;
         deliver_stops(feature, &node, &stopped, &row.name).await?;
     }
     if let Some(node) = feature.take_node(&machine_id) {
         node.shutdown();
+    }
+    // The machine is forgotten: no connector will resend a final stop it
+    // did not acknowledge (it was revoked), so their records go too.
+    let head_id = store.daemon_id().await?;
+    for lease in store.list_owned_node_leases(&head_id).await? {
+        if lease.owner.node_id != machine_id {
+            continue;
+        }
+        for stop in store.list_final_stops(&lease.owner.lease_id).await? {
+            store
+                .finish_final_stop(&stop.agent_id, &stop.stop_id)
+                .await?;
+        }
     }
     let credential = store.remove_exposed_machine(&machine_id).await?;
     svc.delete_remote_machine_token(&machine_id).await?;
@@ -527,7 +540,8 @@ fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
 /// forgotten: the machine keeps its agents running across a lost link, and
 /// once its credential and lease are gone nothing could reach them. Waits at
 /// most [`crate::connector::Tuning::remove_timeout`] (30 s), the connect
-/// included. When any stop is unacknowledged the removal fails
+/// included, or [`crate::connector::Tuning::final_remove_timeout`] (90 s, to
+/// fit the machine's 60 s final push) once the link speaks nodeProtocol 9. When any stop is unacknowledged the removal fails
 /// `machine-unreachable` with `unconfirmedStops` and everything stays, the
 /// stops still queued and resent. A revoked credential needs no stops.
 async fn deliver_stops(
@@ -539,7 +553,8 @@ async fn deliver_stops(
     if agents.is_empty() {
         return Ok(());
     }
-    let deadline = tokio::time::Instant::now() + feature.tuning().remove_timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + feature.tuning().remove_timeout;
     let mut attempts = json!([]);
     // A connect that does not finish in time leaves the stops unconfirmed.
     if let Ok(Err(error)) = tokio::time::timeout_at(deadline, node.connect()).await {
@@ -557,6 +572,7 @@ async fn deliver_stops(
     let unconfirmed = if attempts.as_array().is_some_and(|a| !a.is_empty()) {
         node.wait_stops(agents, tokio::time::Instant::now()).await
     } else {
+        let deadline = started + node.shared_ref().remove_budget();
         node.wait_stops(agents, deadline).await
     };
     if unconfirmed.is_empty() {

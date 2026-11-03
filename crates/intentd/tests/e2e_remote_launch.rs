@@ -1101,3 +1101,138 @@ async fn deleting_a_running_local_agent_stops_its_provider() {
     .await
     .expect("agent.delete stops the local agent's provider process tree");
 }
+
+/// Deleting a remote agent ends it for good: without a prior stop, its
+/// machine pushes its work one last time (landing as its `wip` ref) and
+/// then removes its checkout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_remote_agent_pushes_its_work_then_removes_its_checkout() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote final stop e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-final-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi await ws.file.write("turn.txt", "turn work"); return "ok";"#,
+        50,
+    )
+    .await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    // The turn's end pushes `wip` on its own; wait for it, so only the
+    // final stop can carry what is written next.
+    let turn_wip = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
+                if git(&repo, &["ls-tree", "--name-only", &wip])
+                    .lines()
+                    .any(|f| f == "turn.txt")
+                {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the turn-end push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the turn-end wip lands on head");
+    let checkout = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id);
+    // Unsaved work after the last turn, written straight into the checkout.
+    std::fs::write(checkout.join("work").join("final.txt"), "unsaved work").unwrap();
+
+    ok(
+        &mut rpc_ws,
+        60,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let wip = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
+                if wip != turn_wip {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the machine's final push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the final push lands a new wip on head");
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:final.txt")]),
+        "unsaved work"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:turn.txt")]),
+        "turn work"
+    );
+    timeout(wait(), async {
+        while checkout.exists() {
+            // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the machine removes the checkout after the push");
+}

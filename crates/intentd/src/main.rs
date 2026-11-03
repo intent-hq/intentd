@@ -2564,6 +2564,11 @@ async fn cmd_serve_owned(
     // demand; hand the feature the tailcat binary for their tailcat routes.
     // Node mode never starts a connector.
     services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
+    // The hook that checks machines' git pushes into agent refs, installed
+    // fresh under the data dir; without it every such push is refused.
+    if let Err(error) = intent_git::node_git::configure_receive_hooks(&config.data_dir) {
+        tracing::error!(%error, "remote machines: could not install the git receive hook; machine pushes will be refused");
+    }
     // Machines that may still run this backend's agents reconnect on their
     // own after a restart, in the background, so a machine that is down
     // never slows the start.

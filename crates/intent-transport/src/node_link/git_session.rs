@@ -135,12 +135,15 @@ fn close_message(session: u32, error: Option<&'static str>) -> Vec<u8> {
 
 /// Head's authority over node git sessions.
 pub trait NodeGitAccess: Send + Sync {
-    /// The repository holding `remote`'s refs, only if `binding` is the
-    /// node's current binding and `remote`'s agent runs on its lease.
+    /// The repository holding `remote`'s refs for `service`, only if
+    /// `binding` is the node's current binding and `remote`'s agent runs on
+    /// its lease. An error carrying [`codes::UNAVAILABLE`] closes the session
+    /// with that code; any other refuses it ([`codes::DENIED`]).
     fn repository<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>>;
 }
 
@@ -231,6 +234,17 @@ async fn head_session(
     id
 }
 
+/// The session code for an access refusal: [`codes::UNAVAILABLE`] when the
+/// error says so, [`codes::DENIED`] otherwise.
+fn access_code(error: &intent_core::Error) -> &'static str {
+    match error {
+        intent_core::Error::Internal(message) if message.starts_with(codes::UNAVAILABLE) => {
+            codes::UNAVAILABLE
+        }
+        _ => codes::DENIED,
+    }
+}
+
 async fn run_service(
     id: u32,
     open: &[u8],
@@ -243,10 +257,11 @@ async fn run_service(
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
     let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
     let repository = access
-        .repository(binding, &remote)
+        .repository(binding, &remote, service)
         .await
-        .map_err(|_| codes::DENIED)?;
+        .map_err(|error| access_code(&error))?;
     let mut child = service_command(service, &repository, &remote)
+        .map_err(|_| codes::FAILED)?
         .spawn()
         .map_err(|_| codes::FAILED)?;
     let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -640,3 +655,25 @@ async fn serve_helper(stream: tokio::net::UnixStream, sessions: &NodeGitSessions
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod access_code_tests {
+    use super::*;
+
+    #[test]
+    fn an_unavailable_repository_is_not_reported_as_denied() {
+        let unavailable = intent_core::Error::Internal(format!(
+            "{}: the workspace's repository is gone",
+            codes::UNAVAILABLE
+        ));
+        assert_eq!(access_code(&unavailable), codes::UNAVAILABLE);
+        assert_eq!(
+            access_code(&intent_core::Error::Forbidden("node-git-denied".into())),
+            codes::DENIED
+        );
+        assert_eq!(
+            access_code(&intent_core::Error::Internal("boom".into())),
+            codes::DENIED
+        );
+    }
+}

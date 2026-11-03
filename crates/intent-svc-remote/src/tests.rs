@@ -61,6 +61,12 @@ fn tuning() -> Tuning {
         capabilities_timeout: wait(),
         stop_resend: Backoff::new(Duration::from_millis(150), Duration::from_millis(600)),
         remove_timeout: wait(),
+        final_remove_timeout: wait(),
+        stop_wait: wait(),
+        final_stop_bound: intent_core::remote_launch::FINAL_STOP_BOUND,
+        legacy_push_grace: Duration::from_millis(100),
+        final_stop_check: Duration::from_millis(50),
+        clock: crate::final_stop::Clock::default(),
         connect: ConnectTuning {
             attempt: Duration::from_millis(500),
             total: wait(),
@@ -409,7 +415,9 @@ impl NodeEnd {
     /// frames.
     async fn stop_for(&mut self, agent: &AgentId) -> StopId {
         self.expect(|frame| match frame {
-            LinkFrame::Stop { agent_id, stop_id } if agent_id == *agent => Some(stop_id),
+            LinkFrame::Stop {
+                agent_id, stop_id, ..
+            } if agent_id == *agent => Some(stop_id),
             _ => None,
         })
         .await
@@ -422,6 +430,7 @@ impl NodeEnd {
                 stop_id,
                 agent_id: agent.clone(),
                 outcome,
+                final_push: None,
             })
             .await
             .unwrap();
@@ -1466,7 +1475,9 @@ mod stop_acks {
         let mut link = machine.accept().await;
         let first = link
             .expect(|frame| match frame {
-                LinkFrame::Stop { agent_id, stop_id } => Some((agent_id, stop_id)),
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } => Some((agent_id, stop_id)),
                 LinkFrame::Launch(_) | LinkFrame::Prompt { .. } => {
                     panic!("a launch went out before the queued stop")
                 }
@@ -1504,7 +1515,9 @@ mod stop_acks {
         };
         let resent = link
             .expect(|frame| match frame {
-                LinkFrame::Stop { agent_id, stop_id } if agent_id == agent => Some(stop_id),
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
                 LinkFrame::Launch(_) => panic!("launched behind an unconfirmed stop"),
                 _ => None,
             })
@@ -1641,4 +1654,422 @@ async fn the_backend_records_its_machine_links_while_capture_is_on() {
     }
     traffic.stop();
     node.shutdown();
+}
+
+/// Final stops (nodeProtocol 9): recorded durably, resent after a backend
+/// restart, sent with `final`, and dropped on the machine's acknowledgement.
+mod final_stops {
+    use super::*;
+    use intent_core::node_link::FinalPush;
+    use intent_core::remote_launch::{FinalStopReason, RemoteAgentRecord};
+    use intent_transport::node_link::NodeGitAccess as _;
+
+    /// A session (in workspace `workspace()`) placed on `node`'s lease.
+    async fn placed(backend: &Backend, node: &RemoteNode, machine: &Machine) -> AgentId {
+        let agent = AgentId::new();
+        let now = intent_core::now_iso();
+        let _ = backend
+            .store()
+            .insert_workspace(&intent_core::Workspace {
+                id: workspace(),
+                title: "Remote".into(),
+                branch: "main".into(),
+                repository_path: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                ..Default::default()
+            })
+            .await;
+        sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+            .bind(agent.as_str())
+            .bind(workspace().as_str())
+            .bind(&now)
+            .bind(&now)
+            .execute(backend.store().write_pool())
+            .await
+            .unwrap();
+        backend
+            .store()
+            .record_remote_agent(&RemoteAgentRecord {
+                agent_id: agent.clone(),
+                workspace_id: workspace(),
+                node_id: machine.id(),
+                lease_id: node.status().lease_id,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        agent
+    }
+
+    /// End `agent`'s session: retire it, or mark it deleted.
+    async fn end_session(backend: &Backend, agent: &AgentId, deleted: bool) {
+        let sql = if deleted {
+            "UPDATE agent_session SET status = 'deleted' WHERE id = ?"
+        } else {
+            "UPDATE agent_session SET retired_at = '2026-11-03T00:00:00Z' WHERE id = ?"
+        };
+        sqlx::query(sql)
+            .bind(agent.as_str())
+            .execute(backend.store().write_pool())
+            .await
+            .unwrap();
+    }
+
+    async fn final_stop_for(link: &mut NodeEnd, agent: &AgentId) -> StopId {
+        link.expect(|frame| match frame {
+            LinkFrame::Stop {
+                agent_id,
+                stop_id,
+                final_stop: true,
+            } if agent_id == *agent => Some(stop_id),
+            _ => None,
+        })
+        .await
+    }
+
+    async fn ack_final(link: &NodeEnd, stop_id: StopId, agent: &AgentId, push: FinalPush) {
+        link.link
+            .send(&LinkFrame::StopAck {
+                stop_id,
+                agent_id: agent.clone(),
+                outcome: StopOutcome::Stopped,
+                final_push: Some(push),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn until(
+        what: &str,
+        mut check: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) {
+        tokio::time::timeout(wait(), async {
+            while !check().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    #[tokio::test]
+    async fn a_final_stop_survives_a_restart_and_its_ack_drops_the_records() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        machine.stop().await;
+        let node = backend.bare(&machine).await;
+        let agent = placed(&backend, &node, &machine).await;
+
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let recorded = backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.stop_id, stop_id.to_string());
+        assert_eq!(recorded.reason, FinalStopReason::AgentDeleted);
+        // A second request keeps the first record and its id.
+        assert_eq!(
+            node.final_stop(&agent, FinalStopReason::AgentRetired).await,
+            stop_id
+        );
+
+        // The restart: the in-memory queue is gone, the record is not.
+        node.shutdown();
+        let node = backend.bare(&machine).await;
+        machine.restart().await;
+        let mut link = machine.accept().await;
+        assert!(link.hello.lease_agents.contains(&agent));
+        assert_eq!(final_stop_for(&mut link, &agent).await, stop_id);
+        ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+
+        let store = backend.store().clone();
+        until("the ack drops both records", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move {
+                store.get_final_stop(&agent).await.unwrap().is_none()
+                    && store.get_remote_agent(&agent).await.unwrap().is_none()
+            })
+        })
+        .await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_retired_agents_placement_outlives_its_final_stop() {
+        let (mut machine, backend, node) = exposed().await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentRetired).await;
+        assert_eq!(final_stop_for(&mut link, &agent).await, stop_id);
+        ack_final(&link, stop_id, &agent, FinalPush::Failed).await;
+        let store = backend.store().clone();
+        until("the ack drops the final stop", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move { store.get_final_stop(&agent).await.unwrap().is_none() })
+        })
+        .await;
+        assert!(backend
+            .store()
+            .get_remote_agent(&agent)
+            .await
+            .unwrap()
+            .is_some());
+        node.shutdown();
+    }
+
+    /// `agent.delete` records the final stop before it stops the runtime: the
+    /// plain stop that stop sends joins the queued final stop (same id, still
+    /// final) instead of replacing it.
+    #[tokio::test]
+    async fn a_plain_stop_after_a_final_stop_stays_final() {
+        let (mut machine, backend, node) = exposed().await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        assert_eq!(final_stop_for(&mut link, &agent).await, stop_id);
+        node.shared().request_stop(&agent);
+        for _ in 0..3 {
+            let (sent, is_final) = link
+                .expect(|frame| match frame {
+                    LinkFrame::Stop {
+                        agent_id,
+                        stop_id,
+                        final_stop,
+                    } if agent_id == agent => Some((stop_id, final_stop)),
+                    _ => None,
+                })
+                .await;
+            assert_eq!(sent, stop_id, "the plain stop replaced the final one");
+            assert!(is_final, "the plain stop replaced the final one");
+        }
+        ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+        let store = backend.store().clone();
+        until("the ack drops the final stop", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move { store.get_final_stop(&agent).await.unwrap().is_none() })
+        })
+        .await;
+        node.shutdown();
+    }
+
+    /// #8428: an agent still running at bind whose session was retired or
+    /// deleted, with no final stop recorded (a head that crashed between the
+    /// session change and the stop, or one from before final stops), gets a
+    /// recorded final stop with the matching reason, is never parked or
+    /// attached, and its last push is admitted.
+    #[tokio::test]
+    async fn an_ended_session_running_at_bind_gets_a_recorded_final_stop() {
+        for (deleted, reason) in [
+            (false, FinalStopReason::AgentRetired),
+            (true, FinalStopReason::AgentDeleted),
+        ] {
+            let backend = Backend::new().await;
+            let mut machine = Machine::start(&backend.id().await).await;
+            backend.expose(&mut machine).await.shutdown();
+            let node = backend.bare(&machine).await;
+            let agent = placed(&backend, &node, &machine).await;
+            end_session(&backend, &agent, deleted).await;
+            assert!(backend
+                .store()
+                .get_final_stop(&agent)
+                .await
+                .unwrap()
+                .is_none());
+            *machine.host.running.lock().unwrap() = vec![agent.clone()];
+
+            node.connect().await.unwrap();
+            let mut link = machine.accept().await;
+            link.replay_complete(0).await;
+            let stop_id = final_stop_for(&mut link, &agent).await;
+            let row = backend
+                .store()
+                .get_final_stop(&agent)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.stop_id, stop_id.to_string(), "deleted: {deleted}");
+            assert_eq!(row.reason, reason);
+            assert!(!node.shared_ref().is_parked(&agent));
+            assert!(!node.shared_ref().agents.is_attached(&agent));
+            bound(&node).await;
+            let access = crate::git::HeadGitAccess::new(node.shared());
+            let remote =
+                intent_git::node_git::AgentRemote::new(workspace().as_str(), agent.as_str())
+                    .unwrap();
+            assert!(access
+                .repository(
+                    &link.hello.binding,
+                    &remote,
+                    intent_git::node_git::GitService::ReceivePack
+                )
+                .await
+                .is_ok());
+            node.shutdown();
+        }
+    }
+
+    /// `leaseAgents` keeps live agents and pending final stops, and leaves
+    /// out agents whose session ended with no final stop pending (an ack
+    /// below protocol 9, a stop past its bound, or one from before final
+    /// stops), so the machine sweeps their checkouts.
+    #[tokio::test]
+    async fn lease_agents_leave_out_ended_sessions_without_a_pending_final_stop() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        machine.stop().await;
+        let node = backend.bare(&machine).await;
+        let live = placed(&backend, &node, &machine).await;
+        let retired = placed(&backend, &node, &machine).await;
+        let deleted = placed(&backend, &node, &machine).await;
+        let pending = placed(&backend, &node, &machine).await;
+        end_session(&backend, &retired, false).await;
+        end_session(&backend, &deleted, true).await;
+        end_session(&backend, &pending, false).await;
+        node.final_stop(&pending, FinalStopReason::AgentRetired)
+            .await;
+
+        machine.restart().await;
+        let link = machine.accept().await;
+        let mut listed = link.hello.lease_agents.clone();
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![live, pending];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(listed, expected);
+        assert!(backend
+            .store()
+            .get_remote_agent(&retired)
+            .await
+            .unwrap()
+            .is_some());
+        node.shutdown();
+    }
+
+    /// The bound is checked on a timer, not only at bind: a machine that
+    /// stays away stops being redialed once its final stops age out.
+    #[tokio::test]
+    async fn a_final_stop_ages_out_while_its_machine_stays_away() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        machine.stop().await;
+        let clock = crate::final_stop::Clock::default();
+        let mut quick = tuning();
+        quick.clock = clock.clone();
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            node.shared_ref().has_pending_stops(),
+            "kept within its bound"
+        );
+        assert!(backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .is_some());
+
+        clock.offset_secs.store(
+            i64::try_from(intent_core::remote_launch::FINAL_STOP_BOUND.as_secs()).unwrap(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let store = backend.store().clone();
+        until("the timer drops the expired final stop", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move { store.get_final_stop(&agent).await.unwrap().is_none() })
+        })
+        .await;
+        assert!(backend
+            .store()
+            .get_remote_agent(&agent)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!node.shared_ref().has_pending_stops());
+        // Nothing is left to send: the machine coming back is not dialed.
+        machine.restart().await;
+        machine.no_link(Duration::from_millis(300)).await;
+        node.shutdown();
+    }
+
+    /// `remoteMachines.remove` waits the longer budget only on a link that
+    /// speaks final stops.
+    #[tokio::test]
+    async fn the_remove_budget_follows_the_links_protocol() {
+        let (_machine, _backend, node) = exposed().await;
+        let shared = node.shared_ref();
+        let mut expected = tuning();
+        expected.remove_timeout = Duration::from_secs(30);
+        expected.final_remove_timeout = Duration::from_secs(90);
+        shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        assert_eq!(shared.remove_budget(), shared.tuning_ref().remove_timeout);
+        shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL);
+        assert_eq!(
+            shared.remove_budget(),
+            shared.tuning_ref().final_remove_timeout
+        );
+        let defaults = crate::connector::Tuning::default();
+        assert_eq!(defaults.remove_timeout, expected.remove_timeout);
+        assert_eq!(defaults.final_remove_timeout, expected.final_remove_timeout);
+        assert_eq!(defaults.stop_wait, Duration::from_secs(30));
+        node.shutdown();
+    }
+
+    /// Below nodeProtocol 9 the ack may precede the exit push: the record,
+    /// and the push it admits, outlive the ack by the grace, then go.
+    #[tokio::test]
+    async fn below_protocol_9_the_record_outlives_the_ack_by_the_grace() {
+        let (mut machine, backend, node) = exposed().await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        // As a protocol-8 machine would see it: the stop is not final.
+        node.shared_ref()
+            .set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id,
+                    stop_id,
+                    final_stop,
+                } if agent_id == agent => Some((stop_id, final_stop)),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, (stop_id, false));
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            backend
+                .store()
+                .get_final_stop(&agent)
+                .await
+                .unwrap()
+                .is_some(),
+            "the push is still admitted within the grace"
+        );
+        assert!(!node.shared_ref().has_pending_stops(), "acknowledged once");
+        let store = backend.store().clone();
+        until("the grace ends", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move { store.get_final_stop(&agent).await.unwrap().is_none() })
+        })
+        .await;
+        node.shutdown();
+    }
 }

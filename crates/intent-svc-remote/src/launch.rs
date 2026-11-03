@@ -357,6 +357,43 @@ impl RemoteLaunchPort for RemoteLaunch {
         })
     }
 
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(feature) = svc.remote_feature() else {
+                return;
+            };
+            // One read for the whole list, so deleting a workspace of local
+            // agents costs one statement, not one per agent.
+            let records = match svc.store().get_remote_agents(agent_ids).await {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!(%error, "remote agents: could not read their placements; no final stops");
+                    return;
+                }
+            };
+            for record in records {
+                let agent_id = &record.agent_id;
+                let node = match feature.node(svc, &record.node_id).await {
+                    Ok(node) => node,
+                    Err(error) => {
+                        tracing::warn!(agent = %agent_id, machine = %record.node_id, %error, "remote agent: its machine is unavailable; no final stop");
+                        continue;
+                    }
+                };
+                if node.status().lease_id != record.lease_id {
+                    tracing::info!(agent = %agent_id, "remote agent: placed under an ended lease; no final stop");
+                    continue;
+                }
+                node.final_stop(agent_id, reason).await;
+            }
+        })
+    }
+
     fn runtime<'a>(
         &'a self,
         svc: &'a Services,

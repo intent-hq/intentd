@@ -37,11 +37,32 @@ fn output(agent_id: &AgentId, seq: u64, data: String) -> ScriptOutput {
 #[tokio::test]
 async fn script_frames_travel_both_ways_on_a_protocol_8_link() {
     let mut node = Node::start(token("t")).await;
-    let head = dial(&node, 1).await;
-    let (machine, mut machine_events, _) = node.accept_link().await;
+    let mut offer = hello(binding(1));
+    offer.protocol = ProtocolRange { min: 7, max: 8 };
+    let head = dial_link(&node.endpoint(), offer).await.unwrap();
+    let (machine, machine_events, _) = node.accept_link().await;
     assert_eq!(head.link.protocol(), 8);
     assert_eq!(machine.protocol(), 8);
+    script_frames_travel_both_ways(head, machine, machine_events).await;
+}
 
+/// Two current builds negotiate protocol 9, which keeps protocol 8's script
+/// frames.
+#[tokio::test]
+async fn script_frames_travel_both_ways_on_a_negotiated_protocol_9_link() {
+    let mut node = Node::start(token("t")).await;
+    let head = dial(&node, 1).await;
+    let (machine, machine_events, _) = node.accept_link().await;
+    assert_eq!(head.link.protocol(), 9);
+    assert_eq!(machine.protocol(), 9);
+    script_frames_travel_both_ways(head, machine, machine_events).await;
+}
+
+async fn script_frames_travel_both_ways(
+    head: DialedLink,
+    machine: NodeLink,
+    mut machine_events: LinkEvents,
+) {
     let agent_id = AgentId::new();
     head.link.send(&start_frame(&agent_id)).await.unwrap();
     match tokio::time::timeout(wait(), machine_events.recv())

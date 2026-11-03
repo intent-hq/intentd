@@ -918,6 +918,24 @@ async fn node_runner_reports_a_failed_checkout_as_the_agents_exit() {
     assert!(h.checkouts.pushes.lock().unwrap().is_empty());
 }
 
+/// A saved wip head would not pin fails the launch with
+/// `node-checkout-failed` before the agent can run and overwrite it.
+#[tokio::test]
+async fn node_runner_fails_the_launch_when_an_unapplied_wip_cannot_be_pinned() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.checkouts
+        .fail_pin
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let error = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(error.starts_with(codes::CHECKOUT), "{error}");
+    assert!(error.contains("pin the unapplied wip"), "{error}");
+    assert!(!all.iter().any(started("a1")), "{all:#?}");
+    assert!(h.runner.running().is_empty());
+    assert!(h.checkouts.pushes.lock().unwrap().is_empty());
+}
+
 /// The text of the turn's `wsapi` line (the fixture's `workspace_api` result).
 fn wsapi_line(all: &[JournalRecord], turn: &str) -> String {
     all.iter()
@@ -1673,4 +1691,335 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
     });
     redactor.notification(&mut config);
     assert_eq!(config["update"]["configOptions"][0]["type"], "[redacted]");
+}
+
+/// A final stop (nodeProtocol 9) stops the agent, makes its exit push the
+/// final one (bounded by the final-push timeout) and only then removes its
+/// checkout; its acknowledgement reports the push.
+#[tokio::test]
+async fn node_runner_final_stop_pushes_within_its_bound_then_removes_the_checkout() {
+    use crate::executor::checkout::FINAL_PUSH_TIMEOUT;
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    let checkout = h.storage.existing_agent_dir(&id).expect("a checkout");
+    std::fs::write(checkout.join("work.txt"), "unsaved").unwrap();
+
+    let acked = tokio::time::timeout(wait(), h.runner.final_stop(&id))
+        .await
+        .unwrap();
+    assert_eq!(acked, Some((StopOutcome::Stopped, FinalPush::Pushed)));
+    assert_eq!(
+        h.checkouts.push_timeouts.lock().unwrap().last(),
+        Some(&FINAL_PUSH_TIMEOUT)
+    );
+    assert!(records(&h.runner).await.iter().any(exited("a1")));
+    assert!(!checkout.exists(), "the checkout is removed after the push");
+    assert!(h.storage.agent_ids().is_empty());
+
+    // A repeated final stop finds nothing to stop or push.
+    assert_eq!(
+        h.runner.final_stop(&id).await,
+        Some((StopOutcome::NotRunning, FinalPush::Skipped))
+    );
+}
+
+/// A final stop of an agent that already exited pushes its checkout once
+/// more when the machine knows its workspace; a failed push is reported and
+/// the checkout still goes.
+#[tokio::test]
+async fn node_runner_final_stop_of_an_exited_agent_pushes_and_reports_a_failed_push() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+    h.checkouts
+        .fail_pushes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pushes = h.checkouts.pushes.lock().unwrap().len();
+    assert_eq!(
+        h.runner.final_stop(&id).await,
+        Some((StopOutcome::NotRunning, FinalPush::Failed))
+    );
+    assert_eq!(h.checkouts.pushes.lock().unwrap().len(), pushes + 1);
+    assert!(h.storage.existing_agent_dir(&id).is_none());
+}
+
+/// A final stop delivered again while the first is still pushing joins it:
+/// one push, one removal, the same answer for both, and a launch of the
+/// agent in the meantime waits for the cleanup instead of losing its new
+/// checkout to it.
+#[tokio::test]
+async fn node_runner_repeated_final_stops_share_one_cleanup_and_fence_launches() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+    let pushes = h.checkouts.pushes.lock().unwrap().len();
+
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    let first = tokio::spawn(h.runner.final_stop(&id));
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::spawn(h.runner.final_stop(&id));
+    let runner = h.runner.clone();
+    let relaunch = tokio::spawn(async move { runner.launch(launch("a1")).await });
+    // timing-guard: a short window in which nothing may finish while the push is held
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !second.is_finished(),
+        "the repeat finished before the cleanup"
+    );
+    assert_eq!(h.checkouts.pushes.lock().unwrap().len(), pushes + 1);
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+
+    release.send(()).unwrap();
+    let expected = Some((StopOutcome::NotRunning, FinalPush::Pushed));
+    assert_eq!(
+        tokio::time::timeout(wait(), first).await.unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(
+        tokio::time::timeout(wait(), second).await.unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(
+        h.checkouts.pushes.lock().unwrap().len(),
+        pushes + 1,
+        "the repeat pushed again"
+    );
+    // The relaunch ran after the cleanup: its checkout is there and stays.
+    tokio::time::timeout(wait(), relaunch)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .iter()
+        .filter(|r| started("a1")(r))
+        .count()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relaunch never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        h.storage.existing_agent_dir(&id).is_some(),
+        "the cleanup removed the relaunch's checkout"
+    );
+    h.runner.stop(&id).wait().await.unwrap();
+}
+
+/// A cleanup that panics leaves nothing behind: its stop and a repeat
+/// waiting on it fail (so the backend resends rather than getting an ack),
+/// a launch of the agent goes ahead instead of waiting forever, and the
+/// next final stop runs the cleanup again.
+#[tokio::test]
+async fn node_runner_a_panicked_final_stop_cleanup_fails_cleanly() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    h.checkouts
+        .panic_push
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = tokio::spawn(h.runner.final_stop(&id));
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let repeat = tokio::spawn(h.runner.final_stop(&id));
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), first).await.unwrap().unwrap(),
+        None
+    );
+    assert_eq!(
+        tokio::time::timeout(wait(), repeat).await.unwrap().unwrap(),
+        None
+    );
+    assert!(
+        h.storage.existing_agent_dir(&id).is_some(),
+        "nothing was removed"
+    );
+
+    // A launch is not left waiting on the dead cleanup.
+    tokio::time::timeout(wait(), h.runner.launch(launch("a1")))
+        .await
+        .expect("the launch waited on a panicked cleanup");
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .iter()
+        .filter(|r| started("a1")(r))
+        .count()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relaunch never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next final stop runs the cleanup again, to the end.
+    assert_eq!(
+        tokio::time::timeout(wait(), h.runner.final_stop(&id))
+            .await
+            .unwrap(),
+        Some((StopOutcome::Stopped, FinalPush::Pushed))
+    );
+    assert!(h.storage.existing_agent_dir(&id).is_none());
+}
+
+/// A final stop whose checkout cannot be removed is not acknowledged, so
+/// the backend resends it.
+#[tokio::test]
+async fn node_runner_final_stop_is_not_acknowledged_while_the_checkout_stays() {
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.checkouts
+        .fail_removals
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(h.runner.final_stop(&id).await, None);
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+    h.checkouts
+        .fail_removals
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(h.runner.final_stop(&id).await.is_some());
+    assert!(h.storage.existing_agent_dir(&id).is_none());
+}
+
+/// The bind sweep removes the checkouts of agents the backend no longer
+/// records, and keeps those it lists and those still running.
+#[tokio::test]
+async fn node_runner_sweep_removes_only_orphaned_checkouts() {
+    let Some(h) = harness(2, &[]) else { return };
+    h.runner.launch(launch("running")).await;
+    wait_for(&h.runner, "started", started("running")).await;
+    for orphan in ["kept", "orphan"] {
+        h.storage.agent_dir(&AgentId::from(orphan)).unwrap();
+    }
+    let swept = h.runner.sweep(&[AgentId::from("kept")]).await;
+    assert_eq!(swept, vec![AgentId::from("orphan")]);
+    assert_eq!(
+        h.storage.agent_ids(),
+        vec![AgentId::from("kept"), AgentId::from("running")]
+    );
+}
+
+/// A launch that arrives while the bind sweep is removing its agent's
+/// checkout waits for the removal, then starts on a fresh checkout.
+#[tokio::test]
+async fn node_runner_a_launch_during_the_sweep_waits_for_the_removal() {
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.storage.agent_dir(&id).unwrap();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_sweep.lock().unwrap() = Some((entered_tx, release_rx));
+    let sweeping = {
+        let runner = h.runner.clone();
+        tokio::spawn(async move { runner.sweep(&[]).await })
+    };
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let launching = {
+        let runner = h.runner.clone();
+        tokio::spawn(async move { runner.launch(launch("a1")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !records(&h.runner).await.iter().any(started("a1")),
+        "the launch waits for the removal"
+    );
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), sweeping)
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![id.clone()]
+    );
+    tokio::time::timeout(wait(), launching)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for(&h.runner, "started", started("a1")).await;
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+}
+
+/// The sweep takes its list before the new link's frames are handled; an
+/// agent launched after that keeps its checkout.
+#[tokio::test]
+async fn node_runner_the_sweep_leaves_an_agent_launched_after_its_list() {
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.storage.agent_dir(&id).unwrap();
+    let candidates = h.runner.sweep_candidates(&[]);
+    assert_eq!(candidates, vec![id.clone()]);
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await;
+    assert!(h.runner.sweep_checkouts(candidates).await.is_empty());
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+}
+
+/// A checkout whose saved wip work could not be restored tells the agent on
+/// its first turn, and only then.
+#[tokio::test]
+async fn node_runner_prepends_the_checkout_notice_to_the_first_turn_only() {
+    let Some(h) = harness(1, &[]) else { return };
+    *h.checkouts.notice.lock().unwrap() = Some("wip-not-restored.".into());
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    let echoed = |all: &[JournalRecord], turn: &str, expected: &str| {
+        all.iter().any(|r| {
+            r.turn_id.as_deref() == Some(turn)
+                && matches!(&r.body, JournalBody::Notification { notification }
+                    if notification.to_string().contains(expected))
+        })
+    };
+    assert!(
+        echoed(&all, "t1", "echo: wip-not-restored.hello"),
+        "{all:#?}"
+    );
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("again"))
+        .await;
+    let all = wait_for(&h.runner, "second turn end", turn_ended("a1", "t2")).await;
+    assert!(echoed(&all, "t2", "echo: again"), "{all:#?}");
+    assert!(!echoed(&all, "t2", "wip-not-restored"), "{all:#?}");
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
 }

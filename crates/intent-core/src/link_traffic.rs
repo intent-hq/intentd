@@ -600,6 +600,7 @@ fn light_frame(frame: &LinkFrame) -> Value {
         LinkFrame::Hello(hello) => json!({
             "type": "hello",
             "binding": { "generation": hello.binding.generation },
+            "leaseAgentCount": hello.lease_agents.len(),
         }),
         LinkFrame::Welcome(welcome) => json!({
             "type": "welcome",
@@ -618,12 +619,31 @@ fn light_frame(frame: &LinkFrame) -> Value {
             agent_id, turn_id, ..
         } => json!({ "type": "prompt", "agentId": agent(agent_id), "turnId": field(turn_id) }),
         LinkFrame::Cancel { agent_id } => json!({ "type": "cancel", "agentId": agent(agent_id) }),
-        LinkFrame::Stop { agent_id, stop_id } => {
-            json!({ "type": "stop", "agentId": agent(agent_id), "stopId": stop_id })
+        LinkFrame::Stop {
+            agent_id,
+            stop_id,
+            final_stop,
+        } => {
+            let mut light =
+                json!({ "type": "stop", "agentId": agent(agent_id), "stopId": stop_id });
+            if *final_stop {
+                light["final"] = json!(true);
+            }
+            light
         }
         LinkFrame::StopAck {
-            stop_id, agent_id, ..
-        } => json!({ "type": "stopAck", "agentId": agent(agent_id), "stopId": stop_id }),
+            stop_id,
+            agent_id,
+            final_push,
+            ..
+        } => {
+            let mut light =
+                json!({ "type": "stopAck", "agentId": agent(agent_id), "stopId": stop_id });
+            if let Some(push) = final_push {
+                light["finalPush"] = json!(push);
+            }
+            light
+        }
         LinkFrame::Journal(record) => json!({
             "type": "journal",
             "seq": record.seq,

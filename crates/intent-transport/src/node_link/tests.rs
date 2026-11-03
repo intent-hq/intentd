@@ -44,6 +44,7 @@ fn hello(binding: LeaseBinding) -> LinkHello {
         intentd_version: "test".into(),
         binding,
         acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
     }
 }
 

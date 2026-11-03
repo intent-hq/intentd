@@ -376,3 +376,178 @@ async fn a_descendant_holding_the_terminal_does_not_hold_up_the_exit() {
         .unwrap_or_else(|| panic!("no child pid in {:?}", seen.output));
     gone(child).await;
 }
+
+/// A process an ordinary `scriptStop` is already tearing down still holds
+/// up `stop_agent` (what a final stop runs before it pushes and removes the
+/// checkout): the second kill finds the terminal already taken, so
+/// `stop_agent` must wait for the process's own reaper to record its exit,
+/// not return at once.
+#[tokio::test]
+async fn stop_agent_waits_for_a_teardown_a_script_stop_already_started() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stop");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    let pid = started_pid(&mut f.head, "p1").await;
+    f.scripts.stop(&f.link, &process(&a, "p1"));
+    // Let the ordinary stop's kill start (and take the terminal) first.
+    tokio::task::yield_now().await;
+    tokio::time::timeout(wait(), f.scripts.stop_agent(&a))
+        .await
+        .unwrap();
+    assert!(
+        !f.scripts.is_running(&process(&a, "p1")),
+        "stop_agent returned before the process's exit was recorded"
+    );
+    assert!(
+        !pid_alive(pid),
+        "stop_agent returned while the script still ran"
+    );
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert!(seen.exited.is_some());
+}
+
+/// A process whose reaper never finishes (a child stuck in the kernel, whose
+/// `wait` never returns) does not hold `stop_agent` or `stop_all` past the
+/// reap bound: they log and return, and `stop_agent` reports it.
+#[tokio::test]
+async fn a_stuck_process_does_not_hold_up_stop_agent_or_stop_all() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stuck-reap");
+    hold_reaps_for_test(&a);
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let bound = reap_wait() + Duration::from_secs(3);
+    let t0 = std::time::Instant::now();
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent waited past the reap bound");
+    assert!(
+        !reaped,
+        "a process that was never reaped was reported reaped"
+    );
+    assert!(t0.elapsed() >= reap_wait(), "gave up before the bound");
+    tokio::time::timeout(bound, f.scripts.stop_all())
+        .await
+        .expect("stop_all waited past the reap bound");
+}
+
+/// The whole process group, not only the shell, is gone when `stop_agent`
+/// returns after an ordinary `scriptStop` started the kill: the shell exits
+/// on SIGTERM at once while a descendant that ignores it lives until the
+/// original kill's SIGKILL, and `stop_agent` must wait for that kill.
+#[tokio::test]
+async fn stop_agent_waits_for_a_script_stops_whole_group_teardown() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stop-group");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(
+                &a,
+                "p1",
+                r#"exec /bin/sh -c 'sh -c "trap \"\" TERM HUP; echo trapped-\$\$; while :; do sleep 1; done" & sleep 300'"#,
+            ),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let mut output = String::new();
+    let descendant: u32 = loop {
+        match tokio::time::timeout(wait(), f.head.events.recv())
+            .await
+            .expect("the descendant never printed its pid")
+            .expect("link closed")
+        {
+            LinkEvent::Frame(LinkFrame::ScriptOutput(o)) if o.spawn_id == "p1" => {
+                output.push_str(&o.data);
+                if let Some(pid) = output
+                    .split_whitespace()
+                    .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+                {
+                    break pid;
+                }
+            }
+            LinkEvent::Frame(LinkFrame::ScriptExited(e)) if e.spawn_id == "p1" => {
+                panic!("exited early: {e:?} after {output:?}")
+            }
+            _ => {}
+        }
+    };
+    assert!(pid_alive(descendant));
+    f.scripts.stop(&f.link, &process(&a, "p1"));
+    tokio::task::yield_now().await;
+    tokio::time::timeout(wait(), f.scripts.stop_agent(&a))
+        .await
+        .unwrap();
+    assert!(
+        !pid_alive(descendant),
+        "stop_agent returned while the script's trapped descendant still ran"
+    );
+}
+
+/// A kill that panics is not taken for a finished teardown: the stop over it
+/// reports the process unreaped, and the next stop kills it again.
+#[tokio::test]
+async fn a_panicked_kill_is_not_done_and_the_next_stop_kills_again() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-kill-panics");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    let pid = started_pid(&mut f.head, "p1").await;
+    panic_next_kill_for_test(&a);
+    let bound = reap_wait() + Duration::from_secs(3);
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent hung on a panicked kill");
+    assert!(!reaped, "a panicked kill counted as a finished teardown");
+    assert!(pid_alive(pid), "the panicked kill still killed it");
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("the retried stop hung");
+    assert!(reaped, "the next stop did not kill it again");
+    assert!(!pid_alive(pid));
+}
+
+/// A reaper that panics is not taken for a recorded exit: the stop reports
+/// the process unreaped even though the kill finished.
+#[tokio::test]
+async fn a_panicked_reaper_is_not_counted_reaped() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-reap-panics");
+    panic_reaps_for_test(&a);
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let bound = reap_wait() + Duration::from_secs(3);
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent hung on a panicked reaper");
+    assert!(!reaped, "a panicked reaper counted as a recorded exit");
+}

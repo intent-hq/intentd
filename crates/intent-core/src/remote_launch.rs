@@ -32,6 +32,76 @@ pub struct RemoteAgentRecord {
     pub created_at: String,
 }
 
+/// Why a remote agent ends for good on its machine: its checkout is
+/// removed there after a final WIP push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalStopReason {
+    AgentDeleted,
+    AgentRetired,
+    WorkspaceRetired,
+    WorkspaceDeleted,
+    MachineRemoved,
+}
+
+impl FinalStopReason {
+    /// The stored and documented spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentDeleted => "agent-deleted",
+            Self::AgentRetired => "agent-retired",
+            Self::WorkspaceRetired => "workspace-retired",
+            Self::WorkspaceDeleted => "workspace-deleted",
+            Self::MachineRemoved => "machine-removed",
+        }
+    }
+
+    /// Parse the stored spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::AgentDeleted,
+            Self::AgentRetired,
+            Self::WorkspaceRetired,
+            Self::WorkspaceDeleted,
+            Self::MachineRemoved,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == value)
+    }
+
+    /// Whether the agent's session can come back (a retired agent or
+    /// workspace can be restored), so its placement record is kept after
+    /// the final stop is acknowledged.
+    #[must_use]
+    pub fn keeps_placement(self) -> bool {
+        matches!(self, Self::AgentRetired | Self::WorkspaceRetired)
+    }
+}
+
+/// A final stop head has asked for and the machine has not acknowledged
+/// yet: kept durably, resent at every bind, and while it exists the
+/// machine's final WIP push for the agent is accepted into `repo_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFinalStopRecord {
+    pub agent_id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub machine_id: String,
+    pub lease_id: String,
+    /// The stop's id, reused by every resend.
+    pub stop_id: String,
+    pub reason: FinalStopReason,
+    /// The workspace's repository (refs are shared with its worktrees), so
+    /// the push lands even after the worktree is removed.
+    pub repo_path: String,
+    pub requested_at: String,
+}
+
+/// How long head keeps an unacknowledged final stop before it drops the
+/// record anyway (the machine's next bind sweep removes the checkout).
+pub const FINAL_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Session `metadata` key recording where a remote agent runs: the agent
 /// projection reads it, and an agent carrying it never runs locally.
 /// Daemon-owned: it is written when the agent is created with a remote

@@ -7036,6 +7036,18 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        // A remote agent's final stop is recorded first, before the runtime
+        // stop below and before its session (and placement) rows go: the
+        // plain stop `stop_many` sends then joins the queued final stop
+        // instead of replacing it, and the machine's last push is still
+        // accepted after the rows are deleted.
+        self.feature_remote_launch_port()
+            .final_stop(
+                self,
+                std::slice::from_ref(&agent_id),
+                intent_core::remote_launch::FinalStopReason::AgentDeleted,
+            )
+            .await;
         // Stop the agent's runtime before its rows go (intent-hq/intent#8426):
         // a local provider tree is killed, a remote agent is stopped on its
         // machine (freeing its capacity slot). The fence keeps a racing
@@ -7497,6 +7509,15 @@ impl Services {
             return Ok(None);
         }
         self.desktop_terminate_agent(&session.id).await;
+        // A remote agent stops on its machine, which pushes its work one
+        // last time and removes its checkout.
+        self.feature_remote_launch_port()
+            .final_stop(
+                self,
+                std::slice::from_ref(&session.id),
+                intent_core::remote_launch::FinalStopReason::AgentRetired,
+            )
+            .await;
         // A retired agent is inert: drop its secrets and pending requests (§5.56).
         self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire

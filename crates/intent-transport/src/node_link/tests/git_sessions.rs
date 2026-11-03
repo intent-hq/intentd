@@ -21,6 +21,7 @@ impl NodeGitAccess for AllowAgent {
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        _service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
             binding.ensure_current(&super::binding(1))?;

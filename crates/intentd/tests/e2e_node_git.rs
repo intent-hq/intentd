@@ -21,7 +21,9 @@ use intent_core::{
     BoxFuture, Error, ExecutorCredentialId, HostRole, PrincipalId, Result, WorkspaceApi,
 };
 use intent_git::hub::AgentRef;
-use intent_git::node_git::{AgentRemote, CheckoutCache, NodeGit, HELPER_NAME, SOCKET_ENV};
+use intent_git::node_git::{
+    AgentRemote, CheckoutCache, GitService, NodeGit, HELPER_NAME, SOCKET_ENV,
+};
 use intent_transport::generate_certificate;
 use intent_transport::node_link::{
     dial_git, dial_link, serve_git, serve_helpers, CertificatePin, ExecutorHost, ExecutorLinks,
@@ -85,6 +87,7 @@ impl NodeGitAccess for Lease {
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        _service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
             binding.ensure_current(&self.binding)?;
@@ -282,6 +285,7 @@ impl Fixture {
                 intentd_version: "test".into(),
                 binding: binding.clone(),
                 acked_seq: NodeCounter(0),
+                lease_agents: Vec::new(),
             },
         )
         .await
@@ -302,6 +306,7 @@ impl Fixture {
             binding,
             agents: BTreeSet::from([AGENT.to_owned()]),
         };
+        intent_git::node_git::configure_receive_hooks(&node.path().join("head-data")).unwrap();
         let serving = tokio::spawn(serve_git(head_git, Arc::new(lease)));
 
         // The node side: sessions on the git connection, the helper socket,
@@ -367,7 +372,7 @@ async fn node_fetches_base_and_pushes_wip_over_the_link() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(commit, fixture.base);
+    assert_eq!(commit.base, fixture.base);
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), fixture.base);
     assert_eq!(
         std::fs::read_to_string(worktree.join("README.md")).unwrap(),
@@ -412,6 +417,34 @@ async fn node_fetches_base_and_pushes_wip_over_the_link() {
     assert_eq!(
         git(head, &["rev-parse", &format!("{}^", pushed.wip)]),
         pushed.head
+    );
+
+    // The checkout is removed (final stop or sweep); relaunching the agent
+    // fetches its head and wip refs over the link and restores both.
+    tokio::time::timeout(wait(), fixture.cache.remove(REPO, &worktree))
+        .await
+        .unwrap()
+        .unwrap();
+    let restored = fixture.worktree("a-restored");
+    let checkout = tokio::time::timeout(
+        wait(),
+        fixture.cache.checkout(REPO, &remote(AGENT), &restored),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(checkout.base, fixture.base);
+    assert_eq!(checkout.at, pushed.head);
+    assert_eq!(checkout.unrestored_wip, None);
+    assert_eq!(git(&restored, &["rev-parse", "HEAD"]), pushed.head);
+    assert_eq!(
+        std::fs::read_to_string(restored.join("notes.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(git(&restored, &["status", "--porcelain"]), "?? notes.txt");
+    assert_eq!(
+        try_ref(head, &remote(AGENT).ref_name(AgentRef::Wip)),
+        Some(pushed.wip)
     );
 }
 
