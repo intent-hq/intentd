@@ -4081,6 +4081,8 @@ impl ChildTreeSample {
 }
 
 impl ChildTreeUsage {
+    /// [`Self::store_with_remote`] with no executor-run agents.
+    #[cfg(test)]
     fn store(&self, walk: TreeWalk, available_memory_bytes: Option<u64>) {
         self.store_with_remote(walk, Vec::new(), available_memory_bytes);
     }

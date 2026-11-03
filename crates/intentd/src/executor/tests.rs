@@ -1402,3 +1402,63 @@ fn an_uninstalled_slot_reports_no_agents_or_links() {
     assert!(slot.agent_roots().is_empty());
     assert_eq!(slot.linked_backends(), 0);
 }
+
+/// Revoking a linked backend's credential closes its link and drops it from
+/// the connected-backend count.
+#[tokio::test]
+async fn a_revoked_backend_no_longer_counts_as_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    assert_eq!(node.service.linked_backends(), 1);
+    let id = node.api.credential(&token()).id;
+    node.api.revocations.send(id).unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while node.service.linked_backends() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the revoked backend still counts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.stop().await;
+}
+
+/// A backend that reconnects counts once, whether its old link closed first
+/// or is replaced by a newer bind; a second backend counts separately.
+#[tokio::test]
+async fn a_reconnecting_backend_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    first.link.close();
+    let mut second = dial_link(&node.endpoint, hello(2, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut second).await;
+    assert_eq!(node.service.linked_backends(), 1, "after close and rebind");
+    let mut third = dial_link(&node.endpoint, hello(3, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut third).await;
+    assert_eq!(
+        node.service.linked_backends(),
+        1,
+        "a newer bind beside an open one"
+    );
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+    assert_eq!(node.service.linked_backends(), 2);
+    node.stop().await;
+}
