@@ -35,6 +35,15 @@ saved scripts. They cannot edit script commands, control raw terminals, run host
 commands, change credentials, or manage sharing. Host membership retains its existing
 authority. Role downgrades apply to subsequent operations on open connections.
 
+A guest who joined a workspace by invite can leave it from the workspace sidebar's
+**…** menu → **Leave…** (shown where owners see **Share…**), or from **Settings →
+Collaboration** → **Leave** beside that workspace. Both ask for confirmation, remove
+access to that one workspace, and keep other workspaces on the same host. Rejoining
+needs a new invite. Access through host membership cannot be left per workspace; ask
+the host owner to remove the membership.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; packages/cloudlands-fe/src/lib/components/settings/GuestSessionsSettings.svelte; packages/cloudlands-fe/src/store/renderer/slices/guest-sessions/guest-sessions-selectors.ts (selectCanLeaveWorkspace); packages/intentd/crates/intent-services/src/invite_ops.rs (workspace_members_leave_op). -->
+
 Workspaces support multiple workspace-wide discussions. Start a discussion by
 sending its first message; everyone with workspace access can read and participate.
 Workspace owners and managers can rename discussions; only workspace owners can
