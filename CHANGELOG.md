@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.119] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- *(acp)* Give workspace-create cards unique ids and link them to the created workspace ([#3007](https://github.com/intent-hq/intentd/pull/3007))
+- Durable final stop for remote agents: push, then remove the checkout ([#2998](https://github.com/intent-hq/intentd/pull/2998))
+
+
 ## [0.11.118] - 2026-11-03
 
 ### 🚀 Features

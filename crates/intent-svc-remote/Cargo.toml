@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-remote"
-version = "0.11.118"
+version = "0.11.119"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,13 +8,13 @@ license.workspace = true
 description = "Remote agent runtime for intentd: the backend connector to exposed machines and journal ingestion"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.118" }
-intent-core = { path = "../intent-core", version = "0.11.118" }
-intent-store = { path = "../intent-store", version = "0.11.118" }
-intent-transport = { path = "../intent-transport", version = "0.11.118" }
-intent-acp = { path = "../intent-acp", version = "0.11.118" }
-intent-git = { path = "../intent-git", version = "0.11.118" }
-intent-providers = { path = "../intent-providers", version = "0.11.118" }
+intent-services = { path = "../intent-services", version = "0.11.119" }
+intent-core = { path = "../intent-core", version = "0.11.119" }
+intent-store = { path = "../intent-store", version = "0.11.119" }
+intent-transport = { path = "../intent-transport", version = "0.11.119" }
+intent-acp = { path = "../intent-acp", version = "0.11.119" }
+intent-git = { path = "../intent-git", version = "0.11.119" }
+intent-providers = { path = "../intent-providers", version = "0.11.119" }
 git2 = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
@@ -26,7 +26,7 @@ uuid = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.118", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.119", features = ["test-hooks"] }
 intentd-test-support = { path = "../intentd-test-support" }
 socket2 = "0.6"
 sqlx = { workspace = true }
