@@ -3,7 +3,9 @@
 //! `Debug` never shows the token.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use intent_core::link_traffic::{LinkTap, LinkTraffic, PeerKind, TrafficPeer};
 use intent_core::machines::ExposedMachine;
 use intent_core::{Error, Result};
 use intent_transport::node_link::{CertificatePin, ExecutorToken, NodeEndpoint, TailcatRoute};
@@ -31,6 +33,8 @@ pub(crate) struct MachineTarget {
     /// The sitter-shipped tailcat binary; without it the tailcat route is
     /// not tried.
     pub tailcat_bin: Option<PathBuf>,
+    /// Records the machine's links while the owner captures link traffic.
+    pub tap: Option<LinkTap>,
 }
 
 impl std::fmt::Debug for MachineTarget {
@@ -106,7 +110,23 @@ impl MachineTarget {
                 .collect(),
             token,
             tailcat_bin,
+            tap: None,
         })
+    }
+
+    /// This target with its links recorded in `traffic`, against this
+    /// machine.
+    #[must_use]
+    pub(crate) fn tapped(mut self, traffic: Arc<LinkTraffic>) -> Self {
+        self.tap = Some(LinkTap::new(
+            traffic,
+            TrafficPeer {
+                kind: PeerKind::Machine,
+                id: self.id.clone(),
+                name: Some(self.name.clone()).filter(|name| !name.is_empty()),
+            },
+        ));
+        self
     }
 
     /// The direct routes, one per host, in the stored order.
@@ -126,7 +146,8 @@ impl MachineTarget {
                         format!("wss://{authority}"),
                         self.pin,
                         self.token.clone(),
-                    ),
+                    )
+                    .with_tap(self.tap.clone()),
                 }
             })
             .collect()
@@ -144,7 +165,8 @@ impl MachineTarget {
                 self.port,
                 self.pin,
                 self.token.clone(),
-            ),
+            )
+            .with_tap(self.tap.clone()),
         })
     }
 }

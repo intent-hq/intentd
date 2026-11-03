@@ -1589,3 +1589,56 @@ mod stop_acks {
         node.shutdown();
     }
 }
+
+/// While the owner captures link traffic, the backend records its links to
+/// an exposed machine (the add probe's and the connector's) against that
+/// machine.
+#[tokio::test]
+async fn the_backend_records_its_machine_links_while_capture_is_on() {
+    let backend = Backend::new().await;
+    let traffic = backend.services.link_traffic().clone();
+    traffic.start(true);
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let _runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let records = loop {
+        let records = traffic.snapshot(None, None)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if records
+            .iter()
+            .any(|r| r["frameType"] == "replayComplete" && r["direction"] == "in")
+            || tokio::time::Instant::now() > deadline
+        {
+            break records;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let kinds: Vec<(&str, &str)> = records
+        .iter()
+        .map(|r| {
+            (
+                r["direction"].as_str().unwrap(),
+                r["frameType"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    // The probe's handshake, then the connector's.
+    let hellos = kinds.iter().filter(|k| **k == ("out", "hello")).count();
+    let welcomes = kinds.iter().filter(|k| **k == ("in", "welcome")).count();
+    assert!(hellos >= 2 && welcomes >= 2, "{kinds:?}");
+    assert!(kinds.contains(&("in", "replayComplete")), "{kinds:?}");
+    let name = machine.add_params()["name"].clone();
+    for record in &records {
+        assert_eq!(record["peer"]["kind"], "machine");
+        assert_eq!(record["peer"]["id"], machine.id().as_str());
+        assert_eq!(record["peer"]["name"], name);
+    }
+    traffic.stop();
+    node.shutdown();
+}

@@ -1549,6 +1549,11 @@ async fn dispatch(
         "remoteMachines.list" => remote_machines(api, "list", params).await,
         "remoteMachines.remove" => remote_machines(api, "remove", params).await,
         "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
+        // Executor-link traffic capture (nodes.md "Link traffic capture"):
+        // owner-only, daemon-global; the services recheck the owner role.
+        "remoteLinkTraffic.start" => remote_link_traffic(api, "start", params).await,
+        "remoteLinkTraffic.stop" => remote_link_traffic(api, "stop", params).await,
+        "remoteLinkTraffic.snapshot" => remote_link_traffic(api, "snapshot", params).await,
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -5796,6 +5801,16 @@ async fn remote_machines(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     api.remote_machines(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
+}
+
+async fn remote_link_traffic(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.remote_link_traffic(method, Value::Object(params.clone()))
         .await
         .map_err(domain_to_rpc)
 }

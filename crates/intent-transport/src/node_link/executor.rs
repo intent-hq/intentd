@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use intent_core::link_traffic::{LinkTap, LinkTraffic, PeerKind, TrafficDirection, TrafficPeer};
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
     BindDecision, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS,
@@ -68,6 +69,24 @@ pub trait ExecutorHost: Send + Sync {
     /// Take an admitted connection. Called with the link server's lock
     /// held, so it must not block or call back into [`ExecutorLinks`].
     fn accept(&self, credential: ExecutorCredential, connection: NodeConnection);
+    /// The daemon's link traffic capture, when it has one: every link a
+    /// backend binds is recorded against that backend while it is on.
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        None
+    }
+}
+
+/// The tap recording `credential`'s link, when the host has a capture.
+fn tap_for(host: &dyn ExecutorHost, credential: &ExecutorCredential) -> Option<LinkTap> {
+    let traffic = host.link_traffic()?;
+    Some(LinkTap::new(
+        traffic,
+        TrafficPeer {
+            kind: PeerKind::Backend,
+            id: credential.backend_id.clone(),
+            name: Some(credential.backend_name.clone()).filter(|name| !name.is_empty()),
+        },
+    ))
 }
 
 /// The live state of one credential's binding.
@@ -262,8 +281,13 @@ impl ExecutorLinks {
                         return;
                     }
                 };
-                let (link, events) =
-                    NodeLink::start_with(socket, hello.binding.clone(), self.tuning, true);
+                let (link, events) = NodeLink::start_with(
+                    socket,
+                    hello.binding.clone(),
+                    self.tuning,
+                    true,
+                    tap_for(self.host.as_ref(), &credential),
+                );
                 let id = credential.id.clone();
                 let watched = link.clone();
                 {
@@ -307,12 +331,18 @@ impl ExecutorLinks {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let tap = tap_for(self.host.as_ref(), credential);
         let hello = loop {
             match socket.next().await {
                 // Decode errors quote the peer's bytes; report a fixed code.
                 Some(Ok(Message::Binary(bytes))) => {
-                    if let Ok(LinkFrame::Hello(hello)) = LinkFrame::decode(&bytes) {
-                        break hello;
+                    if let Ok(frame) = LinkFrame::decode(&bytes) {
+                        if let LinkFrame::Hello(hello) = &frame {
+                            if let Some(tap) = &tap {
+                                tap.observe(TrafficDirection::In, &frame, bytes.len());
+                            }
+                            break hello.clone();
+                        }
                     }
                     reject(socket, codes::PROTOCOL).await;
                     return Err(super::protocol("expected hello"));
@@ -376,7 +406,11 @@ impl ExecutorLinks {
         let mut welcome = self.host.welcome(credential, &hello);
         welcome.protocol = protocol;
         welcome.node_id = node_id;
-        let bytes = LinkFrame::Welcome(welcome).encode()?;
+        let frame = LinkFrame::Welcome(welcome);
+        let bytes = frame.encode()?;
+        if let Some(tap) = &tap {
+            tap.observe(TrafficDirection::Out, &frame, bytes.len());
+        }
         socket
             .send(Message::Binary(bytes.into()))
             .await

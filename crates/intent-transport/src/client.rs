@@ -157,6 +157,9 @@ pub(crate) fn with_runtime_capabilities(
             if remote_machines {
                 capabilities["remoteMachines"] = json!(1);
                 capabilities["remoteInitialAgent"] = json!(1);
+                // Link traffic capture is served wherever exposed machines
+                // are: never in node mode.
+                capabilities["remoteLinkTraffic"] = json!(1);
             }
         }
         value.to_string()

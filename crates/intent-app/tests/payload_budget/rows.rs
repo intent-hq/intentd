@@ -199,6 +199,11 @@ pub const CANNOT_EXERCISE: &[(&str, &str, &str)] = &[
         "The model catalog comes from the provider's live model probe; the test host has no provider CLI, so the catalog is empty.",
     ),
     (
+        "remoteLinkTraffic.snapshot",
+        "ok",
+        "Records exist only while the owner captures live executor-link frames, which the test host has none of; with capture off the reply is the empty buffer. Bounded by limit and by a 448 KiB cap on the records' JSON.",
+    ),
+    (
         "pairing.getInfo",
         "-32601",
         "Served only on the WSS pairing handshake, not on UDS.",

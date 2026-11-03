@@ -663,6 +663,7 @@ async fn placement_chooses_among_exposed_machines() {
         on["server"]["capabilities"]["remoteInitialAgent"], 1,
         "{on}"
     );
+    assert_eq!(on["server"]["capabilities"]["remoteLinkTraffic"], 1, "{on}");
 
     let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
