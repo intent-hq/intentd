@@ -161,6 +161,20 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("applied"))
     );
+    assert_eq!(
+        session.proposal_created_workspaces().get("tc-1"),
+        Some(&json!(new_id)),
+        "the applied card records the workspace it created"
+    );
+    let lite = svc
+        .agent_get_op(agent.clone(), None)
+        .await
+        .expect("agent.get");
+    assert_eq!(
+        serde_json::to_value(&lite).unwrap()["metadata"]["proposalCreatedWorkspaces"],
+        json!({ "tc-1": new_id }),
+        "agent.get serves the created workspace for the card"
+    );
     let messages = svc
         .store()
         .get_agent_messages(&agent, None)
@@ -232,6 +246,7 @@ async fn replay_and_client_fallback_never_duplicate_the_notice() {
             "tc-1".to_string(),
             "applied".to_string(),
             Some("Created workspace x.".to_string()),
+            None,
         )
         .await
         .expect("client fallback resolve");
@@ -254,6 +269,7 @@ async fn already_resolved_proposal_keeps_its_outcome() {
         agent.clone(),
         "tc-1".to_string(),
         "dismissed".to_string(),
+        None,
         None,
     )
     .await
@@ -278,6 +294,10 @@ async fn already_resolved_proposal_keeps_its_outcome() {
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("dismissed"))
+    );
+    assert!(
+        session.proposal_created_workspaces().is_empty(),
+        "a dismissed card never links a workspace"
     );
     assert_eq!(
         notices_for(&svc, &agent).await.len(),
@@ -735,4 +755,176 @@ async fn origin_lookup_store_error_fails_the_create_and_a_retry_recovers() {
     assert_eq!(reported(&created), Some(outcome("tc-1", "applied")));
     assert_eq!(workspaces(&svc).await, before + 1);
     assert_eq!(notices_for(&svc, &agent).await.len(), 1);
+}
+
+/// Every `proposalCreatedWorkspaces` map carried by an `agent:updated` event
+/// for `agent`, sorted for an order-independent comparison.
+async fn event_created_maps(svc: &Services, ws: &WorkspaceId, agent: &AgentId) -> Vec<String> {
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![intent_core::events::AGENT_UPDATED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("events");
+    let mut maps: Vec<String> = events
+        .iter()
+        .filter(|event| event.data.get("agentId") == Some(&json!(agent.0)))
+        .filter_map(|event| event.data.get("proposalCreatedWorkspaces"))
+        .map(Value::to_string)
+        .collect();
+    maps.sort();
+    maps
+}
+
+/// `metadata.proposalCreatedWorkspaces` follows the resolution: the
+/// `agent:updated` event carries it, a client-side `agent.resolveProposal`
+/// (no created id) never invents one, and a re-proposed card dismissed later
+/// drops its stale link.
+#[tokio::test]
+async fn created_workspace_link_follows_the_resolution() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    let created = WorkspaceId::from("ws-created");
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        None,
+        Some(created.clone()),
+    )
+    .await
+    .expect("resolve applied");
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![intent_core::events::AGENT_UPDATED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("events");
+    let event_maps: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.data.get("proposalCreatedWorkspaces").cloned())
+        .collect();
+    assert_eq!(event_maps, vec![json!({ "tc-1": "ws-created" })]);
+
+    let other = pending_proposal(&svc, &ws, "tc-2").await;
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        other.clone(),
+        "tc-2".to_string(),
+        "applied".to_string(),
+        Some("Created workspace x.".to_string()),
+        None,
+    )
+    .await
+    .expect("client resolve");
+    let session = svc
+        .store()
+        .get_agent_session(&other)
+        .await
+        .expect("session");
+    assert!(session.proposal_created_workspaces().is_empty());
+
+    let blocks = create_proposal_blocks("tc-1", None);
+    seed(&svc, &ws, &agent, "tc-1", &blocks).await;
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "dismissed".to_string(),
+        None,
+        None,
+    )
+    .await
+    .expect("dismiss re-proposed card");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert!(
+        session.proposal_created_workspaces().is_empty(),
+        "a dismissed re-proposal drops the old link"
+    );
+    assert_eq!(
+        event_created_maps(&svc, &ws, &agent).await,
+        vec![
+            json!({ "tc-1": "ws-created" }).to_string(),
+            json!({}).to_string(),
+        ],
+        "the dismissal event carries the cleared (empty) map"
+    );
+}
+
+/// A created-workspace link written before a later write of the origin
+/// resolve failed survives the client's `agent.resolveProposal` retry (no
+/// created id), and a later applied resolution WITH an id replaces it.
+#[tokio::test]
+async fn applied_retry_without_an_id_keeps_the_created_workspace_link() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &agent,
+            intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+            &json!({ "tc-1": "ws-created" }).to_string(),
+            &now_iso(),
+        )
+        .await
+        .expect("write link as the failed origin resolve did");
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        Some("Created workspace x.".to_string()),
+        None,
+    )
+    .await
+    .expect("client fallback resolve");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_created_workspaces().get("tc-1"),
+        Some(&json!("ws-created")),
+        "the retry keeps the card's created-workspace link"
+    );
+    assert_eq!(
+        event_created_maps(&svc, &ws, &agent).await,
+        vec![json!({ "tc-1": "ws-created" }).to_string()],
+        "the retry's event carries the preserved link"
+    );
+
+    let blocks = create_proposal_blocks("tc-1", None);
+    seed(&svc, &ws, &agent, "tc-1", &blocks).await;
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        None,
+        Some(WorkspaceId::from("ws-replacement")),
+    )
+    .await
+    .expect("re-proposed card applied with a new workspace");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_created_workspaces().get("tc-1"),
+        Some(&json!("ws-replacement")),
+        "an applied resolution with an id replaces the link"
+    );
 }

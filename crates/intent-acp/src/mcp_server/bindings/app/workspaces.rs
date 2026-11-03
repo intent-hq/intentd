@@ -1021,8 +1021,12 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         preview.insert("warnings".to_string(), json!(warnings));
     }
 
+    // A per-card identity (as for workspace-transfer): without it the card is
+    // keyed by its title, so a later card with the same title or content
+    // inherited an earlier card's pending/resolution and local apply state.
     let proposal = json!({
         "kind": "workspace-create",
+        "applyToolCallId": format!("workspace-create-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.create",
             "params": payload_params
@@ -2110,6 +2114,23 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].get("type").unwrap().as_str().unwrap(), "text");
         assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
+    }
+
+    /// Two identical `create` calls must yield two distinct cards: the
+    /// per-card `applyToolCallId` is the identity clients key pending state,
+    /// resolutions and local apply state by, so a title- or content-derived
+    /// identity would let a new card inherit an earlier card's outcome.
+    #[tokio::test]
+    async fn test_create_stamps_unique_apply_tool_call_id() {
+        let args = json!({ "title": "Same WS" });
+        let first = create_proposal(args.clone()).await;
+        let second = create_proposal(args).await;
+        let first_id = first["applyToolCallId"].as_str().expect("first id");
+        let second_id = second["applyToolCallId"].as_str().expect("second id");
+        assert!(first_id.starts_with("workspace-create-"));
+        assert_ne!(first_id, second_id);
+        assert_eq!(first["payload"], second["payload"]);
+        assert!(super::super::proposal::is_valid_proposal(&first));
     }
 
     /// Helper: run `create` against a fresh `FakeApi` and return the proposal.

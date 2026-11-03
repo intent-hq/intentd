@@ -11035,6 +11035,7 @@ impl Services {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         // The id is matched VERBATIM against the recorded pending entries —
         // recording preserves `applyToolCallId` / `preview.title` exactly as
@@ -11121,6 +11122,23 @@ impl Services {
         }
         let resolutions_json = serde_json::to_string(&resolutions)
             .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
+        // The created-workspace map follows the resolutions map: an applied
+        // create records (or replaces) its workspace, an applied resolution
+        // WITHOUT an id keeps any existing link — a client
+        // `agent.resolveProposal` retry after a partially failed
+        // origin-resolve wrote the link must not drop it — a dismissal drops
+        // the link, and entries whose resolution was evicted go with it.
+        let previous_created = session.proposal_created_workspaces();
+        let mut created_workspaces = previous_created.clone();
+        if outcome == PROPOSAL_OUTCOME_APPLIED {
+            if let Some(created) = created_workspace_id.as_ref() {
+                created_workspaces.insert(proposal_id.clone(), json!(created.as_str()));
+            }
+        } else {
+            created_workspaces.shift_remove(&proposal_id);
+        }
+        created_workspaces.retain(|id, _| resolutions.contains_key(id));
+        let created_changed = created_workspaces != previous_created;
         // Persist the resolution FIRST (it doubles as the durable idempotency
         // marker), then shrink the pending list. A failure between the two
         // writes leaves the entry pending WITH its outcome recorded: the RPC
@@ -11129,6 +11147,20 @@ impl Services {
         // both writes), so none can duplicate. The reverse order could
         // permanently lose the resolution: pending entry gone, no recorded
         // outcome, every retry NotFound.
+        if created_changed {
+            let created_json = serde_json::to_string(&created_workspaces).map_err(|e| {
+                Error::Internal(format!("serialize proposal created workspaces: {e}"))
+            })?;
+            self.store
+                .set_agent_session_metadata_key_json(
+                    &workspace_id,
+                    &agent_id,
+                    intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+                    &created_json,
+                    &now_iso(),
+                )
+                .await?;
+        }
         self.store
             .set_agent_session_metadata_key_json(
                 &workspace_id,
@@ -11147,6 +11179,12 @@ impl Services {
                 &now_iso(),
             )
             .await?;
+        // Always carry the CURRENT created-workspace map (empty when
+        // cleared), not only when this invocation wrote it: a retry after a
+        // partial failure reads the already-persisted map, so the first
+        // successful event would otherwise omit the link and hydrated
+        // clients that consume these fields directly (skipping `agent.get`)
+        // would show the card applied without its workspace link.
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -11155,6 +11193,7 @@ impl Services {
                 "agentId": agent_id.0,
                 "pendingProposals": remaining,
                 "proposalResolutions": resolutions,
+                "proposalCreatedWorkspaces": Value::Object(created_workspaces),
             }),
         )
         .await;
@@ -11364,6 +11403,7 @@ impl Services {
                 proposal_id.clone(),
                 PROPOSAL_OUTCOME_APPLIED.to_string(),
                 Some(detail),
+                Some(created.clone()),
             )
             .await
         {

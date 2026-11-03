@@ -2636,7 +2636,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// a system-origin notice to the agent naming the proposal and outcome
     /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
     /// succeeds without a duplicate notice. Unknown `proposalId` (never
-    /// pending, never resolved) → `NotFound`.
+    /// pending, never resolved) → `NotFound`. `created_workspace_id` (an
+    /// in-process caller that just created the workspace for an applied
+    /// `workspace-create` card; never taken from the wire) is recorded under
+    /// `metadata.proposalCreatedWorkspaces` so clients can open it.
     fn agent_resolve_proposal(
         &self,
         workspace_id: WorkspaceId,
@@ -2644,8 +2647,16 @@ pub trait WorkspaceApi: Send + Sync {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        let _ = (
+            workspace_id,
+            agent_id,
+            proposal_id,
+            outcome,
+            detail,
+            created_workspace_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),

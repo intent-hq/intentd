@@ -3083,7 +3083,7 @@ async fn dispatch(
             let detail = opt_str(params, "detail");
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail)
+                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

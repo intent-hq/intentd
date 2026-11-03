@@ -32250,12 +32250,20 @@ impl WorkspaceApi for Services {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
-            self.agent_resolve_proposal_op(workspace_id, agent_id, proposal_id, outcome, detail)
-                .await
+            self.agent_resolve_proposal_op(
+                workspace_id,
+                agent_id,
+                proposal_id,
+                outcome,
+                detail,
+                created_workspace_id,
+            )
+            .await
         })
     }
 
