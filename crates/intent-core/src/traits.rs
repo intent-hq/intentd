@@ -1581,6 +1581,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `note.readAssetChunk`: one offset window of an asset's raw bytes as
+    /// `{ assetId, mimeType, content (base64), bytesRead, size }` (`size` =
+    /// whole asset byte length). Same asset resolution as
+    /// [`Self::read_asset`]. `length` is capped at the transfer chunk size;
+    /// over-cap or zero → `Error::InvalidParams`.
+    fn read_asset_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, asset, offset, length);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::read_asset_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `note.saveAsset`: write an image asset (base64 `data`, an optional
     /// `data:` URL prefix is stripped) under the workspace assets root and
     /// return `{ assetId, path, url }` (PROTOCOL §5.2 — additive asset write
@@ -4311,6 +4331,36 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_show_file not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.showFileChunk`: one offset window of the raw blob bytes that
+    /// [`Self::git_show_file`] would serve, as `{ content (base64),
+    /// bytesRead, size }` (`size` = whole blob byte length). Same path, ref,
+    /// root and fallback rules (a missing path or an unknown/remote/non-repo
+    /// workspace is an empty blob). `length` is capped at the transfer chunk
+    /// size; over-cap or zero → `Error::InvalidParams`.
+    fn git_show_file_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            file_path,
+            git_ref,
+            git_root_id,
+            offset,
+            length,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_show_file_chunk not implemented".to_string(),
             ))
         })
     }

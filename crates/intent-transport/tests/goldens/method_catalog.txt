@@ -204,6 +204,7 @@ router git.push
 router git.removeLockFile
 router git.renameBranch
 router git.showFile
+router git.showFileChunk
 router git.stage
 router git.stageHunk
 router git.status
@@ -295,6 +296,7 @@ router note.list
 router note.listTasks
 router note.listVersions
 router note.readAsset
+router note.readAssetChunk
 router note.restoreVersion
 router note.saveAsset
 router note.setContent

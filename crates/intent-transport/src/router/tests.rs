@@ -18,6 +18,11 @@ use super::handle_message;
 
 struct FakeApi;
 
+/// `big:<n>` names a fake object of size `n` in the bounded-read tests.
+fn big_len(name: &str) -> Option<usize> {
+    name.strip_prefix("big:")?.parse().ok()
+}
+
 #[test]
 fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
     use intent_core::execution::{
@@ -746,13 +751,70 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         asset: String,
     ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+        // `big:<n>` serves `n` base64 quads (3n decoded bytes).
         Box::pin(async move {
+            let data = big_len(&asset).map_or_else(|| "AAAA".to_string(), |n| "QUJD".repeat(n));
             Ok(ReadAssetResult {
                 asset_id: asset,
                 mime_type: "image/png".to_string(),
-                data: "AAAA".to_string(),
+                data,
                 size_kb: 1,
             })
+        })
+    }
+
+    fn read_asset_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "assetId": asset,
+                "mimeType": "image/png",
+                "content": format!("b64:{asset}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
+    }
+
+    fn git_show_file(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // `big:<n>` serves `n` bytes of text; anything else echoes its args.
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            let content = big_len(&file_path).map_or_else(
+                || format!("{scope}{file_path}@{git_ref}"),
+                |n| "x".repeat(n),
+            );
+            Ok(serde_json::json!({ "content": content }))
+        })
+    }
+
+    fn git_show_file_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(serde_json::json!({
+                "content": format!("b64:{scope}{file_path}@{git_ref}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
         })
     }
 
@@ -1733,6 +1795,9 @@ impl WorkspaceApi for FakeApi {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move {
+            if let Some(n) = big_len(&path) {
+                return Ok(Value::String("x".repeat(n)));
+            }
             let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
             Ok(Value::String(format!(
                 "{}:{scope}{path}",
@@ -8475,5 +8540,197 @@ mod script_get_paging {
         let (v, _) = call(&api, Some(json!(1))).await;
         assert_eq!(v["result"]["command"], "é");
         assert_eq!(v["result"]["nextCommandOffset"], Value::Null);
+    }
+}
+
+/// Capped whole-object reads: the legacy shape when it fits, `too-large`
+/// without `maxBytes`, and a truncated reply with `maxBytes`.
+#[tokio::test]
+async fn whole_object_reads_are_bounded() {
+    let cap = 480_000_usize;
+    let req = |method: &str, params: Value| {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+            .to_string()
+    };
+    let big = format!("big:{cap}");
+
+    // file.read: bare string when it fits.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], "ws-1:a.txt");
+    // Over the cap without maxBytes: too-large (or the whole object when the
+    // switch serves it), never a shortened string.
+    let refuse = crate::router::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["code"], -32602, "{v:.200}");
+        assert_eq!(v["error"]["data"]["code"], "too-large");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap);
+        assert_eq!(v["error"]["data"]["maxBytes"], cap);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "file.readChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!("x".repeat(cap)),
+            "whole file"
+        );
+    }
+    // With maxBytes: an object with truncated and totalBytes.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big, "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(
+        v["result"]["content"].as_str().map(str::len),
+        Some(10_000 - 2)
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "ws-1:a.txt", "truncated": false, "totalBytes": 10 })
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 0 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+    assert_eq!(v["error"]["message"], "maxBytes must be a positive integer");
+
+    // git.showFile: { content } when it fits, the same bound otherwise.
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": "a.rs", "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "content": "a.rs@HEAD" }));
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["chunkMethod"], "git.showFileChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!({ "content": "x".repeat(cap) }),
+            "whole blob"
+        );
+    }
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD", "maxBytes": 999_999 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(v["result"]["content"].as_str().map(str::len), Some(cap - 2));
+    assert!(v.to_string().len() < 512_000);
+
+    // note.readAsset: whole, or without its bytes.
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": "a.png" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "AAAA");
+    assert!(v["result"].get("truncated").is_none());
+    let big_asset = format!("big:{}", cap / 4);
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap / 4 * 3);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "note.readAssetChunk");
+    } else {
+        assert_eq!(
+            v["result"]["data"],
+            serde_json::json!("QUJD".repeat(cap / 4)),
+            "whole asset"
+        );
+        assert!(v["result"].get("truncated").is_none());
+    }
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset, "maxBytes": cap }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "", "{v}");
+    assert_eq!(v["result"]["truncated"], true);
+    assert_eq!(v["result"]["totalBytes"], cap / 4 * 3);
+}
+
+#[tokio::test]
+async fn chunk_reads_route_offset_length_and_selector() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.showFileChunk","params":{"workspaceId":"ws-1","filePath":"a.rs","ref":":0","gitRootId":"root-1","offset":8,"length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:root-1:a.rs@:0:8:16", "bytesRead": 16, "size": 1000u64 })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.readAssetChunk","params":{"workspaceId":"ws-1","asset":"a.png","offset":4,"length":2}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["content"], "b64:a.png:4:2");
+    assert_eq!(v["result"]["mimeType"], "image/png");
+    for (method, params) in [
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","length":1}"#,
+        ),
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","offset":0}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","length":1}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","offset":0}"#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(v["error"]["code"], -32602, "{method} {params}: {v}");
     }
 }

@@ -27223,6 +27223,35 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn read_asset_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let assets_root = self.assets_root.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            file_ops::validate_chunk_length(length)?;
+            let asset_id = note_ops::parse_asset_id(&asset)?;
+            let root = assets_root
+                .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
+            let path = root.join(&workspace_id.0).join(&asset_id);
+            let mime_type = note_ops::mime_from_extension(&asset_id);
+            let mut window = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| Error::Internal(format!("Failed to read asset: {e}")))?;
+                file_ops::window_bytes(&bytes, offset, length)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("note.readAssetChunk task failed: {e}")))??;
+            window["assetId"] = serde_json::Value::String(asset_id);
+            window["mimeType"] = serde_json::Value::String(mime_type);
+            Ok(window)
+        })
+    }
+
     fn save_asset(
         &self,
         workspace_id: WorkspaceId,
@@ -31374,6 +31403,44 @@ impl WorkspaceApi for Services {
             }
             let content = intent_git::show::show_file(&worktree, &git_ref, &file_path)?;
             Ok(serde_json::json!({ "content": content }))
+        })
+    }
+
+    fn git_show_file_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        let store = self.store.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            file_ops::validate_chunk_length(length)?;
+            // The `git.showFile` fallbacks, as an empty blob.
+            let empty = || file_ops::window_bytes(&[], offset, length);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return empty(),
+                Err(e) => return Err(e),
+            };
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return empty();
+            };
+            if ws.is_remote || !worktree.join(".git").exists() {
+                return empty();
+            }
+            // Blocking thread: a large blob read should not stall the
+            // executor (matching file.readChunk).
+            tokio::task::spawn_blocking(move || {
+                let bytes = intent_git::show::show_file_bytes(&worktree, &git_ref, &file_path)?;
+                file_ops::window_bytes(&bytes, offset, length)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.showFileChunk task failed: {e}")))?
         })
     }
 
