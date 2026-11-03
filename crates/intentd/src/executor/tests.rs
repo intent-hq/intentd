@@ -1856,3 +1856,67 @@ async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
     assert!(root.join(&reaped.0).join("work").exists());
     node.stop().await;
 }
+
+/// A machine shutdown over a script whose reaper never finishes still stops
+/// the agent (its last push included) and returns: the scripts' stop is
+/// bounded by the reap wait, inside the shutdown's one bound
+/// (intent-hq/intent#8437).
+#[tokio::test]
+async fn shutdown_over_a_stuck_script_still_stops_the_agent() {
+    use intent_core::node_link::ScriptStartCommand;
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node =
+        Running::start_with(dir.path(), MachineApi::new(), admission.clone(), providers).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let agent = AgentId::from("a-stuck-shutdown");
+    crate::executor::scripts::hold_reaps_for_test(&agent);
+    dialed
+        .link
+        .send(&launch_of(&agent.0, "mock"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            command: "sleep 60".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => break,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+    tokio::time::timeout(
+        crate::executor::scripts::reap_wait() + wait(),
+        node.service.shutdown(),
+    )
+    .await
+    .expect("the shutdown hung on the stuck script");
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with the agent still running"
+    );
+    node.stop().await;
+}

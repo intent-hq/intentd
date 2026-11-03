@@ -551,3 +551,24 @@ async fn a_panicked_reaper_is_not_counted_reaped() {
         .expect("stop_agent hung on a panicked reaper");
     assert!(!reaped, "a panicked reaper counted as a recorded exit");
 }
+
+/// Once the machine is shutting down no script process starts: a start
+/// after [`ScriptProcesses::stop_all`] is refused (intent-hq/intent#8437).
+#[tokio::test]
+async fn a_start_after_stop_all_is_refused() {
+    let mut f = fixture().await;
+    let agent = AgentId::new();
+    f.scripts.stop_all().await;
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&agent, "p1", "sleep 60"),
+        )
+        .await;
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert_eq!(seen.pid, None, "the process started: {seen:?}");
+    let error = seen.exited.unwrap().error.unwrap();
+    assert!(error.starts_with("node-script-start-failed: "), "{error}");
+}

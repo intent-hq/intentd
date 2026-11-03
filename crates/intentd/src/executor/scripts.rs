@@ -46,12 +46,18 @@ const OUTPUT_EOF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Slack on top of the teardown and reap timings in [`reap_wait`].
 const REAP_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// [`reap_wait`] outside tests, as a constant so the machine's shutdown
+/// budget can be checked at compile time.
+pub(super) const REAP_WAIT: std::time::Duration = std::time::Duration::from_secs(
+    intent_pty::TERM_GRACE.as_secs() * 2 + OUTPUT_EOF_WAIT.as_secs() + REAP_MARGIN.as_secs(),
+);
+
 /// Longest a stop waits for the processes it kills to be reaped: the kill's
 /// SIGTERM grace, the reaper's own group escalation, its output-EOF wait and
 /// a margin. A process past it (a child stuck in the kernel) is logged and
 /// left; the caller carries on.
 pub(super) fn reap_wait() -> std::time::Duration {
-    let bound = intent_pty::TERM_GRACE * 2 + OUTPUT_EOF_WAIT + REAP_MARGIN;
+    let bound = REAP_WAIT;
     #[cfg(test)]
     let bound = intentd_test_support::test_timeout(bound);
     bound
@@ -111,6 +117,9 @@ pub(super) struct ScriptProcesses {
     /// done (`true`). A later stop joins one instead of starting a kill
     /// that finds the terminal already taken and returns at once.
     kills: Arc<Mutex<HashMap<Key, Kill>>>,
+    /// Set by [`Self::stop_all`]: the machine is shutting down, so no new
+    /// process starts.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Removes a kill's entry from [`ScriptProcesses::kills`] when its task
@@ -178,6 +187,7 @@ impl ScriptProcesses {
             pty,
             running: Arc::default(),
             kills: Arc::default(),
+            shutting_down: Arc::default(),
         }
     }
 
@@ -194,6 +204,12 @@ impl ScriptProcesses {
         let key = key(&command.agent_id, &command.script_id, &command.spawn_id);
         let refuse =
             |code: &str, detail: &str| exited(&key, None, Some(format!("{code}: {detail}")));
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = link
+                .send(&refuse(START_FAILED, "the machine is shutting down"))
+                .await;
+            return;
+        }
         let Some(checkout) = checkout else {
             let _ = link
                 .send(&refuse(
@@ -248,6 +264,12 @@ impl ScriptProcesses {
                 reaped,
             },
         );
+        // A shutdown that began after the check above may have taken its
+        // list before this process was recorded: end it here, so none
+        // outlives the shutdown. Its reaper reports the exit.
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(self.kill(&key, pty_id, generation));
+        }
         let _ = link
             .send(&LinkFrame::ScriptStarted(ScriptStarted {
                 agent_id: key.0.clone(),
@@ -404,8 +426,11 @@ impl ScriptProcesses {
         self.kill_where(|key, _| &key.0 == agent_id).await
     }
 
-    /// Kill every process (the machine is shutting down).
+    /// Kill every process and start no more (the machine is shutting
+    /// down).
     pub(super) async fn stop_all(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.kill_where(|_, _| true).await;
     }
 

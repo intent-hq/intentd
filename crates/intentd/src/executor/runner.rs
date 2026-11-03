@@ -73,15 +73,22 @@ const TRACK_INTERVAL: Duration = Duration::from_secs(1);
 /// its helpers (which inherit it) can be found after the provider exits,
 /// wherever they were reparented to.
 const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
-/// How long shutdown waits for stopped agents to push their last work
-/// (each push bounded by [`FINAL_PUSH_TIMEOUT`]), be cleaned up and have
-/// their queued records (each one fsync'd) journaled.
+/// The whole of a runner's shutdown: its script runs end (bounded by
+/// [`super::scripts::REAP_WAIT`]), then its agents are stopped, push their
+/// last work (each push bounded by [`FINAL_PUSH_TIMEOUT`]), are cleaned up
+/// and have their queued records (each one fsync'd) journaled, and every
+/// final stop's cleanup under way finishes.
 pub(super) const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
 
-// A shutdown push gets its whole bound inside the drain, and the drain ends
-// well before the sitter force-kills a stopping daemon, so a push is never
-// killed midway (intent-hq/intent#8437).
-const _: () = assert!(SHUTDOWN_WAIT.as_secs() > FINAL_PUSH_TIMEOUT.as_secs());
+// A shutdown push gets its whole bound after the scripts are reaped and the
+// agent is killed, all within the shutdown, and the shutdown ends well
+// before the sitter force-kills a stopping daemon, leaving the rest of the
+// daemon's stop room too, so a push is never killed midway
+// (intent-hq/intent#8437).
+const _: () = assert!(
+    super::scripts::REAP_WAIT.as_secs() + TERM_GRACE.as_secs() + FINAL_PUSH_TIMEOUT.as_secs()
+        < SHUTDOWN_WAIT.as_secs()
+);
 const _: () = assert!(
     SHUTDOWN_WAIT.as_secs() + 10 <= intentd_sitter::supervisor::DEFAULT_KILL_TIMEOUT.as_secs()
 );
@@ -1655,11 +1662,13 @@ impl Runner {
         }
     }
 
-    /// Stop every agent and wait (bounded by [`SHUTDOWN_WAIT`]) until each
+    /// End every script run, then stop every agent and wait until each
     /// one's last push is done and its queued output and exit are
     /// journaled, and until every final stop's cleanup already under way
-    /// has pushed and removed its checkout.
+    /// has pushed and removed its checkout. All of it is bounded by
+    /// [`SHUTDOWN_WAIT`].
     pub(super) async fn shutdown(&self) {
+        let started = tokio::time::Instant::now();
         // Close admission first, under the same lock launches are admitted
         // under, so no agent can start after the stop below.
         let running: Vec<AgentId> = {
@@ -1667,10 +1676,14 @@ impl Runner {
             state.closing = true;
             state.agents.keys().cloned().collect()
         };
+        // Script runs end first (bounded by their reap wait), so nothing
+        // still writes to a checkout while its agent's last work is pushed.
+        self.inner.scripts.stop_all().await;
         for id in running {
             self.stop(&id);
         }
-        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let left = SHUTDOWN_WAIT.saturating_sub(started.elapsed());
+        let drained = tokio::time::timeout(left, async {
             // A launch admitted just before closing may register its pump
             // after a take, so keep draining until nothing is left.
             loop {
@@ -1695,7 +1708,6 @@ impl Runner {
         if drained.is_err() {
             tracing::warn!("node: shutdown gave up waiting for agent records to be journaled");
         }
-        self.inner.scripts.stop_all().await;
     }
 }
 
