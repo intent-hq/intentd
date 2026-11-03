@@ -349,6 +349,10 @@ pub struct ExposedMachine {
     pub state: RemoteMachineState,
     pub added_at: String,
     pub last_connected_at: Option<String>,
+    /// The node-link protocol the last bind negotiated (`RemoteMachine.nodeProtocol`),
+    /// kept while disconnected; `None` before the first bind. Saved scripts
+    /// need 8.
+    pub node_protocol: Option<u32>,
 }
 
 /// Where this machine's executor link can be dialed, as `executor.mint`

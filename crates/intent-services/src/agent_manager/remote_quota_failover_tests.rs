@@ -621,6 +621,7 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
             state: intent_core::machines::RemoteMachineState::Disconnected,
             added_at: now_iso(),
             last_connected_at: None,
+            node_protocol: None,
         })
         .await
         .unwrap();

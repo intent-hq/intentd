@@ -803,6 +803,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                 state: intent_core::machines::RemoteMachineState::Disconnected,
                 added_at: "2026-01-01T00:00:00.000Z".into(),
                 last_connected_at: None,
+                node_protocol: None,
             })
             .await
             .expect("exposed machine");

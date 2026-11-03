@@ -532,6 +532,7 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
             state: intent_core::machines::RemoteMachineState::Disconnected,
             added_at: intent_core::now_iso(),
             last_connected_at: None,
+            node_protocol: None,
         })
         .await
         .unwrap();
