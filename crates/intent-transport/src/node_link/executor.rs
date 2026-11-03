@@ -267,8 +267,8 @@ impl ExecutorLinks {
                     // yet: drop the connection instead of binding later.
                     _ = stopped.wait_for(|current| *current != epoch) => return,
                 };
-                let hello = match bound {
-                    Ok(Ok(hello)) => hello,
+                let (hello, protocol) = match bound {
+                    Ok(Ok(bound)) => bound,
                     Ok(Err(error)) => {
                         tracing::info!(
                             code = super::error_code(&error).unwrap_or(codes::PROTOCOL),
@@ -287,6 +287,7 @@ impl ExecutorLinks {
                     self.tuning,
                     true,
                     tap_for(self.host.as_ref(), &credential),
+                    protocol,
                 );
                 let id = credential.id.clone();
                 let watched = link.clone();
@@ -327,7 +328,7 @@ impl ExecutorLinks {
         credential: &ExecutorCredential,
         socket: &mut WebSocketStream<S>,
         epoch: u64,
-    ) -> Result<LinkHello>
+    ) -> Result<(LinkHello, u32)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -415,7 +416,7 @@ impl ExecutorLinks {
             .send(Message::Binary(bytes.into()))
             .await
             .map_err(|_| super::unavailable())?;
-        Ok(hello)
+        Ok((hello, protocol))
     }
 }
 
