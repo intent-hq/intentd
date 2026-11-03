@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.117] - 2026-11-03
+
+### 🚀 Features
+
+- *(remote)* Sub-agents of remote agents inherit the machine; read-only workspace details ([#2999](https://github.com/intent-hq/intentd/pull/2999))
+
+
 ## [0.11.116] - 2026-11-03
 
 ### 🐛 Bug Fixes
