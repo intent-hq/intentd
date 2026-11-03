@@ -250,7 +250,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -325,7 +325,8 @@ custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
-the original configuration is **Codex · Default**. Each profile has its own **Fast
+the original configuration is **Codex · Default**. In a shared workspace, guests see
+an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
