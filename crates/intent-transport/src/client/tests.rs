@@ -987,6 +987,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteLinkTraffic": 1,
             "remoteMachines": 1,
             "remoteInitialAgent": 1,
+            "remoteScripts": 1,
         })
     );
     assert_eq!(
@@ -996,6 +997,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteLinkTraffic": 1,
             "remoteMachines": 1,
             "remoteInitialAgent": 1,
+            "remoteScripts": 1,
             "startupStatus": 1,
         })
     );

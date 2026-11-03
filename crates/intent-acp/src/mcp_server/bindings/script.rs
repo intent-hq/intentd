@@ -65,6 +65,11 @@ pub(crate) const PRELUDE: &str = r"
 
 /// `budget` is the caller's effective `workspace_api` eval budget; `run`
 /// derives its `timeoutSeconds` ceiling from it.
+///
+/// # Errors
+///
+/// The frame's error message: an unknown method, bad arguments, or the
+/// workspace API's refusal.
 pub async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,

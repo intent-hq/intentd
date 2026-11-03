@@ -563,7 +563,18 @@ impl ScriptManager {
     ) -> Self {
         self.agent_wake = services.feature_agent_wake_port();
         self.owner_services = Some(services.clone());
-        let _ = self.machine_runs.set(self.new_machine_runs(services));
+        if self.machine_runs.get().is_none() {
+            let _ = self.machine_runs.set(self.new_machine_runs(services));
+        }
+        self
+    }
+
+    /// Share `runs` (the runtime feature's) instead of a private registry.
+    pub(crate) fn with_machine_runs(
+        mut self,
+        runs: Arc<std::sync::OnceLock<machine_runs::MachineRuns>>,
+    ) -> Self {
+        self.machine_runs = runs;
         self
     }
 

@@ -862,7 +862,7 @@ pub trait RuntimePort: Send + Sync + 'static {
         &'a self,
         svc: &'a Services,
         workspace_id: WorkspaceId,
-        method: &'a str,
+        method: String,
         params: serde_json::Value,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         let _ = (svc, workspace_id, params);

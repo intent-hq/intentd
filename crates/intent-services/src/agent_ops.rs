@@ -225,6 +225,10 @@ pub(crate) struct AgentRetirementGates {
     workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
+/// How long deleting a remote agent waits for its machine to acknowledge
+/// the stops of its script runs before deleting it anyway.
+const REMOTE_SCRIPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl AgentRetirementGates {
     pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
         weak_gate(&self.gates, agent_id)
@@ -7041,8 +7045,28 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
-        // A remote agent's final stop is recorded first, before the runtime
-        // stop below and before its session (and placement) rows go: the
+        // A remote agent's script runs on its machine stop first: wait at
+        // most 10 s for the machine's acknowledgements, then go on anyway.
+        // Before the runtime stop below, which would end the scripts on the
+        // machine without a requested stop (a service would look crashed).
+        if matches!(self.store.get_remote_agent(&agent_id).await, Ok(Some(_))) {
+            let deadline = tokio::time::Instant::now() + REMOTE_SCRIPT_STOP_WAIT;
+            let acked = self
+                .feature_runtime()
+                .end_agent_machine_runs(
+                    self,
+                    &agent_id,
+                    deadline,
+                    "remote-script-lost: the agent was deleted",
+                )
+                .await;
+            if !acked {
+                tracing::warn!(agent = %agent_id, "agent delete: the machine did not acknowledge every script stop");
+            }
+        }
+        // Then the remote agent's final stop is recorded, after its script
+        // stops and before the runtime stop below and before its session
+        // (and placement) rows go: the
         // plain stop `stop_many` sends then joins the queued final stop
         // instead of replacing it, and the machine's last push is still
         // accepted after the rows are deleted.

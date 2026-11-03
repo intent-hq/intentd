@@ -160,6 +160,9 @@ pub(crate) fn with_runtime_capabilities(
                 // Link traffic capture is served wherever exposed machines
                 // are: never in node mode.
                 capabilities["remoteLinkTraffic"] = json!(1);
+                // Remote agents' saved scripts run on their machines
+                // (nodeProtocol 8): advertised only with `remoteMachines`.
+                capabilities["remoteScripts"] = json!(1);
             }
         }
         value.to_string()

@@ -61,6 +61,9 @@ pub(crate) struct RuntimeFeature {
     /// tasks themselves observe the same set; rehydrated from the `hook`
     /// table at boot via [`Services::rehydrate_hooks`](crate::hook_manager::HookServicesExt::rehydrate_hooks).
     pub(crate) hook_tasks: hook_manager::HookTasks,
+    /// Remote agents' machine runs, shared by every manager view; set up by
+    /// the first view built over the owner's services.
+    pub(crate) machine_runs: Arc<std::sync::OnceLock<script_ops::machine_runs::MachineRuns>>,
 }
 
 /// The runtime feature state and script output store, on [`Services`].
@@ -101,6 +104,7 @@ impl RuntimeStateExt for Services {
         .with_settings(self.settings_registry())
         .with_output_store(self.script_output_store())
         .with_tasks(self.feature_store_tasks().clone())
+        .with_machine_runs(self.runtime().machine_runs.clone())
         .with_owner_services(self.clone())
     }
 }
@@ -161,15 +165,12 @@ impl RuntimePort for RuntimeFeature {
         &'a self,
         svc: &'a Services,
         workspace_id: WorkspaceId,
-        method: &'a str,
+        method: String,
         params: serde_json::Value,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        Box::pin(crate::remote_scripts::machine_run_call(
-            svc,
-            workspace_id,
-            method,
-            params,
-        ))
+        Box::pin(async move {
+            crate::remote_scripts::machine_run_call(svc, workspace_id, &method, params).await
+        })
     }
 
     fn machine_script_frame<'a>(

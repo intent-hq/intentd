@@ -61,8 +61,11 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
     if let Some(last) = &row.last_connected_at {
         machine.insert("lastConnectedAt".into(), json!(last));
     }
-    // `nodeProtocol` (stored per bind) is served only together with
-    // `remoteScripts: 1`, which this backend does not advertise yet.
+    // Served with `remoteScripts: 1`: a machine below 8 needs an update
+    // before its agents can use saved scripts.
+    if let Some(protocol) = row.node_protocol {
+        machine.insert("nodeProtocol".into(), json!(protocol));
+    }
     Value::Object(machine)
 }
 
@@ -569,12 +572,28 @@ async fn deliver_stops(
         }
     }
     // An unreachable machine cannot ack now; the stops stay queued.
-    let unconfirmed = if attempts.as_array().is_some_and(|a| !a.is_empty()) {
-        node.wait_stops(agents, tokio::time::Instant::now()).await
+    let unreachable = attempts.as_array().is_some_and(|a| !a.is_empty());
+    let wait_until = if unreachable {
+        tokio::time::Instant::now()
     } else {
-        let deadline = started + node.shared_ref().remove_budget();
-        node.wait_stops(agents, deadline).await
+        started + node.shared_ref().remove_budget()
     };
+    let mut unconfirmed = node.wait_stops(agents, wait_until).await;
+    // The agents' script runs on the machine stop within the same budget;
+    // an unacknowledged script stop leaves its agent unconfirmed.
+    for agent in agents {
+        let acked = node
+            .shared()
+            .end_agent_machine_runs(
+                agent,
+                wait_until,
+                "remote-script-lost: the machine was removed",
+            )
+            .await;
+        if !acked && !unconfirmed.contains(agent) {
+            unconfirmed.push(agent.clone());
+        }
+    }
     if unconfirmed.is_empty() {
         return Ok(());
     }

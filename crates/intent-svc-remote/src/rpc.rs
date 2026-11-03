@@ -92,18 +92,6 @@ impl HeadCalls {
         if method != COMMIT_POLICY_METHOD && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
-        // A protocol-8 machine forwards `ws.script.*`, but this backend does
-        // not run machine runs yet and does not advertise `remoteScripts`:
-        // refuse rather than run the agent's script in the home checkout.
-        if method.starts_with("script.") {
-            return refusal(
-                FORBIDDEN,
-                format!(
-                    "{}: `{method}` is not supported on remote agents by this backend yet",
-                    workspace_api::UNSUPPORTED_CODE
-                ),
-            );
-        }
         let record = match shared.store.get_remote_agent(&request.agent_id).await {
             Ok(Some(record)) if record.lease_id == binding.lease_id => record,
             Ok(_) => {
@@ -136,6 +124,25 @@ impl HeadCalls {
         let features = self.services.session_agent_features(&session);
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
         let budget = Duration::from_millis(u64::from(request.timeout_ms)).min(MAX_BUDGET);
+        // Saved scripts (`remoteScripts: 1`): definitions and reads on the
+        // backend; the agent's runs are its machine runs, never the home run.
+        if method.starts_with("script.") {
+            let caller = intent_services::feature_api::feature_ports::RemoteScriptCaller {
+                workspace_id: record.workspace_id.clone(),
+                agent_id: record.agent_id.clone(),
+                node_id: record.node_id.clone(),
+            };
+            let args = request.params.get("args").cloned().unwrap_or(Value::Null);
+            return match self
+                .services
+                .feature_runtime()
+                .remote_script_call(&self.services, caller, method, args, budget)
+                .await
+            {
+                Ok(value) => LinkOutcome::Ok(value),
+                Err(message) => refusal(CALL_FAILED, message),
+            };
+        }
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
         // The host binds `Caller::Agent { record.agent_id }` around the frame
         // itself: a node's agent acts with exactly its own identity, never

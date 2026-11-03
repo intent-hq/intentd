@@ -21721,6 +21721,12 @@ impl WorkspaceApi for Services {
             ) -> BoxFuture<'_, Result<serde_json::Value>> => script_output;
             fn script_status(&self, workspace_id: WorkspaceId, script_id: String)
                 -> BoxFuture<'_, Result<serde_json::Value>> => script_status;
+            fn script_machine_run(
+                &self,
+                workspace_id: WorkspaceId,
+                method: String,
+                params: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => machine_run_call;
             fn script_run(
                 &self,
                 workspace_id: WorkspaceId,

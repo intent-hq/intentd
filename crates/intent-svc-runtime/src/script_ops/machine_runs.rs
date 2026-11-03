@@ -59,6 +59,10 @@ pub(crate) struct Hooks {
 
 /// Where a machine run is: its script and the remote agent running it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the wire names: workspaceId, scriptId, agentId"
+)]
 pub(crate) struct RunPlace {
     pub workspace_id: WorkspaceId,
     pub script_id: String,
@@ -74,6 +78,10 @@ struct Monitor {
     expires_at: String,
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "`last_run` is the wire `lastRun`"
+)]
 struct Run {
     node_id: String,
     state: ScriptRuntimeState,
@@ -282,31 +290,28 @@ impl MachineRuns {
             self.changed(place).await;
             return Ok(ScriptRuntimeState::default());
         }
-        match (link, spawn_id) {
-            (Some(link), Some(spawn_id)) => {
-                let mut settled = self.inner.settled.subscribe();
-                let _ = (link.send)(stop_frame(place, &spawn_id)).await;
-                let _ = tokio::time::timeout(self.inner.hooks.stop_wait, async {
-                    while self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
-                        if settled.changed().await.is_err() {
-                            return;
-                        }
+        if let (Some(link), Some(spawn_id)) = (link, spawn_id) {
+            let mut settled = self.inner.settled.subscribe();
+            let _ = (link.send)(stop_frame(place, &spawn_id)).await;
+            let _ = tokio::time::timeout(self.inner.hooks.stop_wait, async {
+                while self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
+                    if settled.changed().await.is_err() {
+                        return;
                     }
-                })
-                .await;
-                // Unacknowledged within the wait: the machine stops it once
-                // the link drops; settle it here so the run is not left live.
-                if self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
-                    self.settle(place, &spawn_id, None, None).await;
                 }
+            })
+            .await;
+            // Unacknowledged within the wait: the machine stops it once
+            // the link drops; settle it here so the run is not left live.
+            if self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
+                self.settle(place, &spawn_id, None, None).await;
             }
-            _ => {
-                // Restarting between processes: nothing runs on the machine.
-                let mut runs = lock(&self.inner.runs);
-                if let Some(run) = runs.get_mut(place) {
-                    run.state = idle_after(&run.state);
-                    run.stopping = false;
-                }
+        } else {
+            // Restarting between processes: nothing runs on the machine.
+            let mut runs = lock(&self.inner.runs);
+            if let Some(run) = runs.get_mut(place) {
+                run.state = idle_after(&run.state);
+                run.stopping = false;
             }
         }
         self.changed(place).await;

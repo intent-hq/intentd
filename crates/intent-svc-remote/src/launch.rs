@@ -394,6 +394,44 @@ impl RemoteLaunchPort for RemoteLaunch {
         })
     }
 
+    fn machine_script_link<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<intent_services::feature_api::feature_ports::MachineScriptLink>> {
+        Box::pin(async move {
+            let record = svc
+                .store()
+                .get_remote_agent(agent_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "node-agent-unplaced: agent {agent_id} was not placed on a machine"
+                    ))
+                })?;
+            let feature = svc.remote_feature().ok_or_else(no_node)?;
+            let node = feature.node(svc, &record.node_id).await?;
+            node.connect().await?;
+            let link = node.shared().current_link().ok_or_else(|| {
+                Error::Internal("machine-unreachable: the machine's link closed".into())
+            })?;
+            let status = node.status();
+            let sender = link.clone();
+            Ok(
+                intent_services::feature_api::feature_ports::MachineScriptLink {
+                    node_id: record.node_id.clone(),
+                    protocol: link.protocol(),
+                    machine_name: status.node_name.clone(),
+                    machine_version: status.intentd_version.clone().unwrap_or_default(),
+                    send: Arc::new(move |frame| {
+                        let link = sender.clone();
+                        Box::pin(async move { link.send(&frame).await })
+                    }),
+                },
+            )
+        })
+    }
+
     fn runtime<'a>(
         &'a self,
         svc: &'a Services,

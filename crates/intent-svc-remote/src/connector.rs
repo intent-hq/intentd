@@ -324,12 +324,49 @@ impl Shared {
     /// capabilities request is waiting.
     fn wants_link(&self) -> bool {
         self.agents.live_count() > 0
+            || self.machine_runs_live()
             || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.claimed.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Whether one of this machine's script runs is live: the machine stops
+    /// a binding's scripts when its link closes, so the link stays up.
+    fn machine_runs_live(&self) -> bool {
+        self.services.as_ref().is_some_and(|svc| {
+            svc.feature_runtime()
+                .machine_runs_live(svc, &self.machine_id())
+        })
+    }
+
+    /// Lease end for `agent_id`'s machine runs: stop them and wait for the
+    /// acknowledgements until `deadline`; whether all were acknowledged.
+    pub(crate) async fn end_agent_machine_runs(
+        &self,
+        agent_id: &AgentId,
+        deadline: Instant,
+        reason: &str,
+    ) -> bool {
+        match &self.services {
+            Some(svc) => {
+                svc.feature_runtime()
+                    .end_agent_machine_runs(svc, agent_id, deadline, reason)
+                    .await
+            }
+            None => true,
+        }
+    }
+
+    /// Every live script run on this machine is lost with `reason`.
+    pub(crate) async fn machine_runs_lost(&self, reason: &str) {
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_link_lost(svc, &self.machine_id(), reason)
+                .await;
+        }
     }
 
     /// Queue a stop for `agent_id` (reusing its id when one is already
@@ -926,7 +963,6 @@ impl RemoteNode {
         Ok(Self { shared })
     }
 
-    #[cfg(test)]
     pub(crate) fn shared(&self) -> Arc<Shared> {
         self.shared.clone()
     }
@@ -1393,6 +1429,10 @@ async fn run(
         });
         shared.disconnected();
         lock(&shared.capability_waiters).clear();
+        // The machine stops this binding's scripts when its link closes.
+        shared
+            .machine_runs_lost("remote-script-lost: the machine disconnected")
+            .await;
         match ended {
             Ended::Shutdown => return,
             Ended::Idle => {
@@ -1485,6 +1525,15 @@ async fn serve(
                         let waiters: Vec<_> = lock(&shared.capability_waiters).drain(..).collect();
                         for waiter in waiters {
                             let _ = waiter.send(capabilities.clone());
+                        }
+                    }
+                    LinkEvent::Frame(frame)
+                        if frame.channel() == intent_core::node_link::LinkChannel::Script =>
+                    {
+                        if let Some(svc) = &shared.services {
+                            svc.feature_runtime()
+                                .machine_script_frame(svc, &shared.machine_id(), frame)
+                                .await;
                         }
                     }
                     LinkEvent::Frame(frame) => {

@@ -5620,6 +5620,21 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "script.start" | "script.stop" | "script.restart" | "script.output" | "script.status"
+        | "script.run"
+            if params.contains_key("remoteAgentId") =>
+        {
+            // A remote agent's machine run (`remoteScripts: 1`): status,
+            // output, stop and restart of an existing run; start and run
+            // are the remote agent's own.
+            let ws = require_ws_note(params)?;
+            require_str_param(params, "scriptId")?;
+            require_str_param(params, "remoteAgentId")?;
+            let method = method.trim_start_matches("script.").to_owned();
+            api.script_machine_run(ws, method, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.start" => {
             if matches!(
                 intent_core::current_caller(),
