@@ -1565,6 +1565,29 @@ This is a test skill.
             specialist_name: Some("Coordinator".to_string()),
             role_reminder: None,
         };
+        let service = crate::specialists::SpecialistsService::new(
+            Some(temp_dir.path().join("user")),
+            Some(temp_dir.path().join("bundled")),
+        )
+        .with_embedded(crate::specialists::EMBEDDED_BUNDLED_V3_7);
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/specialists/v3.7");
+        let bundled: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .map(|path| {
+                let id = path.file_stem().unwrap().to_str().unwrap();
+                let (body, name, reminder) = service
+                    .resolve_prompt_injection_in(id, None, true)
+                    .expect("every v3.7 file must be in the bundled catalog");
+                SpecialistPromptInjection {
+                    behavior_prompt: body,
+                    specialist_name: Some(name),
+                    role_reminder: reminder,
+                }
+            })
+            .collect();
+        assert!(!bundled.is_empty());
         let mut leaks = Vec::new();
         for agent_type in [
             "interactive",
@@ -1577,7 +1600,10 @@ This is a test skill.
             "debug",
             "chat",
         ] {
-            for specialist in [None, Some(&coordinator)] {
+            for specialist in [None, Some(&coordinator)]
+                .into_iter()
+                .chain(bundled.iter().map(Some))
+            {
                 for is_sub_agent in [false, true] {
                     for auto_commit in [false, true] {
                         let docs = intent_acp::WorkspaceMcpServer::new(

@@ -6084,6 +6084,12 @@ impl Services {
             metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
+            let plain_folder = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(AgentPersistError::store)?
+                .plain_folder;
             // Both snapshot resolutions below walk the specialist tier
             // directories — blocking pool (monorepo#4148).
             let services = self.clone();
@@ -6091,9 +6097,11 @@ impl Services {
             let wp = snapshot_wp.clone();
             let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
                 (
-                    services
-                        .specialists_service()
-                        .resolve_prompt_injection(&spec_id_owned, wp.as_deref()),
+                    services.specialists_service().resolve_prompt_injection_in(
+                        &spec_id_owned,
+                        wp.as_deref(),
+                        plain_folder,
+                    ),
                     services
                         .specialists_service()
                         .resolve_is_orchestrator(&spec_id_owned, wp.as_deref()),
@@ -7461,12 +7469,9 @@ impl Services {
                     session.specialist = if let Some(spec_id) =
                         update_optional_string(value, "specialist")?
                     {
-                        let wp = self
-                            .store
-                            .get_workspace(&session.workspace_id)
-                            .await
-                            .ok()
-                            .and_then(|w| crate::git_ops::worktree_path(&w));
+                        let workspace = self.store.get_workspace(&session.workspace_id).await.ok();
+                        let plain_folder = workspace.as_ref().is_some_and(|w| w.plain_folder);
+                        let wp = workspace.as_ref().and_then(crate::git_ops::worktree_path);
                         // Canonicalization + the refreshed orchestrator-role
                         // snapshot (`specialistIsOrchestrator`, written at
                         // create, re-resolved here so the session-open
@@ -7487,9 +7492,11 @@ impl Services {
                                     .resolve_display_name(&canonical, wp.as_deref());
                                 let injection = remember_specialist
                                     .then(|| {
-                                        services
-                                            .specialists_service()
-                                            .resolve_prompt_injection(&canonical, wp.as_deref())
+                                        services.specialists_service().resolve_prompt_injection_in(
+                                            &canonical,
+                                            wp.as_deref(),
+                                            plain_folder,
+                                        )
                                     })
                                     .flatten();
                                 Ok((canonical, is_orchestrator, display_name, injection))

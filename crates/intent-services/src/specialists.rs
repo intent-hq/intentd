@@ -1908,7 +1908,51 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        let def = self.resolve(id, workspace_path)?;
+        self.resolve_prompt_injection_in(id, workspace_path, false)
+    }
+
+    /// Apply plain-folder doctrine only to the shipped v3.7 prompts. File
+    /// overrides and older session-pinned bundles retain their authored text.
+    pub(crate) fn resolve_prompt_injection_in(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+        plain_folder: bool,
+    ) -> Option<(Option<String>, String, Option<String>)> {
+        let mut def = self.resolve(id, workspace_path)?;
+        if plain_folder && !self.base_replaced && def["source"] == "bundled" {
+            for (candidate, source) in EMBEDDED_BUNDLED_V3_7 {
+                if !matches!(*candidate, "developer" | "pr-reviewer") {
+                    continue;
+                }
+                let (meta, body) = parse_frontmatter(source);
+                if def["id"] != *candidate || def["behaviorPrompt"] != body {
+                    continue;
+                }
+                let body = if *candidate == "developer" {
+                    body.lines()
+                        .filter(|line| {
+                            !line.starts_with("At the start of the conversation, when you've figured out the nature of the task, rename the branch")
+                                && !line.starts_with("- Commit your changes")
+                                && !line.starts_with("- Only open pull requests")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    body.replace(
+                        "PR review specialist conducting a code review for a pull request",
+                        "review specialist reviewing changes in this folder",
+                    )
+                    .replace("PR changes", "changes")
+                    .replace("locations in the PR", "locations in the changes")
+                    .replace("PR Review #[PR_NUMBER]", "Review findings")
+                };
+                def["behaviorPrompt"] = json!(body);
+                if *candidate == "pr-reviewer" && def["name"] == meta["name"] {
+                    def["name"] = json!("Reviewer");
+                }
+            }
+        }
         let behavior_prompt = def
             .get("behaviorPrompt")
             .and_then(Value::as_str)
@@ -2827,6 +2871,45 @@ mod tests {
         assert_eq!(
             non_empty_path(Some(std::ffi::OsString::from("/tmp/specialists"))),
             Some(PathBuf::from("/tmp/specialists"))
+        );
+    }
+
+    #[test]
+    fn plain_folder_keeps_git_prompts_and_custom_specialists_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = SpecialistsService::new(
+            Some(dir.path().to_path_buf()),
+            Some(dir.path().join("bundle")),
+        );
+        for id in ["developer", "pr-reviewer"] {
+            let original = svc.resolve_prompt_injection(id, None).unwrap();
+            assert_eq!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, false).unwrap()
+            );
+            assert_ne!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, true).unwrap()
+            );
+            let source = EMBEDDED_BUNDLED_V3_7
+                .iter()
+                .find(|(name, _)| *name == id)
+                .unwrap()
+                .1;
+            std::fs::write(dir.path().join(format!("{id}.md")), source).unwrap();
+            assert_eq!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, true).unwrap()
+            );
+        }
+        let old = SpecialistsService::new(
+            Some(dir.path().join("empty")),
+            Some(dir.path().join("bundle")),
+        )
+        .with_embedded(EMBEDDED_BUNDLED_V3_1);
+        assert_eq!(
+            old.resolve_prompt_injection("developer", None),
+            old.resolve_prompt_injection_in("developer", None, true)
         );
     }
 

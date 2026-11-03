@@ -967,6 +967,50 @@ async fn specialist_snapshot_persisted_at_create() {
     assert_eq!(meta["specialistRoleReminder"].as_str(), Some("Stay frozen"));
 }
 
+#[tokio::test]
+async fn plain_folder_specialist_snapshots_and_turn_reminders_omit_git_guidance() {
+    let (_t, svc, _git_ws, _specialists, _cfg) = setup().await;
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.plain_folder = true;
+    svc.store().insert_workspace(&row).await.unwrap();
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Test".to_string()),
+            None,
+            Some("developer".into()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                is_background: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let meta = session.metadata.unwrap();
+    let body = meta["behaviorPrompt"].as_str().unwrap();
+    assert!(!body.contains("rename the branch"));
+    assert!(!body.contains("Commit your changes"));
+    assert!(!body.contains("pull requests"));
+    svc.agent_update_op(
+        id.clone(),
+        json!({"specialist": "pr-reviewer", "rememberSpecialist": true}),
+    )
+    .await
+    .unwrap();
+    let injection = svc.agent_specialist_injection(&id, None).await.unwrap();
+    assert_eq!(injection.specialist_name.as_deref(), Some("Reviewer"));
+    assert!(!injection.behavior_prompt.unwrap().contains("PR "));
+    let reminder = svc.agent_role_reminder(&id).await.unwrap();
+    assert!(reminder.contains("Reviewer"));
+    assert!(!reminder.contains("PR"));
+}
+
 /// An explicit caller `metadata.behaviorPrompt` override is left untouched —
 /// it IS the frozen body; the resolved identity is still snapshotted.
 #[tokio::test]
