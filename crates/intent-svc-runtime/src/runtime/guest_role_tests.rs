@@ -293,3 +293,56 @@ async fn guest_roles_script_list_cannot_import_repository_commands() {
         .unwrap();
     assert_eq!(list["scripts"].as_array().unwrap().len(), 1);
 }
+
+/// Review of intentd#3005: `script.*` addressed to a remote agent's machine
+/// run (`remoteAgentId`) is authorized exactly like the home run: a guest
+/// without the saved-script operator role is refused.
+#[tokio::test]
+async fn guest_roles_cannot_drive_or_read_machine_runs_without_the_operator_role() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let svc = &f.services;
+    let script = f
+        .run(
+            Role::Owner,
+            svc.script_create(
+                f.ws.clone(),
+                ScriptCreateParams {
+                    name: "saved".into(),
+                    command: "true".into(),
+                    mode: ScriptMode::Command,
+                    purpose: Some(intent_core::ScriptPurpose::Saved),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let id = script["id"].as_str().unwrap().to_owned();
+    f.run(
+        Role::Owner,
+        svc.workspace_members_set_role(
+            f.ws.clone(),
+            f.collaborator.clone(),
+            WorkspaceRole::Collaborator,
+        ),
+    )
+    .await
+    .unwrap();
+    for method in ["status", "output", "stop", "restart"] {
+        let result = f
+            .run(
+                Role::Collaborator,
+                svc.script_machine_run(
+                    f.ws.clone(),
+                    method.to_owned(),
+                    json!({ "scriptId": id, "remoteAgentId": "agent-remote" }),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::Forbidden(_))),
+            "{method}: {result:?}"
+        );
+    }
+}

@@ -207,6 +207,22 @@ impl RuntimePort for RuntimeFeature {
             .is_some_and(|runs| runs.live_on(node_id))
     }
 
+    fn end_agents_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agents: &'a [intent_core::AgentId],
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Vec<intent_core::AgentId>> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            match mgr.machine_runs() {
+                Some(runs) => runs.end_agents(agents, deadline, reason).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
     fn end_agent_machine_runs<'a>(
         &'a self,
         svc: &'a Services,

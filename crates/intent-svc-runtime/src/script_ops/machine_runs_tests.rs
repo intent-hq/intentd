@@ -29,6 +29,9 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
         link: Arc::new(move |_agent| {
             let rec = links.clone();
             Box::pin(async move {
+                // A real link lookup awaits the connector: let racing
+                // callers interleave here.
+                tokio::task::yield_now().await;
                 if rec.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(intent_core::Error::Internal("machine-unreachable".into()));
                 }
@@ -423,4 +426,83 @@ async fn start_fails_when_the_machine_is_unreachable_or_too_old_for_a_restart() 
     runs.restart(&place(&agent), &script(ScriptMode::Command, "make"))
         .await
         .unwrap();
+}
+
+/// Review of intentd#3005: two starts of the same place racing across the
+/// link lookup send one `scriptStart` and track one process.
+#[tokio::test]
+async fn concurrent_starts_of_one_place_send_one_script_start() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let def = script(ScriptMode::Service, "serve");
+    let here = place(&agent);
+    let (a, b) = tokio::join!(runs.start(&here, &def), runs.start(&here, &def));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.run_id, b.run_id, "both callers see the same run");
+    let starts = rec
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| matches!(f, LinkFrame::ScriptStart(_)))
+        .count();
+    assert_eq!(starts, 1);
+}
+
+/// Review of intentd#3005: a lease end for several agents sends every
+/// script stop first and waits once, so an agent that never acknowledges
+/// does not cost another agent its acknowledgement.
+#[tokio::test]
+async fn ending_several_agents_waits_once_for_all_their_stops() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let silent = AgentId::new();
+    let prompt = AgentId::new();
+    runs.start(&place(&silent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    runs.start(&place(&prompt), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    // The machine acknowledges `prompt`'s stop as soon as it is sent.
+    let acker = {
+        let runs = runs.clone();
+        let rec = rec.clone();
+        let prompt = prompt.clone();
+        tokio::spawn(async move {
+            loop {
+                let stop = rec.frames.lock().unwrap().iter().find_map(|f| match f {
+                    LinkFrame::ScriptStop(s) if s.agent_id == prompt => Some(s.clone()),
+                    _ => None,
+                });
+                if let Some(stop) = stop {
+                    runs.on_frame(
+                        "mac",
+                        LinkFrame::ScriptExited(ScriptExited {
+                            agent_id: stop.agent_id,
+                            script_id: stop.script_id,
+                            spawn_id: stop.spawn_id,
+                            exit_code: Some(143),
+                            error: None,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let unacked = runs
+        .end_agents(
+            &[silent.clone(), prompt.clone()],
+            deadline,
+            "remote-script-lost: the machine was removed",
+        )
+        .await;
+    acker.await.unwrap();
+    assert_eq!(unacked, vec![silent]);
+    assert!(runs.entries(&ws(), "s1").is_empty());
 }

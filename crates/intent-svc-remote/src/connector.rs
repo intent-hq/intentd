@@ -342,21 +342,21 @@ impl Shared {
         })
     }
 
-    /// Lease end for `agent_id`'s machine runs: stop them and wait for the
-    /// acknowledgements until `deadline`; whether all were acknowledged.
-    pub(crate) async fn end_agent_machine_runs(
+    /// Lease end for `agents`' machine runs: send every stop, wait once
+    /// until `deadline`; the agents whose script stop was unacknowledged.
+    pub(crate) async fn end_agents_machine_runs(
         &self,
-        agent_id: &AgentId,
+        agents: &[AgentId],
         deadline: Instant,
         reason: &str,
-    ) -> bool {
+    ) -> Vec<AgentId> {
         match &self.services {
             Some(svc) => {
                 svc.feature_runtime()
-                    .end_agent_machine_runs(svc, agent_id, deadline, reason)
+                    .end_agents_machine_runs(svc, agents, deadline, reason)
                     .await
             }
-            None => true,
+            None => Vec::new(),
         }
     }
 

@@ -635,10 +635,10 @@ async fn wsapi_turn(
         )
         .await;
         next += 1;
-        reply = got["agent"]["lastAgentResponse"]
+        got["agent"]["lastAgentResponse"]
             .as_str()
             .unwrap_or_default()
-            .to_owned();
+            .clone_into(&mut reply);
     }
     reply
 }

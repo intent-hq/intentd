@@ -903,6 +903,20 @@ pub trait RuntimePort: Send + Sync + 'static {
         false
     }
 
+    /// Lease end for several agents at once (`remoteMachines.remove`): send
+    /// every stop, wait once until `deadline`, drop their entries. Returns
+    /// the agents with an unacknowledged script stop.
+    fn end_agents_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agents: &'a [AgentId],
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Vec<AgentId>> {
+        let _ = (svc, agents, deadline, reason);
+        Box::pin(async { Vec::new() })
+    }
+
     /// Lease end: stop each of `agent_id`'s live machine runs and wait for
     /// their acknowledgements until `deadline`, then drop its entries.
     /// Returns whether every stop was acknowledged.

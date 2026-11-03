@@ -579,19 +579,20 @@ async fn deliver_stops(
         started + node.shared_ref().remove_budget()
     };
     let mut unconfirmed = node.wait_stops(agents, wait_until).await;
-    // The agents' script runs on the machine stop within the same budget;
-    // an unacknowledged script stop leaves its agent unconfirmed.
-    for agent in agents {
-        let acked = node
-            .shared()
-            .end_agent_machine_runs(
-                agent,
-                wait_until,
-                "remote-script-lost: the machine was removed",
-            )
-            .await;
-        if !acked && !unconfirmed.contains(agent) {
-            unconfirmed.push(agent.clone());
+    // The agents' script runs on the machine stop within the same budget,
+    // every stop sent before one wait; an unacknowledged script stop leaves
+    // its agent unconfirmed.
+    for agent in node
+        .shared()
+        .end_agents_machine_runs(
+            agents,
+            wait_until,
+            "remote-script-lost: the machine was removed",
+        )
+        .await
+    {
+        if !unconfirmed.contains(&agent) {
+            unconfirmed.push(agent);
         }
     }
     if unconfirmed.is_empty() {

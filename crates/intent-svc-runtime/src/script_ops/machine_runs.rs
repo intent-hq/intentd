@@ -222,6 +222,11 @@ impl MachineRuns {
         let spawn_id = new_id();
         let state = {
             let mut runs = lock(&self.inner.runs);
+            // Another start may have won while the link was looked up: it
+            // owns the process, so report its run instead of a second one.
+            if let Some(live) = runs.get(place).map(|run| &run.state).filter(|s| is_live(s)) {
+                return Ok(live.clone());
+            }
             let run = runs.entry(place.clone()).or_insert_with(|| Run {
                 node_id: link.node_id.clone(),
                 state: ScriptRuntimeState::default(),
@@ -703,18 +708,32 @@ impl MachineRuns {
         }
     }
 
-    /// Lease end: stop each of `agent_id`'s live runs, wait for the
-    /// acknowledgements until `deadline`, then drop its entries. Returns
-    /// whether every stop was acknowledged.
+    /// Lease end for one agent: [`Self::end_agents`]; whether every stop
+    /// was acknowledged.
     pub(crate) async fn end_agent(
         &self,
         agent_id: &AgentId,
         deadline: tokio::time::Instant,
         reason: &str,
     ) -> bool {
+        self.end_agents(std::slice::from_ref(agent_id), deadline, reason)
+            .await
+            .is_empty()
+    }
+
+    /// Lease end: send a stop for every live run of `agents`, wait once for
+    /// the acknowledgements until `deadline`, settle what is left with
+    /// `reason`, then drop the agents' entries. Returns the agents with an
+    /// unacknowledged stop.
+    pub(crate) async fn end_agents(
+        &self,
+        agents: &[AgentId],
+        deadline: tokio::time::Instant,
+        reason: &str,
+    ) -> Vec<AgentId> {
         let live: Vec<(RunPlace, MachineScriptLink, String)> = lock(&self.inner.runs)
             .iter_mut()
-            .filter(|(place, run)| &place.agent_id == agent_id && is_live(&run.state))
+            .filter(|(place, run)| agents.contains(&place.agent_id) && is_live(&run.state))
             .filter_map(|(place, run)| {
                 run.stopping = true;
                 Some((place.clone(), run.link.clone()?, run.spawn_id.clone()?))
@@ -724,19 +743,25 @@ impl MachineRuns {
         for (place, link, spawn) in &live {
             let _ = (link.send)(stop_frame(place, spawn)).await;
         }
-        let pending = |runs: &MachineRuns| {
+        let pending = |runs: &MachineRuns| -> Vec<&(RunPlace, MachineScriptLink, String)> {
             live.iter()
-                .any(|(place, _, spawn)| runs.spawn_of(place).as_deref() == Some(spawn.as_str()))
+                .filter(|(place, _, spawn)| runs.spawn_of(place).as_deref() == Some(spawn.as_str()))
+                .collect()
         };
         let _ = tokio::time::timeout_at(deadline, async {
-            while pending(self) {
+            while !pending(self).is_empty() {
                 if settled.changed().await.is_err() {
                     return;
                 }
             }
         })
         .await;
-        let acked = !pending(self);
+        let mut unacked: Vec<AgentId> = Vec::new();
+        for (place, _, _) in pending(self) {
+            if !unacked.contains(&place.agent_id) {
+                unacked.push(place.agent_id.clone());
+            }
+        }
         for (place, _, spawn) in &live {
             self.settle(place, spawn, None, Some(reason.to_owned()))
                 .await;
@@ -745,7 +770,7 @@ impl MachineRuns {
             let mut runs = lock(&self.inner.runs);
             let places: Vec<RunPlace> = runs
                 .keys()
-                .filter(|place| &place.agent_id == agent_id)
+                .filter(|place| agents.contains(&place.agent_id))
                 .cloned()
                 .collect();
             for place in &places {
@@ -756,7 +781,7 @@ impl MachineRuns {
         for place in dropped {
             self.changed(&place).await;
         }
-        acked
+        unacked
     }
 
     /// The definition changed or was removed: stop every live machine run

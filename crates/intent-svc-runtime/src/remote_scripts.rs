@@ -323,6 +323,10 @@ pub(crate) async fn machine_run_call(
     params: Value,
 ) -> Result<Value> {
     let agent = str_arg(&params, "remoteAgentId")?;
+    let script_id = str_arg(&params, "scriptId")?;
+    // Authorized exactly as the home run's `script.<method>`.
+    svc.require_saved_script_operator(&workspace_id, &script_id, &format!("script.{method}"))
+        .await?;
     let place = RunPlace {
         workspace_id: workspace_id.clone(),
         script_id: str_arg(&params, "scriptId")?,

@@ -252,6 +252,12 @@ async fn create(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    // `remoteAuthor` is daemon-owned (`remoteScripts: 1`), never a param.
+    if args.get("remoteAuthor").is_some() {
+        return Err(
+            "remote-script-author-readonly: remoteAuthor is set by the backend".to_string(),
+        );
+    }
     // Saved scripts never receive secrets (PROTOCOL §5.56): say so instead of
     // silently ignoring the key and letting the script run without them.
     if args.get("secretEnv").is_some() {
@@ -436,5 +442,29 @@ mod tests {
         assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(6)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(3)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(250)), 1);
+    }
+
+    struct NoApi;
+    impl WorkspaceApi for NoApi {}
+
+    /// `remoteAuthor` is set by the backend only: a local agent supplying
+    /// it is refused with the documented code before anything is saved.
+    #[tokio::test]
+    async fn create_refuses_a_remote_author_param() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(NoApi);
+        let error = create(
+            &api,
+            &WorkspaceId::from("ws"),
+            &serde_json::json!({
+                "name": "n", "command": "true", "mode": "command",
+                "remoteAuthor": { "agentId": "a", "nodeId": "n" },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.starts_with("remote-script-author-readonly: "),
+            "{error}"
+        );
     }
 }
