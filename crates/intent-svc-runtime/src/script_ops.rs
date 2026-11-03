@@ -793,6 +793,7 @@ impl ScriptManager {
             auto_start: params.auto_start,
             created_at,
             updated_at,
+            remote_author: None,
         };
         if self
             .scripts
@@ -1466,6 +1467,7 @@ impl ScriptManager {
                                     auto_start: repo_script.auto_start,
                                     created_at: now.clone(),
                                     updated_at: None,
+                                    remote_author: None,
                                 })
                                 .collect();
                             // Persist in one batched upsert — one INSERT per
@@ -3852,6 +3854,7 @@ mod tests {
             auto_start: None,
             created_at: "t".into(),
             updated_at: None,
+            remote_author: None,
         };
         let state = ScriptRuntimeState {
             status: ScriptStatus::Running,
@@ -4444,6 +4447,7 @@ mod tests {
                 auto_start: Some(false),
                 created_at: now_iso(),
                 updated_at: None,
+                remote_author: None,
             })
             .await
             .unwrap();

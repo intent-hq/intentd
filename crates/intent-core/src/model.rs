@@ -6025,6 +6025,20 @@ pub struct Script {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The remote agent that created this script (`remoteScripts: 1`).
+    /// Daemon-owned: no `script.create` param sets it and an upsert keeps the
+    /// stored value. A remote agent changes only definitions it authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_author: Option<ScriptRemoteAuthor>,
+}
+
+/// `Script.remoteAuthor`: the remote agent that created the script and its
+/// machine (the `remoteMachines` row id, the agent's placement `nodeId`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptRemoteAuthor {
+    pub agent_id: AgentId,
+    pub node_id: String,
 }
 
 /// Wire input for `script.create` (PROTOCOL §5.8); built by the router from

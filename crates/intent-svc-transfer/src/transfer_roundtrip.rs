@@ -787,6 +787,7 @@ async fn seed_source(
             auto_start: None,
             created_at: t.clone(),
             updated_at: None,
+            remote_author: None,
         })
         .await
         .expect("script");

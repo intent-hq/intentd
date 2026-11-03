@@ -6384,6 +6384,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: Some(true),
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&script).await.expect("insert");
 
@@ -6416,6 +6417,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&sparse).await.expect("insert sparse");
     let listed = store.list_all_scripts().await.expect("list");
@@ -6428,6 +6430,64 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_remote_author_round_trips_and_reaches_summaries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let remote_author = intent_core::ScriptRemoteAuthor {
+        node_id: "mac-studio".to_string(),
+        agent_id: intent_core::AgentId::from("agent-r1"),
+    };
+    let script = intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
+        id: "s-remote".to_string(),
+        workspace_id: "ws-1".to_string(),
+        name: "test".to_string(),
+        command: "cargo test".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "agent".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+        remote_author: Some(remote_author.clone()),
+    };
+    store.upsert_script(&script).await.expect("insert");
+    store
+        .upsert_scripts(&[intent_core::Script {
+            id: "s-local".to_string(),
+            remote_author: None,
+            ..script.clone()
+        }])
+        .await
+        .expect("bulk insert");
+    let ws = WorkspaceId::from("ws-1");
+    let got = store
+        .get_script_in_workspace(&ws, "s-remote")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.remote_author, Some(remote_author));
+    assert_eq!(
+        serde_json::to_value(&got).unwrap()["remoteAuthor"],
+        serde_json::json!({ "nodeId": "mac-studio", "agentId": "agent-r1" })
+    );
+    let local = store
+        .get_script_in_workspace(&ws, "s-local")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(local.remote_author, None);
+    assert!(serde_json::to_value(&local)
+        .unwrap()
+        .get("remoteAuthor")
+        .is_none());
 }
 
 #[tokio::test]
@@ -6460,6 +6520,7 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
             auto_start: (i % 2 == 0).then_some(true),
             created_at: now_iso(),
             updated_at: None,
+            remote_author: None,
         })
         .collect();
     store.upsert_scripts(&scripts).await.expect("bulk insert");
@@ -6503,6 +6564,7 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store
         .upsert_script(&script("ws-1", "s-1"))

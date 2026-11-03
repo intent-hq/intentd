@@ -20,6 +20,7 @@ async fn seed_legacy_script(h: &Harness, params: ScriptCreateParams) -> String {
         updated_at: None,
         archived_at: None,
         last_run: None,
+        remote_author: None,
     };
     h.services.store().upsert_script(&def).await.unwrap();
     id
