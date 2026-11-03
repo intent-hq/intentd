@@ -12,6 +12,12 @@ use serde_json::{json, Value};
 
 use crate::seed::{self, Seeded};
 
+/// Items a maximal page of a byte-budgeted forge read must reach: the stub
+/// upstreams fill every item with ~16 KiB of text, so the daemon's 480,000-byte
+/// page budget serves about 27 of them before it resumes inside the
+/// upstream page.
+const BUDGETED_PAGE_ITEMS: usize = 20;
+
 /// How a variant proves it reached the large data.
 #[derive(Debug, Clone)]
 pub enum Proof {
@@ -1956,7 +1962,11 @@ pub fn proxy_rows() -> Vec<Row> {
     };
     // Every paginated GitHub read: default page, the largest page, the
     // `perPage` alias, and the next page.
-    let paged = |base: Value, at: &'static str, extra: Value| -> Vec<Variant> {
+    // `full`: the item count a maximal page must reach. Reads whose items are
+    // small fill the 100-item page; byte-budgeted forge reads (long bodies)
+    // stop at the item budget and resume inside the upstream page, so they
+    // prove a page of at least `BUDGETED_PAGE_ITEMS` long items instead.
+    let paged_upto = |base: Value, at: &'static str, extra: Value, full: usize| -> Vec<Variant> {
         let merge = |more: Value| {
             let mut p = base.clone();
             for (k, v) in extra.as_object().expect("object") {
@@ -1972,21 +1982,25 @@ pub fn proxy_rows() -> Vec<Row> {
             v(
                 "limit=1000",
                 merge(json!({ "limit": 1_000 })),
-                Items(at, 100),
+                Items(at, full),
             ),
             v(
                 "perPage=1000",
                 merge(json!({ "perPage": 1_000 })),
-                Items(at, 100),
+                Items(at, full),
             ),
             next(
                 "nextToken",
                 merge(json!({ "limit": 1_000 })),
                 "/nextToken",
                 "nextToken",
-                Items(at, 100),
+                Items(at, full),
             ),
         ]
+    };
+    let paged = |base: Value, at: &'static str, extra: Value| paged_upto(base, at, extra, 100);
+    let budgeted = |base: Value, at: &'static str, extra: Value| {
+        paged_upto(base, at, extra, BUDGETED_PAGE_ITEMS)
     };
     let single = |why: &'static str| why;
     vec![
@@ -2001,7 +2015,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.getReviewThreads",
-            paged(with(json!({ "number": 1 })), "/threads", json!({})),
+            budgeted(with(json!({ "number": 1 })), "/threads", json!({})),
         ),
         fixed(
             "github.getUser",
@@ -2014,7 +2028,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.issues.list",
-            paged(
+            budgeted(
                 gh.clone(),
                 "/issues",
                 json!({ "state": "open", "labels": "bug" }),
@@ -2022,7 +2036,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.issues.search",
-            paged(
+            budgeted(
                 gh.clone(),
                 "/issues",
                 json!({ "filter": "assigned", "state": "open", "query": "budget", "repos": [{ "owner": "intent-hq", "repo": "large-state-repo-1" }] }),
@@ -2030,7 +2044,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.listReviewComments",
-            paged(with(json!({ "number": 1 })), "/comments", json!({})),
+            budgeted(with(json!({ "number": 1 })), "/comments", json!({})),
         ),
         row(
             "github.pulls.checks",
@@ -2038,7 +2052,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.pulls.files",
-            paged(
+            budgeted(
                 with(json!({ "number": 1 })),
                 "/files",
                 json!({ "expectedHeadSha": "deadbeef" }),
@@ -2050,7 +2064,7 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.pulls.list",
-            paged(
+            budgeted(
                 gh.clone(),
                 "/pulls",
                 json!({ "state": "open", "head": "intent-hq:feature", "base": "main" }),
@@ -2058,10 +2072,10 @@ pub fn proxy_rows() -> Vec<Row> {
         ),
         row(
             "github.pulls.reviews",
-            paged(with(json!({ "number": 1 })), "/reviews", json!({})),
+            budgeted(with(json!({ "number": 1 })), "/reviews", json!({})),
         ),
         row("github.pulls.search", {
-            let mut variants = paged(
+            let mut variants = budgeted(
                 gh.clone(),
                 "/pulls",
                 json!({ "filter": "created", "state": "open", "query": "budget", "repos": [{ "owner": "intent-hq", "repo": "large-state-repo-1" }] }),
@@ -2069,7 +2083,7 @@ pub fn proxy_rows() -> Vec<Row> {
             variants.push(v(
                 "org",
                 json!({ "org": "intent-hq", "limit": 1_000 }),
-                Items("/pulls", 100),
+                Items("/pulls", BUDGETED_PAGE_ITEMS),
             ));
             variants
         }),
@@ -2128,14 +2142,14 @@ pub fn proxy_rows() -> Vec<Row> {
                 v(
                     "limit=100000",
                     json!({ "limit": 100_000, "filter": "assigned" }),
-                    Items("/issues", 200),
+                    Items("/issues", BUDGETED_PAGE_ITEMS),
                 ),
                 next(
                     "nextToken",
                     json!({ "limit": 100_000 }),
                     "/nextToken",
                     "nextToken",
-                    Items("/issues", 200),
+                    Items("/issues", BUDGETED_PAGE_ITEMS),
                 ),
             ],
         ),
@@ -2150,7 +2164,7 @@ pub fn proxy_rows() -> Vec<Row> {
             "linear.listProjects",
             vec![
                 v("default", json!({}), Items("", 10)),
-                v("limit=100000", json!({ "limit": 100_000 }), Items("", 200)),
+                v("limit=100000", json!({ "limit": 100_000 }), Items("", 100)),
             ],
         ),
         row(
@@ -2180,7 +2194,7 @@ pub fn proxy_rows() -> Vec<Row> {
                     json!({ "query": "budget", "limit": 100_000 }),
                     "/nextToken",
                     "nextToken",
-                    Items("/issues", 200),
+                    Items("/issues", BUDGETED_PAGE_ITEMS),
                 ),
             ],
         ),

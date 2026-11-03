@@ -124,6 +124,7 @@ mod installed_cli;
 mod workspace_mutations;
 
 mod github_ops;
+mod proxy_page;
 
 mod collaboration_auth_ops;
 mod github_auth_ops;
@@ -33448,11 +33449,23 @@ impl WorkspaceApi for Services {
             self.require_host_execution("github.pullsReviews").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let page = sc.pull_reviews(&repo_ref, number, intent_sourcecontrol::PageParams {
-                limit: github_ops::clamp_limit(limit).min(100),
-                cursor: github_ops::decode_next_token(next_token.as_deref()),
-            }).await.map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({ "reviews": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let page = sc
+                .pull_reviews(
+                    &repo_ref,
+                    number,
+                    intent_sourcecontrol::PageParams {
+                        limit: req.limit,
+                        cursor: req.cursor(),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let (reviews, next) = req.finish(
+                proxy_page::to_items(&page.items)?,
+                page.next_cursor.as_deref(),
+            );
+            Ok(serde_json::json!({ "reviews": reviews, "nextToken": next }))
         })
     }
 
@@ -33475,15 +33488,17 @@ impl WorkspaceApi for Services {
             if expected_head_sha.as_ref().is_some_and(|expected| expected != &head_sha) {
                 return Err(Error::Conflict { current: serde_json::json!({"headSha": head_sha}) });
             }
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let page = sc.pull_files(&repo_ref, number, intent_sourcecontrol::PageParams {
-                limit: github_ops::clamp_limit(limit).min(100),
-                cursor: github_ops::decode_next_token(next_token.as_deref()),
+                limit: req.limit,
+                cursor: req.cursor(),
             }).await.map_err(pr_ops::map_sc_err)?;
             let after = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha;
             if after.as_ref() != Some(&head_sha) {
                 return Err(Error::Conflict { current: serde_json::json!({"headSha": after}) });
             }
-            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+            let (files, next) = req.finish(proxy_page::to_items(&page.items)?, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": files, "nextToken": next }))
         })
     }
 
@@ -33501,8 +33516,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.pullsList").await?;
             let state = github_ops::parse_pr_state(state.as_deref())?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33523,10 +33538,8 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33556,8 +33569,8 @@ impl WorkspaceApi for Services {
                 Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
                 None => Some(intent_sourcecontrol::PrState::Open),
             };
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -33586,10 +33599,8 @@ impl WorkspaceApi for Services {
                     github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
                 })
                 .collect();
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33615,6 +33626,7 @@ impl WorkspaceApi for Services {
             }
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_org_prs(
@@ -33623,8 +33635,8 @@ impl WorkspaceApi for Services {
                         state,
                         involvement,
                         search: github_ops::normalize_search_query(query),
-                        limit: Some(github_ops::clamp_limit(limit)),
-                        cursor: github_ops::decode_next_token(next_token.as_deref()),
+                        limit: Some(req.limit),
+                        cursor: req.cursor(),
                         ..intent_sourcecontrol::PrQuery::default()
                     },
                 )
@@ -33646,10 +33658,8 @@ impl WorkspaceApi for Services {
                     Ok(github_ops::pull_to_json_with_repo(pr, &repo))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33799,8 +33809,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.issuesList").await?;
             let state = github_ops::parse_issue_state(state.as_deref())?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33822,10 +33832,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
                 .collect();
-            Ok(serde_json::json!({
-                "issues": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "issues": items, "nextToken": next }))
         })
     }
 
@@ -33856,8 +33864,8 @@ impl WorkspaceApi for Services {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
                 None => "open".to_string(),
             };
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -33884,10 +33892,8 @@ impl WorkspaceApi for Services {
                     github_ops::issue_to_json(i, &hit.owner, &hit.name)
                 })
                 .collect();
-            Ok(serde_json::json!({
-                "issues": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "issues": items, "nextToken": next }))
         })
     }
 
@@ -33903,8 +33909,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.listReviewComments")
                 .await?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33920,10 +33926,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(github_ops::review_comment_to_json)
                 .collect();
-            Ok(serde_json::json!({
-                "comments": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "comments": items, "nextToken": next }))
         })
     }
 
@@ -33961,8 +33965,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.getReviewThreads")
                 .await?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33978,10 +33982,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(github_ops::review_thread_to_json)
                 .collect();
-            Ok(serde_json::json!({
-                "threads": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "threads": items, "nextToken": next }))
         })
     }
 
@@ -35378,18 +35380,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_host_execution("linear.listIssues").await?;
             let filter = linear_ops::parse_filter(filter.as_deref())?;
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let cursor = req.cursor();
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
-                .list_issues(filter, linear_ops::wire_limit(limit), cursor.as_deref())
+                .list_issues(filter, Some(u32::from(req.limit)), cursor.as_deref())
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
-            let issues = serde_json::to_value(page.issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
-            Ok(serde_json::json!({
-                "issues": issues,
-                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
-            }))
+            let (issues, next) = req.finish(
+                proxy_page::to_items(&page.issues)?,
+                page.next_token.as_deref(),
+            );
+            Ok(serde_json::json!({ "issues": issues, "nextToken": next }))
         })
     }
 
@@ -35402,18 +35404,18 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             self.require_host_execution("linear.searchIssues").await?;
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let cursor = req.cursor();
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
-                .search_issues(&query, linear_ops::wire_limit(limit), cursor.as_deref())
+                .search_issues(&query, Some(u32::from(req.limit)), cursor.as_deref())
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
-            let issues = serde_json::to_value(page.issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
-            Ok(serde_json::json!({
-                "issues": issues,
-                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
-            }))
+            let (issues, next) = req.finish(
+                proxy_page::to_items(&page.issues)?,
+                page.next_token.as_deref(),
+            );
+            Ok(serde_json::json!({ "issues": issues, "nextToken": next }))
         })
     }
 
@@ -35486,7 +35488,7 @@ impl WorkspaceApi for Services {
             self.require_host_execution("linear.listProjects").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let projects = engine
-                .list_projects(linear_ops::wire_limit(limit))
+                .list_projects(Some(u32::from(proxy_page::clamp_page_limit(limit))))
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(projects)
