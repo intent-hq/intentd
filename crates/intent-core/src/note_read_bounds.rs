@@ -624,12 +624,12 @@ pub fn comment_list_page(
 ) -> Result<(Vec<serde_json::Value>, Option<String>), &'static str> {
     let scope = comment_list_scope(workspace_id, note_id);
     threads.sort_by(|a, b| {
-        b.last_activity
-            .cmp(&a.last_activity)
+        activity_key(&b.last_activity)
+            .cmp(&activity_key(&a.last_activity))
             .then_with(|| a.thread_id.cmp(&b.thread_id))
     });
     let newest = |threads: &[crate::model::CommentThreadSummary]| {
-        threads.first().map(|t| t.last_activity.clone())
+        threads.first().map(|t| activity_key(&t.last_activity))
     };
     let mut cursor = match page.next_token.as_deref() {
         None => CommentCursor {
@@ -702,7 +702,7 @@ pub fn comment_list_page(
             lo: cursor.lo.clone(),
             hi: cursor.hi.clone(),
             at: Some((
-                threads[idx].last_activity.clone(),
+                activity_key(&threads[idx].last_activity),
                 threads[idx].thread_id.clone(),
             )),
         }),
@@ -716,6 +716,18 @@ pub fn comment_list_page(
             }),
     };
     Ok((rows, next.map(|c| c.token(&scope))))
+}
+
+/// Fixed-width sort key for a thread's `lastActivity`. RFC 3339 strings do
+/// not compare as text once the fraction's trailing zeros are trimmed
+/// (`…:00.1Z` sorts after `…:00.12Z`), so a parsed time becomes its
+/// zero-padded nanoseconds since the epoch; an unparseable value sorts after
+/// every parsed one, by its text.
+fn activity_key(at: &str) -> String {
+    match crate::clock::parse_iso(at) {
+        Some(t) => format!("{:039}", t.unix_timestamp_nanos() + 10_i128.pow(37)),
+        None => format!("~{at}"),
+    }
 }
 
 /// Position of a `comment.list` walk (see [`comment_list_page`]): the
@@ -736,7 +748,7 @@ struct CommentCursorKey {
 
 impl CommentCursor {
     fn contains(&self, t: &crate::model::CommentThreadSummary) -> bool {
-        let la = &t.last_activity;
+        let la = &activity_key(&t.last_activity);
         if *la > self.hi || self.lo.as_ref().is_some_and(|lo| la <= lo) {
             return false;
         }
@@ -1348,6 +1360,46 @@ mod tests {
                     .collect(),
             ),
         }
+    }
+
+    /// RFC 3339 times trim trailing zeros, so `…:00.52Z` sorts before
+    /// `…:00.5Z` as text although it is later. A thread replied to in the
+    /// same second as the round's newest activity must still be served again.
+    #[test]
+    fn same_second_replies_compare_as_times_not_text() {
+        let at = |frac: &str| format!("2026-11-03T12:00:00{frac}Z");
+        let mut threads = vec![
+            thread("a", &at(".5"), 1),
+            thread("b", &at(".4"), 1),
+            thread("c", &at(".3"), 1),
+        ];
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut token = None;
+        for page_no in 0..10 {
+            let page = PageRequest::new(Some(1), 1, 1, token.take());
+            let (rows, next) =
+                comment_list_page(threads.clone(), "w", "n1", &page, NOTE_READ_BUDGET_BYTES)
+                    .unwrap();
+            seen.extend(rows.iter().map(|r| {
+                (
+                    r["threadId"].as_str().unwrap().to_string(),
+                    r["lastActivity"].as_str().unwrap().to_string(),
+                )
+            }));
+            let Some(next) = next else { break };
+            token = Some(next);
+            if page_no == 1 {
+                threads[0].last_activity = at(".52");
+            }
+        }
+        let last_a = seen.iter().rev().find(|(id, _)| id == "a").unwrap();
+        assert_eq!(last_a.1, at(".52"), "the reply's row is served: {seen:?}");
+        for id in ["b", "c"] {
+            assert!(seen.iter().any(|(t, _)| t == id), "{id} served: {seen:?}");
+        }
+        assert!(activity_key(&at("")) < activity_key(&at(".05")));
+        assert!(activity_key(&at(".5")) < activity_key(&at(".52")));
+        assert_eq!(activity_key(&at(".5")), activity_key(&at(".500")));
     }
 
     /// A reply bumps `lastActivity`, which moved an unserved thread ahead
