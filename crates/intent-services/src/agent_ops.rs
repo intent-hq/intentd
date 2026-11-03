@@ -472,6 +472,9 @@ mod tests_stab28;
 mod tests_remote_launch;
 
 #[cfg(test)]
+mod tests_workspace_create_remote;
+
+#[cfg(test)]
 mod tests_stab115;
 
 #[cfg(test)]
@@ -3061,15 +3064,26 @@ pub(crate) fn reject_remote_attachments(
     image_blocks: Option<&Value>,
     file_blocks: Option<&Value>,
 ) -> Result<()> {
+    if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+        .is_some()
+    {
+        return reject_attachments_on_remote(image_blocks, file_blocks);
+    }
+    Ok(())
+}
+
+/// The attachment refusal for an agent that runs on another machine: any
+/// non-empty image or file blocks are `-32602`.
+pub(crate) fn reject_attachments_on_remote(
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Result<()> {
     let carries = |blocks: Option<&Value>| match blocks {
         None | Some(Value::Null) => false,
         Some(Value::Array(items)) => !items.is_empty(),
         Some(_) => true,
     };
-    if (carries(image_blocks) || carries(file_blocks))
-        && intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
-            .is_some()
-    {
+    if carries(image_blocks) || carries(file_blocks) {
         return Err(Error::InvalidParams(format!(
             "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
             intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
@@ -5657,20 +5671,131 @@ impl Services {
         model: Option<&str>,
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
+        let needs = self.remote_launch_needs(provider, model, placement).await?;
+        self.ports
+            .remote_launch()
+            .admit(self, workspace_id, placement, &needs)
+            .await
+    }
+
+    /// [`Self::admit_remote_agent`] for `workspace.create`'s initial agent,
+    /// before its workspace exists: the same checks and machine choice,
+    /// leaving the start commit to [`Self::pin_remote_base_commit`] once the
+    /// workspace commits.
+    pub(crate) async fn admit_remote_initial_agent(
+        &self,
+        plan: &mut AgentCreatePlan,
+    ) -> Result<()> {
+        let Some(placement) = plan.placement.take() else {
+            return Ok(());
+        };
+        // The first message would be refused on the machine after the
+        // workspace exists, so its attachments are refused here instead.
+        reject_attachments_on_remote(plan.image_blocks.as_ref(), plan.file_blocks.as_ref())?;
+        let needs = self
+            .remote_launch_needs(&plan.provider, plan.model.as_deref(), &placement)
+            .await?;
+        plan.remote = Some(
+            self.ports
+                .remote_launch()
+                .admit_new_workspace(self, &placement, &needs)
+                .await?,
+        );
+        Ok(())
+    }
+
+    /// The documented subset only, and a provider selection whose profile
+    /// environment resolves and can run on another machine; then what the
+    /// machine must offer.
+    async fn remote_launch_needs(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        placement: &intent_core::placement::AgentPlacement,
+    ) -> Result<intent_core::remote_launch::RemoteLaunchNeeds> {
         placement.check_remote_supported()?;
         let profile = self.resolve_remote_compatible_env(provider).await?;
-        let needs = intent_core::remote_launch::RemoteLaunchNeeds {
+        Ok(intent_core::remote_launch::RemoteLaunchNeeds {
             provider: crate::provider_profiles::parse_profile_ref(provider)
                 .map_or(provider, |(base, _)| base)
                 .to_owned(),
             // The `"default"` sentinel asks for the provider's default.
             model: model.filter(|model| *model != "default").map(str::to_owned),
             with_profile: profile.is_some(),
-        };
-        self.ports
+        })
+    }
+
+    /// Pin the commit an admitted initial agent starts from, now that its
+    /// workspace committed. A failure is recorded as the agent's
+    /// `placementError` (it is still persisted placed, so it never runs
+    /// locally) and returned for [`Self::start_remote_initial_agent`].
+    pub(crate) async fn pin_remote_base_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        plan: &mut AgentCreatePlan,
+    ) -> Option<Error> {
+        let view = plan.remote.as_mut()?;
+        match self
+            .ports
             .remote_launch()
-            .admit(self, workspace_id, placement, &needs)
+            .base_commit(self, workspace_id)
             .await
+        {
+            Ok(commit) => {
+                view.base_commit = commit;
+                None
+            }
+            Err(error) => {
+                view.placement_error = Some(intent_core::remote_launch::PlacementError::new(
+                    "remote-launch-failed",
+                    &error.to_string(),
+                ));
+                Some(error)
+            }
+        }
+    }
+
+    /// Start a persisted, placed initial agent on its machine. On success
+    /// the create result's `notice` is returned; on failure (including a
+    /// `base_error` from [`Self::pin_remote_base_commit`]) the agent keeps
+    /// its placement with a `placementError` and the `launch-failed` error
+    /// the create reports is returned instead.
+    pub(crate) async fn start_remote_initial_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+        created: &mut Value,
+        view: intent_core::remote_launch::RemotePlacementView,
+        base_error: Option<Error>,
+    ) -> std::result::Result<Option<String>, intent_core::InitialAgentLaunchFailure> {
+        let node_name = view.node_name.clone();
+        let started = match base_error {
+            Some(error) => Err(error),
+            None => self.launch_remote_agent(workspace_id, created, view).await,
+        };
+        match started {
+            Ok(()) => Ok(created
+                .get("notice")
+                .and_then(Value::as_str)
+                .map(str::to_owned)),
+            Err(error) => {
+                let cause = error.to_string();
+                Err(intent_core::InitialAgentLaunchFailure {
+                    message: format!(
+                        "The workspace was created, but its initial agent could not start on \"{node_name}\": {cause}"
+                    ),
+                    data: json!({
+                        "code": "launch-failed",
+                        "retryable": false,
+                        "workspaceId": workspace_id.as_str(),
+                        "launch": {
+                            "agentId": created["agent"]["id"],
+                            "state": "failed",
+                        },
+                        "cause": { "code": "remote-launch-failed", "message": cause },
+                    }),
+                })
+            }
+        }
     }
 
     /// Place a just-created remote agent on its node and add the launch

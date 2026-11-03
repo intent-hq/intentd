@@ -279,6 +279,8 @@ impl WorkspaceApi for FakeApi {
                 workspace: ws,
                 initial_agent: None,
                 proposal_origin: None,
+                notice: None,
+                initial_agent_launch_failure: None,
             })
         })
     }

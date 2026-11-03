@@ -961,8 +961,9 @@ async fn invalid_hello_claims_nothing() {
     assert!(api.active_during_upsert.lock().unwrap().is_none());
 }
 
-/// `remoteMachines: 1` and `startupStatus: 1` are added only when the
-/// running daemon supports them, and only to a successful hello.
+/// `remoteMachines: 1` (with `remoteInitialAgent: 1`: `workspace.create`
+/// accepts `initialAgent.placement`) and `startupStatus: 1` are added only
+/// when the running daemon supports them, and only to a successful hello.
 #[test]
 fn runtime_capabilities_are_added_only_when_on() {
     let ok = json!({ "jsonrpc": "2.0", "id": 1, "result": {
@@ -978,11 +979,16 @@ fn runtime_capabilities_are_added_only_when_on() {
     );
     assert_eq!(
         caps(with_runtime_capabilities(Some(ok.clone()), false, true)),
-        json!({ "liveState": true, "remoteMachines": 1 })
+        json!({ "liveState": true, "remoteMachines": 1, "remoteInitialAgent": 1 })
     );
     assert_eq!(
         caps(with_runtime_capabilities(Some(ok.clone()), true, true)),
-        json!({ "liveState": true, "remoteMachines": 1, "startupStatus": 1 })
+        json!({
+            "liveState": true,
+            "remoteMachines": 1,
+            "remoteInitialAgent": 1,
+            "startupStatus": 1,
+        })
     );
     let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602 } }).to_string();
     let patched = with_runtime_capabilities(Some(error.clone()), true, true).unwrap();

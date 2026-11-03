@@ -173,9 +173,11 @@ pub enum Error {
 
     /// A `remoteMachines.*` request about an exposed machine failed
     /// (`machine-unreachable` with the routes tried, `machine-revoked`,
-    /// `machine-in-use`). `data` (`data.code` plus details) is passed through
-    /// verbatim as `error.data`; `internal` selects `-32603`, otherwise
-    /// `-32602`. Neither carries the executor token.
+    /// `machine-in-use`), or `workspace.create`'s placed initial agent could
+    /// not start after the workspace committed (`launch-failed`). `data`
+    /// (`data.code` plus details) is passed through verbatim as
+    /// `error.data`; `internal` selects `-32603`, otherwise `-32602`.
+    /// Neither carries the executor token.
     #[error("{}", .0.message)]
     RemoteMachine(Box<ProviderProfileFailure>),
 

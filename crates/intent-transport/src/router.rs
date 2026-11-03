@@ -1093,6 +1093,10 @@ async fn dispatch(
             if let Some(origin) = res.proposal_origin {
                 result["proposalOrigin"] = json!(origin);
             }
+            // A placed initial agent's launch notice, as on `agent.create`.
+            if let Some(notice) = res.notice {
+                result["notice"] = json!(notice);
+            }
             Ok(result)
         }
         "workspace.update" => {

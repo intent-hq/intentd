@@ -1608,6 +1608,35 @@ pub struct WorkspaceCreateInitialAgent {
     pub image_blocks: Option<serde_json::Value>,
     pub file_blocks: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
+    /// Start the initial agent on another machine (the closed placement
+    /// object of `agent.create`); omitted means local, `null` is `-32602`.
+    #[serde(deserialize_with = "present_placement")]
+    pub placement: Option<crate::placement::AgentPlacement>,
+}
+
+/// A present `placement` must be the placement object: `null` is refused
+/// rather than read as omitted.
+fn present_placement<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::placement::AgentPlacement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::placement::AgentPlacement::deserialize(deserializer).map(Some)
+}
+
+/// Why `workspace.create`'s placed initial agent could not start after the
+/// workspace committed: the `-32603` `launch-failed` error the create
+/// reports instead of a result, kept with the idempotent result so a keyed
+/// retry replays it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialAgentLaunchFailure {
+    /// Human message naming the machine and the cause.
+    pub message: String,
+    /// `error.data`: `{ code: "launch-failed", retryable, workspaceId,
+    /// launch: { agentId, state }, cause: { code, message } }`.
+    pub data: serde_json::Value,
 }
 
 /// Result of `workspace.create` (PROTOCOL §5.1): the created workspace plus,
@@ -1631,6 +1660,15 @@ pub struct WorkspaceCreateResult {
     /// its own `origin`), never persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_origin: Option<WorkspaceCreateProposalOutcome>,
+    /// The launch notice of an initial agent started on another machine
+    /// (the `agent.create` `notice` text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    /// Set when the placed initial agent could not start after the
+    /// workspace committed: the create then fails with this error. Never on
+    /// the wire as a result field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_agent_launch_failure: Option<InitialAgentLaunchFailure>,
 }
 
 /// `workspace.create` result `proposalOrigin` (PROTOCOL §5.1).
