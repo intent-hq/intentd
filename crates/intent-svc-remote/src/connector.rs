@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, StopId,
+    MachineCapabilities, StopId, FINAL_STOP_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -74,8 +74,25 @@ pub(crate) struct Tuning {
     /// to 60 s, ±20% jitter.
     pub stop_resend: Backoff,
     /// Longest `remoteMachines.remove` waits for its stops' acks, the
-    /// connect included.
+    /// connect included, on a link below nodeProtocol 9.
     pub remove_timeout: Duration,
+    /// The same from nodeProtocol 9, where an ack waits for the machine's
+    /// final push (bounded at 60 s there).
+    pub final_remove_timeout: Duration,
+    /// Longest a launch or prompt waits for an earlier stop of its agent to
+    /// be acknowledged.
+    pub stop_wait: Duration,
+    /// How long an unacknowledged final stop's record is kept.
+    pub final_stop_bound: Duration,
+    /// Below nodeProtocol 9 a stop's acknowledgement does not wait for the
+    /// exit push: the final-stop record (and the push it admits) is kept this
+    /// much longer.
+    pub legacy_push_grace: Duration,
+    /// How often recorded final stops are checked against their bound,
+    /// bound or not.
+    pub final_stop_check: Duration,
+    /// The clock final-stop bounds are measured against.
+    pub clock: crate::final_stop::Clock,
     pub connect: ConnectTuning,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
@@ -129,6 +146,12 @@ impl Default for Tuning {
             capabilities_timeout: Duration::from_secs(10),
             stop_resend: Backoff::new(Duration::from_secs(5), Duration::from_secs(60)),
             remove_timeout: Duration::from_secs(30),
+            final_remove_timeout: Duration::from_secs(90),
+            stop_wait: Duration::from_secs(30),
+            final_stop_bound: intent_core::remote_launch::FINAL_STOP_BOUND,
+            legacy_push_grace: Duration::from_secs(120),
+            final_stop_check: Duration::from_secs(60 * 60),
+            clock: crate::final_stop::Clock::default(),
             connect: ConnectTuning::default(),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
@@ -158,6 +181,27 @@ pub struct NodeStatus {
     pub intentd_version: Option<String>,
 }
 
+/// One unacknowledged stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueuedStop {
+    pub stop_id: StopId,
+    /// The agent ends for good: the machine pushes its work one last time
+    /// and removes its checkout (sent as final from nodeProtocol 9).
+    pub final_stop: bool,
+    /// Its record is in the store (`remote_final_stop`).
+    pub durable: bool,
+}
+
+impl QueuedStop {
+    fn plain(stop_id: StopId) -> Self {
+        Self {
+            stop_id,
+            final_stop: false,
+            durable: false,
+        }
+    }
+}
+
 /// A connect request; answered once a link is bound or the dial failed.
 type Waiter = oneshot::Sender<std::result::Result<(), ConnectFailure>>;
 
@@ -179,8 +223,15 @@ pub(crate) struct Shared {
     status: Mutex<NodeStatus>,
     /// Agents whose stop the machine has not acknowledged yet, with the
     /// stop's id: one id per queued stop, reused by every resend on any
-    /// link of this binding (nodeProtocol 7).
-    stops: Mutex<BTreeMap<AgentId, StopId>>,
+    /// link of this binding (nodeProtocol 7), and whether it is final.
+    stops: Mutex<BTreeMap<AgentId, QueuedStop>>,
+    /// Final stops acknowledged below nodeProtocol 9 whose records wait out
+    /// [`Tuning::legacy_push_grace`]: never queued again.
+    in_grace: Mutex<std::collections::HashSet<StopId>>,
+    /// This connector's own handle, for tasks that must not keep it alive.
+    self_ref: Mutex<std::sync::Weak<Shared>>,
+    /// The protocol the current (or last) link negotiated.
+    protocol: std::sync::atomic::AtomicU32,
     /// Bumped whenever a stop leaves the queue (acknowledged, or dropped on
     /// revocation).
     stops_changed: watch::Sender<u64>,
@@ -212,6 +263,26 @@ impl Shared {
     /// The current link, if one is up.
     pub(crate) fn current_link(&self) -> Option<NodeLink> {
         self.link.borrow().clone().filter(|link| !link.is_closed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_parked(&self, agent_id: &AgentId) -> bool {
+        lock(&self.parked).contains_key(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tuning_ref(&self) -> &Tuning {
+        &self.tuning
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_protocol_for_test(&self, protocol: u32) {
+        self.protocol
+            .store(protocol, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn weak(&self) -> std::sync::Weak<Shared> {
+        lock(&self.self_ref).clone()
     }
 
     /// Ask the connector for a link without waiting.
@@ -281,15 +352,162 @@ impl Shared {
     }
 
     /// The id of `agent_id`'s queued stop, queuing a new one if none is.
+    /// A queued final stop stays final.
     fn queue_stop(&self, agent_id: &AgentId) -> StopId {
-        *lock(&self.stops)
+        lock(&self.stops)
             .entry(agent_id.clone())
-            .or_insert_with(StopId::new_v4)
+            .or_insert_with(|| QueuedStop::plain(StopId::new_v4()))
+            .stop_id
     }
 
-    /// Whether stop `stop_id` of `agent_id` is still unacknowledged.
-    fn is_queued(&self, agent_id: &AgentId, stop_id: StopId) -> bool {
-        lock(&self.stops).get(agent_id) == Some(&stop_id)
+    /// Queue final stop `stop_id` for `agent_id`, replacing a queued plain
+    /// stop (or an older final stop). `durable` when its record is in the
+    /// store, so the acknowledgement finishes that record.
+    fn queue_final_stop(&self, agent_id: &AgentId, stop_id: StopId, durable: bool) {
+        let replaced = lock(&self.stops).insert(
+            agent_id.clone(),
+            QueuedStop {
+                stop_id,
+                final_stop: true,
+                durable,
+            },
+        );
+        if replaced.is_some_and(|old| old.stop_id != stop_id) {
+            self.stops_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// End `agent_id` for good with `reason`: record its final stop when
+    /// it is placed on this backend (falling back to one held in memory),
+    /// detach its runtime and queue the stop. Returns the stop's id.
+    pub(crate) async fn final_stop(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        reason: intent_core::remote_launch::FinalStopReason,
+    ) -> StopId {
+        let placed = match self.store.get_remote_agent(agent_id).await {
+            Ok(placed) => placed,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "remote machine: could not read the agent's placement; stopping it from memory");
+                None
+            }
+        };
+        let recorded = match placed {
+            Some(placed) => {
+                let repo_path = self
+                    .store
+                    .get_workspace(&placed.workspace_id)
+                    .await
+                    .map(|workspace| crate::final_stop::repo_path(&workspace))
+                    .unwrap_or_default();
+                match crate::final_stop::record(&self.store, &placed, reason, repo_path).await {
+                    Ok(stop_id) => Some(stop_id),
+                    Err(error) => {
+                        tracing::warn!(agent = %agent_id, %error, "remote machine: could not record a final stop; stopping it from memory");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        self.agents.close(agent_id);
+        let (stop_id, durable) = match recorded {
+            Some(stop_id) => (stop_id, true),
+            None => (StopId::new_v4(), false),
+        };
+        self.request_final_stop(agent_id, stop_id, durable);
+        stop_id
+    }
+
+    /// Queue final stop `stop_id` for `agent_id` and start resending it now
+    /// if a link is up; otherwise it goes out right after the next bind.
+    /// `durable` when its record is written.
+    pub(crate) fn request_final_stop(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        stop_id: StopId,
+        durable: bool,
+    ) {
+        self.queue_final_stop(agent_id, stop_id, durable);
+        let Some(link) = self.current_link() else {
+            self.wake();
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let shared = self.clone();
+        let agent_id = agent_id.clone();
+        // caller-binding: allow — resends one queued final stop on its link until acknowledged
+        runtime.spawn(async move { shared.resend(link, agent_id, stop_id).await });
+    }
+
+    /// The queued stop `stop_id` of `agent_id`, if it still is.
+    fn queued(&self, agent_id: &AgentId, stop_id: StopId) -> Option<QueuedStop> {
+        lock(&self.stops)
+            .get(agent_id)
+            .copied()
+            .filter(|queued| queued.stop_id == stop_id)
+    }
+
+    /// How long `remoteMachines.remove` waits for its stops' acks on the
+    /// current link: longer from nodeProtocol 9, to fit the final push.
+    pub(crate) fn remove_budget(&self) -> Duration {
+        if self.speaks_final_stops() {
+            self.tuning.final_remove_timeout
+        } else {
+            self.tuning.remove_timeout
+        }
+    }
+
+    /// Whether the current link speaks final stops.
+    fn speaks_final_stops(&self) -> bool {
+        self.protocol.load(std::sync::atomic::Ordering::SeqCst) >= FINAL_STOP_PROTOCOL
+    }
+
+    /// Queue every final stop recorded on this lease, dropping (as done)
+    /// those past their bound, whose checkout the machine's next bind sweep
+    /// removes. A read failure is logged; the next bind tries again.
+    pub(crate) async fn load_final_stops(&self) {
+        let lease_id = lock(&self.status).lease_id.clone();
+        let records = match self.store.list_final_stops(&lease_id).await {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, "remote machine: could not read the pending final stops");
+                return;
+            }
+        };
+        for record in records {
+            let Ok(stop_id) = record.stop_id.parse::<StopId>() else {
+                tracing::warn!(agent = %record.agent_id, "remote machine: a final stop record has a bad id; dropped");
+                let _ = self
+                    .store
+                    .finish_final_stop(&record.agent_id, &record.stop_id)
+                    .await;
+                continue;
+            };
+            if lock(&self.in_grace).contains(&stop_id) {
+                continue;
+            }
+            if crate::final_stop::expired(
+                &record,
+                self.tuning.final_stop_bound,
+                self.tuning.clock.now(),
+            ) {
+                tracing::info!(agent = %record.agent_id, "remote machine: a final stop was not acknowledged within its bound; dropped");
+                if let Err(error) = self
+                    .store
+                    .finish_final_stop(&record.agent_id, &record.stop_id)
+                    .await
+                {
+                    tracing::warn!(agent = %record.agent_id, %error, "remote machine: could not drop an expired final stop");
+                    continue;
+                }
+                self.confirm_stop(&record.agent_id, stop_id);
+                continue;
+            }
+            self.queue_final_stop(&record.agent_id, stop_id, true);
+        }
     }
 
     /// Whether `agent_id` has an unacknowledged stop.
@@ -297,11 +515,21 @@ impl Shared {
         lock(&self.stops).contains_key(agent_id)
     }
 
+    /// Whether `agent_id` has an unacknowledged final stop.
+    pub(crate) fn final_stop_queued(&self, agent_id: &AgentId) -> bool {
+        lock(&self.stops)
+            .get(agent_id)
+            .is_some_and(|queued| queued.final_stop)
+    }
+
     /// Stop `stop_id` of `agent_id` is acknowledged: it leaves the queue.
     /// An ack never confirms another stop of the same agent.
     fn confirm_stop(&self, agent_id: &AgentId, stop_id: StopId) {
         let mut stops = lock(&self.stops);
-        if stops.get(agent_id) == Some(&stop_id) {
+        if stops
+            .get(agent_id)
+            .is_some_and(|queued| queued.stop_id == stop_id)
+        {
             stops.remove(agent_id);
             drop(stops);
             self.stops_changed.send_modify(|n| *n += 1);
@@ -309,28 +537,40 @@ impl Shared {
     }
 
     /// The machine revoked this binding's credential, which stops its agents
-    /// there: the queued stops are moot.
+    /// there: the queued stops are moot. Recorded final stops stay (a
+    /// revocation alone drops no record) until acknowledged or past their
+    /// bound.
     fn drop_stops(&self) {
-        let dropped = !std::mem::take(&mut *lock(&self.stops)).is_empty();
+        let dropped = {
+            let mut stops = lock(&self.stops);
+            let before = stops.len();
+            stops.retain(|_, queued| queued.durable);
+            stops.len() != before
+        };
         if dropped {
             self.stops_changed.send_modify(|n| *n += 1);
         }
     }
 
     /// The queued stops, by agent.
-    fn queued_stops(&self) -> Vec<(AgentId, StopId)> {
+    fn queued_stops(&self) -> Vec<(AgentId, QueuedStop)> {
         lock(&self.stops)
             .iter()
-            .map(|(agent_id, stop_id)| (agent_id.clone(), *stop_id))
+            .map(|(agent_id, queued)| (agent_id.clone(), *queued))
             .collect()
     }
 
     /// Send every queued stop on `link`, which nothing else uses yet, so
     /// they precede any launch or prompt on it.
     async fn send_queued(&self, link: &NodeLink) {
-        for (agent_id, stop_id) in self.queued_stops() {
+        let speaks_final = self.speaks_final_stops();
+        for (agent_id, queued) in self.queued_stops() {
             if link
-                .send(&LinkFrame::Stop { agent_id, stop_id })
+                .send(&LinkFrame::Stop {
+                    agent_id,
+                    stop_id: queued.stop_id,
+                    final_stop: queued.final_stop && speaks_final,
+                })
                 .await
                 .is_err()
             {
@@ -345,7 +585,8 @@ impl Shared {
     /// link); a stop queued later starts its own resender. One link resends
     /// each stop once.
     fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
-        for (agent_id, stop_id) in self.queued_stops() {
+        for (agent_id, queued) in self.queued_stops() {
+            let stop_id = queued.stop_id;
             let shared = self.clone();
             let link = link.clone();
             // caller-binding: allow — resends one queued stop on its link until acknowledged
@@ -366,13 +607,20 @@ impl Shared {
             resending.insert(stop_id, generation);
         }
         let mut delays = self.tuning.stop_resend.clone();
-        while self.is_queued(&agent_id, stop_id) && !link.is_closed() {
+        while let Some(queued) = self
+            .queued(&agent_id, stop_id)
+            .filter(|_| !link.is_closed())
+        {
+            let final_stop = queued.final_stop && self.speaks_final_stops();
             match link
-                .stop(agent_id.clone(), stop_id, delays.next_delay())
+                .stop_with(agent_id.clone(), stop_id, final_stop, delays.next_delay())
                 .await
             {
-                Ok(outcome) => {
-                    tracing::debug!(agent = %agent_id, ?outcome, "remote machine: stop acknowledged");
+                Ok(acked) => {
+                    tracing::debug!(agent = %agent_id, outcome = ?acked.outcome, final_push = ?acked.final_push, "remote machine: stop acknowledged");
+                    if queued.durable {
+                        self.finish_final_stop(&agent_id, stop_id, final_stop).await;
+                    }
                     self.confirm_stop(&agent_id, stop_id);
                 }
                 Err(error) if link::error_code(&error) == Some(link::codes::TIMEOUT) => {}
@@ -382,6 +630,44 @@ impl Shared {
         let mut resending = lock(&self.resending);
         if resending.get(&stop_id) == Some(&generation) {
             resending.remove(&stop_id);
+        }
+    }
+
+    /// Final stop `stop_id` of `agent_id` is acknowledged: drop its record
+    /// (and, unless the session can come back, the agent's placement). On a
+    /// link below nodeProtocol 9 the acknowledgement does not wait for the
+    /// exit push, so the record, and the push it admits, is kept for
+    /// [`Tuning::legacy_push_grace`] first.
+    async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: StopId, sent_final: bool) {
+        if !sent_final {
+            // Acknowledged: not queued again while its record waits out
+            // the grace.
+            lock(&self.in_grace).insert(stop_id);
+            let store = self.store.clone();
+            let grace = self.tuning.legacy_push_grace;
+            let agent_id = agent_id.clone();
+            let shared = self.weak();
+            // caller-binding: allow — drops one acknowledged final stop's record after the push grace
+            tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                if let Some(shared) = shared.upgrade() {
+                    lock(&shared.in_grace).remove(&stop_id);
+                }
+                if let Err(error) = store
+                    .finish_final_stop(&agent_id, &stop_id.to_string())
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop");
+                }
+            });
+            return;
+        }
+        if let Err(error) = self
+            .store
+            .finish_final_stop(agent_id, &stop_id.to_string())
+            .await
+        {
+            tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop; the next start resends it");
         }
     }
 
@@ -419,7 +705,7 @@ impl Shared {
         if !self.stop_queued(agent_id) {
             return Ok(());
         }
-        let deadline = Instant::now() + self.tuning.remove_timeout;
+        let deadline = Instant::now() + self.tuning.stop_wait;
         if self
             .wait_stops(std::slice::from_ref(agent_id), deadline)
             .await
@@ -453,6 +739,8 @@ impl Shared {
     }
 
     fn welcome(&self, welcome: &LinkWelcome) {
+        self.protocol
+            .store(welcome.protocol, std::sync::atomic::Ordering::SeqCst);
         let mut status = lock(&self.status);
         status.connected = true;
         status.running_agents.clone_from(&welcome.running_agents);
@@ -607,6 +895,9 @@ impl RemoteNode {
             link: watch::channel(None).0,
             status: Mutex::new(status),
             stops: Mutex::new(BTreeMap::new()),
+            in_grace: Mutex::new(std::collections::HashSet::new()),
+            self_ref: Mutex::new(std::sync::Weak::new()),
+            protocol: std::sync::atomic::AtomicU32::new(0),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
             route: Mutex::new(None),
@@ -621,7 +912,9 @@ impl RemoteNode {
         // After a backend restart, agents placed here may still run: keep
         // dialing (with backoff) until a bind claims them, then let the idle
         // timer close an unneeded link.
+        *lock(&shared.self_ref) = Arc::downgrade(&shared);
         let lease_id = lease.owner().lease_id.clone();
+        shared.load_final_stops().await;
         if has_live_records(&shared.store, &lease_id).await? {
             shared
                 .survivors_unclaimed
@@ -629,6 +922,7 @@ impl RemoteNode {
             shared.wake();
         }
         intent_core::spawn_daemon(run(shared.clone(), lease, Ingest::new(acked), demands));
+        intent_core::spawn_daemon(expire_final_stops(Arc::downgrade(&shared)));
         Ok(Self { shared })
     }
 
@@ -776,21 +1070,35 @@ impl RemoteNode {
         self.shared.send(frame).await
     }
 
+    /// End `agent_id` for good with `reason` (see [`Shared::final_stop`]).
+    pub async fn final_stop(
+        &self,
+        agent_id: &AgentId,
+        reason: intent_core::remote_launch::FinalStopReason,
+    ) -> StopId {
+        self.shared.final_stop(agent_id, reason).await
+    }
+
     /// Agents head counts as running on the machine.
     #[must_use]
     pub fn running(&self) -> usize {
         self.shared.agents.live_count()
     }
 
-    /// Stop every agent attached here: their runtimes end and the machine
-    /// is told to stop them. Returns every agent with a stop the machine has
-    /// not acknowledged yet, these included.
+    /// End every agent attached here for good (the machine is being
+    /// removed): their runtimes end and the machine is sent final stops.
+    /// Returns every agent with a stop the machine has not acknowledged
+    /// yet, these included.
     #[must_use = "the stops are only confirmed once acknowledged"]
-    pub fn stop_all(&self) -> Vec<AgentId> {
+    pub async fn stop_all(&self) -> Vec<AgentId> {
         let mut stopped = self.shared.agents.live_ids();
         for agent_id in &stopped {
-            self.shared.agents.close(agent_id);
-            self.shared.request_stop(agent_id);
+            self.shared
+                .final_stop(
+                    agent_id,
+                    intent_core::remote_launch::FinalStopReason::MachineRemoved,
+                )
+                .await;
         }
         for agent_id in lock(&self.shared.stops).keys() {
             if !stopped.contains(agent_id) {
@@ -859,6 +1167,34 @@ enum Ended {
     Shutdown,
 }
 
+/// Every [`Tuning::final_stop_check`], drop the recorded final stops past
+/// their bound, bound to the machine or not, so a machine that stays away
+/// is no longer redialed for them. Ends with the connector.
+async fn expire_final_stops(shared: std::sync::Weak<Shared>) {
+    let Some(every) = shared
+        .upgrade()
+        .map(|shared| shared.tuning.final_stop_check)
+    else {
+        return;
+    };
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        let Some(mut shutdown) = shared.upgrade().map(|shared| shared.shutdown.subscribe()) else {
+            return;
+        };
+        tokio::select! {
+            _ = tick.tick() => {}
+            () = wait_true(&mut shutdown) => return,
+        }
+        let Some(current) = shared.upgrade() else {
+            return;
+        };
+        current.load_final_stops().await;
+    }
+}
+
 async fn run(
     shared: Arc<Shared>,
     lease: HeadLease,
@@ -883,6 +1219,13 @@ async fn run(
         }
         while let Ok(waiter) = demands.try_recv() {
             waiters.extend(waiter);
+        }
+        // Final stops past their bound are dropped before every dial, so a
+        // machine that stays away is no longer redialed for them.
+        shared.load_final_stops().await;
+        if retry && waiters.is_empty() && !shared.wants_link() {
+            retry = false;
+            continue;
         }
         let target = shared.target();
         let version = lock(&shared.status).intentd_version.clone();
@@ -1224,24 +1567,26 @@ impl Acks {
 /// whose session has not ended (deleted or completed). A session that cannot
 /// be read counts, so a read failure never hides a survivor.
 pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bool> {
+    if !store.list_final_stops(lease_id).await?.is_empty() {
+        return Ok(true);
+    }
     for record in store.list_remote_agents(lease_id).await? {
         match store.get_agent_session(&record.agent_id).await {
-            Ok(session)
-                if matches!(
-                    session.status,
-                    intent_core::AgentStatus::Deleted | intent_core::AgentStatus::Completed
-                ) => {}
+            Ok(session) if crate::final_stop::session_ended(&session) => {}
             _ => return Ok(true),
         }
     }
     Ok(false)
 }
 
-/// Claim the node's running agents at bind: an agent head has no record of
-/// on this lease (a head crash mid-launch, a deleted agent) gets a queued
-/// stop with a new id, resent until acknowledged; one
-/// head knows but has not attached since it started gets a runtime, kept
-/// until the agent manager takes it, so its output is not dropped.
+/// Claim the node's running agents at bind. An agent head has no record of
+/// on this lease (a head crash mid-launch, a deleted agent) gets a final
+/// stop held in memory, with a new id; one whose session has ended
+/// (retired, deleted or completed) gets a recorded final stop; one with a
+/// recorded final stop already has it queued. Each is resent until
+/// acknowledged, and none is parked. One head knows but has not attached
+/// since it started gets a runtime, kept until the agent manager takes it,
+/// so its output is not dropped.
 ///
 /// Returns whether the claim succeeded: `false` when this lease's agent
 /// records could not be read, so nothing was claimed. Claims take turns
@@ -1266,8 +1611,16 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
     };
     #[cfg(not(test))]
     let read = shared.store.list_remote_agents(&lease_id).await;
-    let claimed = match read {
-        Ok(claimed) => claimed,
+    let read = match read {
+        Ok(claimed) => shared
+            .store
+            .list_final_stops(&lease_id)
+            .await
+            .map(|finals| (claimed, finals)),
+        Err(error) => Err(error),
+    };
+    let (claimed, finals) = match read {
+        Ok(read) => read,
         Err(error) => {
             // Without the records head cannot tell which agents are its
             // own; stopping them all could end live work, so claim nothing
@@ -1276,29 +1629,85 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
             return false;
         }
     };
-    let workspaces: HashMap<&AgentId, &WorkspaceId> = claimed
+    let records: HashMap<&AgentId, &intent_core::remote_launch::RemoteAgentRecord> = claimed
         .iter()
-        .map(|record| (&record.agent_id, &record.workspace_id))
+        .map(|record| (&record.agent_id, record))
         .collect();
     for agent_id in running_agents {
-        match workspaces.get(agent_id) {
-            None => {
-                tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
-                shared.queue_stop(agent_id);
+        if let Some(recorded) = finals.iter().find(|stop| &stop.agent_id == agent_id) {
+            if let Ok(stop_id) = recorded.stop_id.parse::<StopId>() {
+                shared.queue_final_stop(agent_id, stop_id, true);
+                continue;
             }
-            Some(workspace_id) if !shared.agents.is_attached(agent_id) => {
-                let sink = shared.agents.attach(agent_id, (*workspace_id).clone());
-                let runtime = Arc::new(RemoteAgentRuntime::new(
-                    agent_id.clone(),
-                    sink,
-                    shared.clone(),
-                ));
-                lock(&shared.parked).insert(agent_id.clone(), runtime);
+        }
+        if shared.final_stop_queued(agent_id) {
+            continue;
+        }
+        let Some(record) = records.get(agent_id) else {
+            tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
+            shared.queue_final_stop(agent_id, StopId::new_v4(), false);
+            continue;
+        };
+        if let Some(reason) = ended_reason(shared, record).await {
+            tracing::info!(agent = %agent_id, reason = reason.as_str(), "remote node: stopping an agent whose session has ended");
+            let repo_path = shared
+                .store
+                .get_workspace(&record.workspace_id)
+                .await
+                .map(|workspace| crate::final_stop::repo_path(&workspace))
+                .unwrap_or_default();
+            match crate::final_stop::record(&shared.store, record, reason, repo_path).await {
+                Ok(stop_id) => shared.queue_final_stop(agent_id, stop_id, true),
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, %error, "remote node: could not record a final stop; stopping it from memory");
+                    shared.queue_final_stop(agent_id, StopId::new_v4(), false);
+                }
             }
-            Some(_) => {}
+            continue;
+        }
+        if !shared.agents.is_attached(agent_id) {
+            let sink = shared.agents.attach(agent_id, record.workspace_id.clone());
+            let runtime = Arc::new(RemoteAgentRuntime::new(
+                agent_id.clone(),
+                sink,
+                shared.clone(),
+            ));
+            lock(&shared.parked).insert(agent_id.clone(), runtime);
         }
     }
     true
+}
+
+/// Why `record`'s agent ends for good, when its session has ended: its
+/// workspace was retired, or it was retired or deleted. `None` while it may
+/// still run, and when its session cannot be read (a read failure never
+/// stops live work).
+async fn ended_reason(
+    shared: &Shared,
+    record: &intent_core::remote_launch::RemoteAgentRecord,
+) -> Option<intent_core::remote_launch::FinalStopReason> {
+    use intent_core::remote_launch::FinalStopReason;
+    let session = shared
+        .store
+        .get_agent_session(&record.agent_id)
+        .await
+        .ok()?;
+    if !crate::final_stop::session_ended(&session) {
+        return None;
+    }
+    if session.status == intent_core::AgentStatus::Deleted {
+        return Some(FinalStopReason::AgentDeleted);
+    }
+    let workspace_retired = shared
+        .store
+        .get_workspace(&record.workspace_id)
+        .await
+        .is_ok_and(|workspace| workspace.is_retired());
+    Some(if workspace_retired {
+        FinalStopReason::WorkspaceRetired
+    } else {
+        FinalStopReason::AgentRetired
+    })
 }
 
 /// Dial the git connection for `link`'s binding and serve the node's git

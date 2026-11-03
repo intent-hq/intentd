@@ -1295,6 +1295,21 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         request: RemoteLaunchRequest,
     ) -> BoxFuture<'a, Result<()>>;
 
+    /// End the remote ones among `agent_ids` for good with `reason`, before
+    /// their sessions or workspace are torn down: each gets a recorded final
+    /// stop, so its machine pushes its work one last time and removes its
+    /// checkout, even across a backend restart. Returns without waiting for
+    /// the machines; local agents are ignored. Nothing by default.
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, agent_ids, reason);
+        Box::pin(async {})
+    }
+
     /// The runtime driving remote agent `agent_id`, starting its provider on
     /// the node when it is not running there.
     ///

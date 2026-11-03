@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use intent_core::node_link::LeaseBinding;
 use intent_core::{AgentId, BoxFuture, Error, Result, WorkspaceId};
-use intent_git::node_git::AgentRemote;
+use intent_git::node_git::{AgentRemote, GitService};
 use intent_transport::node_link::NodeGitAccess;
 
 use crate::connector::Shared;
@@ -31,6 +31,7 @@ impl NodeGitAccess for HeadGitAccess {
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
             let current = self
@@ -39,6 +40,25 @@ impl NodeGitAccess for HeadGitAccess {
                 .ok_or_else(|| Error::InvalidParams("node-link-stale".into()))?;
             binding.ensure_current(current.binding())?;
             let agent_id = AgentId::from(remote.agent_id());
+            // A final stop admits the agent's last push (receive-pack only)
+            // into the workspace's repository, even once its session,
+            // placement or worktree is gone.
+            if let Some(stop) = self.shared.store.get_final_stop(&agent_id).await? {
+                if stop.lease_id != binding.lease_id
+                    || stop.workspace_id.as_str() != remote.workspace_id()
+                    || service != GitService::ReceivePack
+                {
+                    return Err(denied());
+                }
+                let repo = PathBuf::from(&stop.repo_path);
+                if stop.repo_path.is_empty() || !repo.is_dir() {
+                    return Err(Error::Internal(format!(
+                        "{}: the workspace's repository is gone",
+                        intent_transport::node_link::git_codes::UNAVAILABLE
+                    )));
+                }
+                return Ok(repo);
+            }
             let record = self
                 .shared
                 .store

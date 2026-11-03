@@ -85,15 +85,17 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_and_8() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_9() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
-    // frames; a protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 8 });
-    ensure_protocol(7).unwrap();
-    ensure_protocol(8).unwrap();
+    // frames, 9 final stops; a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 9 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
+    assert_eq!(FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    for version in 7..=9 {
+        ensure_protocol(version).unwrap();
+    }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
         assert!(matches!(
             ensure_protocol(peer),
@@ -226,8 +228,13 @@ fn later_additions_within_a_version_decode_on_an_older_peer() {
         intentd_version: "0.12.0".into(),
         binding: binding("head", 1),
         acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
     }))
     .unwrap();
+    assert!(
+        hello.get("leaseAgents").is_none(),
+        "an empty leaseAgents is left out"
+    );
     hello["futureOption"] = json!(true);
     assert!(matches!(
         serde_json::from_value::<LinkFrame>(hello).unwrap(),
@@ -376,6 +383,7 @@ fn every_frame() -> Vec<LinkFrame> {
             intentd_version: "0.12.0".into(),
             binding: binding("head", 3),
             acked_seq: NodeCounter(10),
+            lease_agents: Vec::new(),
         }),
         LinkFrame::Welcome(LinkWelcome {
             protocol: 7,
@@ -413,16 +421,19 @@ fn every_frame() -> Vec<LinkFrame> {
         LinkFrame::Stop {
             agent_id: agent_id.clone(),
             stop_id: request_id,
+            final_stop: false,
         },
         LinkFrame::StopAck {
             stop_id: request_id,
             agent_id: agent_id.clone(),
             outcome: StopOutcome::Stopped,
+            final_push: None,
         },
         LinkFrame::StopAck {
             stop_id: request_id,
             agent_id: agent_id.clone(),
             outcome: StopOutcome::NotRunning,
+            final_push: None,
         },
         LinkFrame::Journal(record(
             11,
@@ -580,6 +591,7 @@ fn stop_and_stop_ack_wire_shapes() {
         serde_json::to_value(LinkFrame::Stop {
             agent_id: agent_id.clone(),
             stop_id,
+            final_stop: false,
         })
         .unwrap(),
         json!({ "type": "stop", "agentId": agent_id.0, "stopId": stop_id.to_string() })
@@ -593,6 +605,7 @@ fn stop_and_stop_ack_wire_shapes() {
                 stop_id,
                 agent_id: agent_id.clone(),
                 outcome,
+                final_push: None,
             })
             .unwrap(),
             json!({
@@ -603,6 +616,55 @@ fn stop_and_stop_ack_wire_shapes() {
             })
         );
     }
+    // nodeProtocol 9: a final stop and its acknowledgement's push report.
+    let final_stop = serde_json::to_value(LinkFrame::Stop {
+        agent_id: agent_id.clone(),
+        stop_id,
+        final_stop: true,
+    })
+    .unwrap();
+    assert_eq!(
+        final_stop,
+        json!({ "type": "stop", "agentId": agent_id.0, "stopId": stop_id.to_string(), "final": true })
+    );
+    assert!(matches!(
+        LinkFrame::decode(final_stop.to_string().as_bytes()).unwrap(),
+        LinkFrame::Stop {
+            final_stop: true,
+            ..
+        }
+    ));
+    for (push, wire) in [
+        (FinalPush::Pushed, "pushed"),
+        (FinalPush::Failed, "failed"),
+        (FinalPush::Skipped, "skipped"),
+    ] {
+        let ack = LinkFrame::StopAck {
+            stop_id,
+            agent_id: agent_id.clone(),
+            outcome: StopOutcome::Stopped,
+            final_push: Some(push),
+        };
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["finalPush"], wire);
+        assert_eq!(
+            LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+            ack
+        );
+    }
+    let hello = LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "0.12.0".into(),
+        binding: binding("head", 1),
+        acked_seq: NodeCounter(0),
+        lease_agents: vec![agent_id.clone()],
+    };
+    let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
+    assert_eq!(value["leaseAgents"], json!([agent_id.0]));
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        LinkFrame::Hello(hello)
+    );
     // Protocol 7 requires the stop id: a stop without one is malformed.
     assert!(LinkFrame::decode(
         json!({ "type": "stop", "agentId": agent_id.0 })

@@ -18,9 +18,9 @@ async fn pair() -> (Node, DialedLink, NodeLink, LinkEvents) {
 async fn next_stop(events: &mut LinkEvents) -> (AgentId, StopId) {
     loop {
         match tokio::time::timeout(wait(), events.recv()).await.unwrap() {
-            Some(LinkEvent::Frame(LinkFrame::Stop { agent_id, stop_id })) => {
-                return (agent_id, stop_id)
-            }
+            Some(LinkEvent::Frame(LinkFrame::Stop {
+                agent_id, stop_id, ..
+            })) => return (agent_id, stop_id),
             Some(_) => {}
             None => panic!("the machine's link closed"),
         }
@@ -33,6 +33,7 @@ async fn ack(machine: &NodeLink, stop_id: StopId, agent_id: &AgentId, outcome: S
             stop_id,
             agent_id: agent_id.clone(),
             outcome,
+            final_push: None,
         })
         .await
         .unwrap();
@@ -197,6 +198,7 @@ async fn a_backend_may_not_send_a_stop_ack() {
             stop_id: StopId::new_v4(),
             agent_id: AgentId::new(),
             outcome: StopOutcome::Stopped,
+            final_push: None,
         })
         .await
         .unwrap();

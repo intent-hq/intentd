@@ -42,6 +42,7 @@ use intent_services::feature_api::Services;
 mod agents;
 mod connect;
 mod connector;
+mod final_stop;
 mod git;
 mod ingest;
 mod launch;

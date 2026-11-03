@@ -747,6 +747,7 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
 async fn remove_fails_and_keeps_everything_when_stops_go_unacknowledged() {
     let mut quick = tuning();
     quick.remove_timeout = std::time::Duration::from_millis(800);
+    quick.final_remove_timeout = std::time::Duration::from_millis(800);
     let backend = Backend::with_tuning(quick).await;
     let mut machine = backend.machine().await;
     let node = backend.expose(&mut machine).await;

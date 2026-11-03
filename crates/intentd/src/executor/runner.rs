@@ -9,7 +9,7 @@
 //! launch that failed or was refused for capacity). Records of one agent are
 //! journaled in order by a single per-agent pump.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,8 +26,8 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    ExitFailure, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
-    StopOutcome,
+    ExitFailure, FinalPush, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
+    MachineCapacity, StopOutcome,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -35,7 +35,7 @@ use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
 
-use super::checkout::Checkouts;
+use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT};
 use super::scripts::ScriptProcesses;
 use super::workspace_api::{self, HeadLink};
 
@@ -158,6 +158,8 @@ struct Inner {
     link_gate: tokio::sync::Mutex<Option<LeaseBinding>>,
     /// Machine runs of the agents' saved scripts (nodeProtocol 8).
     scripts: ScriptProcesses,
+    /// Notified each time the bind sweep finishes removing one checkout.
+    swept: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -173,6 +175,15 @@ struct State {
     /// free) whose exit record is not journaled yet, so a stop arriving in
     /// that window still waits for the record.
     exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
+    /// Agents a final stop is pushing and removing; the bind sweep leaves
+    /// their checkouts to it.
+    finalizing: HashSet<AgentId>,
+    /// Agents launched since the newest bind sweep took its list: the sweep
+    /// never removes their checkouts.
+    launched: HashSet<AgentId>,
+    /// Agents whose checkout the bind sweep is removing now; their launch
+    /// waits for it.
+    sweeping: HashSet<AgentId>,
 }
 
 /// Whether an agent's exit record reached the journal.
@@ -239,8 +250,14 @@ struct Agent {
     gates: workspace_api::Gates,
     /// The agent's working directory, once prepared.
     worktree: Mutex<Option<PathBuf>>,
+    /// Prepended to the agent's first turn (see [`Prepared::notice`]).
+    notice: Mutex<Option<String>>,
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
+    /// A final stop ends the agent: its exit push is bounded by
+    /// [`FINAL_PUSH_TIMEOUT`] and reported in `final_push`.
+    final_stop: std::sync::atomic::AtomicBool,
+    final_push: Mutex<Option<FinalPush>>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     /// Whether the agent's exit record reached the journal.
     journaled: watch::Receiver<ExitRecord>,
@@ -610,6 +627,7 @@ impl Runner {
                 pumps: Mutex::new(Vec::new()),
                 link_gate: tokio::sync::Mutex::new(None),
                 scripts: ScriptProcesses::new(Arc::new(intent_pty::PtyHost::new())),
+                swept: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -735,6 +753,7 @@ impl Runner {
     /// frames that caused them; a failed start is journaled as the agent's
     /// exit with an error code.
     pub(super) async fn launch(&self, command: LaunchCommand) {
+        self.claim_checkout(&command.agent_id).await;
         // Provider discovery reads the filesystem; keep it off the runtime.
         let launch = self.inner.launch.clone();
         let provider = command.provider.clone();
@@ -838,7 +857,10 @@ impl Runner {
                 is_sub_agent,
             },
             worktree: Mutex::new(None),
+            notice: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
+            final_stop: std::sync::atomic::AtomicBool::new(false),
+            final_push: Mutex::new(None),
             stop: Mutex::new(Some(stop_tx)),
             journaled: journaled_rx,
             ready: ready_rx,
@@ -1008,8 +1030,12 @@ impl Runner {
         let started = match prepared {
             None => Err(None),
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
-            Some(Ok(cwd)) => {
+            Some(Ok(Prepared {
+                worktree: cwd,
+                notice,
+            })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
+                *lock(&agent.notice) = notice;
                 match workspace_api::serve(
                     &agent.id,
                     &agent.workspace_id,
@@ -1310,14 +1336,183 @@ impl Runner {
             return;
         };
         let _serial = agent.wip.lock().await;
-        if let Err(error) = self
+        let final_stop = agent.final_stop.load(std::sync::atomic::Ordering::SeqCst);
+        let timeout = if final_stop {
+            FINAL_PUSH_TIMEOUT
+        } else {
+            WIP_PUSH_TIMEOUT
+        };
+        let pushed = self
             .inner
             .checkouts
-            .push_wip(&agent.id, &agent.workspace_id, &worktree)
-            .await
-        {
+            .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout)
+            .await;
+        if let Err(error) = &pushed {
             tracing::warn!(agent = %agent.id, error = %format!("{error:#}"), "node: WIP push failed");
         }
+        if final_stop {
+            *lock(&agent.final_push) = Some(if pushed.is_ok() {
+                FinalPush::Pushed
+            } else {
+                FinalPush::Failed
+            });
+        }
+    }
+
+    /// End `agent_id` for good (a final stop, nodeProtocol 9): end its
+    /// script runs, then stop it as [`Self::stop`] does, its exit push bounded by [`FINAL_PUSH_TIMEOUT`]
+    /// (an agent that is not running is pushed then, when this machine
+    /// knows its workspace), then remove its checkout. Resolves with the
+    /// acknowledgement's outcome and push report, or `None` when the stop
+    /// may not be acknowledged (its exit record was not journaled, or the
+    /// checkout could not be removed): the backend resends it.
+    pub(super) fn final_stop(
+        &self,
+        agent_id: &AgentId,
+    ) -> BoxFuture<'static, Option<(StopOutcome, FinalPush)>> {
+        let agent = {
+            let mut state = lock(&self.inner.state);
+            state.finalizing.insert(agent_id.clone());
+            state.agents.get(agent_id).cloned()
+        };
+        if let Some(agent) = &agent {
+            agent
+                .final_stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let runner = self.clone();
+        let agent_id = agent_id.clone();
+        Box::pin(async move {
+            // The agent's script runs end first, so nothing still writes to
+            // its checkout while it is pushed and removed.
+            runner.inner.scripts.stop_agent(&agent_id).await;
+            let wait = runner.stop(&agent_id);
+            let finished = runner.finish_final_stop(agent, &agent_id, wait).await;
+            lock(&runner.inner.state).finalizing.remove(&agent_id);
+            finished
+        })
+    }
+
+    async fn finish_final_stop(
+        &self,
+        agent: Option<Arc<Agent>>,
+        agent_id: &AgentId,
+        wait: StopWait,
+    ) -> Option<(StopOutcome, FinalPush)> {
+        let outcome = wait.wait().await?;
+        let exit_push = agent.and_then(|agent| *lock(&agent.final_push));
+        let push = match exit_push {
+            Some(push) => push,
+            None => self.push_final(agent_id).await,
+        };
+        if let Err(error) = self.inner.checkouts.remove(agent_id).await {
+            tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: could not remove a stopped agent's checkout; not acknowledging");
+            return None;
+        }
+        Some((outcome, push))
+    }
+
+    /// The final push of an agent that is not running: `skipped` without a
+    /// checkout here, or when this machine does not know its workspace
+    /// (it already pushed when it exited).
+    async fn push_final(&self, agent_id: &AgentId) -> FinalPush {
+        let Some(worktree) = self.inner.checkouts.existing(agent_id) else {
+            return FinalPush::Skipped;
+        };
+        let Some(workspace_id) = lock(&self.inner.state).workspaces.get(agent_id).cloned() else {
+            return FinalPush::Skipped;
+        };
+        match self
+            .inner
+            .checkouts
+            .push_wip(agent_id, &workspace_id, &worktree, FINAL_PUSH_TIMEOUT)
+            .await
+        {
+            Ok(()) => FinalPush::Pushed,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: final WIP push failed");
+                FinalPush::Failed
+            }
+        }
+    }
+
+    /// Mark `agent_id` launched, so the bind sweep leaves its checkout, and
+    /// wait out a removal of that checkout already under way.
+    async fn claim_checkout(&self, agent_id: &AgentId) {
+        loop {
+            let swept = self.inner.swept.notified();
+            tokio::pin!(swept);
+            swept.as_mut().enable();
+            {
+                let mut state = lock(&self.inner.state);
+                state.launched.insert(agent_id.clone());
+                if !state.sweeping.contains(agent_id) {
+                    return;
+                }
+            }
+            swept.await;
+        }
+    }
+
+    /// At a nodeProtocol 9 bind, before any frame of the new link is
+    /// handled: the checkouts of this backend's agents that are neither in
+    /// `lease_agents` nor running, exiting or being removed by a final stop.
+    /// Launches from here on are marked, and the sweep leaves them.
+    pub(super) fn sweep_candidates(&self, lease_agents: &[AgentId]) -> Vec<AgentId> {
+        let on_disk = self.inner.checkouts.agents();
+        let mut state = lock(&self.inner.state);
+        state.launched.clear();
+        on_disk
+            .into_iter()
+            .filter(|agent_id| {
+                !lease_agents.contains(agent_id)
+                    && !state.agents.contains_key(agent_id)
+                    && !state.exiting.contains_key(agent_id)
+                    && !state.finalizing.contains(agent_id)
+            })
+            .collect()
+    }
+
+    /// Remove the checkouts of `candidates` (from [`Self::sweep_candidates`])
+    /// except those launched, exiting or finalizing since. Returns the agents
+    /// swept.
+    pub(super) async fn sweep_checkouts(&self, candidates: Vec<AgentId>) -> Vec<AgentId> {
+        let mut swept = Vec::new();
+        for agent_id in candidates {
+            {
+                let mut state = lock(&self.inner.state);
+                if state.launched.contains(&agent_id)
+                    || state.agents.contains_key(&agent_id)
+                    || state.exiting.contains_key(&agent_id)
+                    || state.finalizing.contains(&agent_id)
+                {
+                    continue;
+                }
+                state.sweeping.insert(agent_id.clone());
+            }
+            #[cfg(test)]
+            self.inner.checkouts.before_sweep_removal(&agent_id).await;
+            let removed = self.inner.checkouts.remove(&agent_id).await;
+            lock(&self.inner.state).sweeping.remove(&agent_id);
+            self.inner.swept.notify_waiters();
+            match removed {
+                Ok(()) => {
+                    tracing::info!(agent = %agent_id, "node: removed the checkout of an agent its backend no longer records");
+                    swept.push(agent_id);
+                }
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: could not remove an orphaned checkout");
+                }
+            }
+        }
+        swept
+    }
+
+    /// [`Self::sweep_candidates`] then [`Self::sweep_checkouts`].
+    #[cfg(test)]
+    pub(super) async fn sweep(&self, lease_agents: &[AgentId]) -> Vec<AgentId> {
+        let candidates = self.sweep_candidates(lease_agents);
+        self.sweep_checkouts(candidates).await
     }
 
     /// Ask the agent's provider to cancel its running turn.
@@ -1427,7 +1622,7 @@ enum Outcome {
 /// and any error.
 async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, Option<String>) {
     let failed = |detail: String| ("refusal".to_owned(), Some(detail));
-    let Ok(blocks) = prompt
+    let Ok(mut blocks) = prompt
         .into_iter()
         .map(serde_json::from_value)
         .collect::<Result<Vec<_>, _>>()
@@ -1442,6 +1637,16 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
     let Some(session) = session else {
         return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
     };
+    // Set before the agent is ready, so the first turn takes it.
+    let notice = lock(&agent.notice).take();
+    if let Some(notice) = notice {
+        match serde_json::from_value(serde_json::json!({ "type": "text", "text": notice })) {
+            Ok(block) => blocks.insert(0, block),
+            Err(error) => {
+                tracing::warn!(error = %error, "node: the checkout notice is not a prompt block");
+            }
+        }
+    }
     // Switch the pump to this turn before anything the prompt causes can
     // arrive.
     let (ack, switched) = oneshot::channel();

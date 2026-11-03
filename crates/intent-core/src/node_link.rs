@@ -36,22 +36,52 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// How a final stop's WIP push went, reported on its acknowledgement
+/// (nodeProtocol 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalPush {
+    /// The agent's `head` and `wip` refs reached the backend.
+    Pushed,
+    /// The push failed or timed out; the checkout was removed anyway.
+    Failed,
+    /// Nothing to push: the agent has no checkout here, or it is not running
+    /// and its workspace is unknown to the machine.
+    Skipped,
+}
+
+/// The first protocol with final stops ([`LinkFrame::Stop`]'s `final`,
+/// [`LinkFrame::StopAck`]'s `finalPush`) and the bind-time checkout sweep
+/// (`leaseAgents` on [`LinkHello`]).
+pub const FINAL_STOP_PROTOCOL: u32 = 9;
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The private node-link protocol versions this build speaks. The
 /// daemon-to-daemon executor link started at 6; 7 adds the correlated stop
 /// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
-/// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]). Neither 6 nor the
-/// single-node 5 ever shipped, and a protocol-6 peer cannot confirm a stop,
-/// so this build speaks 7 and 8: a backend never takes a stop as confirmed
-/// by a machine that cannot acknowledge it. The
+/// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
+/// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]), and
+/// keeps everything 8 has. Neither 6 nor the single-node 5 ever shipped, and
+/// a protocol-6 peer cannot confirm a stop, so this build speaks 7 to 9: a
+/// backend never takes a stop as confirmed by a machine that cannot
+/// acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 8 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 9 };
 
 /// The first protocol with the saved-script frames (`scriptStart`,
 /// `scriptStop`, `scriptStarted`, `scriptOutput`, `scriptExited`). Neither
-/// side sends one on a link that negotiated less.
+/// side sends one on a link that negotiated less; every later protocol has
+/// them too, so gates compare with `>=`.
 pub const SCRIPT_PROTOCOL: u32 = 8;
 
 /// An inclusive range of node-link protocol versions a peer speaks.
@@ -189,6 +219,11 @@ pub struct LinkHello {
     /// Highest journal sequence head has ingested; the node replays
     /// everything after it.
     pub acked_seq: NodeCounter,
+    /// nodeProtocol 9: the agents recorded on this lease, those with a
+    /// pending final stop included. The machine removes every checkout of
+    /// this backend's agents that is neither listed nor running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_agents: Vec<AgentId>,
 }
 
 /// The node's reply to an accepted [`LinkHello`]: the negotiated protocol
@@ -533,18 +568,28 @@ pub enum LinkFrame {
     /// Stop the agent's process. The machine answers with a
     /// [`LinkFrame::StopAck`] for `stop_id` once the stop is applied; a
     /// repeated `stop_id` is the same stop.
+    ///
+    /// `final_stop` (`final`, nodeProtocol 9): the agent ends for good, so
+    /// after the stop the machine pushes its work one last time, removes its
+    /// checkout and only then acknowledges.
     #[serde(rename_all = "camelCase")]
     Stop {
         agent_id: AgentId,
         stop_id: StopId,
+        #[serde(rename = "final", default, skip_serializing_if = "is_false")]
+        final_stop: bool,
     },
     /// Machine to backend: the stop `stop_id` for `agent_id` is applied.
     /// May arrive in any order relative to other frames and acks.
     #[serde(rename_all = "camelCase")]
+    ///
+    /// `final_push` is present only on a final stop's acknowledgement.
     StopAck {
         stop_id: StopId,
         agent_id: AgentId,
         outcome: StopOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_push: Option<FinalPush>,
     },
     Journal(JournalRecord),
     /// Head has ingested every record up to and including `seq`.

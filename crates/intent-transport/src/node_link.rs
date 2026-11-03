@@ -46,7 +46,7 @@ pub use git_session::{
     OpenRequest, ATTACH_WAIT, MAX_SESSIONS,
 };
 pub use intent_core::node_link::*;
-pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink};
+pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink, StopAcked};
 pub use pin::CertificatePin;
 pub use reconnect::{dial_with_backoff, Backoff};
 pub use secret::ExecutorToken;

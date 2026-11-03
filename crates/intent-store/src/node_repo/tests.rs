@@ -732,6 +732,20 @@ async fn remote_agents_are_recorded_per_lease_and_cascade_with_the_agent() {
         None,
         "an agent never placed on a node is local"
     );
+    // One batched read picks the remote ones out of a mixed list.
+    let ids = [
+        AgentId::from("agent-local"),
+        AgentId::from("agent-b"),
+        AgentId::from("agent-a"),
+    ];
+    assert_eq!(
+        store.get_remote_agents(&ids).await.unwrap(),
+        vec![
+            record("agent-a", "2026-01-01T00:00:00Z"),
+            record("agent-b", "2026-01-02T00:00:00Z"),
+        ]
+    );
+    assert!(store.get_remote_agents(&[]).await.unwrap().is_empty());
     let listed = store
         .list_remote_agents(&lease.owner.lease_id)
         .await
@@ -781,6 +795,142 @@ async fn remote_agents_are_recorded_per_lease_and_cascade_with_the_agent() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn final_stops_outlive_the_session_and_drop_the_placement_unless_it_can_come_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("final-stops.db"))
+        .await
+        .unwrap();
+    let (node, lease) = records();
+    store.enroll_node(&node, &lease).await.unwrap();
+    let placed = |agent: &str| RemoteAgentRecord {
+        agent_id: agent.into(),
+        workspace_id: "workspace".into(),
+        node_id: node.id.clone(),
+        lease_id: lease.owner.lease_id.clone(),
+        created_at: now_iso(),
+    };
+    let stop = |agent: &str, stop_id: &str, reason| RemoteFinalStopRecord {
+        agent_id: agent.into(),
+        workspace_id: "workspace".into(),
+        machine_id: node.id.clone(),
+        lease_id: lease.owner.lease_id.clone(),
+        stop_id: stop_id.into(),
+        reason,
+        repo_path: "/repo".into(),
+        requested_at: "2026-01-01T00:00:00Z".into(),
+    };
+    for agent in ["agent-deleted", "agent-retired"] {
+        seed_agent(&store, agent, "workspace").await;
+        store.record_remote_agent(&placed(agent)).await.unwrap();
+    }
+    let deleted = store
+        .record_final_stop(&stop(
+            "agent-deleted",
+            "stop-1",
+            FinalStopReason::AgentDeleted,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.stop_id, "stop-1");
+    let again = store
+        .record_final_stop(&stop(
+            "agent-deleted",
+            "stop-2",
+            FinalStopReason::AgentDeleted,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.stop_id, "stop-1",
+        "a recorded final stop keeps its id"
+    );
+    store
+        .record_final_stop(&stop(
+            "agent-retired",
+            "stop-3",
+            FinalStopReason::AgentRetired,
+        ))
+        .await
+        .unwrap();
+
+    // The session goes; the final stop stays, for the final push.
+    sqlx::query("DELETE FROM agent_session WHERE id = 'agent-deleted'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_final_stop(&AgentId::from("agent-deleted"))
+            .await
+            .unwrap(),
+        Some(deleted.clone())
+    );
+    assert_eq!(
+        store
+            .list_final_stops(&lease.owner.lease_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    assert!(
+        !store
+            .finish_final_stop(&AgentId::from("agent-retired"), "stop-other")
+            .await
+            .unwrap(),
+        "another stop's ack finishes nothing"
+    );
+    assert!(store
+        .finish_final_stop(&AgentId::from("agent-retired"), "stop-3")
+        .await
+        .unwrap());
+    assert!(
+        store
+            .get_remote_agent(&AgentId::from("agent-retired"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a retired agent can be restored, so it stays placed"
+    );
+    assert!(store
+        .finish_final_stop(&AgentId::from("agent-deleted"), "stop-1")
+        .await
+        .unwrap());
+    assert!(store
+        .list_final_stops(&lease.owner.lease_id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A deleted agent's placement is dropped with its final stop.
+    seed_agent(&store, "agent-machine", "workspace").await;
+    store
+        .record_remote_agent(&placed("agent-machine"))
+        .await
+        .unwrap();
+    store
+        .record_final_stop(&stop(
+            "agent-machine",
+            "stop-4",
+            FinalStopReason::MachineRemoved,
+        ))
+        .await
+        .unwrap();
+    assert!(store
+        .finish_final_stop(&AgentId::from("agent-machine"), "stop-4")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .get_remote_agent(&AgentId::from("agent-machine"))
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

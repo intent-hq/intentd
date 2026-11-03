@@ -35,6 +35,51 @@ pub const MAX_RECEIVE_BYTES: u64 = 1 << 30;
 
 const URL_PREFIX: &str = "intent://ws/";
 
+const UNAPPLIED: &str = "unapplied/";
+
+/// Head's `update` hook for node pushes. Inside the agent's prefix (the
+/// only refs a session can reach) it allows exactly `head`, `wip` and
+/// `unapplied/<full lowercase hex sha>`. An `unapplied/` ref is create-only
+/// and named by the commit it holds; pinning the same commit again is a
+/// no-op success, so a pin whose answer was lost can be retried.
+const UPDATE_HOOK: &str = r#"#!/bin/sh
+ref="$1"
+old="$2"
+new="$3"
+refuse() {
+  echo "intent: $ref: $1" >&2
+  exit 1
+}
+case "$ref" in
+refs/intent/ws/*/agents/*/*) ;;
+*) refuse "not an agent ref" ;;
+esac
+name="${ref#refs/intent/ws/*/agents/*/}"
+case "$name" in
+head|wip) exit 0 ;;
+unapplied/*)
+  sha="${name#unapplied/}"
+  case "$sha" in
+  ''|*[!0-9a-f]*) refuse "not a full lowercase commit id" ;;
+  esac
+  if [ "${#sha}" != 40 ] && [ "${#sha}" != 64 ]; then
+    refuse "not a full lowercase commit id"
+  fi
+  [ "$sha" = "$new" ] || refuse "must be named by its commit"
+  if [ "$old" != "$new" ]; then
+    case "$old" in
+    *[!0]*) refuse "is create-only" ;;
+    esac
+  fi
+  exit 0
+  ;;
+*) refuse "not a ref a node may push" ;;
+esac
+"#;
+
+/// Where head keeps its receive hooks (see [`configure_receive_hooks`]).
+static HOOKS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
 const WIP_NAME: &str = "Intent";
 const WIP_EMAIL: &str = "noreply@intent.invalid";
 
@@ -111,6 +156,15 @@ impl AgentRemote {
             AgentRef::Wip => "wip",
         };
         format!("{}{suffix}", self.ref_prefix())
+    }
+
+    /// `<prefix>unapplied/<commit>`: where a node pins a saved `wip` it
+    /// could not restore. Head lets a session create one only under the
+    /// name of the commit it holds, and never update or delete it; pinning
+    /// the commit it already holds succeeds.
+    #[must_use]
+    pub fn unapplied_ref(&self, commit: &str) -> String {
+        format!("{}{UNAPPLIED}{commit}", self.ref_prefix())
     }
 }
 
@@ -201,16 +255,126 @@ pub fn scope_args(remote: &AgentRemote) -> Vec<String> {
 /// one node session for `remote` against `repository` (the workspace
 /// checkout or its git directory). Stdin and stdout carry the session;
 /// stderr is discarded because it is not part of the protocol.
-#[must_use]
-pub fn service_command(service: GitService, repository: &Path, remote: &AgentRemote) -> Command {
+///
+/// # Errors
+///
+/// When head's receive hooks cannot be installed: a push is then refused
+/// rather than run without them.
+pub fn service_command(
+    service: GitService,
+    repository: &Path,
+    remote: &AgentRemote,
+) -> Result<Command> {
     let mut command = sanitized_git();
+    command.args(scope_args(remote));
+    if service == GitService::ReceivePack {
+        command.args(receive_hook_args()?);
+    }
     command
-        .args(scope_args(remote))
         .arg(service.subcommand())
         .arg(repository)
         .stdin(Stdio::piped())
         .stderr(Stdio::null());
-    command
+    Ok(command)
+}
+
+/// Head side, at daemon start: keep the receive hooks in
+/// `<data_dir>/node-git-hooks`, removing whatever an earlier run left there
+/// and installing them fresh. Until this runs, every node push is refused.
+///
+/// # Errors
+///
+/// When the directory can't be cleared or the hook can't be written; node
+/// pushes are then refused.
+pub fn configure_receive_hooks(data_dir: &Path) -> Result<()> {
+    let dir = data_dir.join("node-git-hooks");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(e)),
+    }
+    *HOOKS_DIR
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.clone());
+    ensure_hooks(&dir)
+}
+
+/// The `-c` arguments that run head's [`UPDATE_HOOK`] (and no repository
+/// hook) on a node push, after checking the installed hook is intact and
+/// reinstalling it if not. Fails closed: no verified hook, no push.
+fn receive_hook_args() -> Result<Vec<String>> {
+    let dir = HOOKS_DIR
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or_else(|| {
+            Error::Internal("node git: head's receive hooks are not configured".into())
+        })?;
+    ensure_hooks(&dir)?;
+    Ok(vec![
+        "-c".to_owned(),
+        format!("core.hooksPath={}", dir.display()),
+    ])
+}
+
+/// Whether `dir/update` is a regular file with exactly [`UPDATE_HOOK`] and
+/// mode 0700, in a real (not symlinked) directory.
+fn hooks_intact(dir: &Path) -> bool {
+    let Ok(dir_meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !dir_meta.is_dir() {
+        return false;
+    }
+    let hook = dir.join("update");
+    let Ok(meta) = std::fs::symlink_metadata(&hook) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o7777 != 0o700 {
+            return false;
+        }
+    }
+    std::fs::read(&hook).is_ok_and(|content| content == UPDATE_HOOK.as_bytes())
+}
+
+/// Verify the hook, reinstalling it (written aside, then renamed into
+/// place) when it is missing or altered.
+fn ensure_hooks(dir: &Path) -> Result<()> {
+    if hooks_intact(dir) {
+        return Ok(());
+    }
+    let unavailable =
+        |e: std::io::Error| Error::Internal(format!("node git: head's receive hooks: {e}"));
+    if std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir()) {
+        std::fs::remove_file(dir).map_err(unavailable)?;
+    }
+    std::fs::create_dir_all(dir).map_err(unavailable)?;
+    let staged = tempfile::NamedTempFile::new_in(dir).map_err(unavailable)?;
+    std::fs::write(staged.path(), UPDATE_HOOK).map_err(unavailable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(unavailable)?;
+    }
+    let hook = dir.join("update");
+    if std::fs::symlink_metadata(&hook).is_ok_and(|meta| meta.is_dir()) {
+        std::fs::remove_dir_all(&hook).map_err(unavailable)?;
+    }
+    staged.persist(&hook).map_err(|e| unavailable(e.error))?;
+    if hooks_intact(dir) {
+        Ok(())
+    } else {
+        Err(Error::Internal(
+            "node git: head's receive hook could not be verified".into(),
+        ))
+    }
 }
 
 /// The commit `repository`'s `HEAD` points at: where a remote agent of the
@@ -347,8 +511,9 @@ impl NodeGit {
         #[cfg(test)]
         if let Some(head) = &self.test_head {
             return format!(
-                "ext::git {} %s {}",
+                "ext::git {} {} %s {}",
                 scope_args(remote).join(" "),
+                receive_hook_args().unwrap_or_default().join(" "),
                 head.display()
             );
         }
@@ -410,6 +575,19 @@ impl NodeGit {
     }
 }
 
+/// A worktree [`CheckoutCache::checkout`] added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkout {
+    /// The agent's `base` ref: the commit head launched it at.
+    pub base: String,
+    /// The commit the worktree is at: the agent's saved `head`, else `base`.
+    pub at: String,
+    /// The agent's `wip` commit when it was ahead of `at` but could not be
+    /// restored on top. It is pinned on head under
+    /// [`AgentRemote::unapplied_ref`] and readable from the worktree.
+    pub unrestored_wip: Option<String>,
+}
+
 /// The node's per-repository bare caches, holding every agent worktree.
 #[derive(Debug)]
 pub struct CheckoutCache {
@@ -438,9 +616,17 @@ impl CheckoutCache {
         Ok(self.root.join(format!("{repo_key}.git")))
     }
 
-    /// Fetch `remote`'s base ref from head into the `repo_key` cache
-    /// (creating it on first use) and add a detached worktree for it at
-    /// `worktree`. Returns the base commit.
+    /// Fetch `remote`'s refs from head into the `repo_key` cache (creating
+    /// it on first use) and add a detached worktree at `worktree`.
+    ///
+    /// The worktree is at the agent's saved `head` ref when head has one (a
+    /// relaunched agent whose checkout was removed), else at its `base`. A
+    /// `wip` ref ahead of that commit is restored on top as uncommitted
+    /// changes; when it does not apply cleanly the worktree stays at the
+    /// saved head, the wip is pinned on head under
+    /// [`AgentRemote::unapplied_ref`] (create-only) before this returns, and
+    /// [`Checkout::unrestored_wip`] names it. Head's `base`, `head` and `wip`
+    /// refs are only read.
     ///
     /// # Errors
     ///
@@ -451,7 +637,7 @@ impl CheckoutCache {
         repo_key: &str,
         remote: &AgentRemote,
         worktree: &Path,
-    ) -> Result<String> {
+    ) -> Result<Checkout> {
         let cache = self.cache(repo_key)?;
         let _serial = self.lock.lock().await;
         if !cache.join("HEAD").is_file() {
@@ -460,9 +646,11 @@ impl CheckoutCache {
             init.args(["init", "--quiet", "--bare"]).arg(&cache);
             run(init).await?;
         }
-        let base = remote.ref_name(AgentRef::Base);
+        // Head advertises only this agent's refs; the glob takes whichever
+        // of base, head and wip exist, and prunes local copies it dropped.
+        let prefix = remote.ref_prefix();
         let url = self.git.remote_url(remote);
-        let refspec = format!("+{base}:{base}");
+        let refspec = format!("+{prefix}*:{prefix}*");
         self.git
             .git(
                 &cache,
@@ -470,25 +658,126 @@ impl CheckoutCache {
                     "fetch",
                     "--quiet",
                     "--no-tags",
+                    "--prune",
                     "--no-write-fetch-head",
                     &url,
                     &refspec,
                 ],
             )
             .await?;
-        let commit = self
-            .git
-            .git(
-                &cache,
-                &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-            )
-            .await?;
+        let resolve = |kind: AgentRef| {
+            let name = format!("{}^{{commit}}", remote.ref_name(kind));
+            let mut command = self.git.command(&cache);
+            command.args(["rev-parse", "--verify", "--quiet", &name]);
+            async move { run(command).await.ok() }
+        };
+        let base = resolve(AgentRef::Base).await.ok_or_else(|| {
+            Error::Internal("node-git-failed: head has no base ref for the agent".into())
+        })?;
+        let saved_head = resolve(AgentRef::Head).await;
+        let wip = resolve(AgentRef::Wip).await;
+        let at = saved_head.unwrap_or_else(|| base.clone());
         let mut add = self.git.command(&cache);
         add.args(["worktree", "add", "--quiet", "--detach"])
             .arg(worktree)
-            .arg(&commit);
+            .arg(&at);
         run(add).await?;
-        Ok(commit)
+        let unrestored_wip = match wip {
+            Some(wip) if self.wip_is_ahead(&cache, &at, &wip).await => {
+                match self.restore_wip(worktree, &wip).await {
+                    Ok(()) => None,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "node git: the wip ref did not apply");
+                        // Pinned before the agent runs, so its next push to
+                        // wip cannot lose this work. A pin that already
+                        // landed is up to date, which git reports as success.
+                        let pin = format!("{wip}:{}", remote.unapplied_ref(&wip));
+                        if let Err(push_error) =
+                            self.git.git(&cache, &["push", "--quiet", &url, &pin]).await
+                        {
+                            // No checkout is left behind: the next launch
+                            // restores (and pins) again instead of reusing it.
+                            let mut cleanup = self.git.command(&cache);
+                            cleanup
+                                .args(["worktree", "remove", "--force"])
+                                .arg(worktree);
+                            if let Err(error) = run(cleanup).await {
+                                tracing::warn!(error = %error, "node git: could not remove the unpinned checkout");
+                            }
+                            return Err(Error::Internal(format!(
+                                "pin the unapplied wip {wip} on head: {push_error}"
+                            )));
+                        }
+                        // The same ref locally, so the checkout can name it.
+                        self.git
+                            .git(&cache, &["update-ref", &remote.unapplied_ref(&wip), &wip])
+                            .await?;
+                        Some(wip)
+                    }
+                }
+            }
+            _ => None,
+        };
+        Ok(Checkout {
+            base,
+            at,
+            unrestored_wip,
+        })
+    }
+
+    /// Whether `wip` holds work `at` lacks: it differs and is not already
+    /// part of `at`'s history.
+    async fn wip_is_ahead(&self, cache: &Path, at: &str, wip: &str) -> bool {
+        if wip == at {
+            return false;
+        }
+        let mut ancestor = self.git.command(cache);
+        ancestor.args(["merge-base", "--is-ancestor", wip, at]);
+        run(ancestor).await.is_err()
+    }
+
+    /// Apply `wip`'s own changes (against its parent) to the clean worktree
+    /// as uncommitted changes. `git apply` without `--index` touches only
+    /// the working tree and applies all or nothing.
+    async fn restore_wip(&self, worktree: &Path, wip: &str) -> Result<()> {
+        let scratch = tempfile::tempdir().map_err(io)?;
+        let patch = scratch.path().join("wip.patch");
+        let mut diff = self.git.command(worktree);
+        diff.args(["diff", "--binary", "--full-index", "--no-color"])
+            .arg(format!("--output={}", patch.display()))
+            .arg(format!("{wip}^"))
+            .arg(wip);
+        run(diff).await?;
+        if std::fs::metadata(&patch).map_err(io)?.len() == 0 {
+            return Ok(());
+        }
+        let mut apply = self.git.command(worktree);
+        apply.args(["apply", "--whitespace=nowarn"]).arg(&patch);
+        run(apply).await?;
+        Ok(())
+    }
+
+    /// Forget the worktrees whose directories are gone, in every cache.
+    ///
+    /// # Errors
+    ///
+    /// When the caches cannot be listed or git fails.
+    pub async fn prune(&self) -> Result<()> {
+        let _serial = self.lock.lock().await;
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
+        };
+        for entry in entries {
+            let cache = entry.map_err(io)?.path();
+            if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
+                let mut prune = self.git.command(&cache);
+                prune.args(["worktree", "prune"]);
+                run(prune).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove an agent's worktree from the `repo_key` cache.

@@ -18755,6 +18755,16 @@ impl Services {
             // its store check before the sweep would otherwise respawn a
             // replacement child during the shared grace wait and leave it
             // running as a ghost process after the rows are gone.
+            // Remote agents get final stops, recorded before their sessions
+            // go, so their machines' last pushes are still accepted.
+            services
+                .feature_remote_launch_port()
+                .final_stop(
+                    &services,
+                    &session_ids,
+                    intent_core::remote_launch::FinalStopReason::WorkspaceDeleted,
+                )
+                .await;
             let _teardown_fence = match manager.as_ref() {
                 Some(manager) => Some(manager.stop_many(&session_ids).await),
                 None => None,
