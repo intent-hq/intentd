@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, http, Message};
 
+use intent_core::link_traffic::{LinkTap, LinkTraffic, PeerKind, TrafficPeer};
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{BindDecision, JournalBody, JournalRecord};
 use intent_core::{BoxFuture, ExecutorCredentialId, HostRole, PrincipalId, WorkspaceApi};
@@ -201,6 +202,7 @@ impl WorkspaceApi for MachineApi {
 struct Host {
     ready: AtomicBool,
     accepted: mpsc::UnboundedSender<(ExecutorCredentialId, NodeConnection)>,
+    traffic: Arc<LinkTraffic>,
 }
 
 impl ExecutorHost for Host {
@@ -218,6 +220,9 @@ impl ExecutorHost for Host {
     }
     fn accept(&self, credential: ExecutorCredential, connection: NodeConnection) {
         let _ = self.accepted.send((credential.id, connection));
+    }
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        Some(self.traffic.clone())
     }
 }
 
@@ -287,6 +292,7 @@ impl Machine {
             Arc::new(Host {
                 ready: AtomicBool::new(true),
                 accepted: tx,
+                traffic: Arc::new(LinkTraffic::new()),
             })
         });
         if let Some(host) = &host {
@@ -309,6 +315,7 @@ impl Machine {
 
     fn endpoint(&self, token: &str) -> NodeEndpoint {
         NodeEndpoint {
+            tap: None,
             url: format!("wss://127.0.0.1:{}", self.port),
             pin: CertificatePin::parse(&self.certificate.fingerprint256).unwrap(),
             token: ExecutorToken::new(token).unwrap(),
@@ -1233,6 +1240,7 @@ async fn executor_revoke_closes_a_live_link_with_1008() {
     server.install_executor_links(ExecutorLinks::new(Arc::new(Host {
         ready: AtomicBool::new(true),
         accepted: tx,
+        traffic: Arc::new(LinkTraffic::new()),
     })));
     let port = server.start().await.unwrap();
 
@@ -1269,4 +1277,138 @@ async fn executor_revoke_closes_a_live_link_with_1008() {
     .await;
     assert_eq!(status, 401, "a revoked token is refused");
     server.stop().await;
+}
+
+/// Frame types the capture retained, waiting until it holds `count`.
+async fn captured(traffic: &LinkTraffic, count: usize) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        let records = traffic.snapshot(None, None)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if records.len() >= count || tokio::time::Instant::now() > deadline {
+            return records;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn kinds(records: &[serde_json::Value]) -> Vec<(String, String)> {
+    records
+        .iter()
+        .filter(|r| !r["frameType"].as_str().unwrap().starts_with("heartbeat"))
+        .map(|r| {
+            (
+                r["direction"].as_str().unwrap().to_owned(),
+                r["frameType"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn both_ends_capture_link_traffic_only_while_on() {
+    let mut machine = Machine::start(Mode::Secure { ws_enabled: true }).await;
+    let machine_traffic = machine.host.as_ref().unwrap().traffic.clone();
+    let backend_traffic = Arc::new(LinkTraffic::new());
+    let tap = LinkTap::new(
+        backend_traffic.clone(),
+        TrafficPeer {
+            kind: PeerKind::Machine,
+            id: MACHINE.into(),
+            name: Some("Machine".into()),
+        },
+    );
+
+    // Off: a link and its frames record nothing.
+    let dialed = dial_link(
+        &machine
+            .endpoint(&executor_token())
+            .with_tap(Some(tap.clone())),
+        hello(machine_binding(BACKEND, 1)),
+    )
+    .await
+    .unwrap();
+    let (_, node_link, _node_events) = machine.accepted_link().await;
+    dialed
+        .link
+        .send(&LinkFrame::Ack {
+            seq: NodeCounter(0),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(backend_traffic.status()["retained"], 0);
+    assert_eq!(machine_traffic.status()["retained"], 0);
+    dialed.link.close();
+    node_link.close();
+
+    // On: the handshake and the frames both ways, on both ends.
+    backend_traffic.start(true);
+    machine_traffic.start(true);
+    let dialed = dial_link(
+        &machine.endpoint(&executor_token()).with_tap(Some(tap)),
+        hello(machine_binding(BACKEND, 2)),
+    )
+    .await
+    .unwrap();
+    let (_, node_link, mut node_events) = machine.accepted_link().await;
+    let mut events = dialed.events;
+    dialed
+        .link
+        .send(&LinkFrame::Ack {
+            seq: NodeCounter(0),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(wait(), node_events.recv())
+            .await
+            .unwrap(),
+        Some(LinkEvent::Frame(LinkFrame::Ack { .. }))
+    ));
+    node_link
+        .send(&LinkFrame::ReplayComplete {
+            through_seq: NodeCounter(0),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(wait(), events.recv()).await.unwrap(),
+        Some(LinkEvent::Frame(LinkFrame::ReplayComplete { .. }))
+    ));
+
+    let backend = captured(&backend_traffic, 4).await;
+    assert_eq!(
+        kinds(&backend),
+        [
+            ("out", "hello"),
+            ("in", "welcome"),
+            ("out", "ack"),
+            ("in", "replayComplete"),
+        ]
+        .map(|(d, t)| (d.to_owned(), t.to_owned()))
+    );
+    assert_eq!(
+        backend[0]["peer"],
+        serde_json::json!({ "kind": "machine", "id": MACHINE, "name": "Machine" })
+    );
+    assert!(backend.iter().all(|r| r["bytes"].as_u64().unwrap() > 0));
+
+    let node = captured(&machine_traffic, 4).await;
+    assert_eq!(
+        kinds(&node),
+        [
+            ("in", "hello"),
+            ("out", "welcome"),
+            ("in", "ack"),
+            ("out", "replayComplete"),
+        ]
+        .map(|(d, t)| (d.to_owned(), t.to_owned()))
+    );
+    assert_eq!(
+        node[0]["peer"],
+        serde_json::json!({ "kind": "backend", "id": BACKEND, "name": "Backend" })
+    );
 }

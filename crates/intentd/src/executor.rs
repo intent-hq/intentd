@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::bail;
 use tokio::sync::mpsc;
 
+use intent_core::link_traffic::LinkTraffic;
 use intent_core::machines::{ExecutorCredential, ExecutorLiveStatus, ExecutorLiveness};
 use intent_core::node_link::{LinkHello, LinkWelcome, MachineCapabilities, ProviderCapability};
 use intent_core::nodes::{NodeArch, NodeOs};
@@ -77,6 +78,9 @@ pub(crate) struct ExecutorDeps {
     /// The credentials still active in the store, read when the
     /// revocation feed lagged and may have dropped a revocation.
     pub active_credentials: ActiveCredentials,
+    /// The daemon's link traffic capture: every backend's link is recorded
+    /// in it while the owner captures.
+    pub link_traffic: Option<Arc<LinkTraffic>>,
 }
 
 /// Reads the active executor credentials.
@@ -494,6 +498,10 @@ impl ExecutorHost for ExecutorService {
             close(connection);
         }
     }
+
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        self.deps.link_traffic.clone()
+    }
 }
 
 impl ExecutorLiveness for ExecutorService {
@@ -582,6 +590,10 @@ impl ExecutorHost for ExecutorSlot {
             Some(service) => service.accept(credential, connection),
             None => close(connection),
         }
+    }
+
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        self.0.get()?.link_traffic()
     }
 }
 
@@ -837,6 +849,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             launch: Arc::new(SettingsLaunch(parts.settings.clone())),
             report: report.clone(),
             executable,
+            link_traffic: Some(parts.services.link_traffic().clone()),
             active_credentials: {
                 let store = parts.services.store().clone();
                 Arc::new(move || {

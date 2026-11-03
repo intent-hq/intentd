@@ -327,6 +327,7 @@ impl Running {
                 launch: Arc::new(FixedLaunch(providers)),
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
+                link_traffic: Some(Arc::new(intent_core::link_traffic::LinkTraffic::new())),
                 active_credentials: {
                     let api = api.clone();
                     Arc::new(move || {
@@ -363,6 +364,7 @@ impl Running {
         server.install_executor_links(ExecutorLinks::new(service.clone()));
         let port = server.start().await.unwrap();
         let endpoint = NodeEndpoint {
+            tap: None,
             url: format!("wss://127.0.0.1:{port}"),
             pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
             token: ExecutorToken::new(token()).unwrap(),
@@ -489,6 +491,63 @@ async fn executor_binds_reports_capabilities_and_streams_launch_outcomes() {
             if e.starts_with(runner::codes::PROVIDER)),
         "{record:?}"
     );
+    node.stop().await;
+}
+
+/// While the owner captures link traffic, the machine records each
+/// backend's link both ways, against that backend; the slot hands the
+/// listener the service's capture.
+#[tokio::test]
+async fn executor_records_backend_links_while_capture_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let slot = ExecutorSlot::default();
+    assert!(slot.link_traffic().is_none());
+    slot.install(node.service.clone());
+    let traffic = slot.link_traffic().expect("the service's capture");
+    traffic.start(true);
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
+    dialed.link.send(&refused_launch("a1")).await.unwrap();
+    let _ = next_record(&mut dialed).await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let kinds = loop {
+        let records = traffic.snapshot(None, None)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let kinds: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| !r["frameType"].as_str().unwrap().starts_with("heartbeat"))
+            .map(|r| {
+                (
+                    r["direction"].as_str().unwrap().to_owned(),
+                    r["frameType"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        if kinds.len() >= 5 || tokio::time::Instant::now() > deadline {
+            assert!(records
+                .iter()
+                .all(|r| r["peer"]["kind"] == "backend" && r["peer"]["id"] == HEAD));
+            break kinds;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let expected: Vec<(String, String)> = [
+        ("in", "hello"),
+        ("out", "welcome"),
+        ("out", "replayComplete"),
+        ("in", "launch"),
+        ("out", "journal"),
+    ]
+    .iter()
+    .map(|(d, t)| ((*d).to_owned(), (*t).to_owned()))
+    .collect();
+    assert_eq!(kinds, expected);
+    traffic.stop();
     node.stop().await;
 }
 

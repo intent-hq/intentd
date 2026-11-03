@@ -152,6 +152,7 @@ pub(super) async fn bound_link(dir: &std::path::Path) -> (NodeLink, DialedLink, 
     server.install_executor_links(ExecutorLinks::new(Arc::new(Host(tx))));
     let port = server.start().await.unwrap();
     let endpoint = NodeEndpoint {
+        tap: None,
         url: format!("wss://127.0.0.1:{port}"),
         pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
         token: ExecutorToken::new(TOKEN).unwrap(),

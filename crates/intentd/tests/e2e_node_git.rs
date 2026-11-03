@@ -267,6 +267,7 @@ impl Fixture {
             pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
             token: ExecutorToken::new(EXECUTOR_TOKEN).unwrap(),
             tailcat: None,
+            tap: None,
         };
         let binding = LeaseBinding {
             head_id: "head-1".into(),

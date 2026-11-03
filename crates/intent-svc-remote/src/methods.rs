@@ -285,7 +285,8 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
         &params.fingerprint,
         &params.token,
         feature.tailcat_bin(),
-    )?;
+    )?
+    .tapped(svc.link_traffic().clone());
 
     // Adding the machine's current credential again only refreshes its
     // routes: keep its live lease and offer that lease's next generation, as

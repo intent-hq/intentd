@@ -168,7 +168,8 @@ impl RemoteFeature {
                     "the executor token of machine {machine_id} is missing; make the machine available again"
                 ))
             })?;
-        let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?;
+        let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
+            .tapped(svc.link_traffic().clone());
         let node = RemoteNode::start(
             svc.store().clone(),
             target,

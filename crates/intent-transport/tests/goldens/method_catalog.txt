@@ -319,6 +319,9 @@ router providers.profiles.list
 router providers.profiles.reorder
 router providers.profiles.update
 router providers.profiles.updateDefault
+router remoteLinkTraffic.snapshot
+router remoteLinkTraffic.start
+router remoteLinkTraffic.stop
 router remoteMachines.add
 router remoteMachines.backendInfo
 router remoteMachines.list
