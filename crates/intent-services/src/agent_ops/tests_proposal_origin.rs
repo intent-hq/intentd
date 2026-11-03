@@ -757,6 +757,28 @@ async fn origin_lookup_store_error_fails_the_create_and_a_retry_recovers() {
     assert_eq!(notices_for(&svc, &agent).await.len(), 1);
 }
 
+/// Every `proposalCreatedWorkspaces` map carried by an `agent:updated` event
+/// for `agent`, sorted for an order-independent comparison.
+async fn event_created_maps(svc: &Services, ws: &WorkspaceId, agent: &AgentId) -> Vec<String> {
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![intent_core::events::AGENT_UPDATED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("events");
+    let mut maps: Vec<String> = events
+        .iter()
+        .filter(|event| event.data.get("agentId") == Some(&json!(agent.0)))
+        .filter_map(|event| event.data.get("proposalCreatedWorkspaces"))
+        .map(Value::to_string)
+        .collect();
+    maps.sort();
+    maps
+}
+
 /// `metadata.proposalCreatedWorkspaces` follows the resolution: the
 /// `agent:updated` event carries it, a client-side `agent.resolveProposal`
 /// (no created id) never invents one, and a re-proposed card dismissed later
@@ -830,6 +852,14 @@ async fn created_workspace_link_follows_the_resolution() {
         session.proposal_created_workspaces().is_empty(),
         "a dismissed re-proposal drops the old link"
     );
+    assert_eq!(
+        event_created_maps(&svc, &ws, &agent).await,
+        vec![
+            json!({ "tc-1": "ws-created" }).to_string(),
+            json!({}).to_string(),
+        ],
+        "the dismissal event carries the cleared (empty) map"
+    );
 }
 
 /// A created-workspace link written before a later write of the origin
@@ -868,6 +898,11 @@ async fn applied_retry_without_an_id_keeps_the_created_workspace_link() {
         session.proposal_created_workspaces().get("tc-1"),
         Some(&json!("ws-created")),
         "the retry keeps the card's created-workspace link"
+    );
+    assert_eq!(
+        event_created_maps(&svc, &ws, &agent).await,
+        vec![json!({ "tc-1": "ws-created" }).to_string()],
+        "the retry's event carries the preserved link"
     );
 
     let blocks = create_proposal_blocks("tc-1", None);

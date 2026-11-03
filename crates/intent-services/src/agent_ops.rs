@@ -11100,17 +11100,23 @@ impl Services {
                 &now_iso(),
             )
             .await?;
-        self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, {
-            let mut data = json!({
+        // Always carry the CURRENT created-workspace map (empty when
+        // cleared), not only when this invocation wrote it: a retry after a
+        // partial failure reads the already-persisted map, so the first
+        // successful event would otherwise omit the link and hydrated
+        // clients that consume these fields directly (skipping `agent.get`)
+        // would show the card applied without its workspace link.
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
                 "agentId": agent_id.0,
                 "pendingProposals": remaining,
                 "proposalResolutions": resolutions,
-            });
-            if created_changed {
-                data["proposalCreatedWorkspaces"] = Value::Object(created_workspaces);
-            }
-            data
-        })
+                "proposalCreatedWorkspaces": Value::Object(created_workspaces),
+            }),
+        )
         .await;
         // Deliver the proposal-resolved system notice — fail-soft, the
         // persisted resolution is the source of truth.
