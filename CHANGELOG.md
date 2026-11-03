@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.112] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- *(workspace-status)* Any merge-queued PR wins the displayStatus PR rung ([#2972](https://github.com/intent-hq/intentd/pull/2972))
+- *(intentd)* Run every hook ws.* call as the owning agent ([#2965](https://github.com/intent-hq/intentd/pull/2965))
+- *(rpc_profile)* Budget agent.dismissQuestions / agent.queueMessage on the per-method tier ([#2960](https://github.com/intent-hq/intentd/pull/2960))
+- *(agents)* Refuse user retire of the last top-level agent ([#2963](https://github.com/intent-hq/intentd/pull/2963))
+
+### 📚 Documentation
+
+- *(guide)* Note the same-provider Retry on the usage-limit banner ([#2959](https://github.com/intent-hq/intentd/pull/2959))
+- Update new workspace form guide ([#2969](https://github.com/intent-hq/intentd/pull/2969))
+- *(guide)* Describe Update for outdated Claude Code CLI ([#2970](https://github.com/intent-hq/intentd/pull/2970))
+
+### 🧪 Testing
+
+- Keep ratchet lint baselines in one file per crate ([#2971](https://github.com/intent-hq/intentd/pull/2971))
+- Replace the last four elapsed-time assertions with timing-free checks ([#2962](https://github.com/intent-hq/intentd/pull/2962))
+
+
 ## [0.11.111] - 2026-11-02
 
 ### 📚 Documentation
