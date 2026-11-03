@@ -380,7 +380,8 @@ impl LinkTraffic {
         if !self.is_active() {
             return;
         }
-        let light = !self.payloads.load(Ordering::Relaxed) || bytes > self.limits.max_payload_bytes;
+        let payloads = self.payloads.load(Ordering::Relaxed);
+        let light = !payloads || bytes > self.limits.max_payload_bytes;
         let cost = if light { LIGHT_BYTES } else { bytes };
         // Reserve the frame's place under the lock; copy it after.
         let (epoch, tx, queued) = {
@@ -399,7 +400,8 @@ impl LinkTraffic {
         let body = if light {
             Body::Light {
                 frame: light_frame(frame),
-                truncated: bytes > self.limits.max_payload_bytes,
+                // Only a payload left out for size is truncated.
+                truncated: payloads && bytes > self.limits.max_payload_bytes,
             }
         } else {
             Body::Full(Box::new(frame.clone()))
@@ -682,8 +684,8 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
         "hello" => format!(
             "hello generation {}",
             frame
-                .pointer("/binding/generation")
-                .map_or_else(|| "?".to_owned(), ToString::to_string)
+                .get("binding")
+                .map_or_else(|| "?".to_owned(), |binding| number(binding, "generation"))
         ),
         "welcome" => format!(
             "welcome protocol {}, {} running agents",

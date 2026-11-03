@@ -679,3 +679,22 @@ async fn stop_waits_for_a_batch_being_published() {
         .collect();
     assert_eq!(kinds, vec![(true, 0), (true, 1), (false, 0)]);
 }
+
+#[test]
+fn hello_generation_is_unquoted() {
+    // `binding.generation` is a NodeCounter, which serializes as a string.
+    let hello = json!({ "type": "hello", "binding": { "generation": "3" } });
+    assert_eq!(super::summarize("hello", &hello), "hello generation 3");
+}
+
+#[tokio::test]
+async fn payloads_off_never_marks_a_large_frame_truncated() {
+    let (traffic, _) = traffic(limits(10, 64, 16));
+    traffic.start(false);
+    LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &launch_frame(), 900);
+    settle(&traffic, 1).await;
+    let record = traffic.snapshot(None, None)["records"][0].clone();
+    assert!(record.get("payload").is_none());
+    assert!(record.get("truncated").is_none(), "{record}");
+    assert_eq!(traffic.status()["oversized"], 0);
+}
