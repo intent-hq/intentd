@@ -3159,7 +3159,8 @@ fn spawn_env_overlay(
 /// The enhanced PATH for a spawned shell, reusing the canonical de-duplicated,
 /// order-preserving dir list (current PATH first, then essential system dirs and
 /// node/version-manager locations). Returns `None` when no dirs resolve.
-fn enhanced_shell_path() -> Option<String> {
+/// Shared with the workspace setup-script runner (`runtime.rs`).
+pub(crate) fn enhanced_shell_path() -> Option<String> {
     let dirs = intent_services::feature_api::auggie_discovery::enhanced_path_dirs();
     if dirs.is_empty() {
         return None;
