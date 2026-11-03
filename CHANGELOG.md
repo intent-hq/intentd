@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.118] - 2026-11-03
+
+### 🚀 Features
+
+- Saved-script frames and machine runs for remote agents (nodeProtocol 8, part 1) ([#3004](https://github.com/intent-hq/intentd/pull/3004))
+
+### 🐛 Bug Fixes
+
+- Agent.delete stops the agent's runtime before removing its rows ([#3000](https://github.com/intent-hq/intentd/pull/3000))
+
+
 ## [0.11.117] - 2026-11-03
 
 ### 🚀 Features
