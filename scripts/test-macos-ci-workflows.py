@@ -76,7 +76,18 @@ class WorkflowTests(unittest.TestCase):
             "((github.event.action == 'labeled' && github.event.label.name == 'ci:macos') || "
             "(github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ci:macos'))))"))
         self.assertEqual(jobs['preflight']['needs'], ['runner-route'])
-        self.assertNotIn('if', jobs['preflight'])
+        # Skipped with routing (no opt-in); a failed route still runs on WarpBuild.
+        self.assertEqual(jobs['preflight']['if'], "${{ !cancelled() && needs.runner-route.result != 'skipped' }}")
+
+    def test_preflight_concurrency_is_job_level(self):
+        # A workflow-level group is joined when the run is created, so adding
+        # any other label to the PR would cancel a preflight in progress.
+        data = workflow('macos-preflight.yml')
+        self.assertNotIn('concurrency', data)
+        self.assertEqual(data['jobs']['preflight']['concurrency'], {
+            'group': 'macos-preflight-${{ github.event.pull_request.number || inputs.ref || github.ref }}',
+            'cancel-in-progress': True})
+        self.assertNotIn('concurrency', data['jobs']['runner-route'])
 
     def test_preflight_check_name_is_distinct_from_required_contexts(self):
         # A same-named check would let a preflight run stand in for (or block
@@ -106,6 +117,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(pre['Configure the self-hosted compiler cache'].get('env'),
                          queue['Configure the self-hosted compiler cache'].get('env'))
         self.assertIn('-D warnings', pre['Clippy (target-gated code)']['run'])
+
+        def toolchain(steps):
+            return next(s for s in steps if str(s.get('uses', '')).startswith('dtolnay/rust-toolchain@'))
+
+        queue_tc = toolchain(build['steps'])
+        pre_tc = toolchain(workflow('macos-preflight.yml')['jobs']['preflight']['steps'])
+        self.assertEqual(pre_tc['uses'], queue_tc['uses'])
+        self.assertEqual(pre_tc['with'], {k: v.replace('${{ matrix.target }}', target) for k, v in queue_tc['with'].items()})
         job_env = workflow('macos-preflight.yml')['jobs']['preflight']['env']
         for key, value in build['env'].items():
             self.assertEqual(job_env[key], value)

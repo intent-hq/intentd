@@ -31,11 +31,6 @@ on:
 permissions:
   contents: read
 
-# One run per PR (or dispatched ref): a new push supersedes the running check.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.ref || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   # Routing runs only when the preflight will: unlabeled PRs skip the whole
   # workflow at once, and fork PRs get no CI (see ci.yml's `pull_request`).
@@ -53,8 +48,18 @@ jobs:
   preflight:
     name: macOS preflight (aarch64-apple-darwin)
     needs: [runner-route]
+    # Runs whenever routing ran (only after an opt-in), even if routing failed:
+    # runs-on then falls back to WarpBuild, as ci.yml's `build` does.
+    if: ${{ !cancelled() && needs.runner-route.result != 'skipped' }}
+    # Job-level, not workflow-level: GitHub enters a workflow's group when the
+    # run is created, so adding an unrelated label would start a run that
+    # cancels the preflight in progress and then skips itself. A skipped job
+    # never joins this group; a new push to the PR does supersede the run.
+    concurrency:
+      group: macos-preflight-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+      cancel-in-progress: true
     # The idle self-hosted Apple Silicon runner (m1mac) when routing finds one,
-    # else WarpBuild's macOS runner, exactly as ci.yml's `build` job.
+    # else WarpBuild's macOS runner, as ci.yml's `build` job.
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['macos-26-xlarge'] || fromJSON('["warp-macos-26-arm64-6x"]') }}
     timeout-minutes: 60
     env:
