@@ -597,6 +597,15 @@ async fn start_backend(
     data_dir: &Path,
     repo: &Path,
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
+    start_backend_with(data_dir, repo, &[]).await
+}
+
+/// [`start_backend`] with extra environment for the backend process.
+async fn start_backend_with(
+    data_dir: &Path,
+    repo: &Path,
+    env: &[(&str, &str)],
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace(data_dir, repo).await;
     common::enable_ws_api(data_dir);
@@ -606,6 +615,7 @@ async fn start_backend(
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("head.log")).unwrap(),
@@ -845,4 +855,249 @@ async fn placement_chooses_among_exposed_machines() {
             .is_some_and(|notice| notice.contains("Machine B")),
         "{placed}"
     );
+}
+
+/// The `agent.pid` file the fixture provider wrote in `agent_id`'s worktree
+/// under the machine's data dir `root`.
+fn find_agent_pid_file(root: &Path, agent_id: &str) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && !kind.is_symlink() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|n| n == "agent.pid")
+                && path.to_string_lossy().contains(agent_id)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn pid_alive(pid: i64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// intent-hq/intent#8426: `agent.delete` on a running remote agent stops
+/// its runtime on the machine — the provider process exits and the agent
+/// no longer counts against the machine's capacity, on head
+/// (`remoteMachines.list`) and on the machine (`executor.list`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_remote_agent_stops_it_on_the_machine() {
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping remote delete e2e: node not on PATH");
+        return;
+    }
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping remote delete e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-rdel-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    ok(
+        &mut rpc_ws,
+        1,
+        "client.hello",
+        json!({ "clientId": "remote-delete-e2e", "name": "Remote delete E2E" }),
+    )
+    .await;
+    let backend = ok(&mut rpc_ws, 2, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        3,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut machine_ws = connect(machine.port, client_config(&machine.fingerprint)).await;
+
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id,
+        "name": "Remote",
+        "model": "default",
+        "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert_eq!(
+            response["error"]["data"]["code"], "placement-unavailable",
+            "{response}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+
+    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 100).await;
+    assert!(reply.contains("echo:"), "{reply}");
+
+    let head_running = |listed: &Value| listed["machines"][0]["runningAgents"].clone();
+    let machine_running = |listed: &Value| listed["backends"][0]["runningAgents"].clone();
+    let listed = ok(&mut rpc_ws, 110, "remoteMachines.list", json!({})).await;
+    assert_eq!(head_running(&listed), 1, "{listed}");
+    let listed = ok(&mut machine_ws, 111, "executor.list", json!({})).await;
+    assert_eq!(machine_running(&listed), 1, "{listed}");
+    let pid_file = find_agent_pid_file(&node_dir, &agent_id)
+        .unwrap_or_else(|| panic!("the fixture's agent.pid for {agent_id} on the machine"));
+    let pids: Value = serde_json::from_str(&std::fs::read_to_string(&pid_file).unwrap()).unwrap();
+    let (provider_pid, child_pid) = (
+        pids["agent"].as_i64().unwrap(),
+        pids["child"].as_i64().unwrap(),
+    );
+    assert!(
+        pid_alive(provider_pid),
+        "the provider runs before the delete"
+    );
+
+    ok(
+        &mut rpc_ws,
+        120,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+
+    let mut id = 200;
+    timeout(wait(), async {
+        loop {
+            id += 2;
+            let head = ok(&mut rpc_ws, id, "remoteMachines.list", json!({})).await;
+            let node = ok(&mut machine_ws, id + 1, "executor.list", json!({})).await;
+            if head_running(&head) == 0
+                && machine_running(&node) == 0
+                && !pid_alive(provider_pid)
+                && !pid_alive(child_pid)
+            {
+                return;
+            }
+            // timing-guard: poll interval for the machine to tear the agent down (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("agent.delete stops the remote agent and frees its slot on the machine");
+}
+
+/// intent-hq/intent#8426, local half: `agent.delete` on a running local
+/// agent stops its provider process tree before the rows go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_local_agent_stops_its_provider() {
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping local delete e2e: node not on PATH");
+        return;
+    }
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping local delete e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-ldel-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &scratch.path().join("head"),
+        &repo,
+        &[("MOCK_AGENT_SCRIPT_PATH", fixture.as_str())],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let created = ok(
+        &mut rpc_ws,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Local", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 10).await;
+
+    let pid_file = repo.join("agent.pid");
+    let pids: Value = serde_json::from_str(
+        &std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|e| panic!("the fixture's agent.pid at {}: {e}", pid_file.display())),
+    )
+    .unwrap();
+    let (provider_pid, child_pid) = (
+        pids["agent"].as_i64().unwrap(),
+        pids["child"].as_i64().unwrap(),
+    );
+    assert!(
+        pid_alive(provider_pid),
+        "the provider runs before the delete"
+    );
+
+    ok(
+        &mut rpc_ws,
+        20,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    timeout(wait(), async {
+        while pid_alive(provider_pid) || pid_alive(child_pid) {
+            // timing-guard: poll interval for the provider tree to exit (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("agent.delete stops the local agent's provider process tree");
 }
