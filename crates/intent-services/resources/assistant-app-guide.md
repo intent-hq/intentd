@@ -910,9 +910,10 @@ Intent runs its own bundled copy of that CLI instead, downloading it with npm on
 first use. Sessions keep using the installed CLI's sign-in and settings. The host
 owner sees a warning that Intent is using its bundled CLI (older apps show
 **CLI is out of date**). Updating the installed CLI makes Intent switch back to
-it. For Codex, **Update** runs `codex update` in a terminal on the daemon host;
-follow its output until it finishes. If the button is missing or the command
-fails, update the CLI with the tool that installed it. If the bundled download
+it. **Update** runs `codex update` or `claude update` in a terminal on the
+daemon host; follow its output until it finishes. If the button is missing or
+the command fails or prints another upgrade command, update the CLI with the
+tool that installed it. If the bundled download
 fails (for example, offline or without npm), Codex launches report the
 installed version, the required minimum, and the download error; Claude Code
 keeps using the installed CLI.
