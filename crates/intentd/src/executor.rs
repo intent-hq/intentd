@@ -214,9 +214,16 @@ impl ExecutorService {
         for task in tasks {
             let _ = task.await;
         }
-        let backends: Vec<Backend> = lock(&self.backends).drain().map(|(_, b)| b).collect();
+        // Together, so the whole stop takes one drain, not one per backend.
+        let backends: Vec<_> = lock(&self.backends)
+            .drain()
+            .map(|(_, backend)| {
+                // caller-binding: allow — stops one backend's agents; shutdown joins it
+                tokio::spawn(stop_backend_for_shutdown(backend))
+            })
+            .collect();
         for backend in backends {
-            stop_backend_for_shutdown(backend).await;
+            let _ = backend.await;
         }
         let stopping = std::mem::take(&mut *lock(&self.stopping));
         for task in stopping {

@@ -2023,3 +2023,22 @@ async fn node_runner_prepends_the_checkout_notice_to_the_first_turn_only() {
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "exit", exited("a1")).await;
 }
+
+/// A push while the daemon is stopping is the agent's last one, bounded like
+/// a final stop's (intent-hq/intent#8437).
+#[tokio::test]
+async fn node_runner_shutdown_pushes_within_the_final_bound() {
+    use crate::executor::checkout::FINAL_PUSH_TIMEOUT;
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.shutdown().await;
+    assert_eq!(
+        h.checkouts.pushes.lock().unwrap().as_slice(),
+        &[AgentId::from("a1")]
+    );
+    assert_eq!(
+        h.checkouts.push_timeouts.lock().unwrap().last(),
+        Some(&FINAL_PUSH_TIMEOUT)
+    );
+}

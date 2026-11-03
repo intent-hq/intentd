@@ -238,6 +238,12 @@ pub struct SupervisorConfig {
     pub kill_timeout: Duration,
 }
 
+/// The default [`SupervisorConfig::kill_timeout`]. A stopping daemon first
+/// stops the remote agents it runs for backends, each one's last work pushed
+/// within a bound (intentd's executor shutdown drain, 75 s); this leaves room
+/// for that and the rest of its shutdown (intent-hq/intent#8437).
+pub const DEFAULT_KILL_TIMEOUT: Duration = Duration::from_secs(90);
+
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
@@ -260,7 +266,7 @@ impl Default for SupervisorConfig {
             // `backoff_reset_after` clears the count, so a daemon that works
             // at all can never trip it.
             give_up_after_failures: 10,
-            kill_timeout: Duration::from_secs(30),
+            kill_timeout: DEFAULT_KILL_TIMEOUT,
         }
     }
 }
@@ -2061,7 +2067,7 @@ mod tests {
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
         assert_eq!(config.give_up_after_failures, 10);
-        assert_eq!(config.kill_timeout, Duration::from_secs(30));
+        assert_eq!(config.kill_timeout, Duration::from_secs(90));
         // Stable's local tick: about hourly, with jitter either side.
         assert_eq!(config.tick_min, Duration::from_secs(50 * 60));
         assert_eq!(config.tick_max, Duration::from_secs(70 * 60));

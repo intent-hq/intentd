@@ -73,9 +73,18 @@ const TRACK_INTERVAL: Duration = Duration::from_secs(1);
 /// its helpers (which inherit it) can be found after the provider exits,
 /// wherever they were reparented to.
 const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
-/// How long shutdown waits for stopped agents to be cleaned up and their
-/// queued records (each one fsync'd) to be journaled.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// How long shutdown waits for stopped agents to push their last work
+/// (each push bounded by [`FINAL_PUSH_TIMEOUT`]), be cleaned up and have
+/// their queued records (each one fsync'd) journaled.
+pub(super) const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
+
+// A shutdown push gets its whole bound inside the drain, and the drain ends
+// well before the sitter force-kills a stopping daemon, so a push is never
+// killed midway (intent-hq/intent#8437).
+const _: () = assert!(SHUTDOWN_WAIT.as_secs() > FINAL_PUSH_TIMEOUT.as_secs());
+const _: () = assert!(
+    SHUTDOWN_WAIT.as_secs() + 10 <= intentd_sitter::supervisor::DEFAULT_KILL_TIMEOUT.as_secs()
+);
 
 /// How this machine launches a provider: its registry entry, the executable
 /// a local agent of it would spawn (or the npx package), and extra
@@ -1659,9 +1668,7 @@ impl Runner {
         for id in running {
             self.stop(&id);
         }
-        // Each stopped agent pushes its work before it is cleaned up, so the
-        // wait also covers that push's bound.
-        let drained = tokio::time::timeout(SHUTDOWN_WAIT + FINAL_PUSH_TIMEOUT, async {
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
             // A launch admitted just before closing may register its pump
             // after a take, so keep draining until nothing is left.
             loop {
