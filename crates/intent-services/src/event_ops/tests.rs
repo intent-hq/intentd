@@ -201,7 +201,7 @@ fn bound_event_rows_under_budget_untouched() {
 /// every row survives, and trimmed rows carry observable markers.
 #[test]
 fn bound_event_rows_over_budget_trims_and_marks() {
-    // 60 rows × ~30 KiB ≈ 1.8 MiB — well past the 700 KiB budget.
+    // 60 rows × ~30 KiB ≈ 1.8 MiB — well past the 480,000-byte budget.
     let mut rows: Vec<Value> = (0..60).map(|i| big_row(i, 30 * 1024)).collect();
     assert!(total_size(&rows) > EVENT_QUERY_RESPONSE_BUDGET_BYTES);
     let trimmed = bound_event_rows(&mut rows);

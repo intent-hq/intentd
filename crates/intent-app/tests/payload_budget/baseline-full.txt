@@ -20,10 +20,6 @@ chat.subscribe sinceMessageId 527206
 comment.list max 6888946
 comment.subscribe default 6888982
 crossWorkspace.readNote default 2592438
-discussion.list afterSequence 745698
-discussion.list beforeSequence 745781
-discussion.list limit=100 745805
-event.query default 683217
 git.branchDiff baseCommitSha 819758
 git.branchDiff baseRef 1639071
 git.diffs default 3368715
@@ -81,11 +77,6 @@ rules.list workspace 1255793
 script.list default 1404390
 script.list view=full 1404390
 script.output maxLines=100000 779996
-search.events default 22733818
-search.inFiles default 2758060
-search.inFiles max 4347229
-search.messages agent+role 971726
-search.messages default 14764061
 search.notes default 1369857
 search.notes max 682175
 skill.list default 1173851
