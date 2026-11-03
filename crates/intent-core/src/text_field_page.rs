@@ -13,6 +13,10 @@ fn json_escaped_len(c: char) -> usize {
     }
 }
 
+/// Smallest JSON-escaped size of one field part, even when the row's other
+/// fields leave less room than this under the budget.
+pub const MIN_PART_JSON_BYTES: usize = 64 * 1024;
+
 fn json_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(0, |v| v.len())
 }
@@ -78,7 +82,14 @@ pub fn page_text_field(
     obj.insert(markers[1].clone(), json!(full));
     obj.insert(markers[2].clone(), json!(offset));
     obj.insert(markers[3].clone(), json!(full));
-    let room = budget.saturating_sub(json_len(&Value::Object(obj.clone())));
+    // When the row's other fields already fill the budget (only possible for
+    // rows saved before the write-time caps), still serve a sensible part so
+    // the field is read in a bounded number of requests rather than one
+    // character at a time. Such a reply exceeds `budget` by at most the
+    // other fields' own overshoot plus this minimum.
+    let room = budget
+        .saturating_sub(json_len(&Value::Object(obj.clone())))
+        .max(MIN_PART_JSON_BYTES);
     let rest = &full_text[offset..];
     let mut part = prefix_within_json_bytes(rest, room);
     if part.is_empty() {
@@ -130,6 +141,38 @@ mod tests {
         let command = format!("{}é😀{}", "\"".repeat(250_001), "\\é".repeat(200_000));
         let row = json!({ "id": "s1", "name": "big", "command": command });
         assert_eq!(rebuild(&row), command);
+    }
+
+    /// A row whose other fields already exceed the budget (a legacy env)
+    /// still gets parts of at least `MIN_PART_JSON_BYTES`, so the field is
+    /// read in a handful of requests, not one per character.
+    #[test]
+    fn over_budget_other_fields_still_get_a_minimum_part() {
+        let command = format!("{}é", "a".repeat(300_000));
+        let row = json!({ "id": "s1", "env": { "K": "v".repeat(500_000) }, "command": command });
+        let mut first = row.clone();
+        page_text_field(&mut first, "command", 0, BUDGET).unwrap();
+        let first_len = first["command"].as_str().unwrap().len();
+        assert!(
+            first_len >= MIN_PART_JSON_BYTES - 8,
+            "first part is {first_len} bytes"
+        );
+
+        let mut out = String::new();
+        let mut offset = 0;
+        let mut parts = 0;
+        loop {
+            let mut part = row.clone();
+            page_text_field(&mut part, "command", offset, BUDGET).unwrap();
+            parts += 1;
+            assert!(parts <= 6, "too many parts");
+            out.push_str(part["command"].as_str().unwrap());
+            match part["nextCommandOffset"].as_u64() {
+                Some(next) => offset = usize::try_from(next).unwrap(),
+                None => break,
+            }
+        }
+        assert_eq!(out, command);
     }
 
     #[test]

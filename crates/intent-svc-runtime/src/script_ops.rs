@@ -452,11 +452,23 @@ pub(crate) const SCRIPT_ENV_MAX_BYTES: usize = 64 * 1024;
 /// Write-time size caps for a script definition. Rows saved before the caps
 /// existed are not rewritten; reads keep serving them as stored.
 fn check_script_field_sizes(params: &ScriptCreateParams) -> Result<()> {
-    let text_fields = [
-        ("name", Some(params.name.as_str())),
-        ("cwd", params.cwd.as_deref()),
-        ("category", params.category.as_deref()),
-    ];
+    check_script_fields(
+        &params.name,
+        params.cwd.as_deref(),
+        params.category.as_deref(),
+        params.env.as_ref(),
+    )
+}
+
+/// The caps behind [`check_script_field_sizes`], shared with repo-config
+/// seeding (which builds rows directly instead of going through create).
+fn check_script_fields(
+    name: &str,
+    cwd: Option<&str>,
+    category: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<()> {
+    let text_fields = [("name", Some(name)), ("cwd", cwd), ("category", category)];
     for (field, value) in text_fields {
         let bytes = value.map_or(0, str::len);
         if bytes > SCRIPT_TEXT_FIELD_MAX_BYTES {
@@ -466,9 +478,8 @@ fn check_script_field_sizes(params: &ScriptCreateParams) -> Result<()> {
             )));
         }
     }
-    let env_bytes: usize = params
-        .env
-        .iter()
+    let env_bytes: usize = env
+        .into_iter()
         .flatten()
         .map(|(key, value)| key.len() + value.len())
         .sum();
@@ -1399,6 +1410,27 @@ impl ScriptManager {
                             let now = now_iso();
                             let scripts: Vec<Script> = repo_scripts
                                 .into_iter()
+                                // Repo config is user-supplied: apply the same
+                                // save-time caps, skipping (not failing on) an
+                                // over-cap entry so the others still seed.
+                                .filter(|repo_script| {
+                                    match check_script_fields(
+                                        &repo_script.name,
+                                        repo_script.cwd.as_deref(),
+                                        None,
+                                        repo_script.env.as_ref(),
+                                    ) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                workspace = %workspace_id,
+                                                error = %e,
+                                                "skipping repo-config script over the field size limit"
+                                            );
+                                            false
+                                        }
+                                    }
+                                })
                                 .map(|repo_script| Script {
                                     purpose: intent_core::ScriptPurpose::Saved,
                                     archived_at: None,

@@ -38,11 +38,20 @@ pub(crate) const PRELUDE: &str = r"
                 let code = first.code;
                 let next = first.nextCodeOffset;
                 let changed = false;
+                // Parts are at least 64 KiB of JSON, so 4096 parts covers any
+                // code the daemon accepts; more, or a part that does not move
+                // forward, means the result can never complete.
+                let parts = 1;
                 while (next !== null && next !== undefined) {
+                    if (++parts > 4096) throw new Error(`hook.get: code for ${hookId} is incomplete`);
                     const part = await host({ method: 'hook.get', args: { hookId, codeOffset: next } });
                     if (part.codeBytes !== size || part.codeOffset !== next) { changed = true; break; }
                     code += part.code;
-                    next = part.nextCodeOffset;
+                    const after = part.nextCodeOffset;
+                    if (after !== null && after !== undefined && !(after > next)) {
+                        throw new Error(`hook.get: code for ${hookId} is incomplete`);
+                    }
+                    next = after;
                 }
                 if (changed) continue;
                 let bytes = 0;
