@@ -586,3 +586,61 @@ async fn machine_run_output_replies_are_bounded() {
         assert!(text.contains("older output omitted"), "{label}");
     }
 }
+
+/// Review of intentd#3005: output without a newline (a progress bar, `yes |
+/// tr -d '\n'`) keeps the run's output bounded instead of growing an
+/// unfinished line without limit.
+#[tokio::test]
+async fn output_without_newlines_stays_bounded() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    let chunk = "y".repeat(64 * 1024);
+    for seq in 0..20 {
+        frame(&runs, output(&start, seq, &chunk)).await;
+    }
+    let kept = runs.output(&place(&agent)).unwrap();
+    assert!(
+        kept.len() <= 512 * 1024 + 64 * 1024,
+        "kept {} bytes of 1.25 MiB without a newline",
+        kept.len()
+    );
+}
+
+/// Review of intentd#3005: monitors match lines as the home run's do (one
+/// line kept up to the shared decoder's bound, an oversized line counts but
+/// cannot match), so a wake never carries a huge line.
+#[tokio::test]
+async fn a_monitor_wake_never_carries_a_huge_line() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    runs.monitor(
+        &place(&agent),
+        &serde_json::json!({ "ttlMs": 60000, "outputPattern": "needle" }),
+    )
+    .unwrap();
+    let huge = format!("{}needle{}\n", "a".repeat(200_000), "b".repeat(200_000));
+    frame(&runs, output(&start, 0, &huge)).await;
+    frame(&runs, output(&start, 1, "short needle\n")).await;
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "one wake");
+    assert!(
+        wakes[0].1.len() <= 4096 + 512,
+        "wake text is {} bytes",
+        wakes[0].1.len()
+    );
+    assert!(
+        wakes[0].1.contains("short needle"),
+        "{}",
+        &wakes[0].1[..200.min(wakes[0].1.len())]
+    );
+}

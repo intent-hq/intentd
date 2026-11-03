@@ -73,6 +73,8 @@ struct Monitor {
     id: String,
     run_id: Option<String>,
     pattern: Option<regex::Regex>,
+    /// Splits the run's output into lines as the home run's monitors do.
+    decoder: intent_core::script_output::LineDecoder,
     expires: tokio::time::Instant,
     created_at: String,
     expires_at: String,
@@ -530,18 +532,33 @@ impl MachineRuns {
             let Some(run) = runs.get_mut(place) else {
                 return;
             };
-            run.partial.push_str(data);
+            // Monitors see lines as the home run's do: the shared decoder
+            // keeps one line up to its bound, and an oversized line counts
+            // but cannot match, so a wake never carries a huge line.
             let mut matched = None;
-            while let Some(end) = run.partial.find('\n') {
-                let line: String = run.partial.drain(..=end).collect();
-                if matched.is_none() {
-                    if let Some(monitor) = &run.monitor {
-                        if monitor.pattern.as_ref().is_some_and(|p| p.is_match(&line)) {
-                            matched = Some(line.trim_end().to_owned());
+            if let Some(monitor) = &mut run.monitor {
+                for byte in data.bytes() {
+                    if let Some(line) = monitor.decoder.push(byte) {
+                        if let Some(text) = line.text.filter(|text| {
+                            monitor.pattern.as_ref().is_some_and(|p| p.is_match(text))
+                        }) {
+                            matched = Some(text);
+                            break;
                         }
                     }
                 }
-                run.output.push_str(&line);
+            }
+            run.partial.push_str(data);
+            if let Some(end) = run.partial.rfind('\n') {
+                let complete: String = run.partial.drain(..=end).collect();
+                run.output.push_str(&complete);
+            }
+            // An unfinished line that would take the run past the keep
+            // bound (output without newlines) joins the kept output, which is
+            // trimmed to the bound; `output()` reads both as one text.
+            if run.output.len() + run.partial.len() > OUTPUT_KEEP_BYTES {
+                let unfinished = std::mem::take(&mut run.partial);
+                run.output.push_str(&unfinished);
             }
             if run.output.len() > OUTPUT_KEEP_BYTES {
                 run.output = tail(&run.output, OUTPUT_KEEP_BYTES).to_owned();
@@ -876,10 +893,17 @@ impl MachineRuns {
         let ttl = Duration::from_millis(u64::try_from(options.ttl).unwrap_or(0));
         let created = chrono::Utc::now();
         let expires = created + chrono::Duration::from_std(ttl).unwrap_or_default();
+        // A line already under way when the monitor starts is not joined:
+        // matching begins at the next line, as for a home-run monitor.
+        let mut decoder = intent_core::script_output::LineDecoder::new(true);
+        if !run.partial.is_empty() {
+            decoder.gap();
+        }
         let monitor = Monitor {
             id: new_id(),
             run_id: run.state.run_id.clone(),
             pattern: options.pattern,
+            decoder,
             expires: tokio::time::Instant::now() + ttl,
             created_at: created.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             expires_at: expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
