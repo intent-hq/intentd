@@ -224,7 +224,10 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
         }]
     );
     let ws = result.workspace.id;
-    assert_eq!(remote.base_commits.lock().unwrap().clone(), [ws.clone()]);
+    assert_eq!(
+        remote.base_commits.lock().unwrap().as_slice(),
+        std::slice::from_ref(&ws)
+    );
     let launched = remote.launched.lock().unwrap().clone();
     assert_eq!(launched.len(), 1);
     assert_eq!(launched[0].workspace_id, ws);
@@ -452,4 +455,49 @@ fn the_initial_agent_placement_wire_shape_is_closed() {
     );
     assert!(parse(json!({ "placement": null })).is_err());
     assert!(parse(json!({ "placement": {"target": "remote", "bogus": 1} })).is_err());
+}
+
+/// The first message of a remote agent cannot carry attachments, so a
+/// placed initial agent with images or files (top-level or under
+/// `metadata`) is refused before anything is created; empty arrays are
+/// no attachments.
+#[intent_test_macros::daemon_test]
+async fn a_placed_initial_agent_with_attachments_creates_nothing() {
+    let remote = Arc::new(FakeRemote::default());
+    let fx = fixture(Some(remote.clone())).await;
+    let image = json!([{ "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo=" }]);
+    for agent in [
+        json!({ "prompt": "look", "imageBlocks": image, "placement": {"target": "remote"} }),
+        json!({
+            "prompt": "look",
+            "metadata": { "imageBlocks": image },
+            "placement": {"target": "remote"},
+        }),
+    ] {
+        let result = fx.svc.create_workspace(request(&fx, agent), None).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.contains("attachments are not supported on remote agents")),
+            "{result:?}"
+        );
+    }
+    assert!(remote.needs.lock().unwrap().is_empty());
+    assert_nothing_created(&fx).await;
+
+    let result = fx
+        .svc
+        .create_workspace(
+            request(
+                &fx,
+                json!({
+                    "prompt": "look",
+                    "imageBlocks": [],
+                    "fileBlocks": [],
+                    "placement": {"target": "remote"},
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect("empty attachment arrays are no attachments");
+    assert_eq!(result.initial_agent.unwrap()["nodeId"], "node-1");
 }

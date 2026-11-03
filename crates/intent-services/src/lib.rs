@@ -24317,13 +24317,8 @@ impl WorkspaceApi for Services {
                     error = %failure.message,
                     "workspace.create: the initial agent could not start on its machine"
                 );
-                return Err(Error::RemoteMachine(Box::new(
-                    intent_core::ProviderProfileFailure {
-                        internal: true,
-                        message: failure.message,
-                        data: failure.data,
-                    },
-                )));
+                let intent_core::InitialAgentLaunchFailure { message, data } = failure;
+                return Err(Error::remote_machine(true, message, data));
             }
             Ok(result)
         })

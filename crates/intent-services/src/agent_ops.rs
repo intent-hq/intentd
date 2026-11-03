@@ -3064,15 +3064,26 @@ pub(crate) fn reject_remote_attachments(
     image_blocks: Option<&Value>,
     file_blocks: Option<&Value>,
 ) -> Result<()> {
+    if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+        .is_some()
+    {
+        return reject_attachments_on_remote(image_blocks, file_blocks);
+    }
+    Ok(())
+}
+
+/// The attachment refusal for an agent that runs on another machine: any
+/// non-empty image or file blocks are `-32602`.
+pub(crate) fn reject_attachments_on_remote(
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Result<()> {
     let carries = |blocks: Option<&Value>| match blocks {
         None | Some(Value::Null) => false,
         Some(Value::Array(items)) => !items.is_empty(),
         Some(_) => true,
     };
-    if (carries(image_blocks) || carries(file_blocks))
-        && intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
-            .is_some()
-    {
+    if carries(image_blocks) || carries(file_blocks) {
         return Err(Error::InvalidParams(format!(
             "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
             intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
@@ -5678,6 +5689,9 @@ impl Services {
         let Some(placement) = plan.placement.take() else {
             return Ok(());
         };
+        // The first message would be refused on the machine after the
+        // workspace exists, so its attachments are refused here instead.
+        reject_attachments_on_remote(plan.image_blocks.as_ref(), plan.file_blocks.as_ref())?;
         let needs = self
             .remote_launch_needs(&plan.provider, plan.model.as_deref(), &placement)
             .await?;
