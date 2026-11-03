@@ -514,6 +514,9 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("note".to_string()));
             }
             let mut note = sample_note(&workspace_id);
+            if note_id.as_str() == "huge" {
+                note.content = "x".repeat(600 * 1024);
+            }
             note.id = note_id;
             Ok(note)
         })
@@ -2016,9 +2019,13 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: intent_core::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({
+                "window": [window.start_line, window.max_lines, window.start_offset],
+                "boundedDefault": bounded_default,
                 "id": note_id.as_str(), "title": "t", "content": "c",
                 "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
                 "sourceWorkspaceTitle": "T", "branch": "b", "lineCount": 1,
@@ -4177,14 +4184,139 @@ async fn note_add_returns_bare_result_object() {
 }
 
 #[tokio::test]
-async fn note_list_tasks_returns_bare_array() {
+async fn note_list_tasks_returns_a_page() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
     )
     .await
     .unwrap();
-    assert!(v["result"].is_array());
-    assert_eq!(v["result"][0]["status"], serde_json::json!("todo"));
+    assert!(v["result"]["tasks"].is_array());
+    assert_eq!(v["result"]["tasks"][0]["status"], serde_json::json!("todo"));
+    assert_eq!(v["result"]["nextToken"], Value::Null);
+}
+
+/// Bounded reads write guard: a whole-content write to a note whose default
+/// read is cut needs `baseContentBytes`; small notes and guarded writes pass.
+#[tokio::test]
+async fn whole_content_writes_to_a_cut_note_need_base_content_bytes() {
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.setContent","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{msg}: {v}");
+        assert_eq!(v["error"]["data"]["code"], "content-base-required", "{msg}");
+        assert_eq!(v["error"]["data"]["contentBytes"], 600 * 1024, "{msg}");
+    }
+    // A metadata-only update and a write to a small note are not guarded.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","title":"T"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"n1","content":"short"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+}
+
+/// A default `note.get` of a note over the read budget is cut with the
+/// truncated-read markers.
+#[tokio::test]
+async fn note_get_cuts_a_note_over_the_budget() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"huge"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["note"]["contentTruncated"], true, "{v}");
+    assert_eq!(v["result"]["note"]["contentBytes"], 600 * 1024);
+    assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+}
+
+/// The cut `note.get` row carries `nextContentOffset`; following it with
+/// `contentOffset` reads the rest, so the whole note is recoverable.
+#[tokio::test]
+async fn note_get_content_cursor_reads_the_rest_of_a_cut_note() {
+    let mut content = String::new();
+    let mut offset: Option<u64> = None;
+    for _ in 0..10 {
+        let params = match offset {
+            Some(o) => format!(r#""workspaceId":"ws-1","noteId":"huge","contentOffset":{o}"#),
+            None => r#""workspaceId":"ws-1","noteId":"huge""#.to_string(),
+        };
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{{params}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        let note = &v["result"]["note"];
+        assert_eq!(
+            note["contentOffset"].as_u64(),
+            Some(offset.unwrap_or(0)),
+            "{v}"
+        );
+        content.push_str(note["content"].as_str().unwrap());
+        match note["nextContentOffset"].as_u64() {
+            Some(next) => offset = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(content, "x".repeat(600 * 1024));
+}
+
+/// A `contentOffset` that is not a positive integer inside the content is
+/// `-32602`.
+#[tokio::test]
+async fn note_get_rejects_a_bad_content_offset() {
+    for bad in ["0", "-1", "\"5\"", "614400", "999999999"] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{"workspaceId":"ws-1","noteId":"huge","contentOffset":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "contentOffset={bad}: {v}");
+    }
+}
+
+/// Bounded reads (§5.2): list reads page by default; `limit` must be a
+/// positive integer, `nextToken` a non-empty string minted for this list.
+#[tokio::test]
+async fn list_reads_validate_paging_params() {
+    for method in [
+        r#""note.list","params":{"workspaceId":"ws-1""#,
+        r#""note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1""#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":{method}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(v["result"]["nextToken"], Value::Null, "{method}: {v}");
+        for (param, message) in [
+            (r#""limit":0"#, "limit must be a positive integer"),
+            (r#""limit":"5""#, "limit must be a positive integer"),
+            (r#""nextToken":"""#, "nextToken must be a non-empty string"),
+            (r#""nextToken":7"#, "nextToken must be a non-empty string"),
+            (r#""nextToken":"garbage""#, "invalid nextToken"),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":{method},{param}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {param}: {v}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(message),
+                "{method} {param}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -6705,6 +6837,29 @@ async fn cross_workspace_methods_require_params() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
+
+    // readNote line window: positive integers flow through; others → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","startLine":3,"maxLines":20,"startOffset":7}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["window"], serde_json::json!([3, 20, 7]));
+    assert_eq!(v["result"]["boundedDefault"], serde_json::json!(true));
+    for bad in ["0", "-1", "1.5", "\"2\"", "true"] {
+        for key in ["startLine", "maxLines", "startOffset"] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","{key}":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{key}={bad}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(format!("{key} must be a positive integer"))
+            );
+        }
+    }
 }
 
 #[tokio::test]

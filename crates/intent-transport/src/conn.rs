@@ -1094,7 +1094,11 @@ async fn process_captured_frame(
                 &method,
                 rpc_id.clone(),
                 out_tx,
-                handle_sub_fast_path(sub, api, bus, out_tx, subs),
+                // Boxed off this frame: `process_captured_frame` sits close to
+                // the default test stack (see `crate::stack_frame`).
+                crate::stack_frame::boxed_await(|| {
+                    handle_sub_fast_path(sub, api, bus, out_tx, subs)
+                }),
             )
             .await;
         }
@@ -1713,6 +1717,7 @@ pub(crate) async fn handle_sub_fast_path(
                     replace_group,
                     projection,
                     max_content_bytes,
+                    snapshot_limit,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1757,6 +1762,7 @@ pub(crate) async fn handle_sub_fast_path(
                     WorkspaceId::from(workspace_id),
                     projection,
                     max_content_bytes,
+                    snapshot_limit,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -1785,6 +1791,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     note_id,
                     replace_group,
+                    snapshot_limit: _,
                 } = p;
                 let timer =
                     subscriptions::SnapshotTimer::start(Channel::NotePresence, &workspace_id);
@@ -1979,6 +1986,7 @@ pub(crate) async fn handle_sub_fast_path(
                     note_id,
                     replace_group,
                     include_retired,
+                    snapshot_limit,
                 }) => {
                     // Time the request-to-snapshot interval (intent-hq/intent#3707),
                     // started before the replace-group cleanup so a costly
@@ -2031,6 +2039,7 @@ pub(crate) async fn handle_sub_fast_path(
                         out_tx.clone(),
                         timer,
                         include_retired,
+                        snapshot_limit,
                     ));
                     subs.insert(subscription_id, handle, replace_group, None);
                     true
@@ -2177,33 +2186,35 @@ async fn forward_note_subscription(
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
     max_content_bytes: Option<usize>,
+    snapshot_limit: usize,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
 ) {
-    let snapshot = match api.list_notes(&workspace_id).await {
-        Ok(notes) => match projection {
-            Some(intent_core::NoteListProjection::Slim) => Value::Array(
-                notes
-                    .into_iter()
-                    .map(intent_core::note_list_slim_row)
-                    .collect(),
-            ),
-            None => match max_content_bytes {
-                Some(limit) => Value::Array(
-                    notes
-                        .into_iter()
-                        .map(|note| intent_core::note_bounded_row(note, limit))
-                        .collect(),
-                ),
-                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
-            },
-        },
-        Err(_) => Value::Array(Vec::new()),
-    };
-    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    let notes = api.list_notes(&workspace_id).await.unwrap_or_default();
+    let page = intent_core::note_read_bounds::PageRequest::new(
+        Some(snapshot_limit),
+        snapshot_limit,
+        snapshot_limit,
+        None,
+    );
+    let (rows, next) = intent_core::note_read_bounds::note_list_page(
+        notes,
+        workspace_id.as_str(),
+        projection,
+        max_content_bytes,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .unwrap_or_default();
+    let frame = subscriptions::build_paged_snapshot_push(
+        &subscription_id,
+        0,
+        &Value::Array(rows),
+        next.as_deref(),
+    );
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
@@ -2867,6 +2878,9 @@ struct ChannelParams {
     replace_group: Option<String>,
     /// `workspace.subscribe { includeRetired }`; always `false` elsewhere.
     include_retired: bool,
+    /// `comment.subscribe` snapshot page size (bounded reads); `None`
+    /// elsewhere and for an unpaged snapshot.
+    snapshot_limit: Option<usize>,
 }
 
 /// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
@@ -2883,6 +2897,7 @@ fn parse_channel_params(
                 note_id: None,
                 replace_group: p.replace_group,
                 include_retired: p.include_retired,
+                snapshot_limit: None,
             })
         }
         Channel::Comment => {
@@ -2892,6 +2907,7 @@ fn parse_channel_params(
                 note_id: Some(p.note_id),
                 replace_group: p.replace_group,
                 include_retired: false,
+                snapshot_limit: Some(p.snapshot_limit),
             })
         }
         // `note`/`task`/`agent` are all workspace-scoped collections.
@@ -2902,6 +2918,7 @@ fn parse_channel_params(
                 note_id: None,
                 replace_group: p.replace_group,
                 include_retired: false,
+                snapshot_limit: None,
             })
         }
     }
@@ -2966,6 +2983,7 @@ async fn forward_channel_subscription(
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
     include_retired: bool,
+    snapshot_limit: Option<usize>,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
@@ -3002,6 +3020,11 @@ async fn forward_channel_subscription(
         } else {
             read.await
         }
+    } else if let (Channel::Comment, Some(limit), Some(note)) =
+        (channel, snapshot_limit, note_id.as_ref())
+    {
+        // Bounded reads: the comment snapshot is the first thread page.
+        Some(subscriptions::comment_snapshot_page(api.as_ref(), &workspace_id, note, limit).await)
     } else {
         None
     };

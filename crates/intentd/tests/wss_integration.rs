@@ -16305,8 +16305,9 @@ async fn wss_note_version_history_round_trip() {
 /// `note.list` frame past the 1 MiB outbound warn threshold.
 /// `projection: "slim"` (§5.2, v8.1) serves bounded rows — `content`
 /// replaced by `contentPreview` (500 chars) + `contentLength` — so the slim
-/// frame stays far under the threshold, while the default (absent
-/// projection) still round-trips the complete content for existing clients.
+/// frame stays far under the threshold. Bounded reads (§5.2): the default
+/// full projection pages too, and a row over the read budget is cut with the
+/// truncated-read markers, so that frame also fits the 500 KiB budget.
 #[intent_test_macros::daemon_test]
 async fn wss_note_list_slim_projection_bounds_large_frames() {
     let srv = start(WsOptions::default()).await;
@@ -16366,14 +16367,53 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
         frame.len()
     );
 
-    // Default (absent projection): full rows, complete content intact.
+    // Default (absent projection): full rows, paged; the giant one is cut
+    // to fit, on whichever page it lands (a page stops before a row that
+    // would overflow it).
     let full = &sess[1];
-    let rows = full["result"]["notes"].as_array().expect("notes array");
+    let frame = serde_json::to_string(full).expect("serialize");
+    assert!(
+        frame.len() < 500 * 1024,
+        "full frame fits: {} bytes",
+        frame.len()
+    );
+    let mut rows: Vec<serde_json::Value> = full["result"]["notes"]
+        .as_array()
+        .expect("notes array")
+        .clone();
+    let mut token = full["result"]["nextToken"].as_str().map(str::to_string);
+    let mut id = 10;
+    while let Some(t) = token {
+        id += 1;
+        let page = wss_session(
+            srv.port,
+            srv.cfg.clone(),
+            vec![serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "note.list",
+                "params": { "workspaceId": ws_id, "nextToken": t },
+            })
+            .to_string()],
+        )
+        .await;
+        let frame = serde_json::to_string(&page[0]).expect("serialize");
+        assert!(frame.len() < 500 * 1024, "page fits: {} bytes", frame.len());
+        rows.extend(
+            page[0]["result"]["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .cloned(),
+        );
+        token = page[0]["result"]["nextToken"].as_str().map(str::to_string);
+    }
     let giant = rows
         .iter()
         .find(|n| n["title"] == "Giant")
         .expect("giant note listed");
-    assert_eq!(giant["content"].as_str().map(str::len), Some(1_100_000));
+    assert_eq!(giant["contentTruncated"], true);
+    assert_eq!(giant["contentBytes"].as_u64(), Some(1_100_000));
+    let cut = giant["content"].as_str().map_or(0, str::len);
+    assert!(cut > 400_000 && cut < 1_100_000, "a bounded prefix: {cut}");
     assert!(giant.get("contentPreview").is_none());
 
     srv.ws.stop().await;

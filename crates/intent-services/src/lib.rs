@@ -12608,17 +12608,6 @@ fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
     )
 }
 
-/// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
-/// matching the TS `numberLines` helper used by `crossWorkspace.readNote`.
-fn number_lines(content: &str) -> String {
-    content
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| format!("{:>4} | {line}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
 fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -21589,6 +21578,8 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: intent_core::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -21605,18 +21596,46 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let content = note.content;
-            let line_count = content.split('\n').count();
-            Ok(serde_json::json!({
+            let budget = if window.is_requested() || bounded_default {
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES
+            } else {
+                usize::MAX
+            };
+            let page = intent_core::note_read_bounds::note_line_page(&note.content, window, budget)
+                .map_err(|e| Error::InvalidParams(e.to_string()))?;
+            let mut out = serde_json::json!({
                 "id": note.id,
                 "title": note.title,
-                "content": content,
-                "numberedContent": number_lines(&content),
+                "content": page.content,
+                "numberedContent": page.numbered_content,
                 "sourceWorkspaceId": target_workspace_id,
                 "sourceWorkspaceTitle": target.title,
                 "branch": target.branch,
-                "lineCount": line_count,
-            }))
+                "lineCount": page.total_lines,
+            });
+            // A whole-note read keeps the original shape; a partial page
+            // says which lines it carries and where to read on.
+            if window.is_requested() || page.truncated() {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("startLine".into(), serde_json::json!(page.start_line));
+                    obj.insert("endLine".into(), serde_json::json!(page.end_line));
+                    obj.insert("truncated".into(), serde_json::json!(page.truncated()));
+                    obj.insert(
+                        "nextStartLine".into(),
+                        serde_json::json!(page.next_start_line()),
+                    );
+                    // A cut line resumes at a byte offset on the same line,
+                    // so following the cursor rebuilds the note exactly.
+                    obj.insert(
+                        "nextStartOffset".into(),
+                        serde_json::json!(page.next_start_offset()),
+                    );
+                    if page.start_offset > 0 {
+                        obj.insert("startOffset".into(), serde_json::json!(page.start_offset));
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 

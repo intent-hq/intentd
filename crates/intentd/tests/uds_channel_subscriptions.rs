@@ -359,6 +359,99 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let _ = server.await;
 }
 
+/// Bounded reads: the `comment.subscribe` seq-0 snapshot is the first
+/// `comment.list` page and carries `nextToken`; following it through
+/// `comment.list` serves the remaining threads.
+#[intent_test_macros::daemon_test]
+async fn comment_channel_snapshot_is_paged_with_next_token() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let n = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "N", "content": "alpha beta gamma" }),
+    )
+    .await;
+    let note_id = n["note"]["id"].as_str().unwrap().to_string();
+    let mut thread_ids = Vec::new();
+    for (i, word) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+        let c = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            20 + i64::try_from(i).unwrap(),
+            "comment.add",
+            json!({
+                "workspaceId": ws_id,
+                "noteId": note_id,
+                "searchContext": "alpha beta gamma",
+                "commentTarget": word,
+                "comment": format!("on {word}")
+            }),
+        )
+        .await;
+        thread_ids.push(c["commentId"].as_str().unwrap().to_string());
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "comment.subscribe",
+        "params": { "workspaceId": ws_id, "noteId": note_id, "limit": 2 }
+    });
+    send(&mut sub_write, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].is_string(), "{resp}");
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let first = snap["params"]["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .clone();
+    assert_eq!(first.len(), 2, "the snapshot is one page: {snap}");
+    let token = snap["params"]["nextToken"]
+        .as_str()
+        .expect("a paged snapshot carries nextToken")
+        .to_string();
+
+    let rest = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        30,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "limit": 2, "nextToken": token }),
+    )
+    .await;
+    assert!(rest["nextToken"].is_null(), "the walk ends: {rest}");
+    let mut seen: Vec<String> = first
+        .iter()
+        .chain(rest["threads"].as_array().expect("threads"))
+        .map(|t| t["threadId"].as_str().unwrap().to_string())
+        .collect();
+    seen.sort();
+    thread_ids.sort();
+    assert_eq!(seen, thread_ids, "every thread served once");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
 #[intent_test_macros::daemon_test]
 async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();

@@ -7445,7 +7445,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         .iter()
         .any(|n| n["id"] == json!(created_id)));
 
-    // `note.listTasks` returns a bare array (TS parity).
+    // `note.listTasks` returns one page (bounded reads).
     let tasks = wss_rpc(
         &mut rpc,
         7,
@@ -7453,7 +7453,8 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": created_id }),
     )
     .await;
-    assert!(tasks.is_array(), "note.listTasks bare array: {tasks}");
+    assert!(tasks["tasks"].is_array(), "note.listTasks page: {tasks}");
+    assert_eq!(tasks["nextToken"], Value::Null, "one page: {tasks}");
 
     // --- mcp.servers.list — empty on a fresh workspace ----------------------
     let mcp = wss_rpc(&mut rpc, 8, "mcp.servers.list", json!({})).await;
