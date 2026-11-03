@@ -74,9 +74,11 @@ fn session_code(error: &Error) -> String {
     error.to_string()
 }
 
-#[tokio::test]
+/// Nothing attaches within [`ATTACH_WAIT`]: the session is unavailable.
+#[tokio::test(start_paused = true)]
 async fn open_without_a_connection_is_unavailable() {
     let sessions = NodeGitSessions::new();
+    let started = tokio::time::Instant::now();
     let error = sessions
         .open(GitService::UploadPack, &remote("agent-1"))
         .await
@@ -85,6 +87,40 @@ async fn open_without_a_connection_is_unavailable() {
         session_code(&error).contains(git_codes::UNAVAILABLE),
         "{error}"
     );
+    assert!(started.elapsed() >= ATTACH_WAIT, "{:?}", started.elapsed());
+}
+
+/// intent-hq/intent#8383: head binds the link and launches the agent
+/// before the node has attached the git connection, so the checkout opens
+/// its session first. It waits for the connection instead of failing.
+#[tokio::test]
+async fn open_waits_for_a_connection_that_attaches_after_it() {
+    let mut node = Node::start(token("t")).await;
+    let _link = dial(&node, 1).await;
+    let _ = node.accept_link().await;
+    let sessions = NodeGitSessions::new();
+    let opening = tokio::spawn({
+        let sessions = sessions.clone();
+        async move {
+            sessions
+                .open(GitService::UploadPack, &remote("agent-1"))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!opening.is_finished(), "open waits for a connection");
+    let head_git = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
+    let node_git = node.accept_git().await;
+    let access = AllowAgent {
+        repository: repository(node.dir.path()),
+    };
+    let _serving = tokio::spawn(serve_git(head_git, Arc::new(access)));
+    sessions.attach(node_git);
+    let session = tokio::time::timeout(wait(), opening)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.is_ok(), "{:?}", session.err());
 }
 
 #[tokio::test]

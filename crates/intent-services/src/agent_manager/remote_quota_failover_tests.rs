@@ -868,3 +868,44 @@ async fn a_switch_during_a_running_turn_is_not_confirmed_by_the_old_run() {
     assert_eq!(session.model.as_deref(), Some("sonnet"));
     assert_ne!(session.status, AgentStatus::Error);
 }
+
+/// intent-hq/intent#8383: a remote start failure after a failover (here the
+/// machine could not fetch the agent's code) leaves the failed message at
+/// the front of the queue for `agent.retry` or the next send, and nothing
+/// starts the agent again on its own: no redrive loop. The failure names
+/// its cause instead of asking for a sign-in.
+#[intent_test_macros::daemon_test]
+async fn a_remote_start_failure_is_requeued_but_never_redriven_on_its_own() {
+    let ws = WorkspaceId::from("ws-remote-failover-no-loop");
+    let id = AgentId::from("agent-remote-failover-no-loop");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    *backup_run.exited.lock().unwrap() = Some(
+        "node-agent-not-running: node-checkout-failed: fetch the agent's base commit from \
+         head: head refused the session (node-git-unavailable)"
+            .into(),
+    );
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+
+    send(&mgr, &id, &ws, "hello").await;
+    wait_idle(&mgr, &id).await;
+    // timing-guard: a redrive would start the agent again well within this
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 2, "no automatic redrive");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    let reason = session.stop_reason.unwrap_or_default();
+    assert!(reason.contains("node-checkout-failed"), "{reason}");
+    assert!(reason.contains("not a sign-in problem"), "{reason}");
+    assert!(!reason.contains("Sign in"), "{reason}");
+    let queue = mgr.services.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1, "{queue:?}");
+    assert_eq!(queue[0]["requeuedAfterFailure"], json!(true), "{queue:?}");
+}

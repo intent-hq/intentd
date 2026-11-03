@@ -1110,11 +1110,40 @@ fn remote_backup_failed_text(
     let from = provider_profiles::readable_selection(from, Some(profiles));
     let backup = provider_profiles::readable_selection(backup, Some(profiles));
     let reason = reason.trim().trim_end_matches('.');
+    let advice = match non_account_start_cause(reason, machine) {
+        Some(cause) => format!(
+            "{cause}, which is not a sign-in problem. Retry the message, or create a new \
+             agent."
+        ),
+        None => {
+            format!("Sign in to {backup} on {machine}, or create a new agent with another account.")
+        }
+    };
     format!(
         "{REMOTE_FAILOVER_UNAVAILABLE} {from} ran out of quota on {machine}, and the backup \
-         {backup} couldn't start there: {reason}. Sign in to {backup} on {machine}, or create a \
-         new agent with another account."
+         {backup} couldn't start there: {reason}. {advice}"
     )
+}
+
+/// What stopped a remote start when it was not the provider or its account
+/// (intent-hq/intent#8383): the node error codes in `reason` for the
+/// checkout, the machine's capacity, its shutdown or the link. `None` for
+/// an account or provider start failure, or a reason without such a code.
+fn non_account_start_cause(reason: &str, machine: &str) -> Option<String> {
+    let has = |code: &str| reason.contains(code);
+    if has("node-checkout-failed") || has("node-git-") {
+        Some(format!(
+            "{machine} couldn't fetch the agent's code from this backend"
+        ))
+    } else if has("node-capacity") {
+        Some(format!("{machine} has no room for another agent"))
+    } else if has("node-shutting-down") {
+        Some(format!("{machine} is shutting down"))
+    } else if has("node-link-") {
+        Some(format!("the connection to {machine} was lost"))
+    } else {
+        None
+    }
 }
 
 /// The error a remote agent fails with when its machine could not start
