@@ -1439,7 +1439,15 @@ impl Runner {
                     };
                     // The agent's script runs end first, so nothing still
                     // writes to its checkout while it is pushed and removed.
-                    runner.inner.scripts.stop_agent(&agent_id).await;
+                    if !runner.inner.scripts.stop_agent(&agent_id).await {
+                        // A script that is still not reaped may still write
+                        // to the checkout: stop the provider, but neither
+                        // push nor remove, and do not acknowledge, so the
+                        // backend resends the stop.
+                        tracing::warn!(agent = %agent_id, "node: final stop not acknowledged: a script of the agent was not reaped");
+                        drop(runner.stop(&agent_id));
+                        return;
+                    }
                     let wait = runner.stop(&agent_id);
                     guard.result = runner.finish_final_stop(agent, &agent_id, wait).await;
                 });

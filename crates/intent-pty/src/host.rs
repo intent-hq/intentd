@@ -30,7 +30,7 @@ const FANOUT_CAPACITY: usize = 2048;
 const READ_CHUNK: usize = 8192;
 /// Grace period between SIGTERM and SIGKILL during teardown (mirrors M5).
 #[cfg(unix)]
-const TERM_GRACE: Duration = Duration::from_secs(2);
+pub const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);
 /// Poll interval while the exit watcher waits for the reader to drain the

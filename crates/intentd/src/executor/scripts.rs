@@ -43,6 +43,32 @@ const SCROLLBACK_BYTES: usize = 64 * 1024;
 /// process group is reaped.
 const OUTPUT_EOF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Slack on top of the teardown and reap timings in [`reap_wait`].
+const REAP_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Longest a stop waits for the processes it kills to be reaped: the kill's
+/// SIGTERM grace, the reaper's own group escalation, its output-EOF wait and
+/// a margin. A process past it (a child stuck in the kernel) is logged and
+/// left; the caller carries on.
+pub(super) fn reap_wait() -> std::time::Duration {
+    let bound = intent_pty::TERM_GRACE * 2 + OUTPUT_EOF_WAIT + REAP_MARGIN;
+    #[cfg(test)]
+    let bound = intentd_test_support::test_timeout(bound);
+    bound
+}
+
+/// Agents whose script reapers never finish (test seam for a process whose
+/// `wait` never returns).
+#[cfg(test)]
+static HELD_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Make every reaper of `agent_id`'s scripts hang (test seam).
+#[cfg(test)]
+pub(super) fn hold_reaps_for_test(agent_id: &AgentId) {
+    lock(&HELD_REAPS).insert(agent_id.clone());
+}
+
 /// A process is named by its agent, script and spawn.
 type Key = (AgentId, String, String);
 
@@ -181,10 +207,7 @@ impl ScriptProcesses {
         let this = self.clone();
         let link = link.clone();
         // caller-binding: allow — node-local script process supervision; the node has no service layer
-        tokio::spawn(async move {
-            this.reap(link, key, pty_id, stream).await;
-            reaped_tx.send_replace(true);
-        });
+        tokio::spawn(async move { this.reap(link, key, pty_id, stream, reaped_tx).await });
     }
 
     /// Wait for the process to exit, then report it.
@@ -194,7 +217,12 @@ impl ScriptProcesses {
         key: Key,
         pty_id: PtyId,
         stream: Arc<Mutex<OutputStream>>,
+        reaped: tokio::sync::watch::Sender<bool>,
     ) {
+        #[cfg(test)]
+        if lock(&HELD_REAPS).contains(&key.0) {
+            std::future::pending::<()>().await;
+        }
         let exit = self.pty.wait(pty_id).await;
         // A descendant can outlive the direct child and keep the terminal
         // open: reap the group first, as a local saved script does, so the
@@ -212,6 +240,9 @@ impl ScriptProcesses {
                 running.remove(&key);
             }
         }
+        // The process is gone and recorded: a stop waiting on it goes ahead
+        // without waiting for the output flush or the link.
+        reaped.send_replace(true);
         // Output loss is always reported, and before the exit.
         finish_output(&link, &stream).await;
         let frame = match exit {
@@ -268,9 +299,10 @@ impl ScriptProcesses {
         ))
     }
 
-    /// Kill every process of `agent_id`.
-    pub(super) async fn stop_agent(&self, agent_id: &AgentId) {
-        self.kill_where(|key, _| &key.0 == agent_id).await;
+    /// Kill every process of `agent_id`. Returns whether each was reaped
+    /// within [`reap_wait`].
+    pub(super) async fn stop_agent(&self, agent_id: &AgentId) -> bool {
+        self.kill_where(|key, _| &key.0 == agent_id).await
     }
 
     /// Kill every process (the machine is shutting down).
@@ -281,23 +313,35 @@ impl ScriptProcesses {
     /// Kill every matching process, then wait until each one's reaper has
     /// recorded its exit. A process another kill is already tearing down
     /// (its terminal is gone, so this kill is a no-op) is waited for too.
-    async fn kill_where(&self, matches: impl Fn(&Key, &Process) -> bool) {
+    /// The wait is bounded by [`reap_wait`]: past it, a process that is
+    /// still not reaped is logged and left. Returns whether every one was
+    /// reaped.
+    async fn kill_where(&self, matches: impl Fn(&Key, &Process) -> bool) -> bool {
         let victims: Vec<(PtyId, tokio::sync::watch::Receiver<bool>)> = lock(&self.running)
             .iter()
             .filter(|(key, p)| matches(key, p))
             .map(|(_, p)| (p.pty_id, p.reaped.clone()))
             .collect();
-        let mut kills = tokio::task::JoinSet::new();
-        for (id, _) in &victims {
-            let pty = self.pty.clone();
-            let id = *id;
-            // caller-binding: allow — node-local script teardown, joined below
-            kills.spawn(async move { pty.kill(id).await });
+        let pty = self.pty.clone();
+        let done = tokio::time::timeout(reap_wait(), async {
+            let mut kills = tokio::task::JoinSet::new();
+            for (id, _) in &victims {
+                let pty = pty.clone();
+                let id = *id;
+                // caller-binding: allow — node-local script teardown, joined below
+                kills.spawn(async move { pty.kill(id).await });
+            }
+            while kills.join_next().await.is_some() {}
+            for (_, mut reaped) in victims {
+                let _ = reaped.wait_for(|reaped| *reaped).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !done {
+            tracing::warn!("node: a script process was not reaped within its bound; leaving it");
         }
-        while kills.join_next().await.is_some() {}
-        for (_, mut reaped) in victims {
-            let _ = reaped.wait_for(|reaped| *reaped).await;
-        }
+        done
     }
 }
 

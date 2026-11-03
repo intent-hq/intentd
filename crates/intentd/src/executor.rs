@@ -108,6 +108,17 @@ struct Backend {
     _storage: Arc<Storage>,
 }
 
+impl ExecutorService {
+    /// The runners of the backends linked now (test seam).
+    #[cfg(test)]
+    fn runners_for_test(&self) -> Vec<Runner> {
+        lock(&self.backends)
+            .values()
+            .map(|backend| backend.runner.clone())
+            .collect()
+    }
+}
+
 /// The running executor service. Cloning the `Arc` shares it.
 pub(crate) struct ExecutorService {
     deps: ExecutorDeps,

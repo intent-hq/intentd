@@ -412,3 +412,35 @@ async fn stop_agent_waits_for_a_teardown_a_script_stop_already_started() {
     let seen = until_exited(&mut f.head, "p1").await;
     assert!(seen.exited.is_some());
 }
+
+/// A process whose reaper never finishes (a child stuck in the kernel, whose
+/// `wait` never returns) does not hold `stop_agent` or `stop_all` past the
+/// reap bound: they log and return, and `stop_agent` reports it.
+#[tokio::test]
+async fn a_stuck_process_does_not_hold_up_stop_agent_or_stop_all() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stuck-reap");
+    hold_reaps_for_test(&a);
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let bound = reap_wait() + Duration::from_secs(3);
+    let t0 = std::time::Instant::now();
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent waited past the reap bound");
+    assert!(
+        !reaped,
+        "a process that was never reaped was reported reaped"
+    );
+    assert!(t0.elapsed() >= reap_wait(), "gave up before the bound");
+    tokio::time::timeout(bound, f.scripts.stop_all())
+        .await
+        .expect("stop_all waited past the reap bound");
+}

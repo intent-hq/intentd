@@ -1656,3 +1656,64 @@ async fn a_final_stop_ends_the_agents_scripts_before_it_is_acknowledged() {
     assert!(!checkout.exists());
     node.stop().await;
 }
+
+/// A final stop over a script whose reaper never finishes is not
+/// acknowledged (the backend resends it), and it answers within the reap
+/// bound instead of hanging, so a later stop or launch is not stuck behind
+/// it.
+#[tokio::test]
+async fn a_final_stop_over_a_stuck_script_answers_without_an_ack() {
+    use intent_core::node_link::ScriptStartCommand;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let agent = AgentId::from("a-stuck-final");
+    crate::executor::scripts::hold_reaps_for_test(&agent);
+    let mut offer = hello(1, "lease-1", 0);
+    offer.lease_agents = vec![agent.clone()];
+    let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
+    replay_complete(&mut dialed).await;
+    let checkout = dir
+        .path()
+        .join("executor")
+        .join(&node.api.credential(&token()).id.0)
+        .join("agents")
+        .join(&agent.0)
+        .join("work");
+    std::fs::create_dir_all(&checkout).unwrap();
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            command: "sleep 60".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => break,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+    let runner = node
+        .service
+        .runners_for_test()
+        .pop()
+        .expect("a linked backend");
+    let bound = crate::executor::scripts::reap_wait() + Duration::from_secs(3);
+    let answer = tokio::time::timeout(bound, runner.final_stop(&agent))
+        .await
+        .expect("the final stop hung on the stuck script");
+    assert_eq!(answer, None, "acknowledged with a script still unreaped");
+    assert!(
+        checkout.exists(),
+        "the checkout went with a script still unreaped"
+    );
+    node.stop().await;
+}
