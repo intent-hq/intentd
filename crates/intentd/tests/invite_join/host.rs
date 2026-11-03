@@ -78,15 +78,6 @@ async fn exercise_host_join(provider: &str, credentials: &[(&str, &str)]) {
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
         .await
         .unwrap();
-    // No principal.me refresh is needed to issue a link on an empty host.
-    if credentials.is_empty() {
-        assert!(store
-            .get_primary_principal()
-            .await
-            .unwrap()
-            .identity_key()
-            .is_none());
-    }
     let mut events = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     result(
         &wss_rpc(
@@ -275,12 +266,41 @@ async fn exercise_host_join(provider: &str, credentials: &[(&str, &str)]) {
 }
 
 #[tokio::test]
-async fn host_invites_admit_github_without_repository_setup_over_wss() {
-    exercise_host_join("github", &[]).await;
+async fn github_host_invites_github_member_over_wss() {
+    exercise_host_join("github", OWNER_FORGE).await;
 }
+
+/// With no owner forge connected, neither host nor workspace invites are
+/// minted, open or pinned: `github-identity-required`, nothing stored.
 #[tokio::test]
-async fn host_invites_admit_gitlab_without_repository_setup_over_wss() {
-    exercise_host_join("gitlab", &[]).await;
+async fn host_without_a_forge_refuses_invites_over_wss() {
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    let ws_id = create_workspace(&mut owner, 310, "No forge").await;
+    for (method, params) in [
+        (
+            "host.invite.create",
+            json!({"pinLogin":"gh-guest","pinProvider":"github"}),
+        ),
+        ("workspace.invite.create", json!({"workspaceId":ws_id})),
+        (
+            "workspace.invite.create",
+            json!({"workspaceId":ws_id,"pinLogin":"gh-guest","pinProvider":"github"}),
+        ),
+    ] {
+        let frame = wss_rpc(&mut owner, 311, method, params).await;
+        assert_eq!(frame["error"]["code"], -32603, "{method}: {frame}");
+        assert_eq!(
+            frame["error"]["data"]["code"], "github-identity-required",
+            "{method}: {frame}"
+        );
+    }
+    let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    assert!(store.list_open_host_invites().await.unwrap().is_empty());
+    assert_eq!(store.count_open_workspace_invites().await.unwrap(), 0);
 }
 #[tokio::test]
 async fn github_repository_host_invites_gitlab_member_over_wss() {
@@ -295,7 +315,7 @@ async fn gitlab_repository_host_invites_github_member_over_wss() {
 #[tokio::test]
 async fn host_invite_scope_secret_and_parameter_refusals_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     for params in [
         json!({}),
@@ -355,7 +375,7 @@ async fn host_invite_scope_secret_and_parameter_refusals_over_wss() {
 #[tokio::test]
 async fn host_proof_refuses_wrong_provider_instance_and_account_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let created = host_invite(&mut owner, "gitlab").await;
     let mut join = connect_invite(host.port, host.cfg.clone()).await;
@@ -410,7 +430,7 @@ async fn host_proof_refuses_wrong_provider_instance_and_account_over_wss() {
 #[tokio::test]
 async fn host_pin_lookup_refusals_preserve_an_empty_invite_list_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     for status in [401, 429, 503] {
         mock.user_lookup_status.store(status, Ordering::SeqCst);
@@ -464,7 +484,7 @@ async fn host_pin_lookup_refusals_preserve_an_empty_invite_list_over_wss() {
 #[tokio::test]
 async fn guest_upgrades_to_host_member_with_same_principal_and_bearer_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let workspace = create_workspace(&mut owner, 400, "Shared before membership").await;
     let (id, secret, _) = create_invite(&mut owner, 401, &workspace, json!({})).await;
@@ -583,7 +603,7 @@ async fn guest_upgrades_to_host_member_with_same_principal_and_bearer_over_wss()
 #[tokio::test]
 async fn invitation_account_search_over_wss_is_public_and_provider_qualified() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     for (provider, login, id) in [
         ("github", "gh-guest", 9001),
@@ -658,7 +678,7 @@ async fn invitation_account_search_over_wss_is_public_and_provider_qualified() {
 #[tokio::test]
 async fn invitation_account_search_over_wss_preserves_directory_errors_and_bound_fallback() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     for (status, code) in [
         (401, Some("identity-unverifiable")),

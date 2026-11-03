@@ -56,7 +56,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use crate::principal_ops::ForgeUser;
+use crate::principal_ops::{ForgeLink, ForgeUser};
 use crate::source_control_auth_ops::{Provider, Target};
 use crate::{github_auth_ops, pr_ops, Services};
 
@@ -290,6 +290,23 @@ impl Services {
         self.store.get_principal(&id).await
     }
 
+    /// Sharing requires a connected owner forge: the host's GitHub
+    /// credential or its bound GitLab instance must answer for a live
+    /// account right now (the same probes the primary identity refresh
+    /// uses). A cached profile, an unreachable forge or a rejected
+    /// credential does not qualify, so with neither forge connected no
+    /// invite is minted and no open invite is redeemed —
+    /// [`InviteErrorKind::GithubIdentityRequired`]. Guests who already
+    /// joined keep their access; this gates new admissions only.
+    pub(crate) async fn require_owner_forge(&self) -> Result<()> {
+        if matches!(self.github_link().await, ForgeLink::Connected(_))
+            || matches!(self.gitlab_link().await, ForgeLink::Connected(_))
+        {
+            return Ok(());
+        }
+        Err(Error::Invite(InviteErrorKind::GithubIdentityRequired))
+    }
+
     /// The `(provider, host)` a forge-scoped invite param names, with the
     /// github.com host spelled out accepted for `provider: "github"` (the
     /// GitHub side has no instance selection).
@@ -465,6 +482,7 @@ impl Services {
         if ws.archived {
             return Err(Error::Invite(InviteErrorKind::WorkspaceArchived));
         }
+        self.require_owner_forge().await?;
         let ttl = expires_in_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
         if ttl == 0 || ttl > MAX_INVITE_TTL_SECS {
             return Err(Error::InvalidParams(format!(
@@ -840,6 +858,7 @@ impl Services {
             return Err(Error::Invite(InviteErrorKind::CredentialInvalid));
         };
         let invite = self.open_invite(invite_id, secret, scope).await?;
+        self.require_owner_forge().await?;
         if invite
             .pin_identity_key()
             .is_some_and(|pinned| pinned != identity)
@@ -860,6 +879,7 @@ impl Services {
         scope: InviteScope,
     ) -> Result<Value> {
         let invite = self.open_invite(invite_id, secret, scope).await?;
+        self.require_owner_forge().await?;
         let mut preview = self.invite_preview(&invite).await?;
         let authorization_generation = self
             .store
@@ -948,6 +968,7 @@ impl Services {
             ));
         }
         let invite = self.open_invite(invite_id, secret, scope).await?;
+        self.require_owner_forge().await?;
         let target = self.proof_target(&invite, &claim)?;
         let provider = match &target {
             Target::Github => Provider::Github,
@@ -1265,3 +1286,6 @@ mod host_tests;
 
 #[cfg(test)]
 mod removal_tests;
+
+#[cfg(test)]
+mod forge_required_tests;

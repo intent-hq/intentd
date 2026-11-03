@@ -5,13 +5,16 @@ use super::*;
 #[tokio::test]
 async fn sharing_member_issues_scoped_guest_invites_without_repository_setup() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
         .await
         .unwrap();
     let primary = store.get_primary_principal().await.unwrap();
-    assert!(primary.identity_key().is_none());
+    assert_eq!(
+        serde_json::to_value(primary.identity_key()).unwrap(),
+        github_identity(OWNER_GH_ID)
+    );
     let link = host_invite(&mut owner, "gitlab").await;
     let mut join = connect_invite(host.port, host.cfg.clone()).await;
     let challenge = result(

@@ -160,6 +160,7 @@ impl Services {
         if pin.host.is_none() && provider == Provider::Gitlab {
             pin.host = Some("gitlab.com".into());
         }
+        self.require_owner_forge().await?;
         let creator = self.inviting_principal().await?;
         let (identity, login) = self.resolve_pin(None, pin).await?;
         let secret = random_hex_secret();

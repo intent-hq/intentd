@@ -19,7 +19,7 @@ fn github_claim(gist_id: &str, login: &str) -> InviteProofClaim {
 
 /// One workspace owned by a non-administrator principal (the primary is
 /// demoted so the one-owner index admits the promotion) plus a collaborator
-/// member. Both carry a GitHub identity so invite creation needs no forge.
+/// member. Both carry a GitHub identity; the host's GitHub is connected.
 pub(super) struct Fixture {
     pub(super) services: Services,
     pub(super) store: Store,
@@ -67,10 +67,14 @@ pub(super) fn gitlab_guest(host: &str, login: &str, id: u64) -> ForgeUser {
 /// beside the temp db: the identity resolution every mint runs
 /// ([`Services::resolve_identity_forge`]) probes GitLab through that store,
 /// so it must never read the developer's real `~/intent/.secrets.json`.
+/// GitHub is connected (a stub forge answering `GET /user`): sharing
+/// requires a connected owner forge.
 fn services(store: &Store, tmp: &TempDb) -> Services {
-    Services::new_isolated(store.clone()).with_gitlab_secret_store(
-        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
-    )
+    Services::new_isolated(store.clone())
+        .with_gitlab_secret_store(intent_core::FileSecretStore::with_path(
+            tmp.path.with_extension("secrets.json"),
+        ))
+        .with_source_control(Arc::new(StubForge::default()))
 }
 
 pub(super) fn wire(principal_id: &PrincipalId) -> Caller {
@@ -136,31 +140,6 @@ pub(super) fn id_of(created: &Value) -> String {
         .as_str()
         .expect("invite id")
         .to_string()
-}
-
-#[tokio::test]
-async fn intent_authority_issues_workspace_invites_without_a_profile_or_forge() {
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.unwrap();
-    let services =
-        services(&store, &tmp).with_source_control(Arc::new(StubForge::unauthenticated()));
-    let ws = WorkspaceId::new();
-    store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let primary = store.get_primary_principal().await.unwrap();
-    assert!(primary.identity_key().is_none());
-    let result = with_caller(
-        Caller::Daemon,
-        services.workspace_invite_create_op(&ws, None, None),
-    )
-    .await
-    .expect("Intent owner can invite without a forge identity");
-    assert_eq!(result["invite"]["createdByPrincipalId"], json!(primary.id));
-    assert!(store
-        .get_primary_principal()
-        .await
-        .unwrap()
-        .identity_key()
-        .is_none());
 }
 
 #[tokio::test]
@@ -644,37 +623,6 @@ async fn invite_mint_waits_for_the_transition_and_revalidates_the_creator() {
     mint.await.expect("mint task").expect("mints once released");
     assert_eq!(
         f.store
-            .count_open_workspace_invites()
-            .await
-            .expect("count invites"),
-        1
-    );
-}
-
-/// Revoking repository credentials does not remove the Intent owner's authority
-/// to issue workspace invitations, even when a cached profile remains.
-#[tokio::test]
-async fn primary_can_mint_without_a_live_credential() {
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-    let services =
-        services(&store, &tmp).with_source_control(Arc::new(StubForge::unauthenticated()));
-    let ws = WorkspaceId::new();
-    store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let mut primary = store.get_primary_principal().await.expect("primary");
-    primary.github_user_id = Some(10);
-    store
-        .upsert_principal(&primary)
-        .await
-        .expect("seed identity");
-    let r = with_caller(
-        Caller::Daemon,
-        services.workspace_invite_create_op(&ws, None, None),
-    )
-    .await;
-    assert!(r.is_ok(), "Intent authority suffices: {r:?}");
-    assert_eq!(
-        store
             .count_open_workspace_invites()
             .await
             .expect("count invites"),
@@ -3500,10 +3448,10 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
 
 // --- verifier probes (adopted as regression tests) --------------------------
 
-/// An unavailable repository forge cannot block unpinned invitation issuance.
-/// The real client reports disconnected while the Intent owner still mints.
+/// A cached primary identity is no connection: with the real client
+/// reporting the forge disconnected (unreachable), no invite is minted.
 #[tokio::test]
-async fn cached_primary_identity_needs_no_live_auth() {
+async fn cached_primary_identity_without_live_auth_cannot_invite() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     let mut primary = f.store.get_principal(&f.primary).await.expect("primary");
@@ -3527,10 +3475,10 @@ async fn cached_primary_identity_needs_no_live_auth() {
         services.workspace_invite_create_op(&f.ws, None, None),
     )
     .await;
-    assert!(r.is_ok(), "Intent authority suffices: {r:?}");
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
     assert_eq!(
         f.store.count_open_workspace_invites().await.expect("count"),
-        1
+        0
     );
 }
 
