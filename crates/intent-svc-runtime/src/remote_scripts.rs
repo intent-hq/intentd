@@ -140,9 +140,9 @@ async fn remote_call_inner(
         "script.status" => Ok(json!(runs(&mgr)?.state(&place(&args)?).unwrap_or_default())),
         "script.output" => {
             let place = place(&args)?;
-            Ok(
-                json!({ "output": runs(&mgr)?.output_lines(&place, max_lines(&args)).unwrap_or_default() }),
-            )
+            Ok(runs(&mgr)?
+                .output_reply(&place, max_lines(&args))
+                .unwrap_or_else(|| Value::String("No output yet.".to_owned())))
         }
         "script.monitor" => runs(&mgr)?.monitor(&place(&args)?, &args),
         "script.monitors" => Ok(json!(runs(&mgr)?.monitors_of(&caller.agent_id))),
@@ -348,9 +348,9 @@ pub(crate) async fn machine_run_call(
         "status" => Ok(json!(runs.state(&place).ok_or_else(unknown)?)),
         "output" => {
             runs.state(&place).ok_or_else(unknown)?;
-            Ok(
-                json!({ "output": runs.output_lines(&place, max_lines(&params)).unwrap_or_default() }),
-            )
+            Ok(runs
+                .output_reply(&place, max_lines(&params))
+                .unwrap_or_default())
         }
         "stop" => Ok(json!(runs.stop(&place).await?)),
         "restart" => {

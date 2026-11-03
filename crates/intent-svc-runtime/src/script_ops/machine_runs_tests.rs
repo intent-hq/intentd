@@ -511,3 +511,78 @@ async fn ending_several_agents_waits_once_for_all_their_stops() {
     assert_eq!(unacked, vec![silent]);
     assert!(runs.entries(&ws(), "s1").is_empty());
 }
+
+/// The bytes `value` takes on the wire.
+fn wire_len(value: &serde_json::Value) -> usize {
+    serde_json::to_string(value).unwrap().len()
+}
+
+/// Review of intentd#3005: a machine run's output replies follow the
+/// "Bounded output reads" contract like the home run's: `script.output`
+/// fits 480,000 JSON-escaped bytes under a `[showing last …]` header, and
+/// `script.run` keeps the newest bytes with `outputTruncated: true`.
+#[tokio::test]
+async fn machine_run_output_replies_are_bounded() {
+    // ASCII, and output that doubles when JSON-escaped.
+    for (label, line) in [("ascii", "x".repeat(99)), ("escaped", "\"".repeat(99))] {
+        let rec = Arc::new(Recorded::default());
+        let runs = MachineRuns::new(hooks(&rec));
+        let agent = AgentId::new();
+        let def = script(ScriptMode::Command, "make");
+        let here = place(&agent);
+        let waiter = {
+            let runs = runs.clone();
+            let here = here.clone();
+            let def = def.clone();
+            tokio::spawn(async move {
+                runs.run(
+                    &here,
+                    &def,
+                    intentd_test_support::test_timeout(Duration::from_secs(10)),
+                    10_000,
+                )
+                .await
+            })
+        };
+        let start = loop {
+            if let Some(start) = rec.frames.lock().unwrap().iter().find_map(|f| match f {
+                LinkFrame::ScriptStart(s) => Some(s.clone()),
+                _ => None,
+            }) {
+                break start;
+            }
+            tokio::task::yield_now().await;
+        };
+        // 5,000 lines of 100 bytes: within the 512 KiB the run keeps, over
+        // the 480,000-byte reply budget (twice over once escaped).
+        let chunk = format!("{line}\n").repeat(1000);
+        for seq in 0..5 {
+            frame(&runs, output(&start, seq, &chunk)).await;
+        }
+        frame(&runs, exited(&start, Some(0), None)).await;
+
+        let reply = waiter.await.unwrap().unwrap();
+        // The budget covers the output text; the reply's other members and
+        // `script.output`'s header line ride on top, as for the home run.
+        assert!(
+            wire_len(&reply) <= 480_000 + 256,
+            "{label}: script.run reply is {} bytes",
+            wire_len(&reply)
+        );
+        assert_eq!(reply["outputTruncated"], true, "{label}");
+
+        let text = runs.output_reply(&here, 10_000).unwrap();
+        assert!(
+            wire_len(&text) <= 480_000 + 256,
+            "{label}: script.output is {} bytes",
+            wire_len(&text)
+        );
+        let text = text.as_str().unwrap();
+        assert!(
+            text.starts_with("[showing last "),
+            "{label}: {}",
+            &text[..80]
+        );
+        assert!(text.contains("older output omitted"), "{label}");
+    }
+}

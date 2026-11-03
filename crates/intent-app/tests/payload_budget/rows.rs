@@ -310,13 +310,16 @@ const SCRIPT_LIST_PARSE: (&str, &str, &str) = ("intent-core/src/script_lists.rs"
 
 /// `remote_scripts::machine_run_call`, which `script.*` hands its params to
 /// when they carry `remoteAgentId` (a remote agent's machine run).
-const MACHINE_RUN_PARSE: (&str, &str, &str) =
-    ("intent-svc-runtime/src/remote_scripts.rs", "machine_run_call", "params");
+const MACHINE_RUN_PARSE: (&str, &str, &str) = (
+    "intent-svc-runtime/src/remote_scripts.rs",
+    "machine_run_call",
+    "params",
+);
 
 /// The seeded daemon has no remote machines, so no machine run to address.
 const MACHINE_RUN_UNEXERCISED: &[(&str, &str)] = &[(
     "remoteAgentId",
-    "Addresses a remote agent's machine run (remoteScripts: 1); the seeded daemon has no remote machine.",
+    "Addresses a remote agent's machine run (remoteScripts: 1); the seeded daemon has no remote machine. Its replies use the home run's bounded-output helpers, covered above 480,000 escaped bytes by machine_runs::tests::machine_run_output_replies_are_bounded.",
 )];
 
 impl Row {

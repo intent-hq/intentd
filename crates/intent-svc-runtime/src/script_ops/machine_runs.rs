@@ -377,10 +377,16 @@ impl MachineRuns {
         .is_ok();
         let state = self.state(place).unwrap_or_default();
         let output = self.output_lines(place, max_lines).unwrap_or_default();
+        // As the home run's `script.run`: the newest bytes that fit the
+        // reply budget once JSON-escaped, `outputTruncated` on a cut.
+        let (output, cut) = super::output_tail_within_budget(&output);
         let mut result = json!({
             "exitCode": if done { state.exit_code } else { None },
             "output": output,
         });
+        if cut {
+            result["outputTruncated"] = json!(true);
+        }
         if !done {
             result["timedOut"] = json!(true);
         }
@@ -408,6 +414,23 @@ impl MachineRuns {
         lock(&self.inner.runs)
             .get(place)
             .map(|run| format!("{}{}", run.output, run.partial))
+    }
+
+    /// `script.output` of `place`'s run, as the home run's: the newest
+    /// `line_count` lines under a `[… lines]` header, cut to the reply
+    /// budget ("Bounded output reads"); `None` without a machine run.
+    pub(crate) fn output_reply(&self, place: &RunPlace, line_count: usize) -> Option<Value> {
+        let text = self.output(place)?;
+        if text.trim().is_empty() {
+            return Some(Value::String("No output yet.".to_owned()));
+        }
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        let lines: Vec<&str> = text.split('\n').collect();
+        let total = lines.len();
+        let tail = lines[total.saturating_sub(line_count)..].join("\n");
+        Some(Value::String(super::format_output_tail(
+            &tail, total, line_count,
+        )))
     }
 
     /// The last `max_lines` lines of `place`'s output.
