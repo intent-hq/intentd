@@ -2635,7 +2635,9 @@ impl Services {
     /// role-reminder injection). Rebuilt every turn (interval = 1); the reminder
     /// is added to the outbound provider prompt only and never persisted.
     pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
-        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        // Runs on every turn: the metadata-only lookup skips the transcript
+        // load and payload hydration `get_agent_session` performs.
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let specialist_id = session.specialist.as_deref()?;
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
         // when present it wins over live 3-tier resolution, so later edits or
