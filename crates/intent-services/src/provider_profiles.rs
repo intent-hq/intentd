@@ -2227,6 +2227,22 @@ impl Services {
         Ok(doc.unwrap_or_default())
     }
 
+    /// Whether `providers.catalog` is read by a workspace guest of this host,
+    /// who must not learn the host's profile or Default names. The durable
+    /// role decides, re-read per call like [`Self::require_host_execution`],
+    /// so a removed member is a guest from the next read. Fails closed: an
+    /// unknown principal or a failed lookup counts as a guest.
+    pub(crate) async fn catalog_caller_is_guest(&self) -> Result<bool> {
+        let Some(principal_id) = crate::capability::gated_collaborator_caller("providers.catalog")?
+        else {
+            return Ok(false);
+        };
+        Ok(!matches!(
+            self.store.get_host_role(&principal_id).await,
+            Ok(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+        ))
+    }
+
     /// `providers.catalog` `defaultNames`: the renamed Default of each base
     /// provider, or `None` when none is renamed (or the file is unreadable).
     pub(crate) fn provider_default_names(&self) -> Option<Value> {
