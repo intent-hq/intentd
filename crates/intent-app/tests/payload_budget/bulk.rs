@@ -9,10 +9,12 @@
 //! - `git.showFileChunk` / `note.readAssetChunk` (cap param `length`): the
 //!   same as `file.readChunk`, on a committed blob and a note asset.
 //!
-//! It also checks the default form of the capped whole-object reads
-//! (`file.read`, `git.showFile`, `note.readAsset` without `maxBytes`, which
-//! are `BoundedRead` rows): an object over the cap is refused with a small
-//! `too-large` error frame, never a shortened or oversized reply.
+//! It also checks the legacy form of the capped whole-object reads
+//! (`file.read`, `git.showFile`, `note.readAsset` without `maxBytes`, whose
+//! `BoundedRead` rows send `maxBytes`): an object over the cap is served whole
+//! under the frame cap (or refused with a small `too-large` frame when
+//! `REFUSE_OVER_CAP_WITHOUT_MAX_BYTES` is on), never shortened; a file past
+//! the frame cap answers a small error frame either way.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -139,8 +141,7 @@ pub async fn sweep(
         }
     }
 
-    // Capped whole-object reads without maxBytes: an object over the cap is
-    // refused with a small too-large frame (file.read past the frame cap too).
+    // Whole-object reads without maxBytes: see the module comment.
     let legacy = [
         (
             "file.read",

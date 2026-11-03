@@ -8,9 +8,10 @@
 //! - With `maxBytes` the reply carries `truncated` and `totalBytes`; text is
 //!   cut to the longest prefix (on a character boundary) whose JSON string
 //!   fits, and an asset that does not fit is sent without its bytes.
-//! - Without `maxBytes` the legacy shape is served when it fits; a larger
-//!   object is refused with `-32602` `too-large` instead of a silently
-//!   shortened legacy reply that a client could write back.
+//! - Without `maxBytes` the legacy whole-object reply is served, as before
+//!   (see [`REFUSE_OVER_CAP_WITHOUT_MAX_BYTES`]; in refuse mode an object over
+//!   the cap answers `-32602` `too-large`, never a shortened legacy reply that
+//!   a client could write back).
 //!
 //! The whole object is fetched with the chunk methods (`file.readChunk`,
 //! `git.showFileChunk`, `note.readAssetChunk`), which clients send over a
@@ -30,11 +31,12 @@ pub(crate) const OBJECT_READ_MAX_BYTES: usize = 480_000;
 pub(crate) const OBJECT_READ_MIN_BYTES: usize = 4_096;
 
 /// Whether a read without `maxBytes` of an object over the cap is refused
-/// (`too-large`). `false` serves the whole object, as before protocol 15.4,
-/// up to the outbound frame cap. Pending a product decision; flipping it is
-/// the whole code change: the unit tests here cover both modes, and the
-/// router test and the payload sweep's bulk check branch on it.
-pub const REFUSE_OVER_CAP_WITHOUT_MAX_BYTES: bool = true;
+/// (`too-large`). `false` (the decided behavior) serves the whole object to
+/// such callers, as before protocol 15.4, up to the outbound frame cap, so
+/// older apps and the iOS app keep working; callers that send `maxBytes`
+/// (the current app) get the bounded reply. The unit tests here cover both
+/// modes, and the router test and the payload sweep's bulk check branch on it.
+pub const REFUSE_OVER_CAP_WITHOUT_MAX_BYTES: bool = false;
 
 /// Parse the optional `maxBytes` param, clamped into
 /// [[`OBJECT_READ_MIN_BYTES`], [`OBJECT_READ_MAX_BYTES`]]. Absent or `null`

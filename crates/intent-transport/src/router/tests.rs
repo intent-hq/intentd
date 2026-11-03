@@ -8540,6 +8540,8 @@ mod script_get_paging {
         let (v, _) = call(&api, Some(json!(1))).await;
         assert_eq!(v["result"]["command"], "é");
         assert_eq!(v["result"]["nextCommandOffset"], Value::Null);
+    }
+}
 
 /// Capped whole-object reads: the legacy shape when it fits, `too-large`
 /// without `maxBytes`, and a truncated reply with `maxBytes`.

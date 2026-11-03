@@ -754,9 +754,10 @@ use std::time::{Duration, Instant};
 // workspace-retired / retire-unsupported errors.
 // 15.3 adds plain-folder workspaces: Workspace.plainFolder and the workspace.create
 // plainFolder option (plain-folder-path-rejected); workspace.update refuses plainFolder.
-// 15.4 adds bounded object reads (boundedReads: 1): file.read, git.showFile and
-// note.readAsset replies stay under the read budget (maxBytes truncates, otherwise
-// too-large), and git.showFileChunk / note.readAssetChunk read whole objects in windows.
+// 15.4 adds bounded object reads (boundedReads: 1): maxBytes caps file.read,
+// git.showFile and note.readAsset replies under the read budget (callers without it
+// still get the whole object), and git.showFileChunk / note.readAssetChunk read whole
+// objects in windows.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
 pub const PROTOCOL_VERSION: &str = "15.4";
