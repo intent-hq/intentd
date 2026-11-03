@@ -63,14 +63,18 @@
 //!   relationship. The same marker above a `const` / `static` / `let`
 //!   binding exempts every use of it. A marker without a reason never
 //!   exempts and is itself reported.
-//! - **Baseline** (`tests/fixed_deadline_baseline.txt`): one `<path> <count>`
-//!   line per file that still has unmarked fixed deadlines, sorted by path. It
-//!   only ratchets down: a file over its entry (or absent) fails naming every
-//!   line; a file under its entry, or an entry whose file is gone, fails
-//!   naming the exact line to write.
-//!   To rewrite it after a bulk conversion, run the lint with
+//! - **Baseline** (`tests/baselines/fixed_deadline/<crate>.txt`, one file per
+//!   crate so PRs fixing different crates never conflict): one
+//!   `<path> <count>` line per file of that crate that still has unmarked
+//!   fixed deadlines, sorted by path. Every crate is clean today, so the
+//!   directory does not exist, and it should stay that way. It only ratchets
+//!   down: a file over its entry (or absent) fails naming every line; a file
+//!   under its entry, or an entry whose file is gone, fails naming the exact
+//!   line to write and its file.
+//!   To rewrite the files after a bulk conversion, run the lint with
 //!   `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1`; update mode refuses to raise
-//!   or add an entry, or to record a malformed marker.
+//!   or add an entry, or to record a malformed marker, and deletes the file of
+//!   a crate whose last entry went.
 //! - **Limits:** a name is followed one step, within one file: a constant
 //!   imported from another file (`use super::WAIT`) or reached by path
 //!   (`Self::WAIT`, `super::WAIT`), a production constant used by a test, an
@@ -83,12 +87,11 @@
 //!   if declared at file level.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use intentd_test_support::source_lint::{
-    markers_by_line, parse_count_baseline, skip_group, skip_whitespace, statement_line,
-    test_code_files, Marker, TestCodeText,
+    count_baseline_file, markers_by_line, parse_count_baseline, read_count_baselines, skip_group,
+    skip_whitespace, statement_line, test_code_files, write_count_baselines, Marker, TestCodeText,
 };
 
 /// Opt-out tag: `// fixed-deadline: allow — <reason>`.
@@ -106,7 +109,16 @@ const DEADLINE_CALLS: &[(&str, &[usize])] = &[
     ("wait_with_timeout", &[0]),
 ];
 
-const BASELINE_FILE: &str = "crates/intent-core/tests/fixed_deadline_baseline.txt";
+/// One `<crate>.txt` baseline per crate.
+const BASELINE_DIR: &str = "crates/intent-core/tests/baselines/fixed_deadline";
+
+/// Comment lines opening every per-crate baseline file.
+const BASELINE_HEADER: &str = "\
+# Grandfathered fixed test deadlines in this crate: `<path> <count>`, sorted by path.
+# Checked by `cargo test -p intent-core --test fixed_deadline_lint`. Entries only ratchet
+# down: wrap a hang guard in `intentd_test_support::test_timeout(..)`, or mark an
+# observation window that must stay under a fixed production timer with
+# `// fixed-deadline: allow — stays under <timer>`.";
 
 fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -596,12 +608,6 @@ fn scan_tree(root: &Path) -> Tree {
     }
 }
 
-/// Parses the baseline: `<path> <count>` per line, blank lines and `#`
-/// comments ignored, paths strictly increasing, counts positive.
-fn parse_baseline(text: &str) -> Result<BTreeMap<String, usize>, String> {
-    parse_count_baseline(text, "fixed deadlines")
-}
-
 /// The failure report, empty when the tree matches the baseline and every
 /// marker is well-formed.
 fn report(
@@ -619,18 +625,19 @@ fn report(
             ));
         }
         let count = found.len();
+        let file = count_baseline_file(BASELINE_DIR, path);
         match baseline.get(path).copied() {
             Some(allowed) if count == allowed => {}
             None if count == 0 => {}
             Some(allowed) if count < allowed => out.push(if count == 0 {
                 format!(
                     "{path}: no fixed deadlines left but the baseline allows {allowed}; the ratchet \
-                     only moves down — remove its line from {BASELINE_FILE}: `{path} {allowed}`"
+                     only moves down — remove its line from {file}: `{path} {allowed}`"
                 )
             } else {
                 format!(
                     "{path}: {count} fixed deadline(s) but the baseline allows {allowed}; the ratchet \
-                     only moves down — replace its line in {BASELINE_FILE} with: `{path} {count}`"
+                     only moves down — replace its line in {file} with: `{path} {count}`"
                 )
             }),
             allowed => {
@@ -669,7 +676,8 @@ fn report(
     for (path, allowed) in baseline {
         if !deadlines.contains_key(path) {
             out.push(format!(
-                "{path}: no longer exists; remove its line from {BASELINE_FILE}: `{path} {allowed}`"
+                "{path}: no longer exists; remove its line from {}: `{path} {allowed}`",
+                count_baseline_file(BASELINE_DIR, path)
             ));
         }
     }
@@ -679,10 +687,8 @@ fn report(
 #[test]
 fn fixed_test_deadlines_use_the_timeout_multiplier() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let baseline_text = fs::read_to_string(root.join(BASELINE_FILE))
-        .unwrap_or_else(|e| panic!("read {BASELINE_FILE}: {e}"));
-    let baseline =
-        parse_baseline(&baseline_text).unwrap_or_else(|e| panic!("{BASELINE_FILE}: {e}"));
+    let baseline = read_count_baselines(&root, BASELINE_DIR, "fixed deadlines")
+        .unwrap_or_else(|e| panic!("{e}"));
     let Tree { deadlines, whole } = scan_tree(&root);
     for known in [
         "crates/intent-store/src/tests/write_acquire_retry.rs",
@@ -704,22 +710,21 @@ fn fixed_test_deadlines_use_the_timeout_multiplier() {
         let malformed = deadlines.values().flatten().any(|d| d.marker_malformed);
         assert!(
             raised.is_empty() && !malformed,
-            "update mode only lowers {BASELINE_FILE}; fix these first:\n{}",
+            "update mode only lowers the baselines in {BASELINE_DIR}/; fix these first:\n{}",
             report(&deadlines, &baseline)
         );
-        let header = baseline_text.lines().take_while(|l| l.starts_with('#'));
-        let entries = deadlines
+        let counts = deadlines
             .iter()
-            .filter(|(_, found)| !found.is_empty())
-            .map(|(path, found)| format!("{path} {}", found.len()));
-        let lines: Vec<String> = header.map(str::to_string).chain(entries).collect();
-        fs::write(root.join(BASELINE_FILE), lines.join("\n") + "\n").expect("write baseline");
+            .map(|(path, found)| (path.clone(), found.len()))
+            .collect();
+        write_count_baselines(&root, BASELINE_DIR, BASELINE_HEADER, &counts)
+            .unwrap_or_else(|e| panic!("{e}"));
         return;
     }
     let report = report(&deadlines, &baseline);
     assert!(
         report.is_empty(),
-        "fixed test deadlines out of step with {BASELINE_FILE}:\n\n{report}\n"
+        "fixed test deadlines out of step with the baselines in {BASELINE_DIR}/:\n\n{report}\n"
     );
 }
 
@@ -862,7 +867,11 @@ async fn t() {
 #[test]
 fn baseline_parses_and_rejects_malformed_entries() {
     assert_eq!(
-        parse_baseline("# c\n\ncrates/a/tests/x.rs 3\ncrates/b/src/tests.rs\t1\n").unwrap(),
+        parse_count_baseline(
+            "# c\n\ncrates/a/tests/x.rs 3\ncrates/b/src/tests.rs\t1\n",
+            "fixed deadlines"
+        )
+        .unwrap(),
         BTreeMap::from([
             ("crates/a/tests/x.rs".to_string(), 3),
             ("crates/b/src/tests.rs".to_string(), 1),
@@ -881,7 +890,7 @@ fn baseline_parses_and_rejects_malformed_entries() {
             "sorted by path and unique",
         ),
     ] {
-        let err = parse_baseline(text).expect_err(text);
+        let err = parse_count_baseline(text, "fixed deadlines").expect_err(text);
         assert!(err.contains(expected), "{text:?}: {err}");
     }
 }
@@ -929,9 +938,9 @@ fn report_follows_the_ratchet() {
          fixed production timer or debounce): keep it fixed and put \
          `// fixed-deadline: allow — stays under <timer>` on the line above",
         "never stretch an observation window",
-        "replace its line in crates/intent-core/tests/fixed_deadline_baseline.txt with: `crates/a/tests/under.rs 1`",
-        "remove its line from crates/intent-core/tests/fixed_deadline_baseline.txt: `crates/a/tests/fixed.rs 1`",
-        "crates/a/tests/gone.rs: no longer exists",
+        "replace its line in crates/intent-core/tests/baselines/fixed_deadline/a.txt with: `crates/a/tests/under.rs 1`",
+        "remove its line from crates/intent-core/tests/baselines/fixed_deadline/a.txt: `crates/a/tests/fixed.rs 1`",
+        "crates/a/tests/gone.rs: no longer exists; remove its line from crates/intent-core/tests/baselines/fixed_deadline/a.txt",
         "crates/a/tests/marked.rs:5: timeout(Duration::from_secs(5), f);\n  fixed-deadline marker is malformed",
     ] {
         assert!(report.contains(expected), "missing {expected:?} in:\n{report}");

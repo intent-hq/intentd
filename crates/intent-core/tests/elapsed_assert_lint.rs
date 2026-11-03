@@ -43,14 +43,19 @@
 //!   it — for a measurement under a paused clock, or a limit no load can
 //!   reach (say why). A marker without a reason never exempts and is itself
 //!   reported.
-//! - **Baseline** (`tests/elapsed_assert_baseline.txt`): one `<path> <count>`
-//!   line per file that still has unmarked elapsed-time assertions, sorted by
-//!   path. It only ratchets down: a file over its entry (or absent) fails
-//!   naming every line; a file under its entry, or an entry whose file is
-//!   gone, fails naming the exact line to write. To rewrite it after a bulk
-//!   conversion, run the lint with `INTENTD_UPDATE_ELAPSED_ASSERT_BASELINE=1`;
-//!   update mode refuses to raise or add an entry, or to record a malformed
-//!   marker.
+//! - **Baseline** (`tests/baselines/elapsed_assert/<crate>.txt`, one file
+//!   per crate so PRs fixing different crates never conflict): one
+//!   `<path> <count>` line per file of that crate that still has unmarked
+//!   elapsed-time assertions, sorted by path; a crate with none has no file.
+//!   Every crate is clean today, so the directory does not exist, and it
+//!   should stay that way. It only ratchets down: a file over its entry (or
+//!   absent) fails naming every line; a file under its entry, or an entry
+//!   whose file is gone, fails naming the exact line to write and its file.
+//!   To rewrite the
+//!   files after a bulk conversion, run the lint with
+//!   `INTENTD_UPDATE_ELAPSED_ASSERT_BASELINE=1`; update mode refuses to raise
+//!   or add an entry, or to record a malformed marker, and deletes the file of
+//!   a crate whose last entry went.
 //! - **Limits:** only the three assertion macros are read — an
 //!   `if elapsed > limit { panic!(…) }`, an `assert_eq!(elapsed < limit,
 //!   true)` or an `.lt(&limit)` call is not seen, and neither is a measured
@@ -62,18 +67,26 @@
 //!   comparison.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use intentd_test_support::source_lint::{
-    markers_by_line, parse_count_baseline, statement_line, test_code_files, tokenize, Marker,
-    TestCodeText, Token,
+    count_baseline_file, markers_by_line, read_count_baselines, statement_line, test_code_files,
+    tokenize, write_count_baselines, Marker, TestCodeText, Token,
 };
 
 /// Opt-out tag: `// elapsed-assert: allow — <reason>`.
 const TAG: &str = "elapsed-assert";
 
-const BASELINE_FILE: &str = "crates/intent-core/tests/elapsed_assert_baseline.txt";
+/// One `<crate>.txt` baseline per crate.
+const BASELINE_DIR: &str = "crates/intent-core/tests/baselines/elapsed_assert";
+
+/// Comment lines opening every per-crate baseline file.
+const BASELINE_HEADER: &str = "\
+# Grandfathered elapsed-time assertions in this crate: `<path> <count>`, sorted by path.
+# Checked by `cargo test -p intent-core --test elapsed_assert_lint`. Entries only ratchet
+# down: assert what the time limit stood for (rows changed, calls made, a write that got in
+# while other work was held, event order) instead of how long the step took, or mark a
+# measurement under a paused tokio clock with `// elapsed-assert: allow — <reason>`.";
 
 /// Environment variable that rewrites the baseline (lowering only).
 const UPDATE_ENV: &str = "INTENTD_UPDATE_ELAPSED_ASSERT_BASELINE";
@@ -303,19 +316,20 @@ fn report(found: &BTreeMap<String, Vec<Hit>>, baseline: &BTreeMap<String, usize>
             ));
         }
         let count = hits.len();
+        let file = count_baseline_file(BASELINE_DIR, path);
         match baseline.get(path).copied() {
             Some(allowed) if count == allowed => {}
             None if count == 0 => {}
             Some(allowed) if count < allowed => out.push(if count == 0 {
                 format!(
                     "{path}: no elapsed-time assertions left but the baseline allows {allowed}; \
-                     the ratchet only moves down — remove its line from {BASELINE_FILE}: \
+                     the ratchet only moves down — remove its line from {file}: \
                      `{path} {allowed}`"
                 )
             } else {
                 format!(
                     "{path}: {count} elapsed-time assertion(s) but the baseline allows {allowed}; \
-                     the ratchet only moves down — replace its line in {BASELINE_FILE} with: \
+                     the ratchet only moves down — replace its line in {file} with: \
                      `{path} {count}`"
                 )
             }),
@@ -352,7 +366,8 @@ fn report(found: &BTreeMap<String, Vec<Hit>>, baseline: &BTreeMap<String, usize>
     for (path, allowed) in baseline {
         if !found.contains_key(path) {
             out.push(format!(
-                "{path}: no longer exists; remove its line from {BASELINE_FILE}: `{path} {allowed}`"
+                "{path}: no longer exists; remove its line from {}: `{path} {allowed}`",
+                count_baseline_file(BASELINE_DIR, path)
             ));
         }
     }
@@ -362,10 +377,8 @@ fn report(found: &BTreeMap<String, Vec<Hit>>, baseline: &BTreeMap<String, usize>
 #[test]
 fn tests_do_not_assert_measured_durations_stay_under_a_limit() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let baseline_text = fs::read_to_string(root.join(BASELINE_FILE))
-        .unwrap_or_else(|e| panic!("read {BASELINE_FILE}: {e}"));
-    let baseline = parse_count_baseline(&baseline_text, "elapsed-time assertions")
-        .unwrap_or_else(|e| panic!("{BASELINE_FILE}: {e}"));
+    let baseline = read_count_baselines(&root, BASELINE_DIR, "elapsed-time assertions")
+        .unwrap_or_else(|e| panic!("{e}"));
     let found = scan_tree(&root);
     let scanned: usize = found.values().map(Vec::len).sum();
     assert!(
@@ -383,22 +396,21 @@ fn tests_do_not_assert_measured_durations_stay_under_a_limit() {
         let malformed = found.values().flatten().any(|h| h.marker_malformed);
         assert!(
             raised.is_empty() && !malformed,
-            "update mode only lowers {BASELINE_FILE}; fix these first:\n{}",
+            "update mode only lowers the baselines in {BASELINE_DIR}/; fix these first:\n{}",
             report(&found, &baseline)
         );
-        let header = baseline_text.lines().take_while(|l| l.starts_with('#'));
-        let entries = found
+        let counts = found
             .iter()
-            .filter(|(_, hits)| !hits.is_empty())
-            .map(|(path, hits)| format!("{path} {}", hits.len()));
-        let lines: Vec<String> = header.map(str::to_string).chain(entries).collect();
-        fs::write(root.join(BASELINE_FILE), lines.join("\n") + "\n").expect("write baseline");
+            .map(|(path, hits)| (path.clone(), hits.len()))
+            .collect();
+        write_count_baselines(&root, BASELINE_DIR, BASELINE_HEADER, &counts)
+            .unwrap_or_else(|e| panic!("{e}"));
         return;
     }
     let report = report(&found, &baseline);
     assert!(
         report.is_empty(),
-        "elapsed-time assertions out of step with {BASELINE_FILE}:\n\n{report}\n"
+        "elapsed-time assertions out of step with the baselines in {BASELINE_DIR}/:\n\n{report}\n"
     );
 }
 
@@ -530,6 +542,7 @@ fn report_follows_the_ratchet() {
         ("crates/a/tests/equal.rs".to_string(), vec![hit(3)]),
         ("crates/a/tests/over.rs".to_string(), vec![hit(4), hit(9)]),
         ("crates/a/tests/under.rs".to_string(), vec![hit(2)]),
+        ("crates/b/src/lib.rs".to_string(), vec![hit(6)]),
         ("crates/a/tests/fixed.rs".to_string(), vec![]),
         ("crates/a/tests/new.rs".to_string(), vec![hit(7)]),
         ("crates/a/tests/clean.rs".to_string(), vec![]),
@@ -545,6 +558,7 @@ fn report_follows_the_ratchet() {
         ("crates/a/tests/equal.rs".to_string(), 1),
         ("crates/a/tests/over.rs".to_string(), 1),
         ("crates/a/tests/under.rs".to_string(), 3),
+        ("crates/b/src/lib.rs".to_string(), 2),
         ("crates/a/tests/fixed.rs".to_string(), 2),
         ("crates/a/tests/gone.rs".to_string(), 1),
         ("crates/a/tests/marked.rs".to_string(), 1),
@@ -554,10 +568,11 @@ fn report_follows_the_ratchet() {
         "crates/a/tests/over.rs: 2 assertion(s) that a measured duration stayed under a limit, the baseline allows 1:",
         "  crates/a/tests/over.rs:4: assert!(elapsed < cap);",
         "  crates/a/tests/over.rs:9: assert!(elapsed < cap);",
-        "replace its line in crates/intent-core/tests/elapsed_assert_baseline.txt with: `crates/a/tests/under.rs 1`",
-        "remove its line from crates/intent-core/tests/elapsed_assert_baseline.txt: `crates/a/tests/fixed.rs 2`",
+        "replace its line in crates/intent-core/tests/baselines/elapsed_assert/a.txt with: `crates/a/tests/under.rs 1`",
+        "remove its line from crates/intent-core/tests/baselines/elapsed_assert/a.txt: `crates/a/tests/fixed.rs 2`",
+        "replace its line in crates/intent-core/tests/baselines/elapsed_assert/b.txt with: `crates/b/src/lib.rs 1`",
         "crates/a/tests/new.rs: 1 assertion(s) that a measured duration stayed under a limit, the baseline has no entry for it:",
-        "crates/a/tests/gone.rs: no longer exists",
+        "crates/a/tests/gone.rs: no longer exists; remove its line from crates/intent-core/tests/baselines/elapsed_assert/a.txt",
         "crates/a/tests/marked.rs:5: assert!(elapsed < cap);\n  elapsed-assert marker is malformed",
     ] {
         assert!(report.contains(expected), "missing {expected:?} in:\n{report}");
