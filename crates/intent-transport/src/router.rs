@@ -145,6 +145,19 @@ fn parse_message_block_page(
     Ok(intent_core::MessageBlockPage { offset, max_bytes })
 }
 
+/// `maxBytes` on `git.diffs` / `git.branchDiff` (§5.6 "Response budget"):
+/// a positive integer sets the packed result's budget (the daemon clamps it into
+/// [64 KiB, 480,000]); absent / `null` → `None` (the 480,000-byte default);
+/// anything else → `-32602`.
+fn git_diff_max_bytes(params: &Map<String, Value>) -> Result<Option<usize>, RpcErr> {
+    match params.get("maxBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or_else(|| invalid_params("maxBytes must be a positive integer".to_string())),
+    }
+}
+
 fn parse_max_content_bytes(
     params: &Map<String, Value>,
 ) -> std::result::Result<Option<usize>, RpcErr> {
@@ -3966,8 +3979,22 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // walk to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let max_bytes = git_diff_max_bytes(params)?;
+            // §5.6 "Response budget": resumes the file list a previous
+            // page cut (its trailing `{ nextToken }` entry).
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_diffs(ws, paths, staged, commit_hash, git_root_id)
+                .git_diffs_budgeted(
+                    ws,
+                    paths,
+                    staged,
+                    commit_hash,
+                    git_root_id,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -4069,8 +4096,20 @@ async fn dispatch(
             }
             let target_ref = opt_nonempty_str(params, "targetRef");
             let paths = opt_str_array(params, "paths");
+            let max_bytes = git_diff_max_bytes(params)?;
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_branch_diff(ws, base_ref, base_sha, target_ref, paths)
+                .git_branch_diff_budgeted(
+                    ws,
+                    base_ref,
+                    base_sha,
+                    target_ref,
+                    paths,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

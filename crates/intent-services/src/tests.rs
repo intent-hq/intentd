@@ -26238,7 +26238,14 @@ mod file_tracking {
             async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The identical call joined the in-flight walk as a follower.
-        let key = (ws_id.clone(), None, false, None, None);
+        let key = (
+            ws_id.clone(),
+            None,
+            false,
+            None,
+            None,
+            (crate::git_ops::DiffBudget::for_max_bytes(None), None),
+        );
         wait_until("second call to join as follower", || {
             svc.git_diffs_waiters(&key) == 1
         })
@@ -28254,6 +28261,7 @@ mod file_tracking {
             false,
             None,
             None,
+            (crate::git_ops::DiffBudget::for_max_bytes(None), None),
         );
         wait_until("absolute request to join as follower", || {
             svc.git_diffs_waiters(&key) == 1
@@ -28338,6 +28346,7 @@ mod file_tracking {
             false,
             None,
             None,
+            (crate::git_ops::DiffBudget::for_max_bytes(None), None),
         );
         wait_until("reordered request to join as follower", || {
             svc.git_diffs_waiters(&key) == 1

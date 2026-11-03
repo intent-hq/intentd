@@ -8890,3 +8890,44 @@ async fn chunk_reads_route_offset_length_and_selector() {
         assert_eq!(v["error"]["code"], -32602, "{method} {params}: {v}");
     }
 }
+
+#[test]
+fn git_diff_max_bytes_parses_the_opt_in_and_rejects_bad_values() {
+    use super::git_diff_max_bytes;
+    use serde_json::json;
+    let p = |v: Value| v.as_object().cloned().unwrap();
+    // Absent: the service applies the default (maximum) budget.
+    assert!(matches!(git_diff_max_bytes(&p(json!({}))), Ok(None)));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": null }))),
+        Ok(None)
+    ));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": 100_000 }))),
+        Ok(Some(100_000))
+    ));
+    for bad in [json!(0), json!(-1), json!("big"), json!(1.5)] {
+        let Err(err) = git_diff_max_bytes(&p(json!({ "maxBytes": bad }))) else {
+            panic!("maxBytes {bad} must be rejected");
+        };
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("maxBytes must be a positive integer"));
+    }
+}
+
+#[tokio::test]
+async fn git_diffs_rejects_malformed_max_bytes() {
+    for method in ["git.diffs", "git.branchDiff"] {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": { "workspaceId": WorkspaceId::new().as_str(), "baseRef": "main", "maxBytes": "x" },
+        });
+        let resp = handle_message(&FakeApi, &req.to_string()).await.unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602, "{method}: {v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("maxBytes"),
+            "{method}: {v}"
+        );
+    }
+}
