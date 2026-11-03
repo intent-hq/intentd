@@ -28,6 +28,33 @@ These app-version notes qualify every later description in this guide:
   to the overview when the selected tab is clicked; use their existing
   **Context** actions to find the Spec and other notes.
 
+- New-workspace **Codebase**, **Branch**, **Setup script**, **Initial agent**,
+  and **Model** pickers, **Add codebase**, and the separate **Setup Script** modal
+  apply to app versions offering that form. Older apps use their existing
+  repository and agent/setup controls; **Single agent** and **Agent orchestration**
+  may still appear. Use the controls actually shown and preserve the prompt draft.
+- Last-top-level **Retire Agent** protection depends on the connected daemon.
+  Daemons offering the newer guard reject both manual and agent requests; older
+  daemons may allow manual retirement. Start a replacement agent first.
+- Same-provider **Retry** on a usage-limit banner requires an app offering it.
+  Older apps may offer only **Retry on [provider]** for an available alternative;
+  otherwise wait for the limit to reset and continue from the conversation.
+- **Update** for an outdated Claude Code CLI requires an app offering that action;
+  older apps may offer it only for Codex. If absent, update Claude Code with the
+  tool that installed it.
+
+In Home versions with a **Waiting** filter, status grouping separates running work
+from external waits. **Running** covers an agent at work or a running command script
+such as a build or test. With a matching app and daemon that support background-task
+activity, it also covers an agent's still-running background task, such as a shell
+command it left running; older apps may not show that activity. A dev server or
+other service script, or an open terminal tab, alone does not count.
+**Waiting** covers workspaces watching something external: a monitored PR, a background
+hook, a delegated agent, a script run monitor, or a PR in the merge queue. The
+**Waiting** filter shows the same workspaces; older apps may not offer that filter.
+Choosing a queued PR over another ready PR also requires a daemon supporting that
+priority; older daemons may show the linked PR's stage.
+
 **Reveal in Sidebar** keeps other selected panes open only in supporting
 multi-pane apps. Older apps retain their existing single-pane navigation.
 
@@ -545,15 +572,13 @@ chat. These versions remember the Home choice until the app restarts, the accoun
 or connection changes, or Home resets. Older apps use the workspace's selected
 agent or their default selection; use the agent menu to choose.
 
-In Home versions with a **Waiting** filter, status grouping separates running work
-from external waits. **Running** covers an agent at work or a running command script
-such as a build or test. With a matching app and daemon that support background-task
-activity, it also covers an agent's still-running background task, such as a shell
-command it left running; older apps may not show that activity. A dev server or
-other service script, or an open terminal tab, alone does not count.
-**Waiting** covers workspaces watching something external: a monitored PR, a background
-hook, a delegated agent, a script run monitor, or a PR in the merge queue. The
-**Waiting** filter shows the same workspaces; older apps may not offer that filter.
+Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
+and **Done & idle**, in that priority order. **Running** covers an agent at work, a
+running command script such as a build or test, or an agent's background task such as
+a shell command it left running; a dev server or other service script, or an open
+terminal tab, alone does not count. **Waiting** covers workspaces watching something external: a
+monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
+the merge queue. The **Waiting** filter shows the same workspaces.
 
 The PR badge's priority in list and board views depends on the app version. Apps
 that prioritize queued PRs show a PR in the merge queue first, then drafts, other
