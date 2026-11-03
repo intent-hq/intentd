@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.113] - 2026-11-03
+
+### 🚀 Features
+
+- Report executor-run agents' memory and connected-daemon counts ([#2980](https://github.com/intent-hq/intentd/pull/2980))
+
+### 🐛 Bug Fixes
+
+- Bound search, event and discussion reads under the 500 KiB budget ([#2977](https://github.com/intent-hq/intentd/pull/2977))
+- Require a connected owner forge to create or redeem invites ([#2974](https://github.com/intent-hq/intentd/pull/2974))
+- Run workspace setup scripts with the enhanced PATH ([#2983](https://github.com/intent-hq/intentd/pull/2983))
+
+
 ## [0.11.112] - 2026-11-03
 
 ### 🐛 Bug Fixes
