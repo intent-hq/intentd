@@ -75,10 +75,14 @@ async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
     assert_eq!(machine_json["capabilities"]["capacity"]["agentCap"], 2);
     assert!(machine_json["addedAt"].is_string());
     assert!(machine_json["lastConnectedAt"].is_string());
+    // The negotiated version is stored but not served until the backend
+    // advertises `remoteScripts: 1`.
+    assert!(machine_json.get("nodeProtocol").is_none(), "{machine_json}");
     assert!(added.get("replacedCredentialId").is_none());
 
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"].as_array().unwrap().len(), 1);
+    assert!(listed["machines"][0].get("nodeProtocol").is_none());
     for text in [added.to_string(), listed.to_string()] {
         assert!(!text.contains(&machine.token), "never the token");
     }
@@ -89,6 +93,17 @@ async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
             .await
             .unwrap(),
         Some(machine.token.clone())
+    );
+    assert_eq!(
+        backend
+            .store()
+            .get_exposed_machine(&machine.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .node_protocol,
+        Some(intent_core::node_link::NODE_LINK_PROTOCOLS.max),
+        "the bind's version is stored"
     );
     let row = backend
         .store()

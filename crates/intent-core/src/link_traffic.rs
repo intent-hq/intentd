@@ -12,8 +12,8 @@
 //! [`LinkTraffic::stop`] turns capture off and clears everything. Nothing is
 //! persisted.
 //!
-//! Redaction happens before a record enters the ring: profile environment
-//! values, any key naming a token, secret, password, credential,
+//! Redaction happens before a record enters the ring: profile and script
+//! environment values (every member named `env`), any key naming a token, secret, password, credential,
 //! authorization, cookie, private key or certificate, and any PEM block are
 //! replaced by `"***"`. Payloads larger than the limit after redaction are
 //! omitted (`truncated: true`), the record itself kept.
@@ -662,6 +662,41 @@ fn light_frame(frame: &LinkFrame) -> Value {
         }
         LinkFrame::Capabilities => json!({ "type": "capabilities" }),
         LinkFrame::CapabilitiesReply { .. } => json!({ "type": "capabilitiesReply" }),
+        LinkFrame::ScriptStart(start) => json!({
+            "type": "scriptStart",
+            "agentId": agent(&start.agent_id),
+            "scriptId": field(&start.script_id),
+            "spawnId": field(&start.spawn_id),
+            "mode": start.mode,
+        }),
+        LinkFrame::ScriptStop(stop) => json!({
+            "type": "scriptStop",
+            "agentId": agent(&stop.agent_id),
+            "scriptId": field(&stop.script_id),
+            "spawnId": field(&stop.spawn_id),
+        }),
+        LinkFrame::ScriptStarted(started) => json!({
+            "type": "scriptStarted",
+            "agentId": agent(&started.agent_id),
+            "scriptId": field(&started.script_id),
+            "spawnId": field(&started.spawn_id),
+            "pid": started.pid,
+        }),
+        LinkFrame::ScriptOutput(output) => json!({
+            "type": "scriptOutput",
+            "agentId": agent(&output.agent_id),
+            "scriptId": field(&output.script_id),
+            "spawnId": field(&output.spawn_id),
+            "seq": output.seq,
+        }),
+        LinkFrame::ScriptExited(exited) => json!({
+            "type": "scriptExited",
+            "agentId": agent(&exited.agent_id),
+            "scriptId": field(&exited.script_id),
+            "spawnId": field(&exited.spawn_id),
+            "exitCode": exited.exit_code,
+            "error": exited.error.as_deref().map(field),
+        }),
     }
 }
 
@@ -766,6 +801,43 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
             ),
             _ => "response ok".to_owned(),
         },
+        "scriptStart" => format!(
+            "scriptStart {} spawn {} for {agent} ({})",
+            text(frame, "scriptId"),
+            text(frame, "spawnId"),
+            text(frame, "mode")
+        ),
+        "scriptStop" => format!(
+            "scriptStop {} spawn {} for {agent}",
+            text(frame, "scriptId"),
+            text(frame, "spawnId")
+        ),
+        "scriptStarted" => format!(
+            "scriptStarted {} spawn {} for {agent} pid {}",
+            text(frame, "scriptId"),
+            text(frame, "spawnId"),
+            number(frame, "pid")
+        ),
+        "scriptOutput" => format!(
+            "scriptOutput {} spawn {} for {agent} #{}",
+            text(frame, "scriptId"),
+            text(frame, "spawnId"),
+            number(frame, "seq")
+        ),
+        "scriptExited" => {
+            let mut line = format!(
+                "scriptExited {} spawn {} for {agent}",
+                text(frame, "scriptId"),
+                text(frame, "spawnId")
+            );
+            match frame.get("exitCode").filter(|code| !code.is_null()) {
+                Some(code) => {
+                    let _ = write!(line, " code {code}");
+                }
+                None => line.push_str(" without a code"),
+            }
+            line
+        }
         other => other.to_owned(),
     }
 }
@@ -811,6 +883,8 @@ pub(crate) fn redact(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 if key == "profileEnv" {
                     redact_profile_env(child);
+                } else if key == "env" {
+                    redact_env(child);
                 } else if secret_key(key)
                     && !matches!(child, Value::Null | Value::Number(_) | Value::Bool(_))
                 {
@@ -828,19 +902,55 @@ pub(crate) fn redact(value: &mut Value) {
     }
 }
 
-/// `{ providerRef, fingerprint, env: [{ key, value }] }`: every non-null
-/// `value` is masked; everything else is redacted as usual.
-fn redact_profile_env(env: &mut Value) {
-    if let Some(entries) = env.get_mut("env").and_then(Value::as_array_mut) {
-        for entry in entries {
-            if let Some(value) = entry.get_mut("value") {
+/// A `profileEnv` overlay `{ providerRef, fingerprint, env: [{ key, value }] }`:
+/// its `env` values are masked, its `providerRef` and `fingerprint` stay
+/// readable. Recognized only under the `profileEnv` key, never by shape, so
+/// an ordinary env map with variables named `env` or `providerRef` is not
+/// mistaken for one.
+fn redact_profile_env(overlay: &mut Value) {
+    match overlay {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "env" {
+                    redact_env(child);
+                } else {
+                    redact(child);
+                }
+            }
+        }
+        other => redact_env(other),
+    }
+}
+
+/// An environment under an `env` key: a script's `env: [{ key, value }]`
+/// (`scriptStart`) or a saved script's `env: { KEY: value }` (forwarded
+/// `script.*` params and results). Every non-null value is masked and the
+/// keys stay visible.
+fn redact_env(env: &mut Value) {
+    match env {
+        Value::Array(entries) => {
+            for entry in entries.iter_mut() {
+                // A `{ key, value }` pair masks its value; anything else (a
+                // bare string, an object of other members) still gets the
+                // generic redaction, so nothing is left as it was.
+                if let Some(value) = entry.get_mut("value") {
+                    if !value.is_null() {
+                        *value = json!(MASK);
+                    }
+                }
+                redact(entry);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
                 if !value.is_null() {
                     *value = json!(MASK);
                 }
             }
         }
+        Value::String(_) => *env = json!(MASK),
+        _ => {}
     }
-    redact(env);
 }
 
 /// One link's view of the daemon's capture: the peer every frame it sees

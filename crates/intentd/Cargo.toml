@@ -47,6 +47,7 @@ intent-git = { path = "../intent-git", version = "0.11.117" }
 intent-context = { path = "../intent-context", version = "0.11.117" }
 intent-transport = { path = "../intent-transport", version = "0.11.117" }
 intent-nodes = { path = "../intent-nodes", version = "0.11.117" }
+intent-pty = { path = "../intent-pty", version = "0.11.117" }
 intent-js = { path = "../intent-js", version = "0.11.117", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }

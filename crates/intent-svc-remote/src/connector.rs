@@ -506,6 +506,9 @@ impl Shared {
                 .record_exposed_machine_capabilities(&id, &welcome.capabilities)
                 .await?;
             self.store
+                .record_exposed_machine_protocol(&id, welcome.protocol)
+                .await?;
+            self.store
                 .set_exposed_machine_state(&id, RemoteMachineState::Disconnected)
                 .await
         };

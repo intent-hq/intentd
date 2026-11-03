@@ -536,9 +536,12 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         98,
     )
     .await;
+    // The documented refusal is the `remote-agent-unsupported:` code
+    // (this backend does not run remote agents' saved scripts yet); the
+    // prose after it is not a contract.
     assert!(
         refused.starts_with("wsapi-error: ")
-            && refused.contains("is not supported on remote agents yet"),
+            && refused.contains("remote-agent-unsupported: `script.list`"),
         "{refused}"
     );
 

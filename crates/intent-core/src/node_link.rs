@@ -38,15 +38,21 @@ pub enum StopOutcome {
 
 /// The private node-link protocol versions this build speaks. The
 /// daemon-to-daemon executor link started at 6; 7 adds the correlated stop
-/// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]).
-/// Neither 6 nor the single-node 5 ever shipped, and a protocol-6 peer
-/// cannot confirm a stop, so this build speaks 7 only: a backend never
-/// takes a stop as confirmed by a machine that cannot acknowledge it. The
+/// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
+/// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]). Neither 6 nor the
+/// single-node 5 ever shipped, and a protocol-6 peer cannot confirm a stop,
+/// so this build speaks 7 and 8: a backend never takes a stop as confirmed
+/// by a machine that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 7 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 8 };
+
+/// The first protocol with the saved-script frames (`scriptStart`,
+/// `scriptStop`, `scriptStarted`, `scriptOutput`, `scriptExited`). Neither
+/// side sends one on a link that negotiated less.
+pub const SCRIPT_PROTOCOL: u32 = 8;
 
 /// An inclusive range of node-link protocol versions a peer speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,11 +90,13 @@ impl std::fmt::Display for ProtocolRange {
 
 /// The link frame types a backend holding an executor credential may send
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
-/// liveness, agent control, journal acks, the capabilities request and
-/// responses to the machine's forwarded `workspace.call` requests. Nothing
-/// else is admitted from an executor credential; the machine-to-backend
-/// frames (`welcome`, `journal`, `replayComplete`, `request`,
-/// `capabilitiesReply`, `stopAck`) and `cancelRequest` are refused. Git sessions use the
+/// liveness, agent control, journal acks, the capabilities request,
+/// responses to the machine's forwarded `workspace.call` requests, and
+/// starting and stopping script runs (protocol 8). Nothing else is admitted
+/// from an executor credential; the machine-to-backend frames (`welcome`,
+/// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
+/// `scriptStarted`, `scriptOutput`, `scriptExited`) and `cancelRequest` are
+/// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
 /// [`LinkFrame::admitted_from_executor`] is the typed form.
 pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
@@ -101,6 +109,8 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "launch",
     "prompt",
     "response",
+    "scriptStart",
+    "scriptStop",
     "stop",
 ];
 
@@ -347,6 +357,110 @@ impl std::fmt::Debug for LaunchProfileEnv {
     }
 }
 
+/// Backend asks the machine to run one process of a remote agent's machine
+/// run of a saved script, in that agent's checkout. `spawn_id` is a UUID the
+/// backend picks for every process it starts, automatic restarts included,
+/// unique within the binding; it is not the run's §5.8a `runId`. A process is
+/// identified by (`agent_id`, `script_id`, `spawn_id`). The body is closed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptStartCommand {
+    /// The remote agent whose machine run this is: it runs in its checkout.
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub command: String,
+    pub mode: crate::ScriptMode,
+    /// Relative to the agent's checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The saved environment, in saved order. Values may be secrets:
+    /// `Debug` renders only the keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<ScriptEnvVar>,
+}
+
+impl std::fmt::Debug for ScriptStartCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptStartCommand")
+            .field("agent_id", &self.agent_id)
+            .field("script_id", &self.script_id)
+            .field("spawn_id", &self.spawn_id)
+            .field("mode", &self.mode)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One saved environment variable of a [`ScriptStartCommand`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for ScriptEnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}=<redacted>", self.key)
+    }
+}
+
+/// Names one script process: the body of `scriptStop`. The machine answers
+/// every stop with that process's `scriptExited`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptProcessRef {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+}
+
+/// Machine to backend: the run's process is spawned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptStarted {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub pid: u32,
+}
+
+/// Machine to backend: the next piece of the run's combined output, as
+/// UTF-8 text (invalid bytes replaced), `seq` counting from 0 per `spawn_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptOutput {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub seq: u64,
+    pub data: String,
+}
+
+/// Machine to backend: the run ended. `exit_code` is absent only together
+/// with `error` (`"<code>: <detail>"`), for a refused start or a stop of a
+/// process that is not running (`node-script-not-running`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptExited {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The largest `data` one [`ScriptOutput`] carries, in bytes.
+pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The most `scriptOutput` `data` one side keeps queued on a link, in bytes;
+/// past it the sender drops output and later reports how much it dropped.
+pub const SCRIPT_OUTPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
 /// A request over the link: node to head for forwarded workspace API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -384,6 +498,9 @@ pub enum LinkChannel {
     Control,
     Journal,
     Rpc,
+    /// Script runs (protocol 8): queued behind control frames, so output
+    /// never delays heartbeats, stops or launches.
+    Script,
 }
 
 /// One frame on the control/journal/RPC connection.
@@ -457,6 +574,11 @@ pub enum LinkFrame {
     CapabilitiesReply {
         capabilities: MachineCapabilities,
     },
+    ScriptStart(ScriptStartCommand),
+    ScriptStop(ScriptProcessRef),
+    ScriptStarted(ScriptStarted),
+    ScriptOutput(ScriptOutput),
+    ScriptExited(ScriptExited),
 }
 
 impl LinkFrame {
@@ -481,6 +603,21 @@ impl LinkFrame {
             Self::Request(_) | Self::Response { .. } | Self::CancelRequest { .. } => {
                 LinkChannel::Rpc
             }
+            Self::ScriptStart(_)
+            | Self::ScriptStop(_)
+            | Self::ScriptStarted(_)
+            | Self::ScriptOutput(_)
+            | Self::ScriptExited(_) => LinkChannel::Script,
+        }
+    }
+
+    /// The lowest negotiated protocol this frame may travel on.
+    #[must_use]
+    pub fn min_protocol(&self) -> u32 {
+        if self.channel() == LinkChannel::Script {
+            SCRIPT_PROTOCOL
+        } else {
+            NODE_LINK_PROTOCOLS.min
         }
     }
 
@@ -498,14 +635,19 @@ impl LinkFrame {
             | Self::Stop { .. }
             | Self::Ack { .. }
             | Self::Response { .. }
-            | Self::Capabilities => true,
+            | Self::Capabilities
+            | Self::ScriptStart(_)
+            | Self::ScriptStop(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
             | Self::Request(_)
             | Self::CancelRequest { .. }
             | Self::CapabilitiesReply { .. }
-            | Self::StopAck { .. } => false,
+            | Self::StopAck { .. }
+            | Self::ScriptStarted(_)
+            | Self::ScriptOutput(_)
+            | Self::ScriptExited(_) => false,
         }
     }
 

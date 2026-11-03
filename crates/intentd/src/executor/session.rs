@@ -11,7 +11,8 @@
 //! acknowledge nothing, and cannot move the journal back to its lease.
 
 use intent_core::node_link::{
-    LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError, MachineCapabilities, StopId,
+    LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
+    MachineCapabilities, StopId,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -177,6 +178,25 @@ async fn apply(
     Applied::Done
 }
 
+/// Apply one script-lane frame (nodeProtocol 8) for `binding`'s session, on
+/// `link`. A replaced session starts and stops nothing.
+async fn apply_script(runner: &Runner, binding: &LeaseBinding, link: &NodeLink, frame: LinkFrame) {
+    let gate = runner.link_gate().lock().await;
+    if admit(gate.as_ref(), binding, link.is_closed()) == Admission::Replaced {
+        tracing::debug!("node: dropping a script frame from a replaced link");
+        return;
+    }
+    match frame {
+        LinkFrame::ScriptStart(command) => {
+            runner.script_start(link, binding.generation, command).await;
+        }
+        LinkFrame::ScriptStop(process) => runner.script_stop(link, &process),
+        other => {
+            tracing::debug!(frame = ?other.channel(), "node: ignoring unexpected script frame");
+        }
+    }
+}
+
 /// A fresh capabilities report, for [`LinkFrame::Capabilities`].
 pub(super) type Report =
     std::sync::Arc<dyn Fn() -> BoxFuture<'static, MachineCapabilities> + Send + Sync>;
@@ -227,6 +247,9 @@ pub(super) async fn serve_link(
                         .await;
                 });
             }
+            LinkEvent::Frame(frame) if frame.channel() == LinkChannel::Script => {
+                apply_script(&runner, &binding, &link, frame).await;
+            }
             LinkEvent::Frame(frame) => {
                 match apply(&runner, &binding, || link.is_closed(), frame).await {
                     Applied::Close => link.close(),
@@ -256,6 +279,8 @@ pub(super) async fn serve_link(
         }
     }
     streamer.abort();
+    // No script outlives the link that started it.
+    runner.end_binding_scripts(binding.generation).await;
 }
 
 /// Send every record after `acked`, then `ReplayComplete`, then each new

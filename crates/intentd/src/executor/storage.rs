@@ -199,6 +199,13 @@ impl Storage {
         self.git_socket.clone()
     }
 
+    /// `agent_id`'s test working directory, if [`Self::agent_dir`] made it.
+    #[cfg(test)]
+    pub(super) fn existing_agent_dir(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        let dir = self.root.join(AGENTS).join(&agent_id.0).join("work");
+        (valid_id(&agent_id.0) && dir.is_dir()).then_some(dir)
+    }
+
     /// A fresh working directory for `agent_id`, created on demand.
     #[cfg(test)]
     pub(super) fn agent_dir(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {

@@ -1311,4 +1311,5 @@ async fn abandoned_queued_request_is_never_sent_uncancelled() {
 
 mod executor;
 mod git_sessions;
+mod script_lane;
 mod stop_ack;

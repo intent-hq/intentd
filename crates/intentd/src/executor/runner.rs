@@ -36,6 +36,7 @@ use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
 
 use super::checkout::Checkouts;
+use super::scripts::ScriptProcesses;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
@@ -155,6 +156,8 @@ struct Inner {
     /// adoption and every side effect, so a replaced session can act on
     /// nothing (see `session.rs`).
     link_gate: tokio::sync::Mutex<Option<LeaseBinding>>,
+    /// Machine runs of the agents' saved scripts (nodeProtocol 8).
+    scripts: ScriptProcesses,
 }
 
 #[derive(Default)]
@@ -606,8 +609,39 @@ impl Runner {
                 state: Mutex::new(State::default()),
                 pumps: Mutex::new(Vec::new()),
                 link_gate: tokio::sync::Mutex::new(None),
+                scripts: ScriptProcesses::new(Arc::new(intent_pty::PtyHost::new())),
             }),
         }
+    }
+
+    /// Start one process of a machine run for the link binding
+    /// `generation`, in the agent's checkout when it has one here.
+    pub(super) async fn script_start(
+        &self,
+        link: &intent_transport::node_link::NodeLink,
+        generation: NodeCounter,
+        command: intent_core::node_link::ScriptStartCommand,
+    ) {
+        let checkout = self.inner.checkouts.existing(&command.agent_id);
+        self.inner
+            .scripts
+            .start(link, generation, checkout.as_deref(), command)
+            .await;
+    }
+
+    /// Stop one script process; its `scriptExited` acknowledges the stop.
+    pub(super) fn script_stop(
+        &self,
+        link: &intent_transport::node_link::NodeLink,
+        process: &intent_core::node_link::ScriptProcessRef,
+    ) {
+        self.inner.scripts.stop(link, process);
+    }
+
+    /// Kill every script process the link binding `generation` started:
+    /// its link ended, so no script outlives it.
+    pub(super) async fn end_binding_scripts(&self, generation: NodeCounter) {
+        self.inner.scripts.stop_binding(generation).await;
     }
 
     /// The machine's shared limits and their use.
@@ -1319,6 +1353,11 @@ impl Runner {
     /// `not-running` when no such agent runs, once any exit record still
     /// being written for it is journaled. Repeating a stop is harmless.
     pub(super) fn stop(&self, agent_id: &AgentId) -> StopWait {
+        // The agent's scripts stop with it.
+        let scripts = self.inner.scripts.clone();
+        let agent = agent_id.clone();
+        // caller-binding: allow — node-local script teardown for a stopped agent
+        tokio::spawn(async move { scripts.stop_agent(&agent).await });
         let state = lock(&self.inner.state);
         if let Some(agent) = state.agents.get(agent_id).cloned() {
             drop(state);
@@ -1374,6 +1413,7 @@ impl Runner {
         if drained.is_err() {
             tracing::warn!("node: shutdown gave up waiting for agent records to be journaled");
         }
+        self.inner.scripts.stop_all().await;
     }
 }
 

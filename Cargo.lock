@@ -2650,6 +2650,7 @@ dependencies = [
  "intent-linear",
  "intent-nodes",
  "intent-providers",
+ "intent-pty",
  "intent-sentry",
  "intent-services",
  "intent-sourcecontrol",

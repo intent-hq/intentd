@@ -23,7 +23,7 @@ const CREDENTIAL_COLUMNS: &str =
     "id, backend_id, backend_name, backend_fingerprint, created_at, last_used_at, revoked_at";
 const MACHINE_COLUMNS: &str = "id, name, hosts_json, port, tc_address, fingerprint, \
      credential_id, platform_json, capabilities_json, observed_at, state, added_at, \
-     last_connected_at";
+     last_connected_at, node_protocol";
 
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("remote machine persistence: {error}"))
@@ -93,6 +93,11 @@ fn machine_row(row: &SqliteRow) -> Result<ExposedMachine> {
         state,
         added_at: row.get("added_at"),
         last_connected_at: row.get("last_connected_at"),
+        node_protocol: row
+            .get::<Option<i64>, _>("node_protocol")
+            .map(u32::try_from)
+            .transpose()
+            .map_err(db)?,
     })
 }
 
@@ -412,7 +417,8 @@ impl Store {
         sqlx::query(
             "INSERT OR REPLACE INTO exposed_machine (id, name, hosts_json, port, tc_address, \
              fingerprint, credential_id, platform_json, capabilities_json, observed_at, state, \
-             added_at, last_connected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             added_at, last_connected_at, node_protocol) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&machine.id)
         .bind(&machine.name)
@@ -427,6 +433,7 @@ impl Store {
         .bind(machine.state.as_str())
         .bind(&machine.added_at)
         .bind(&machine.last_connected_at)
+        .bind(machine.node_protocol.map(i64::from))
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -533,6 +540,23 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Record the node-link protocol a bind negotiated with the machine; it
+    /// is kept while the machine is disconnected. Returns whether the
+    /// machine exists.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn record_exposed_machine_protocol(&self, id: &str, protocol: u32) -> Result<bool> {
+        let done = sqlx::query("UPDATE exposed_machine SET node_protocol = ? WHERE id = ?")
+            .bind(i64::from(protocol))
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(db)?;
         Ok(done.rows_affected() > 0)
     }
 

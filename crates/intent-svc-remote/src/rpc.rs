@@ -92,6 +92,18 @@ impl HeadCalls {
         if method != COMMIT_POLICY_METHOD && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
+        // A protocol-8 machine forwards `ws.script.*`, but this backend does
+        // not run machine runs yet and does not advertise `remoteScripts`:
+        // refuse rather than run the agent's script in the home checkout.
+        if method.starts_with("script.") {
+            return refusal(
+                FORBIDDEN,
+                format!(
+                    "{}: `{method}` is not supported on remote agents by this backend yet",
+                    workspace_api::UNSUPPORTED_CODE
+                ),
+            );
+        }
         let record = match shared.store.get_remote_agent(&request.agent_id).await {
             Ok(Some(record)) if record.lease_id == binding.lease_id => record,
             Ok(_) => {

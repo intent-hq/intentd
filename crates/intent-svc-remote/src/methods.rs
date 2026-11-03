@@ -61,6 +61,8 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
     if let Some(last) = &row.last_connected_at {
         machine.insert("lastConnectedAt".into(), json!(last));
     }
+    // `nodeProtocol` (stored per bind) is served only together with
+    // `remoteScripts: 1`, which this backend does not advertise yet.
     Value::Object(machine)
 }
 
@@ -354,6 +356,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
             .as_ref()
             .map_or_else(|| now.clone(), |row| row.added_at.clone()),
         last_connected_at: Some(now),
+        node_protocol: Some(welcome.protocol),
     };
 
     // Save. A new credential replaces the lease: the old connector stops
