@@ -3,7 +3,7 @@
 //! host scope) and no open invite can be redeemed. Existing guests keep
 //! their access, and the unused invites work again once a forge reconnects.
 
-use super::tests::{fixture, guest, id_of, invite_kind, nonce_of, wire, with_forge, Fixture};
+use super::tests::{fixture, gist, guest, id_of, invite_kind, nonce_of, wire, with_forge, Fixture};
 use super::*;
 use crate::tests::pr::StubForge;
 use crate::tests::TempDb;
@@ -166,9 +166,81 @@ async fn disconnect_blocks_redemption_but_keeps_existing_guests() {
         .unwrap()
         .is_some());
 
-    with_forge(&mut f, vec![]);
+    with_forge(&mut f, vec![("g1", Ok(gist("other", Some(&nonce))))]);
     f.services
         .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("reconnected forge reopens redemption");
+    let joined = f
+        .services
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &nonce,
+            InviteProofClaim::github("g1", "other"),
+            InviteScope::Workspace,
+        )
+        .await
+        .expect("the nonce a refused prove presented is still redeemable");
+    assert_eq!(joined["status"], json!("authorized"));
+    assert_eq!(joined["login"], json!("other"));
+}
+
+/// The owner-forge check runs only after the invite and secret validate:
+/// a wrong secret is still `NotFound` and never reaches a forge.
+#[tokio::test]
+async fn wrong_secret_is_not_found_without_a_forge_call() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    let invite_id = id_of(&f.create_invite(None).await);
+    let forge = Arc::new(StubForge::unauthenticated());
+    f.services = f.services.clone().with_source_control(forge.clone());
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, "wrong", InviteScope::Workspace)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+    let r = f
+        .services
+        .invite_prove_op(
+            &invite_id,
+            "wrong",
+            "nonce",
+            InviteProofClaim::github("g1", "guest"),
+            InviteScope::Workspace,
+        )
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
+    assert_eq!(
+        forge
+            .get_user_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Host-scope invites are gated the same way: minted while connected, they
+/// cannot be challenged once the owner's forge is disconnected.
+#[tokio::test]
+async fn host_invite_redemption_refuses_without_a_forge() {
+    let tmp = TempDb::new();
+    let mut f = fixture(&tmp).await;
+    with_forge(&mut f, vec![]);
+    let created = with_caller(
+        Caller::Daemon,
+        f.services.host_invite_create_op(pin("guest")),
+    )
+    .await
+    .expect("connected owner mints a host invite");
+    let (invite_id, secret) = (
+        id_of(&created),
+        created["secret"].as_str().unwrap().to_string(),
+    );
+    disconnect(&mut f);
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Host)
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert_eq!(f.store.list_open_host_invites().await.unwrap().len(), 1);
 }

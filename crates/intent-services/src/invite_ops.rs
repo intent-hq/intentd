@@ -293,18 +293,32 @@ impl Services {
     /// Sharing requires a connected owner forge: the host's GitHub
     /// credential or its bound GitLab instance must answer for a live
     /// account right now (the same probes the primary identity refresh
-    /// uses). A cached profile, an unreachable forge or a rejected
+    /// uses; both run concurrently). A cached profile or a rejected
     /// credential does not qualify, so with neither forge connected no
     /// invite is minted and no open invite is redeemed —
-    /// [`InviteErrorKind::GithubIdentityRequired`]. Guests who already
-    /// joined keep their access; this gates new admissions only.
+    /// [`InviteErrorKind::GithubIdentityRequired`]. When neither is
+    /// connected but one could not be reached, the owner may well be
+    /// connected, so the refusal is [`InviteErrorKind::GithubUnreachable`]
+    /// (retryable) instead. Guests who already joined keep their access;
+    /// this gates new admissions only.
+    ///
+    /// The probes run as the daemon: this is the host checking its own
+    /// connection, and the unauthenticated `/invite` redemption calls bind
+    /// no caller (the GitLab probe refuses to run without one).
     pub(crate) async fn require_owner_forge(&self) -> Result<()> {
-        if matches!(self.github_link().await, ForgeLink::Connected(_))
-            || matches!(self.gitlab_link().await, ForgeLink::Connected(_))
-        {
-            return Ok(());
+        let (github, gitlab) = intent_core::with_caller(Caller::Daemon, async {
+            tokio::join!(self.github_link(), self.gitlab_link())
+        })
+        .await;
+        match (github, gitlab) {
+            (ForgeLink::Connected(_), _) | (_, ForgeLink::Connected(_)) => Ok(()),
+            (ForgeLink::Unreachable, _) | (_, ForgeLink::Unreachable) => {
+                Err(Error::Invite(InviteErrorKind::GithubUnreachable))
+            }
+            (ForgeLink::NotConnected, ForgeLink::NotConnected) => {
+                Err(Error::Invite(InviteErrorKind::GithubIdentityRequired))
+            }
         }
-        Err(Error::Invite(InviteErrorKind::GithubIdentityRequired))
     }
 
     /// The `(provider, host)` a forge-scoped invite param names, with the

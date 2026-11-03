@@ -3448,10 +3448,11 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
 
 // --- verifier probes (adopted as regression tests) --------------------------
 
-/// A cached primary identity is no connection: with the real client
-/// reporting the forge disconnected (unreachable), no invite is minted.
+/// A cached primary identity is no connection: with the real client unable
+/// to reach the forge, no invite is minted, and the refusal is the
+/// retryable `github-unreachable` rather than "connect a forge".
 #[tokio::test]
-async fn cached_primary_identity_without_live_auth_cannot_invite() {
+async fn unreachable_forge_refuses_invites_as_unreachable() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     let mut primary = f.store.get_principal(&f.primary).await.expect("primary");
@@ -3475,7 +3476,7 @@ async fn cached_primary_identity_without_live_auth_cannot_invite() {
         services.workspace_invite_create_op(&f.ws, None, None),
     )
     .await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
     assert_eq!(
         f.store.count_open_workspace_invites().await.expect("count"),
         0
