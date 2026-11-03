@@ -48,8 +48,14 @@ const QUEUE: usize = 1024;
 /// Wire bytes of the frames waiting for the collector before new ones are
 /// dropped: two of the largest frames a link carries.
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
-/// What a light capture counts against the queue's byte budget.
-pub(crate) const LIGHT_BYTES: usize = 256;
+/// What a light capture counts against the queue's byte budget, and the
+/// most JSON its record holds: every string it copies is clipped to
+/// [`FIELD_BYTES`] and its summary to [`SUMMARY_BYTES`].
+pub(crate) const LIGHT_BYTES: usize = 1024;
+/// Longest string a light capture copies from a frame.
+const FIELD_BYTES: usize = 96;
+/// Longest summary a record keeps.
+const SUMMARY_BYTES: usize = 200;
 /// Most records in one published batch, and the longest a record waits for
 /// its batch.
 const BATCH_MAX: usize = 100;
@@ -557,7 +563,10 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
         record.insert("requestId".into(), json!(request_id));
     }
     record.insert("bytes".into(), json!(captured.bytes));
-    record.insert("summary".into(), json!(summarize(&frame_type, &payload)));
+    record.insert(
+        "summary".into(),
+        json!(clip(&summarize(&frame_type, &payload), SUMMARY_BYTES)),
+    );
     let mut oversized = false;
     if let Some(truncated) = light {
         if truncated {
@@ -585,7 +594,8 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
 /// ids and the fields [`summarize`] reads, never a prompt, params body,
 /// result, journal body or launch configuration.
 fn light_frame(frame: &LinkFrame) -> Value {
-    let agent = |id: &crate::AgentId| json!(id);
+    let agent = |id: &crate::AgentId| json!(clip(id.as_str(), FIELD_BYTES));
+    let field = |text: &str| json!(clip(text, FIELD_BYTES));
     match frame {
         LinkFrame::Hello(hello) => json!({
             "type": "hello",
@@ -594,19 +604,19 @@ fn light_frame(frame: &LinkFrame) -> Value {
         LinkFrame::Welcome(welcome) => json!({
             "type": "welcome",
             "protocol": welcome.protocol,
-            "runningAgents": welcome.running_agents,
+            "runningAgentCount": welcome.running_agents.len(),
         }),
         LinkFrame::Heartbeat { nonce } => json!({ "type": "heartbeat", "nonce": nonce }),
         LinkFrame::HeartbeatReply { nonce } => json!({ "type": "heartbeatReply", "nonce": nonce }),
         LinkFrame::Launch(launch) => json!({
             "type": "launch",
             "agentId": agent(&launch.agent_id),
-            "provider": launch.provider,
-            "model": launch.model,
+            "provider": field(&launch.provider),
+            "model": launch.model.as_deref().map(field),
         }),
         LinkFrame::Prompt {
             agent_id, turn_id, ..
-        } => json!({ "type": "prompt", "agentId": agent(agent_id), "turnId": turn_id }),
+        } => json!({ "type": "prompt", "agentId": agent(agent_id), "turnId": field(turn_id) }),
         LinkFrame::Cancel { agent_id } => json!({ "type": "cancel", "agentId": agent(agent_id) }),
         LinkFrame::Stop { agent_id, stop_id } => {
             json!({ "type": "stop", "agentId": agent(agent_id), "stopId": stop_id })
@@ -629,10 +639,10 @@ fn light_frame(frame: &LinkFrame) -> Value {
                 "type": "request",
                 "requestId": request.request_id,
                 "agentId": agent(&request.agent_id),
-                "method": request.method,
+                "method": field(&request.method),
             });
             if let Some(method) = request.params.get("method").and_then(Value::as_str) {
-                light["params"] = json!({ "method": method });
+                light["params"] = json!({ "method": field(method) });
             }
             light
         }
@@ -653,6 +663,19 @@ fn light_frame(frame: &LinkFrame) -> Value {
         LinkFrame::Capabilities => json!({ "type": "capabilities" }),
         LinkFrame::CapabilitiesReply { .. } => json!({ "type": "capabilitiesReply" }),
     }
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, with `…`
+/// marking a cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 fn journal_kind(body: &JournalBody) -> &'static str {
@@ -693,7 +716,14 @@ fn summarize(frame_type: &str, frame: &Value) -> String {
             frame
                 .get("runningAgents")
                 .and_then(Value::as_array)
-                .map_or(0, Vec::len)
+                .map(Vec::len)
+                .or_else(|| {
+                    frame
+                        .get("runningAgentCount")
+                        .and_then(Value::as_u64)
+                        .and_then(|count| usize::try_from(count).ok())
+                })
+                .unwrap_or(0)
         ),
         "heartbeat" | "heartbeatReply" => format!("{frame_type} {}", number(frame, "nonce")),
         "launch" => {

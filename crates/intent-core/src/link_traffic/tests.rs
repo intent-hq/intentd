@@ -698,3 +698,58 @@ async fn payloads_off_never_marks_a_large_frame_truncated() {
     assert!(record.get("truncated").is_none(), "{record}");
     assert_eq!(traffic.status()["oversized"], 0);
 }
+
+#[tokio::test]
+async fn light_captures_bound_what_they_copy() {
+    // Light captures charge a fixed cost, so what they keep must be bounded
+    // too, however long the frame's strings and lists are.
+    let (traffic, _) = traffic(limits(100, 64 * 1024, 64));
+    traffic.start(false);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    let huge = "m".repeat(1024 * 1024);
+    let request = LinkFrame::Request(LinkRequest {
+        request_id: uuid::Uuid::new_v4(),
+        agent_id: AgentId::from_string("a".repeat(1024 * 1024)),
+        method: crate::remote_launch::workspace_api::CALL_METHOD.into(),
+        params: json!({ "method": huge }),
+        timeout_ms: 1000,
+    });
+    let request_with_method = LinkFrame::Request(LinkRequest {
+        request_id: uuid::Uuid::new_v4(),
+        agent_id: AgentId::from_string("agent-1"),
+        method: huge.clone(),
+        params: json!({}),
+        timeout_ms: 1000,
+    });
+    let welcome = LinkFrame::Welcome(crate::node_link::LinkWelcome {
+        protocol: 6,
+        node_id: huge.clone(),
+        running_agents: (0..100_000)
+            .map(|n| AgentId::from_string(format!("agent-{n}")))
+            .collect(),
+        capabilities: crate::node_link::MachineCapabilities::new(
+            crate::placement::AgentPlatform {
+                os: crate::nodes::NodeOs::Linux,
+                arch: crate::nodes::NodeArch::X86_64,
+            },
+            "test",
+            2,
+            "2026-10-30T00:00:00Z",
+        ),
+        hosts: vec![huge.clone()],
+        tc_address: None,
+    });
+    for frame in [&request, &request_with_method, &welcome] {
+        tap.observe(TrafficDirection::In, frame, 3 * 1024 * 1024);
+    }
+    settle(&traffic, 3).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    for record in records.as_array().unwrap() {
+        let size = serde_json::to_vec(record).unwrap().len();
+        assert!(size <= super::LIGHT_BYTES, "{size}: {record}");
+    }
+    assert_eq!(
+        records[2]["summary"],
+        "welcome protocol 6, 100000 running agents"
+    );
+}
