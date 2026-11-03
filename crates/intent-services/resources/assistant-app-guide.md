@@ -28,7 +28,14 @@ Sharing needs the host owner's GitHub or GitLab account connected in **Settings 
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts. -->
+GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
+self-managed GitLab account in **Settings → Connections** or during onboarding, by
+device sign-in or a personal access token. With it connected, sharing can pin
+invitations to GitLab accounts and a guest can join with a GitLab identity; on hosts
+that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
+older connected daemon shows an update note instead of the GitLab setup.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
 Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
@@ -462,6 +469,32 @@ direct or Tailcat routes. **Indexing Notes** appears only when the daemon report
 that phase. **Startup status unavailable. Reconnecting securely…** means current
 status is unavailable. For **Startup Failed**, use **Retry Connection** after
 checking the desktop daemon. **Back to Home** keeps saved credentials.
+
+## Run Intent in a browser from a cloud machine
+
+`@intent-hq/web` (command `intent-web`) is a new, separately installed server that
+serves the Intent web app without the desktop app, for example on a VPS or dev box.
+It ships with Intent releases on npm. It is unrelated to the experimental desktop
+**Browser access** above: do not tell the user to unlock Labs for it.
+
+- Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
+  only on `127.0.0.1:47120` and prints an **access key** on first run;
+  `npx @intent-hq/web key` shows it again and `key --reset` signs out every browser.
+- Reach it through a private HTTPS front-end such as `tailscale serve --bg 47120`, then
+  open the `https://` address and enter the key. Never suggest Tailscale Funnel or
+  another public tunnel.
+- If `intentd` is already running on the same machine when `intent-web` starts, it
+  appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
+  other machines in **Settings → Machines → Add machine** with the host, port and token
+  from `intentd pair` on that machine, then check the fingerprint and choose
+  **Confirm & connect**. With no machine yet, the browser shows **Add your first
+  machine**.
+- Its data directory (default `~/.local/state/intent-web`) holds machine tokens in
+  plain text; treat it like an SSH key. The **Settings → Mobile** tab, iCloud sync of
+  saved machines and desktop-only features such as native file dialogs are not
+  available there.
+
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
 
 ## Start or continue work
 
