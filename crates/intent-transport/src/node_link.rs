@@ -43,7 +43,7 @@ pub use git_helper::run_git_remote_helper;
 pub use git_session::serve_helpers;
 pub use git_session::{
     codes as git_codes, serve_git, CloseStatus, GitSession, NodeGitAccess, NodeGitSessions,
-    OpenRequest, MAX_SESSIONS,
+    OpenRequest, ATTACH_WAIT, MAX_SESSIONS,
 };
 pub use intent_core::node_link::*;
 pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink};

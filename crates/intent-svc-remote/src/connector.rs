@@ -996,6 +996,11 @@ async fn run(
         shared
             .claimed
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Before the link is published: a launch goes out as soon as it is,
+        // and the node's checkout fetches over the git connection at once
+        // (intent-hq/intent#8383). Before the queued stops too, so their
+        // resenders start right after they are sent.
+        let git = serve_git(&shared, &endpoint, &link).await;
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
@@ -1013,7 +1018,6 @@ async fn run(
             "remote machine: link bound"
         );
         shared.announce().await;
-        let git = serve_git(&shared, &endpoint, &link).await;
         let served = Served {
             lease: &lease,
             link: &link,
