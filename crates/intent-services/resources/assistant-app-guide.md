@@ -481,6 +481,11 @@ while it stays open unless the agent is retired or deleted. Choose another from 
 agent menu above the chat; Home remembers that choice for the workspace until the app
 restarts, the account or connection changes, or Home is reset.
 
+**Retire Agent** stops an agent and keeps its conversation so it can be restored later.
+Intent refuses to retire a workspace's last top-level agent, whether you or the agent
+asks; start another agent in the workspace first, or archive the workspace instead.
+Delegated agents can always be retired.
+
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
 running command script such as a build or test, or an agent's background task such as

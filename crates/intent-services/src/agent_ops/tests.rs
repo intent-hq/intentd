@@ -976,22 +976,72 @@ async fn agent_self_retire_rejects_the_last_top_level_agent() {
     assert_last_top_level_refusal(&err);
 }
 
-/// The guard only applies to agent callers' top-level sessions: a child
-/// agent may still self-retire under the last top-level agent, and a
-/// non-agent (user / wire) retire of the last top-level agent is allowed.
+/// Run `agent_retire_op` as a user over the wire (`agent.retire`).
+async fn user_retire(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> intent_core::Result<serde_json::Value> {
+    intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+}
+
+/// The guard only covers top-level sessions: a child agent may still
+/// self-retire under the last top-level agent, and a user may retire it too.
+/// Daemon-internal (unbound) retires are not guarded.
 #[tokio::test]
-async fn last_top_level_guard_skips_children_and_non_agent_callers() {
+async fn last_top_level_guard_skips_children_and_daemon_callers() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
+    let other_child = create_agent(&svc, &ws, "OtherChild").await;
     link_child(&svc, &ws, &child, &parent, AgentStatus::RuntimeIdle).await;
+    link_child(&svc, &ws, &other_child, &parent, AgentStatus::RuntimeIdle).await;
 
     self_retire(&svc, &ws, &child)
         .await
         .expect("a child agent may self-retire");
+    user_retire(&svc, &ws, &other_child)
+        .await
+        .expect("a user may retire a child agent");
     svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
         .await
-        .expect("a non-agent caller may retire the last top-level agent");
+        .expect("a daemon-internal caller may retire the last top-level agent");
+}
+
+/// Guard: a user (wire `agent.retire`) may not retire the workspace's last
+/// active top-level agent either. The refusal speaks to the user, mutates
+/// nothing, and lifts once another top-level agent exists.
+#[tokio::test]
+async fn user_retire_rejects_the_last_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
+
+    let err = user_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("a user must not retire the only top-level agent");
+    assert_last_top_level_refusal(&err);
+    assert!(
+        err.to_string().contains("Start another agent"),
+        "user-facing guidance: {err}"
+    );
+    let s = svc.store().get_agent_session(&solo).await.expect("session");
+    assert!(s.retired_at.is_none(), "nothing mutated on refusal");
+
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    user_retire(&svc, &ws, &solo)
+        .await
+        .expect("retire succeeds once a peer exists");
+    let err = user_retire(&svc, &ws, &peer)
+        .await
+        .expect_err("the remaining top-level agent is now protected");
+    assert_last_top_level_refusal(&err);
 }
 
 /// Two top-level agents self-retiring at the same time on separate worker
@@ -1032,6 +1082,46 @@ async fn concurrent_self_retires_leave_one_top_level_agent() {
         );
         assert_eq!(active[0].id, survivor);
     }
+}
+
+/// A guarded retire that read its target before waiting on the workspace
+/// gate must not turn into a last-agent refusal when, meanwhile, a rival
+/// retire of the same target won and the last peer retired too: the late
+/// call reports the documented idempotent `alreadyRetired` result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let gate = svc.agent_retirement_gates.for_workspace(&ws);
+    let held = gate.lock().await;
+    let late = {
+        let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
+        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+    };
+    // The late call holds its own handle on the gate once it has read the
+    // (still unretired) target and is about to wait on the lock.
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while Arc::strong_count(&gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("late retire reaches the workspace gate");
+    for id in [&target, &peer] {
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+            .await
+            .expect("daemon-internal retire");
+    }
+    drop(held);
+    let res = late
+        .await
+        .expect("join")
+        .expect("late retire is an idempotent retry");
+    assert_eq!(res["alreadyRetired"], json!(true), "{res}");
 }
 
 /// Cascade: retiring the parent retires every settled/idle descendant with
