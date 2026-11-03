@@ -176,6 +176,9 @@ struct Inner {
     scripts: ScriptProcesses,
     /// Notified each time the bind sweep finishes removing one checkout.
     swept: tokio::sync::Notify,
+    /// Set when shutdown begins: an ordinary push still under way is
+    /// cancelled, so the agent's last push starts within the budget.
+    closing_signal: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -679,6 +682,7 @@ impl Runner {
                 link_gate: tokio::sync::Mutex::new(None),
                 scripts: ScriptProcesses::new(Arc::new(intent_pty::PtyHost::new())),
                 swept: tokio::sync::Notify::new(),
+                closing_signal: watch::channel(false).0,
             }),
         }
     }
@@ -1396,11 +1400,25 @@ impl Runner {
         } else {
             WIP_PUSH_TIMEOUT
         };
-        let pushed = self
-            .inner
-            .checkouts
-            .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout)
-            .await;
+        let push =
+            self.inner
+                .checkouts
+                .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout);
+        let pushed = if final_stop || closing {
+            push.await
+        } else {
+            // An ordinary push (up to `WIP_PUSH_TIMEOUT`) would hold the
+            // lock past the shutdown budget; shutdown cancels it, and the
+            // agent's exit push then sends everything this one would have.
+            // Head's ref update is atomic, so it is left old or whole.
+            let mut shutting_down = self.inner.closing_signal.subscribe();
+            tokio::select! {
+                pushed = push => pushed,
+                Ok(_) = shutting_down.wait_for(|closing| *closing) => {
+                    Err(anyhow::anyhow!("cancelled: the machine is shutting down"))
+                }
+            }
+        };
         if let Err(error) = &pushed {
             tracing::warn!(agent = %agent.id, error = %format!("{error:#}"), "node: WIP push failed");
         }
@@ -1676,6 +1694,8 @@ impl Runner {
             state.closing = true;
             state.agents.keys().cloned().collect()
         };
+        // An ordinary push under way gives way to each agent's last one.
+        self.inner.closing_signal.send_replace(true);
         // Script runs end first (bounded by their reap wait), so nothing
         // still writes to a checkout while its agent's last work is pushed.
         self.inner.scripts.stop_all().await;
