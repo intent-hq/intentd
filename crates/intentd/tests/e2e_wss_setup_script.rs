@@ -965,6 +965,7 @@ touch "${{WORKTREE_PATH}}/.setup-path-ran-{run_id}"
             found = true;
             break;
         }
+        // timing-guard: poll interval while waiting on the setup marker file
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(found, "setup script should have run");
