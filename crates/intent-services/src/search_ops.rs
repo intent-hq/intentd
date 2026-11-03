@@ -21,6 +21,43 @@ pub(crate) const INLINE_THRESHOLD: usize = 25;
 /// Number of matches per streamed `search:result` batch.
 pub(crate) const STREAM_BATCH_SIZE: usize = 10;
 
+/// `search.messages` / `search.events` match count when `limit` is absent
+/// (§5.15). Before the read payload budget an absent limit meant no cap.
+pub(crate) const MATCH_LIMIT_DEFAULT: usize = 50;
+
+/// Largest `search.messages` / `search.events` `limit`; larger values clamp.
+pub(crate) const MATCH_LIMIT_MAX: usize = 200;
+
+/// Serialized-size ceiling for the matches of one inline `search.*` reply,
+/// 480,000 bytes (the per-page budget shared by bounded reads), below the
+/// 500 KiB read payload budget with room for the envelope. Matches
+/// past it are dropped and the reply carries `truncated: true`.
+pub(crate) const INLINE_MATCHES_BUDGET_BYTES: usize = 480_000;
+
+/// Resolve a `search.messages` / `search.events` `limit`: absent → the
+/// default, negative → 0, over the maximum → the maximum.
+pub(crate) fn match_limit(limit: Option<i64>) -> usize {
+    limit.map_or(MATCH_LIMIT_DEFAULT, |n| {
+        usize::try_from(n.max(0))
+            .unwrap_or(usize::MAX)
+            .min(MATCH_LIMIT_MAX)
+    })
+}
+
+/// Keep the longest prefix of `matches` whose serialized size fits
+/// [`INLINE_MATCHES_BUDGET_BYTES`]; returns whether any match was dropped.
+pub(crate) fn bound_inline_matches(matches: &mut Vec<Value>) -> bool {
+    let mut used = 0usize;
+    for (i, m) in matches.iter().enumerate() {
+        used += intent_core::slim_body_size(m) + 1;
+        if used > INLINE_MATCHES_BUDGET_BYTES {
+            matches.truncate(i);
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve a workspace's search root (its worktree path), or `None` when the
 /// workspace has no usable path (remote/non-repo) — callers return an empty
 /// result in that case. When `caller_agent_id` is provided and the agent has a
@@ -41,6 +78,12 @@ pub(crate) async fn search_root(
     Ok(crate::git_ops::worktree_path(&ws))
 }
 
+/// `search.inFiles` `opts.maxResults` when absent (§5.15).
+pub(crate) const IN_FILES_MAX_RESULTS_DEFAULT: usize = 500;
+
+/// Largest `search.inFiles` `opts.maxResults`; larger values clamp.
+pub(crate) const IN_FILES_MAX_RESULTS_MAX: usize = 2_000;
+
 /// Parse the raw `opts` object into [`SearchOpts`]; an unusable shape surfaces
 /// as `InvalidParams` (→ `-32602`). Absent/null yields the defaults.
 pub(crate) fn parse_opts(opts: Option<Value>) -> Result<intent_search::SearchOpts> {
@@ -49,6 +92,19 @@ pub(crate) fn parse_opts(opts: Option<Value>) -> Result<intent_search::SearchOpt
         Some(value) => serde_json::from_value(value)
             .map_err(|_| Error::InvalidParams("Invalid search opts".to_string())),
     }
+}
+
+/// Bound a `search.inFiles` request: `maxResults` defaults to
+/// [`IN_FILES_MAX_RESULTS_DEFAULT`] and clamps to
+/// [`IN_FILES_MAX_RESULTS_MAX`], and the matches stop at
+/// [`INLINE_MATCHES_BUDGET_BYTES`]. Either cut sets `truncated`.
+pub(crate) fn bound_in_files_opts(opts: &mut intent_search::SearchOpts) {
+    opts.max_results = Some(
+        opts.max_results
+            .unwrap_or(IN_FILES_MAX_RESULTS_DEFAULT)
+            .min(IN_FILES_MAX_RESULTS_MAX),
+    );
+    opts.max_bytes = Some(INLINE_MATCHES_BUDGET_BYTES);
 }
 
 /// Extract searchable plain text from an agent message's JSON `content`. A bare
@@ -92,12 +148,11 @@ pub(crate) fn message_fts_matches(
 
 /// Build `search.events` matches over the event log. The searchable text is the
 /// event `type` plus its JSON `data`; `limit` caps the number of matches.
-pub(crate) fn event_matches(
-    events: &[Event],
-    query: &str,
-    limit: Option<usize>,
-) -> Vec<EventMatch> {
+pub(crate) fn event_matches(events: &[Event], query: &str, limit: usize) -> Vec<EventMatch> {
     let mut out = Vec::new();
+    if limit == 0 {
+        return out;
+    }
     for ev in events {
         let text = format!("{} {}", ev.event_type, ev.data);
         if !contains_ci(&text, query) {
@@ -108,7 +163,7 @@ pub(crate) fn event_matches(
             preview: make_preview(&text, query),
             score: None,
         });
-        if limit.is_some_and(|n| out.len() >= n) {
+        if out.len() >= limit {
             break;
         }
     }
@@ -171,4 +226,68 @@ pub(crate) fn engine_matches(result: &RetrieveResult) -> Vec<CodebaseMatch> {
             score: item.score,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_limit_defaults_and_clamps() {
+        assert_eq!(match_limit(None), MATCH_LIMIT_DEFAULT);
+        assert_eq!(match_limit(Some(10)), 10);
+        assert_eq!(match_limit(Some(0)), 0);
+        assert_eq!(match_limit(Some(-1)), 0);
+        assert_eq!(match_limit(Some(100_000)), MATCH_LIMIT_MAX);
+    }
+
+    #[test]
+    fn inline_matches_are_cut_at_the_budget() {
+        let small = vec![serde_json::json!({ "preview": "x" }); 10];
+        let mut untouched = small.clone();
+        assert!(!bound_inline_matches(&mut untouched));
+        assert_eq!(untouched, small);
+
+        let big = serde_json::json!({ "preview": "x".repeat(10 * 1024) });
+        let mut matches = vec![big; 100];
+        assert!(bound_inline_matches(&mut matches));
+        let bytes = serde_json::to_vec(&matches).unwrap().len();
+        assert!(bytes <= INLINE_MATCHES_BUDGET_BYTES, "{bytes}");
+        assert!(matches.len() >= 40, "{}", matches.len());
+    }
+
+    #[test]
+    fn in_files_opts_default_and_clamp_max_results() {
+        let mut opts = parse_opts(None).unwrap();
+        bound_in_files_opts(&mut opts);
+        assert_eq!(opts.max_results, Some(IN_FILES_MAX_RESULTS_DEFAULT));
+        assert_eq!(opts.max_bytes, Some(INLINE_MATCHES_BUDGET_BYTES));
+
+        let mut opts = parse_opts(Some(serde_json::json!({ "maxResults": 100_000 }))).unwrap();
+        bound_in_files_opts(&mut opts);
+        assert_eq!(opts.max_results, Some(IN_FILES_MAX_RESULTS_MAX));
+
+        let mut opts = parse_opts(Some(serde_json::json!({ "maxResults": 7 }))).unwrap();
+        bound_in_files_opts(&mut opts);
+        assert_eq!(opts.max_results, Some(7));
+    }
+
+    #[test]
+    fn event_matches_honour_limit() {
+        let events: Vec<Event> = (0..5)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("e-{i}"),
+                    "workspaceId": "ws-1",
+                    "type": "agent:idle",
+                    "timestamp": "2026-11-02T00:00:00Z",
+                    "actor": { "type": "system" },
+                    "data": {},
+                }))
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(event_matches(&events, "agent", 3).len(), 3);
+        assert!(event_matches(&events, "agent", 0).is_empty());
+    }
 }

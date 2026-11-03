@@ -1142,3 +1142,68 @@ mod agents;
 mod principal_mentions;
 
 mod management;
+
+fn sized_page(count: i64, body_bytes: usize) -> intent_core::discussion::DiscussionPage {
+    let messages = (1..=count)
+        .map(|sequence| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("m-{sequence}"),
+                "workspaceId": "ws-1",
+                "sequence": sequence,
+                "body": "b".repeat(body_bytes),
+                "author": { "principalId": null, "login": null, "displayName": null, "avatarUrl": null },
+                "createdAt": "2026-11-02T00:00:00Z",
+            }))
+            .unwrap()
+        })
+        .collect();
+    intent_core::discussion::DiscussionPage {
+        messages,
+        has_more: false,
+    }
+}
+
+fn page_bytes(page: &intent_core::discussion::DiscussionPage) -> usize {
+    serde_json::to_vec(&page.messages).unwrap().len()
+}
+
+#[test]
+fn discussion_page_under_budget_is_untouched() {
+    let mut page = sized_page(50, 1024);
+    bound_discussion_page(&mut page, false);
+    assert_eq!(page.messages.len(), 50);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn discussion_latest_page_keeps_newest_messages_under_budget() {
+    // 100 messages at the 16 KiB body maximum ≈ 1.7 MB unbounded.
+    let mut page = sized_page(100, intent_core::discussion::DISCUSSION_BODY_MAX_BYTES);
+    bound_discussion_page(&mut page, false);
+    assert!(page.has_more);
+    assert!(page_bytes(&page) <= DISCUSSION_PAGE_BUDGET_BYTES);
+    assert!(page.messages.len() > 20, "{}", page.messages.len());
+    assert_eq!(page.messages.last().unwrap().sequence, 100);
+    let first = page.messages.first().unwrap().sequence;
+    assert!(page.messages.iter().map(|m| m.sequence).eq(first..=100));
+}
+
+#[test]
+fn discussion_after_page_keeps_oldest_messages_under_budget() {
+    let mut page = sized_page(100, intent_core::discussion::DISCUSSION_BODY_MAX_BYTES);
+    bound_discussion_page(&mut page, true);
+    assert!(page.has_more);
+    assert!(page_bytes(&page) <= DISCUSSION_PAGE_BUDGET_BYTES);
+    assert_eq!(page.messages.first().unwrap().sequence, 1);
+    let last = page.messages.last().unwrap().sequence;
+    assert!(page.messages.iter().map(|m| m.sequence).eq(1..=last));
+}
+
+#[test]
+fn discussion_page_always_keeps_one_message() {
+    let mut page = sized_page(3, DISCUSSION_PAGE_BUDGET_BYTES);
+    bound_discussion_page(&mut page, false);
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].sequence, 3);
+    assert!(page.has_more);
+}

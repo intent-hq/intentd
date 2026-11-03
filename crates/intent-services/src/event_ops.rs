@@ -266,17 +266,19 @@ pub(crate) fn build_workspace_summary(
 }
 
 /// Serialized-size ceiling for one `event.query` response (monorepo#3347).
-/// Sized comfortably below the transport's 1 MiB large-frame advisory
-/// (`LARGE_MESSAGE_WARN_BYTES`): [`bound_event_rows`] charges each row its
-/// ACTUAL post-cap serialized size against this budget, so the response
-/// total stays within `budget + Σ(per-row identity fields + marker)` — the
-/// identity fields are normally small daemon-generated scalars (uuid ids,
-/// ISO timestamps, enum actor types), keeping the worst case under the
-/// advisory even at [`EVENT_QUERY_MAX_LEGACY_LIMIT`] rows. Rows whose
+/// 480,000 bytes, the per-page budget shared by bounded reads: below the
+/// 500 KiB read payload budget (`READ_PAYLOAD_BUDGET_BYTES` in
+/// intent-transport; it was 700 KiB under the old 1 MiB advisory), with
+/// room for the row separators and the JSON-RPC envelope:
+/// [`bound_event_rows`] charges each row its ACTUAL post-cap serialized size
+/// against this budget, so the response total stays within
+/// `budget + Σ(per-row identity fields + marker)` — the identity fields are
+/// normally small daemon-generated scalars (uuid ids, ISO timestamps, enum
+/// actor types), keeping the worst case under the read budget even at [`EVENT_QUERY_MAX_LEGACY_LIMIT`] rows. Rows whose
 /// stored strings are pathological get every trimmable field capped —
 /// see [`EVENT_ROW_TRIM_FIELDS`] — so the only untrimmable floor is the
 /// bounded scalar set (`id`, `workspaceId`, `type`, `timestamp`).
-pub(crate) const EVENT_QUERY_RESPONSE_BUDGET_BYTES: usize = 700 * 1024;
+pub(crate) const EVENT_QUERY_RESPONSE_BUDGET_BYTES: usize = 480_000;
 
 /// Row-count cap for the legacy (non-paginated) `event.query` path
 /// (monorepo#3347). Previously the caller-supplied limit was passed to SQL
