@@ -846,15 +846,10 @@ impl MachineRuns {
                 unacked.push(place.agent_id.clone());
             }
         }
+        // A run whose stop was never acknowledged is lost with `reason`, not
+        // stopped: nobody saw it end.
         for (place, _, spawn) in &live {
-            self.settle(
-                place,
-                spawn,
-                None,
-                Some(reason.to_owned()),
-                Ending::StreamGap,
-            )
-            .await;
+            self.lose(place, spawn, reason).await;
         }
         let dropped: Vec<RunPlace> = {
             let mut runs = lock(&self.inner.runs);
@@ -872,6 +867,67 @@ impl MachineRuns {
             self.changed(&place).await;
         }
         unacked
+    }
+
+    /// Settle `spawn_id`'s process of `place` as lost with `reason` (a
+    /// stream gap: no exit was seen), even if a stop had been requested.
+    async fn lose(&self, place: &RunPlace, spawn_id: &str, reason: &str) {
+        if let Some(run) = lock(&self.inner.runs).get_mut(place) {
+            run.stopping = false;
+        }
+        self.settle(
+            place,
+            spawn_id,
+            None,
+            Some(reason.to_owned()),
+            Ending::StreamGap,
+        )
+        .await;
+    }
+
+    /// A final stop for `agent_id` is under way: the machine stops the
+    /// agent's scripts itself, so an exit it reports for one of them now
+    /// ends that run (no service restart).
+    pub(crate) fn final_stop_begun(&self, agent_id: &AgentId) {
+        for (place, run) in lock(&self.inner.runs).iter_mut() {
+            if &place.agent_id == agent_id && is_live(&run.state) {
+                run.stopping = true;
+            }
+        }
+    }
+
+    /// The machine acknowledged `agent_id`'s final stop: every machine run of
+    /// the agent it never reported ending is lost with `reason`, as the lease
+    /// end settles them, and the agent's entries are dropped. No frame is
+    /// sent: the machine already stopped them.
+    pub(crate) async fn final_stop_acked(&self, agent_id: &AgentId, reason: &str) {
+        let live: Vec<(RunPlace, String)> = lock(&self.inner.runs)
+            .iter_mut()
+            .filter(|(place, run)| &place.agent_id == agent_id && is_live(&run.state))
+            .map(|(place, run)| {
+                // A service between processes is settled too.
+                let spawn = run.spawn_id.get_or_insert_with(new_id).clone();
+                (place.clone(), spawn)
+            })
+            .collect();
+        for (place, spawn) in &live {
+            self.lose(place, spawn, reason).await;
+        }
+        let dropped: Vec<RunPlace> = {
+            let mut runs = lock(&self.inner.runs);
+            let places: Vec<RunPlace> = runs
+                .keys()
+                .filter(|place| &place.agent_id == agent_id)
+                .cloned()
+                .collect();
+            for place in &places {
+                runs.remove(place);
+            }
+            places
+        };
+        for place in dropped {
+            self.changed(&place).await;
+        }
     }
 
     /// The definition changed or was removed: stop every live machine run

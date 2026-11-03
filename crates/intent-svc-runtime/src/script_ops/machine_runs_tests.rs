@@ -695,3 +695,68 @@ async fn a_line_cut_off_by_a_lost_link_does_not_match() {
     assert!(wakes[0].1.contains("remote-script-lost"), "{}", wakes[0].1);
     assert!(!wakes[0].1.contains("output matched"), "{}", wakes[0].1);
 }
+
+fn script_starts(rec: &Recorded) -> usize {
+    rec.frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| matches!(f, LinkFrame::ScriptStart(_)))
+        .count()
+}
+
+/// Docs K (final stop): the machine stops an agent's scripts itself during
+/// a final stop (a retire sends no lease-end `scriptStop`), so once a final
+/// stop is under way a service's exit settles it instead of restarting it.
+#[tokio::test]
+async fn a_service_ended_by_a_final_stop_is_not_restarted() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    runs.final_stop_begun(&agent);
+    frame(&runs, exited(&start, Some(143), None)).await;
+    // timing-guard: longer than the 20 ms restart backoff, so a restart would have been sent
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(script_starts(&rec), 1, "no restart after a final stop");
+    assert_ne!(
+        runs.state(&place(&agent)).map(|s| s.status),
+        Some(ScriptStatus::Restarting)
+    );
+}
+
+/// Docs K (final stop): once the machine acknowledges an agent's final stop,
+/// the backend settles that agent's machine runs it never saw end, as the
+/// lease end settles them, without sending any frame.
+#[tokio::test]
+async fn a_final_stop_ack_settles_the_runs_never_seen_ending() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    runs.monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .unwrap();
+    let frames_before = rec.frames.lock().unwrap().len();
+    runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
+        .await;
+    assert_eq!(
+        rec.frames.lock().unwrap().len(),
+        frames_before,
+        "no frame sent"
+    );
+    assert!(
+        runs.entries(&ws(), "s1").is_empty(),
+        "its entries are dropped"
+    );
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert!(wakes[0].1.contains("remote-script-lost"), "{}", wakes[0].1);
+}

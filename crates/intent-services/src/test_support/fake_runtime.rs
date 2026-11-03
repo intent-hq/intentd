@@ -300,6 +300,17 @@ macro_rules! forward_to_unavailable {
 }
 
 impl RuntimePort for FakeRuntime {
+    fn end_agent_machine_runs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _deadline: tokio::time::Instant,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        self.record("end_agent_machine_runs");
+        Box::pin(async { true })
+    }
+
     fn active_hooks_for_agent<'a>(
         &'a self,
         svc: &'a Services,

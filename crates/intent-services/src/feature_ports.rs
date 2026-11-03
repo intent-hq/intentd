@@ -903,6 +903,24 @@ pub trait RuntimePort: Send + Sync + 'static {
         false
     }
 
+    /// A final stop for `agent_id` is under way: the machine stops its
+    /// scripts itself, so their exits end the runs (no restart).
+    fn machine_runs_final_stop_begun(&self, svc: &Services, agent_id: &AgentId) {
+        let _ = (svc, agent_id);
+    }
+
+    /// The machine acknowledged `agent_id`'s final stop: settle its machine
+    /// runs never seen ending as lost with `reason` and drop its entries.
+    fn machine_runs_final_stop_acked<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, agent_id, reason);
+        Box::pin(async {})
+    }
+
     /// Lease end for several agents at once (`remoteMachines.remove`): send
     /// every stop, wait once until `deadline`, drop their entries. Returns
     /// the agents with an unacknowledged script stop.

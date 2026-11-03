@@ -25,6 +25,9 @@ struct FakeRemote {
     launched: Mutex<Vec<RemoteLaunchRequest>>,
     needs: Mutex<Vec<RemoteLaunchNeeds>>,
     fail_launch: bool,
+    /// Each final stop recorded, and whether the agent's script-stop wait
+    /// (`end_agent_machine_runs`) had already run then.
+    final_stops: Mutex<Vec<(AgentId, bool)>>,
 }
 
 fn view(placement: &AgentPlacement) -> RemotePlacementView {
@@ -42,6 +45,24 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
 }
 
 impl RemoteLaunchPort for FakeRemote {
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        _reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        let scripts_stopped = crate::test_support::fake_runtime::FakeRuntime::of(svc)
+            .calls()
+            .contains(&"end_agent_machine_runs");
+        for agent in agent_ids {
+            self.final_stops
+                .lock()
+                .unwrap()
+                .push((agent.clone(), scripts_stopped));
+        }
+        Box::pin(async {})
+    }
+
     fn placements<'a>(
         &'a self,
         _svc: &'a Services,
@@ -907,4 +928,28 @@ async fn a_failed_parent_read_fails_the_sub_agent_instead_of_running_it_locally(
 
     assert_eq!(remote.launched.lock().unwrap().len(), launched);
     assert_eq!(count().await, before, "nothing was created");
+}
+
+/// Docs K (lease end): `agent.delete` records a remote agent's final stop
+/// only after the bounded wait for its machine runs' script stops, so the
+/// machine never ends a script without a requested stop first.
+#[tokio::test]
+async fn deleting_a_remote_agent_records_its_final_stop_after_the_script_stop_wait() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = crate::test_support::fake_runtime::FakeRuntime::install(svc)
+        .with_remote_launch_port(remote.clone());
+    create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = remote.launched.lock().unwrap()[0].agent_id.clone();
+    svc.agent_delete_op(id.clone(), Some(ws)).await.unwrap();
+    assert_eq!(*remote.final_stops.lock().unwrap(), vec![(id, true)]);
 }

@@ -207,6 +207,26 @@ impl RuntimePort for RuntimeFeature {
             .is_some_and(|runs| runs.live_on(node_id))
     }
 
+    fn machine_runs_final_stop_begun(&self, svc: &Services, agent_id: &intent_core::AgentId) {
+        if let Some(runs) = svc.script_manager().machine_runs() {
+            runs.final_stop_begun(agent_id);
+        }
+    }
+
+    fn machine_runs_final_stop_acked<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a intent_core::AgentId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.final_stop_acked(agent_id, reason).await;
+            }
+        })
+    }
+
     fn end_agents_machine_runs<'a>(
         &'a self,
         svc: &'a Services,

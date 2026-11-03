@@ -447,6 +447,11 @@ impl Shared {
             }
             None => None,
         };
+        // The machine stops the agent's scripts itself during a final stop.
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_runs_final_stop_begun(svc, agent_id);
+        }
         self.agents.close(agent_id);
         let (stop_id, durable) = match recorded {
             Some(stop_id) => (stop_id, true),
@@ -657,6 +662,19 @@ impl Shared {
                     tracing::debug!(agent = %agent_id, outcome = ?acked.outcome, final_push = ?acked.final_push, "remote machine: stop acknowledged");
                     if queued.durable {
                         self.finish_final_stop(&agent_id, stop_id, final_stop).await;
+                    }
+                    if final_stop {
+                        // The machine stopped the agent's scripts first: any
+                        // run it never reported ending is settled now.
+                        if let Some(svc) = &self.services {
+                            svc.feature_runtime()
+                                .machine_runs_final_stop_acked(
+                                    svc,
+                                    &agent_id,
+                                    "remote-script-lost: the agent was stopped for good",
+                                )
+                                .await;
+                        }
                     }
                     self.confirm_stop(&agent_id, stop_id);
                 }
