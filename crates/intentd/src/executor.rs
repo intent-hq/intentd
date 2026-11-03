@@ -196,7 +196,9 @@ impl ExecutorService {
         Ok(service)
     }
 
-    /// Stop every backend's agents (the daemon is stopping).
+    /// Stop every backend's agents (the daemon is stopping), each one's last
+    /// work pushed before its backend's links close. Run it before the WSS
+    /// listener stops, which closes those links.
     pub(crate) async fn shutdown(&self) {
         let tasks: Vec<_> = [lock(&self.worker).take(), lock(&self.refresher).take()]
             .into_iter()
@@ -214,7 +216,7 @@ impl ExecutorService {
         }
         let backends: Vec<Backend> = lock(&self.backends).drain().map(|(_, b)| b).collect();
         for backend in backends {
-            stop_backend(backend).await;
+            stop_backend_for_shutdown(backend).await;
         }
         let stopping = std::mem::take(&mut *lock(&self.stopping));
         for task in stopping {
@@ -500,8 +502,8 @@ impl ExecutorService {
     }
 }
 
-/// Close a backend's links, settle its sessions, then stop its agents, so
-/// none can be launched behind the stop.
+/// A revoked backend: close its links, settle its sessions, then stop its
+/// agents, so none can be launched behind the stop.
 async fn stop_backend(backend: Backend) {
     for link in &backend.links {
         link.close();
@@ -510,6 +512,21 @@ async fn stop_backend(backend: Backend) {
         let _ = session.await;
     }
     backend.runner.shutdown().await;
+    backend.helpers.abort();
+}
+
+/// The daemon is stopping: stop a backend's agents while its links are still
+/// up, so each one's last work is pushed to the backend, then close the
+/// links and settle their sessions. The runner closes its own admission
+/// first, so nothing is launched behind the stop (intent-hq/intent#8437).
+async fn stop_backend_for_shutdown(backend: Backend) {
+    backend.runner.shutdown().await;
+    for link in &backend.links {
+        link.close();
+    }
+    for session in backend.sessions {
+        let _ = session.await;
+    }
     backend.helpers.abort();
 }
 

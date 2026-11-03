@@ -1372,7 +1372,10 @@ impl Runner {
         };
         let _serial = agent.wip.lock().await;
         let final_stop = agent.final_stop.load(std::sync::atomic::Ordering::SeqCst);
-        let timeout = if final_stop {
+        // A push while the daemon is stopping is the agent's last one here
+        // too, bounded like a final stop's.
+        let closing = lock(&self.inner.state).closing;
+        let timeout = if final_stop || closing {
             FINAL_PUSH_TIMEOUT
         } else {
             WIP_PUSH_TIMEOUT
@@ -1656,7 +1659,9 @@ impl Runner {
         for id in running {
             self.stop(&id);
         }
-        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
+        // Each stopped agent pushes its work before it is cleaned up, so the
+        // wait also covers that push's bound.
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT + FINAL_PUSH_TIMEOUT, async {
             // A launch admitted just before closing may register its pump
             // after a take, so keep draining until nothing is left.
             loop {
