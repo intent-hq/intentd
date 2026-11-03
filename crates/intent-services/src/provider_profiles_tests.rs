@@ -20,6 +20,8 @@ const SECRET: &str = "sk-very-secret-value-1234";
 #[path = "provider_profiles_default_tests.rs"]
 mod default_overrides;
 
+#[path = "provider_profiles_guest_tests.rs"]
+mod guest_catalog;
 #[path = "provider_profiles_quota_tests.rs"]
 mod quota_state;
 #[path = "provider_profiles_remote_tests.rs"]

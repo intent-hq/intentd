@@ -19685,15 +19685,19 @@ impl WorkspaceApi for Services {
             // Saved profile summaries ride alongside the per-type rows
             // (PROTOCOL §5.54); `providers` stays one row per provider type.
             let mut catalog = provider_catalog::build_providers_catalog();
+            // Profile and Default names are host settings: a guest's read
+            // keeps the shape but names none of them (§5.54 "Guest reads").
+            let guest = self.catalog_caller_is_guest().await?;
             let (profiles, default_remote_incompatibility) = self.provider_profile_catalog().await;
-            catalog["profiles"] = serde_json::Value::Array(profiles);
+            catalog["profiles"] =
+                serde_json::Value::Array(if guest { Vec::new() } else { profiles });
             // Default configurations that cannot run on another machine
             // (§5.54 "Remote compatibility"); omitted when none.
             if let Some(defaults) = default_remote_incompatibility {
                 catalog["defaultRemoteIncompatibility"] = defaults;
             }
             // Renamed Default configurations (§5.54); omitted when none is.
-            if let Some(names) = self.provider_default_names() {
+            if let Some(names) = self.provider_default_names().filter(|_| !guest) {
                 catalog["defaultNames"] = names;
             }
             Ok(catalog)
