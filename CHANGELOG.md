@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.115] - 2026-11-03
+
+### 🚀 Features
+
+- Capture executor-link traffic for the owner ([#2992](https://github.com/intent-hq/intentd/pull/2992))
+
+### 🐛 Bug Fixes
+
+- Bound script, terminal and hook reads under the 500 KiB budget ([#2978](https://github.com/intent-hq/intentd/pull/2978))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe GitLab as a supported forge ([#2996](https://github.com/intent-hq/intentd/pull/2996))
+- *(assistant-guide)* Cover running Intent in a browser with @intent-hq/web ([#2997](https://github.com/intent-hq/intentd/pull/2997))
+
+### ⚡ Performance
+
+- *(agents)* Start turns without loading the full transcript ([#2994](https://github.com/intent-hq/intentd/pull/2994))
+
+
 ## [0.11.114] - 2026-11-03
 
 ### 🚀 Features
