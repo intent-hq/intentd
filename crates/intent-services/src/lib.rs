@@ -2676,7 +2676,7 @@ impl Services {
         agent_id: &AgentId,
         workspace_path: Option<&Path>,
     ) -> Option<crate::rules::SpecialistPromptInjection> {
-        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let override_bp = Self::session_metadata_str(&session, "behaviorPrompt");
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
         // on a specialist session, `specialistName` presence marks a snapshot

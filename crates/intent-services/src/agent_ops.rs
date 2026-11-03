@@ -9424,10 +9424,15 @@ impl Services {
     /// touch a retired session — reads that must still serve retired rows
     /// (`agent.get`, `agent.getSession`, conversation reads) do not come
     /// through here.
+    ///
+    /// The returned session carries every session column (`system_prompt`
+    /// included) but an EMPTY `messages` log: these paths run on every send
+    /// and turn start and never read the transcript, and hydrating it made
+    /// each turn of a long-lived agent cost seconds of read-pool time.
     pub(crate) async fn require_agent_session(&self, agent_id: &AgentId) -> Result<AgentSession> {
         let session = self
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_without_messages(agent_id)
             .await
             .map_err(|e| match e {
                 Error::NotFound(_) => {

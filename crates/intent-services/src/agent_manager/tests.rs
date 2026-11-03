@@ -21929,6 +21929,45 @@ mod stale_redrive_tests {
             .expect("set delegated report");
     }
 
+    /// The stale check runs once per redelivered queued message and reads
+    /// only session metadata, so a transcript that cannot be decoded (any
+    /// full transcript read fails on it) must not turn a stale message fresh.
+    #[tokio::test]
+    async fn stale_check_does_not_read_the_transcript() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-t"), AgentId::from("a-576-t"));
+        seed_agent(&mgr, &ws, &id).await;
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services.store.get_agent_session(&id).await.is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+
+        let mut msg = queued_msg("please continue", &queued_at, false);
+        assert!(
+            mgr.annotate_stale_redrive(&id, &mut msg).await,
+            "the stale check resolves without reading the transcript"
+        );
+    }
+
     #[tokio::test]
     async fn stale_message_is_annotated_and_flagged() {
         let (_tmp, mgr) = manager().await;

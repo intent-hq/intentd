@@ -82,6 +82,17 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
 pub(crate) const AGENT_HAS_ASSISTANT_MESSAGE_SQL: &str = "SELECT EXISTS(\
     SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant')";
 
+/// Bounded probe behind [`Store::agent_has_assistant_after_last_user`]:
+/// whether any `assistant` row follows the agent's latest `user` row. Both
+/// lookups seek `idx_agent_message_agent_role_seq` (0064) — the inner one
+/// reads the highest `user` seq, the outer one tests for a later
+/// `assistant` seq — so the cost does not grow with the transcript. With no
+/// `user` row the inner `MAX` is NULL and the probe is false. Extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement.
+pub(crate) const AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ?1 AND role = 'assistant' AND seq > (\
+    SELECT MAX(seq) FROM agent_message WHERE agent_id = ?1 AND role = 'user'))";
+
 /// Two-phase search SQL behind [`Store::search_agent_messages_fts`],
 /// extracted so the monorepo#4127 plan-shape guard
 /// (`search_messages_fts_ranking_pass_avoids_fat_tables`) runs
@@ -1368,6 +1379,12 @@ impl Store {
 
     /// Fetch a session by id (with its message log), or `NotFound`.
     ///
+    /// This reads and hydrates EVERY `agent_message` row (tool payload bodies
+    /// included), so its cost grows with the conversation. Paths that only
+    /// need session columns use [`Store::get_agent_session_without_messages`]
+    /// (every column) or [`Store::get_agent_session_summary`] (no heavy
+    /// columns) instead.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
@@ -1392,7 +1409,9 @@ impl Store {
     /// `image_blocks` and `initial_message` included) WITHOUT the message
     /// log (`messages` stays empty), or `NotFound` — the bounded
     /// `agent.getSession` read, which serves a budgeted transcript page
-    /// instead of hydrating the whole log.
+    /// instead of hydrating the whole log, and the per-turn session lookup
+    /// (`require_agent_session`), which needs `system_prompt` but never the
+    /// transcript.
     ///
     /// # Errors
     ///
@@ -6128,6 +6147,25 @@ impl Store {
             .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("probe assistant message failed: {e}")))?;
+        Ok(exists != 0)
+    }
+
+    /// Whether an `assistant` message follows `agent_id`'s latest `user`
+    /// message — exactly the transcript test "the last `user` row exists and
+    /// some later row is `assistant`" over `get_agent_messages(agent_id,
+    /// None)`, without reading or decoding the transcript. Two seeks of the
+    /// `(agent_id, role, seq)` index; it answers the quota-failover "was the
+    /// cut-short turn partially answered?" check at turn start.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_after_last_user(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant after last user failed: {e}")))?;
         Ok(exists != 0)
     }
 
@@ -15832,6 +15870,133 @@ mod tests {
             .expect("direct update");
         assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
         assert!(!full_check(&store, &agent).await);
+    }
+
+    /// The quota-failover partial-turn probe must stay index seeks: both
+    /// the `MAX(seq)` user lookup and the later-assistant test read only the
+    /// `(agent_id, role, seq)` covering index, never `agent_message` rows.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-after-user-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL}"
+        ))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert_eq!(message_steps.len(), 2, "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_after_last_user` agrees with the transcript scan
+    /// it replaced: no rows, a trailing user row, an answered turn, system
+    /// rows interleaved after the user row, truncation, and per-agent scope.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_matches_transcript_scan() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-after-user");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-after-user".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-after-user".to_string());
+        let other = AgentId("agent-assistant-after-user-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let scan = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let messages = store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read");
+                messages
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                    .is_some_and(|i| messages[i + 1..].iter().any(|m| m.role == "assistant"))
+            }
+        };
+        let check = |expected: bool| {
+            let store = store.clone();
+            let agent = agent.clone();
+            async move {
+                assert_eq!(
+                    store
+                        .agent_has_assistant_after_last_user(&agent)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(scan(&store, &agent).await, expected);
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("greeting"), &ts)
+            .await
+            .expect("append assistant with no user");
+        check(false).await;
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "system", &text("model changed"), &ts)
+            .await
+            .expect("append system");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("partial"), &ts)
+            .await
+            .expect("append assistant");
+        check(true).await;
+        assert!(
+            !store
+                .agent_has_assistant_after_last_user(&other)
+                .await
+                .unwrap(),
+            "another agent's rows do not count"
+        );
+        store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        check(true).await;
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        check(false).await;
     }
 
     /// Recompute one session's stats live from `agent_message` — the ground
