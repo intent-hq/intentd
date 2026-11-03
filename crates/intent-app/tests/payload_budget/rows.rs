@@ -30,6 +30,10 @@ pub enum Proof {
     /// Like [`Proof::Cut`], but the marker is per row: at least one item of
     /// the array carries `true` at the second pointer (relative to the row).
     RowsCut(&'static str, usize, &'static str),
+    /// Like [`Proof::Cut`], but the array also holds fewer than `below`
+    /// items: with `below` set to the requested count, the page was cut by
+    /// bytes, not by count or by the data running out.
+    ByteCut(&'static str, usize, usize, &'static str),
 }
 
 /// Request params of one variant.
@@ -311,7 +315,7 @@ impl Row {
 /// Every sweep row, sorted by method.
 #[expect(clippy::too_many_lines, reason = "one flat table reads best")]
 pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
-    use Proof::{Bytes, Cut, Fixed, Items, RowsCut};
+    use Proof::{ByteCut, Bytes, Cut, Fixed, Items, RowsCut};
     let ws = c.ws.as_str();
     let agent = c.agent.as_str();
     let note = c.note.as_str();
@@ -623,17 +627,17 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 v(
                     "limit=100",
                     json!({ "workspaceId": ws, "conversationId": c.conversation, "limit": 100 }),
-                    Cut("/messages", 50, "/hasMore"),
+                    ByteCut("/messages", 50, 100, "/hasMore"),
                 ),
                 v(
                     "beforeSequence",
                     json!({ "workspaceId": ws, "limit": 100, "beforeSequence": 150 }),
-                    Cut("/messages", 50, "/hasMore"),
+                    ByteCut("/messages", 50, 100, "/hasMore"),
                 ),
                 v(
                     "afterSequence",
                     json!({ "workspaceId": ws, "limit": 100, "afterSequence": 0 }),
-                    Cut("/messages", 50, "/hasMore"),
+                    ByteCut("/messages", 50, 100, "/hasMore"),
                 ),
             ],
         ),

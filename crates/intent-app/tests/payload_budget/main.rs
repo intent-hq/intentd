@@ -400,6 +400,20 @@ fn check_proof(proof: &Proof, result: &Value) -> Result<(), String> {
                 )),
             }
         }
+        Proof::ByteCut(at, min, below, flag) => {
+            check_proof(&Proof::Cut(at, *min, flag), result)?;
+            let n = result
+                .pointer(at)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if n < *below {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{n} items at `{at}`, expected fewer than {below} (a byte cut)"
+                ))
+            }
+        }
         Proof::RowsCut(at, min, flag) => {
             check_proof(&Proof::Items(at, *min), result)?;
             let rows = result.pointer(at).and_then(Value::as_array);
