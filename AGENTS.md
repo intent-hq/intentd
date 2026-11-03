@@ -305,6 +305,15 @@ clean there and still fail Windows Clippy (an import that only `cfg(unix)` code 
 CI's `windows-cross-lint` job runs the same check on every PR and merge-queue entry, on Linux, so
 a local run only saves a push round trip; the push-only `windows` job is the native MSVC check.
 
+macOS has no PR-time or local equivalent: CI's native macOS check and Clippy run only in
+the merge queue, and `cargo clippy --target aarch64-apple-darwin` fails on Linux in the C
+build scripts. Before enqueueing an integration branch or a PR that adds or changes
+`cfg(target_os = …)` / `cfg(unix)` / `cfg(windows)` code, add the `ci:macos` label (or
+`gh workflow run macos-preflight.yml --ref main -f ref=<branch-or-sha>`): the advisory
+`macOS preflight` workflow runs the queue's macOS check and Clippy on the PR head, then
+again on each push while the label stays. It is opt-in because macOS minutes are paid; a
+macOS-only `unused_async` ejected intentd#2910 from the queue.
+
 The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
 integration test is a source-scanning lint, selected by convention — run them all with
 `make lint-sources` from the monorepo root or `cargo test --workspace --test '*_lint'` in
