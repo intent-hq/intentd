@@ -2,6 +2,99 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.117] - 2026-11-03
+
+### 🚀 Features
+
+- *(remote)* Sub-agents of remote agents inherit the machine; read-only workspace details ([#2999](https://github.com/intent-hq/intentd/pull/2999))
+
+
+## [0.11.116] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- Bound file, blob and asset reads under the 500 KiB budget ([#2993](https://github.com/intent-hq/intentd/pull/2993))
+- Bound note and comment reads under the 500 KiB budget ([#2991](https://github.com/intent-hq/intentd/pull/2991))
+
+
+## [0.11.115] - 2026-11-03
+
+### 🚀 Features
+
+- Capture executor-link traffic for the owner ([#2992](https://github.com/intent-hq/intentd/pull/2992))
+
+### 🐛 Bug Fixes
+
+- Bound script, terminal and hook reads under the 500 KiB budget ([#2978](https://github.com/intent-hq/intentd/pull/2978))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe GitLab as a supported forge ([#2996](https://github.com/intent-hq/intentd/pull/2996))
+- *(assistant-guide)* Cover running Intent in a browser with @intent-hq/web ([#2997](https://github.com/intent-hq/intentd/pull/2997))
+
+### ⚡ Performance
+
+- *(agents)* Start turns without loading the full transcript ([#2994](https://github.com/intent-hq/intentd/pull/2994))
+
+
+## [0.11.114] - 2026-11-03
+
+### 🚀 Features
+
+- *(workspace)* Accept a remote placement for workspace.create's initial agent ([#2982](https://github.com/intent-hq/intentd/pull/2982))
+
+### 🐛 Bug Fixes
+
+- Bind the git connection before a remote launch can check out ([#2986](https://github.com/intent-hq/intentd/pull/2986))
+- *(providers)* Omit host profile names from a guest's providers.catalog ([#2990](https://github.com/intent-hq/intentd/pull/2990))
+- Page specialist, rules and skill lists by default ([#2976](https://github.com/intent-hq/intentd/pull/2976))
+- Bound GitHub and Linear proxy reads under the 500 KiB budget ([#2975](https://github.com/intent-hq/intentd/pull/2975))
+- Bound workspace and agent lists, queues, sessions and diagnostics ([#2979](https://github.com/intent-hq/intentd/pull/2979))
+
+### 📚 Documentation
+
+- *(guide)* Note that guests see agents without the host's profile names ([#2985](https://github.com/intent-hq/intentd/pull/2985))
+- *(guide)* Explain leaving a shared workspace from the workspace menu ([#2987](https://github.com/intent-hq/intentd/pull/2987))
+
+### ⚡ Performance
+
+- *(agents)* Check first-turn naming without loading the full transcript ([#2988](https://github.com/intent-hq/intentd/pull/2988))
+
+
+## [0.11.113] - 2026-11-03
+
+### 🚀 Features
+
+- Report executor-run agents' memory and connected-daemon counts ([#2980](https://github.com/intent-hq/intentd/pull/2980))
+
+### 🐛 Bug Fixes
+
+- Bound search, event and discussion reads under the 500 KiB budget ([#2977](https://github.com/intent-hq/intentd/pull/2977))
+- Require a connected owner forge to create or redeem invites ([#2974](https://github.com/intent-hq/intentd/pull/2974))
+- Run workspace setup scripts with the enhanced PATH ([#2983](https://github.com/intent-hq/intentd/pull/2983))
+
+
+## [0.11.112] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- *(workspace-status)* Any merge-queued PR wins the displayStatus PR rung ([#2972](https://github.com/intent-hq/intentd/pull/2972))
+- *(intentd)* Run every hook ws.* call as the owning agent ([#2965](https://github.com/intent-hq/intentd/pull/2965))
+- *(rpc_profile)* Budget agent.dismissQuestions / agent.queueMessage on the per-method tier ([#2960](https://github.com/intent-hq/intentd/pull/2960))
+- *(agents)* Refuse user retire of the last top-level agent ([#2963](https://github.com/intent-hq/intentd/pull/2963))
+
+### 📚 Documentation
+
+- *(guide)* Note the same-provider Retry on the usage-limit banner ([#2959](https://github.com/intent-hq/intentd/pull/2959))
+- Update new workspace form guide ([#2969](https://github.com/intent-hq/intentd/pull/2969))
+- *(guide)* Describe Update for outdated Claude Code CLI ([#2970](https://github.com/intent-hq/intentd/pull/2970))
+
+### 🧪 Testing
+
+- Keep ratchet lint baselines in one file per crate ([#2971](https://github.com/intent-hq/intentd/pull/2971))
+- Replace the last four elapsed-time assertions with timing-free checks ([#2962](https://github.com/intent-hq/intentd/pull/2962))
+
+
 ## [0.11.111] - 2026-11-02
 
 ### 📚 Documentation

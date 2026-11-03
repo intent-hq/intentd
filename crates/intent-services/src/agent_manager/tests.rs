@@ -6361,6 +6361,18 @@ fn test_provider() -> intent_providers::ProviderConfig {
     }
 }
 
+/// Seed a second active top-level session beside `id` (same workspace) so
+/// the last-top-level-agent retire guard lets `id` be retired.
+async fn seed_top_level_peer(mgr: &AgentManager, id: &AgentId) {
+    let mut peer = mgr.services.store.get_agent_session(id).await.unwrap();
+    peer.id = AgentId::from(format!("{}-peer", id.as_str()));
+    mgr.services
+        .store
+        .insert_agent_session_with_task_graph(&peer, false)
+        .await
+        .expect("insert top-level peer");
+}
+
 async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
     seed_agent_with_task_graph(mgr, ws, id, false).await;
 }
@@ -10684,6 +10696,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
         AgentId::from("retire-running"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     track(&mgr, &id);
     let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let worker = tokio::spawn(std::future::pending::<()>());
@@ -10776,6 +10789,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     let ws = WorkspaceId::from("ws-retire-start");
     let id = AgentId::from("retire-start");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
     let starting = tokio::spawn({
@@ -10883,6 +10897,7 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
     let ws = WorkspaceId::from("ws-retire-admission");
     let id = AgentId::from("retire-admission");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     // Pause the sender between admission/persistence and worker registration.
     let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     intent_core::with_caller(
@@ -10984,6 +10999,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
     let ws = WorkspaceId::from("ws-retire-cleanup");
     let id = AgentId::from("retire-cleanup");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let flush = if matches!(cleanup, RetiredCleanup::Flush) {
         mgr.services.enqueue_message(
@@ -11081,6 +11097,7 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
         AgentId::from("child"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     let mut descendant = mgr.services.store.get_agent_session(&id).await.unwrap();
     descendant.id = child.clone();
     descendant.parent_agent_id = Some(id.clone());
@@ -11125,6 +11142,51 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
     mgr.stop(&id).await;
 }
 
+/// A user retire of the workspace's last top-level agent is refused before
+/// the running target is stopped: its turn and worker survive untouched.
+#[tokio::test]
+async fn user_retire_last_top_level_rejection_does_not_stop_target() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retire-last-top-level"),
+        AgentId::from("solo"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("last active top-level agent")),
+        "{result:?}"
+    );
+    assert!(!aborted.is_finished());
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.contains(&id));
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    assert!(mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .retired_at
+        .is_none());
+    mgr.stop(&id).await;
+}
+
 #[tokio::test]
 async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
     let (_tmp, mgr) = manager().await;
@@ -11135,14 +11197,7 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
         AgentId::from("self-retire"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    // A peer top-level agent, so the last-top-level guard lets it retire.
-    let mut peer = mgr.services.store.get_agent_session(&id).await.unwrap();
-    peer.id = AgentId::from("self-retire-peer");
-    mgr.services
-        .store
-        .insert_agent_session_with_task_graph(&peer, false)
-        .await
-        .expect("insert peer");
+    seed_top_level_peer(&mgr, &id).await;
     track(&mgr, &id);
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
@@ -21872,6 +21927,45 @@ mod stale_redrive_tests {
             .update_agent_session(ws, &session)
             .await
             .expect("set delegated report");
+    }
+
+    /// The stale check runs once per redelivered queued message and reads
+    /// only session metadata, so a transcript that cannot be decoded (any
+    /// full transcript read fails on it) must not turn a stale message fresh.
+    #[tokio::test]
+    async fn stale_check_does_not_read_the_transcript() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-t"), AgentId::from("a-576-t"));
+        seed_agent(&mgr, &ws, &id).await;
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services.store.get_agent_session(&id).await.is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+
+        let mut msg = queued_msg("please continue", &queued_at, false);
+        assert!(
+            mgr.annotate_stale_redrive(&id, &mut msg).await,
+            "the stale check resolves without reading the transcript"
+        );
     }
 
     #[tokio::test]

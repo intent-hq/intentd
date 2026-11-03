@@ -47,6 +47,60 @@ pub struct SearchOpts {
     pub regex: bool,
     pub globs: Vec<String>,
     pub max_results: Option<usize>,
+    /// Stop once the collected matches' estimated serialized size passes
+    /// this many bytes (sets `truncated`). Not a wire field: the service
+    /// sets it to keep the inline reply under the read payload budget.
+    #[serde(skip)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Longest `preview` a [`SearchMatch`] carries, in characters. A longer
+/// matching line (minified code, generated data) is windowed around the
+/// match with `…` marking the cut ends.
+pub const PREVIEW_MAX_CHARS: usize = 400;
+
+/// Characters of context kept before the match when a preview is windowed.
+const PREVIEW_LEAD_CHARS: usize = 40;
+
+/// Window `line` (already trimmed) to at most [`PREVIEW_MAX_CHARS`]
+/// characters around the 0-based character offset `match_char`.
+fn window_preview(line: &str, match_char: usize) -> String {
+    let total = line.chars().count();
+    if total <= PREVIEW_MAX_CHARS {
+        return line.to_string();
+    }
+    let start = match_char
+        .saturating_sub(PREVIEW_LEAD_CHARS)
+        .min(total - PREVIEW_MAX_CHARS);
+    let end = start + PREVIEW_MAX_CHARS;
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(line.chars().skip(start).take(PREVIEW_MAX_CHARS));
+    if end < total {
+        out.push('…');
+    }
+    out
+}
+
+/// Serialized JSON length of `s` as a string literal, quotes included.
+fn json_str_len(s: &str) -> usize {
+    2 + s
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
+/// Serialized size of one budgeted match (`before`/`after`/`score` are
+/// never set here) plus its array separator.
+fn match_bytes(m: &SearchMatch) -> usize {
+    // {"file":,"line":,"col":,"preview":} is 35 bytes; u64s are at most 20.
+    36 + 40 + json_str_len(&m.file) + json_str_len(&m.preview)
 }
 
 /// The inline content-search result (`matches` + `truncated`).
@@ -93,6 +147,7 @@ pub fn search_in_files(
     let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut matches: Vec<SearchMatch> = Vec::new();
     let mut truncated = false;
+    let mut bytes = 0usize;
 
     for entry in WalkBuilder::new(root).require_git(false).build() {
         if cancel.is_cancelled() || truncated {
@@ -115,6 +170,8 @@ pub fn search_in_files(
             matches: &mut matches,
             cancel,
             max: opts.max_results,
+            max_bytes: opts.max_bytes,
+            bytes: &mut bytes,
             truncated: &mut truncated,
         };
         let _ = searcher.search_path(&matcher, path, &mut sink);
@@ -129,6 +186,8 @@ struct ContentSink<'a> {
     matches: &'a mut Vec<SearchMatch>,
     cancel: &'a CancelToken,
     max: Option<usize>,
+    max_bytes: Option<usize>,
+    bytes: &'a mut usize,
     truncated: &'a mut bool,
 }
 
@@ -153,15 +212,27 @@ impl Sink for ContentSink<'_> {
                 .count()
                 + 1
         });
-        self.matches.push(SearchMatch {
+        let full = String::from_utf8_lossy(line_bytes);
+        let lead = full.chars().take_while(|c| c.is_whitespace()).count();
+        let preview = window_preview(full.trim(), (col - 1).saturating_sub(lead));
+        let found = SearchMatch {
             file: self.file.to_string(),
             line: mat.line_number().unwrap_or(0),
             col: col as u64,
-            preview: String::from_utf8_lossy(line_bytes).trim().to_string(),
+            preview,
             before: None,
             after: None,
             score: None,
-        });
+        };
+        if let Some(max_bytes) = self.max_bytes {
+            let size = match_bytes(&found);
+            if self.bytes.saturating_add(size) > max_bytes {
+                *self.truncated = true;
+                return Ok(false);
+            }
+            *self.bytes += size;
+        }
+        self.matches.push(found);
         Ok(true)
     }
 }

@@ -140,6 +140,7 @@ pub async fn ctx<'a>(client: &mut Client, daemon: &Daemon, seeded: &'a Seeded) -
         thread: ids.comment_thread.clone(),
         conversation: ids.discussion_conversation.clone(),
         script: ids.script.clone(),
+        huge_script: ids.huge_script.clone(),
         monitor: "large-state-monitor-0000".into(),
         worktree: daemon.state.worktree.display().to_string(),
         specialist: "large-specialist-0".into(),

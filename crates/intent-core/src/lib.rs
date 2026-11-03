@@ -33,6 +33,7 @@ pub mod git_remote_url;
 pub mod host_membership;
 pub mod human_author;
 pub mod ids;
+pub mod link_traffic;
 pub mod machine_selection;
 pub mod machines;
 pub mod message_block_page;
@@ -40,6 +41,7 @@ pub mod model;
 pub mod native_review;
 pub mod node_link;
 pub mod nodes;
+pub mod note_read_bounds;
 pub mod path_utils;
 pub mod placement;
 pub mod process_policy;
@@ -67,6 +69,7 @@ pub mod settings_file;
 pub mod slug;
 pub mod startup;
 pub mod test_isolation;
+pub mod text_field_page;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
@@ -159,11 +162,11 @@ pub use model::{
     CreatedTaskEntry, CrossWorkspaceSearch, DiskUsageBreakdownEntry, Draft, Event, EventActor,
     EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
     GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts,
-    GitPullResult, GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo,
-    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    GitPullResult, GitStatus, Hook, HookListRow, HookState, HookSummary, InitialAgentLaunchFailure,
+    KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
+    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
     PullRequestWorkspace, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory,
@@ -182,6 +185,11 @@ pub use model::{
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
     PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
 };
+pub use model::{
+    AgentListPage, AgentListSelection, AGENT_LIST_DEFAULT_LIMIT, AGENT_LIST_MAX_LIMIT,
+    AGENT_LIST_PAGE_BUDGET_BYTES, AGENT_QUEUE_DEFAULT_LIMIT, AGENT_QUEUE_MAX_LIMIT,
+    AGENT_QUEUE_PAGE_BUDGET_BYTES,
+};
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
@@ -190,6 +198,10 @@ pub use model::{
 pub use model::{
     InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
     WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+};
+pub use model::{
+    WorkspacePage, WORKSPACE_LIST_BUDGET_BYTES, WORKSPACE_LIST_DEFAULT_LIMIT,
+    WORKSPACE_LIST_MAX_LIMIT,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,

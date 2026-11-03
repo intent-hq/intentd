@@ -19,8 +19,8 @@ use intent_services::{
     agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
     AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
-    PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
-    WorkspaceSetupStates,
+    PermissionPolicy, ProcessSample, RemoteAgentMemory, RemoteAgentRoot, Services, TreeMemoryProbe,
+    TreeSample, WatcherRegistry, WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -2803,7 +2803,14 @@ async fn cmd_serve_owned(
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
-    spawn_child_tree_sampler(manager.clone(), &child_usage.clone());
+    #[cfg(unix)]
+    let remote_roots: RemoteRoots = {
+        let slot = executor_slot.clone();
+        Arc::new(move || slot.agent_roots())
+    };
+    #[cfg(not(unix))]
+    let remote_roots: RemoteRoots = Arc::new(Vec::new);
+    spawn_child_tree_sampler(manager.clone(), remote_roots, &child_usage.clone());
     let route_info = spawn_route_info_sampler();
     // Workspaces-root disk sampler: report the volume `workspace.create`
     // actually provisions under, resolved with the same precedence as the
@@ -2850,8 +2857,26 @@ async fn cmd_serve_owned(
         command_scripts.clone(),
     ));
 
+    let remote_links: Arc<dyn Fn() -> intent_transport::RemoteLinks + Send + Sync> = {
+        #[cfg(unix)]
+        let slot = executor_slot.clone();
+        let services = services.clone();
+        Arc::new(move || {
+            use intent_app::remote::RemoteServicesExt as _;
+            intent_transport::RemoteLinks {
+                #[cfg(unix)]
+                backends: slot.linked_backends(),
+                #[cfg(not(unix))]
+                backends: 0,
+                machines: services
+                    .remote_feature()
+                    .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
+            }
+        })
+    };
     let control = Arc::new(DaemonControl {
         startup: Some(bootstrap.dispatch.status().clone()),
+        remote_links,
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
@@ -3443,6 +3468,8 @@ async fn cmd_serve_owned(
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
     startup: Option<intent_core::startup::StartupStatus>,
+    /// Live daemon-to-daemon link counts for `system.status.remoteLinks`.
+    remote_links: Arc<dyn Fn() -> intent_transport::RemoteLinks + Send + Sync>,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
@@ -3998,6 +4025,10 @@ struct ChildTreeSample {
     /// bucket's rows sum to its total by construction. Collected only on
     /// published sweeps — burst sweeps pass no agent roots and produce none.
     agent_processes: std::sync::Arc<HashMap<AgentId, Vec<ProcessSample>>>,
+    /// The agents this machine runs for other backends (the executor), with
+    /// their processes from the same walk. Kept apart from the local buckets:
+    /// the spawn budget's per-agent reads and eviction see local agents only.
+    remote_agents: std::sync::Arc<Vec<RemoteAgentMemory>>,
     /// Host memory available for new allocations (`sysinfo::System::
     /// available_memory`, Linux `MemAvailable`), refreshed in the same sweep
     /// as `memory_bytes` so the spawn budget compares a tree total and the
@@ -4030,8 +4061,38 @@ struct ChildTreeUsage {
     inner: std::sync::RwLock<Option<ChildTreeSample>>,
 }
 
+impl ChildTreeSample {
+    /// `agentMemoryBytes`: every attributed agent's bytes, local and
+    /// executor-run, so it equals `agent.memoryUsage`'s `totalBytes`.
+    fn agent_memory_bytes(&self) -> u64 {
+        let local: u64 = self.agent_bytes.values().sum();
+        let remote: u64 = self
+            .remote_agents
+            .iter()
+            .flat_map(|agent| agent.processes.iter().map(|p| p.memory_bytes))
+            .sum();
+        local.saturating_add(remote)
+    }
+
+    /// `agentProcessCount`: the attributed agents, local and executor-run.
+    fn agent_process_count(&self) -> usize {
+        self.agent_bytes.len() + self.remote_agents.len()
+    }
+}
+
 impl ChildTreeUsage {
+    /// [`Self::store_with_remote`] with no executor-run agents.
+    #[cfg(test)]
     fn store(&self, walk: TreeWalk, available_memory_bytes: Option<u64>) {
+        self.store_with_remote(walk, Vec::new(), available_memory_bytes);
+    }
+
+    fn store_with_remote(
+        &self,
+        walk: TreeWalk,
+        remote_agents: Vec<RemoteAgentMemory>,
+        available_memory_bytes: Option<u64>,
+    ) {
         let TreeWalk {
             count,
             bytes: memory_bytes,
@@ -4049,6 +4110,7 @@ impl ChildTreeUsage {
             peak_memory_bytes,
             agent_bytes: std::sync::Arc::new(agent_bytes),
             agent_processes: std::sync::Arc::new(agent_processes),
+            remote_agents: std::sync::Arc::new(remote_agents),
             available_memory_bytes,
             seq,
             sampled_at: intent_core::now_iso(),
@@ -4118,6 +4180,7 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load().map(|s| AgentMemorySnapshot {
             sampled_at: Some(s.sampled_at),
             processes: s.agent_processes.as_ref().clone(),
+            remote: s.remote_agents.as_ref().clone(),
         })
     }
 }
@@ -4187,19 +4250,96 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// The agents this machine runs for other backends, read by the sampler on
+/// each published sweep.
+type RemoteRoots = Arc<dyn Fn() -> Vec<RemoteAgentRoot> + Send + Sync>;
+
 /// One pass of [`walk_descendants`]: the aggregate, the per-agent buckets and
 /// the rows behind them, all from the same traversal.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct TreeWalk {
+#[derive(Debug)]
+struct TreeWalk<K = AgentId> {
     /// Descendant processes found (the root excluded).
     count: usize,
     /// Aggregate resident bytes of those descendants.
     bytes: u64,
     /// Resident bytes credited to each registered agent root.
-    agent_bytes: HashMap<AgentId, u64>,
+    agent_bytes: HashMap<K, u64>,
     /// The processes credited to each agent; a bucket's rows sum to its
     /// `agent_bytes` entry. Empty when `agent_roots` is empty.
-    agent_processes: HashMap<AgentId, Vec<ProcessSample>>,
+    agent_processes: HashMap<K, Vec<ProcessSample>>,
+}
+
+impl<K: Eq + std::hash::Hash> PartialEq for TreeWalk<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count
+            && self.bytes == other.bytes
+            && self.agent_bytes == other.agent_bytes
+            && self.agent_processes == other.agent_processes
+    }
+}
+
+impl<K: Eq + std::hash::Hash> Eq for TreeWalk<K> {}
+
+impl<K> Default for TreeWalk<K> {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            agent_bytes: HashMap::new(),
+            agent_processes: HashMap::new(),
+        }
+    }
+}
+
+/// Whose bucket a registered root opens in the sampler's walk: a local
+/// agent's, or the agent at this index of the executor's roots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum MemoryRoot {
+    Local(AgentId),
+    Remote(usize),
+}
+
+/// Split a sampler walk into the local buckets and the executor-run agents'
+/// rows. An executor root with no process in the walk (it exited between
+/// the roots snapshot and the refresh) has no row, as a local one has none.
+fn split_walk(
+    walk: TreeWalk<MemoryRoot>,
+    remote_roots: Vec<RemoteAgentRoot>,
+) -> (TreeWalk, Vec<RemoteAgentMemory>) {
+    let TreeWalk {
+        count,
+        bytes,
+        agent_bytes,
+        mut agent_processes,
+    } = walk;
+    let local = TreeWalk {
+        count,
+        bytes,
+        agent_bytes: agent_bytes
+            .into_iter()
+            .filter_map(|(root, bytes)| match root {
+                MemoryRoot::Local(agent) => Some((agent, bytes)),
+                MemoryRoot::Remote(_) => None,
+            })
+            .collect(),
+        agent_processes: agent_processes
+            .iter()
+            .filter_map(|(root, rows)| match root {
+                MemoryRoot::Local(agent) => Some((agent.clone(), rows.clone())),
+                MemoryRoot::Remote(_) => None,
+            })
+            .collect(),
+    };
+    let remote = remote_roots
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, agent)| {
+            agent_processes
+                .remove(&MemoryRoot::Remote(index))
+                .map(|processes| RemoteAgentMemory { agent, processes })
+        })
+        .collect();
+    (local, remote)
 }
 
 /// Aggregate process count and resident bytes, plus per-agent buckets and
@@ -4225,18 +4365,18 @@ struct TreeWalk {
 /// live process table. The walk is iterative and visited-guarded: a pid table
 /// sampled while processes exit and get reparented can contain a cycle, and
 /// recursion over a deep chain could blow the stack.
-fn walk_descendants(
+fn walk_descendants<K: Clone + Eq + std::hash::Hash>(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
     describe: &dyn Fn(sysinfo::Pid) -> (String, String),
     root: sysinfo::Pid,
-    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> TreeWalk {
+    agent_roots: &HashMap<sysinfo::Pid, K>,
+) -> TreeWalk<K> {
     let mut walk = TreeWalk::default();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
     // Each frame carries the bucket its subtree inherits: the nearest
     // registered agent root at or above it (`None` outside any agent subtree).
-    let mut stack: Vec<(sysinfo::Pid, Option<&AgentId>)> = vec![(root, None)];
+    let mut stack: Vec<(sysinfo::Pid, Option<&K>)> = vec![(root, None)];
     while let Some((pid, bucket)) = stack.pop() {
         for child in children.get(&pid).into_iter().flatten() {
             if !seen.insert(*child) {
@@ -4279,11 +4419,11 @@ fn walk_descendants(
 /// process, so counting them charged an N-threaded child N+1 times — up to
 /// 219x inflation of `childMemoryBytes` (monorepo#2342). macOS never lists
 /// thread rows, so `thread_kind()` is `None` there and nothing changes.
-fn descendant_tree_usage(
+fn descendant_tree_usage<K: Clone + Eq + std::hash::Hash>(
     sys: &sysinfo::System,
     root: sysinfo::Pid,
-    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> TreeWalk {
+    agent_roots: &HashMap<sysinfo::Pid, K>,
+) -> TreeWalk<K> {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
         if proc.thread_kind().is_some() {
@@ -4362,7 +4502,11 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
-fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
+fn spawn_child_tree_sampler(
+    manager: Arc<AgentManager>,
+    remote_roots: RemoteRoots,
+    usage: &Arc<ChildTreeUsage>,
+) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
@@ -4430,16 +4574,27 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             // the handles lock + per-descendant bucketing and row building
             // at sub-second cadence would buy nothing — an empty map keeps
             // the walk on its aggregate-only fast path.
-            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
-                manager
-                    .agent_root_pids()
-                    .into_iter()
-                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+            // Executor-run agents (run here for other backends) are credited
+            // the same way, to buckets of their own.
+            let remote = if publish { remote_roots() } else { Vec::new() };
+            let agent_roots: HashMap<sysinfo::Pid, MemoryRoot> = if publish {
+                remote
+                    .iter()
+                    .enumerate()
+                    .map(|(index, agent)| {
+                        (
+                            sysinfo::Pid::from_u32(agent.root_pid),
+                            MemoryRoot::Remote(index),
+                        )
+                    })
+                    .chain(manager.agent_root_pids().into_iter().map(|(pid, agent)| {
+                        (sysinfo::Pid::from_u32(pid), MemoryRoot::Local(agent))
+                    }))
                     .collect()
             } else {
                 HashMap::new()
             };
-            let walk = descendant_tree_usage(&sys, pid, &agent_roots);
+            let (walk, remote) = split_walk(descendant_tree_usage(&sys, pid, &agent_roots), remote);
             let (count, bytes) = (walk.count, walk.bytes);
             if publish {
                 // Host headroom is read only on published sweeps: it is the
@@ -4450,7 +4605,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
                     0 => None,
                     bytes => Some(bytes),
                 };
-                task_usage.store(walk, available);
+                task_usage.store_with_remote(walk, remote, available);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -4682,8 +4837,10 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.as_ref().map(|s| s.count),
             child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
-            agent_memory_bytes: child_tree.as_ref().map(|s| s.agent_bytes.values().sum()),
-            agent_process_count: child_tree.as_ref().map(|s| s.agent_bytes.len()),
+            agent_memory_bytes: child_tree.as_ref().map(ChildTreeSample::agent_memory_bytes),
+            agent_process_count: child_tree
+                .as_ref()
+                .map(ChildTreeSample::agent_process_count),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
@@ -4712,6 +4869,9 @@ impl SystemControl for DaemonControl {
             // In-flight turns: one lock read of the manager's busy set.
             busy_agents: self.manager.list_busy().len(),
             idle_update_check,
+            // Two in-memory reads: the executor's open inbound links and the
+            // exposed-machine connectors' link state.
+            remote_links: Some((self.remote_links)()),
         }
     }
 
@@ -11655,7 +11815,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
@@ -11750,6 +11910,67 @@ for line in sys.stdin:
         assert!(walk.agent_processes.is_empty());
     }
 
+    /// Agents the executor runs for other backends open buckets of their
+    /// own in the same walk: their rows carry the launch and owner, their
+    /// bytes count in `agentMemoryBytes` / `agentProcessCount` and in the
+    /// `agent.memoryUsage` snapshot, but never in the local per-agent
+    /// samples the spawn budget evicts by. An executor root with no process
+    /// in the walk gets no row. Local buckets are unchanged.
+    #[test]
+    fn executor_run_agents_get_their_own_buckets_and_count_in_the_totals() {
+        let children = adjacency(&[(1, 10), (10, 11), (1, 20), (20, 21), (1, 40)]);
+        let memory = |pid: sysinfo::Pid| Some(u64::try_from(usize::from(pid)).unwrap() * 100);
+        let local = AgentId::from("agent-local");
+        let owner = intent_services::RemoteOwner {
+            backend_id: "head-1".into(),
+            backend_name: "Studio".into(),
+        };
+        let remote_root = |id: &str, root_pid: u32| RemoteAgentRoot {
+            agent_id: AgentId::from(id),
+            workspace_id: intent_core::WorkspaceId::from("ws-on-head"),
+            provider: "claude-code".into(),
+            model: Some("opus".into()),
+            owner: owner.clone(),
+            root_pid,
+        };
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(10), MemoryRoot::Local(local.clone())),
+            (sysinfo::Pid::from(20), MemoryRoot::Remote(0)),
+            (sysinfo::Pid::from(30), MemoryRoot::Remote(1)),
+        ]);
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        let (walk, remote) = split_walk(
+            walk,
+            vec![
+                remote_root("agent-remote", 20),
+                remote_root("agent-gone", 30),
+            ],
+        );
+        assert_eq!((walk.count, walk.bytes), (5, 10_200));
+        assert_eq!(walk.agent_bytes, HashMap::from([(local.clone(), 2_100)]));
+        assert_eq!(
+            walk.agent_processes,
+            HashMap::from([(local.clone(), vec![row(10, 1), row(11, 10)])])
+        );
+        assert_eq!(remote.len(), 1, "{remote:?}");
+        assert_eq!(remote[0].agent, remote_root("agent-remote", 20));
+        let mut pids: Vec<u32> = remote[0].processes.iter().map(|p| p.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![20, 21]);
+
+        let usage = ChildTreeUsage::default();
+        usage.store_with_remote(walk, remote.clone(), None);
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.agent_memory_bytes(), 2_100 + 4_100);
+        assert_eq!(sample.agent_process_count(), 2);
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.agent_samples(), HashMap::from([(local, 2_100)]));
+        assert_eq!(
+            probe.agent_memory_snapshot().expect("sampled").remote,
+            remote
+        );
+    }
+
     /// An agent root that vanished mid-walk (its memory read fails) still
     /// buckets the live descendants underneath it — the chain below a dead
     /// `npm exec` is exactly the RSS the agent is responsible for.
@@ -11789,7 +12010,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 2, "each pid is counted exactly once");
         assert_eq!(walk.bytes, 20);
@@ -11807,7 +12028,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 1);
         assert_eq!(walk.bytes, 700);
@@ -11824,7 +12045,7 @@ for line in sys.stdin:
                 &memory,
                 &describe,
                 sysinfo::Pid::from(1),
-                &HashMap::new()
+                &HashMap::<sysinfo::Pid, AgentId>::new()
             ),
             TreeWalk::default()
         );
@@ -11897,7 +12118,8 @@ for line in sys.stdin:
             .values()
             .filter(|p| p.thread_kind().is_some() && p.parent() == Some(child_pid))
             .count();
-        let usage = descendant_tree_usage(&sys, child_pid, &HashMap::new());
+        let usage =
+            descendant_tree_usage(&sys, child_pid, &HashMap::<sysinfo::Pid, AgentId>::new());
         let _ = child.kill();
         let _ = child.wait();
 

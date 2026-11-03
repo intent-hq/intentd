@@ -682,3 +682,152 @@ async fn shared_specialist_project_paths_over_wss_require_guest_membership() {
     assert_eq!(denied["error"]["code"], -32003, "{denied}");
     srv.ws.stop().await;
 }
+
+/// A non-administrator's `workspace.subscribe` seq-0 snapshot is paged like
+/// everyone else's (§6.9 "Paged snapshots"): a guest who is a member of more
+/// workspaces than one page holds gets the first page plus a `nextToken`,
+/// within the payload budget. The token continues through `workspace.list`
+/// to exactly the guest's workspaces, and the tombstone filter still covers
+/// rows the guest only loaded from a later page, while a private
+/// workspace's deletion stays silent.
+#[tokio::test]
+async fn guest_workspace_snapshot_is_paged_and_tombstones_later_pages() {
+    const MEMBER_WORKSPACES: usize = 130;
+    const PAYLOAD_BUDGET_BYTES: usize = 500 * 1024;
+    let srv = start(WsOptions::default()).await;
+    let token = "c7".repeat(32);
+    let guest = Guest::connect(&srv, &token).await;
+    let mut member_ids = Vec::new();
+    for _ in 0..MEMBER_WORKSPACES {
+        let id = WorkspaceId::new();
+        srv.store
+            .insert_workspace(&fixture_workspace(&id))
+            .await
+            .unwrap();
+        srv.store
+            .add_workspace_member(&id, &guest.principal.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        member_ids.push(id.0.clone());
+    }
+    let private = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&private))
+        .await
+        .unwrap();
+
+    let url = format!("wss://localhost:{}/ws?token={token}", srv.port);
+    let mut subscriber = Guest {
+        principal: guest.principal.clone(),
+        ws: common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await,
+        next_id: 0,
+    };
+    assert!(subscriber
+        .call("workspace.subscribe", json!({}))
+        .await
+        .get("error")
+        .is_none());
+    // Read the raw seq-0 frame so the budget check covers the whole
+    // JSON-RPC notification, not just its params.
+    let raw = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match subscriber.ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["method"] == "subscription.push" {
+                            return text.to_string();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        subscriber.ws.send(Message::Pong(p)).await.unwrap();
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected the seq-0 snapshot, got {other:?}"),
+                }
+            }
+        },
+    )
+    .await
+    .expect("seq-0 snapshot within deadline");
+    assert!(
+        raw.len() < PAYLOAD_BUDGET_BYTES,
+        "guest snapshot frame is {} B",
+        raw.len()
+    );
+    let snapshot = serde_json::from_str::<Value>(&raw).unwrap()["params"].clone();
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["seq"], 0);
+    let first_page: Vec<String> = snapshot["snapshot"]
+        .as_array()
+        .expect("snapshot rows")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        first_page.len() < MEMBER_WORKSPACES,
+        "the snapshot is one page, not the whole list: {}",
+        first_page.len()
+    );
+    let mut next_token = snapshot["nextToken"].clone();
+    assert!(next_token.is_string(), "{snapshot}");
+
+    let mut seen = first_page.clone();
+    let mut pages = 0;
+    while let Some(token) = next_token.as_str().map(str::to_string) {
+        let page = subscriber
+            // The snapshot's cursor is scoped to the subscription's filter
+            // (archived rows included), as the app's continuation sends it.
+            .call(
+                "workspace.list",
+                json!({ "includeArchived": true, "nextToken": token }),
+            )
+            .await;
+        assert!(page.get("error").is_none(), "{page}");
+        seen.extend(
+            page["result"]["workspaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_string()),
+        );
+        next_token = page["result"]["nextToken"].clone();
+        pages += 1;
+        assert!(pages < 20, "paging terminates");
+    }
+    seen.sort();
+    let mut expected = member_ids.clone();
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the pages list exactly the guest's workspaces"
+    );
+
+    let later = member_ids
+        .iter()
+        .find(|id| !first_page.contains(id))
+        .expect("a member workspace beyond the first page")
+        .clone();
+    // The host owner deletes both over its own connection (a bound caller).
+    for id in [private.0.as_str(), later.as_str()] {
+        let deleted = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &json!({"jsonrpc":"2.0","id":7,"method":"workspace.delete","params":{"workspaceId":id}})
+                .to_string(),
+        )
+        .await;
+        assert!(deleted.get("error").is_none(), "{deleted}");
+    }
+    let delta = workspace_push(&mut subscriber).await;
+    assert_eq!(delta["kind"], "delta", "{delta}");
+    assert_eq!(
+        delta["delta"]["removedIds"],
+        json!([later]),
+        "only the later-page member workspace is tombstoned: {delta}"
+    );
+    drop(subscriber);
+    drop(guest);
+    srv.ws.stop().await;
+}

@@ -1,9 +1,0 @@
-# Grandfathered elapsed-time assertions per file: `<path> <count>`, sorted by path.
-# Checked by `cargo test -p intent-core --test elapsed_assert_lint`. Entries only ratchet
-# down: assert what the time limit stood for (rows changed, calls made, a write that got in
-# while other work was held, event order) instead of how long the step took, or mark a
-# measurement under a paused tokio clock with `// elapsed-assert: allow — <reason>`.
-crates/intent-pty/src/host.rs 1
-crates/intentd/tests/auggie_context_e2e.rs 1
-crates/intentd/tests/e2e_wss_browser_exec.rs 1
-crates/intentd/tests/e2e_wss_sticky_reverse.rs 1

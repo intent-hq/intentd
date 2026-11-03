@@ -24,8 +24,18 @@ invitation link joins directly without an enable step. Workspace sharing, guest 
 discussions, the People panel, and **Settings → Collaboration** are ready for users.
 Personal device pairing is still experimental; do not introduce it in routine answers
 about settings, devices, or mobile pairing.
+Sharing needs the host owner's GitHub or GitLab account connected in **Settings →
+Connections**: without one, new invitation links cannot be created and unused links
+cannot be redeemed until it is reconnected. People who already joined keep access.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts. -->
+GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
+self-managed GitLab account in **Settings → Connections** or during onboarding, by
+device sign-in or a personal access token. With it connected, sharing can pin
+invitations to GitLab accounts and a guest can join with a GitLab identity; on hosts
+that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
+older connected daemon shows an update note instead of the GitLab setup.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
 Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
@@ -34,6 +44,15 @@ restart or inspect existing
 saved scripts. They cannot edit script commands, control raw terminals, run host
 commands, change credentials, or manage sharing. Host membership retains its existing
 authority. Role downgrades apply to subsequent operations on open connections.
+
+A guest who joined a workspace by invite can leave it from the workspace sidebar's
+**…** menu → **Leave…** (shown where owners see **Share…**), or from **Settings →
+Collaboration** → **Leave** beside that workspace. Both ask for confirmation, remove
+access to that one workspace, and keep other workspaces on the same host. Rejoining
+needs a new invite. Access through host membership cannot be left per workspace; ask
+the host owner to remove the membership.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; packages/cloudlands-fe/src/lib/components/settings/GuestSessionsSettings.svelte; packages/cloudlands-fe/src/store/renderer/slices/guest-sessions/guest-sessions-selectors.ts (selectCanLeaveWorkspace); packages/intentd/crates/intent-services/src/invite_ops.rs (workspace_members_leave_op). -->
 
 Workspaces support multiple workspace-wide discussions. Start a discussion by
 sending its first message; everyone with workspace access can read and participate.
@@ -247,7 +266,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -334,7 +353,8 @@ custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
-the original configuration is **Codex · Default**. Each profile has its own **Fast
+the original configuration is **Codex · Default**. In a shared workspace, guests see
+an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
@@ -462,6 +482,32 @@ that phase. **Startup status unavailable. Reconnecting securely…** means curre
 status is unavailable. For **Startup Failed**, use **Retry Connection** after
 checking the desktop daemon. **Back to Home** keeps saved credentials.
 
+## Run Intent in a browser from a cloud machine
+
+`@intent-hq/web` (command `intent-web`) is a new, separately installed server that
+serves the Intent web app without the desktop app, for example on a VPS or dev box.
+It ships with Intent releases on npm. It is unrelated to the experimental desktop
+**Browser access** above: do not tell the user to unlock Labs for it.
+
+- Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
+  only on `127.0.0.1:47120` and prints an **access key** on first run;
+  `npx @intent-hq/web key` shows it again and `key --reset` signs out every browser.
+- Reach it through a private HTTPS front-end such as `tailscale serve --bg 47120`, then
+  open the `https://` address and enter the key. Never suggest Tailscale Funnel or
+  another public tunnel.
+- If `intentd` is already running on the same machine when `intent-web` starts, it
+  appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
+  other machines in **Settings → Machines → Add machine** with the host, port and token
+  from `intentd pair` on that machine, then check the fingerprint and choose
+  **Confirm & connect**. With no machine yet, the browser shows **Add your first
+  machine**.
+- Its data directory (default `~/.local/state/intent-web`) holds machine tokens in
+  plain text; treat it like an SSH key. The **Settings → Mobile** tab, iCloud sync of
+  saved machines and desktop-only features such as native file dialogs are not
+  available there.
+
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
+
 ## Start or continue work
 
 When a new workspace uses a remote-tracking base branch from a local repository,
@@ -493,13 +539,19 @@ while it stays open unless the agent is retired or deleted. Choose another from 
 agent menu above the chat; Home remembers that choice for the workspace until the app
 restarts, the account or connection changes, or Home is reset.
 
+**Retire Agent** stops an agent and keeps its conversation so it can be restored later.
+Intent refuses to retire a workspace's last top-level agent, whether you or the agent
+asks; start another agent in the workspace first, or archive the workspace instead.
+Delegated agents can always be retired.
+
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
 running command script such as a build or test, or an agent's background task such as
 a shell command it left running; a dev server or other service script, or an open
 terminal tab, alone does not count. **Waiting** covers workspaces watching something external: a
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
-the merge queue. The **Waiting** filter shows the same workspaces.
+the merge queue (even when another of its PRs is ready to merge). The **Waiting** filter
+shows the same workspaces.
 
 The PR badge in list and board views shows a PR in the merge queue first, then
 draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
@@ -508,22 +560,38 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector}.svelte; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
 
-Open **New workspace** (`/workspace/new`), select a repository, describe the work,
-and choose **Create workspace**. The workspace groups working files, notes, and
-agent conversations. Resolve any displayed repository, Git, or provider setup
-error before retrying. If creation succeeded but sending the first message failed,
-use the form's retry instruction instead of creating a second workspace.
-The repository picker's tabs are **Clone** (a repository from a connected forge
-account), **Existing folder** (a folder on the machine), and **New**. **Clone** is
-hidden only once Intent has confirmed no forge account is connected; to clone, use
-the picker's connect link or **Settings → Connections**. Onboarding's project step
-uses the same tab names.
-Selecting a repository restores the agent setup last used to create a workspace
-there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
-reasoning effort. A repository with no saved setup uses the most recent setup.
-Changes you make in the form are kept when you switch repositories.
+Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
+choose **Create workspace**. The settings beside the prompt (below it on narrow
+windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
+Use **+** below the prompt to add context, or the microphone on the right to dictate.
+These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
+your repositories once each, most recently used first, with search at the top;
+the selected codebase is included even if it has not reached your history yet.
+Use the external-link action beside a codebase to open it in your browser.
+**Add codebase** opens the **Clone**, **Existing folder**, and **New** tabs.
+**Clone** is hidden only once Intent has confirmed no forge account is connected;
+to clone, use the connect link or **Settings → Connections**. Onboarding uses
+the same tab names. Open the agent picker to choose who starts the workspace.
+**Create new or manage specialists** closes the workspace form and opens specialist settings.
+In **Setup script**, search the list and select the repository's config, last-used
+commands, or a template to apply it. **Edit commands** opens the selected script;
+**Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
+**Done** or **Save & Done** keeps your edits; **Cancel** discards them and returns
+to the workspace form.
+For a local repository, use the isolation switch at the bottom of **Branch**.
+With isolation on, agents edit a separate copy. Turn it off to edit files in the
+existing folder on its current branch, without creating a worktree.
+Your prompt draft stays intact. The workspace groups working files, notes, and agent
+conversations. Resolve any displayed repository, Git, or provider setup error
+before retrying. If creation succeeded but sending the first message failed, use
+the form's retry instruction instead of creating a second workspace.
+Selecting a repository restores the setup last used to create a workspace there:
+the agent, provider, model, and reasoning effort. A repository with no saved setup
+uses the most recent setup. Changes you make in the form are kept when you switch
+repositories.
+
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
@@ -888,11 +956,12 @@ scheduled check is still pending. A blocker Intent raised because the provider
 stalled clears on its own after the agent's next successful turn. A recorded
 blocker notice can remain in the conversation after the current warning clears.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs; packages/cloudlands-fe/src/lib/components/chat/StreamingStatus.svelte. -->
 
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
-whose usage limit was reached. For sign-in errors, including an expired Claude
+whose usage limit was reached, and **Retry** lets you try the same provider
+again after its limit resets. For sign-in errors, including an expired Claude
 OAuth login, run the displayed CLI login command on the host running the agent,
 complete sign-in, then retry. Signing in to the Claude desktop app does not sign
 in its CLI. For **Agent session corrupted**, retry starts a fresh session and
@@ -922,9 +991,10 @@ Intent runs its own bundled copy of that CLI instead, downloading it with npm on
 first use. Sessions keep using the installed CLI's sign-in and settings. The host
 owner sees a warning that Intent is using its bundled CLI (older apps show
 **CLI is out of date**). Updating the installed CLI makes Intent switch back to
-it. For Codex, **Update** runs `codex update` in a terminal on the daemon host;
-follow its output until it finishes. If the button is missing or the command
-fails, update the CLI with the tool that installed it. If the bundled download
+it. **Update** runs `codex update` or `claude update` in a terminal on the
+daemon host; follow its output until it finishes. If the button is missing or
+the command fails or prints another upgrade command, update the CLI with the
+tool that installed it. If the bundled download
 fails (for example, offline or without npm), Codex launches report the
 installed version, the required minimum, and the download error; Claude Code
 keeps using the installed CLI.

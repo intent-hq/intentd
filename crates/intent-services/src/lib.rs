@@ -65,6 +65,7 @@ mod auto_archive;
 mod auto_retire;
 mod executor_capabilities;
 mod executor_ops;
+mod link_traffic_ops;
 mod plain_folder;
 mod remote_machine_ops;
 mod retire;
@@ -124,6 +125,7 @@ mod installed_cli;
 mod workspace_mutations;
 
 mod github_ops;
+mod proxy_page;
 
 mod collaboration_auth_ops;
 mod github_auth_ops;
@@ -348,7 +350,8 @@ pub mod auggie_discovery {
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
     resolve_provider_launch, AgentManager, AgentMemorySnapshot, BusEventSink, ProcessRegistry,
-    ProcessSample, ProviderLaunchSpec, TreeMemoryProbe, TreeSample,
+    ProcessSample, ProviderLaunchSpec, RemoteAgentMemory, RemoteAgentRoot, RemoteOwner,
+    TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -1316,6 +1319,9 @@ pub struct Services {
     /// Where the executor link can be dialed (`executor.mint`), attached by
     /// the composition root; the transport owns the listener.
     machine_routes: Arc<OnceLock<Arc<dyn intent_core::machines::MachineRoutesSource>>>,
+    /// The owner's capture of executor-link traffic (`remoteLinkTraffic.*`),
+    /// tapped by the backend's and the machine's links.
+    link_traffic: Arc<intent_core::link_traffic::LinkTraffic>,
     /// Live status of executor credentials (`executor.list`), attached by
     /// the executor link; unset reads every credential as disconnected.
     executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
@@ -1906,6 +1912,7 @@ impl Services {
             )
             .0,
             machine_routes: Arc::new(OnceLock::new()),
+            link_traffic: Arc::default(),
             executor_liveness: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
@@ -2633,7 +2640,9 @@ impl Services {
     /// role-reminder injection). Rebuilt every turn (interval = 1); the reminder
     /// is added to the outbound provider prompt only and never persisted.
     pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
-        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        // Runs on every turn: the metadata-only lookup skips the transcript
+        // load and payload hydration `get_agent_session` performs.
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let specialist_id = session.specialist.as_deref()?;
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
         // when present it wins over live 3-tier resolution, so later edits or
@@ -2672,7 +2681,7 @@ impl Services {
         agent_id: &AgentId,
         workspace_path: Option<&Path>,
     ) -> Option<crate::rules::SpecialistPromptInjection> {
-        let session = self.store.get_agent_session(agent_id).await.ok()?;
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let override_bp = Self::session_metadata_str(&session, "behaviorPrompt");
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
         // on a specialist session, `specialistName` presence marks a snapshot
@@ -5163,6 +5172,7 @@ impl Services {
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
+        link_traffic_ops::publish_link_traffic(&self.link_traffic, bus.clone());
         self.event_bus = Some(bus);
         self
     }
@@ -7625,6 +7635,67 @@ impl Services {
     /// `agent.wakeOrCreate` spawns a fresh agent instead of waking it.
     /// `agent.retry` remains the escape hatch (it clears the Error status,
     /// the `stop_reason`, and the streak before redriving).
+    /// Every `workspace.list` / lite snapshot step after the store read:
+    /// membership narrowing, the batched card aggregates (`full` selects the
+    /// enriched `workspace.list` rows, otherwise the lite snapshot rows), the
+    /// emit-path PR merge, list-row slimming and the membership summary.
+    pub(crate) async fn finish_workspace_list(
+        &self,
+        list: &mut Vec<Workspace>,
+        filter: intent_core::WorkspaceListFilter,
+        full: bool,
+    ) -> Result<()> {
+        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
+        // reads below must cover them whenever the list includes them.
+        let include_archived = filter.include_archived || filter.include_retired;
+        // Membership filter (multiplayer w3) before any enrichment, so a
+        // collaborator's rows never cost more than what it can see.
+        self.retain_member_workspaces(list).await?;
+        // `activity` is derived from live agent state, never persisted (§9.9);
+        // the card aggregates are computed fresh on the emit path (§9.1).
+        // Every store-backed aggregate is fetched once for the requested ids
+        // and joined below in store order; no per-workspace store futures.
+        let started = std::time::Instant::now();
+        let count = list.len();
+        let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+        let snapshot = self
+            .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+            .await;
+        for ws in list.iter_mut() {
+            self.enrich_workspace_from_snapshot(ws, &snapshot, full)
+                .await;
+        }
+        tracing::debug!(
+            workspaces = count,
+            full,
+            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "workspace.list: aggregate enrichment"
+        );
+        // Emit-path PR merge: fold git-root + monitor PRs into each
+        // row's `pullRequests`. Runs after enrichment: the displayStatus
+        // derivation already folded the git-root PRs and the monitor
+        // signals with the same per-URL priority (and canonicalized the
+        // row's own `activePullRequest` / `pullRequests` copies to the
+        // same lifecycle), so it must not see them a second time via the
+        // merged `pullRequests`. The git-root PRs move out of the
+        // snapshot — the list's one bulk git-root read serves both the
+        // derivation and the wire merge.
+        self.merge_external_pull_requests(list, include_archived, snapshot.git_root_prs)
+            .await;
+        // List-frame slimming (monorepo#3041): the final pass, after
+        // enrichment and the PR merge, so base rows served on the panic
+        // degradation path above (still carrying persisted `tokenUsage` /
+        // `setupScript`) and externally merged PR entries are slimmed
+        // alike. `workspace.get` keeps every field for detail reads.
+        for ws in list.iter_mut() {
+            ws.slim_for_list();
+        }
+        // Membership summary (multiplayer w1): one SQL query for the
+        // whole list, relative to the request's bound caller.
+        self.attach_workspace_memberships(list).await;
+        Ok(())
+    }
+
     pub(crate) fn session_poisoned(&self, session: &AgentSession) -> bool {
         if session.status != intent_core::AgentStatus::Error {
             return false;
@@ -12535,17 +12606,6 @@ fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
         (nonempty_repository_path(a), nonempty_repository_path(b)),
         (Some(pa), Some(pb)) if pa == pb
     )
-}
-
-/// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
-/// matching the TS `numberLines` helper used by `crossWorkspace.readNote`.
-fn number_lines(content: &str) -> String {
-    content
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| format!("{:>4} | {line}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
@@ -17753,6 +17813,16 @@ impl Services {
         };
         let Some((bus, ws)) = stream_target else {
             registry.unregister(request_id);
+            // Inline replies stay under the read payload budget; a cut is
+            // flagged with an additive `truncated: true`.
+            let mut matches = matches;
+            if search_ops::bound_inline_matches(&mut matches) {
+                return serde_json::json!({
+                    "requestId": request_id,
+                    "matches": matches,
+                    "truncated": true,
+                });
+            }
             return serde_json::json!({ "requestId": request_id, "matches": matches });
         };
         let stream_request_id = request_id.to_string();
@@ -19298,6 +19368,14 @@ impl WorkspaceApi for Services {
         !self.node_mode && self.ports.remote_launch().manages_machines()
     }
 
+    fn remote_link_traffic(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.remote_link_traffic_op(method, params))
+    }
+
     fn desktop_agent_call(
         &self,
         workspace: WorkspaceId,
@@ -19651,6 +19729,9 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             caps.insert("messageBlockPages".into(), serde_json::json!(1));
+            // Reads answer bounded pages by default (default page sizes,
+            // maximums and byte budgets), so a new app pages them.
+            caps.insert("boundedReads".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -19671,15 +19752,19 @@ impl WorkspaceApi for Services {
             // Saved profile summaries ride alongside the per-type rows
             // (PROTOCOL §5.54); `providers` stays one row per provider type.
             let mut catalog = provider_catalog::build_providers_catalog();
+            // Profile and Default names are host settings: a guest's read
+            // keeps the shape but names none of them (§5.54 "Guest reads").
+            let guest = self.catalog_caller_is_guest().await?;
             let (profiles, default_remote_incompatibility) = self.provider_profile_catalog().await;
-            catalog["profiles"] = serde_json::Value::Array(profiles);
+            catalog["profiles"] =
+                serde_json::Value::Array(if guest { Vec::new() } else { profiles });
             // Default configurations that cannot run on another machine
             // (§5.54 "Remote compatibility"); omitted when none.
             if let Some(defaults) = default_remote_incompatibility {
                 catalog["defaultRemoteIncompatibility"] = defaults;
             }
             // Renamed Default configurations (§5.54); omitted when none is.
-            if let Some(names) = self.provider_default_names() {
+            if let Some(names) = self.provider_default_names().filter(|_| !guest) {
                 catalog["defaultNames"] = names;
             }
             Ok(catalog)
@@ -19887,6 +19972,7 @@ impl WorkspaceApi for Services {
             let crate::agent_manager::AgentMemorySnapshot {
                 sampled_at,
                 processes: samples,
+                remote,
             } = snapshot;
             let spawn_details = manager.agent_spawn_details();
 
@@ -19951,6 +20037,44 @@ impl WorkspaceApi for Services {
                         .collect::<Vec<_>>(),
                 });
                 if let Some(model) = model {
+                    row["model"] = serde_json::Value::String(model);
+                }
+                agents.push(row);
+            }
+            // Agents this machine runs for other backends: no session row
+            // here, so the row is what the launch said, tagged with the
+            // backend it runs for. No name (the launch carries none).
+            for crate::agent_manager::RemoteAgentMemory {
+                agent,
+                mut processes,
+            } in remote
+            {
+                let memory_bytes: u64 = processes.iter().map(|p| p.memory_bytes).sum();
+                total_bytes += memory_bytes;
+                processes.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
+                let mut row = serde_json::json!({
+                    "agentId": agent.agent_id.0,
+                    "workspaceId": agent.workspace_id.0,
+                    "provider": agent.provider,
+                    "remoteOwner": {
+                        "backendId": agent.owner.backend_id,
+                        "backendName": agent.owner.backend_name,
+                    },
+                    "rootPid": agent.root_pid,
+                    "processCount": processes.len(),
+                    "memoryBytes": memory_bytes,
+                    "processes": processes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "pid": p.pid,
+                            "parentPid": p.parent_pid,
+                            "name": p.name,
+                            "cmdline": p.cmdline,
+                            "memoryBytes": p.memory_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                if let Some(model) = agent.model {
                     row["model"] = serde_json::Value::String(model);
                 }
                 agents.push(row);
@@ -20440,7 +20564,8 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let opts = search_ops::parse_opts(opts)?;
+            let mut opts = search_ops::parse_opts(opts)?;
+            search_ops::bound_in_files_opts(&mut opts);
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
                 return Ok(serde_json::json!({
@@ -20551,6 +20676,10 @@ impl WorkspaceApi for Services {
                     _ => vec![workspace_id.clone()],
                 };
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
+            // Absent → MATCH_LIMIT_DEFAULT, clamped to MATCH_LIMIT_MAX (a
+            // negative SQL LIMIT would otherwise mean no limit).
+            let limit =
+                Some(i64::try_from(search_ops::match_limit(limit)).expect("limit fits in i64"));
             let token = registry.register_as(&request_id, capability::search_owner()?);
             // User-typed queries are never handed to the FTS5 parser verbatim
             // (as-you-type input would surface `fts5: syntax error`); a query
@@ -20604,7 +20733,7 @@ impl WorkspaceApi for Services {
             }
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register_as(&request_id, capability::search_owner()?);
-            let limit = limit.and_then(|n| usize::try_from(n).ok());
+            let limit = search_ops::match_limit(limit);
             let mut q = EventQuery {
                 workspace_id: workspace_id.clone(),
                 ..Default::default()
@@ -21449,6 +21578,8 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: intent_core::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -21465,18 +21596,46 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let content = note.content;
-            let line_count = content.split('\n').count();
-            Ok(serde_json::json!({
+            let budget = if window.is_requested() || bounded_default {
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES
+            } else {
+                usize::MAX
+            };
+            let page = intent_core::note_read_bounds::note_line_page(&note.content, window, budget)
+                .map_err(|e| Error::InvalidParams(e.to_string()))?;
+            let mut out = serde_json::json!({
                 "id": note.id,
                 "title": note.title,
-                "content": content,
-                "numberedContent": number_lines(&content),
+                "content": page.content,
+                "numberedContent": page.numbered_content,
                 "sourceWorkspaceId": target_workspace_id,
                 "sourceWorkspaceTitle": target.title,
                 "branch": target.branch,
-                "lineCount": line_count,
-            }))
+                "lineCount": page.total_lines,
+            });
+            // A whole-note read keeps the original shape; a partial page
+            // says which lines it carries and where to read on.
+            if window.is_requested() || page.truncated() {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("startLine".into(), serde_json::json!(page.start_line));
+                    obj.insert("endLine".into(), serde_json::json!(page.end_line));
+                    obj.insert("truncated".into(), serde_json::json!(page.truncated()));
+                    obj.insert(
+                        "nextStartLine".into(),
+                        serde_json::json!(page.next_start_line()),
+                    );
+                    // A cut line resumes at a byte offset on the same line,
+                    // so following the cursor rebuilds the note exactly.
+                    obj.insert(
+                        "nextStartOffset".into(),
+                        serde_json::json!(page.next_start_offset()),
+                    );
+                    if page.start_offset > 0 {
+                        obj.insert("startOffset".into(), serde_json::json!(page.start_offset));
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -21571,6 +21730,11 @@ impl WorkspaceApi for Services {
                 agent_id: Option<AgentId>,
                 include_retired: bool,
             ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_list;
+            fn hook_list_page(
+                &self,
+                workspace_id: WorkspaceId,
+                params: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_list_page;
             fn hook_get(&self, workspace_id: WorkspaceId, hook_id: intent_core::HookId)
                 -> BoxFuture<'_, Result<serde_json::Value>> => hook_get;
             fn hook_cancel(
@@ -21677,55 +21841,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
-        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
-        // reads below must cover them whenever the list includes them.
-        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             let mut list = store.list_workspaces(filter).await?;
-            // Membership filter (multiplayer w3) before any enrichment, so a
-            // collaborator's rows never cost more than what it can see.
-            this.retain_member_workspaces(&mut list).await?;
-            // `activity` is derived from live agent state, never persisted (§9.9);
-            // the card aggregates are computed fresh on the emit path (§9.1).
-            // Every store-backed aggregate is fetched once for the requested ids
-            // and joined below in store order; no per-workspace store futures.
-            let started = std::time::Instant::now();
-            let count = list.len();
-            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this
-                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
-                .await;
-            for ws in &mut list {
-                this.enrich_workspace_from_snapshot(ws, &snapshot, true)
-                    .await;
-            }
-            tracing::debug!(
-                workspaces = count,
-                total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "workspace.list: aggregate enrichment"
-            );
-            // Emit-path PR merge: fold git-root + monitor PRs into each
-            // row's `pullRequests`. Runs after enrichment: the displayStatus
-            // derivation already folded the git-root PRs and the monitor
-            // signals with the same per-URL priority (and canonicalized the
-            // row's own `activePullRequest` / `pullRequests` copies to the
-            // same lifecycle), so it must not see them a second time via the
-            // merged `pullRequests`. The git-root PRs move out of the
-            // snapshot — the list's one bulk git-root read serves both the
-            // derivation and the wire merge.
-            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
-                .await;
-            // List-frame slimming (monorepo#3041): the final pass, after
-            // enrichment and the PR merge, so base rows served on the panic
-            // degradation path above (still carrying persisted `tokenUsage` /
-            // `setupScript`) and externally merged PR entries are slimmed
-            // alike. `workspace.get` keeps every field for detail reads.
-            for ws in &mut list {
-                ws.slim_for_list();
-            }
-            // Membership summary (multiplayer w1): one SQL query for the
-            // whole list, relative to the request's bound caller.
-            this.attach_workspace_memberships(&mut list).await;
+            this.finish_workspace_list(&mut list, filter, true).await?;
             Ok(list)
         })
     }
@@ -21736,7 +21854,6 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
-        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             // Store rows + live activity + cheap status aggregates only. No
             // notes/sessions enrichment so workspace.subscribe seq-0 stays
@@ -21748,28 +21865,69 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(filter).await?;
-            this.retain_member_workspaces(&mut list).await?;
-            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this
-                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
-                .await;
-            for ws in &mut list {
-                this.enrich_workspace_from_snapshot(ws, &snapshot, false)
-                    .await;
-            }
-            // Emit-path PR merge, same as the full list path: the seq-0
-            // snapshot must carry the same `pullRequests` a later
-            // `workspace.list` would (and, like there, the displayStatus
-            // above already folded the git-root PRs, whose one bulk read
-            // now moves out of the snapshot into the merge).
-            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
-                .await;
-            // Same final slimming pass as the full list path (monorepo#3041).
-            for ws in &mut list {
-                ws.slim_for_list();
-            }
-            this.attach_workspace_memberships(&mut list).await;
+            this.finish_workspace_list(&mut list, filter, false).await?;
             Ok(list)
+        })
+    }
+
+    fn list_workspaces_page(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+        lite: bool,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<intent_core::WorkspacePage>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let limit = crate::pagination::clamp_page_limit(
+                limit,
+                intent_core::WORKSPACE_LIST_DEFAULT_LIMIT,
+                intent_core::WORKSPACE_LIST_MAX_LIMIT,
+            );
+            // Lite (snapshot) and enriched pages share one scope, so a
+            // snapshot's token continues through `workspace.list`.
+            let scope = serde_json::json!([
+                "workspace.list",
+                filter.include_archived,
+                filter.include_retired
+            ]);
+            let after = next_token
+                .as_deref()
+                .map(|token| crate::pagination::decode_keyset_token(token, &scope))
+                .transpose()?;
+            // One row past the page tells whether more rows follow.
+            let mut list = this
+                .store
+                .list_workspaces_page(
+                    filter,
+                    after.as_ref().map(|(c, i)| (c.as_str(), i.as_str())),
+                    limit + 1,
+                )
+                .await?;
+            let has_more = list.len() > limit;
+            list.truncate(limit);
+            let last_scanned = list
+                .last()
+                .map(|ws| crate::pagination::encode_keyset_token(&scope, &ws.created_at, &ws.id.0));
+            this.finish_workspace_list(&mut list, filter, !lite).await?;
+            let kept = crate::pagination::fit_rows_to_budget(
+                &list,
+                intent_core::WORKSPACE_LIST_BUDGET_BYTES,
+            );
+            let next_token = if kept < list.len() {
+                list.truncate(kept);
+                list.last().map(|ws| {
+                    crate::pagination::encode_keyset_token(&scope, &ws.created_at, &ws.id.0)
+                })
+            } else if has_more {
+                last_scanned
+            } else {
+                None
+            };
+            Ok(intent_core::WorkspacePage {
+                workspaces: list,
+                next_token,
+            })
         })
     }
 
@@ -22152,6 +22310,7 @@ impl WorkspaceApi for Services {
                                 // foreground agent (top-level wins over any
                                 // metadata.isBackground copy).
                                 is_background: Some(false),
+                                placement: agent.placement,
                                 ..Default::default()
                             };
                             // Project-tier root for the plan's failing
@@ -22188,6 +22347,21 @@ impl WorkspaceApi for Services {
                                 )
                             })
                             .await?;
+                            let mut plan = plan;
+                            // A placed initial agent (§5.1, nodes.md): the
+                            // placement, remote compatibility and machine
+                            // choice are checked here, before any workspace
+                            // effect; the start commit is pinned once the
+                            // workspace commits.
+                            if plan.placement.is_some() {
+                                if input.plain_folder == Some(true) {
+                                    return Err(Error::InvalidParams(
+                                        "initialAgent.placement: remote agents need a workspace with a git repository to start from".into(),
+                                    ));
+                                }
+                                boxed_await(|| services.admit_remote_initial_agent(&mut plan))
+                                    .await?;
+                            }
                             Some((plan, prompt, image_blocks))
                         }
                         None => None,
@@ -23996,6 +24170,8 @@ impl WorkspaceApi for Services {
                         .await;
                     }
                     let mut initial_agent = None;
+                    let mut notice = None;
+                    let mut initial_agent_launch_failure = None;
                     if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
                         // `agent.create` — the initial agent opts out of the
@@ -24012,6 +24188,10 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
+                        let base_error =
+                            boxed_await(|| services.pin_remote_base_commit(&ws.id, &mut plan))
+                                .await;
+                        let remote_view = plan.remote.clone();
                         // On that infrastructure failure the create returns
                         // before the setup task below is scheduled, so the
                         // already-inserted row would otherwise read `pending`
@@ -24027,6 +24207,30 @@ impl WorkspaceApi for Services {
                                 return Err(e.into());
                             }
                         };
+                        let mut created = created;
+                        // A placed initial agent starts on its machine; when
+                        // it cannot, the workspace and the placed agent are
+                        // kept, no turn is started, and the create reports
+                        // the failure after the workspace is settled.
+                        let mut launch_failed = false;
+                        if let Some(view) = remote_view {
+                            match boxed_await(|| {
+                                services.start_remote_initial_agent(
+                                    &ws.id,
+                                    &mut created,
+                                    view,
+                                    base_error,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(launched) => notice = launched,
+                                Err(failure) => {
+                                    launch_failed = true;
+                                    initial_agent_launch_failure = Some(failure);
+                                }
+                            }
+                        }
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
@@ -24053,9 +24257,10 @@ impl WorkspaceApi for Services {
                         // attached, else the store-only persist. Best-effort like the
                         // delegate path — the agent holds
                         // `AgentSession.initial_message` for resume.
-                        let has_content = prompt.is_some()
-                            || created_image_blocks.is_some()
-                            || created_file_blocks.is_some();
+                        let has_content = !launch_failed
+                            && (prompt.is_some()
+                                || created_image_blocks.is_some()
+                                || created_file_blocks.is_some());
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
                             // Principal stamp (multiplayer w2): the initial
@@ -24195,6 +24400,8 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                         proposal_origin: None,
+                        notice,
+                        initial_agent_launch_failure,
                     })
                 }),
             ))
@@ -24257,6 +24464,19 @@ impl WorkspaceApi for Services {
                     self.resolve_create_proposal_origin(origin, &result.workspace.id, replayed)
                 })
                 .await;
+            }
+            // The placed initial agent could not start after the workspace
+            // committed (replayed as such on a keyed retry): the documented
+            // `-32603` `launch-failed` error instead of a result.
+            if let Some(failure) = result.initial_agent_launch_failure.take() {
+                tracing::warn!(
+                    method = "workspace.create",
+                    workspace = %result.workspace.id.as_str(),
+                    error = %failure.message,
+                    "workspace.create: the initial agent could not start on its machine"
+                );
+                let intent_core::InitialAgentLaunchFailure { message, data } = failure;
+                return Err(Error::remote_machine(true, message, data));
             }
             Ok(result)
         })
@@ -27019,6 +27239,35 @@ impl WorkspaceApi for Services {
                 data,
                 size_kb,
             })
+        })
+    }
+
+    fn read_asset_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let assets_root = self.assets_root.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            file_ops::validate_chunk_length(length)?;
+            let asset_id = note_ops::parse_asset_id(&asset)?;
+            let root = assets_root
+                .ok_or_else(|| Error::Internal("asset storage is not configured".to_string()))?;
+            let path = root.join(&workspace_id.0).join(&asset_id);
+            let mime_type = note_ops::mime_from_extension(&asset_id);
+            let mut window = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| Error::Internal(format!("Failed to read asset: {e}")))?;
+                file_ops::window_bytes(&bytes, offset, length)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("note.readAssetChunk task failed: {e}")))??;
+            window["assetId"] = serde_json::Value::String(asset_id);
+            window["mimeType"] = serde_json::Value::String(mime_type);
+            Ok(window)
         })
     }
 
@@ -31176,6 +31425,44 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn git_show_file_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        let store = self.store.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            file_ops::validate_chunk_length(length)?;
+            // The `git.showFile` fallbacks, as an empty blob.
+            let empty = || file_ops::window_bytes(&[], offset, length);
+            let ws = match store.get_workspace(&workspace_id).await {
+                Ok(w) => w,
+                Err(Error::NotFound(_)) => return empty(),
+                Err(e) => return Err(e),
+            };
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return empty();
+            };
+            if ws.is_remote || !worktree.join(".git").exists() {
+                return empty();
+            }
+            // Blocking thread: a large blob read should not stall the
+            // executor (matching file.readChunk).
+            tokio::task::spawn_blocking(move || {
+                let bytes = intent_git::show::show_file_bytes(&worktree, &git_ref, &file_path)?;
+                file_ops::window_bytes(&bytes, offset, length)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.showFileChunk task failed: {e}")))?
+        })
+    }
+
     fn git_numstat(
         &self,
         workspace_id: WorkspaceId,
@@ -31327,6 +31614,23 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        selection: intent_core::AgentListSelection,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<intent_core::AgentListPage>> {
+        Box::pin(async move {
+            // Scoped reads keep their existing (ungated) membership path.
+            if !matches!(selection, intent_core::AgentListSelection::Scoped(_)) {
+                self.require_member(&workspace_id).await?;
+            }
+            self.agent_list_page_op(workspace_id, selection, limit, next_token)
+                .await
+        })
+    }
+
     fn agent_list_including_retired(
         &self,
         workspace_id: WorkspaceId,
@@ -31475,6 +31779,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_session_op(agent_id).await
+        })
+    }
+
+    fn agent_get_session_bounded(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_get_session_bounded_op(agent_id).await
         })
     }
 
@@ -32152,6 +32467,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_queue_op(agent_id, workspace_id).await
+        })
+    }
+
+    fn agent_get_queue_page(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            let reply = self
+                .agent_get_queue_op(agent_id.clone(), workspace_id)
+                .await?;
+            crate::pagination::page_queue_reply(reply, &agent_id.0, limit, next_token.as_deref())
         })
     }
 
@@ -32878,6 +33209,7 @@ impl WorkspaceApi for Services {
         agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         stale_responding_after_ms: Option<i64>,
+        row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -32889,6 +33221,7 @@ impl WorkspaceApi for Services {
                 agent_id,
                 task_note_id,
                 stale_responding_after_ms,
+                row_limit,
             )
             .await
         })
@@ -33390,11 +33723,23 @@ impl WorkspaceApi for Services {
             self.require_host_execution("github.pullsReviews").await?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let page = sc.pull_reviews(&repo_ref, number, intent_sourcecontrol::PageParams {
-                limit: github_ops::clamp_limit(limit).min(100),
-                cursor: github_ops::decode_next_token(next_token.as_deref()),
-            }).await.map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({ "reviews": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let page = sc
+                .pull_reviews(
+                    &repo_ref,
+                    number,
+                    intent_sourcecontrol::PageParams {
+                        limit: req.limit,
+                        cursor: req.cursor(),
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let (reviews, next) = req.finish(
+                proxy_page::to_items(&page.items)?,
+                page.next_cursor.as_deref(),
+            );
+            Ok(serde_json::json!({ "reviews": reviews, "nextToken": next }))
         })
     }
 
@@ -33417,15 +33762,17 @@ impl WorkspaceApi for Services {
             if expected_head_sha.as_ref().is_some_and(|expected| expected != &head_sha) {
                 return Err(Error::Conflict { current: serde_json::json!({"headSha": head_sha}) });
             }
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let page = sc.pull_files(&repo_ref, number, intent_sourcecontrol::PageParams {
-                limit: github_ops::clamp_limit(limit).min(100),
-                cursor: github_ops::decode_next_token(next_token.as_deref()),
+                limit: req.limit,
+                cursor: req.cursor(),
             }).await.map_err(pr_ops::map_sc_err)?;
             let after = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha;
             if after.as_ref() != Some(&head_sha) {
                 return Err(Error::Conflict { current: serde_json::json!({"headSha": after}) });
             }
-            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+            let (files, next) = req.finish(proxy_page::to_items(&page.items)?, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": files, "nextToken": next }))
         })
     }
 
@@ -33443,8 +33790,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.pullsList").await?;
             let state = github_ops::parse_pr_state(state.as_deref())?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33465,10 +33812,8 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33498,8 +33843,8 @@ impl WorkspaceApi for Services {
                 Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
                 None => Some(intent_sourcecontrol::PrState::Open),
             };
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -33528,10 +33873,8 @@ impl WorkspaceApi for Services {
                     github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
                 })
                 .collect();
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33557,6 +33900,7 @@ impl WorkspaceApi for Services {
             }
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_org_prs(
@@ -33565,8 +33909,8 @@ impl WorkspaceApi for Services {
                         state,
                         involvement,
                         search: github_ops::normalize_search_query(query),
-                        limit: Some(github_ops::clamp_limit(limit)),
-                        cursor: github_ops::decode_next_token(next_token.as_deref()),
+                        limit: Some(req.limit),
+                        cursor: req.cursor(),
                         ..intent_sourcecontrol::PrQuery::default()
                     },
                 )
@@ -33588,10 +33932,8 @@ impl WorkspaceApi for Services {
                     Ok(github_ops::pull_to_json_with_repo(pr, &repo))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(serde_json::json!({
-                "pulls": pulls,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (pulls, next) = req.finish(pulls, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "pulls": pulls, "nextToken": next }))
         })
     }
 
@@ -33741,8 +34083,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.issuesList").await?;
             let state = github_ops::parse_issue_state(state.as_deref())?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33764,10 +34106,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
                 .collect();
-            Ok(serde_json::json!({
-                "issues": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "issues": items, "nextToken": next }))
         })
     }
 
@@ -33798,8 +34138,8 @@ impl WorkspaceApi for Services {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
                 None => "open".to_string(),
             };
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
@@ -33826,10 +34166,8 @@ impl WorkspaceApi for Services {
                     github_ops::issue_to_json(i, &hit.owner, &hit.name)
                 })
                 .collect();
-            Ok(serde_json::json!({
-                "issues": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "issues": items, "nextToken": next }))
         })
     }
 
@@ -33845,8 +34183,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.listReviewComments")
                 .await?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33862,10 +34200,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(github_ops::review_comment_to_json)
                 .collect();
-            Ok(serde_json::json!({
-                "comments": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "comments": items, "nextToken": next }))
         })
     }
 
@@ -33903,8 +34239,8 @@ impl WorkspaceApi for Services {
         self.execution_call(async move {
             self.require_host_execution("github.getReviewThreads")
                 .await?;
-            let limit = github_ops::clamp_limit(limit);
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let (limit, cursor) = (req.limit, req.cursor());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
@@ -33920,10 +34256,8 @@ impl WorkspaceApi for Services {
                 .iter()
                 .map(github_ops::review_thread_to_json)
                 .collect();
-            Ok(serde_json::json!({
-                "threads": items,
-                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
-            }))
+            let (items, next) = req.finish(items, page.next_cursor.as_deref());
+            Ok(serde_json::json!({ "threads": items, "nextToken": next }))
         })
     }
 
@@ -35320,18 +35654,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_host_execution("linear.listIssues").await?;
             let filter = linear_ops::parse_filter(filter.as_deref())?;
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let cursor = req.cursor();
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
-                .list_issues(filter, linear_ops::wire_limit(limit), cursor.as_deref())
+                .list_issues(filter, Some(u32::from(req.limit)), cursor.as_deref())
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
-            let issues = serde_json::to_value(page.issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
-            Ok(serde_json::json!({
-                "issues": issues,
-                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
-            }))
+            let (issues, next) = req.finish(
+                proxy_page::to_items(&page.issues)?,
+                page.next_token.as_deref(),
+            );
+            Ok(serde_json::json!({ "issues": issues, "nextToken": next }))
         })
     }
 
@@ -35344,18 +35678,18 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             self.require_host_execution("linear.searchIssues").await?;
-            let cursor = github_ops::decode_next_token(next_token.as_deref());
+            let req = proxy_page::PageRequest::new(limit, next_token.as_deref());
+            let cursor = req.cursor();
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
-                .search_issues(&query, linear_ops::wire_limit(limit), cursor.as_deref())
+                .search_issues(&query, Some(u32::from(req.limit)), cursor.as_deref())
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
-            let issues = serde_json::to_value(page.issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
-            Ok(serde_json::json!({
-                "issues": issues,
-                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
-            }))
+            let (issues, next) = req.finish(
+                proxy_page::to_items(&page.issues)?,
+                page.next_token.as_deref(),
+            );
+            Ok(serde_json::json!({ "issues": issues, "nextToken": next }))
         })
     }
 
@@ -35428,7 +35762,7 @@ impl WorkspaceApi for Services {
             self.require_host_execution("linear.listProjects").await?;
             let engine = linear_ops::resolve_engine(injected).await?;
             let projects = engine
-                .list_projects(linear_ops::wire_limit(limit))
+                .list_projects(Some(u32::from(proxy_page::clamp_page_limit(limit))))
                 .await
                 .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(projects)

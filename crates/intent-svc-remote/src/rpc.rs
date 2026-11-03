@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
 use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
-use intent_core::{Caller, Error, WorkspaceApi};
+use intent_core::{Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
 
@@ -125,10 +125,13 @@ impl HeadCalls {
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
         let budget = Duration::from_millis(u64::from(request.timeout_ms)).min(MAX_BUDGET);
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
+        // The host binds `Caller::Agent { record.agent_id }` around the frame
+        // itself: a node's agent acts with exactly its own identity, never
+        // the head daemon's.
         let host = intent_acp::make_workspace_host_for_bridge(
             api,
             record.workspace_id.clone(),
-            Some(record.agent_id.clone()),
+            record.agent_id.clone(),
             Some(self.services.turn_attachments()),
             features,
             is_sub_agent,
@@ -138,10 +141,7 @@ impl HeadCalls {
             "method": method,
             "args": request.params.get("args").cloned().unwrap_or(Value::Null),
         });
-        let caller = Caller::Agent {
-            agent_id: record.agent_id,
-        };
-        match intent_core::with_caller(caller, host(frame)).await {
+        match host(frame).await {
             Ok(value) => LinkOutcome::Ok(value),
             Err(message) => refusal(CALL_FAILED, message),
         }

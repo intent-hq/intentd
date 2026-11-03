@@ -6764,3 +6764,65 @@ mod progressive_history {
         );
     }
 }
+
+/// [`visible_workspace_seed`]: the visible-id seed of a non-administrator's
+/// paged workspace snapshot.
+mod visible_workspace_seed_tests {
+    use super::*;
+    use intent_core::{chief_workspace, BoxFuture, Result, WorkspaceApi, WorkspaceListFilter};
+
+    /// The caller's whole list is `ws-1`..`ws-3`, or a store error.
+    struct SeedApi {
+        fail: bool,
+    }
+
+    impl WorkspaceApi for SeedApi {
+        fn list_workspaces(
+            &self,
+            _filter: WorkspaceListFilter,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    return Err(intent_core::Error::Internal("store down".into()));
+                }
+                Ok(["ws-1", "ws-2", "ws-3"]
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    fn ids(set: &HashSet<String>) -> Vec<&str> {
+        let mut out: Vec<&str> = set.iter().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_complete_page_seeds_its_own_ids() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed = visible_workspace_seed(&SeedApi { fail: false }, &page, None, false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_page_seeds_the_whole_visible_list() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: false }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1", "ws-2", "ws-3"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_full_read_falls_back_to_the_page() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: true }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
+    }
+}

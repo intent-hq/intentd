@@ -11,6 +11,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::{self, http, Message};
 use tokio_tungstenite::WebSocketStream;
 
+use intent_core::link_traffic::{LinkTap, TrafficDirection};
 use intent_core::node_link::{
     ensure_protocol, LeaseBinding, LinkFrame, LinkHello, LinkWelcome, NODE_LINK_PROTOCOLS,
 };
@@ -42,6 +43,9 @@ pub struct NodeEndpoint {
     pub pin: CertificatePin,
     pub token: ExecutorToken,
     pub tailcat: Option<TailcatRoute>,
+    /// Records the link's frames, handshake included, while the daemon's
+    /// link traffic capture is on.
+    pub tap: Option<LinkTap>,
 }
 
 /// A tailcat route to a machine: the sitter-shipped tailcat binary run in
@@ -63,6 +67,7 @@ impl NodeEndpoint {
             pin,
             token,
             tailcat: None,
+            tap: None,
         }
     }
 
@@ -79,7 +84,15 @@ impl NodeEndpoint {
             pin,
             token,
             tailcat: Some(route),
+            tap: None,
         }
+    }
+
+    /// This endpoint with `tap` recording its link's frames.
+    #[must_use]
+    pub fn with_tap(mut self, tap: Option<LinkTap>) -> Self {
+        self.tap = tap;
+        self
     }
 }
 
@@ -112,19 +125,29 @@ pub(super) async fn dial_link_with(
     tuning: Tuning,
 ) -> Result<DialedLink> {
     let binding = hello.binding.clone();
+    let tap = endpoint.tap.as_ref();
     let (socket, welcome) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut socket = connect(endpoint, LINK_PATH, &[]).await?;
-        let bytes = LinkFrame::Hello(hello).encode()?;
+        let frame = LinkFrame::Hello(hello);
+        let bytes = frame.encode()?;
+        if let Some(tap) = tap {
+            tap.observe(TrafficDirection::Out, &frame, bytes.len());
+        }
         socket
             .send(Message::Binary(bytes.into()))
             .await
             .map_err(|_| super::unavailable())?;
         let welcome = read_welcome(&mut socket, &binding).await?;
+        if let Some(tap) = tap.filter(|tap| tap.is_active()) {
+            let frame = LinkFrame::Welcome(welcome.clone());
+            let bytes = frame.encode().map_or(0, |bytes| bytes.len());
+            tap.observe(TrafficDirection::In, &frame, bytes);
+        }
         Ok::<_, Error>((socket, welcome))
     })
     .await
     .map_err(|_| super::unavailable())??;
-    let (link, events) = NodeLink::start(socket, binding, tuning);
+    let (link, events) = NodeLink::start_with(socket, binding, tuning, false, endpoint.tap.clone());
     Ok(DialedLink {
         link,
         events,

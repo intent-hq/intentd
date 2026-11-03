@@ -2729,6 +2729,15 @@ async fn agent_retire_stops_running_turn_over_wss() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer = wss_rpc(
+        &mut rpc,
+        9_001,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS peer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    assert!(peer["agent"]["id"].is_string(), "peer created: {peer}");
 
     let sent = wss_rpc(
         &mut rpc,
@@ -7436,7 +7445,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         .iter()
         .any(|n| n["id"] == json!(created_id)));
 
-    // `note.listTasks` returns a bare array (TS parity).
+    // `note.listTasks` returns one page (bounded reads).
     let tasks = wss_rpc(
         &mut rpc,
         7,
@@ -7444,7 +7453,8 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": created_id }),
     )
     .await;
-    assert!(tasks.is_array(), "note.listTasks bare array: {tasks}");
+    assert!(tasks["tasks"].is_array(), "note.listTasks page: {tasks}");
+    assert_eq!(tasks["nextToken"], Value::Null, "one page: {tasks}");
 
     // --- mcp.servers.list — empty on a fresh workspace ----------------------
     let mcp = wss_rpc(&mut rpc, 8, "mcp.servers.list", json!({})).await;

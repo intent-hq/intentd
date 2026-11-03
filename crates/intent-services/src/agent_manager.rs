@@ -1386,6 +1386,40 @@ pub struct AgentMemorySnapshot {
     /// Every process in each registered agent's subtree, bucketed by agent.
     /// Empty for probes that don't attribute.
     pub processes: HashMap<AgentId, Vec<ProcessSample>>,
+    /// The agents this machine runs for other backends (the executor), each
+    /// with its subtree from the same sweep. They have no session row here,
+    /// so they carry what their launch said.
+    pub remote: Vec<RemoteAgentMemory>,
+}
+
+/// The backend an agent this machine runs for it belongs to: its executor
+/// credential's `backendId` / `backendName` (`remoteOwner`, §5.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteOwner {
+    pub backend_id: String,
+    pub backend_name: String,
+}
+
+/// An agent this machine runs for another backend, as its launch described
+/// it, with its provider process's pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAgentRoot {
+    /// The backend's agent id.
+    pub agent_id: AgentId,
+    /// The backend's workspace id.
+    pub workspace_id: WorkspaceId,
+    pub provider: String,
+    pub model: Option<String>,
+    pub owner: RemoteOwner,
+    pub root_pid: u32,
+}
+
+/// One executor-run agent's processes from a sweep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAgentMemory {
+    pub agent: RemoteAgentRoot,
+    /// Every process in the agent's subtree; they sum to its bytes.
+    pub processes: Vec<ProcessSample>,
 }
 
 /// What the manager knows about a live agent's spawned child, for
@@ -3175,7 +3209,7 @@ impl AgentManager {
                 // workspaces, so when the session row is missing (mid-create or already
                 // deleted) swallow the lookup error and skip the publish rather than
                 // blocking the registry path. The tracing log still fires above.
-                let workspace_id = match services.store.get_agent_session(&agent_id).await {
+                let workspace_id = match services.store.get_agent_session_summary(&agent_id).await {
                     Ok(session) => session.workspace_id,
                     Err(_) => return,
                 };
@@ -3573,7 +3607,11 @@ impl AgentManager {
         // by the caller before `create_agent` runs, so propagate any store
         // error rather than silently defaulting to top-level (which would
         // mis-scope both surfaces and hide DB failures).
-        let session = self.services.store.get_agent_session(&agent_id).await?;
+        let session = self
+            .services
+            .store
+            .get_agent_session_without_messages(&agent_id)
+            .await?;
         // Sub-agent gating: delegated children (`parent_agent_id` set) and
         // background workers (`is_background`) — the same derivation the
         // prompt assembly uses. Captured once here, at bridge creation:
@@ -4462,8 +4500,12 @@ impl AgentManager {
         // Load the agent session record once and reuse both `workspace_id` (for
         // the pre-handshake status hint) and `acp_session_id` (for the resume
         // branch decision below) from the same struct.
-        let session_record =
-            boxed_await(|| self.services.store.get_agent_session(agent_id)).await?;
+        let session_record = boxed_await(|| {
+            self.services
+                .store
+                .get_agent_session_without_messages(agent_id)
+        })
+        .await?;
         // Pre-first-token turn-startup hint: the ACP `initialize` handshake is
         // about to run for this agent (STAT-1 / PROTOCOL §7). The status payload
         // carries `workspaceId` (the FE routes hints per-agent but callers key
@@ -5603,7 +5645,12 @@ impl AgentManager {
         if !self.prepend_pending.lock().unwrap().contains(agent_id) {
             return None;
         }
-        let session = match self.services.store.get_agent_session(agent_id).await {
+        let session = match self
+            .services
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -5680,16 +5727,25 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Option<String> {
-        let messages = self
+        // Runs on every turn: probe the `(agent_id, role, seq)` index instead
+        // of loading (and hydrating) the whole transcript, which held
+        // read-pool connections for seconds per turn on long-lived agents.
+        if self
             .services
             .store
-            .get_agent_messages(agent_id, None)
+            .agent_has_assistant_message(agent_id)
             .await
-            .ok()?;
-        if messages.iter().any(|m| m.role == "assistant") {
+            .ok()?
+        {
             return None;
         }
-        let session = self.services.store.get_agent_session(agent_id).await;
+        // Metadata-only lookup: `get_agent_session` also loads and hydrates
+        // the whole transcript, which this per-turn check never reads.
+        let session = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
@@ -6247,9 +6303,9 @@ impl AgentManager {
                 && self
                     .services
                     .store
-                    .get_agent_messages(agent_id, None)
+                    .agent_has_assistant_after_last_user(agent_id)
                     .await
-                    .is_ok_and(|messages| partial_turn_follows_last_user(&messages))
+                    .unwrap_or(false)
             {
                 return (
                     crate::quota_failover::QUOTA_FAILOVER_CONTINUATION.to_string(),
@@ -6845,7 +6901,12 @@ impl AgentManager {
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
         // in-flight turn to interrupt, so fall back to the kill path.
-        let session = self.services.store.get_agent_session(agent_id).await.ok();
+        let session = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok();
         if !repository_origin::is_current(&self.handles, agent_id, &repository_origin) {
             repository_origin.retire();
             return InterruptOutcome {
@@ -8247,7 +8308,12 @@ impl AgentManager {
     /// delivered report queryable. Fail open: session-lookup or timestamp
     /// parse failures treat the message as fresh (today's behavior).
     async fn annotate_stale_redrive(&self, agent_id: &AgentId, msg: &mut QueuedMessage) -> bool {
-        let session = match self.services.store.get_agent_session(agent_id).await {
+        let session = match self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+        {
             Ok(session) => session,
             Err(e) => {
                 tracing::warn!(
@@ -8608,7 +8674,12 @@ impl AgentManager {
             // parked message with no drainer. Re-poll and kick the drain if
             // the session is no longer poisoned; the STAB-52 Error gate in
             // `try_drain_queue` makes this a no-op while still quarantined.
-            if let Ok(current) = self.services.store.get_agent_session(&agent_id).await {
+            if let Ok(current) = self
+                .services
+                .store
+                .get_agent_session_summary(&agent_id)
+                .await
+            {
                 if !self.services.session_poisoned(&current) {
                     self.clone()
                         .try_drain_queue(agent_id.clone(), workspace_id.clone())
@@ -8878,7 +8949,7 @@ impl AgentManager {
                 if self
                     .services
                     .store
-                    .get_agent_session(&agent_id)
+                    .get_agent_session_summary(&agent_id)
                     .await
                     .is_err()
                 {
@@ -9153,7 +9224,12 @@ impl AgentManager {
                     );
                     return;
                 }
-                match self.services.store.get_agent_session(&agent_id).await {
+                match self
+                    .services
+                    .store
+                    .get_agent_session_summary(&agent_id)
+                    .await
+                {
                     Ok(session) if !self.services.session_poisoned(&session) => {}
                     Ok(_) => {
                         tracing::debug!(
@@ -10044,7 +10120,7 @@ impl AgentManager {
             && self
                 .services
                 .store
-                .get_agent_session(agent_id)
+                .get_agent_session_summary(agent_id)
                 .await
                 .ok()
                 .and_then(|s| s.acp_session_id)
@@ -10634,7 +10710,11 @@ impl AgentManager {
         _workspace_id: WorkspaceId,
     ) -> Result<Value> {
         // Fetch current session status
-        let session = self.services.store.get_agent_session(&agent_id).await?;
+        let session = self
+            .services
+            .store
+            .get_agent_session_summary(&agent_id)
+            .await?;
 
         // Soft-retire inertness: a retired session must not be redriven —
         // `agent.restore` is the deliberate return-to-service path.
@@ -11393,7 +11473,11 @@ impl AgentManager {
             .pin_agent_session_provider_if_null(workspace_id, agent_id, &provider, &now_iso())
             .await?;
         if !landed {
-            return self.services.store.get_agent_session(agent_id).await;
+            return self
+                .services
+                .store
+                .get_agent_session_without_messages(agent_id)
+                .await;
         }
         tracing::info!(
             agent_id = %agent_id,
@@ -11528,7 +11612,11 @@ impl AgentManager {
                 agent_id = %agent_id,
                 "session provider changed concurrently; skipping the re-home"
             );
-            let fresh = self.services.store.get_agent_session(agent_id).await?;
+            let fresh = self
+                .services
+                .store
+                .get_agent_session_without_messages(agent_id)
+                .await?;
             return Ok((fresh, false));
         }
         // Same follow-through as `agent.setModel`: the persisted display
@@ -12894,7 +12982,7 @@ impl AgentManager {
                     if !services.has_ready_to_send(&id) {
                         return;
                     }
-                    if let Ok(session) = services.store.get_agent_session(&id).await {
+                    if let Ok(session) = services.store.get_agent_session_summary(&id).await {
                         mgr.try_drain_queue(id, session.workspace_id).await;
                     }
                 });
@@ -12912,7 +13000,7 @@ impl AgentManager {
             if !self.services.has_ready_to_send(&id) {
                 continue;
             }
-            if let Ok(session) = self.services.store.get_agent_session(&id).await {
+            if let Ok(session) = self.services.store.get_agent_session_summary(&id).await {
                 Arc::clone(self)
                     .try_drain_queue(id, session.workspace_id)
                     .await;
@@ -15088,7 +15176,9 @@ async fn run_message_worker(
                 // user has not seen. Fail closed on a session-load error
                 // (leave the request pending).
                 let clear_attention = options.origin.is_user()
-                    || match boxed_await(|| mgr.services.store.get_agent_session(&agent_id)).await {
+                    || match boxed_await(|| mgr.services.store.get_agent_session_summary(&agent_id))
+                        .await
+                    {
                         Ok(s) => s.parent_agent_id.is_some() || s.is_background,
                         Err(e) => {
                             tracing::warn!(
@@ -20032,6 +20122,145 @@ mod role_reminder_tests {
         assert!(later.ends_with("later"));
     }
 
+    /// The first-turn check runs on every turn, so it must not read the
+    /// transcript: loading and hydrating every message of a long-lived agent
+    /// held read-pool connections for seconds per turn. A prior message whose
+    /// stored content cannot be decoded makes any full transcript read fail
+    /// (and the old check then skipped naming); the probe never decodes
+    /// content, so naming still fires.
+    #[tokio::test]
+    async fn first_turn_naming_check_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Developer", false, Some("developer")).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&agent_id, None)
+                .await
+                .is_err(),
+            "fixture: a full transcript read must fail on the undecodable row"
+        );
+        let instruction = mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .expect("first turn still names the agent without reading the transcript");
+        assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    /// The specialist role reminder is resolved on every turn too, so it must
+    /// use the metadata-only session lookup: `get_agent_session` loads and
+    /// hydrates the whole transcript, and fails on an undecodable row.
+    #[tokio::test]
+    async fn role_reminder_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        assert!(
+            mgr.services.agent_role_reminder(&agent_id).await.is_some(),
+            "fixture: the developer specialist has a role reminder"
+        );
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+        assert!(
+            mgr.services.agent_role_reminder(&agent_id).await.is_some(),
+            "the role reminder resolves without reading the transcript"
+        );
+    }
+
+    /// Naming follows the persisted transcript: an `agent.editAndRegenerate`
+    /// truncation that keeps an assistant reply stays past the first turn,
+    /// and one that drops every reply is a first turn again (unchanged from
+    /// the full-transcript check this probe replaced).
+    #[tokio::test]
+    async fn first_turn_naming_follows_transcript_truncation() {
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Developer", false, Some("developer")).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        let store = &mgr.services.store;
+        let text = |t: &str| serde_json::json!([{ "type": "text", "text": t }]);
+        let first = store
+            .append_agent_message(&agent_id, "user", &text("q1"), &now_iso())
+            .await
+            .unwrap();
+        assert!(mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .is_some());
+        store
+            .append_agent_message(&agent_id, "assistant", &text("a1"), &now_iso())
+            .await
+            .unwrap();
+        let second = store
+            .append_agent_message(&agent_id, "user", &text("q2"), &now_iso())
+            .await
+            .unwrap();
+        store
+            .append_agent_message(&agent_id, "assistant", &text("a2"), &now_iso())
+            .await
+            .unwrap();
+        assert!(mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .is_none());
+
+        store
+            .truncate_agent_messages_from(&agent_id, second.seq)
+            .await
+            .unwrap();
+        assert!(
+            mgr.build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                .await
+                .is_none(),
+            "an earlier assistant reply survives the truncation"
+        );
+
+        store
+            .truncate_agent_messages_from(&agent_id, first.seq + 1)
+            .await
+            .unwrap();
+        assert!(
+            mgr.build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                .await
+                .is_some(),
+            "no assistant reply is left, so the next turn is a first turn"
+        );
+    }
+
     /// Seed an Assistant (chief) chat session alongside the default fixture.
     async fn insert_assistant_chat(
         mgr: &AgentManager,
@@ -22740,6 +22969,165 @@ mod legacy_feature_freeze_tests {
             "a stamped row is never rewritten"
         );
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod transcript_free_turn_start_tests {
+    //! The turn-start path reads session metadata on every turn, so it must
+    //! never load the transcript: hydrating every message (and tool payload)
+    //! of a long-lived agent held read-pool connections for seconds per turn
+    //! and slowed concurrent RPCs. Each test corrupts a stored message so any
+    //! full transcript read fails, then drives the per-turn path.
+
+    use super::dead_child_respawn_tests::{
+        install_fake_handle, mock_agent_script, mock_env, seed_mock_session,
+    };
+    use super::role_reminder_tests::manager_with;
+    use super::*;
+
+    /// Append one user message for `agent_id`, then make its stored content
+    /// undecodable so `get_agent_messages(.., None)` and `get_agent_session`
+    /// fail.
+    async fn corrupt_transcript(mgr: &AgentManager, agent_id: &AgentId) {
+        mgr.services
+            .store
+            .append_agent_message(
+                agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+    }
+
+    /// `ensure_started` (every turn's choke point) reuses a live child
+    /// without reading the transcript.
+    #[tokio::test]
+    async fn turn_start_does_not_read_the_transcript() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+        let agent_id = AgentId::from("agent-turn-start");
+        seed_mock_session(&mgr, &agent_id, "acp-live").await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        corrupt_transcript(&mgr, &agent_id).await;
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("turn start succeeds without reading the transcript");
+        assert_eq!(acp, "acp-live");
+        mgr.stop(&agent_id).await;
+    }
+
+    /// The shared send / queue / turn-start lookup keeps every session
+    /// column (`system_prompt` included) and the retired and unknown-id
+    /// gates, but never loads the transcript.
+    #[tokio::test]
+    async fn require_agent_session_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_without_messages(&agent_id)
+            .await
+            .unwrap();
+        session.system_prompt = Some("stored system prompt".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .unwrap();
+        corrupt_transcript(&mgr, &agent_id).await;
+
+        let session = mgr
+            .services
+            .require_agent_session(&agent_id)
+            .await
+            .expect("lookup succeeds without reading the transcript");
+        assert_eq!(
+            session.system_prompt.as_deref(),
+            Some("stored system prompt")
+        );
+        assert!(session.messages.is_empty(), "the transcript is not loaded");
+
+        let unknown = mgr
+            .services
+            .require_agent_session(&AgentId::from("agent-missing"))
+            .await;
+        assert!(
+            matches!(unknown, Err(Error::InvalidParams(ref m)) if m.contains("unknown agent id")),
+            "{unknown:?}"
+        );
+        mgr.services
+            .store
+            .set_agent_session_retired_at(&workspace_id, &agent_id, Some(&now_iso()), &now_iso())
+            .await
+            .unwrap();
+        let retired = mgr.services.require_agent_session(&agent_id).await;
+        assert!(
+            matches!(retired, Err(Error::InvalidParams(ref m)) if m.contains("retired")),
+            "{retired:?}"
+        );
+    }
+
+    /// After a quota failover onto a resumed session, the turn body decides
+    /// between the continuation and the message with a bounded probe of the
+    /// role index, not a transcript read: an assistant row after the last
+    /// user row means the cut-short turn was partially answered.
+    #[tokio::test]
+    async fn quota_failover_continuation_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let store = &mgr.services.store;
+        let text = |t: &str| serde_json::json!([{ "type": "text", "text": t }]);
+        store
+            .append_agent_message(&agent_id, "user", &text("request"), &now_iso())
+            .await
+            .unwrap();
+        mgr.services
+            .quota_failover_replays
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
+        assert_eq!(
+            mgr.build_turn_body(&agent_id, "request", None).await,
+            "request",
+            "no reply after the last user row: the message is sent as is"
+        );
+        store
+            .append_agent_message(&agent_id, "assistant", &text("partial"), &now_iso())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            store.get_agent_messages(&agent_id, None).await.is_err(),
+            "fixture: a full transcript read must fail on the undecodable rows"
+        );
+        assert_eq!(
+            mgr.build_turn_body(&agent_id, "request", None).await,
+            crate::quota_failover::QUOTA_FAILOVER_CONTINUATION,
+            "a partially answered turn continues without reading the transcript"
+        );
     }
 }
 

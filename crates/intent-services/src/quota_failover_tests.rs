@@ -745,3 +745,69 @@ fn the_first_unmarked_candidate_skips_marked_ones_and_never_falls_back() {
         None
     );
 }
+
+/// intent-hq/intent#8383: the backup could not start for a reason that has
+/// nothing to do with its account (here the machine could not fetch the
+/// agent's code). The text names that cause and never asks for a sign-in.
+#[test]
+fn a_backup_start_failure_that_is_not_an_account_problem_names_its_cause() {
+    let reason = "transport closed: node-agent-not-running: node-checkout-failed: fetch the \
+                  agent's base commit from head: internal error: node-git-failed: fatal: \
+                  internal error: git-remote-intent: head refused the session \
+                  (node-git-unavailable)";
+    let text = remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
+    assert!(text.starts_with(REMOTE_FAILOVER_UNAVAILABLE), "{text}");
+    for needle in [
+        "claude-code ran out of quota on Mac",
+        "the backup claude-code (PB1) couldn't start there",
+        "node-checkout-failed",
+        "Mac couldn't fetch the agent's code from this backend",
+        "not a sign-in problem",
+        "Retry the message",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+    }
+    assert!(!text.contains("Sign in"), "{text}");
+    // The failed message is already requeued: resubmitting it would run it twice.
+    assert!(!text.contains("Send your message again"), "{text}");
+}
+
+#[test]
+fn each_non_account_start_failure_names_its_own_cause() {
+    for (reason, cause) in [
+        (
+            "node-capacity: 2 agents already run",
+            "Mac has no room for another agent",
+        ),
+        ("node-shutting-down: stopping", "Mac is shutting down"),
+        (
+            "transport closed: node-link-closed",
+            "the connection to Mac was lost",
+        ),
+        ("node-link-unavailable", "the connection to Mac was lost"),
+    ] {
+        let text =
+            remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
+        assert!(text.contains(cause), "{cause:?} missing from {text:?}");
+        assert!(!text.contains("Sign in"), "{text}");
+    }
+}
+
+/// Account and provider start failures (and failures without a code) keep
+/// the sign-in advice.
+#[test]
+fn an_account_start_failure_still_suggests_signing_in() {
+    for reason in [
+        "node-agent-start-failed: Claude Code is not signed in",
+        "node-provider-unavailable: claude-code is not installed",
+        "node-profile-unavailable: the account folder ~/.claude-backup does not exist",
+        "the account folder ~/.claude-backup does not exist on this machine",
+    ] {
+        let text =
+            remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
+        assert!(
+            text.contains("Sign in to claude-code (PB1) on Mac"),
+            "{text}"
+        );
+    }
+}

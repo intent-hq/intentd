@@ -413,6 +413,35 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// One page of [`Self::list_workspaces`] (`lite: false`) or
+    /// [`Self::list_workspaces_lite`] (`lite: true`) rows in `(createdAt,
+    /// id)` order (PROTOCOL §5.1 "Paged workspace lists"): at most `limit`
+    /// rows (default [`crate::WORKSPACE_LIST_DEFAULT_LIMIT`], maximum
+    /// [`crate::WORKSPACE_LIST_MAX_LIMIT`]), stopping early at
+    /// [`crate::WORKSPACE_LIST_BUDGET_BYTES`], starting after `next_token`.
+    /// `InvalidParams` for a malformed token. The default serves every row
+    /// as one page, for test doubles.
+    fn list_workspaces_page(
+        &self,
+        filter: WorkspaceListFilter,
+        lite: bool,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<crate::WorkspacePage>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let workspaces = if lite {
+                self.list_workspaces_lite(filter).await?
+            } else {
+                self.list_workspaces(filter).await?
+            };
+            Ok(crate::WorkspacePage {
+                workspaces,
+                next_token: None,
+            })
+        })
+    }
+
     /// Workspaces linked to the pull request at `url`
     /// (`workspace.findByPullRequest`, PROTOCOL §5.1 "Pull request workspace
     /// lookup"): most recently linked first, archived included, narrowed to the
@@ -1552,6 +1581,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `note.readAssetChunk`: one offset window of an asset's raw bytes as
+    /// `{ assetId, mimeType, content (base64), bytesRead, size }` (`size` =
+    /// whole asset byte length). Same asset resolution as
+    /// [`Self::read_asset`]. `length` is capped at the transfer chunk size;
+    /// over-cap or zero → `Error::InvalidParams`.
+    fn read_asset_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, asset, offset, length);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::read_asset_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `note.saveAsset`: write an image asset (base64 `data`, an optional
     /// `data:` URL prefix is stripped) under the workspace assets root and
     /// return `{ assetId, path, url }` (PROTOCOL §5.2 — additive asset write
@@ -2002,6 +2051,41 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// One page of an `agent.list` read (PROTOCOL §5.5 "Paged agent lists"):
+    /// the `selection` rows in `(createdAt, id)` order, at most `limit`
+    /// (default [`crate::AGENT_LIST_DEFAULT_LIMIT`], maximum
+    /// [`crate::AGENT_LIST_MAX_LIMIT`]), stopping early at
+    /// [`crate::AGENT_LIST_PAGE_BUDGET_BYTES`], starting after `next_token`.
+    /// `InvalidParams` for a malformed token. The default serves the whole
+    /// selection as one page, for test doubles.
+    fn agent_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        selection: crate::AgentListSelection,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<crate::AgentListPage>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let agents = match selection {
+                crate::AgentListSelection::Active => self.agent_list(workspace_id).await?,
+                crate::AgentListSelection::All => {
+                    self.agent_list_including_retired(workspace_id).await?
+                }
+                crate::AgentListSelection::RetiredOnly => {
+                    self.agent_list_retired_only(workspace_id).await?
+                }
+                crate::AgentListSelection::Scoped(scope) => {
+                    self.agent_list_scoped(workspace_id, scope).await?
+                }
+            };
+            Ok(crate::AgentListPage {
+                agents,
+                next_token: None,
+            })
+        })
+    }
+
     /// `agent.list { scope }` (PROTOCOL §5.5): ONLY the non-retired sessions
     /// in one [`AgentListRowScope`] bin (`topLevel` / `delegated` /
     /// `background`), filtered SQL-side so cost stays O(rows returned).
@@ -2200,6 +2284,24 @@ pub trait WorkspaceApi: Send + Sync {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_session not implemented".to_string(),
             ))
+        })
+    }
+
+    /// The wire `agent.getSession` read (PROTOCOL §5.5): the
+    /// [`Self::agent_get_session`] projection serialized, with `messages`
+    /// bounded to the newest slim transcript page that keeps the session
+    /// under the read payload budget, plus `messagesTotal`,
+    /// `messagesTruncated` and `messagesNextToken` (continue with
+    /// `agent.getConversation`). The default serves the whole session, for
+    /// test doubles that only implement [`Self::agent_get_session`].
+    fn agent_get_session_bounded(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let session = self.agent_get_session(agent_id, workspace_id).await?;
+            serde_json::to_value(session).map_err(|e| Error::Internal(e.to_string()))
         })
     }
 
@@ -2722,6 +2824,30 @@ pub trait WorkspaceApi: Send + Sync {
     /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
     /// When `workspace_id` is supplied the callee verifies the session belongs
     /// to that workspace (defense-in-depth against a bare `agentId` probe).
+    /// One page of [`Self::agent_get_queue`] (PROTOCOL §5.5 "Paged queue
+    /// reads"): at most `limit` entries in drain order (default
+    /// [`crate::AGENT_QUEUE_DEFAULT_LIMIT`], maximum
+    /// [`crate::AGENT_QUEUE_MAX_LIMIT`]) from `next_token`, stopping early at
+    /// [`crate::AGENT_QUEUE_PAGE_BUDGET_BYTES`], plus `queueLength` (the whole
+    /// queue) and `nextToken`. The default serves the whole queue as one page,
+    /// for test doubles.
+    fn agent_get_queue_page(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let mut reply = self.agent_get_queue(agent_id, workspace_id).await?;
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("nextToken".into(), serde_json::Value::Null);
+            }
+            Ok(reply)
+        })
+    }
+
     fn agent_get_queue(
         &self,
         agent_id: AgentId,
@@ -3160,19 +3286,23 @@ pub trait WorkspaceApi: Send + Sync {
     /// subscriptions, delegation groups, and stuck-risk signals as
     /// `{ ok, diagnostics, text }` (PROTOCOL §5.5). Optional `agent_id` /
     /// `task_note_id` focus the snapshot; `stale_responding_after_ms` tunes the
-    /// stale-responding threshold (default 600000).
+    /// stale-responding threshold (default 600000). `row_limit` caps every
+    /// row list of the snapshot (default 100, maximum 200; the reply is also
+    /// held under the read payload budget).
     fn agent_diagnostics(
         &self,
         workspace_id: WorkspaceId,
         agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         stale_responding_after_ms: Option<i64>,
+        row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
             agent_id,
             task_note_id,
             stale_responding_after_ms,
+            row_limit,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -4201,6 +4331,36 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_show_file not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `git.showFileChunk`: one offset window of the raw blob bytes that
+    /// [`Self::git_show_file`] would serve, as `{ content (base64),
+    /// bytesRead, size }` (`size` = whole blob byte length). Same path, ref,
+    /// root and fallback rules (a missing path or an unknown/remote/non-repo
+    /// workspace is an empty blob). `length` is capped at the transfer chunk
+    /// size; over-cap or zero → `Error::InvalidParams`.
+    fn git_show_file_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            file_path,
+            git_ref,
+            git_root_id,
+            offset,
+            length,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_show_file_chunk not implemented".to_string(),
             ))
         })
     }
@@ -6062,6 +6222,24 @@ pub trait WorkspaceApi: Send + Sync {
             Err(Error::Internal(
                 "WorkspaceApi::executor_revoke not implemented".into(),
             ))
+        })
+    }
+
+    /// `remoteLinkTraffic.*` (owner-only capture of executor-link traffic):
+    /// `method` is the part after `remoteLinkTraffic.` (`start`, `stop`,
+    /// `snapshot`) and `params` the request's params object. Results and
+    /// errors as documented in monorepo `docs/protocol/methods/nodes.md`,
+    /// "Link traffic capture".
+    fn remote_link_traffic(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::remote_link_traffic({method}) not implemented"
+            )))
         })
     }
 
@@ -8920,14 +9098,26 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `crossWorkspace.readNote`: one note in a sibling workspace as
     /// `{ id, title, content, numberedContent, sourceWorkspaceId,
-    /// sourceWorkspaceTitle, branch, lineCount }`.
+    /// sourceWorkspaceTitle, branch, lineCount }`. With a line `window`, or
+    /// with `bounded_default` set, the read is bounded to the window and the
+    /// [`crate::note_read_bounds::NOTE_READ_BUDGET_BYTES`] budget and a
+    /// partial page adds `startLine` / `endLine` / `truncated` /
+    /// `nextStartLine`; otherwise the whole note is served.
     fn cross_workspace_read_note(
         &self,
         workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: crate::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, target_workspace_id, note_id);
+        let _ = (
+            workspace_id,
+            target_workspace_id,
+            note_id,
+            window,
+            bounded_default,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_read_note not implemented".to_string(),
@@ -9110,6 +9300,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `hook.list`: one page of [`Self::hook_list`]'s workspace rows.
+    /// `params` carries `includeRetired?`, `limit?` (1–200, default 100) and
+    /// `cursor?`; the reply is `{ hooks, nextCursor? }`.
+    fn hook_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_list_page not implemented".to_string(),
             ))
         })
     }

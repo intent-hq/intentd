@@ -172,6 +172,32 @@ impl AgentPlacement {
             && self.arch.is_none_or(|arch| arch == platform.arch)
     }
 
+    /// Whether this placement asks for the backend: `{ target: "local" }`
+    /// with no other member, from any caller (for a remote agent's
+    /// sub-agent it turns the inherited machine off). Every other placement
+    /// asks for a remote machine.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParams`] when `target` is `"local"` with any other
+    /// member.
+    pub fn runs_on_backend(&self) -> crate::Result<bool> {
+        if self.target != Some(PlacementTarget::Local) {
+            return Ok(false);
+        }
+        if *self
+            != (Self {
+                target: Some(PlacementTarget::Local),
+                ..Self::default()
+            })
+        {
+            return Err(Error::InvalidParams(
+                "placement.target \"local\" runs the agent on the backend; omit os, arch, nodeId, checkout and exclusive".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// The subset this daemon's remote launch supports: a valid placement
     /// that is not explicitly local, uses an isolated checkout (also when
     /// `target` is omitted) and does not ask for an exclusive node.
@@ -324,6 +350,7 @@ impl PlatformAvailability {
             machine: None,
             capacity: None,
             machines: Vec::new(),
+            hint: None,
         }
     }
 
@@ -345,6 +372,7 @@ impl PlatformAvailability {
             machine: Some(machine),
             capacity,
             machines: Vec::new(),
+            hint: None,
         }
     }
 }
@@ -451,6 +479,9 @@ pub struct PlacementUnavailable {
     pub capacity: Option<CapacityRefusal>,
     /// Per-candidate `no-capacity` limits when several machines were full.
     pub machines: Vec<MachineCapacityRefusal>,
+    /// A sentence appended to the message (never to the data), such as how
+    /// to run an inherited placement on the backend instead.
+    pub hint: Option<String>,
 }
 
 /// `error.data.code` of [`PlacementUnavailable`].
@@ -464,11 +495,27 @@ impl PlacementUnavailable {
         self
     }
 
+    /// Append `hint` to the message; the data is unchanged.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
     /// The human message, for example
     /// `No capacity for x86_64; available: none; supported: linux/x86_64`,
-    /// or for one machine `No capacity on Build box: 4 of 4 agents running`.
+    /// or for one machine `No capacity on Build box: 4 of 4 agents running`,
+    /// followed by the hint if any.
     #[must_use]
     pub fn message(&self) -> String {
+        let message = self.bare_message();
+        match &self.hint {
+            Some(hint) => format!("{message} {hint}"),
+            None => message,
+        }
+    }
+
+    fn bare_message(&self) -> String {
         let requested = match (self.requested.os, self.requested.arch) {
             (Some(os), Some(arch)) => format!("{}/{}", os_name(os), arch_name(arch)),
             (Some(os), None) => os_name(os).to_string(),

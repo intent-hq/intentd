@@ -210,6 +210,12 @@ async fn boot() -> Fixture {
         .insert_agent_session(&agent_session(&ws_id, agent_id.as_str()))
         .await
         .expect("seed agent");
+    // A peer top-level agent, so retiring the monitored agent is not refused
+    // as the workspace's last top-level agent.
+    store
+        .insert_agent_session(&agent_session(&ws_id, "agent-prmon-e2e-peer"))
+        .await
+        .expect("seed peer agent");
 
     let services = Arc::new(intent_app::compose(
         Services::new_isolated(store.clone())

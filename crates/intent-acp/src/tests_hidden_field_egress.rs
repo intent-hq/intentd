@@ -401,6 +401,7 @@ impl WorkspaceApi for FakeApi {
         _agent_id: Option<AgentId>,
         _task_note_id: Option<intent_core::NoteId>,
         _stale_responding_after_ms: Option<i64>,
+        _row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let agents: Vec<Value> = [CALLER, TARGET]

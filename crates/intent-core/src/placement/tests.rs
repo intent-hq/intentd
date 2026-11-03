@@ -505,3 +505,52 @@ fn platform_of_names_only_supported_pairs() {
         AgentPlatform::of(std::env::consts::OS, std::env::consts::ARCH)
     );
 }
+
+/// `{ target: "local" }` alone asks for the backend, from any caller; any
+/// other member alongside it is refused, and every other placement is a
+/// remote one.
+#[test]
+fn target_local_alone_runs_on_the_backend() {
+    let local: AgentPlacement = serde_json::from_str(r#"{"target":"local"}"#).unwrap();
+    assert!(local.runs_on_backend().unwrap());
+    for raw in [
+        "{}",
+        r#"{"target":"remote"}"#,
+        r#"{"os":"linux"}"#,
+        r#"{"checkout":"shared"}"#,
+    ] {
+        let placement: AgentPlacement = serde_json::from_str(raw).unwrap();
+        assert!(!placement.runs_on_backend().unwrap(), "{raw}");
+    }
+    for raw in [
+        r#"{"target":"local","os":"linux"}"#,
+        r#"{"target":"local","arch":"x86_64"}"#,
+        r#"{"target":"local","nodeId":"node-1"}"#,
+        r#"{"target":"local","checkout":"shared"}"#,
+        r#"{"target":"local","checkout":"isolated"}"#,
+        r#"{"target":"local","exclusive":false}"#,
+    ] {
+        let placement: AgentPlacement = serde_json::from_str(raw).unwrap();
+        let err = placement.runs_on_backend().unwrap_err();
+        assert_eq!(err.code(), -32602, "{raw}");
+        assert_eq!(
+            err.to_string(),
+            "invalid params: \
+             placement.target \"local\" runs the agent on the backend; omit os, arch, nodeId, checkout and exclusive",
+            "{raw}"
+        );
+    }
+}
+
+/// The hint a sub-agent's inherited placement adds to an admission
+/// failure is appended to the message only; `error.data` is unchanged.
+#[test]
+fn a_hint_extends_the_message_but_not_the_data() {
+    let failure = PlatformAvailability::none("2026-11-03T00:00:00Z".into())
+        .unavailable(AgentPlacement::default());
+    let data = failure.data();
+    let plain = failure.message();
+    let hinted = failure.with_hint("Run it elsewhere.");
+    assert_eq!(hinted.message(), format!("{plain} Run it elsewhere."));
+    assert_eq!(hinted.data(), data);
+}

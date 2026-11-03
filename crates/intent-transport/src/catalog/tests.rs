@@ -768,6 +768,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "git.removeLockFile",
     "git.renameBranch",
     "git.showFile",
+    "git.showFileChunk",
     "git.stage",
     "git.stageHunk",
     "git.status",
@@ -887,6 +888,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.listVersions",
     "note.presence.update",
     "note.readAsset",
+    "note.readAssetChunk",
     "note.restoreVersion",
     "note.saveAsset",
     "note.setContent",
@@ -918,6 +920,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteLinkTraffic.snapshot",
+    "remoteLinkTraffic.start",
+    "remoteLinkTraffic.stop",
     "remoteMachines.add",
     "remoteMachines.backendInfo",
     "remoteMachines.list",
@@ -1504,6 +1509,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteLinkTraffic.snapshot",
+    "remoteLinkTraffic.start",
+    "remoteLinkTraffic.stop",
     "remoteMachines.add",
     "remoteMachines.backendInfo",
     "remoteMachines.list",
@@ -1887,6 +1895,9 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "providers.setup.login",
         "providers.setup.start",
         "providers.setup.status",
+        "remoteLinkTraffic.snapshot",
+        "remoteLinkTraffic.start",
+        "remoteLinkTraffic.stop",
         "remoteMachines.add",
         "remoteMachines.backendInfo",
         "remoteMachines.list",
@@ -2115,12 +2126,10 @@ fn payload_class_parameters_are_well_formed() {
 #[test]
 fn bulk_transfer_caps_match_handlers() {
     let chunk = intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
-    let frame = crate::MAX_OUTBOUND_MESSAGE_BYTES;
     let expected: BTreeSet<(&str, Option<&str>, usize)> = [
-        ("file.read", None, frame),
         ("file.readChunk", Some("length"), chunk),
-        ("git.showFile", None, frame),
-        ("note.readAsset", None, frame),
+        ("git.showFileChunk", Some("length"), chunk),
+        ("note.readAssetChunk", Some("length"), chunk),
         ("workspace.export.read", None, chunk),
     ]
     .into_iter()

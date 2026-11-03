@@ -86,6 +86,15 @@ impl RemoteFeature {
         lock(&self.nodes).values().cloned().collect()
     }
 
+    /// How many exposed machines this backend holds a live link to now.
+    #[must_use]
+    pub fn connected_machines(&self) -> usize {
+        lock(&self.nodes)
+            .values()
+            .filter(|node| node.status().connected)
+            .count()
+    }
+
     pub(crate) fn take_node(&self, machine_id: &str) -> Option<RemoteNode> {
         lock(&self.nodes).remove(machine_id)
     }
@@ -159,7 +168,8 @@ impl RemoteFeature {
                     "the executor token of machine {machine_id} is missing; make the machine available again"
                 ))
             })?;
-        let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?;
+        let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
+            .tapped(svc.link_traffic().clone());
         let node = RemoteNode::start(
             svc.store().clone(),
             target,

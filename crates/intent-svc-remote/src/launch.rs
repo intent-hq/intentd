@@ -247,6 +247,19 @@ impl RemoteLaunchPort for RemoteLaunch {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
+            let mut view = self.admit_new_workspace(svc, placement, needs).await?;
+            view.base_commit = self.base_commit(svc, workspace_id).await?;
+            Ok(view)
+        })
+    }
+
+    fn admit_new_workspace<'a>(
+        &'a self,
+        svc: &'a Services,
+        placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
+    ) -> BoxFuture<'a, Result<RemotePlacementView>> {
+        Box::pin(async move {
             let Some(feature) = svc.remote_feature() else {
                 return Err(unavailable(
                     placement,
@@ -282,8 +295,6 @@ impl RemoteLaunchPort for RemoteLaunch {
             let Some(platform) = status.platform.or(row.platform) else {
                 return Err(unavailable(placement, node.availability()));
             };
-            let checkout = workspace_checkout(svc, workspace_id).await?;
-            let base_commit = blocking(move || node_git::head_commit(&checkout)).await?;
             Ok(RemotePlacementView {
                 node_id: status.node_id.clone(),
                 lease_id: status.lease_id,
@@ -298,8 +309,19 @@ impl RemoteLaunchPort for RemoteLaunch {
                 },
                 effective_isolation: EffectiveIsolation::Pending,
                 placement_error: None,
-                base_commit,
+                base_commit: String::new(),
             })
+        })
+    }
+
+    fn base_commit<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let checkout = workspace_checkout(svc, workspace_id).await?;
+            blocking(move || node_git::head_commit(&checkout)).await
         })
     }
 

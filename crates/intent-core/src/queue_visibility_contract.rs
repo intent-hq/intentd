@@ -40,7 +40,8 @@ pub enum CallerClass {
     ForeignGuest,
     /// [`Caller::Agent`] inspecting a different agent through `workspace_api`.
     Agent,
-    /// [`Caller::Daemon`] (hook runs, background work).
+    /// [`Caller::Daemon`] (daemon-internal background work; a hook's `ws.*`
+    /// calls are [`Caller::Agent`], not this).
     Daemon,
     /// No bound caller (`current_caller()` is `None`).
     Unbound,

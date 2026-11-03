@@ -66,6 +66,7 @@ fn placeholder_ctx(seeded: &seed::Seeded) -> rows::Ctx<'_> {
         thread: "thread".into(),
         conversation: "conversation".into(),
         script: "script".into(),
+        huge_script: "huge-script".into(),
         monitor: "monitor".into(),
         worktree: "/tmp".into(),
         specialist: "specialist".into(),
@@ -391,6 +392,43 @@ fn check_proof(proof: &Proof, result: &Value) -> Result<(), String> {
             Some(Value::Object(o)) if o.is_empty() => Err(format!("empty object at `{at}`")),
             Some(_) => Ok(()),
         },
+        Proof::Cut(at, min, flag) => {
+            check_proof(&Proof::Items(at, *min), result)?;
+            match result.pointer(flag) {
+                Some(Value::Bool(true)) => Ok(()),
+                other => Err(format!(
+                    "`{flag}` is {other:?}, expected true (a bounded cut)"
+                )),
+            }
+        }
+        Proof::ByteCut(at, min, below, flag) => {
+            check_proof(&Proof::Cut(at, *min, flag), result)?;
+            let n = result
+                .pointer(at)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if n < *below {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{n} items at `{at}`, expected fewer than {below} (a byte cut)"
+                ))
+            }
+        }
+        Proof::RowsCut(at, min, flag) => {
+            check_proof(&Proof::Items(at, *min), result)?;
+            let rows = result.pointer(at).and_then(Value::as_array);
+            if rows.is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.pointer(flag) == Some(&Value::Bool(true)))
+            }) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "no row at `{at}` has `{flag}` true (a bounded cut)"
+                ))
+            }
+        }
     }
 }
 

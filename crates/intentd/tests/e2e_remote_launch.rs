@@ -634,7 +634,8 @@ fn add_params(machine: &Machine, name: &str) -> Value {
 /// capability is advertised with no setting; a named machine takes
 /// the agent; a model no machine lists is `model-unavailable` naming each
 /// machine's models and sign-in status; an unknown `nodeId` is
-/// `machine-unknown`.
+/// `machine-unknown`; `workspace.create` places its initial agent the same
+/// way (`remoteInitialAgent`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placement_chooses_among_exposed_machines() {
     if intent_providers::resolve_on_path("node").is_none() {
@@ -658,6 +659,11 @@ async fn placement_chooses_among_exposed_machines() {
     let hello = json!({ "clientId": "placement-e2e", "name": "Placement E2E" });
     let on = ok(&mut rpc_ws, 1, "client.hello", hello).await;
     assert_eq!(on["server"]["capabilities"]["remoteMachines"], 1, "{on}");
+    assert_eq!(
+        on["server"]["capabilities"]["remoteInitialAgent"], 1,
+        "{on}"
+    );
+    assert_eq!(on["server"]["capabilities"]["remoteLinkTraffic"], 1, "{on}");
 
     let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
@@ -784,4 +790,56 @@ async fn placement_chooses_among_exposed_machines() {
     for machine in &machines {
         assert!(!missing.to_string().contains(&machine.token));
     }
+
+    // `workspace.create` places its initial agent the same way: a named
+    // machine takes it, and a refusal creates no workspace.
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let branch = String::from_utf8(branch.stdout).unwrap().trim().to_owned();
+    let workspace = |model: &str, placement: Value| {
+        json!({
+            "repositoryPath": repo.to_string_lossy(),
+            "baseRef": branch,
+            "initialAgent": { "model": model, "provider": "mock", "placement": placement },
+        })
+    };
+    let before = ok(&mut rpc_ws, 20, "workspace.list", json!({})).await;
+    let refused = rpc(
+        &mut rpc_ws,
+        21,
+        "workspace.create",
+        workspace("no-such-model", json!({ "target": "remote" })),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "model-unavailable",
+        "{refused}"
+    );
+    let after = ok(&mut rpc_ws, 22, "workspace.list", json!({})).await;
+    let count = |list: &Value| list["workspaces"].as_array().map(Vec::len);
+    assert_eq!(
+        count(&after),
+        count(&before),
+        "a refused placement creates no workspace: {after}"
+    );
+    assert!(count(&before).is_some(), "{before}");
+    let placed = ok(
+        &mut rpc_ws,
+        23,
+        "workspace.create",
+        workspace("default", json!({ "target": "remote", "nodeId": b_id })),
+    )
+    .await;
+    assert_eq!(placed["initialAgent"]["nodeId"], b_id.as_str(), "{placed}");
+    assert_eq!(placed["initialAgent"]["nodeName"], "Machine B", "{placed}");
+    assert!(
+        placed["notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("Machine B")),
+        "{placed}"
+    );
 }

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::bail;
 use tokio::sync::mpsc;
 
+use intent_core::link_traffic::LinkTraffic;
 use intent_core::machines::{ExecutorCredential, ExecutorLiveStatus, ExecutorLiveness};
 use intent_core::node_link::{LinkHello, LinkWelcome, MachineCapabilities, ProviderCapability};
 use intent_core::nodes::{NodeArch, NodeOs};
@@ -77,6 +78,9 @@ pub(crate) struct ExecutorDeps {
     /// The credentials still active in the store, read when the
     /// revocation feed lagged and may have dropped a revocation.
     pub active_credentials: ActiveCredentials,
+    /// The daemon's link traffic capture: every backend's link is recorded
+    /// in it while the owner captures.
+    pub link_traffic: Option<Arc<LinkTraffic>>,
 }
 
 /// Reads the active executor credentials.
@@ -94,6 +98,8 @@ type MakeCheckouts = fn(Arc<Storage>, CheckoutCache) -> Arc<dyn checkout::Checko
 /// One backend's agents on this machine.
 struct Backend {
     runner: Runner,
+    /// The backend these agents run for, from its credential.
+    owner: intent_services::RemoteOwner,
     git_sessions: NodeGitSessions,
     links: Vec<NodeLink>,
     sessions: Vec<tokio::task::JoinHandle<()>>,
@@ -213,7 +219,12 @@ impl ExecutorService {
     }
 
     /// Open `credential`'s storage, journal and runner.
-    async fn open_backend(&self, credential: &ExecutorCredentialId) -> anyhow::Result<Backend> {
+    async fn open_backend(&self, credential: &ExecutorCredential) -> anyhow::Result<Backend> {
+        let owner = intent_services::RemoteOwner {
+            backend_id: credential.backend_id.clone(),
+            backend_name: credential.backend_name.clone(),
+        };
+        let credential = &credential.id;
         if !storage::valid_id(&credential.0) {
             bail!("executor credential id is not a safe path component");
         }
@@ -264,6 +275,7 @@ impl ExecutorService {
         });
         Ok(Backend {
             runner,
+            owner,
             git_sessions,
             links: Vec::new(),
             sessions: Vec::new(),
@@ -276,7 +288,7 @@ impl ExecutorService {
     async fn take(self: &Arc<Self>, credential: ExecutorCredential, connection: NodeConnection) {
         let opened = lock(&self.backends).contains_key(&credential.id);
         if !opened {
-            match self.open_backend(&credential.id).await {
+            match self.open_backend(&credential).await {
                 Ok(backend) => {
                     lock(&self.backends).insert(credential.id.clone(), backend);
                 }
@@ -341,6 +353,23 @@ impl ExecutorService {
                 backend.git_sessions.attach(git);
             }
         }
+    }
+
+    /// Every running agent's provider process pid, tagged with the backend
+    /// it runs for, for the memory sampler.
+    pub(crate) fn agent_roots(&self) -> Vec<intent_services::RemoteAgentRoot> {
+        lock(&self.backends)
+            .values()
+            .flat_map(|backend| backend.runner.agent_roots(&backend.owner))
+            .collect()
+    }
+
+    /// How many backends hold an open inbound link to this machine now.
+    pub(crate) fn linked_backends(&self) -> usize {
+        lock(&self.backends)
+            .values()
+            .filter(|backend| backend.links.iter().any(|link| !link.is_closed()))
+            .count()
     }
 
     /// Stop a revoked backend's agents and close its links. The stop runs
@@ -469,6 +498,10 @@ impl ExecutorHost for ExecutorService {
             close(connection);
         }
     }
+
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        self.deps.link_traffic.clone()
+    }
 }
 
 impl ExecutorLiveness for ExecutorService {
@@ -493,6 +526,21 @@ impl ExecutorSlot {
     /// Install the service; later calls are ignored.
     pub(crate) fn install(&self, service: Arc<ExecutorService>) {
         let _ = self.0.set(service);
+    }
+
+    /// [`ExecutorService::agent_roots`]; none before the service is
+    /// installed.
+    pub(crate) fn agent_roots(&self) -> Vec<intent_services::RemoteAgentRoot> {
+        self.0
+            .get()
+            .map(|service| service.agent_roots())
+            .unwrap_or_default()
+    }
+
+    /// [`ExecutorService::linked_backends`]; none before the service is
+    /// installed.
+    pub(crate) fn linked_backends(&self) -> usize {
+        self.0.get().map_or(0, |service| service.linked_backends())
     }
 
     #[cfg(test)]
@@ -542,6 +590,10 @@ impl ExecutorHost for ExecutorSlot {
             Some(service) => service.accept(credential, connection),
             None => close(connection),
         }
+    }
+
+    fn link_traffic(&self) -> Option<Arc<LinkTraffic>> {
+        self.0.get()?.link_traffic()
     }
 }
 
@@ -797,6 +849,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
             launch: Arc::new(SettingsLaunch(parts.settings.clone())),
             report: report.clone(),
             executable,
+            link_traffic: Some(parts.services.link_traffic().clone()),
             active_credentials: {
                 let store = parts.services.store().clone();
                 Arc::new(move || {

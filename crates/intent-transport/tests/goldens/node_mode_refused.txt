@@ -150,6 +150,7 @@ git.push
 git.removeLockFile
 git.renameBranch
 git.showFile
+git.showFileChunk
 git.stage
 git.stageHunk
 git.status
@@ -269,6 +270,7 @@ note.presence.subscribe
 note.presence.unsubscribe
 note.presence.update
 note.readAsset
+note.readAssetChunk
 note.restoreVersion
 note.saveAsset
 note.setContent
@@ -299,6 +301,9 @@ providers.setup.cancel
 providers.setup.login
 providers.setup.start
 providers.setup.status
+remoteLinkTraffic.snapshot
+remoteLinkTraffic.start
+remoteLinkTraffic.stop
 remoteMachines.add
 remoteMachines.backendInfo
 remoteMachines.list

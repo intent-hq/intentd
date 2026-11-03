@@ -380,8 +380,14 @@ async fn browser_exec_fe_json_rpc_error_surfaces_as_internal_error() {
         .contains("CDP not attached"));
 }
 
+/// An unanswered client-triggered screenshot comes back over WSS as the
+/// daemon's reverse timeout (`-32603`), not a hang. Which deadline it gets
+/// (20s, inside the JavaScript tool's 30s outer budget, rather than the 30s
+/// default) is pinned without wall-clock timing on a paused clock at the
+/// `browser::exec` call site:
+/// intent-transport `browser::tests::exec_arms_the_screenshot_deadline_for_an_unanswered_screenshot`.
 #[tokio::test]
-async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss() {
+async fn browser_exec_unanswered_screenshot_times_out_over_wss() {
     let (_daemon, port, cfg) = boot().await;
     let mut ws = connect_ws(port, cfg).await;
     let frame = json!({
@@ -390,7 +396,6 @@ async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss(
         "method": "browser.exec",
         "params": { "actions": [{ "action": "screenshot" }] },
     });
-    let started = tokio::time::Instant::now();
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .unwrap();
@@ -398,16 +403,16 @@ async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss(
     let reverse = read_text(&mut ws).await;
     assert_eq!(reverse["method"], "browser.exec");
     assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
-    // Do not answer the reverse request. The daemon must settle the caller
-    // before the JavaScript tool's 30-second outer budget expires.
-    let response = read_text_with_timeout(&mut ws, Duration::from_secs(25)).await;
-    let elapsed = started.elapsed();
+    // Do not answer the reverse request; the daemon's own deadline settles it.
+    let response = read_text_with_timeout(
+        &mut ws,
+        intentd_test_support::test_timeout(Duration::from_secs(40)),
+    )
+    .await;
     assert_eq!(response["id"], 32);
     assert_eq!(response["error"]["code"], -32603);
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
         .contains("reverse request timed out: browser.exec"));
-    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
 }

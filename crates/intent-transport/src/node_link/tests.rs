@@ -197,6 +197,7 @@ impl Node {
 
     fn endpoint(&self) -> NodeEndpoint {
         NodeEndpoint {
+            tap: None,
             url: format!("wss://{}", self.address()),
             pin: CertificatePin::parse(&self.certificate.fingerprint256).unwrap(),
             token: self.token.clone(),
@@ -701,6 +702,7 @@ async fn reconnects_with_backoff_once_the_node_is_up() {
         probe.local_addr().unwrap()
     };
     let endpoint = NodeEndpoint {
+        tap: None,
         url: format!("wss://{address}"),
         pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
         token: token.clone(),
@@ -875,6 +877,7 @@ async fn endpoint_must_be_wss_without_credentials() {
         format!("wss://{address}/?x=1"),
     ] {
         let endpoint = NodeEndpoint {
+            tap: None,
             url,
             ..node.endpoint()
         };

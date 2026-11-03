@@ -173,7 +173,7 @@ fn assert_scoped(events: &[Value], workspace: &str) {
 
 async fn offline_addition_notifies_guest(cached: bool) {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let workspace = create_workspace(&mut owner, 881, "Shared").await;
     let private = create_workspace(&mut owner, 882, "Private").await;

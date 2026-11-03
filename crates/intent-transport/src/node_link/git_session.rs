@@ -48,6 +48,10 @@ const CHUNK: usize = 64 * 1024;
 pub const MAX_SESSIONS: usize = 8;
 /// Messages queued per session before the connection's reader waits.
 const SESSION_QUEUE: usize = 16;
+/// How long a node session waits for head's git connection to attach.
+/// Head binds the link and dials the git connection right after, so a
+/// launch's checkout can open its session first (intent-hq/intent#8383).
+pub const ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Stable session error codes.
 pub mod codes {
@@ -307,9 +311,20 @@ struct NodeState {
 }
 
 /// Node side: opens git sessions on the current git connection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NodeGitSessions {
     state: Arc<Mutex<NodeState>>,
+    /// Bumped on every attach, so an open waiting for a connection wakes.
+    attached: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for NodeGitSessions {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            attached: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 impl std::fmt::Debug for NodeGitSessions {
@@ -342,6 +357,8 @@ impl NodeGitSessions {
             state.sessions.clear();
             (state.epoch, previous)
         };
+        self.attached
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         // The previous connection's head sessions end when it closes, and
         // its reader stops even if it was waiting on a full session queue.
         if let Some((_, previous)) = previous {
@@ -393,19 +410,28 @@ impl NodeGitSessions {
     ///
     /// # Errors
     ///
-    /// A [`codes`] error: unavailable without a connection, or head's
-    /// refusal.
+    /// A [`codes`] error: unavailable when no connection attaches within
+    /// [`ATTACH_WAIT`], or head's refusal.
     pub async fn open(&self, service: GitService, remote: &AgentRemote) -> Result<GitSession> {
         let (events_tx, mut events) = mpsc::channel(SESSION_QUEUE);
-        let (id, epoch, sender) = {
-            let mut state = lock(&self.state);
-            let Some((epoch, sender)) = state.connection.clone() else {
-                return Err(session_error(codes::UNAVAILABLE));
-            };
-            let id = state.next_id;
-            state.next_id = state.next_id.wrapping_add(1);
-            state.sessions.insert(id, events_tx);
-            (id, epoch, sender)
+        let mut attached = self.attached.subscribe();
+        let deadline = tokio::time::Instant::now() + ATTACH_WAIT;
+        let (id, epoch, sender) = loop {
+            {
+                let mut state = lock(&self.state);
+                if let Some((epoch, sender)) = state.connection.clone() {
+                    let id = state.next_id;
+                    state.next_id = state.next_id.wrapping_add(1);
+                    state.sessions.insert(id, events_tx);
+                    break (id, epoch, sender);
+                }
+            }
+            // Head dials the git connection right after binding the link;
+            // wait for it rather than fail the launch's checkout.
+            match tokio::time::timeout_at(deadline, attached.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return Err(session_error(codes::UNAVAILABLE)),
+            }
         };
         let mut session = GitSession {
             id,

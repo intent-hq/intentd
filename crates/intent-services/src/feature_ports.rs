@@ -470,6 +470,14 @@ pub trait RuntimePort: Send + Sync + 'static {
         include_retired: bool,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    /// Wire `hook.list`: one page of the workspace's hooks.
+    fn hook_list_page<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
     /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
     /// or terminal; hooks from other workspaces read as `NotFound`.
     fn hook_get<'a>(
@@ -1229,6 +1237,45 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>>;
 
+    /// [`Self::admit`] for an agent whose workspace does not exist yet
+    /// (`workspace.create`'s initial agent): the same checks and machine
+    /// choice, before anything is created, with an empty `base_commit` that
+    /// [`Self::base_commit`] fills once the workspace commits. Refuses as a
+    /// daemon without machines by default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`], except for the workspace's commit.
+    fn admit_new_workspace<'a>(
+        &'a self,
+        svc: &'a Services,
+        placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
+    ) -> BoxFuture<'a, Result<RemotePlacementView>> {
+        let _ = (svc, needs);
+        Box::pin(async move {
+            let failure =
+                PlatformAvailability::none(intent_core::now_iso()).unavailable(placement.clone());
+            Err(Error::PlacementUnavailable(Box::new(failure)))
+        })
+    }
+
+    /// The commit a remote agent of `workspace_id` starts from: its
+    /// checkout's `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParams`] for a workspace without a git repository;
+    /// [`Error::Unsupported`] by default.
+    fn base_commit<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<String>> {
+        let _ = (svc, workspace_id);
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
     /// Whether this port places agents on exposed machines (the backend
     /// side of `remoteMachines.*`), which the `remoteMachines` capability
     /// requires. `false` by default.
@@ -1563,6 +1610,15 @@ impl RuntimePort for UnavailableRuntime {
         include_retired: bool,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         DEFAULT_WORKSPACE_API.hook_list(workspace_id, agent_id, include_retired)
+    }
+
+    fn hook_list_page<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_list_page(workspace_id, params)
     }
 
     fn hook_get<'a>(

@@ -1206,6 +1206,143 @@ pub fn parse_count_baseline(
     Ok(out)
 }
 
+// ---- per-crate ratchet baselines --------------------------------------------
+//
+// A ratchet lint keeps its grandfathered counts in one file per crate:
+// `<dir>/<crate>.txt` holds the entries for paths under `crates/<crate>/`, so
+// two PRs lowering different crates' entries never edit the same file and
+// cannot conflict. With one shared list, sorted neighbours from different
+// crates conflicted: four per-crate PRs (intentd#2945–#2948) were queued
+// together and two were rejected as unmergeable, rebased and re-run twice.
+// A union merge driver would not do: two adjacent deletions would restore
+// both lines.
+
+/// The crate owning workspace-relative `path`: `<crate>` of
+/// `crates/<crate>/…`, if `path` is under one.
+#[must_use]
+pub fn baseline_crate(path: &str) -> Option<&str> {
+    let (krate, rest) = path.strip_prefix("crates/")?.split_once('/')?;
+    (!krate.is_empty() && !rest.is_empty()).then_some(krate)
+}
+
+/// The per-crate file of baseline directory `dir` that holds `path`'s
+/// entry: `<dir>/<crate>.txt`. Every scanned path is under `crates/`; one
+/// that is not names `<dir>/<crate>.txt` literally.
+#[must_use]
+pub fn count_baseline_file(dir: &str, path: &str) -> String {
+    format!("{dir}/{}.txt", baseline_crate(path).unwrap_or("<crate>"))
+}
+
+/// Reads a per-crate ratchet baseline: every `<dir>/<crate>.txt` under
+/// `root`, each parsed by [`parse_count_baseline`], merged into one map keyed
+/// by workspace-relative path. A missing `dir` is an empty baseline (git
+/// keeps no empty directory, so a lint with nothing grandfathered has none).
+///
+/// # Errors
+///
+/// An unreadable `dir` or file; a directory entry that is not a
+/// `<crate>.txt` file; a parse error (prefixed with the file); an entry whose
+/// path is not under `crates/<crate>/` for its file's `<crate>`; or a file
+/// with no entries (delete it instead).
+pub fn read_count_baselines(
+    root: &Path,
+    dir: &str,
+    what: &str,
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (krate, file) in count_baseline_files(root, dir)? {
+        let text = fs::read_to_string(root.join(&file)).map_err(|e| format!("read {file}: {e}"))?;
+        let entries = parse_count_baseline(&text, what).map_err(|e| format!("{file}: {e}"))?;
+        if entries.is_empty() {
+            return Err(format!(
+                "{file}: has no entries; delete the file once its last entry is gone"
+            ));
+        }
+        if let Some(path) = entries
+            .keys()
+            .find(|path| baseline_crate(path) != Some(krate.as_str()))
+        {
+            return Err(format!(
+                "{file}: {path:?} is not under crates/{krate}/; its entry belongs in {}",
+                count_baseline_file(dir, path)
+            ));
+        }
+        out.extend(entries);
+    }
+    Ok(out)
+}
+
+/// Rewrites the per-crate ratchet baseline `dir` under `root` to `counts`:
+/// one `<crate>.txt` per crate with a positive count, starting with `header`
+/// (`#` comment lines) and listing `<path> <count>` sorted by path; every
+/// other `<crate>.txt` there is removed, so a crate whose last entry went
+/// loses its file. Zero counts are dropped.
+///
+/// # Errors
+///
+/// A count for a path outside `crates/<crate>/`, or a failure to list
+/// `dir` or to write or remove a file.
+pub fn write_count_baselines(
+    root: &Path,
+    dir: &str,
+    header: &str,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> Result<(), String> {
+    let mut by_crate: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (path, &count) in counts.iter().filter(|(_, &count)| count > 0) {
+        let krate = baseline_crate(path).ok_or_else(|| {
+            format!("{path:?} is not under crates/<crate>/; no baseline holds it")
+        })?;
+        by_crate
+            .entry(krate)
+            .or_default()
+            .push(format!("{path} {count}"));
+    }
+    for (krate, file) in count_baseline_files(root, dir)? {
+        if !by_crate.contains_key(krate.as_str()) {
+            fs::remove_file(root.join(&file)).map_err(|e| format!("remove {file}: {e}"))?;
+        }
+    }
+    if !by_crate.is_empty() {
+        fs::create_dir_all(root.join(dir)).map_err(|e| format!("create {dir}: {e}"))?;
+    }
+    for (krate, entries) in by_crate {
+        let file = format!("{dir}/{krate}.txt");
+        let lines: Vec<&str> = header
+            .lines()
+            .chain(entries.iter().map(String::as_str))
+            .collect();
+        fs::write(root.join(&file), lines.join("\n") + "\n")
+            .map_err(|e| format!("write {file}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The `(crate, workspace-relative file)` pairs of baseline directory `dir`,
+/// sorted; none when `dir` does not exist.
+fn count_baseline_files(root: &Path, dir: &str) -> Result<Vec<(String, String)>, String> {
+    let entries = match fs::read_dir(root.join(dir)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read_dir {dir}: {e}")),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir {dir}: {e}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let krate = name
+            .strip_suffix(".txt")
+            .filter(|krate| !krate.is_empty() && entry.path().is_file())
+            .ok_or_else(|| {
+                format!("{dir}/{name}: a baseline directory holds only `<crate>.txt` files")
+            })?;
+        out.push((krate.to_string(), format!("{dir}/{name}")));
+    }
+    out.sort();
+    Ok(out)
+}
+
 // ---- test-code discovery ----------------------------------------------------
 //
 // Lints whose rule applies only to test code (`fixed_deadline_lint`,
@@ -2589,5 +2726,167 @@ use some::module;
                 ("crates/a/tests/e2e.rs".to_string(), true),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod count_baseline_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const DIR: &str = "crates/lints/tests/baselines/demo";
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+
+    fn counts(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        entries.iter().map(|&(p, n)| (p.to_string(), n)).collect()
+    }
+
+    #[test]
+    fn baseline_crate_names_the_crate_directory() {
+        assert_eq!(
+            baseline_crate("crates/intentd/tests/e2e.rs"),
+            Some("intentd")
+        );
+        assert_eq!(baseline_crate("crates/a/src/lib.rs"), Some("a"));
+        assert_eq!(baseline_crate("crates/a"), None);
+        assert_eq!(baseline_crate("crates/a/"), None);
+        assert_eq!(baseline_crate("crates//x.rs"), None);
+        assert_eq!(baseline_crate("scripts/x.rs"), None);
+        assert_eq!(
+            count_baseline_file(DIR, "crates/a/tests/x.rs"),
+            format!("{DIR}/a.txt")
+        );
+    }
+
+    #[test]
+    fn reads_one_file_per_crate_into_one_map() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(BTreeMap::new()),
+            "a missing directory is an empty baseline"
+        );
+        write(
+            root.path(),
+            &format!("{DIR}/a.txt"),
+            "# header\ncrates/a/src/x.rs 1\ncrates/a/tests/y.rs 2\n",
+        );
+        write(
+            root.path(),
+            &format!("{DIR}/b-c.txt"),
+            "crates/b-c/tests/z.rs 3\n",
+        );
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(counts(&[
+                ("crates/a/src/x.rs", 1),
+                ("crates/a/tests/y.rs", 2),
+                ("crates/b-c/tests/z.rs", 3),
+            ]))
+        );
+    }
+
+    #[test]
+    fn rejects_misplaced_empty_unsorted_and_foreign_files() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a.txt",
+                "crates/b/tests/x.rs 1\n",
+                "a.txt: \"crates/b/tests/x.rs\" is not under crates/a/; its entry belongs in \
+                 crates/lints/tests/baselines/demo/b.txt",
+            ),
+            (
+                "a.txt",
+                "# only a header\n",
+                "a.txt: has no entries; delete the file",
+            ),
+            (
+                "a.txt",
+                "crates/a/tests/y.rs 1\ncrates/a/tests/x.rs 1\n",
+                "a.txt: line 2: entries must be sorted by path and unique",
+            ),
+            (
+                "a.txt",
+                "crates/a/tests/x.rs 0\n",
+                "a.txt: line 1: a file with no hits has no entry",
+            ),
+            (
+                "README.md",
+                "notes\n",
+                "README.md: a baseline directory holds only `<crate>.txt` files",
+            ),
+            (
+                ".txt",
+                "crates/a/tests/x.rs 1\n",
+                "/.txt: a baseline directory holds only `<crate>.txt` files",
+            ),
+        ];
+        for (name, body, expected) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            write(root.path(), &format!("{DIR}/{name}"), body);
+            let err = read_count_baselines(root.path(), DIR, "hits").expect_err(name);
+            assert!(err.contains(expected), "{name}: {err:?} lacks {expected:?}");
+        }
+    }
+
+    #[test]
+    fn write_splits_by_crate_and_removes_emptied_files() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let header = "# Demo baseline.\n# Entries only ratchet down.";
+        write_count_baselines(
+            root.path(),
+            DIR,
+            header,
+            &counts(&[
+                ("crates/a/tests/y.rs", 2),
+                ("crates/a/src/x.rs", 1),
+                ("crates/b/tests/z.rs", 3),
+                ("crates/c/tests/clean.rs", 0),
+            ]),
+        )
+        .expect("write");
+        let read = |name: &str| fs::read_to_string(root.path().join(DIR).join(name)).ok();
+        assert_eq!(
+            read("a.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/a/src/x.rs 1\ncrates/a/tests/y.rs 2\n")
+        );
+        assert_eq!(
+            read("b.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/b/tests/z.rs 3\n")
+        );
+        assert_eq!(read("c.txt"), None, "a zero count writes no file");
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(counts(&[
+                ("crates/a/src/x.rs", 1),
+                ("crates/a/tests/y.rs", 2),
+                ("crates/b/tests/z.rs", 3),
+            ]))
+        );
+
+        write_count_baselines(
+            root.path(),
+            DIR,
+            header,
+            &counts(&[("crates/a/src/x.rs", 1)]),
+        )
+        .expect("lower");
+        assert_eq!(
+            read("b.txt"),
+            None,
+            "a crate burnt down to zero loses its file"
+        );
+        assert_eq!(
+            read("a.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/a/src/x.rs 1\n")
+        );
+        let err = write_count_baselines(root.path(), DIR, header, &counts(&[("scripts/x.rs", 1)]))
+            .expect_err("outside crates/");
+        assert!(err.contains("not under crates/<crate>/"), "{err}");
     }
 }

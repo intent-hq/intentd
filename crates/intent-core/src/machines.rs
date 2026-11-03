@@ -47,6 +47,8 @@ pub struct ModelUnavailable {
     pub model: String,
     pub machines: Vec<MachineModels>,
     pub retryable: bool,
+    /// A sentence appended to the message (never to the data).
+    pub hint: Option<String>,
 }
 
 impl ModelUnavailable {
@@ -71,6 +73,7 @@ impl ModelUnavailable {
             model: model.into(),
             machines,
             retryable,
+            hint: None,
         }
     }
 
@@ -79,6 +82,14 @@ impl ModelUnavailable {
     /// signed-in); it has: sonnet, haiku.` with one sentence per machine.
     #[must_use]
     pub fn message(&self) -> String {
+        let message = self.bare_message();
+        match &self.hint {
+            Some(hint) => format!("{message} {hint}"),
+            None => message,
+        }
+    }
+
+    fn bare_message(&self) -> String {
         if self.model.is_empty() {
             return self.provider_message();
         }
@@ -205,6 +216,8 @@ pub struct MachineUpdateRequired {
     pub machine_version: String,
     pub backend_version: String,
     pub update: UpdateSide,
+    /// A sentence appended to the message (never to the data).
+    pub hint: Option<String>,
 }
 
 impl MachineUpdateRequired {
@@ -212,6 +225,14 @@ impl MachineUpdateRequired {
     /// this backend needs 0.12.0 or newer).`
     #[must_use]
     pub fn message(&self) -> String {
+        let message = self.bare_message();
+        match &self.hint {
+            Some(hint) => format!("{message} {hint}"),
+            None => message,
+        }
+    }
+
+    fn bare_message(&self) -> String {
         match self.update {
             UpdateSide::Machine => format!(
                 "Update Intent on {} (it runs {}; this backend needs {} or newer).",

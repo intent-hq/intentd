@@ -116,6 +116,8 @@ struct Host {
     hosts: Mutex<Vec<String>>,
     tc_address: Mutex<Option<String>>,
     accepted: mpsc::UnboundedSender<NodeConnection>,
+    /// Git connections admitted so far.
+    git_accepted: std::sync::atomic::AtomicUsize,
 }
 
 impl ExecutorHost for Host {
@@ -136,6 +138,10 @@ impl ExecutorHost for Host {
         }
     }
     fn accept(&self, _credential: ExecutorCredential, connection: NodeConnection) {
+        if matches!(connection, NodeConnection::Git(_)) {
+            self.git_accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let _ = self.accepted.send(connection);
     }
 }
@@ -185,6 +191,7 @@ impl Machine {
             hosts: Mutex::new(vec!["127.0.0.1".into()]),
             tc_address: Mutex::new(None),
             accepted: tx,
+            git_accepted: std::sync::atomic::AtomicUsize::new(0),
         });
         let tokens = Arc::new(AsyncTokenStore::new(Arc::new(OwnerToken)));
         let mut server = WsApiServer::new(
@@ -1215,6 +1222,42 @@ mod on_demand {
         node.shutdown();
     }
 
+    /// intent-hq/intent#8383: a launch goes out as soon as the link is
+    /// published, and its checkout fetches over the git connection at once,
+    /// so head dials the git connection before it publishes the link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_git_connection_is_bound_before_the_link_is_published() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let host = machine.host.clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut hooked = tuning();
+        let record = seen.clone();
+        hooked.before_publish = crate::connector::BeforePublish(Some(Arc::new(
+            move |_: &Arc<crate::connector::Shared>| {
+                // The machine admits a dialed connection right after its
+                // upgrade, on its own task: give it that moment.
+                let deadline = std::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_secs(2));
+                let mut count = host.git_accepted.load(std::sync::atomic::Ordering::SeqCst);
+                while count == 0 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                    count = host.git_accepted.load(std::sync::atomic::Ordering::SeqCst);
+                }
+                *record.lock().unwrap() = Some(count);
+            },
+        )));
+        let node = backend.bare_with(&machine, hooked).await;
+        node.connect().await.unwrap();
+        let _link = machine.accept().await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(1),
+            "the git connection is admitted before the link is published"
+        );
+        node.shutdown();
+    }
+
     #[tokio::test]
     async fn an_idle_link_is_closed_and_not_redialed() {
         let (mut machine, backend, bare) = exposed().await;
@@ -1545,4 +1588,57 @@ mod stop_acks {
         confirmed(&node).await;
         node.shutdown();
     }
+}
+
+/// While the owner captures link traffic, the backend records its links to
+/// an exposed machine (the add probe's and the connector's) against that
+/// machine.
+#[tokio::test]
+async fn the_backend_records_its_machine_links_while_capture_is_on() {
+    let backend = Backend::new().await;
+    let traffic = backend.services.link_traffic().clone();
+    traffic.start(true);
+    let mut machine = backend.machine().await;
+    let node = backend.expose(&mut machine).await;
+    let agent = AgentId::new();
+    let _runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let records = loop {
+        let records = traffic.snapshot(None, None)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if records
+            .iter()
+            .any(|r| r["frameType"] == "replayComplete" && r["direction"] == "in")
+            || tokio::time::Instant::now() > deadline
+        {
+            break records;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let kinds: Vec<(&str, &str)> = records
+        .iter()
+        .map(|r| {
+            (
+                r["direction"].as_str().unwrap(),
+                r["frameType"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    // The probe's handshake, then the connector's.
+    let hellos = kinds.iter().filter(|k| **k == ("out", "hello")).count();
+    let welcomes = kinds.iter().filter(|k| **k == ("in", "welcome")).count();
+    assert!(hellos >= 2 && welcomes >= 2, "{kinds:?}");
+    assert!(kinds.contains(&("in", "replayComplete")), "{kinds:?}");
+    let name = machine.add_params()["name"].clone();
+    for record in &records {
+        assert_eq!(record["peer"]["kind"], "machine");
+        assert_eq!(record["peer"]["id"], machine.id().as_str());
+        assert_eq!(record["peer"]["name"], name);
+    }
+    traffic.stop();
+    node.shutdown();
 }

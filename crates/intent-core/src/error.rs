@@ -173,9 +173,11 @@ pub enum Error {
 
     /// A `remoteMachines.*` request about an exposed machine failed
     /// (`machine-unreachable` with the routes tried, `machine-revoked`,
-    /// `machine-in-use`). `data` (`data.code` plus details) is passed through
-    /// verbatim as `error.data`; `internal` selects `-32603`, otherwise
-    /// `-32602`. Neither carries the executor token.
+    /// `machine-in-use`), or `workspace.create`'s placed initial agent could
+    /// not start after the workspace committed (`launch-failed`). `data`
+    /// (`data.code` plus details) is passed through verbatim as
+    /// `error.data`; `internal` selects `-32603`, otherwise `-32602`.
+    /// Neither carries the executor token.
     #[error("{}", .0.message)]
     RemoteMachine(Box<ProviderProfileFailure>),
 
@@ -424,8 +426,9 @@ pub enum InviteErrorKind {
     PinMismatch,
     /// The pinned login does not name a GitHub account.
     PinUnknown,
-    /// Minting an invite requires the owner's linked GitHub identity
-    /// (`github.authStatus.isConfigured`).
+    /// Sharing requires a connected owner forge: with neither GitHub nor
+    /// GitLab connected on the host, no invite is minted and no open invite
+    /// is redeemed (the code name predates GitLab identities).
     GithubIdentityRequired,
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
@@ -513,8 +516,9 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked forge identity — connect GitHub \
-                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
+                "unsupported: sharing requires the host owner's connected forge identity — \
+                 connect GitHub (github.connect) or GitLab (sourceControl.connect) to create \
+                 or redeem invites"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \
@@ -816,6 +820,38 @@ impl Error {
 }
 
 impl Error {
+    /// Append `hint` to an admission failure's message, leaving its code and
+    /// `error.data` unchanged: the typed placement, model and update
+    /// failures, provider-profile and remote-machine failures, and
+    /// invalid params. Other errors are returned as they are.
+    #[must_use]
+    pub fn with_hint(self, hint: &str) -> Self {
+        match self {
+            Self::PlacementUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::PlacementUnavailable(failure)
+            }
+            Self::ModelUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::ModelUnavailable(failure)
+            }
+            Self::MachineUpdateRequired(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::MachineUpdateRequired(failure)
+            }
+            Self::ProviderProfile(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::ProviderProfile(failure)
+            }
+            Self::RemoteMachine(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::RemoteMachine(failure)
+            }
+            Self::InvalidParams(message) => Self::InvalidParams(format!("{message} {hint}")),
+            other => other,
+        }
+    }
+
     /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.
     #[must_use]
     pub fn remote_machine(

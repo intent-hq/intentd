@@ -47,7 +47,8 @@
 //! legitimate ceiling exceeds even that tier carries its own budget
 //! ([`PER_METHOD_STATEMENT_BUDGETS`] — `agent.sendMessage`,
 //! `agent.sendToTask`, `agent.sendQueuedMessageNow`,
-//! `agent.resolveProposal`), and every other method keeps the default
+//! `agent.resolveProposal`, `agent.dismissQuestions`,
+//! `agent.queueMessage`), and every other method keeps the default
 //! budget ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All tier thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
@@ -192,11 +193,22 @@ fn is_compound_statement_method(method: &str) -> bool {
 /// through the shared wake/delivery machinery — 27–28 statements observed
 /// on both, deterministically over the flat budget
 /// (intent-hq/monorepo#5376) — so both ride the same tier.
+/// `agent.dismissQuestions` has the same persist-then-deliver shape: it
+/// persists the dismissal marker, emits the self-contained `agent:updated`
+/// event, recomputes the display status, declines the message's secret
+/// requests, delivers the questions-dismissed notice (first dismissal only)
+/// and kicks the queue drain — 29–33 statements observed
+/// (intent-hq/intent#8325). `agent.queueMessage` enqueues and then kicks
+/// the same drain, which can start a turn through the delivery path
+/// `agent.sendQueuedMessageNow` uses — 40 observed (intent-hq/intent#8325).
+/// Both ride the same tier.
 const PER_METHOD_STATEMENT_BUDGETS: &[(&str, u64)] = &[
     ("agent.sendMessage", 250),
     ("agent.sendToTask", 250),
     ("agent.sendQueuedMessageNow", 250),
     ("agent.resolveProposal", 250),
+    ("agent.dismissQuestions", 250),
+    ("agent.queueMessage", 250),
 ];
 
 /// The per-method statement budget for `method`, if it has one (see
@@ -1169,6 +1181,14 @@ mod tests {
             per_method_statement_budget("agent.resolveProposal").unwrap()
         );
         assert_eq!(
+            layer.statement_threshold_for("agent.dismissQuestions"),
+            per_method_statement_budget("agent.dismissQuestions").unwrap()
+        );
+        assert_eq!(
+            layer.statement_threshold_for("agent.queueMessage"),
+            per_method_statement_budget("agent.queueMessage").unwrap()
+        );
+        assert_eq!(
             layer.statement_threshold_for("workspace.list"),
             DEFAULT_STATEMENT_WARN_THRESHOLD
         );
@@ -1186,8 +1206,13 @@ mod tests {
             per_method_statement_budget("agent.resolveProposal"),
             Some(250)
         );
+        assert_eq!(
+            per_method_statement_budget("agent.dismissQuestions"),
+            Some(250)
+        );
+        assert_eq!(per_method_statement_budget("agent.queueMessage"), Some(250));
         assert_eq!(per_method_statement_budget("agent.list"), None);
-        assert_eq!(per_method_statement_budget("agent.dismissQuestions"), None);
+        assert_eq!(per_method_statement_budget("agent.markSeen"), None);
         assert_eq!(per_method_statement_budget("workspace.create"), None);
     }
 
@@ -1263,6 +1288,64 @@ mod tests {
             }
         });
         assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn dismiss_questions_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.dismissQuestions` persists the dismissal marker and then
+        // declines the message's secret requests, delivers the
+        // questions-dismissed notice, and kicks the queue drain through the
+        // same wake/delivery path, so the same content-scaled ceiling
+        // (intent-hq/monorepo#3492) must fit its budget; 29 and 33 observed
+        // (intent-hq/intent#8325) tripped the flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.dismissQuestions", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn queue_message_at_observed_ceiling_emits_no_warn_under_defaults() {
+        // `agent.queueMessage` enqueues and then kicks the queue drain,
+        // which can start a turn through the same delivery path as
+        // `agent.sendQueuedMessageNow`, so the same content-scaled ceiling
+        // (intent-hq/monorepo#3492) must fit its budget; 40 observed
+        // (intent-hq/intent#8325) tripped the flat budget.
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        let warns = run_dispatch(layer, "agent.queueMessage", || {
+            for _ in 0..150 {
+                sqlx_event();
+            }
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn dismiss_questions_over_per_method_budget_still_warns() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let budget = per_method_statement_budget("agent.dismissQuestions").unwrap();
+        let warns = run_dispatch(layer, "agent.dismissQuestions", || {
+            for _ in 0..=budget {
+                sqlx_event();
+            }
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(
+            warns[0].contains("method=agent.dismissQuestions"),
+            "{warns:?}"
+        );
+        assert!(
+            warns[0].contains(&format!("threshold={budget}")),
+            "{warns:?}"
+        );
     }
 
     #[test]

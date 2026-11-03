@@ -327,6 +327,7 @@ impl Running {
                 launch: Arc::new(FixedLaunch(providers)),
                 report: report.clone(),
                 executable: std::env::current_exe().unwrap(),
+                link_traffic: Some(Arc::new(intent_core::link_traffic::LinkTraffic::new())),
                 active_credentials: {
                     let api = api.clone();
                     Arc::new(move || {
@@ -363,6 +364,7 @@ impl Running {
         server.install_executor_links(ExecutorLinks::new(service.clone()));
         let port = server.start().await.unwrap();
         let endpoint = NodeEndpoint {
+            tap: None,
             url: format!("wss://127.0.0.1:{port}"),
             pin: CertificatePin::parse(&certificate.fingerprint256).unwrap(),
             token: ExecutorToken::new(token()).unwrap(),
@@ -489,6 +491,63 @@ async fn executor_binds_reports_capabilities_and_streams_launch_outcomes() {
             if e.starts_with(runner::codes::PROVIDER)),
         "{record:?}"
     );
+    node.stop().await;
+}
+
+/// While the owner captures link traffic, the machine records each
+/// backend's link both ways, against that backend; the slot hands the
+/// listener the service's capture.
+#[tokio::test]
+async fn executor_records_backend_links_while_capture_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let slot = ExecutorSlot::default();
+    assert!(slot.link_traffic().is_none());
+    slot.install(node.service.clone());
+    let traffic = slot.link_traffic().expect("the service's capture");
+    traffic.start(true);
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    assert_eq!(replay_complete(&mut dialed).await, NodeCounter(0));
+    dialed.link.send(&refused_launch("a1")).await.unwrap();
+    let _ = next_record(&mut dialed).await;
+    let deadline = tokio::time::Instant::now() + wait();
+    let kinds = loop {
+        let records = traffic.snapshot(None, None)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let kinds: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| !r["frameType"].as_str().unwrap().starts_with("heartbeat"))
+            .map(|r| {
+                (
+                    r["direction"].as_str().unwrap().to_owned(),
+                    r["frameType"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        if kinds.len() >= 5 || tokio::time::Instant::now() > deadline {
+            assert!(records
+                .iter()
+                .all(|r| r["peer"]["kind"] == "backend" && r["peer"]["id"] == HEAD));
+            break kinds;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let expected: Vec<(String, String)> = [
+        ("in", "hello"),
+        ("out", "welcome"),
+        ("out", "replayComplete"),
+        ("in", "launch"),
+        ("out", "journal"),
+    ]
+    .iter()
+    .map(|(d, t)| ((*d).to_owned(), (*t).to_owned()))
+    .collect();
+    assert_eq!(kinds, expected);
+    traffic.stop();
     node.stop().await;
 }
 
@@ -1335,5 +1394,130 @@ async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
         .await
         .unwrap();
     assert_eq!(unknown, StopOutcome::NotRunning);
+    node.stop().await;
+}
+
+/// A running agent reports its provider process's pid with what its launch
+/// said and the backend it runs for, so the memory sampler can credit its
+/// tree to it; once the agent stops it is no longer reported.
+#[tokio::test]
+async fn a_running_agent_reports_its_root_pid_and_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, _dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let roots = node.service.agent_roots();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let root = &roots[0];
+    assert_eq!(root.agent_id, AgentId::from("a1"));
+    assert_eq!(root.workspace_id, WorkspaceId::from("ws-1"));
+    assert_eq!(root.provider, "mock");
+    assert_eq!(root.model, None);
+    assert_eq!(
+        root.owner,
+        intent_services::RemoteOwner {
+            backend_id: HEAD.into(),
+            backend_name: "Backend".into(),
+        }
+    );
+    assert!(root.root_pid > 0);
+    assert!(!process_gone(i32::try_from(root.root_pid).unwrap()));
+
+    node.api.revocations.send(id).unwrap();
+    wait_released(&admission).await;
+    assert!(node.service.agent_roots().is_empty());
+    node.stop().await;
+}
+
+/// The connected-backend count is the backends holding an open inbound
+/// link now: one while a backend's link is up, none once it closes.
+#[tokio::test]
+async fn linked_backends_count_open_inbound_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    assert_eq!(node.service.linked_backends(), 0);
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    assert_eq!(node.service.linked_backends(), 1);
+    dialed.link.close();
+    let deadline = tokio::time::Instant::now() + wait();
+    while node.service.linked_backends() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed link still counts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.stop().await;
+}
+
+/// Before the service is installed the slot reports no agents and no links.
+#[test]
+fn an_uninstalled_slot_reports_no_agents_or_links() {
+    let slot = ExecutorSlot::default();
+    assert!(slot.agent_roots().is_empty());
+    assert_eq!(slot.linked_backends(), 0);
+}
+
+/// Revoking a linked backend's credential closes its link and drops it from
+/// the connected-backend count.
+#[tokio::test]
+async fn a_revoked_backend_no_longer_counts_as_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    assert_eq!(node.service.linked_backends(), 1);
+    let id = node.api.credential(&token()).id;
+    node.api.revocations.send(id).unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while node.service.linked_backends() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the revoked backend still counts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.stop().await;
+}
+
+/// A backend that reconnects counts once, whether its old link closed first
+/// or is replaced by a newer bind; a second backend counts separately.
+#[tokio::test]
+async fn a_reconnecting_backend_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    first.link.close();
+    let mut second = dial_link(&node.endpoint, hello(2, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut second).await;
+    assert_eq!(node.service.linked_backends(), 1, "after close and rebind");
+    let mut third = dial_link(&node.endpoint, hello(3, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut third).await;
+    assert_eq!(
+        node.service.linked_backends(),
+        1,
+        "a newer bind beside an open one"
+    );
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-o", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+    assert_eq!(node.service.linked_backends(), 2);
     node.stop().await;
 }

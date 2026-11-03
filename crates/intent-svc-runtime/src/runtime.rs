@@ -180,13 +180,15 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             svc.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
-            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
+            let options = intent_core::script_lists::ScriptListOptions::parse_full_pages(&options)?;
             if options.summary {
                 svc.script_manager()
                     .summary_page(&workspace_id, &options)
                     .await
             } else {
-                svc.script_manager().list(&workspace_id).await
+                svc.script_manager()
+                    .full_page(&workspace_id, &options)
+                    .await
             }
         })
     }
@@ -575,6 +577,18 @@ impl RuntimePort for RuntimeFeature {
             svc.require_member(&workspace_id).await?;
             svc.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
                 .await
+        })
+    }
+
+    fn hook_list_page<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_member(&workspace_id).await?;
+            svc.hook_list_page_op(&workspace_id, &params).await
         })
     }
 
@@ -1376,6 +1390,20 @@ impl RuntimePort for RuntimeFeature {
                     ("BRANCH_NAME".to_string(), branch_name),
                     ("SOURCE_BRANCH".to_string(), source_branch),
                 ];
+                // Give the setup script the same enhanced PATH as saved
+                // scripts (inherited dirs first, then Homebrew, login-shell
+                // and user tool dirs). A launchd/Finder-started daemon only
+                // inherits /usr/bin:/bin:/usr/sbin:/sbin, so without this a
+                // setup script could not find Homebrew tools like sccache.
+                // Resolved off the async worker: the first call may run the
+                // login-shell probe if the startup prewarm has not finished.
+                let enhanced_path = tokio::task::spawn_blocking(script_ops::enhanced_shell_path)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(path) = enhanced_path {
+                    spec.env.push(("PATH".to_string(), path));
+                }
                 spec.env.extend(extra_env);
                 match pty_for_setup.spawn(spec) {
                     Ok(pty_id) => {

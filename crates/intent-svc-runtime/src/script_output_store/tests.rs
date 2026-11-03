@@ -875,3 +875,42 @@ fn sweep_deletes_stale_compaction_temps_even_with_retention_disabled() {
         "symlinks are left alone"
     );
 }
+
+#[test]
+fn paginate_budgets_bytes_and_rebuilds_an_oversized_escape_heavy_line() {
+    let (_dir, store) = store(1 << 26);
+    let quotes = format!("{}é{}", "\"".repeat(400_000), "\\".repeat(200_000));
+    let wide = "y".repeat(200_000);
+    let body = format!("old\n{wide}\n{wide}\n{wide}\n{quotes}\n");
+    store.open_writer("ws", "s", "r").append(body.as_bytes());
+    let mut newest_first: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut continues = false;
+    loop {
+        let got = store
+            .paginate("ws", "s", "r", Some(50), token.as_deref())
+            .unwrap();
+        assert_eq!(got, paginate_text_lines(&body, Some(50), token.as_deref()));
+        let size = serde_json::to_vec(&got).unwrap().len();
+        assert!(size <= 480_100, "page is {size} bytes");
+        for (n, item) in got["items"].as_array().unwrap().iter().enumerate() {
+            let item = item.as_str().unwrap();
+            if n == 0 && continues {
+                let last = newest_first.last_mut().unwrap();
+                *last = format!("{item}{last}");
+            } else {
+                newest_first.push(item.to_owned());
+            }
+        }
+        continues = got["lineContinues"] == true;
+        match got["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_owned()),
+            None => break,
+        }
+    }
+    newest_first.reverse();
+    assert_eq!(
+        newest_first,
+        vec!["old".to_owned(), wide.clone(), wide.clone(), wide, quotes]
+    );
+}

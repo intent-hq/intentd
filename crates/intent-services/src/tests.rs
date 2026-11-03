@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use intent_core::note_read_bounds::LineWindow;
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, Error, MessageOrigin, Note,
     NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput,
@@ -3498,7 +3499,13 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
 
     // Same-repo sibling read: full shape with numbered content + line count.
     let v = svc
-        .cross_workspace_read_note(caller.clone(), sibling.clone(), NoteId::from("sib-note"))
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow::default(),
+            true,
+        )
         .await
         .expect("read");
     assert_eq!(v["id"], "sib-note");
@@ -3506,6 +3513,150 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
     assert_eq!(v["numberedContent"], "   1 | l1\n   2 | l2");
     assert_eq!(v["sourceWorkspaceId"], "ws-sibling");
     assert_eq!(v["lineCount"], 2);
+    assert!(
+        v.get("truncated").is_none(),
+        "a note that fits keeps its shape"
+    );
+
+    // A window serves just those lines plus the page fields.
+    let v = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow {
+                start_line: Some(2),
+                max_lines: Some(5),
+                start_offset: None,
+            },
+            false,
+        )
+        .await
+        .expect("window");
+    assert_eq!(v["content"], "l2");
+    assert_eq!(v["numberedContent"], "   2 | l2");
+    assert_eq!(v["startLine"], 2);
+    assert_eq!(v["endLine"], 2);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["nextStartLine"], serde_json::Value::Null);
+    let err = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("sib-note"),
+            LineWindow {
+                start_line: Some(3),
+                max_lines: None,
+                start_offset: None,
+            },
+            false,
+        )
+        .await
+        .expect_err("past end");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("exceeds total lines")),
+        "{err:?}"
+    );
+
+    // A note larger than the read budget pages: every reply fits the
+    // 500 KiB budget and the pages rebuild the note exactly.
+    let big: String = (0..12_000)
+        .map(|i| format!("line {i} {}", "\"quoted\" ".repeat(12)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    svc.store
+        .insert_note(&note(&sibling, "big-note", &big))
+        .await
+        .unwrap();
+    let mut pages = Vec::new();
+    let mut start = None;
+    loop {
+        let v = svc
+            .cross_workspace_read_note(
+                caller.clone(),
+                sibling.clone(),
+                NoteId::from("big-note"),
+                LineWindow {
+                    start_line: start,
+                    max_lines: None,
+                    start_offset: None,
+                },
+                true,
+            )
+            .await
+            .expect("page");
+        assert!(
+            serde_json::to_string(&v).unwrap().len() < 500 * 1024,
+            "page over budget"
+        );
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["lineCount"], 12_000);
+        pages.push(v["content"].as_str().unwrap().to_string());
+        match v["nextStartLine"].as_u64() {
+            Some(next) => start = Some(usize::try_from(next).unwrap()),
+            None => break,
+        }
+    }
+    assert!(pages.len() > 1);
+    assert_eq!(pages.join("\n"), big);
+
+    // One line far over the budget (multi-byte characters and escapes):
+    // the cursor resumes inside the line, and the pages rebuild it exactly.
+    let huge = format!("head\n{}\ntail", "é€😀\"x".repeat(150_000));
+    svc.store
+        .insert_note(&note(&sibling, "huge-line", &huge))
+        .await
+        .unwrap();
+    let mut rebuilt = String::new();
+    let mut window = LineWindow::default();
+    let mut served = 0;
+    loop {
+        let v = svc
+            .cross_workspace_read_note(
+                caller.clone(),
+                sibling.clone(),
+                NoteId::from("huge-line"),
+                window,
+                true,
+            )
+            .await
+            .expect("page");
+        assert!(
+            serde_json::to_string(&v).unwrap().len() < 500 * 1024,
+            "page over budget"
+        );
+        if served > 0 && v.get("startOffset").is_none() {
+            rebuilt.push('\n');
+        }
+        rebuilt.push_str(v["content"].as_str().unwrap());
+        served += 1;
+        let Some(next) = v["nextStartLine"].as_u64() else {
+            assert!(v["nextStartOffset"].is_null());
+            break;
+        };
+        window = LineWindow {
+            start_line: Some(usize::try_from(next).unwrap()),
+            max_lines: None,
+            start_offset: v["nextStartOffset"]
+                .as_u64()
+                .map(|o| usize::try_from(o).unwrap()),
+        };
+    }
+    assert!(served > 2);
+    assert_eq!(rebuilt, huge);
+    // A caller without bounded defaults and no window keeps the whole note.
+    let v = svc
+        .cross_workspace_read_note(
+            caller.clone(),
+            sibling.clone(),
+            NoteId::from("big-note"),
+            LineWindow::default(),
+            false,
+        )
+        .await
+        .expect("whole");
+    assert_eq!(v["content"].as_str(), Some(big.as_str()));
+    assert!(v.get("truncated").is_none());
 
     // listNotes for the sibling returns the bare-array shape.
     let v = svc
@@ -3528,7 +3679,13 @@ async fn cross_workspace_read_note_enforces_access_and_shape() {
 
     // A missing note in a valid sibling surfaces the "Note not found" message.
     let err = svc
-        .cross_workspace_read_note(caller, sibling, NoteId::from("nope"))
+        .cross_workspace_read_note(
+            caller,
+            sibling,
+            NoteId::from("nope"),
+            LineWindow::default(),
+            true,
+        )
         .await
         .expect_err("missing");
     match err {
@@ -5979,6 +6136,40 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.asset_id, "img.png");
     assert_eq!(r.mime_type, "image/png");
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
+}
+
+/// `note.readAssetChunk` serves offset windows of an asset's raw bytes with
+/// the `note.readAsset` resolution and the shared chunk length cap.
+#[intent_test_macros::daemon_test]
+async fn read_asset_chunk_windows_asset_bytes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let root_guard = test_tempdir("intentd-assets-");
+    let root = root_guard.path().to_path_buf();
+    std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
+    std::fs::write(root.join(&ws.0).join("img.png"), b"hello world").expect("write asset");
+    let svc = Services::new_isolated(store).with_assets_root(root.clone());
+
+    let r = svc
+        .read_asset_chunk(ws.clone(), "workspace-asset://host/img.png".into(), 6, 100)
+        .await
+        .expect("read chunk");
+    assert_eq!(
+        r,
+        serde_json::json!({
+            "assetId": "img.png",
+            "mimeType": "image/png",
+            "content": "d29ybGQ=",
+            "bytesRead": 5,
+            "size": 11,
+        })
+    );
+    let err = svc
+        .read_asset_chunk(ws, "img.png".into(), 0, 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -24282,6 +24473,88 @@ mod file_tracking {
         (tmp, Services::new_isolated(store), ws_id)
     }
 
+    /// `git.showFileChunk` serves offset windows of the raw blob bytes with
+    /// the `git.showFile` path/ref rules: HEAD and the index ref, a missing
+    /// path as an empty blob, and the shared chunk length cap.
+    #[intent_test_macros::daemon_test]
+    async fn git_show_file_chunk_windows_blob_bytes() {
+        use base64::Engine as _;
+        let repo = init_git_repo();
+        let bytes: Vec<u8> = (0..1_000_u32)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        std::fs::write(repo.dir.join("bin.dat"), &bytes).unwrap();
+        let git = Repository::open(&repo.dir).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(std::path::Path::new("bin.dat")).unwrap();
+        index.write().unwrap();
+        let (_tmp, svc, ws_id) = svc_with_repo(&repo).await;
+        let decode = |v: &serde_json::Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v["content"].as_str().unwrap())
+                .unwrap()
+        };
+
+        // The staged blob at the index ref, windowed; a window crossing the
+        // end is shortened and one past it is empty.
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), ":0".into(), None, 100, 50)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), bytes[100..150]);
+        assert_eq!(w["bytesRead"], 50);
+        assert_eq!(w["size"], 1_000);
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), ":0".into(), None, 990, 50)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), bytes[990..]);
+        let w = svc
+            .git_show_file_chunk(
+                ws_id.clone(),
+                "bin.dat".into(),
+                ":0".into(),
+                None,
+                5_000,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(w["bytesRead"], 0);
+        assert_eq!(w["size"], 1_000);
+
+        // HEAD does not have it yet: an empty blob, like git.showFile.
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "bin.dat".into(), "HEAD".into(), None, 0, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            w,
+            serde_json::json!({ "content": "", "bytesRead": 0, "size": 0 })
+        );
+        let w = svc
+            .git_show_file_chunk(ws_id.clone(), "seed.txt".into(), "HEAD".into(), None, 0, 4)
+            .await
+            .unwrap();
+        assert_eq!(decode(&w), b"seed");
+
+        // Zero and over-cap lengths are InvalidParams.
+        for length in [0, crate::feature_ports::IMPORT_MAX_CHUNK_BYTES as u64 + 1] {
+            let err = svc
+                .git_show_file_chunk(
+                    ws_id.clone(),
+                    "seed.txt".into(),
+                    "HEAD".into(),
+                    None,
+                    0,
+                    length,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        }
+    }
+
     /// Agent-initiated `git.agentCommit` with no `files` commits only the
     /// paths the tracked-changes pipeline attributes to the committing agent
     /// (monorepo#939): another agent's and unattributed worktree changes stay
@@ -29332,7 +29605,8 @@ mod search_adapters {
     #[intent_test_macros::daemon_test]
     async fn streaming_emits_result_batches_and_done() {
         let h = stream_harness().await;
-        // 60 matching messages → above the inline threshold → streamed.
+        // 60 matching messages → above the inline threshold → streamed. The
+        // explicit limit lifts the 50-match default.
         let msgs: Vec<(&str, Value)> = (0..60)
             .map(|i| ("assistant", json!(format!("needle {i}"))))
             .collect();
@@ -29345,7 +29619,7 @@ mod search_adapters {
                 "needle".into(),
                 None,
                 None,
-                None,
+                Some(60),
                 None,
                 Some("srch-stream".into()),
             )
@@ -32320,6 +32594,11 @@ mod worktree_provisioning {
             obj.get("messageBlockPages"),
             Some(&serde_json::json!(1)),
             "capped message block reads are advertised as exact integer 1: {caps}"
+        );
+        assert_eq!(
+            obj.get("boundedReads"),
+            Some(&serde_json::json!(1)),
+            "bounded read defaults are advertised as exact integer 1: {caps}"
         );
     }
 
@@ -46997,4 +47276,62 @@ mod idempotency_serialization {
             "(round, holders): entry leaked after every slot dropped"
         );
     }
+}
+
+/// Paged `workspace.list` (§5.1 "Paged workspace lists"): following
+/// `nextToken` walks every row exactly once in `(createdAt, id)` order, for
+/// both the enriched and the lite rows, and a malformed token is rejected.
+#[intent_test_macros::daemon_test]
+async fn workspace_list_pages_walk_every_row_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    for i in 0..5 {
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from(format!("ws-page-{i}"))))
+            .await
+            .expect("workspace");
+    }
+    let svc = Services::new_isolated(store);
+    let filter = intent_core::WorkspaceListFilter::ACTIVE;
+    let mut expected: Vec<(String, String)> = svc
+        .list_workspaces(filter)
+        .await
+        .expect("whole list")
+        .into_iter()
+        .map(|ws| (ws.created_at, ws.id.0))
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 5);
+    for lite in [false, true] {
+        let mut seen = Vec::new();
+        let mut token = None;
+        let mut pages = 0;
+        loop {
+            let page = svc
+                .list_workspaces_page(filter, lite, Some(2), token.clone())
+                .await
+                .expect("page");
+            assert!(page.workspaces.len() <= 2);
+            seen.extend(
+                page.workspaces
+                    .into_iter()
+                    .map(|ws| (ws.created_at, ws.id.0)),
+            );
+            pages += 1;
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected, "lite={lite}: every row once, in order");
+        assert_eq!(pages, 3);
+    }
+    let err = svc
+        .list_workspaces_page(filter, false, None, Some("garbage".into()))
+        .await
+        .expect_err("bad token");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
 }

@@ -26,7 +26,7 @@ mod tests {
         for (id, expected) in [
             (
                 "developer",
-                "034e0f0e4f5b732fa61126b33d397c9a42ca1a4b96d9b5abd6eb86e63ae7215b",
+                "88c23a198f88a6bf313618baa69eef3d4acea31268b6a81e88b8d22d9335286d",
             ),
             (
                 "pr-reviewer",

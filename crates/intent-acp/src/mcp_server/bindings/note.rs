@@ -122,7 +122,7 @@ struct LineWindow {
 /// primitive strings and primitive safe positive integers; this check stays
 /// authoritative for the string contents.
 /// Numeric strings are tolerated for parity with `editLines`' `req_i64`.
-fn opt_positive_line(args: &Value, key: &str) -> Result<Option<usize>, String> {
+pub(super) fn opt_positive_line(args: &Value, key: &str) -> Result<Option<usize>, String> {
     let invalid = || format!("{key} must be a positive integer");
     let parsed = match args.get(key) {
         None | Some(Value::Null) => return Ok(None),

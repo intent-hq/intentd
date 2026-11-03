@@ -26,19 +26,22 @@
 //!   skips ordinary `"…"` / `'…'` literals on that line but tracks no
 //!   block-comment or raw-string state, so a `//` inside `/* … */` or `r#"…"#`
 //!   reads as a comment — a marker can be spoofed only deliberately.
-//! - Baseline (`tests/fixed_sleep_baseline.txt`): one `<path> <count>` line
-//!   per file that still has unannotated sleeps, sorted by path. It only
-//!   ratchets down: a file over its entry (or absent from the baseline) fails
+//! - Baseline (`tests/baselines/fixed_sleep/<crate>.txt`, one file per crate
+//!   so PRs fixing different crates never conflict): one `<path> <count>`
+//!   line per file of that crate that still has unannotated sleeps, sorted by
+//!   path; a crate with none has no file. It only ratchets down: a file over its entry (or absent from the baseline) fails
 //!   naming every unannotated line; a file under its entry, or an entry whose
-//!   file is gone, fails naming the exact line to write so the entry follows
-//!   the fix.
+//!   file is gone, fails naming the exact line to write, and its file, so the
+//!   entry follows the fix; delete a crate's file with its last entry.
 //! - Skipped: this file, whose fixtures spell the patterns out.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use intentd_test_support::source_lint::parse_count_baseline;
+use intentd_test_support::source_lint::{
+    count_baseline_file, parse_count_baseline, read_count_baselines,
+};
 
 /// Marker that exempts a fixed sleep when it sits in a `//` comment, followed
 /// by a reason, on the sleep's line or the one above.
@@ -49,7 +52,8 @@ const THREAD_SLEEP: &str = concat!("thread::", "sleep(");
 /// Also covers `tokio::time::sleep(`.
 const TIME_SLEEP: &str = concat!("time::", "sleep(");
 
-const BASELINE_FILE: &str = "crates/intent-core/tests/fixed_sleep_baseline.txt";
+/// One `<crate>.txt` baseline per crate.
+const BASELINE_DIR: &str = "crates/intent-core/tests/baselines/fixed_sleep";
 const SELF_FILE: &str = "crates/intent-core/tests/fixed_sleep_lint.rs";
 
 /// Does `line` contain a fixed sleep? Either a Rust [`THREAD_SLEEP`] /
@@ -178,13 +182,6 @@ fn unannotated_sleeps(source: &str) -> Vec<Sleep> {
         .collect()
 }
 
-/// Parses the baseline: `<path> <count>` per line, blank lines and `#`
-/// comments ignored, paths strictly increasing (sorted, unique), counts
-/// positive — a file with no unannotated sleeps has no entry.
-fn parse_baseline(text: &str) -> Result<BTreeMap<String, usize>, String> {
-    parse_count_baseline(text, "unannotated sleeps")
-}
-
 /// One way a scanned tree disagrees with the baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Finding {
@@ -272,6 +269,7 @@ fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String
                 count,
                 allowed,
             } => {
+                let file = count_baseline_file(BASELINE_DIR, path);
                 let allowed = match allowed {
                     Some(allowed) => format!("the baseline allows {allowed}"),
                     None => "the baseline has no entry for it".to_string(),
@@ -285,7 +283,7 @@ fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String
                 out.push(format!(
                     "  fix: justify each new sleep with `// {TIMING_GUARD_MARKER} <reason>` on \
                      its line or the one above, or replace it with a wait on an observable event; \
-                     as a last resort (never preferred) set its entry in {BASELINE_FILE} to \
+                     as a last resort (never preferred) set its entry in {file} to \
                      `{path} {count}`."
                 ));
             }
@@ -295,8 +293,9 @@ fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String
                 allowed,
             } => out.push(format!(
                 "{path}: no unannotated fixed sleeps left but the baseline allows {allowed}; \
-                 the ratchet only moves down — remove its line from {BASELINE_FILE}: \
-                 `{path} {allowed}`"
+                 the ratchet only moves down — remove its line from {}: \
+                 `{path} {allowed}`",
+                count_baseline_file(BASELINE_DIR, path)
             )),
             Finding::Under {
                 path,
@@ -304,12 +303,14 @@ fn render(findings: &[Finding], sleeps: &BTreeMap<String, Vec<Sleep>>) -> String
                 allowed,
             } => out.push(format!(
                 "{path}: {count} unannotated fixed sleep(s) but the baseline allows {allowed}; \
-                 the ratchet only moves down — replace its line in {BASELINE_FILE} with: \
-                 `{path} {count}`"
+                 the ratchet only moves down — replace its line in {} with: \
+                 `{path} {count}`",
+                count_baseline_file(BASELINE_DIR, path)
             )),
             Finding::Stale { path, allowed } => out.push(format!(
-                "{path}: no longer exists; remove its line from {BASELINE_FILE}: \
-                 `{path} {allowed}`"
+                "{path}: no longer exists; remove its line from {}: \
+                 `{path} {allowed}`",
+                count_baseline_file(BASELINE_DIR, path)
             )),
         }
     }
@@ -356,10 +357,8 @@ fn display_rel(rel: &Path) -> String {
 #[test]
 fn fixed_sleeps_are_annotated_or_baselined() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    let baseline_text = fs::read_to_string(root.join(BASELINE_FILE))
-        .unwrap_or_else(|e| panic!("read {BASELINE_FILE}: {e}"));
-    let baseline =
-        parse_baseline(&baseline_text).unwrap_or_else(|e| panic!("{BASELINE_FILE}: {e}"));
+    let baseline = read_count_baselines(&root, BASELINE_DIR, "unannotated sleeps")
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let files = collect_test_sources(&root);
     let mut sleeps = BTreeMap::new();
@@ -391,7 +390,7 @@ fn fixed_sleeps_are_annotated_or_baselined() {
     let findings = classify(&counts, &baseline);
     assert!(
         findings.is_empty() && malformed_markers(&sleeps).is_empty(),
-        "fixed sleeps in e2e tests out of step with {BASELINE_FILE}:\n\n{}\n",
+        "fixed sleeps in e2e tests out of step with the baselines in {BASELINE_DIR}/:\n\n{}\n",
         render(&findings, &sleeps)
     );
 }
@@ -530,7 +529,7 @@ fn a_sleep_on_the_first_line_has_no_line_above() {
 #[test]
 fn baseline_parses_sorted_entries_and_skips_comments() {
     let text = "# path count\n\ncrates/a/tests/x.rs 3\ncrates/b/tests/common/mod.rs\t1\n";
-    let parsed = parse_baseline(text).expect("valid baseline");
+    let parsed = parse_count_baseline(text, "unannotated sleeps").expect("valid baseline");
     assert_eq!(
         parsed,
         BTreeMap::from([
@@ -538,7 +537,10 @@ fn baseline_parses_sorted_entries_and_skips_comments() {
             ("crates/b/tests/common/mod.rs".to_string(), 1),
         ])
     );
-    assert_eq!(parse_baseline("").expect("empty baseline"), BTreeMap::new());
+    assert_eq!(
+        parse_count_baseline("", "unannotated sleeps").expect("empty baseline"),
+        BTreeMap::new()
+    );
 }
 
 #[test]
@@ -556,7 +558,7 @@ fn baseline_rejects_malformed_unsorted_or_zero_entries() {
             "sorted by path and unique",
         ),
     ] {
-        let err = parse_baseline(text).expect_err(text);
+        let err = parse_count_baseline(text, "unannotated sleeps").expect_err(text);
         assert!(err.contains(expected), "{text:?}: {err}");
     }
 }
@@ -678,7 +680,7 @@ fn report_names_every_line_over_baseline_and_the_corrected_entry() {
         "{report}"
     );
     assert!(report.contains("`crates/a/tests/over.rs 2`"), "{report}");
-    assert!(report.contains("replace its line in crates/intent-core/tests/fixed_sleep_baseline.txt with: `crates/a/tests/under.rs 1`"), "{report}");
-    assert!(report.contains("remove its line from crates/intent-core/tests/fixed_sleep_baseline.txt: `crates/a/tests/fixed.rs 1`"), "{report}");
-    assert!(report.contains("remove its line from crates/intent-core/tests/fixed_sleep_baseline.txt: `crates/a/tests/gone.rs 4`"), "{report}");
+    assert!(report.contains("replace its line in crates/intent-core/tests/baselines/fixed_sleep/a.txt with: `crates/a/tests/under.rs 1`"), "{report}");
+    assert!(report.contains("remove its line from crates/intent-core/tests/baselines/fixed_sleep/a.txt: `crates/a/tests/fixed.rs 1`"), "{report}");
+    assert!(report.contains("remove its line from crates/intent-core/tests/baselines/fixed_sleep/a.txt: `crates/a/tests/gone.rs 4`"), "{report}");
 }

@@ -240,6 +240,10 @@ pub struct LargeStateIds {
     pub discussion_conversation: String,
     pub discussion_message: String,
     pub script: String,
+    /// A saved script whose escape-heavy, multibyte `command` is larger
+    /// than one read reply (`script.get` serves it in parts). Inserted
+    /// straight into the store (no events) and not counted in `scripts`.
+    pub huge_script: String,
     pub hook: HookId,
     pub pr_monitor: PrMonitorId,
     pub owner_principal: PrincipalId,
@@ -840,6 +844,27 @@ pub async fn build_large_state(scale: &LargeStateScale) -> LargeState {
         scripts.push(id);
     }
     counts.scripts = scripts.len();
+    let huge_script = uuid_like(0x00AA, 0);
+    store
+        .upsert_script(&Script {
+            purpose: ScriptPurpose::Saved,
+            archived_at: None,
+            last_run: None,
+            id: huge_script.clone(),
+            workspace_id: big_ws.0.clone(),
+            name: "large-state-huge-command".into(),
+            command: format!("echo '{}' # {}", "\"".repeat(300_000), "é".repeat(150_000)),
+            cwd: None,
+            env: None,
+            mode: ScriptMode::Command,
+            category: None,
+            source: "agent".into(),
+            auto_start: Some(false),
+            created_at: ts(390 * 86_400),
+            updated_at: Some(ts(390 * 86_400)),
+        })
+        .await
+        .expect("upsert huge script");
     for i in 0..scale.script_monitors {
         store
             .insert_script_monitor(&intent_core::ScriptMonitor {
@@ -1176,6 +1201,7 @@ pub async fn build_large_state(scale: &LargeStateScale) -> LargeState {
             discussion_conversation,
             discussion_message,
             script: scripts[0].clone(),
+            huge_script,
             hook: first_hook.expect("hook"),
             pr_monitor: first_pr_monitor.expect("pr monitor"),
             owner_principal,

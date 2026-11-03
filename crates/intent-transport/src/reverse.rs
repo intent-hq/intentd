@@ -28,7 +28,7 @@ pub(crate) const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Screenshot reverse requests must settle before the agent JavaScript tool's
 /// 30-second outer deadline so the caller receives the transport error.
-const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Select the reverse deadline without changing the global default. A mixed
 /// `browser.exec` batch uses the screenshot deadline when any action captures
