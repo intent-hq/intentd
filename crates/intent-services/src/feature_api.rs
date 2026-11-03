@@ -219,7 +219,8 @@ pub mod retire {
 /// Shell selection and environment scrubbing.
 pub mod shell {
     pub use crate::shell::{
-        default_shell, scrubbed_env_vars_except, shell_args, shell_true_invocation,
+        default_shell, enhanced_shell_path, saved_script_env_overlay, scrubbed_env_vars_except,
+        shell_args, shell_true_invocation,
     };
 }
 

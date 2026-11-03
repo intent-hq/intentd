@@ -29,6 +29,10 @@ pub(super) trait Checkouts: Send + Sync {
         repo_key: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<PathBuf>>;
 
+    /// The agent's existing checkout on this machine, if it has one (it
+    /// stays after the agent's process stops). Saved scripts run in it.
+    fn existing(&self, agent_id: &AgentId) -> Option<PathBuf>;
+
     /// Push the agent's committed `HEAD` to its `head` ref and a commit of
     /// its dirty tree to its `wip` ref.
     fn push_wip<'a>(
@@ -52,6 +56,11 @@ impl GitCheckouts {
 }
 
 impl Checkouts for GitCheckouts {
+    fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        let worktree = self.storage.agent_worktree(agent_id).ok()?;
+        worktree.join(".git").exists().then_some(worktree)
+    }
+
     fn prepare<'a>(
         &'a self,
         agent_id: &'a AgentId,
@@ -120,6 +129,10 @@ impl PlainCheckouts {
 
 #[cfg(test)]
 impl Checkouts for PlainCheckouts {
+    fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        self.storage.existing_agent_dir(agent_id)
+    }
+
     fn prepare<'a>(
         &'a self,
         agent_id: &'a AgentId,

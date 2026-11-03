@@ -3285,36 +3285,20 @@ fn spawn_env_overlay(
     cwd: Option<&std::path::Path>,
     def_env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Vec<(String, String)> {
-    let mut env = vec![
-        ("FORCE_COLOR".to_string(), "1".to_string()),
-        ("TERM".to_string(), "xterm-256color".to_string()),
-        ("PAGER".to_string(), "cat".to_string()),
-        ("GIT_PAGER".to_string(), "cat".to_string()),
-    ];
-    if let Some(path) = enhanced_shell_path() {
-        env.push(("PATH".to_string(), path));
-    }
-    env.extend(intent_git::identity::commit_identity_env(cwd));
-    if let Some(map) = def_env {
-        for (k, v) in map {
-            env.push((k.clone(), v.clone()));
-        }
-    }
-    env
+    intent_services::feature_api::shell::saved_script_env_overlay(
+        cwd,
+        def_env
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    )
 }
 
-/// The enhanced PATH for a spawned shell, reusing the canonical de-duplicated,
-/// order-preserving dir list (current PATH first, then essential system dirs and
-/// node/version-manager locations). Returns `None` when no dirs resolve.
-/// Shared with the workspace setup-script runner (`runtime.rs`).
+/// The enhanced PATH for a spawned shell (see
+/// [`intent_services::feature_api::shell::enhanced_shell_path`]). Shared with
+/// the workspace setup-script runner (`runtime.rs`).
 pub(crate) fn enhanced_shell_path() -> Option<String> {
-    let dirs = intent_services::feature_api::auggie_discovery::enhanced_path_dirs();
-    if dirs.is_empty() {
-        return None;
-    }
-    std::env::join_paths(dirs)
-        .ok()
-        .map(|joined| joined.to_string_lossy().into_owned())
+    intent_services::feature_api::shell::enhanced_shell_path()
 }
 
 /// Clamp a caller-supplied `maxLines` to a sane positive count (mirrors

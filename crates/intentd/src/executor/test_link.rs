@@ -114,6 +114,14 @@ pub(super) struct Served(
 
 /// A bound link: the machine's end, the backend's end, and the listener.
 pub(super) async fn bound_link(dir: &std::path::Path) -> (NodeLink, DialedLink, Served) {
+    bound_link_offering(dir, NODE_LINK_PROTOCOLS).await
+}
+
+/// [`bound_link`] with the backend offering `protocol`.
+pub(super) async fn bound_link_offering(
+    dir: &std::path::Path,
+    protocol: intent_core::node_link::ProtocolRange,
+) -> (NodeLink, DialedLink, Served) {
     let api = Arc::new(Api {
         principal: PrincipalId::new(),
         credential: ExecutorCredential {
@@ -159,7 +167,7 @@ pub(super) async fn bound_link(dir: &std::path::Path) -> (NodeLink, DialedLink, 
         tailcat: None,
     };
     let hello = LinkHello {
-        protocol: NODE_LINK_PROTOCOLS,
+        protocol,
         intentd_version: "test".into(),
         binding: LeaseBinding {
             head_id: "head-1".into(),

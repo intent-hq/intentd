@@ -32,6 +32,7 @@ use intent_transport::node_link::{
 
 mod checkout;
 mod runner;
+mod scripts;
 mod session;
 mod storage;
 #[cfg(test)]

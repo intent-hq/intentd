@@ -171,6 +171,11 @@ impl Router {
     {
         let link = self.head.get();
         let agent_id = self.agent_id.clone();
+        let min_protocol = workspace_api::forward_min_protocol(method);
+        let refused = format!(
+            "{}: `{method}` needs saved-script support on both this machine and the backend (node-link protocol {min_protocol}); update Intent on both",
+            workspace_api::UNSUPPORTED_CODE
+        );
         let params = json!({ "method": method, "args": args });
         let timeout = self.timeout;
         async move {
@@ -178,6 +183,9 @@ impl Router {
                 "node-link-unavailable: head is not connected to this node; try again shortly"
                     .to_owned()
             })?;
+            if link.protocol() < min_protocol {
+                return Err(refused);
+            }
             match link.call(agent_id, CALL_METHOD, params, timeout).await {
                 Ok(LinkOutcome::Ok(value)) => Ok(value),
                 Ok(LinkOutcome::Err(error)) => Err(error.message),

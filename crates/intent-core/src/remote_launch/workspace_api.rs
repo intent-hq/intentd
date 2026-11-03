@@ -3,7 +3,8 @@
 //! A remote agent evaluates its `workspace_api` code on its execution node.
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
-//! namespaces (plus `workspace.details`) is forwarded to head over the node link (head checks the agent
+//! namespaces (saved scripts included: head keeps them and runs them on the
+//! agent's machine), plus `workspace.details`, is forwarded to head over the node link (head checks the agent
 //! is on the link's lease and routes the frame again, never trusting the
 //! node), and everything else is refused with an explicit error instead of
 //! running on the wrong host.
@@ -18,8 +19,9 @@ pub const CALL_METHOD: &str = "workspace.call";
 pub const COMMIT_POLICY_METHOD: &str = "git.commitPolicy";
 
 /// Namespaces forwarded to head.
-pub const FORWARDED_NAMESPACES: &[&str] =
-    &["note", "task", "agent", "pr", "mr", "comment", "event"];
+pub const FORWARDED_NAMESPACES: &[&str] = &[
+    "note", "task", "agent", "pr", "mr", "comment", "event", "script",
+];
 
 /// Methods that run on the node, against the agent's checkout.
 pub const LOCAL_METHODS: &[&str] = &[
@@ -68,6 +70,18 @@ pub fn route(method: &str) -> Route {
             Route::Forward
         }
         _ => Route::Unsupported,
+    }
+}
+
+/// The lowest negotiated node-link protocol on which `method` is forwarded:
+/// saved scripts need the protocol-8 script frames, so on an older link the
+/// machine refuses `script.*` itself with [`unsupported_message`].
+#[must_use]
+pub fn forward_min_protocol(method: &str) -> u32 {
+    if method.starts_with("script.") {
+        crate::node_link::SCRIPT_PROTOCOL
+    } else {
+        crate::node_link::NODE_LINK_PROTOCOLS.min
     }
 }
 
@@ -151,6 +165,9 @@ mod tests {
             "mr.snapshot",
             "comment.add",
             "event.subscribe",
+            "script.create",
+            "script.run",
+            "script.monitor",
         ] {
             assert_eq!(route(method), Route::Forward, "{method}");
         }
@@ -159,7 +176,6 @@ mod tests {
     #[test]
     fn everything_else_is_refused_by_name() {
         for method in [
-            "script.list",
             "terminal.list",
             "browser.exec",
             "hook.schedule",
@@ -174,14 +190,15 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
-        let message = unsupported_message("script.list");
+        let message = unsupported_message("terminal.list");
         assert!(
             message.starts_with(
-                "remote-agent-unsupported: `script.list` is not supported on remote agents yet"
+                "remote-agent-unsupported: `terminal.list` is not supported on remote agents yet"
             ),
             "{message}"
         );
-        assert!(message.contains("ws.script.*"), "{message}");
+        assert!(message.contains("ws.terminal.*"), "{message}");
+        assert!(message.contains("ws.script and"), "{message}");
         assert!(unsupported_message("file.getAttachment").contains("attachments are"));
     }
 }
