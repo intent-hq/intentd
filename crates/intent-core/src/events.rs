@@ -537,6 +537,11 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // `{ machine: RemoteMachine }` or `{ machineId, removed: true }`; global and
 // owner-only, never the executor token.
 pub const REMOTE_MACHINE_CHANGED: &str = "remoteMachine:changed";
+// Owner-only capture of executor-link traffic: a batch of new records, or
+// (with `records: []`) capture starting or stopping. Payload `{ records:
+// LinkTrafficRecord[], capture: LinkTrafficCapture }`; global, owner-only and
+// never persisted. Records are redacted before they are kept.
+pub const REMOTE_LINK_TRAFFIC_RECORDS: &str = "remoteLinkTraffic:records";
 
 pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
 pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
@@ -774,6 +779,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOST_INVITES_CHANGED,
     HOST_EXECUTION_CONTEXT_CHANGED,
     REMOTE_MACHINE_CHANGED,
+    REMOTE_LINK_TRAFFIC_RECORDS,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,

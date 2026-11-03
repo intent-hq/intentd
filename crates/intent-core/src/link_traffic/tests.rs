@@ -1,0 +1,478 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use super::{Limits, LinkTap, LinkTraffic, PeerKind, TrafficDirection, TrafficPeer};
+use crate::node_link::{
+    JournalBody, JournalRecord, LaunchCommand, LaunchProfileEnv, LinkFrame, LinkOutcome,
+    LinkRequest,
+};
+use crate::nodes::NodeCounter;
+use crate::{AgentId, WorkspaceId};
+
+fn machine() -> TrafficPeer {
+    TrafficPeer {
+        kind: PeerKind::Machine,
+        id: "m-1".into(),
+        name: Some("Mac Studio".into()),
+    }
+}
+
+fn limits(max_records: usize, max_payload_bytes: usize, queue: usize) -> Limits {
+    Limits {
+        max_records,
+        max_payload_bytes,
+        queue,
+        batch_window: Duration::ZERO,
+    }
+}
+
+fn traffic(limits: Limits) -> (Arc<LinkTraffic>, Arc<Mutex<Vec<Value>>>) {
+    let traffic = Arc::new(LinkTraffic::with_limits(limits));
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let sink = published.clone();
+    traffic.set_sink(Arc::new(move |batch| sink.lock().unwrap().push(batch)));
+    (traffic, published)
+}
+
+fn launch_frame() -> LinkFrame {
+    LinkFrame::Launch(LaunchCommand {
+        agent_id: AgentId::from_string("agent-1"),
+        workspace_id: WorkspaceId::from_string("ws-1"),
+        provider: "claude-code".into(),
+        model: Some("opus".into()),
+        base_commit: "abc123".into(),
+        repo_key: "repo".into(),
+        agent_features: json!({ "apiToken": "tok-secret", "inputTokens": 12 }),
+        is_sub_agent: false,
+        profile_env: Some(LaunchProfileEnv(json!({
+            "providerRef": "claude-code@work",
+            "fingerprint": "fp-1",
+            "env": [
+                { "key": "ANTHROPIC_API_KEY", "value": "sk-ant-secret" },
+                { "key": "UNSET_ME", "value": null }
+            ]
+        }))),
+    })
+}
+
+fn journal_frame(seq: u64) -> LinkFrame {
+    LinkFrame::Journal(JournalRecord {
+        seq: NodeCounter(seq),
+        agent_id: AgentId::from_string("agent-1"),
+        workspace_id: WorkspaceId::from_string("ws-1"),
+        turn_id: None,
+        recorded_at: "2026-11-03T00:00:00Z".into(),
+        body: JournalBody::Started {
+            base_commit: "abc".into(),
+        },
+    })
+}
+
+async fn settle(traffic: &LinkTraffic, retained: usize) -> Value {
+    for _ in 0..200 {
+        let status = traffic.status();
+        if status["retained"].as_u64() == Some(retained as u64) {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("capture never retained {retained}: {}", traffic.status());
+}
+
+#[tokio::test]
+async fn off_records_nothing() {
+    let (traffic, published) = traffic(limits(10, 1 << 16, 16));
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::Out, &launch_frame(), 100);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let status = traffic.status();
+    assert_eq!(status["active"], false);
+    assert_eq!(status["retained"], 0);
+    assert_eq!(status["nextSeq"], 1);
+    assert!(status.get("startedAt").is_none());
+    assert_eq!(traffic.snapshot(None, None)["records"], json!([]));
+    assert!(published.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn on_records_both_directions_with_fields() {
+    let (traffic, published) = traffic(limits(10, 1 << 16, 16));
+    let status = traffic.start(true);
+    assert_eq!(status["active"], true);
+    assert!(status["startedAt"].is_string());
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::Out, &launch_frame(), 321);
+    tap.observe(TrafficDirection::In, &journal_frame(7), 99);
+    settle(&traffic, 2).await;
+    let snapshot = traffic.snapshot(None, None);
+    let records = snapshot["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let out = &records[0];
+    assert_eq!(out["seq"], 1);
+    assert_eq!(out["direction"], "out");
+    assert_eq!(
+        out["peer"],
+        json!({ "kind": "machine", "id": "m-1", "name": "Mac Studio" })
+    );
+    assert_eq!(out["frameType"], "launch");
+    assert_eq!(out["agentId"], "agent-1");
+    assert_eq!(out["bytes"], 321);
+    assert!(out["at"].as_str().unwrap().ends_with('Z'));
+    assert!(out["summary"].as_str().unwrap().contains("claude-code"));
+    assert_eq!(out["payload"]["type"], "launch");
+    assert!(out.get("truncated").is_none());
+    let inbound = &records[1];
+    assert_eq!(inbound["seq"], 2);
+    assert_eq!(inbound["direction"], "in");
+    assert_eq!(inbound["frameType"], "journal");
+    assert_eq!(inbound["bytes"], 99);
+    assert!(inbound["summary"].as_str().unwrap().contains("started"));
+    assert_eq!(snapshot["capture"]["nextSeq"], 3);
+    let published = published.lock().unwrap();
+    let total: usize = published
+        .iter()
+        .map(|batch| batch["records"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(total, 2);
+    assert_eq!(published.last().unwrap()["capture"]["active"], true);
+}
+
+#[tokio::test]
+async fn launch_secrets_are_masked() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &launch_frame(), 10);
+    settle(&traffic, 1).await;
+    let record = traffic.snapshot(None, None)["records"][0].clone();
+    let text = record.to_string();
+    assert!(!text.contains("sk-ant-secret"), "{text}");
+    assert!(!text.contains("tok-secret"), "{text}");
+    let env = &record["payload"]["profileEnv"];
+    assert_eq!(env["providerRef"], "claude-code@work");
+    assert_eq!(env["fingerprint"], "fp-1");
+    assert_eq!(env["env"][0]["key"], "ANTHROPIC_API_KEY");
+    assert_eq!(env["env"][0]["value"], "***");
+    assert_eq!(env["env"][1]["value"], Value::Null);
+    assert_eq!(record["payload"]["agentFeatures"]["apiToken"], "***");
+    assert_eq!(record["payload"]["agentFeatures"]["inputTokens"], 12);
+}
+
+#[test]
+fn redaction_masks_keys_certificates_and_keeps_ids() {
+    let mut value = json!({
+        "password": "hunter2",
+        "Authorization": "Bearer x",
+        "nested": [{ "clientSecret": "s", "privateKey": "k", "cookie": "c" }],
+        "credentialId": "cred-1",
+        "fingerprint": "AB:CD",
+        "requestId": "r-1",
+        "note": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        "certificate": { "der": "x" },
+        "accessToken": null,
+        "plain": "hello",
+        "private_key": "k1",
+        "privateXkey": "k2",
+        "usage": { "inputTokens": 5, "outputTokens": 6, "totalTokens": 11, "tokenized": true },
+        "authHeaders": ["a"],
+    });
+    super::redact(&mut value);
+    assert_eq!(value["password"], "***");
+    assert_eq!(value["Authorization"], "***");
+    assert_eq!(value["nested"][0]["clientSecret"], "***");
+    assert_eq!(value["nested"][0]["privateKey"], "***");
+    assert_eq!(value["nested"][0]["cookie"], "***");
+    assert_eq!(value["credentialId"], "cred-1");
+    assert_eq!(value["fingerprint"], "AB:CD");
+    assert_eq!(value["requestId"], "r-1");
+    assert_eq!(value["note"], "***");
+    assert_eq!(value["certificate"], "***");
+    assert_eq!(value["accessToken"], Value::Null);
+    assert_eq!(value["plain"], "hello");
+    assert_eq!(value["private_key"], "***");
+    assert_eq!(value["privateXkey"], "***");
+    assert_eq!(
+        value["usage"],
+        json!({ "inputTokens": 5, "outputTokens": 6, "totalTokens": 11, "tokenized": true })
+    );
+    assert_eq!(value["authHeaders"], json!(["a"]));
+}
+
+#[test]
+fn secret_key_matches_the_documented_pattern() {
+    for key in [
+        "token",
+        "ACCESS_TOKEN",
+        "clientSecret",
+        "password",
+        "credentials",
+        "Authorization",
+        "setCookie",
+        "privateKey",
+        "private-key",
+        "privatekey",
+        "certificatePem",
+    ] {
+        assert!(super::secret_key(key), "{key}");
+    }
+    for key in [
+        "fingerprint",
+        "credentialId",
+        "stopId",
+        "requestId",
+        "privateNotes",
+        "keyring",
+        "plain",
+    ] {
+        assert!(!super::secret_key(key), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn start_and_stop_publish_the_capture_state() {
+    let (traffic, published) = traffic(limits(10, 1 << 16, 16));
+    let started = traffic.start(true);
+    assert_eq!(started["payloads"], true);
+    {
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0]["records"], json!([]));
+        assert_eq!(published[0]["capture"]["active"], true);
+    }
+    // A start that only changes payloads publishes too.
+    assert_eq!(traffic.start(false)["payloads"], false);
+    assert_eq!(published.lock().unwrap()[1]["capture"]["payloads"], false);
+    let stopped = traffic.stop();
+    assert_eq!(stopped["active"], false);
+    {
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 3);
+        assert_eq!(published[2]["records"], json!([]));
+        assert_eq!(published[2]["capture"]["active"], false);
+        assert_eq!(published[2]["capture"]["retained"], 0);
+    }
+    // A stop while off publishes nothing.
+    traffic.stop();
+    assert_eq!(published.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn request_records_carry_method_and_request_id_and_mask_params() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    let request_id = uuid::Uuid::new_v4();
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(
+        TrafficDirection::In,
+        &LinkFrame::Request(LinkRequest {
+            request_id,
+            agent_id: AgentId::from_string("agent-1"),
+            method: "workspace.call".into(),
+            params: json!({
+                "method": "note.read",
+                "args": { "id": "spec", "githubToken": "ghp_secret" }
+            }),
+            timeout_ms: 1000,
+        }),
+        50,
+    );
+    tap.observe(
+        TrafficDirection::Out,
+        &LinkFrame::Response {
+            request_id,
+            outcome: LinkOutcome::Ok(json!({ "content": "hi" })),
+        },
+        40,
+    );
+    settle(&traffic, 2).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    assert_eq!(records[0]["requestId"], request_id.to_string());
+    let summary = records[0]["summary"].as_str().unwrap();
+    assert!(summary.contains("note.read"), "{summary}");
+    assert!(!summary.contains("workspace.call"), "{summary}");
+    assert_eq!(
+        records[0]["payload"]["params"]["args"]["githubToken"],
+        "***"
+    );
+    assert!(!records.to_string().contains("ghp_secret"));
+    assert_eq!(records[1]["requestId"], request_id.to_string());
+    assert_eq!(records[1]["frameType"], "response");
+}
+
+#[tokio::test]
+async fn ring_evicts_oldest_and_counts() {
+    let (traffic, _) = traffic(limits(3, 1 << 16, 64));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    for seq in 1..=5 {
+        tap.observe(TrafficDirection::In, &journal_frame(seq), 10);
+        // One at a time, so the queue never overflows.
+        settle(&traffic, usize::try_from(seq.min(3)).unwrap()).await;
+        for _ in 0..200 {
+            if traffic.status()["nextSeq"] == seq + 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let snapshot = traffic.snapshot(None, None);
+    let seqs: Vec<u64> = snapshot["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![3, 4, 5]);
+    assert_eq!(snapshot["capture"]["retained"], 3);
+    assert_eq!(snapshot["capture"]["evicted"], 2);
+    assert_eq!(snapshot["capture"]["maxRecords"], 3);
+    assert_eq!(snapshot["capture"]["dropped"], 0);
+}
+
+#[tokio::test]
+async fn snapshot_pages_after_seq_with_limit() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 64));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    for seq in 1..=5 {
+        tap.observe(TrafficDirection::In, &journal_frame(seq), 10);
+    }
+    settle(&traffic, 5).await;
+    let page = traffic.snapshot(Some(2), Some(2));
+    let seqs: Vec<u64> = page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![3, 4]);
+}
+
+#[tokio::test]
+async fn oversized_payload_is_omitted_and_counted() {
+    let (traffic, _) = traffic(limits(10, 64, 16));
+    traffic.start(true);
+    LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &launch_frame(), 900);
+    settle(&traffic, 1).await;
+    let snapshot = traffic.snapshot(None, None);
+    let record = &snapshot["records"][0];
+    assert!(record.get("payload").is_none());
+    assert_eq!(record["truncated"], true);
+    assert_eq!(record["frameType"], "launch");
+    assert_eq!(snapshot["capture"]["oversized"], 1);
+}
+
+#[tokio::test]
+async fn payloads_off_keeps_records_without_bodies() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(false);
+    LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &launch_frame(), 10);
+    settle(&traffic, 1).await;
+    let record = traffic.snapshot(None, None)["records"][0].clone();
+    assert!(record.get("payload").is_none());
+    assert!(record.get("truncated").is_none());
+    assert_eq!(traffic.status()["oversized"], 0);
+}
+
+#[tokio::test]
+async fn full_queue_drops_and_counts() {
+    let traffic = Arc::new(LinkTraffic::with_limits(Limits {
+        max_records: 100,
+        max_payload_bytes: 1 << 16,
+        queue: 2,
+        batch_window: Duration::ZERO,
+    }));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    // No await between observations: the collector cannot drain, so only
+    // the queue's two slots are filled.
+    for seq in 1..=6 {
+        tap.observe(TrafficDirection::In, &journal_frame(seq), 10);
+    }
+    let status = settle(&traffic, 2).await;
+    assert_eq!(status["dropped"], 4);
+}
+
+#[tokio::test]
+async fn stop_clears_and_restart_resets() {
+    let (traffic, published) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::In, &journal_frame(1), 10);
+    settle(&traffic, 1).await;
+    let stopped = traffic.stop();
+    assert_eq!(stopped["active"], false);
+    assert_eq!(stopped["retained"], 0);
+    assert_eq!(stopped["nextSeq"], 1);
+    assert_eq!(traffic.snapshot(None, None)["records"], json!([]));
+    let before = published.lock().unwrap().len();
+    tap.observe(TrafficDirection::In, &journal_frame(2), 10);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(traffic.status()["retained"], 0);
+    assert_eq!(published.lock().unwrap().len(), before);
+    // A second stop is a no-op.
+    assert_eq!(traffic.stop()["active"], false);
+    traffic.start(true);
+    tap.observe(TrafficDirection::In, &journal_frame(3), 10);
+    settle(&traffic, 1).await;
+    assert_eq!(traffic.snapshot(None, None)["records"][0]["seq"], 1);
+}
+
+#[tokio::test]
+async fn start_while_on_keeps_records_and_updates_payloads() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::In, &journal_frame(1), 10);
+    settle(&traffic, 1).await;
+    let started_at = traffic.status()["startedAt"].clone();
+    let again = traffic.start(false);
+    assert_eq!(again["retained"], 1);
+    assert_eq!(again["startedAt"], started_at);
+    tap.observe(TrafficDirection::In, &journal_frame(2), 10);
+    settle(&traffic, 2).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    assert!(records[0].get("payload").is_some());
+    assert!(records[1].get("payload").is_none());
+}
+
+#[tokio::test]
+async fn snapshot_stops_before_the_byte_cap_but_returns_at_least_one() {
+    let (traffic, _) = traffic(limits(100, 1 << 16, 64));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    let big = |turn: u64| LinkFrame::Prompt {
+        agent_id: AgentId::from_string("agent-1"),
+        turn_id: format!("t{turn}"),
+        prompt: vec![json!({ "type": "text", "text": "x".repeat(60 * 1024) })],
+    };
+    for turn in 1..=20 {
+        tap.observe(TrafficDirection::Out, &big(turn), 61 * 1024);
+    }
+    settle(&traffic, 20).await;
+    let page = traffic.snapshot(None, Some(2000));
+    let records = page["records"].as_array().unwrap();
+    assert!(records.len() < 20, "{} records", records.len());
+    assert!(!records.is_empty());
+    let size = serde_json::to_vec(&page["records"]).unwrap().len();
+    assert!(size <= super::SNAPSHOT_MAX_BYTES, "{size}");
+    // Paging with afterSeq reaches the end.
+    let seq = |r: &Value| r["seq"].as_u64().unwrap();
+    let mut seen: Vec<u64> = records.iter().map(seq).collect();
+    let mut pages = 1;
+    while *seen.last().unwrap() + 1 < page["capture"]["nextSeq"].as_u64().unwrap() {
+        let next = traffic.snapshot(seen.last().copied(), None);
+        let more = next["records"].as_array().unwrap();
+        assert!(!more.is_empty());
+        assert!(serde_json::to_vec(more).unwrap().len() <= super::SNAPSHOT_MAX_BYTES);
+        seen.extend(more.iter().map(seq));
+        pages += 1;
+    }
+    assert!(pages > 1, "large records span pages");
+    assert_eq!(
+        seen,
+        (1..=20).collect::<Vec<u64>>(),
+        "every record once, in order"
+    );
+}

@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use intent_core::link_traffic::{LinkTap, TrafficDirection};
 use intent_core::node_link::{
     LeaseBinding, LinkFrame, LinkId, LinkOutcome, LinkRequest, LinkRpcError, StopId, StopOutcome,
 };
@@ -81,11 +82,20 @@ struct Inner {
     /// The peer holds an executor credential: it may send only
     /// [`LinkFrame::admitted_from_executor`] frames.
     executor_peer: bool,
+    /// Records every frame sent and received while the daemon's link
+    /// traffic capture is on; heartbeats included.
+    tap: Option<LinkTap>,
 }
 
 impl Inner {
     fn is_closed(&self) -> bool {
         *self.close.borrow()
+    }
+
+    fn observe(&self, direction: TrafficDirection, frame: &LinkFrame, bytes: usize) {
+        if let Some(tap) = &self.tap {
+            tap.observe(direction, frame, bytes);
+        }
     }
 
     fn shut(&self) {
@@ -107,6 +117,7 @@ impl Inner {
         let Ok(bytes) = frame.encode() else {
             return;
         };
+        self.observe(TrafficDirection::Out, frame, bytes.len());
         if let Err(mpsc::error::TrySendError::Full(_)) =
             self.urgent.try_send(Message::Binary(bytes.into()))
         {
@@ -124,6 +135,7 @@ impl Inner {
             return;
         }
         if let Ok(bytes) = frame.encode() {
+            self.observe(TrafficDirection::Out, frame, bytes.len());
             let _ = self.out.try_send(Outbound {
                 message: Message::Binary(bytes.into()),
                 request: None,
@@ -314,6 +326,7 @@ impl Drop for CallGuard {
 
 impl NodeLink {
     /// Run the link over an upgraded socket whose handshake is complete.
+    #[cfg(test)]
     pub(super) fn start<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
@@ -322,17 +335,19 @@ impl NodeLink {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::start_with(socket, binding, tuning, false)
+        Self::start_with(socket, binding, tuning, false, None)
     }
 
     /// [`Self::start`] for a link whose peer is an executor credential: any
     /// frame outside [`intent_core::node_link::EXECUTOR_LINK_REQUESTS`]
-    /// closes the link.
+    /// closes the link. `tap`, when given, records the link's frames
+    /// while capture is on.
     pub(super) fn start_with<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
         tuning: Tuning,
         executor_peer: bool,
+        tap: Option<LinkTap>,
     ) -> (Self, LinkEvents)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -351,6 +366,7 @@ impl NodeLink {
             close,
             close_frame: Mutex::new(None),
             executor_peer,
+            tap,
         });
         let (sink, stream) = socket.split();
         let last_seen = Arc::new(Mutex::new(Instant::now()));
@@ -428,6 +444,8 @@ impl NodeLink {
             return Err(closed_error());
         }
         let bytes = frame.encode()?;
+        self.inner
+            .observe(TrafficDirection::Out, frame, bytes.len());
         let mut close = self.inner.close.subscribe();
         // A stalled writer must not hold a sender past the link's closure.
         tokio::select! {
@@ -634,6 +652,7 @@ async fn read_loop<S>(
             );
             break;
         };
+        inner.observe(TrafficDirection::In, &frame, bytes.len());
         // A consumer that stops draining events must not keep a closed link
         // (and its reader) alive.
         let keep = tokio::select! {

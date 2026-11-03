@@ -6175,6 +6175,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `remoteLinkTraffic.*` (owner-only capture of executor-link traffic):
+    /// `method` is the part after `remoteLinkTraffic.` (`start`, `stop`,
+    /// `snapshot`) and `params` the request's params object. Results and
+    /// errors as documented in monorepo `docs/protocol/methods/nodes.md`,
+    /// "Link traffic capture".
+    fn remote_link_traffic(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::remote_link_traffic({method}) not implemented"
+            )))
+        })
+    }
+
     /// `remoteMachines.*` (daemon-to-daemon remote agents, backend side,
     /// owner-only): `method` is the part after `remoteMachines.`
     /// (`backendInfo`, `add`, `list`, `remove`, `refresh`) and `params` the

@@ -65,6 +65,7 @@ mod auto_archive;
 mod auto_retire;
 mod executor_capabilities;
 mod executor_ops;
+mod link_traffic_ops;
 mod plain_folder;
 mod remote_machine_ops;
 mod retire;
@@ -1318,6 +1319,9 @@ pub struct Services {
     /// Where the executor link can be dialed (`executor.mint`), attached by
     /// the composition root; the transport owns the listener.
     machine_routes: Arc<OnceLock<Arc<dyn intent_core::machines::MachineRoutesSource>>>,
+    /// The owner's capture of executor-link traffic (`remoteLinkTraffic.*`),
+    /// tapped by the backend's and the machine's links.
+    link_traffic: Arc<intent_core::link_traffic::LinkTraffic>,
     /// Live status of executor credentials (`executor.list`), attached by
     /// the executor link; unset reads every credential as disconnected.
     executor_liveness: Arc<OnceLock<Arc<dyn intent_core::machines::ExecutorLiveness>>>,
@@ -1908,6 +1912,7 @@ impl Services {
             )
             .0,
             machine_routes: Arc::new(OnceLock::new()),
+            link_traffic: Arc::default(),
             executor_liveness: Arc::new(OnceLock::new()),
             presence: Arc::new(presence::PresenceRegistry::default()),
             github_api_base_uri: None,
@@ -5167,6 +5172,7 @@ impl Services {
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
+        link_traffic_ops::publish_link_traffic(&self.link_traffic, bus.clone());
         self.event_bus = Some(bus);
         self
     }
@@ -19371,6 +19377,14 @@ impl WorkspaceApi for Services {
 
     fn remote_machines_capability(&self) -> bool {
         !self.node_mode && self.ports.remote_launch().manages_machines()
+    }
+
+    fn remote_link_traffic(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.remote_link_traffic_op(method, params))
     }
 
     fn desktop_agent_call(
