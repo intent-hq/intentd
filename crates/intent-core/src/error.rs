@@ -424,8 +424,9 @@ pub enum InviteErrorKind {
     PinMismatch,
     /// The pinned login does not name a GitHub account.
     PinUnknown,
-    /// Minting an invite requires the owner's linked GitHub identity
-    /// (`github.authStatus.isConfigured`).
+    /// Sharing requires a connected owner forge: with neither GitHub nor
+    /// GitLab connected on the host, no invite is minted and no open invite
+    /// is redeemed (the code name predates GitLab identities).
     GithubIdentityRequired,
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
@@ -513,8 +514,9 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked forge identity — connect GitHub \
-                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
+                "unsupported: sharing requires the host owner's connected forge identity — \
+                 connect GitHub (github.connect) or GitLab (sourceControl.connect) to create \
+                 or redeem invites"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \
