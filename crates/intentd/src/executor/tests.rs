@@ -1717,3 +1717,75 @@ async fn a_final_stop_over_a_stuck_script_answers_without_an_ack() {
     );
     node.stop().await;
 }
+
+/// A final stop over a script whose kill or reaper panicked is not
+/// acknowledged (the backend resends it); after a panicked kill, the resent
+/// stop kills the script again and is acknowledged.
+#[tokio::test]
+async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
+    use intent_core::node_link::{FinalPush, ScriptStartCommand, StopOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let killed = AgentId::from("a-panicked-kill");
+    let reaped = AgentId::from("a-panicked-reap");
+    crate::executor::scripts::panic_reaps_for_test(&reaped);
+    let mut offer = hello(1, "lease-1", 0);
+    offer.lease_agents = vec![killed.clone(), reaped.clone()];
+    let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
+    replay_complete(&mut dialed).await;
+    let root = dir
+        .path()
+        .join("executor")
+        .join(&node.api.credential(&token()).id.0)
+        .join("agents");
+    for agent in [&killed, &reaped] {
+        std::fs::create_dir_all(root.join(&agent.0).join("work")).unwrap();
+        dialed
+            .link
+            .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+                agent_id: agent.clone(),
+                script_id: "s1".into(),
+                spawn_id: format!("spawn-{}", agent.0),
+                command: "sleep 60".into(),
+                mode: intent_core::ScriptMode::Command,
+                cwd: None,
+                env: vec![],
+            }))
+            .await
+            .unwrap();
+    }
+    let mut started = 0;
+    while started < 2 {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(_)) => started += 1,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+    let runner = node
+        .service
+        .runners_for_test()
+        .pop()
+        .expect("a linked backend");
+    let bound = crate::executor::scripts::reap_wait() + Duration::from_secs(3);
+
+    crate::executor::scripts::panic_next_kill_for_test(&killed);
+    let answer = tokio::time::timeout(bound, runner.final_stop(&killed))
+        .await
+        .expect("the final stop hung on a panicked kill");
+    assert_eq!(answer, None, "acknowledged over a panicked kill");
+    assert!(root.join(&killed.0).join("work").exists());
+    let answer = tokio::time::timeout(bound, runner.final_stop(&killed))
+        .await
+        .expect("the resent final stop hung");
+    assert_eq!(answer, Some((StopOutcome::NotRunning, FinalPush::Skipped)));
+    assert!(!root.join(&killed.0).join("work").exists());
+
+    let answer = tokio::time::timeout(bound, runner.final_stop(&reaped))
+        .await
+        .expect("the final stop hung on a panicked reaper");
+    assert_eq!(answer, None, "acknowledged over a panicked reaper");
+    assert!(root.join(&reaped.0).join("work").exists());
+    node.stop().await;
+}

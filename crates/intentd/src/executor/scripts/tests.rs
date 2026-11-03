@@ -499,3 +499,55 @@ async fn stop_agent_waits_for_a_script_stops_whole_group_teardown() {
         "stop_agent returned while the script's trapped descendant still ran"
     );
 }
+
+/// A kill that panics is not taken for a finished teardown: the stop over it
+/// reports the process unreaped, and the next stop kills it again.
+#[tokio::test]
+async fn a_panicked_kill_is_not_done_and_the_next_stop_kills_again() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-kill-panics");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    let pid = started_pid(&mut f.head, "p1").await;
+    panic_next_kill_for_test(&a);
+    let bound = reap_wait() + Duration::from_secs(3);
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent hung on a panicked kill");
+    assert!(!reaped, "a panicked kill counted as a finished teardown");
+    assert!(pid_alive(pid), "the panicked kill still killed it");
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("the retried stop hung");
+    assert!(reaped, "the next stop did not kill it again");
+    assert!(!pid_alive(pid));
+}
+
+/// A reaper that panics is not taken for a recorded exit: the stop reports
+/// the process unreaped even though the kill finished.
+#[tokio::test]
+async fn a_panicked_reaper_is_not_counted_reaped() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-reap-panics");
+    panic_reaps_for_test(&a);
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let bound = reap_wait() + Duration::from_secs(3);
+    let reaped = tokio::time::timeout(bound, f.scripts.stop_agent(&a))
+        .await
+        .expect("stop_agent hung on a panicked reaper");
+    assert!(!reaped, "a panicked reaper counted as a recorded exit");
+}

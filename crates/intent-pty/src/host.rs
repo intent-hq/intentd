@@ -29,7 +29,8 @@ const FANOUT_CAPACITY: usize = 2048;
 /// Read chunk size for the PTY reader loop.
 const READ_CHUNK: usize = 8192;
 /// Grace period between SIGTERM and SIGKILL during teardown (mirrors M5).
-#[cfg(unix)]
+/// Defined on every platform so callers can budget for a teardown; only
+/// Unix teardown waits it.
 pub const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);

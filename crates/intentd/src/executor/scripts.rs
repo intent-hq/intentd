@@ -69,6 +69,27 @@ pub(super) fn hold_reaps_for_test(agent_id: &AgentId) {
     lock(&HELD_REAPS).insert(agent_id.clone());
 }
 
+/// Agents whose next script kill panics, and whose script reapers panic
+/// (test seams).
+#[cfg(test)]
+static PANIC_KILLS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+    std::sync::LazyLock::new(Mutex::default);
+#[cfg(test)]
+static PANIC_REAPS: std::sync::LazyLock<Mutex<std::collections::HashSet<AgentId>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Make the next kill of one of `agent_id`'s scripts panic (test seam).
+#[cfg(test)]
+pub(super) fn panic_next_kill_for_test(agent_id: &AgentId) {
+    lock(&PANIC_KILLS).insert(agent_id.clone());
+}
+
+/// Make every reaper of `agent_id`'s scripts panic (test seam).
+#[cfg(test)]
+pub(super) fn panic_reaps_for_test(agent_id: &AgentId) {
+    lock(&PANIC_REAPS).insert(agent_id.clone());
+}
+
 /// A process is named by its agent, script and spawn.
 type Key = (AgentId, String, String);
 
@@ -90,6 +111,26 @@ pub(super) struct ScriptProcesses {
     /// done (`true`). A later stop joins one instead of starting a kill
     /// that finds the terminal already taken and returns at once.
     kills: Arc<Mutex<HashMap<Key, Kill>>>,
+}
+
+/// Removes a kill's entry from [`ScriptProcesses::kills`] when its task
+/// ends, if the entry is still this kill's.
+struct KillGuard {
+    kills: Arc<Mutex<HashMap<Key, Kill>>>,
+    key: Key,
+    finished: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        let mut kills = lock(&self.kills);
+        if kills
+            .get(&self.key)
+            .is_some_and(|kill| kill.done.same_channel(&self.finished.subscribe()))
+        {
+            kills.remove(&self.key);
+        }
+    }
 }
 
 /// One kill under way.
@@ -234,6 +275,11 @@ impl ScriptProcesses {
         if lock(&HELD_REAPS).contains(&key.0) {
             std::future::pending::<()>().await;
         }
+        #[cfg(test)]
+        assert!(
+            !lock(&PANIC_REAPS).contains(&key.0),
+            "test: the reaper panicked"
+        );
         let exit = self.pty.wait(pty_id).await;
         // A descendant can outlive the direct child and keep the terminal
         // open: reap the group first, as a local saved script does, so the
@@ -315,21 +361,23 @@ impl ScriptProcesses {
         );
         drop(kills);
         let pty = self.pty.clone();
-        let all = self.kills.clone();
-        let key = key.clone();
+        // Drops the kill's entry however its task ends (a panic included),
+        // so the next stop kills again; joiners see `true` only when the
+        // teardown finished, and a dropped sender otherwise.
+        let guard = KillGuard {
+            kills: self.kills.clone(),
+            key: key.clone(),
+            finished,
+        };
         // caller-binding: allow — node-local script teardown; every stop of the process joins it
         tokio::spawn(async move {
+            #[cfg(test)]
+            assert!(
+                !lock(&PANIC_KILLS).remove(&guard.key.0),
+                "test: the kill panicked"
+            );
             pty.kill(pty_id).await;
-            {
-                let mut kills = lock(&all);
-                if kills
-                    .get(&key)
-                    .is_some_and(|kill| kill.done.same_channel(&finished.subscribe()))
-                {
-                    kills.remove(&key);
-                }
-            }
-            finished.send_replace(true);
+            guard.finished.send_replace(true);
         });
         done
     }
@@ -366,7 +414,8 @@ impl ScriptProcesses {
     /// process's reaper has recorded its exit. A kill started elsewhere
     /// (`scriptStop`) of a process already reaped is waited for too. The
     /// wait is bounded by [`reap_wait`]: past it, what is still not done is
-    /// logged and left. Returns whether everything finished.
+    /// logged and left. A kill or reaper that panicked counts as not done.
+    /// Returns whether everything finished.
     async fn kill_where(&self, matches: impl Fn(&Key, NodeCounter) -> bool) -> bool {
         let mut waits: Vec<tokio::sync::watch::Receiver<bool>> = Vec::new();
         let victims: Vec<(Key, PtyId, NodeCounter)> = {
@@ -392,15 +441,19 @@ impl ScriptProcesses {
         {
             waits.push(kill);
         }
+        // A kill or reaper whose task ended without finishing (a panic: its
+        // sender dropped before `true`) is not done.
         let done = tokio::time::timeout(reap_wait(), async {
+            let mut all = true;
             for mut wait in waits {
-                let _ = wait.wait_for(|done| *done).await;
+                all &= wait.wait_for(|done| *done).await.is_ok();
             }
+            all
         })
         .await
-        .is_ok();
+        .unwrap_or(false);
         if !done {
-            tracing::warn!("node: a script process was not reaped within its bound; leaving it");
+            tracing::warn!("node: a script process was not reaped (its teardown failed or ran past its bound); leaving it");
         }
         done
     }
