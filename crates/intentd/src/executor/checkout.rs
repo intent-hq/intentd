@@ -181,6 +181,14 @@ pub(super) struct PlainCheckouts {
     pub(super) fail_removals: std::sync::atomic::AtomicBool,
     /// Fail every checkout, like a base head cannot serve.
     pub(super) fail: std::sync::atomic::AtomicBool,
+    /// Holds the next push: signals the first sender when it starts and
+    /// waits for the receiver.
+    pub(super) hold_push: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Fail every checkout as an unapplied wip that head would not pin.
     pub(super) fail_pin: std::sync::atomic::AtomicBool,
     /// The notice the next checkout reports.
@@ -206,6 +214,7 @@ impl PlainCheckouts {
             fail_removals: std::sync::atomic::AtomicBool::new(false),
             fail: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
+            hold_push: std::sync::Mutex::default(),
             notice: std::sync::Mutex::default(),
             hold_sweep: std::sync::Mutex::default(),
         })
@@ -251,6 +260,11 @@ impl Checkouts for PlainCheckouts {
         Box::pin(async move {
             self.pushes.lock().unwrap().push(agent_id.clone());
             self.push_timeouts.lock().unwrap().push(timeout);
+            let hold = self.hold_push.lock().unwrap().take();
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             ensure!(
                 !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the push"

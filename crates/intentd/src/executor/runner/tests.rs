@@ -1750,6 +1750,82 @@ async fn node_runner_final_stop_of_an_exited_agent_pushes_and_reports_a_failed_p
     assert!(h.storage.existing_agent_dir(&id).is_none());
 }
 
+/// A final stop delivered again while the first is still pushing joins it:
+/// one push, one removal, the same answer for both, and a launch of the
+/// agent in the meantime waits for the cleanup instead of losing its new
+/// checkout to it.
+#[tokio::test]
+async fn node_runner_repeated_final_stops_share_one_cleanup_and_fence_launches() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+    let pushes = h.checkouts.pushes.lock().unwrap().len();
+
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    let first = tokio::spawn(h.runner.final_stop(&id));
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::spawn(h.runner.final_stop(&id));
+    let runner = h.runner.clone();
+    let relaunch = tokio::spawn(async move { runner.launch(launch("a1")).await });
+    // timing-guard: a short window in which nothing may finish while the push is held
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !second.is_finished(),
+        "the repeat finished before the cleanup"
+    );
+    assert_eq!(h.checkouts.pushes.lock().unwrap().len(), pushes + 1);
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+
+    release.send(()).unwrap();
+    let expected = Some((StopOutcome::NotRunning, FinalPush::Pushed));
+    assert_eq!(
+        tokio::time::timeout(wait(), first).await.unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(
+        tokio::time::timeout(wait(), second).await.unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(
+        h.checkouts.pushes.lock().unwrap().len(),
+        pushes + 1,
+        "the repeat pushed again"
+    );
+    // The relaunch ran after the cleanup: its checkout is there and stays.
+    tokio::time::timeout(wait(), relaunch)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .iter()
+        .filter(|r| started("a1")(r))
+        .count()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relaunch never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        h.storage.existing_agent_dir(&id).is_some(),
+        "the cleanup removed the relaunch's checkout"
+    );
+    h.runner.stop(&id).wait().await.unwrap();
+}
+
 /// A final stop whose checkout cannot be removed is not acknowledged, so
 /// the backend resends it.
 #[tokio::test]

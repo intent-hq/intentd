@@ -175,9 +175,11 @@ struct State {
     /// free) whose exit record is not journaled yet, so a stop arriving in
     /// that window still waits for the record.
     exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
-    /// Agents a final stop is pushing and removing; the bind sweep leaves
-    /// their checkouts to it.
-    finalizing: HashSet<AgentId>,
+    /// Agents a final stop is pushing and removing, each with the one
+    /// cleanup every repeat of that stop joins (`None` until it finishes).
+    /// The bind sweep leaves their checkouts to it, and a launch waits for
+    /// it.
+    finalizing: HashMap<AgentId, watch::Receiver<Option<FinalStopDone>>>,
     /// Agents launched since the newest bind sweep took its list: the sweep
     /// never removes their checkouts.
     launched: HashSet<AgentId>,
@@ -185,6 +187,10 @@ struct State {
     /// waits for it.
     sweeping: HashSet<AgentId>,
 }
+
+/// A final stop's answer: the acknowledgement's outcome and push report, or
+/// `None` when it may not be acknowledged.
+type FinalStopDone = Option<(StopOutcome, FinalPush)>;
 
 /// Whether an agent's exit record reached the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1360,36 +1366,57 @@ impl Runner {
     }
 
     /// End `agent_id` for good (a final stop, nodeProtocol 9): end its
-    /// script runs, then stop it as [`Self::stop`] does, its exit push bounded by [`FINAL_PUSH_TIMEOUT`]
-    /// (an agent that is not running is pushed then, when this machine
-    /// knows its workspace), then remove its checkout. Resolves with the
-    /// acknowledgement's outcome and push report, or `None` when the stop
-    /// may not be acknowledged (its exit record was not journaled, or the
-    /// checkout could not be removed): the backend resends it.
+    /// script runs, then stop it as [`Self::stop`] does, its exit push
+    /// bounded by [`FINAL_PUSH_TIMEOUT`] (an agent that is not running is
+    /// pushed then, when this machine knows its workspace), then remove its
+    /// checkout. Resolves with the acknowledgement's outcome and push report,
+    /// or `None` when the stop may not be acknowledged (its exit record was
+    /// not journaled, or the checkout could not be removed): the backend
+    /// resends it.
+    ///
+    /// The cleanup runs once per agent at a time: a repeat delivered while
+    /// it runs (the backend resends until acknowledged) joins it and gets
+    /// the same answer, and it runs to the end even if no caller waits.
     pub(super) fn final_stop(
         &self,
         agent_id: &AgentId,
     ) -> BoxFuture<'static, Option<(StopOutcome, FinalPush)>> {
-        let agent = {
+        let mut done = {
             let mut state = lock(&self.inner.state);
-            state.finalizing.insert(agent_id.clone());
-            state.agents.get(agent_id).cloned()
+            if let Some(running) = state.finalizing.get(agent_id) {
+                running.clone()
+            } else {
+                let (finished, done) = watch::channel(None);
+                state.finalizing.insert(agent_id.clone(), done.clone());
+                let agent = state.agents.get(agent_id).cloned();
+                drop(state);
+                if let Some(agent) = &agent {
+                    agent
+                        .final_stop
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let runner = self.clone();
+                let agent_id = agent_id.clone();
+                // caller-binding: allow — node-local final-stop cleanup that every repeat joins
+                tokio::spawn(async move {
+                    // The agent's script runs end first, so nothing still
+                    // writes to its checkout while it is pushed and removed.
+                    runner.inner.scripts.stop_agent(&agent_id).await;
+                    let wait = runner.stop(&agent_id);
+                    let result = runner.finish_final_stop(agent, &agent_id, wait).await;
+                    lock(&runner.inner.state).finalizing.remove(&agent_id);
+                    finished.send_replace(Some(result));
+                    // A launch waiting for this cleanup goes ahead.
+                    runner.inner.swept.notify_waiters();
+                });
+                done
+            }
         };
-        if let Some(agent) = &agent {
-            agent
-                .final_stop
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        let runner = self.clone();
-        let agent_id = agent_id.clone();
         Box::pin(async move {
-            // The agent's script runs end first, so nothing still writes to
-            // its checkout while it is pushed and removed.
-            runner.inner.scripts.stop_agent(&agent_id).await;
-            let wait = runner.stop(&agent_id);
-            let finished = runner.finish_final_stop(agent, &agent_id, wait).await;
-            lock(&runner.inner.state).finalizing.remove(&agent_id);
-            finished
+            match done.wait_for(Option::is_some).await {
+                Ok(result) => (*result).flatten(),
+                Err(_) => None,
+            }
         })
     }
 
@@ -1437,7 +1464,8 @@ impl Runner {
     }
 
     /// Mark `agent_id` launched, so the bind sweep leaves its checkout, and
-    /// wait out a removal of that checkout already under way.
+    /// wait out a removal of that checkout already under way (by the sweep
+    /// or a final stop).
     async fn claim_checkout(&self, agent_id: &AgentId) {
         loop {
             let swept = self.inner.swept.notified();
@@ -1446,7 +1474,7 @@ impl Runner {
             {
                 let mut state = lock(&self.inner.state);
                 state.launched.insert(agent_id.clone());
-                if !state.sweeping.contains(agent_id) {
+                if !state.sweeping.contains(agent_id) && !state.finalizing.contains_key(agent_id) {
                     return;
                 }
             }
@@ -1468,7 +1496,7 @@ impl Runner {
                 !lease_agents.contains(agent_id)
                     && !state.agents.contains_key(agent_id)
                     && !state.exiting.contains_key(agent_id)
-                    && !state.finalizing.contains(agent_id)
+                    && !state.finalizing.contains_key(agent_id)
             })
             .collect()
     }
@@ -1484,7 +1512,7 @@ impl Runner {
                 if state.launched.contains(&agent_id)
                     || state.agents.contains_key(&agent_id)
                     || state.exiting.contains_key(&agent_id)
-                    || state.finalizing.contains(&agent_id)
+                    || state.finalizing.contains_key(&agent_id)
                 {
                     continue;
                 }
