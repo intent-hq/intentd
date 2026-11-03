@@ -182,6 +182,11 @@ pub use model::{
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
     PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
 };
+pub use model::{
+    AgentListPage, AgentListSelection, AGENT_LIST_DEFAULT_LIMIT, AGENT_LIST_MAX_LIMIT,
+    AGENT_LIST_PAGE_BUDGET_BYTES, AGENT_QUEUE_DEFAULT_LIMIT, AGENT_QUEUE_MAX_LIMIT,
+    AGENT_QUEUE_PAGE_BUDGET_BYTES,
+};
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
@@ -190,6 +195,10 @@ pub use model::{
 pub use model::{
     InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
     WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+};
+pub use model::{
+    WorkspacePage, WORKSPACE_LIST_BUDGET_BYTES, WORKSPACE_LIST_DEFAULT_LIMIT,
+    WORKSPACE_LIST_MAX_LIMIT,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,

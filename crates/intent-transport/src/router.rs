@@ -1041,14 +1041,15 @@ async fn dispatch(
             // Retired rows are opt-in only (§5.1): `includeArchived` alone
             // never returns them.
             let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
-            let workspaces = api
-                .list_workspaces(intent_core::WorkspaceListFilter::new(
-                    include_archived,
-                    include_retired,
-                ))
+            let filter = intent_core::WorkspaceListFilter::new(include_archived, include_retired);
+            // Paged for every caller (§5.1 "Paged workspace lists"): the
+            // reply always carries `nextToken` (`null` after the last page).
+            let (limit, next_token) = list_page_params(params)?;
+            let page = api
+                .list_workspaces_page(filter, false, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(json!({ "workspaces": workspaces }))
+            Ok(json!({ "workspaces": page.workspaces, "nextToken": page.next_token }))
         }
         "workspace.findByPullRequest" => {
             let url = params
@@ -2369,21 +2370,22 @@ async fn dispatch(
                 RPC_REQUEST_SHAPE_FIELD,
                 agent_list_request_shape(scope.as_ref(), include_retired, retired_only).as_str(),
             );
-            let agents = if let Some(scope) = scope {
-                api.agent_list_scoped(ws.clone(), scope)
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else if retired_only {
-                api.agent_list_retired_only(ws.clone())
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else if include_retired {
-                api.agent_list_including_retired(ws.clone())
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else {
-                api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
+            // Paged for every caller (§5.5 "Paged agent lists and queues"):
+            // the reply carries `nextToken` (`null` after the last page) next
+            // to the whole-workspace counts.
+            let (limit, token) = list_page_params(params)?;
+            let selection = match scope {
+                Some(scope) => intent_core::AgentListSelection::Scoped(scope),
+                None if retired_only => intent_core::AgentListSelection::RetiredOnly,
+                None if include_retired => intent_core::AgentListSelection::All,
+                None => intent_core::AgentListSelection::Active,
             };
+            let page = api
+                .agent_list_page(ws.clone(), selection, limit, token)
+                .await
+                .map_err(domain_to_rpc)?;
+            let next_token = page.next_token;
+            let agents = page.agents;
             let retired_count = api
                 .agent_retired_count(ws.clone())
                 .await
@@ -2401,6 +2403,7 @@ async fn dispatch(
                 "retiredCount": retired_count,
                 "scopeCounts": scope_counts,
                 "delegatedCounts": delegated_counts,
+                "nextToken": next_token,
             }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
@@ -2519,7 +2522,7 @@ async fn dispatch(
         "agent.getSession" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            match api.agent_get_session(agent_id, ws).await {
+            match api.agent_get_session_bounded(agent_id, ws).await {
                 Ok(session) => Ok(json!({ "session": session })),
                 Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -2895,11 +2898,11 @@ async fn dispatch(
         "agent.getQueue" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            let result = api
-                .agent_get_queue(agent_id, ws)
+            // Paged for every caller (§5.5 "Paged agent lists and queues").
+            let (limit, token) = list_page_params(params)?;
+            api.agent_get_queue_page(agent_id, ws, limit, token)
                 .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
+                .map_err(domain_to_rpc)
         }
         "agent.workers.list" => {
             let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
@@ -3270,8 +3273,15 @@ async fn dispatch(
             let agent_id = opt_str(params, "agentId").map(AgentId::from);
             let task_note_id = opt_str(params, "taskNoteId").map(NoteId::from);
             let stale_responding_after_ms = opt_int(params, "staleRespondingAfterMs");
+            let row_limit = opt_int(params, "limit");
             let result = api
-                .agent_diagnostics(ws, agent_id, task_note_id, stale_responding_after_ms)
+                .agent_diagnostics(
+                    ws,
+                    agent_id,
+                    task_note_id,
+                    stale_responding_after_ms,
+                    row_limit,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -6125,6 +6135,25 @@ fn opt_string_map(
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect()
     })
+}
+
+/// Paging params of a bounded list read (`limit?`, `nextToken?`, §5.1 /
+/// §5.5): `limit` must be an integer and `nextToken` a string or `null`
+/// (`-32602` otherwise); defaults and range clamping are the service's.
+fn list_page_params(params: &Map<String, Value>) -> Result<(Option<i64>, Option<String>), RpcErr> {
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .ok_or_else(|| invalid_params("limit must be an integer"))?,
+        ),
+    };
+    let next_token = match params.get("nextToken") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid_params("nextToken must be a string")),
+    };
+    Ok((limit, next_token))
 }
 
 /// Optional integer param from a JSON number (absent/non-number → `None`).

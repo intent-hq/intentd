@@ -324,3 +324,117 @@ fn budget_page_reminted_tokens_resume_at_first_excluded_row() {
         "no token at newest edge"
     );
 }
+
+#[test]
+fn clamp_page_limit_uses_default_and_bounds() {
+    assert_eq!(clamp_page_limit(None, 100, 200), 100);
+    assert_eq!(clamp_page_limit(Some(0), 100, 200), 1);
+    assert_eq!(clamp_page_limit(Some(-3), 100, 200), 1);
+    assert_eq!(clamp_page_limit(Some(150), 100, 200), 150);
+    assert_eq!(clamp_page_limit(Some(10_000), 100, 200), 200);
+}
+
+#[test]
+fn keyset_token_round_trips_and_rejects_garbage_or_other_scopes() {
+    let scope = json!(["workspace.list", true, false]);
+    let token = encode_keyset_token(&scope, "2026-01-01T00:00:00.000Z", "ws-1");
+    assert_eq!(
+        decode_keyset_token(&token, &scope).expect("decode"),
+        ("2026-01-01T00:00:00.000Z".to_string(), "ws-1".to_string())
+    );
+    let other = json!(["workspace.list", false, false]);
+    let empty_id = encode_keyset_token(&scope, "2026-01-01T00:00:00.000Z", "");
+    for (bad, against) in [
+        ("", &scope),
+        ("not json", &scope),
+        (encode_token(&json!({ "b": 3 })).as_str(), &scope),
+        (token.as_str(), &other),
+        (empty_id.as_str(), &scope),
+    ] {
+        assert!(
+            matches!(
+                decode_keyset_token(bad, against),
+                Err(intent_core::Error::InvalidParams(_))
+            ),
+            "{bad:?} must be rejected for {against}"
+        );
+    }
+}
+
+#[test]
+fn fit_rows_to_budget_keeps_a_prefix_and_never_empties() {
+    let rows: Vec<Value> = (0..10)
+        .map(|i| json!({ "i": i, "pad": "x".repeat(90) }))
+        .collect();
+    let one = serde_json::to_vec(&rows[0]).unwrap().len() + 1;
+    assert_eq!(fit_rows_to_budget(&rows, usize::MAX), 10);
+    assert_eq!(fit_rows_to_budget(&rows, 2 + one * 3), 3);
+    assert_eq!(
+        fit_rows_to_budget(&rows, 1),
+        1,
+        "one row is always admitted"
+    );
+    assert_eq!(fit_rows_to_budget::<Value>(&[], 1), 0);
+}
+
+#[test]
+fn page_queue_reply_walks_the_queue_in_order() {
+    let queue: Vec<Value> = (0..5)
+        .map(|i| json!({ "id": format!("m{i}"), "position": i }))
+        .collect();
+    let reply = json!({ "success": true, "queue": queue });
+    let first = page_queue_reply(reply.clone(), "a1", Some(2), None).expect("first");
+    assert_eq!(first["queue"].as_array().unwrap().len(), 2);
+    assert_eq!(first["queueLength"], 5);
+    let token = first["nextToken"].as_str().expect("token").to_string();
+    let second = page_queue_reply(reply.clone(), "a1", Some(2), Some(&token)).expect("second");
+    assert_eq!(second["queue"][0]["id"], "m2");
+    assert_eq!(
+        second["queue"][0]["position"], 2,
+        "whole-queue position kept"
+    );
+    let token = second["nextToken"].as_str().expect("token").to_string();
+    let last = page_queue_reply(reply.clone(), "a1", Some(2), Some(&token)).expect("last");
+    assert_eq!(last["queue"].as_array().unwrap().len(), 1);
+    assert_eq!(last["nextToken"], Value::Null);
+    assert!(matches!(
+        page_queue_reply(reply.clone(), "a1", None, Some("garbage")),
+        Err(intent_core::Error::InvalidParams(_))
+    ));
+    assert!(
+        matches!(
+            page_queue_reply(reply, "other-agent", None, Some(&token)),
+            Err(intent_core::Error::InvalidParams(_))
+        ),
+        "a token is scoped to its agent"
+    );
+}
+
+#[test]
+fn page_queue_reply_passes_a_refused_reply_through() {
+    let refused = json!({ "success": false, "refused": true, "queueLength": 3, "queue": [] });
+    let paged = page_queue_reply(refused, "a1", None, None).expect("refused");
+    assert_eq!(paged["refused"], true);
+    assert_eq!(paged["queueLength"], 3);
+    assert_eq!(paged["queue"], json!([]));
+    assert_eq!(paged["nextToken"], Value::Null);
+}
+
+#[test]
+fn page_queue_reply_stops_at_the_byte_budget() {
+    let big = "q".repeat(200 * 1024);
+    let queue: Vec<Value> = (0..4).map(|i| json!({ "id": i, "content": big })).collect();
+    let paged = page_queue_reply(
+        json!({ "success": true, "queue": queue }),
+        "a1",
+        Some(4),
+        None,
+    )
+    .expect("paged");
+    assert_eq!(
+        paged["queue"].as_array().unwrap().len(),
+        2,
+        "two 200 KiB entries fit 480,000 bytes"
+    );
+    assert!(paged["nextToken"].is_string());
+}

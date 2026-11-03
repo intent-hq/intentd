@@ -47010,3 +47010,61 @@ mod idempotency_serialization {
         );
     }
 }
+
+/// Paged `workspace.list` (§5.1 "Paged workspace lists"): following
+/// `nextToken` walks every row exactly once in `(createdAt, id)` order, for
+/// both the enriched and the lite rows, and a malformed token is rejected.
+#[intent_test_macros::daemon_test]
+async fn workspace_list_pages_walk_every_row_once() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    for i in 0..5 {
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from(format!("ws-page-{i}"))))
+            .await
+            .expect("workspace");
+    }
+    let svc = Services::new_isolated(store);
+    let filter = intent_core::WorkspaceListFilter::ACTIVE;
+    let mut expected: Vec<(String, String)> = svc
+        .list_workspaces(filter)
+        .await
+        .expect("whole list")
+        .into_iter()
+        .map(|ws| (ws.created_at, ws.id.0))
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 5);
+    for lite in [false, true] {
+        let mut seen = Vec::new();
+        let mut token = None;
+        let mut pages = 0;
+        loop {
+            let page = svc
+                .list_workspaces_page(filter, lite, Some(2), token.clone())
+                .await
+                .expect("page");
+            assert!(page.workspaces.len() <= 2);
+            seen.extend(
+                page.workspaces
+                    .into_iter()
+                    .map(|ws| (ws.created_at, ws.id.0)),
+            );
+            pages += 1;
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected, "lite={lite}: every row once, in order");
+        assert_eq!(pages, 3);
+    }
+    let err = svc
+        .list_workspaces_page(filter, false, None, Some("garbage".into()))
+        .await
+        .expect_err("bad token");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+}

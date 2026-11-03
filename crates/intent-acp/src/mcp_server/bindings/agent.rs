@@ -1471,7 +1471,7 @@ async fn diagnostics(
     let task_note_id = opt_str(args, "taskNoteId").map(NoteId::from_string);
     let stale = args.get("staleRespondingAfterMs").and_then(Value::as_i64);
     let v = api
-        .agent_diagnostics(ws.clone(), agent_id, task_note_id, stale)
+        .agent_diagnostics(ws.clone(), agent_id, task_note_id, stale, None)
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))

@@ -29,10 +29,13 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
-    fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
-    live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
-    parse_session_stats_output, resolve_auggie_bin_with,
+    clamp_diagnostics_row_limit, ensure_effort_supported_by_model, fetch_auggie_models,
+    fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows, fit_diagnostics,
+    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
+    parse_model_list_json, parse_model_list_output, parse_session_stats_output,
+    resolve_auggie_bin_with, DiagnosticsSections, DIAGNOSTICS_BUDGET_BYTES,
+    DIAGNOSTICS_DEFAULT_ROW_LIMIT, DIAGNOSTICS_MAX_ROW_LIMIT, SESSION_BUDGET_BYTES,
+    SESSION_MESSAGES_PAGE_LIMIT,
 };
 use crate::agent_subscriptions::GroupPersistOp;
 use crate::test_support::fake_runtime::FakeRuntime;
@@ -7106,7 +7109,7 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
 
     // No live turn: persisted staleness stands.
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let row = find_row(&result);
@@ -7122,7 +7125,7 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
         vec![json!({ "type": "text", "id": "msg-1:0", "text": "still working…" })],
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics live");
     let row = find_row(&result);
@@ -20537,7 +20540,7 @@ async fn diagnostics_reports_event_subscriptions() {
     .expect("subscribe");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -20560,7 +20563,7 @@ async fn diagnostics_reports_event_subscriptions() {
     // The agentId filter scopes the event-subscription list too.
     let other = create_agent(&svc, &ws, "Other").await;
     let filtered = svc
-        .agent_diagnostics_op(ws.clone(), Some(other), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(other), None, None, None)
         .await
         .expect("diagnostics filtered");
     assert_eq!(
@@ -20582,7 +20585,7 @@ async fn diagnostics_reports_event_subscriptions() {
     .await
     .expect("chief subscribe");
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics with chief sub");
     let chief_entry = result["diagnostics"]["eventSubscriptions"]
@@ -20640,7 +20643,7 @@ async fn diagnostics_reports_queue_snapshots() {
     );
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -20680,7 +20683,7 @@ async fn diagnostics_reports_queue_snapshots() {
 
     // The agentId filter scopes the queue list too.
     let filtered = svc
-        .agent_diagnostics_op(ws.clone(), Some(sender.clone()), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(sender.clone()), None, None, None)
         .await
         .expect("diagnostics filtered");
     assert_eq!(filtered["diagnostics"]["queues"], json!([]));
@@ -20690,7 +20693,7 @@ async fn diagnostics_reports_queue_snapshots() {
     svc.dequeue_message(&target).expect("drain interrupt");
     svc.dequeue_message(&target).expect("drain normal");
     let drained = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics after drain");
     assert_eq!(drained["diagnostics"]["queues"], json!([]));
@@ -20855,7 +20858,7 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
     }
 
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -20933,7 +20936,7 @@ async fn diagnostics_reports_subtree_memory_bytes() {
 
     // No manager attached: the field is absent everywhere.
     let before = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics without manager");
     for row in before["diagnostics"]["agents"].as_array().expect("agents") {
@@ -20956,7 +20959,7 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     )]))));
 
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -21172,7 +21175,7 @@ async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
     svc.record_turn_silent_tail(&stalled, threshold + 60_000);
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -21216,7 +21219,7 @@ async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
     // turn clears the risk.
     svc.record_turn_silent_tail(&stalled, 800);
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics after healthy turn");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -21276,7 +21279,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         MessageOrigin::Automatic,
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics fresh");
     assert!(
@@ -21307,7 +21310,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         MessageOrigin::Automatic,
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics stale");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -21335,7 +21338,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
             intent_core::Caller::Agent {
                 agent_id: target.clone(),
             },
-            svc.agent_diagnostics_op(ws.clone(), filter, None, None),
+            svc.agent_diagnostics_op(ws.clone(), filter, None, None, None),
         )
         .await
         .expect("recipient diagnostics");
@@ -21374,7 +21377,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark responding");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics responding");
     assert!(
@@ -21399,7 +21402,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark stale responding");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics stale responding");
     assert!(
@@ -21418,7 +21421,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         guard.get_mut(&target).expect("queue")[0].editing = true;
     }
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics editing");
     assert!(
@@ -21439,7 +21442,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         q[0].queued_at = "not-a-timestamp".into();
     }
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics unparseable");
     assert!(
@@ -21482,7 +21485,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark idle");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics pending questions");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -21517,7 +21520,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         m.id.clone()
     };
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics user-origin under pending questions");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -21537,7 +21540,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("archive");
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics archived");
     assert!(
@@ -28566,7 +28569,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
 
     // agent.diagnostics agent rows.
     let diag = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .unwrap();
     let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
@@ -28768,7 +28771,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
 
     // agent.diagnostics agent rows.
     let diag = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .unwrap();
     let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
@@ -32487,7 +32490,7 @@ async fn diagnostics_snapshot_shape_and_subscriptions() {
     .expect("register watch");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
 
@@ -32533,7 +32536,7 @@ async fn diagnostics_agent_filter_narrows_scope() {
     let _b = create_agent(&svc, &ws, "B").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None, None)
         .await
         .expect("diagnostics");
 
@@ -32568,7 +32571,7 @@ async fn diagnostics_task_filter_matches_task_agents() {
     let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -32592,7 +32595,7 @@ async fn diagnostics_task_filter_includes_note_side_assignees() {
     let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None, None)
         .await
         .expect("diagnostics");
     let agents = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -32650,7 +32653,7 @@ async fn diagnostics_task_filter_matches_session_side_only() {
         .expect("update note");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -32671,7 +32674,13 @@ async fn diagnostics_task_filter_unknown_note_yields_empty_snapshot() {
     let _agent = create_agent(&svc, &ws, "Someone").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(NoteId::from("note-missing")), None)
+        .agent_diagnostics_op(
+            ws.clone(),
+            None,
+            Some(NoteId::from("note-missing")),
+            None,
+            None,
+        )
         .await
         .expect("diagnostics must not error on an unknown note");
     let diag = &result["diagnostics"];
@@ -32690,7 +32699,7 @@ async fn diagnostics_flags_orphaned_subscription() {
         .expect("register watch");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
 
@@ -32732,7 +32741,7 @@ async fn diagnostics_healthy_after_all_group_reports_subscription_linkage() {
     }
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -32795,7 +32804,7 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
         .expect("mark child responding");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -32843,7 +32852,7 @@ async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
         .expect("mark child responding but stale");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -32870,7 +32879,7 @@ async fn diagnostics_after_all_group_without_watch_is_critical() {
     svc.enroll_child_in_group(&gid, &child);
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -33046,6 +33055,173 @@ async fn agent_get_session_unknown_agent_is_not_found() {
         .await
         .expect_err("unknown agent");
     assert!(matches!(err, Error::NotFound(_)));
+}
+
+/// Bounded `agent.getSession` (§5.5): the wire read serves only the newest
+/// slim transcript page, trimmed to the session byte budget, and its
+/// `messagesNextToken` continues through `agent.getConversation` to the
+/// message right before the first one served.
+#[tokio::test]
+async fn agent_get_session_bounded_serves_newest_page_within_budget() {
+    use intent_core::ConversationProjection;
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Long").await;
+    let body = "x".repeat(12 * 1024);
+    for i in 0..120 {
+        let content = json!([{ "type": "text", "text": format!("m{i:03} {body}") }]);
+        svc.store()
+            .append_agent_message(&id, "user", &content, &now_iso())
+            .await
+            .expect("append");
+    }
+    let session = svc
+        .agent_get_session_bounded_op(id.clone())
+        .await
+        .expect("bounded getSession");
+    let bytes = serde_json::to_vec(&session).expect("json").len();
+    assert!(
+        bytes <= SESSION_BUDGET_BYTES,
+        "session {bytes} B over {SESSION_BUDGET_BYTES}"
+    );
+    let messages = session["messages"].as_array().expect("messages");
+    assert!(
+        !messages.is_empty() && messages.len() < SESSION_MESSAGES_PAGE_LIMIT,
+        "byte budget trims the page: {}",
+        messages.len()
+    );
+    assert_eq!(session["messagesTotal"], 120);
+    assert_eq!(session["messagesTruncated"], true);
+    let text = |m: &Value| m["contentBlocks"][0]["text"].as_str().unwrap_or("")[..4].to_string();
+    assert_eq!(
+        text(messages.last().unwrap()),
+        "m119",
+        "newest message kept"
+    );
+    let first = 120 - messages.len();
+    assert_eq!(text(&messages[0]), format!("m{first:03}"));
+
+    let token = session["messagesNextToken"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    let older = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(5),
+            None,
+            Some(token),
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            false,
+        )
+        .await
+        .expect("older page");
+    let older = older["messages"].as_array().expect("older messages");
+    assert_eq!(
+        text(older.last().expect("older row")),
+        format!("m{:03}", first - 1),
+        "the token continues right before the first served message"
+    );
+}
+
+/// A short transcript is served whole with no continuation.
+#[tokio::test]
+async fn agent_get_session_bounded_serves_short_transcript_whole() {
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Short").await;
+    for i in 0..3 {
+        let content = json!([{ "type": "text", "text": format!("hello {i}") }]);
+        svc.store()
+            .append_agent_message(&id, "user", &content, &now_iso())
+            .await
+            .expect("append");
+    }
+    let session = svc
+        .agent_get_session_bounded_op(id.clone())
+        .await
+        .expect("bounded getSession");
+    assert_eq!(session["messages"].as_array().expect("messages").len(), 3);
+    assert_eq!(session["messagesTotal"], 3);
+    assert_eq!(session["messagesTruncated"], false);
+    assert_eq!(session["messagesNextToken"], Value::Null);
+    assert_eq!(session["id"], id.0.as_str());
+}
+
+/// `agent.diagnostics` row limit (§5.5): every row list is cut to the
+/// limit, `summary` still counts every row, `truncated` names the cuts,
+/// and `limit` clamps into `[1, 200]` (default 100).
+#[tokio::test]
+async fn diagnostics_row_limit_caps_lists_and_keeps_summary_counts() {
+    let (_t, svc, ws) = setup().await;
+    for i in 0..5 {
+        create_agent(&svc, &ws, &format!("Row{i}")).await;
+    }
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None, Some(2))
+        .await
+        .expect("diagnostics");
+    let d = &result["diagnostics"];
+    assert_eq!(d["rowLimit"], 2);
+    assert_eq!(d["agents"].as_array().expect("agents").len(), 2);
+    assert_eq!(d["summary"]["agents"], 5, "summary counts every row");
+    assert_eq!(d["truncated"]["agents"], 3);
+
+    let all = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
+        .await
+        .expect("diagnostics default");
+    assert_eq!(
+        all["diagnostics"]["rowLimit"],
+        DIAGNOSTICS_DEFAULT_ROW_LIMIT
+    );
+    assert_eq!(
+        all["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents")
+            .len(),
+        5
+    );
+    assert_eq!(all["diagnostics"]["truncated"], json!({}));
+
+    assert_eq!(clamp_diagnostics_row_limit(None), 100);
+    assert_eq!(clamp_diagnostics_row_limit(Some(0)), 1);
+    assert_eq!(clamp_diagnostics_row_limit(Some(-4)), 1);
+    assert_eq!(
+        clamp_diagnostics_row_limit(Some(10_000)),
+        DIAGNOSTICS_MAX_ROW_LIMIT
+    );
+}
+
+/// The diagnostics byte backstop halves the row limit until the snapshot
+/// fits, and cuts each queue's entries to the limit with a flag.
+#[test]
+fn fit_diagnostics_halves_limit_until_within_budget() {
+    use serde_json::Value;
+    let row = json!({ "id": "a", "pad": "p".repeat(4 * 1024) });
+    let entries: Vec<Value> = (0..300).map(|i| json!({ "id": i })).collect();
+    let sections = DiagnosticsSections {
+        agents: vec![row; 200],
+        subscriptions: Vec::new(),
+        event_subscriptions: Vec::new(),
+        queues: vec![json!({ "agentId": "a", "queueLength": 300, "entries": entries })],
+        delegation_groups: Vec::new(),
+        stuck_risks: Vec::new(),
+    };
+    let d = fit_diagnostics(&json!({ "summary": {} }), &sections, 200);
+    let bytes = serde_json::to_vec(&d).expect("json").len();
+    assert!(bytes <= DIAGNOSTICS_BUDGET_BYTES, "{bytes}");
+    assert_eq!(d["rowLimit"], 100, "200 rows of 4 KiB halve once");
+    assert_eq!(d["agents"].as_array().expect("agents").len(), 100);
+    assert_eq!(d["truncated"]["agents"], 100);
+    assert_eq!(
+        d["queues"][0]["entries"].as_array().expect("entries").len(),
+        100
+    );
+    assert_eq!(d["queues"][0]["entriesTruncated"], true);
+    assert_eq!(d["queues"][0]["queueLength"], 300);
 }
 
 /// `agent.update` patches only listed fields; omitted fields survive the write.
@@ -50479,4 +50655,53 @@ async fn mcp_get_message_block_binding_pages_with_next_offset() {
     assert_eq!(parsed["length"], json!(text.len()), "{parsed}");
     assert_eq!(parsed["lines"], json!(120_001), "{parsed}");
     assert_eq!(parsed["last"], "119999", "{parsed}");
+}
+
+/// Paged `agent.list` (§5.5 "Paged agent lists and queues"): following
+/// `nextToken` walks every session of the selection exactly once, in
+/// `(createdAt, id)` order, and a malformed token is rejected.
+#[tokio::test]
+async fn agent_list_pages_walk_every_row_once() {
+    let (_t, svc, ws) = setup().await;
+    for i in 0..5 {
+        create_agent(&svc, &ws, &format!("Paged{i}")).await;
+    }
+    let mut expected: Vec<(String, String)> = svc
+        .agent_list_op(ws.clone())
+        .await
+        .expect("whole list")
+        .into_iter()
+        .map(|a| (a.created_at, a.id.0))
+        .collect();
+    expected.sort();
+    let mut seen = Vec::new();
+    let mut token = None;
+    loop {
+        let page = svc
+            .agent_list_page_op(
+                ws.clone(),
+                intent_core::AgentListSelection::Active,
+                Some(2),
+                token.clone(),
+            )
+            .await
+            .expect("page");
+        assert!(page.agents.len() <= 2);
+        seen.extend(page.agents.into_iter().map(|a| (a.created_at, a.id.0)));
+        match page.next_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected, "every row once, in order");
+    let err = svc
+        .agent_list_page_op(
+            ws,
+            intent_core::AgentListSelection::Active,
+            None,
+            Some("garbage".into()),
+        )
+        .await
+        .expect_err("bad token");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
 }

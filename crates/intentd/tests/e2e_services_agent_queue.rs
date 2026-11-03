@@ -210,7 +210,7 @@ async fn agent_diagnostics_baseline() {
 
     // Get diagnostics with no agents
     let diag = services
-        .agent_diagnostics(ws.clone(), None, None, None)
+        .agent_diagnostics(ws.clone(), None, None, None, None)
         .await
         .expect("get diagnostics");
     assert_eq!(diag["ok"], true);
@@ -234,7 +234,7 @@ async fn agent_diagnostics_baseline() {
 
     // Get diagnostics focused on this agent
     let diag2 = services
-        .agent_diagnostics(ws.clone(), Some(agent_id.clone()), None, None)
+        .agent_diagnostics(ws.clone(), Some(agent_id.clone()), None, None, None)
         .await
         .expect("get diagnostics with agent filter");
     assert_eq!(diag2["ok"], true);

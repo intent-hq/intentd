@@ -53,6 +53,127 @@ fn decode_token(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Page an `agent.getQueue` reply (PROTOCOL §5.5 "Paged queue reads"): keep
+/// at most `limit` entries from the token's offset, trimmed to
+/// [`intent_core::AGENT_QUEUE_PAGE_BUDGET_BYTES`], and add `queueLength`
+/// (the whole queue) and `nextToken` (`null` after the last entry). A
+/// refused reply (no `queue` entries visible) passes through with
+/// `nextToken: null`. Entries keep their whole-queue `position`.
+pub(crate) fn page_queue_reply(
+    mut reply: Value,
+    agent_id: &str,
+    limit: Option<i64>,
+    next_token: Option<&str>,
+) -> intent_core::Result<Value> {
+    let scope = json!(["agent.getQueue", agent_id]);
+    let limit = clamp_page_limit(
+        limit,
+        intent_core::AGENT_QUEUE_DEFAULT_LIMIT,
+        intent_core::AGENT_QUEUE_MAX_LIMIT,
+    );
+    let start = match next_token {
+        None => 0,
+        Some(token) => serde_json::from_str::<Value>(token)
+            .ok()
+            .filter(|c| c.get("version") == Some(&json!(1)) && c.get("scope") == Some(&scope))
+            .and_then(|c| c.get("offset").and_then(Value::as_u64))
+            .and_then(|q| usize::try_from(q).ok())
+            .ok_or_else(|| {
+                intent_core::Error::InvalidParams("invalid or mismatched nextToken".to_string())
+            })?,
+    };
+    let Some(obj) = reply.as_object_mut() else {
+        return Ok(reply);
+    };
+    let entries = match obj.remove("queue") {
+        Some(Value::Array(entries)) => entries,
+        _ => Vec::new(),
+    };
+    let total = entries.len();
+    if !obj.contains_key("queueLength") {
+        obj.insert("queueLength".into(), json!(total));
+    }
+    let window: Vec<Value> = entries.into_iter().skip(start).take(limit).collect();
+    let kept = fit_rows_to_budget(&window, intent_core::AGENT_QUEUE_PAGE_BUDGET_BYTES);
+    let end = start.saturating_add(kept);
+    let page: Vec<Value> = window.into_iter().take(kept).collect();
+    obj.insert("queue".into(), Value::Array(page));
+    obj.insert(
+        "nextToken".into(),
+        if end < total {
+            json!(json!({ "version": 1, "scope": scope, "offset": end }).to_string())
+        } else {
+            Value::Null
+        },
+    );
+    Ok(reply)
+}
+
+/// Clamp a list read's `limit` into `[1, max]`, `default` when absent.
+#[must_use]
+pub(crate) fn clamp_page_limit(limit: Option<i64>, default: usize, max: usize) -> usize {
+    limit.map_or(default, |l| {
+        usize::try_from(l.max(1)).unwrap_or(max).min(max)
+    })
+}
+
+/// Keyset continuation token for lists ordered by `(createdAt, id)`
+/// ascending: versioned JSON scoped to the list read (method plus the
+/// resource and filters that select its rows, the `script_lists` cursor
+/// style). The next page starts strictly after the pair.
+pub(crate) fn encode_keyset_token(scope: &Value, created_at: &str, id: &str) -> String {
+    json!({ "version": 1, "scope": scope, "created_at": created_at, "id": id }).to_string()
+}
+
+/// Decode an [`encode_keyset_token`] token minted for `scope`; a malformed
+/// or differently scoped one is `InvalidParams` (a keyset list has no
+/// sensible restart point).
+pub(crate) fn decode_keyset_token(
+    token: &str,
+    scope: &Value,
+) -> intent_core::Result<(String, String)> {
+    let invalid =
+        || intent_core::Error::InvalidParams("invalid or mismatched nextToken".to_string());
+    let cursor: Value = serde_json::from_str(token).map_err(|_| invalid())?;
+    if cursor.get("version") != Some(&json!(1)) || cursor.get("scope") != Some(scope) {
+        return Err(invalid());
+    }
+    let created_at = cursor
+        .get("created_at")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let id = cursor
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if created_at.is_empty() || id.is_empty() {
+        return Err(invalid());
+    }
+    Ok((created_at.to_string(), id.to_string()))
+}
+
+/// How many leading `rows` fit `budget` serialized bytes (array commas
+/// included). At least one row is always admitted, so a page never comes
+/// back empty while rows remain.
+pub(crate) fn fit_rows_to_budget<T: serde::Serialize>(rows: &[T], budget: usize) -> usize {
+    let mut total = 2usize;
+    for (i, row) in rows.iter().enumerate() {
+        let size = serde_json::to_vec(row).map_or(0, |b| b.len()) + 1;
+        if i > 0 && total.saturating_add(size) > budget {
+            return i;
+        }
+        total = total.saturating_add(size);
+    }
+    rows.len()
+}
+
+/// The opaque backward continuation token whose next page ends (exclusive)
+/// at `boundary`, counted from the oldest item — the same token
+/// [`page_window`] mints, so it continues through any reader of that contract.
+pub(crate) fn backward_page_token(boundary: usize) -> String {
+    encode_token(&json!({ "b": boundary }))
+}
+
 /// Decode the oldest-indexed exclusive end carried by a backward page token.
 /// Malformed and non-backward tokens return `None`, matching [`page_window`]'s
 /// behavior of restarting from the newest page.

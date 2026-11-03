@@ -2972,17 +2972,15 @@ async fn forward_channel_subscription(
     // `specLinked` flag flipped (monorepo#2407). Seeded from the snapshot's
     // own `list_notes` read — no extra query.
     let mut spec_links = HashSet::new();
-    let snapshot = if channel == Channel::Task {
-        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
-        spec_links = links;
-        snapshot
-    } else if channel == Channel::Workspace {
-        // The workspace subscribe fast-path bypasses router::dispatch, but its
-        // seq-0 aggregate read has the same bounded-statement contract as
-        // workspace.list. Give that read the canonical profiling span so the
-        // runtime guardrail and real-daemon integration tests can attribute
-        // sqlx statements to `workspace.subscribe`.
-        let span = tracing::info_span!(
+    // The workspace / agent channels serve a paged seq-0 snapshot (§6.9
+    // "Paged snapshots"): the first list page plus `nextToken`.
+    // The workspace subscribe fast-path bypasses router::dispatch, but its
+    // seq-0 aggregate read has the same bounded-statement contract as
+    // workspace.list. Give that read the canonical profiling span so the
+    // runtime guardrail and real-daemon integration tests can attribute
+    // sqlx statements to `workspace.subscribe`.
+    let workspace_span = || {
+        tracing::info_span!(
             target: RPC_DISPATCH_SPAN_TARGET,
             RPC_DISPATCH_SPAN_NAME,
             method = "workspace.subscribe",
@@ -2990,9 +2988,34 @@ async fn forward_channel_subscription(
             encode_elapsed_ms = tracing::field::Empty,
             oversized_replacement = tracing::field::Empty,
             encode_failed = tracing::field::Empty,
+        )
+    };
+    let paged = if matches!(channel, Channel::Workspace | Channel::Agent) {
+        let read = subscriptions::paged_collection_snapshot(
+            api.as_ref(),
+            channel,
+            &workspace_id,
+            include_retired,
         );
+        if channel == Channel::Workspace {
+            read.instrument(workspace_span()).await
+        } else {
+            read.await
+        }
+    } else {
+        None
+    };
+    let mut snapshot_next_token = None;
+    let snapshot = if let Some((page, next_token)) = paged {
+        snapshot_next_token = Some(next_token);
+        page
+    } else if channel == Channel::Task {
+        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
+        spec_links = links;
+        snapshot
+    } else if channel == Channel::Workspace {
         subscriptions::workspace_snapshot(api.as_ref(), include_retired)
-            .instrument(span)
+            .instrument(workspace_span())
             .await
     } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
@@ -3000,12 +3023,34 @@ async fn forward_channel_subscription(
     };
     // The global workspace channel discloses ids through `workspace:deleted`
     // tombstones, so a non-administrator subscriber only receives them for
-    // workspaces it has been shown (multiplayer w3); seeded from its own
-    // membership-scoped snapshot, no extra query.
-    let mut visible_workspaces = (channel == Channel::Workspace
-        && crate::context::is_non_administrator_caller())
-    .then(|| subscriptions::visible_workspace_ids(&snapshot));
-    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    // workspaces it has been shown (multiplayer w3). The seq-0 frame is one
+    // page, but the client loads the rest through `workspace.list`, so the
+    // set is seeded from the caller's whole membership-scoped list.
+    let mut visible_workspaces =
+        if channel == Channel::Workspace && crate::context::is_non_administrator_caller() {
+            let next_token = snapshot_next_token.as_ref().and_then(Option::as_deref);
+            Some(
+                subscriptions::visible_workspace_seed(
+                    api.as_ref(),
+                    &snapshot,
+                    next_token,
+                    include_retired,
+                )
+                .instrument(workspace_span())
+                .await,
+            )
+        } else {
+            None
+        };
+    let frame = match &snapshot_next_token {
+        Some(next_token) => subscriptions::build_paged_snapshot_push(
+            &subscription_id,
+            0,
+            &snapshot,
+            next_token.as_deref(),
+        ),
+        None => subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot),
+    };
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
