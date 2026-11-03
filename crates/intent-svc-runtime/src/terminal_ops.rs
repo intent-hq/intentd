@@ -49,9 +49,15 @@ use intent_services::feature_api::{
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
-/// How often the output streamer re-reads the foreground process group for
-/// `terminal:process`. Cheap (one `tcgetpgrp` plus a process-name read).
-const PROCESS_POLL: Duration = Duration::from_millis(500);
+/// Delay after output before re-reading the foreground program. A program
+/// start or exit almost always prints (the echoed Enter, a new prompt), so
+/// output drives the check; the delay lets the new program take the
+/// foreground first and folds a burst of output into one check.
+const PROCESS_SETTLE: Duration = Duration::from_millis(250);
+
+/// Fallback check for a change with no output (e.g. a job resumed by a
+/// signal from another terminal).
+const PROCESS_IDLE_CHECK: Duration = Duration::from_secs(5);
 
 /// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
 const DEFAULT_TERM: &str = "xterm-256color";
@@ -599,8 +605,8 @@ fn utf8_len(b: u8) -> usize {
 
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
-/// While it runs, it also polls the foreground program and emits
-/// `terminal:process` on each change.
+/// While it runs, it re-reads the foreground program shortly after output
+/// (and on a slow idle fallback) and emits `terminal:process` on each change.
 pub(crate) fn spawn_output_stream(
     tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
@@ -617,8 +623,9 @@ pub(crate) fn spawn_output_stream(
             return;
         };
         let mut live = attachment.live;
-        let mut process_poll = tokio::time::interval(PROCESS_POLL);
-        process_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let process_check = tokio::time::sleep(PROCESS_IDLE_CHECK);
+        tokio::pin!(process_check);
+        let mut process_check_soon = false;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
@@ -633,16 +640,24 @@ pub(crate) fn spawn_output_stream(
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk),
+                    Ok(chunk) => {
+                        emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk);
+                        if !process_check_soon {
+                            process_check_soon = true;
+                            process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_SETTLE);
+                        }
+                    }
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
-                _ = process_poll.tick() => {
+                () = &mut process_check => {
                     if let Ok(Some(process)) = pty.refresh_process(pty_id) {
                         emit_process(bus.as_ref(), &workspace_id, &terminal_id, &process);
                     }
+                    process_check_soon = false;
+                    process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_IDLE_CHECK);
                 }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
