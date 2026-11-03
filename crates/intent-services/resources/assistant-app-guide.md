@@ -581,14 +581,16 @@ uses the most recent setup. Changes you make in the form are kept when you switc
 repositories.
 
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
 workspace for that repository, and uses that agent's last model and reasoning
 effort while it stays selected. The new workspace opens as a tab at the end of
-the top tab strip, and the current workspace stays selected.
+the top tab strip, and the current workspace stays selected. Once created, the
+card shows **Open workspace**, whoever applied it; if that workspace was deleted,
+a message says it no longer exists.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 

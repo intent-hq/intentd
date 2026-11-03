@@ -10956,6 +10956,7 @@ impl Services {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         // The id is matched VERBATIM against the recorded pending entries —
         // recording preserves `applyToolCallId` / `preview.title` exactly as
@@ -11042,6 +11043,19 @@ impl Services {
         }
         let resolutions_json = serde_json::to_string(&resolutions)
             .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
+        // The created-workspace map follows the resolutions map: an applied
+        // create records its workspace, and entries whose resolution was
+        // evicted (or re-proposed and dismissed) are dropped with it.
+        let previous_created = session.proposal_created_workspaces();
+        let mut created_workspaces = previous_created.clone();
+        created_workspaces.shift_remove(&proposal_id);
+        if outcome == PROPOSAL_OUTCOME_APPLIED {
+            if let Some(created) = created_workspace_id.as_ref() {
+                created_workspaces.insert(proposal_id.clone(), json!(created.as_str()));
+            }
+        }
+        created_workspaces.retain(|id, _| resolutions.contains_key(id));
+        let created_changed = created_workspaces != previous_created;
         // Persist the resolution FIRST (it doubles as the durable idempotency
         // marker), then shrink the pending list. A failure between the two
         // writes leaves the entry pending WITH its outcome recorded: the RPC
@@ -11050,6 +11064,20 @@ impl Services {
         // both writes), so none can duplicate. The reverse order could
         // permanently lose the resolution: pending entry gone, no recorded
         // outcome, every retry NotFound.
+        if created_changed {
+            let created_json = serde_json::to_string(&created_workspaces).map_err(|e| {
+                Error::Internal(format!("serialize proposal created workspaces: {e}"))
+            })?;
+            self.store
+                .set_agent_session_metadata_key_json(
+                    &workspace_id,
+                    &agent_id,
+                    intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+                    &created_json,
+                    &now_iso(),
+                )
+                .await?;
+        }
         self.store
             .set_agent_session_metadata_key_json(
                 &workspace_id,
@@ -11068,16 +11096,17 @@ impl Services {
                 &now_iso(),
             )
             .await?;
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            &agent_id,
-            AGENT_UPDATED,
-            json!({
+        self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, {
+            let mut data = json!({
                 "agentId": agent_id.0,
                 "pendingProposals": remaining,
                 "proposalResolutions": resolutions,
-            }),
-        )
+            });
+            if created_changed {
+                data["proposalCreatedWorkspaces"] = Value::Object(created_workspaces);
+            }
+            data
+        })
         .await;
         // Deliver the proposal-resolved system notice — fail-soft, the
         // persisted resolution is the source of truth.
@@ -11285,6 +11314,7 @@ impl Services {
                 proposal_id.clone(),
                 PROPOSAL_OUTCOME_APPLIED.to_string(),
                 Some(detail),
+                Some(created.clone()),
             )
             .await
         {

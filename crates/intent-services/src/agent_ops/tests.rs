@@ -10320,7 +10320,11 @@ const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
     "fileBlocks",
     "stats",
 ];
-const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+const DETAIL_ONLY_METADATA_KEYS: &[&str] = &[
+    "pendingProposals",
+    "proposalResolutions",
+    "proposalCreatedWorkspaces",
+];
 
 /// Build the worst-case-realistic `agent.list` row for the budget /
 /// allowlist goldens: one session with every optional field populated (ids,
@@ -10443,6 +10447,9 @@ async fn worst_case_agent_list_row(
         intent_core::PROPOSAL_RESOLUTIONS_KEY: {
             "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
             "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        },
+        intent_core::PROPOSAL_CREATED_WORKSPACES_KEY: {
+            "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4",
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
@@ -10616,6 +10623,10 @@ async fn agent_list_strips_detail_only_fields_get_keeps_them() {
             "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
             "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
         })
+    );
+    assert_eq!(
+        got["metadata"]["proposalCreatedWorkspaces"],
+        json!({ "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4" })
     );
     // And agent.get never applies the list caps either.
     assert!(
@@ -41287,6 +41298,7 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
             "tc-1".to_string(),
             "applied".to_string(),
             Some("Created workspace ws-123.".to_string()),
+            None,
         )
         .await
         .expect("resolve");
@@ -41378,6 +41390,7 @@ async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
             "tc-1".to_string(),
             "dismissed".to_string(),
             None,
+            None,
         )
         .await
         .expect("resolve");
@@ -41444,6 +41457,7 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         "tc-1".to_string(),
         "applied".to_string(),
         None,
+        None,
     )
     .await
     .expect("resolve");
@@ -41462,6 +41476,7 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
             id.clone(),
             "tc-1".to_string(),
             "dismissed".to_string(),
+            None,
             None,
         )
         .await
@@ -41554,6 +41569,7 @@ async fn resolve_proposal_error_paths() {
             "tc-unknown".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("unknown proposal must fail");
@@ -41568,6 +41584,7 @@ async fn resolve_proposal_error_paths() {
             "tc-1".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("workspace mismatch must fail");
@@ -41580,6 +41597,7 @@ async fn resolve_proposal_error_paths() {
             id.clone(),
             "tc-1".to_string(),
             "ignored".to_string(),
+            None,
             None,
         )
         .await
@@ -41594,6 +41612,7 @@ async fn resolve_proposal_error_paths() {
             "  ".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("empty proposalId must fail");
@@ -41607,6 +41626,7 @@ async fn resolve_proposal_error_paths() {
             ghost,
             "tc-1".to_string(),
             "applied".to_string(),
+            None,
             None,
         )
         .await
@@ -41646,6 +41666,7 @@ async fn resolve_proposal_title_falls_back_to_id_when_carrier_gone() {
         id.clone(),
         "tc-dangling".to_string(),
         "dismissed".to_string(),
+        None,
         None,
     )
     .await
@@ -41696,6 +41717,7 @@ async fn resolve_proposal_removes_only_named_entry() {
         id.clone(),
         "tc-a".to_string(),
         "dismissed".to_string(),
+        None,
         None,
     )
     .await
@@ -41750,6 +41772,7 @@ async fn resolve_proposal_ignores_seeded_invalid_outcome() {
             "tc-seeded".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("seeded invalid entry must not resolve");
@@ -41781,6 +41804,7 @@ async fn resolve_proposal_matches_whitespace_id_verbatim() {
             id.clone(),
             ws_id.to_string(),
             "dismissed".to_string(),
+            None,
             None,
         )
         .await
@@ -41833,6 +41857,7 @@ async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
         id.clone(),
         "tc-new".to_string(),
         "applied".to_string(),
+        None,
         None,
     )
     .await
