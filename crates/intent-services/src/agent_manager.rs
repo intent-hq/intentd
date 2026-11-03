@@ -1386,6 +1386,40 @@ pub struct AgentMemorySnapshot {
     /// Every process in each registered agent's subtree, bucketed by agent.
     /// Empty for probes that don't attribute.
     pub processes: HashMap<AgentId, Vec<ProcessSample>>,
+    /// The agents this machine runs for other backends (the executor), each
+    /// with its subtree from the same sweep. They have no session row here,
+    /// so they carry what their launch said.
+    pub remote: Vec<RemoteAgentMemory>,
+}
+
+/// The backend an agent this machine runs for it belongs to: its executor
+/// credential's `backendId` / `backendName` (`remoteOwner`, §5.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteOwner {
+    pub backend_id: String,
+    pub backend_name: String,
+}
+
+/// An agent this machine runs for another backend, as its launch described
+/// it, with its provider process's pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAgentRoot {
+    /// The backend's agent id.
+    pub agent_id: AgentId,
+    /// The backend's workspace id.
+    pub workspace_id: WorkspaceId,
+    pub provider: String,
+    pub model: Option<String>,
+    pub owner: RemoteOwner,
+    pub root_pid: u32,
+}
+
+/// One executor-run agent's processes from a sweep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAgentMemory {
+    pub agent: RemoteAgentRoot,
+    /// Every process in the agent's subtree; they sum to its bytes.
+    pub processes: Vec<ProcessSample>,
 }
 
 /// What the manager knows about a live agent's spawned child, for

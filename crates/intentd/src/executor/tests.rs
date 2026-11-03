@@ -1337,3 +1337,68 @@ async fn a_stop_is_acknowledged_only_after_the_agent_is_actually_stopped() {
     assert_eq!(unknown, StopOutcome::NotRunning);
     node.stop().await;
 }
+
+/// A running agent reports its provider process's pid with what its launch
+/// said and the backend it runs for, so the memory sampler can credit its
+/// tree to it; once the agent stops it is no longer reported.
+#[tokio::test]
+async fn a_running_agent_reports_its_root_pid_and_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((node, admission, id, _dialed)) = running_agent(dir.path()).await else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let roots = node.service.agent_roots();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let root = &roots[0];
+    assert_eq!(root.agent_id, AgentId::from("a1"));
+    assert_eq!(root.workspace_id, WorkspaceId::from("ws-1"));
+    assert_eq!(root.provider, "mock");
+    assert_eq!(root.model, None);
+    assert_eq!(
+        root.owner,
+        intent_services::RemoteOwner {
+            backend_id: HEAD.into(),
+            backend_name: "Backend".into(),
+        }
+    );
+    assert!(root.root_pid > 0);
+    assert!(!process_gone(i32::try_from(root.root_pid).unwrap()));
+
+    node.api.revocations.send(id).unwrap();
+    wait_released(&admission).await;
+    assert!(node.service.agent_roots().is_empty());
+    node.stop().await;
+}
+
+/// The connected-backend count is the backends holding an open inbound
+/// link now: one while a backend's link is up, none once it closes.
+#[tokio::test]
+async fn linked_backends_count_open_inbound_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 1).await;
+    assert_eq!(node.service.linked_backends(), 0);
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    assert_eq!(node.service.linked_backends(), 1);
+    dialed.link.close();
+    let deadline = tokio::time::Instant::now() + wait();
+    while node.service.linked_backends() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed link still counts"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.stop().await;
+}
+
+/// Before the service is installed the slot reports no agents and no links.
+#[test]
+fn an_uninstalled_slot_reports_no_agents_or_links() {
+    let slot = ExecutorSlot::default();
+    assert!(slot.agent_roots().is_empty());
+    assert_eq!(slot.linked_backends(), 0);
+}
