@@ -5432,7 +5432,8 @@ async fn dispatch(
             // Optional workspaceId: present → include the workspace's read-only
             // rule files; omitted → global user-override set only.
             let workspace_id = opt_workspace_id(params);
-            api.rules_list(workspace_id).await.map_err(domain_to_rpc)
+            let listed = api.rules_list(workspace_id).await.map_err(domain_to_rpc)?;
+            catalog_lists::page_rules_list(listed, params)
         }
         "rules.get" => {
             let ws = require_ws_note(params)?;
@@ -5463,7 +5464,7 @@ async fn dispatch(
             };
             let provider = opt_str(params, "provider");
             match api.specialist_list(workspace_path, provider).await {
-                Ok(v) => Ok(v),
+                Ok(v) => catalog_lists::page_specialist_list(v, params),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -5520,8 +5521,8 @@ async fn dispatch(
         }
         "skill.list" => {
             let ws_id = require_workspace_id(params)?;
-            match api.skill_list(ws_id).await {
-                Ok(v) => Ok(v),
+            match api.skill_list(ws_id.clone()).await {
+                Ok(v) => catalog_lists::page_skill_list(v, params, &ws_id),
                 Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -6575,6 +6576,8 @@ mod response_profile_tests {
         assert!(!notification.encode_failed);
     }
 }
+
+mod catalog_lists;
 
 #[cfg(test)]
 mod tests;

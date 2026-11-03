@@ -24,13 +24,9 @@ note.list projection=full 2971285
 note.listTasks default 594422
 note.subscribe default 2971364
 note.subscribe maxContentBytes 957071
-rules.list workspace 1255854
 script.list default 1404298
 script.list view=full 1404298
 script.output maxLines=100000 779996
-skill.list default 1173844
-specialist.list default 6370075
-specialist.list max 6370075
 terminal.getBuffer default 699219
 terminal.readOutput maxLines=100000 541323
 workspace.list default 2205997
