@@ -441,10 +441,11 @@ async fn search_issues_next_token_round_trips() {
 
         let calls = fx.engine.search_calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], ("login bug".to_string(), None, None));
+        // No wire `limit`: the daemon sends its default page size (50).
+        assert_eq!(calls[0], ("login bug".to_string(), Some(50), None));
         assert_eq!(
             calls[1],
-            ("login bug".to_string(), None, Some("cursor-2".to_string()))
+            ("login bug".to_string(), Some(50), Some("cursor-2".to_string()))
         );
     }
 }
