@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-use crate::node_link::LinkFrame;
+use crate::node_link::{JournalBody, LinkFrame, LinkOutcome};
 
 /// Records kept before the oldest is evicted.
 pub const MAX_RECORDS: usize = 2000;
@@ -45,6 +45,11 @@ pub const SNAPSHOT_MAX_LIMIT: usize = 2000;
 pub const SNAPSHOT_MAX_BYTES: usize = 448 * 1024;
 /// Frames waiting for the collector before new ones are dropped.
 const QUEUE: usize = 1024;
+/// Wire bytes of the frames waiting for the collector before new ones are
+/// dropped: two of the largest frames a link carries.
+const QUEUE_BYTES: usize = 16 * 1024 * 1024;
+/// What a light capture counts against the queue's byte budget.
+pub(crate) const LIGHT_BYTES: usize = 256;
 /// Most records in one published batch, and the longest a record waits for
 /// its batch.
 const BATCH_MAX: usize = 100;
@@ -86,6 +91,8 @@ pub struct Limits {
     pub max_records: usize,
     pub max_payload_bytes: usize,
     pub queue: usize,
+    /// Wire bytes of the frames waiting for the collector, at most.
+    pub queue_bytes: usize,
     pub batch_window: Duration,
 }
 
@@ -95,6 +102,7 @@ impl Default for Limits {
             max_records: MAX_RECORDS,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             queue: QUEUE,
+            queue_bytes: QUEUE_BYTES,
             batch_window: BATCH_WINDOW,
         }
     }
@@ -108,8 +116,20 @@ struct Captured {
     at: OffsetDateTime,
     peer: TrafficPeer,
     direction: TrafficDirection,
-    frame: LinkFrame,
+    body: Body,
     bytes: usize,
+    /// What it counts against the queue's byte budget.
+    cost: usize,
+}
+
+/// What a waiting frame keeps.
+enum Body {
+    /// The whole frame, to render with its payload.
+    Full(Box<LinkFrame>),
+    /// Only the type, ids and summary fields (see [`light_frame`]): the
+    /// payload would be omitted anyway (payloads off, or the frame is past
+    /// `max_payload_bytes`), so the frame is never cloned.
+    Light { frame: Value, truncated: bool },
 }
 
 /// A running capture.
@@ -117,6 +137,8 @@ struct Session {
     epoch: u64,
     started_at: String,
     tx: mpsc::Sender<Captured>,
+    /// Bytes waiting for the collector (each frame's `cost`).
+    queued: Arc<AtomicUsize>,
     /// Each record with its seq and its JSON size in bytes.
     records: VecDeque<(u64, Value, usize)>,
     next_seq: u64,
@@ -129,6 +151,9 @@ struct Session {
 struct State {
     session: Option<Session>,
     epochs: u64,
+    /// The last capture's start, so the next one's `startedAt` is strictly
+    /// later: clients tell captures apart by it.
+    last_start: Option<OffsetDateTime>,
 }
 
 /// A daemon's link-traffic capture. See the module docs.
@@ -137,6 +162,10 @@ pub struct LinkTraffic {
     payloads: AtomicBool,
     limits: Limits,
     state: Mutex<State>,
+    /// Held from reading the status a batch carries until it is published,
+    /// so batches go out in the order of the state they describe: no batch
+    /// follows the stop that cleared it. Taken before `state`.
+    publishing: Mutex<()>,
     sink: Mutex<Option<RecordsSink>>,
 }
 
@@ -160,6 +189,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// `now` at millisecond precision, or 1 ms after `last` when that is not
+/// strictly earlier, so each capture's `startedAt` differs.
+fn next_start(last: Option<OffsetDateTime>, now: OffsetDateTime) -> OffsetDateTime {
+    let now = now
+        .replace_nanosecond(now.nanosecond() / 1_000_000 * 1_000_000)
+        .unwrap_or(now);
+    match last {
+        Some(last) if last >= now => last + time::Duration::milliseconds(1),
+        _ => now,
+    }
+}
+
 fn iso_ms(at: OffsetDateTime) -> String {
     let at = at
         .replace_nanosecond(at.nanosecond() / 1_000_000 * 1_000_000)
@@ -180,6 +221,7 @@ impl LinkTraffic {
             payloads: AtomicBool::new(true),
             limits,
             state: Mutex::new(State::default()),
+            publishing: Mutex::new(()),
             sink: Mutex::new(None),
         }
     }
@@ -199,16 +241,21 @@ impl LinkTraffic {
     /// kept. Returns the capture status, also published with no records.
     /// Must run inside a Tokio runtime.
     pub fn start(self: &Arc<Self>, payloads: bool) -> Value {
+        let _publishing = lock(&self.publishing);
         let mut state = lock(&self.state);
         self.payloads.store(payloads, Ordering::Relaxed);
         if state.session.is_none() {
             state.epochs += 1;
             let epoch = state.epochs;
             let (tx, rx) = mpsc::channel(self.limits.queue.max(1));
+            let queued = Arc::new(AtomicUsize::new(0));
+            let started_at = next_start(state.last_start, OffsetDateTime::now_utc());
+            state.last_start = Some(started_at);
             state.session = Some(Session {
                 epoch,
-                started_at: iso_ms(OffsetDateTime::now_utc()),
+                started_at: iso_ms(started_at),
                 tx,
+                queued: queued.clone(),
                 records: VecDeque::new(),
                 next_seq: 1,
                 evicted: 0,
@@ -220,6 +267,7 @@ impl LinkTraffic {
                 Arc::downgrade(self),
                 epoch,
                 rx,
+                queued,
                 self.limits.batch_window,
             ));
             self.active.store(true, Ordering::Relaxed);
@@ -234,6 +282,7 @@ impl LinkTraffic {
     /// (cleared) status, also published with no records when capture was
     /// on.
     pub fn stop(&self) -> Value {
+        let _publishing = lock(&self.publishing);
         let mut state = lock(&self.state);
         self.active.store(false, Ordering::Relaxed);
         let was_on = state.session.take().is_some();
@@ -331,20 +380,54 @@ impl LinkTraffic {
         if !self.is_active() {
             return;
         }
-        let mut state = lock(&self.state);
-        let Some(session) = state.session.as_mut() else {
-            return;
+        let light = !self.payloads.load(Ordering::Relaxed) || bytes > self.limits.max_payload_bytes;
+        let cost = if light { LIGHT_BYTES } else { bytes };
+        // Reserve the frame's place under the lock; copy it after.
+        let (epoch, tx, queued) = {
+            let mut state = lock(&self.state);
+            let Some(session) = state.session.as_mut() else {
+                return;
+            };
+            if session.queued.load(Ordering::Relaxed).saturating_add(cost) > self.limits.queue_bytes
+            {
+                session.dropped += 1;
+                return;
+            }
+            session.queued.fetch_add(cost, Ordering::Relaxed);
+            (session.epoch, session.tx.clone(), session.queued.clone())
+        };
+        let body = if light {
+            Body::Light {
+                frame: light_frame(frame),
+                truncated: bytes > self.limits.max_payload_bytes,
+            }
+        } else {
+            Body::Full(Box::new(frame.clone()))
         };
         let captured = Captured {
             at: OffsetDateTime::now_utc(),
             peer: peer.clone(),
             direction,
-            frame: frame.clone(),
+            body,
             bytes,
+            cost,
         };
-        if session.tx.try_send(captured).is_err() {
-            session.dropped += 1;
+        if tx.try_send(captured).is_err() {
+            queued.fetch_sub(cost, Ordering::Relaxed);
+            let mut state = lock(&self.state);
+            if let Some(session) = state.session.as_mut().filter(|s| s.epoch == epoch) {
+                session.dropped += 1;
+            }
         }
+    }
+
+    /// Bytes waiting for the collector.
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        lock(&self.state)
+            .session
+            .as_ref()
+            .map_or(0, |s| s.queued.load(Ordering::Relaxed))
     }
 
     /// Render `batch` and keep it, if capture `epoch` is still running;
@@ -355,6 +438,7 @@ impl LinkTraffic {
             .into_iter()
             .map(|captured| render(&captured, payloads, self.limits.max_payload_bytes))
             .collect();
+        let _publishing = lock(&self.publishing);
         let (records, capture) = {
             let mut state = lock(&self.state);
             let Some(session) = state.session.as_mut() else {
@@ -391,6 +475,7 @@ async fn collect(
     traffic: Weak<LinkTraffic>,
     epoch: u64,
     mut rx: mpsc::Receiver<Captured>,
+    queued: Arc<AtomicUsize>,
     window: Duration,
 ) {
     loop {
@@ -424,6 +509,8 @@ async fn collect(
                 Err(_) => break,
             }
         }
+        let cost: usize = batch.iter().map(|captured| captured.cost).sum();
+        queued.fetch_sub(cost, Ordering::Relaxed);
         let Some(traffic) = traffic.upgrade() else {
             return;
         };
@@ -446,7 +533,10 @@ struct Draft {
 const SEQ_BYTES: usize = 28;
 
 fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draft {
-    let mut payload = serde_json::to_value(&captured.frame).unwrap_or(Value::Null);
+    let (mut payload, light) = match &captured.body {
+        Body::Full(frame) => (serde_json::to_value(frame).unwrap_or(Value::Null), None),
+        Body::Light { frame, truncated } => (frame.clone(), Some(*truncated)),
+    };
     redact(&mut payload);
     let frame_type = payload
         .get("type")
@@ -467,7 +557,12 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
     record.insert("bytes".into(), json!(captured.bytes));
     record.insert("summary".into(), json!(summarize(&frame_type, &payload)));
     let mut oversized = false;
-    if payloads {
+    if let Some(truncated) = light {
+        if truncated {
+            oversized = true;
+            record.insert("truncated".into(), json!(true));
+        }
+    } else if payloads {
         let size = serde_json::to_vec(&payload).map_or(usize::MAX, |bytes| bytes.len());
         if size > max_payload_bytes {
             oversized = true;
@@ -484,14 +579,100 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
     }
 }
 
+/// The parts of `frame` a record shows without its payload: the type, the
+/// ids and the fields [`summarize`] reads, never a prompt, params body,
+/// result, journal body or launch configuration.
+fn light_frame(frame: &LinkFrame) -> Value {
+    let agent = |id: &crate::AgentId| json!(id);
+    match frame {
+        LinkFrame::Hello(hello) => json!({
+            "type": "hello",
+            "binding": { "generation": hello.binding.generation },
+        }),
+        LinkFrame::Welcome(welcome) => json!({
+            "type": "welcome",
+            "protocol": welcome.protocol,
+            "runningAgents": welcome.running_agents,
+        }),
+        LinkFrame::Heartbeat { nonce } => json!({ "type": "heartbeat", "nonce": nonce }),
+        LinkFrame::HeartbeatReply { nonce } => json!({ "type": "heartbeatReply", "nonce": nonce }),
+        LinkFrame::Launch(launch) => json!({
+            "type": "launch",
+            "agentId": agent(&launch.agent_id),
+            "provider": launch.provider,
+            "model": launch.model,
+        }),
+        LinkFrame::Prompt {
+            agent_id, turn_id, ..
+        } => json!({ "type": "prompt", "agentId": agent(agent_id), "turnId": turn_id }),
+        LinkFrame::Cancel { agent_id } => json!({ "type": "cancel", "agentId": agent(agent_id) }),
+        LinkFrame::Stop { agent_id, stop_id } => {
+            json!({ "type": "stop", "agentId": agent(agent_id), "stopId": stop_id })
+        }
+        LinkFrame::StopAck {
+            stop_id, agent_id, ..
+        } => json!({ "type": "stopAck", "agentId": agent(agent_id), "stopId": stop_id }),
+        LinkFrame::Journal(record) => json!({
+            "type": "journal",
+            "seq": record.seq,
+            "agentId": agent(&record.agent_id),
+            "body": { "kind": journal_kind(&record.body) },
+        }),
+        LinkFrame::Ack { seq } => json!({ "type": "ack", "seq": seq }),
+        LinkFrame::ReplayComplete { through_seq } => {
+            json!({ "type": "replayComplete", "throughSeq": through_seq })
+        }
+        LinkFrame::Request(request) => {
+            let mut light = json!({
+                "type": "request",
+                "requestId": request.request_id,
+                "agentId": agent(&request.agent_id),
+                "method": request.method,
+            });
+            if let Some(method) = request.params.get("method").and_then(Value::as_str) {
+                light["params"] = json!({ "method": method });
+            }
+            light
+        }
+        LinkFrame::Response {
+            request_id,
+            outcome,
+        } => json!({
+            "type": "response",
+            "requestId": request_id,
+            "outcome": match outcome {
+                LinkOutcome::Ok(_) => json!({ "ok": null }),
+                LinkOutcome::Err(error) => json!({ "err": { "code": error.code } }),
+            },
+        }),
+        LinkFrame::CancelRequest { request_id } => {
+            json!({ "type": "cancelRequest", "requestId": request_id })
+        }
+        LinkFrame::Capabilities => json!({ "type": "capabilities" }),
+        LinkFrame::CapabilitiesReply { .. } => json!({ "type": "capabilitiesReply" }),
+    }
+}
+
+fn journal_kind(body: &JournalBody) -> &'static str {
+    match body {
+        JournalBody::Started { .. } => "started",
+        JournalBody::Notification { .. } => "notification",
+        JournalBody::TurnEnded { .. } => "turnEnded",
+        JournalBody::Exited { .. } => "exited",
+    }
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("?")
 }
 
+/// A counter, which may serialize as a string (`NodeCounter`), unquoted.
 fn number(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .map_or_else(|| "?".to_owned(), ToString::to_string)
+    match value.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "?".to_owned(),
+    }
 }
 
 /// A short line naming the frame, from fields that are never secret.

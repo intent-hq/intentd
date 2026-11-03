@@ -24,6 +24,7 @@ fn limits(max_records: usize, max_payload_bytes: usize, queue: usize) -> Limits 
         max_records,
         max_payload_bytes,
         queue,
+        queue_bytes: usize::MAX,
         batch_window: Duration::ZERO,
     }
 }
@@ -381,6 +382,7 @@ async fn full_queue_drops_and_counts() {
         max_records: 100,
         max_payload_bytes: 1 << 16,
         queue: 2,
+        queue_bytes: usize::MAX,
         batch_window: Duration::ZERO,
     }));
     traffic.start(true);
@@ -475,4 +477,205 @@ async fn snapshot_stops_before_the_byte_cap_but_returns_at_least_one() {
         (1..=20).collect::<Vec<u64>>(),
         "every record once, in order"
     );
+}
+
+#[tokio::test]
+async fn queued_bytes_are_bounded_and_released() {
+    // The collector cannot run between these synchronous observes, so the
+    // byte budget alone decides what is queued.
+    let (traffic, _) = traffic(Limits {
+        queue_bytes: 3000,
+        ..limits(100, 1 << 16, 64)
+    });
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    for seq in 1..=10 {
+        tap.observe(TrafficDirection::In, &journal_frame(seq), 1000);
+    }
+    let status = settle(&traffic, 3).await;
+    assert_eq!(status["dropped"], 7, "{status}");
+    // Draining the queue gives the budget back.
+    for seq in 11..=13 {
+        tap.observe(TrafficDirection::In, &journal_frame(seq), 1000);
+    }
+    let status = settle(&traffic, 6).await;
+    assert_eq!(status["dropped"], 7, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_batch_is_published_after_the_stop_that_cleared_it() {
+    for _ in 0..50 {
+        let (traffic, published) = traffic(limits(100, 1 << 16, 1024));
+        traffic.start(true);
+        let tap = LinkTap::new(traffic.clone(), machine());
+        let feeder = std::thread::spawn(move || {
+            for seq in 1..=2000 {
+                tap.observe(TrafficDirection::In, &journal_frame(seq), 10);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        traffic.stop();
+        feeder.join().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let published = published.lock().unwrap();
+        let last = published.last().unwrap();
+        assert_eq!(last["capture"]["active"], false, "{last}");
+        assert_eq!(last["records"], json!([]), "{last}");
+    }
+}
+
+#[tokio::test]
+async fn large_frames_queue_a_light_capture() {
+    let (traffic, _) = traffic(Limits {
+        queue_bytes: 16 * 1024 * 1024,
+        ..limits(100, 64 * 1024, 1024)
+    });
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    let big = |turn: u64| LinkFrame::Prompt {
+        agent_id: AgentId::from_string("agent-1"),
+        turn_id: format!("t{turn}"),
+        prompt: vec![json!({ "type": "text", "text": "x".repeat(1024 * 1024) })],
+    };
+    // 40 MiB of frames on the wire: queued as full frames they would pass
+    // the 16 MiB budget; as light captures they stay small.
+    for turn in 1..=40 {
+        tap.observe(TrafficDirection::In, &big(turn), 1024 * 1024 + 64);
+    }
+    let queued = traffic.queued_bytes();
+    assert!(queued <= 40 * super::LIGHT_BYTES, "{queued}");
+    let status = settle(&traffic, 40).await;
+    assert_eq!(status["dropped"], 0, "{status}");
+    assert_eq!(status["oversized"], 40, "{status}");
+    assert_eq!(traffic.queued_bytes(), 0);
+    let records = traffic.snapshot(None, Some(1))["records"].clone();
+    let record = &records[0];
+    assert_eq!(record["frameType"], "prompt");
+    assert_eq!(record["agentId"], "agent-1");
+    assert_eq!(record["summary"], "prompt agent-1 turn t1");
+    assert_eq!(record["bytes"], 1024 * 1024 + 64);
+    assert_eq!(record["truncated"], true);
+    assert!(record.get("payload").is_none());
+}
+
+#[tokio::test]
+async fn light_captures_keep_every_summary() {
+    // Payloads off: every frame is a light capture, and its summary still
+    // names what the full frame would.
+    let (traffic, _) = traffic(limits(100, 1 << 16, 64));
+    traffic.start(false);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    let request_id = uuid::Uuid::new_v4();
+    let request = LinkFrame::Request(LinkRequest {
+        request_id,
+        agent_id: AgentId::from_string("agent-1"),
+        method: crate::remote_launch::workspace_api::CALL_METHOD.into(),
+        params: json!({ "method": "note.read", "args": { "apiToken": "secret" } }),
+        timeout_ms: 1000,
+    });
+    let frames = [
+        (launch_frame(), "launch agent-1 with claude-code (opus)"),
+        (journal_frame(7), "journal #7 agent-1 started"),
+        (request, "request note.read for agent-1"),
+    ];
+    for (frame, _) in &frames {
+        tap.observe(TrafficDirection::Out, frame, 100);
+    }
+    settle(&traffic, frames.len()).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    for (record, (_, summary)) in records.as_array().unwrap().iter().zip(&frames) {
+        assert_eq!(record["summary"], *summary, "{record}");
+        assert!(record.get("payload").is_none());
+        assert!(record.get("truncated").is_none());
+    }
+    assert_eq!(records[2]["requestId"], request_id.to_string());
+}
+
+#[tokio::test]
+async fn each_capture_has_a_later_started_at() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    let mut previous = String::new();
+    for _ in 0..20 {
+        let started_at = traffic.start(true)["startedAt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        traffic.stop();
+        let parsed = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).unwrap()
+        };
+        if !previous.is_empty() {
+            assert!(
+                parsed(&started_at) > parsed(&previous),
+                "{previous} then {started_at}"
+            );
+        }
+        previous = started_at;
+    }
+}
+
+#[test]
+fn next_start_bumps_a_tie_by_a_millisecond() {
+    let ms = |ms: i128| time::OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000).unwrap();
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(1_000_123_456_789).unwrap();
+    assert_eq!(super::next_start(None, at), ms(1_000_123));
+    assert_eq!(super::next_start(Some(ms(1_000_123)), at), ms(1_000_124));
+    assert_eq!(super::next_start(Some(ms(1_000_500)), at), ms(1_000_501));
+    assert_eq!(super::next_start(Some(ms(1_000_100)), at), ms(1_000_123));
+}
+
+#[tokio::test]
+async fn counter_summaries_are_unquoted() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::In, &journal_frame(7), 100);
+    tap.observe(
+        TrafficDirection::Out,
+        &LinkFrame::Ack {
+            seq: NodeCounter(7),
+        },
+        20,
+    );
+    settle(&traffic, 2).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    assert_eq!(records[0]["summary"], "journal #7 agent-1 started");
+    assert_eq!(records[1]["summary"], "ack #7");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_waits_for_a_batch_being_published() {
+    // The sink holds a batch mid-publication while `stop` runs: the stop's
+    // event must still come after it.
+    let traffic = Arc::new(LinkTraffic::with_limits(limits(10, 1 << 16, 16)));
+    let published = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let sink = published.clone();
+    traffic.set_sink(Arc::new(move |batch: Value| {
+        if batch["records"].as_array().is_some_and(|r| !r.is_empty()) {
+            entered_tx.lock().unwrap().send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        sink.lock().unwrap().push(batch);
+    }));
+    traffic.start(true);
+    LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::In, &journal_frame(1), 10);
+    let stopper = traffic.clone();
+    let stop = tokio::task::spawn_blocking(move || {
+        entered_rx.recv().unwrap();
+        stopper.stop();
+    });
+    stop.await.unwrap();
+    let published = published.lock().unwrap();
+    let kinds: Vec<(bool, usize)> = published
+        .iter()
+        .map(|batch| {
+            (
+                batch["capture"]["active"].as_bool().unwrap(),
+                batch["records"].as_array().unwrap().len(),
+            )
+        })
+        .collect();
+    assert_eq!(kinds, vec![(true, 0), (true, 1), (false, 0)]);
 }
