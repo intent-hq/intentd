@@ -644,3 +644,28 @@ async fn a_monitor_wake_never_carries_a_huge_line() {
         &wakes[0].1[..200.min(wakes[0].1.len())]
     );
 }
+
+/// Review of intentd#3005: like a home-run monitor, a machine run's monitor
+/// checks the final line when the run exits without a trailing newline, so
+/// `printf READY; exit` wakes with the match, not the exit.
+#[tokio::test]
+async fn a_final_line_without_a_newline_matches_before_the_exit() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    runs.monitor(
+        &place(&agent),
+        &serde_json::json!({ "ttlMs": 60000, "outputPattern": "READY" }),
+    )
+    .unwrap();
+    frame(&runs, output(&start, 0, "READY")).await;
+    frame(&runs, exited(&start, Some(0), None)).await;
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert!(wakes[0].1.contains("output matched"), "{}", wakes[0].1);
+    assert!(wakes[0].1.contains("READY"), "{}", wakes[0].1);
+}

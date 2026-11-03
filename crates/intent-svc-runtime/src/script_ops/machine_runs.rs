@@ -652,21 +652,36 @@ impl MachineRuns {
                     };
                     run.last_run = Some(last_run(&run.state, outcome, Some(code), error.clone()));
                 }
-                let wake = run.monitor.take().filter(|m| {
+                let monitor = run.monitor.take().filter(|m| {
                     m.expires > tokio::time::Instant::now()
                         && m.run_id
                             .as_ref()
                             .is_none_or(|r| run.state.run_id.as_ref() == Some(r))
                 });
-                let wake = wake.map(|_| match &error {
-                    Some(error) => format!(
-                        "Script \"{}\" (machine run on {}) exited with code {code}: {error}",
-                        run.def.name, run.node_id
-                    ),
-                    None => format!(
-                        "Script \"{}\" (machine run on {}) exited with code {code}",
-                        run.def.name, run.node_id
-                    ),
+                let wake = monitor.map(|mut monitor| {
+                    // As the home run's monitor: the final line, unterminated
+                    // at exit, is checked before the exit wake.
+                    let last = monitor
+                        .decoder
+                        .eof()
+                        .and_then(|line| line.text)
+                        .filter(|text| monitor.pattern.as_ref().is_some_and(|p| p.is_match(text)));
+                    match (last, &error) {
+                        (Some(line), _) => format!(
+                            "Script \"{}\" (machine run on {}): output matched `{}`: {line}",
+                            run.def.name,
+                            run.node_id,
+                            monitor.pattern.map(|p| p.to_string()).unwrap_or_default()
+                        ),
+                        (None, Some(error)) => format!(
+                            "Script \"{}\" (machine run on {}) exited with code {code}: {error}",
+                            run.def.name, run.node_id
+                        ),
+                        (None, None) => format!(
+                            "Script \"{}\" (machine run on {}) exited with code {code}",
+                            run.def.name, run.node_id
+                        ),
+                    }
                 });
                 (false, wake)
             }
