@@ -322,8 +322,8 @@ custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
-the original configuration is **Codex · Default**. Guests in a shared workspace see
-only the provider and model, never the host's profile names. Each profile has its own **Fast
+the original configuration is **Codex · Default**. In a shared workspace, guests see
+an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
