@@ -72,8 +72,16 @@ async fn fixture(tmp: &TempDb) -> Fixture {
             .await
             .unwrap();
     }
+    // Sharing requires a connected owner forge: GitHub is a stub that
+    // answers `GET /user`, and GitLab reads a scratch (empty) secret store
+    // so the result never depends on the developer's real credentials.
+    let svc = Services::new_isolated(store)
+        .with_gitlab_secret_store(intent_core::FileSecretStore::with_path(
+            tmp.path.with_extension("secrets.json"),
+        ))
+        .with_source_control(std::sync::Arc::new(crate::tests::pr::StubForge::default()));
     Fixture {
-        svc: Services::new_isolated(store),
+        svc,
         ws,
         owner: owner.id,
         inherited,
