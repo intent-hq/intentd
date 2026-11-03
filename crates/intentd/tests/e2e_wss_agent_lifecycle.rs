@@ -7902,6 +7902,7 @@ async fn terminal_process_fields_and_events_over_wss() {
         &mut rpc,
         4,
         "terminal.write",
+        // timing-guard: the shell job whose foreground state is observed, not a wait
         json!({ "terminalId": terminal_id, "data": STANDARD.encode("sleep 30\n") }),
     )
     .await;
