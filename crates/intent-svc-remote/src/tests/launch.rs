@@ -660,7 +660,15 @@ async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
         "{unknown:?}"
     );
 
-    for method in ["script.list", "file.read", "hook.list", "workspace.info"] {
+    // `script.*` is forwarded by a protocol-8 machine, but this backend
+    // does not run machine runs yet, so it refuses them too.
+    for method in [
+        "script.list",
+        "script.start",
+        "file.read",
+        "hook.list",
+        "workspace.info",
+    ] {
         let error = refused(forward(&link, &agent, method, json!({})).await);
         assert!(
             error.message.starts_with("remote-agent-unsupported"),
