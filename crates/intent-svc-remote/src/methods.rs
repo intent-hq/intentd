@@ -578,19 +578,19 @@ async fn deliver_stops(
     } else {
         started + node.shared_ref().remove_budget()
     };
-    let mut unconfirmed = node.wait_stops(agents, wait_until).await;
-    // The agents' script runs on the machine stop within the same budget,
-    // every stop sent before one wait; an unacknowledged script stop leaves
-    // its agent unconfirmed.
-    for agent in node
-        .shared()
-        .end_agents_machine_runs(
+    // The agents' stops and their script runs' stops are awaited together,
+    // within the same budget: every script stop is sent before any wait, and
+    // an unacknowledged script stop leaves its agent unconfirmed.
+    let shared = node.shared();
+    let (mut unconfirmed, scripts_unacked) = tokio::join!(
+        node.wait_stops(agents, wait_until),
+        shared.end_agents_machine_runs(
             agents,
             wait_until,
             "remote-script-lost: the machine was removed",
-        )
-        .await
-    {
+        ),
+    );
+    for agent in scripts_unacked {
         if !unconfirmed.contains(&agent) {
             unconfirmed.push(agent);
         }
