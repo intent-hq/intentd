@@ -5866,8 +5866,9 @@ impl Services {
     /// parent's machine, when the caller is that parent and it runs on a
     /// remote machine, with the machine's name for the error hint. Creates
     /// by the user, by a local agent or for a top-level agent inherit
-    /// nothing. A failed read of the parent's session is an error, never a
-    /// silent fallback to the backend.
+    /// nothing, as does a caller with no stored session. A failed read of
+    /// the parent's session is an error, never a silent fallback to the
+    /// backend.
     async fn inherited_placement(
         &self,
         parent: Option<&AgentId>,
@@ -5881,10 +5882,11 @@ impl Services {
         ) {
             return Ok(None);
         }
-        let session = self
-            .store
-            .get_agent_session_without_messages(parent)
-            .await?;
+        let session = match self.store.get_agent_session_without_messages(parent).await {
+            Ok(session) => session,
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
             session.metadata.as_ref(),
         ) else {
