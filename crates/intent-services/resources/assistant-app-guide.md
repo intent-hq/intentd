@@ -476,7 +476,8 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 - Reach it through a private HTTPS front-end such as `tailscale serve --bg 47120`, then
   open the `https://` address and enter the key. Never suggest Tailscale Funnel or
   another public tunnel.
-- If `intentd` runs on the same machine it appears as **This machine (local)**. Add
+- If `intentd` is already running on the same machine when `intent-web` starts, it
+  appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
   other machines in **Settings → Machines → Add machine** with the host, port and token
   from `intentd pair` on that machine, then check the fingerprint and choose
   **Confirm & connect**. With no machine yet, the browser shows **Add your first
