@@ -86,6 +86,16 @@ struct Process {
 pub(super) struct ScriptProcesses {
     pty: Arc<PtyHost>,
     running: Arc<Mutex<HashMap<Key, Process>>>,
+    /// Kills under way, each until its whole process-group teardown is
+    /// done (`true`). A later stop joins one instead of starting a kill
+    /// that finds the terminal already taken and returns at once.
+    kills: Arc<Mutex<HashMap<Key, Kill>>>,
+}
+
+/// One kill under way.
+struct Kill {
+    generation: NodeCounter,
+    done: tokio::sync::watch::Receiver<bool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -126,6 +136,7 @@ impl ScriptProcesses {
         Self {
             pty,
             running: Arc::default(),
+            kills: Arc::default(),
         }
     }
 
@@ -261,31 +272,71 @@ impl ScriptProcesses {
     /// `node-script-not-running` and stops nothing.
     pub(super) fn stop(&self, link: &NodeLink, process: &ScriptProcessRef) {
         let key = key(&process.agent_id, &process.script_id, &process.spawn_id);
-        let pty_id = lock(&self.running).get(&key).map(|p| p.pty_id);
+        let found = lock(&self.running)
+            .get(&key)
+            .map(|p| (p.pty_id, p.generation));
+        if let Some((pty_id, generation)) = found {
+            // The exit is reported by its reaper.
+            drop(self.kill(&key, pty_id, generation));
+        } else {
+            let link = link.clone();
+            // caller-binding: allow — node-local answer to a stop of no process
+            tokio::spawn(async move {
+                let _ = link
+                    .send(&exited(
+                        &key,
+                        Some(-1),
+                        Some(format!("{NOT_RUNNING}: no such process on this machine")),
+                    ))
+                    .await;
+            });
+        }
+    }
+
+    /// Kill `key`'s process group, or join the kill already under way.
+    /// Resolves (turns `true`) once the whole group's teardown is done.
+    fn kill(
+        &self,
+        key: &Key,
+        pty_id: PtyId,
+        generation: NodeCounter,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        let mut kills = lock(&self.kills);
+        if let Some(kill) = kills.get(key) {
+            return kill.done.clone();
+        }
+        let (finished, done) = tokio::sync::watch::channel(false);
+        kills.insert(
+            key.clone(),
+            Kill {
+                generation,
+                done: done.clone(),
+            },
+        );
+        drop(kills);
         let pty = self.pty.clone();
-        let link = link.clone();
-        // caller-binding: allow — node-local script stop; the exit is reported by its reaper
+        let all = self.kills.clone();
+        let key = key.clone();
+        // caller-binding: allow — node-local script teardown; every stop of the process joins it
         tokio::spawn(async move {
-            match pty_id {
-                Some(pty_id) => {
-                    pty.kill(pty_id).await;
-                }
-                None => {
-                    let _ = link
-                        .send(&exited(
-                            &key,
-                            Some(-1),
-                            Some(format!("{NOT_RUNNING}: no such process on this machine")),
-                        ))
-                        .await;
+            pty.kill(pty_id).await;
+            {
+                let mut kills = lock(&all);
+                if kills
+                    .get(&key)
+                    .is_some_and(|kill| kill.done.same_channel(&finished.subscribe()))
+                {
+                    kills.remove(&key);
                 }
             }
+            finished.send_replace(true);
         });
+        done
     }
 
     /// Kill every process started on the link binding `generation`.
     pub(super) async fn stop_binding(&self, generation: NodeCounter) {
-        self.kill_where(|_, p| p.generation == generation).await;
+        self.kill_where(|_, g| g == generation).await;
     }
 
     /// Whether `process` is still recorded as running (until its reaper
@@ -310,30 +361,40 @@ impl ScriptProcesses {
         self.kill_where(|_, _| true).await;
     }
 
-    /// Kill every matching process, then wait until each one's reaper has
-    /// recorded its exit. A process another kill is already tearing down
-    /// (its terminal is gone, so this kill is a no-op) is waited for too.
-    /// The wait is bounded by [`reap_wait`]: past it, a process that is
-    /// still not reaped is logged and left. Returns whether every one was
-    /// reaped.
-    async fn kill_where(&self, matches: impl Fn(&Key, &Process) -> bool) -> bool {
-        let victims: Vec<(PtyId, tokio::sync::watch::Receiver<bool>)> = lock(&self.running)
-            .iter()
-            .filter(|(key, p)| matches(key, p))
-            .map(|(_, p)| (p.pty_id, p.reaped.clone()))
-            .collect();
-        let pty = self.pty.clone();
-        let done = tokio::time::timeout(reap_wait(), async {
-            let mut kills = tokio::task::JoinSet::new();
-            for (id, _) in &victims {
-                let pty = pty.clone();
-                let id = *id;
-                // caller-binding: allow — node-local script teardown, joined below
-                kills.spawn(async move { pty.kill(id).await });
+    /// Kill every matching process (joining a kill already under way), then
+    /// wait until each kill's whole process-group teardown is done and each
+    /// process's reaper has recorded its exit. A kill started elsewhere
+    /// (`scriptStop`) of a process already reaped is waited for too. The
+    /// wait is bounded by [`reap_wait`]: past it, what is still not done is
+    /// logged and left. Returns whether everything finished.
+    async fn kill_where(&self, matches: impl Fn(&Key, NodeCounter) -> bool) -> bool {
+        let mut waits: Vec<tokio::sync::watch::Receiver<bool>> = Vec::new();
+        let victims: Vec<(Key, PtyId, NodeCounter)> = {
+            let running = lock(&self.running);
+            for (key, p) in running.iter() {
+                if matches(key, p.generation) {
+                    waits.push(p.reaped.clone());
+                }
             }
-            while kills.join_next().await.is_some() {}
-            for (_, mut reaped) in victims {
-                let _ = reaped.wait_for(|reaped| *reaped).await;
+            running
+                .iter()
+                .filter(|(key, p)| matches(key, p.generation))
+                .map(|(key, p)| (key.clone(), p.pty_id, p.generation))
+                .collect()
+        };
+        for (key, pty_id, generation) in &victims {
+            waits.push(self.kill(key, *pty_id, *generation));
+        }
+        for kill in lock(&self.kills)
+            .iter()
+            .filter(|(key, kill)| matches(key, kill.generation))
+            .map(|(_, kill)| kill.done.clone())
+        {
+            waits.push(kill);
+        }
+        let done = tokio::time::timeout(reap_wait(), async {
+            for mut wait in waits {
+                let _ = wait.wait_for(|done| *done).await;
             }
         })
         .await

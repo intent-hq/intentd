@@ -444,3 +444,58 @@ async fn a_stuck_process_does_not_hold_up_stop_agent_or_stop_all() {
         .await
         .expect("stop_all waited past the reap bound");
 }
+
+/// The whole process group, not only the shell, is gone when `stop_agent`
+/// returns after an ordinary `scriptStop` started the kill: the shell exits
+/// on SIGTERM at once while a descendant that ignores it lives until the
+/// original kill's SIGKILL, and `stop_agent` must wait for that kill.
+#[tokio::test]
+async fn stop_agent_waits_for_a_script_stops_whole_group_teardown() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stop-group");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(
+                &a,
+                "p1",
+                r#"exec /bin/sh -c 'sh -c "trap \"\" TERM HUP; echo trapped-\$\$; while :; do sleep 1; done" & sleep 300'"#,
+            ),
+        )
+        .await;
+    started_pid(&mut f.head, "p1").await;
+    let mut output = String::new();
+    let descendant: u32 = loop {
+        match tokio::time::timeout(wait(), f.head.events.recv())
+            .await
+            .expect("the descendant never printed its pid")
+            .expect("link closed")
+        {
+            LinkEvent::Frame(LinkFrame::ScriptOutput(o)) if o.spawn_id == "p1" => {
+                output.push_str(&o.data);
+                if let Some(pid) = output
+                    .split_whitespace()
+                    .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+                {
+                    break pid;
+                }
+            }
+            LinkEvent::Frame(LinkFrame::ScriptExited(e)) if e.spawn_id == "p1" => {
+                panic!("exited early: {e:?} after {output:?}")
+            }
+            _ => {}
+        }
+    };
+    assert!(pid_alive(descendant));
+    f.scripts.stop(&f.link, &process(&a, "p1"));
+    tokio::task::yield_now().await;
+    tokio::time::timeout(wait(), f.scripts.stop_agent(&a))
+        .await
+        .unwrap();
+    assert!(
+        !pid_alive(descendant),
+        "stop_agent returned while the script's trapped descendant still ran"
+    );
+}
