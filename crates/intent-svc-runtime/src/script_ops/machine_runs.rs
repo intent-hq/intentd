@@ -69,6 +69,17 @@ pub(crate) struct RunPlace {
     pub agent_id: AgentId,
 }
 
+/// How a process's run ended, for the monitor's final-line check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The machine reported the process's exit (`scriptExited`): its output
+    /// reached EOF, so an unterminated final line is a real line.
+    ProcessExit,
+    /// The run ended without the process's own EOF (lost link, unsent
+    /// frame, unacknowledged stop, lease end): a cut-off line is a gap.
+    StreamGap,
+}
+
 struct Monitor {
     id: String,
     run_id: Option<String>,
@@ -266,6 +277,7 @@ impl MachineRuns {
                 &spawn_id,
                 None,
                 Some(format!("remote-script-lost: {error}")),
+                Ending::StreamGap,
             )
             .await;
             return self.state(place).ok_or(error);
@@ -311,7 +323,8 @@ impl MachineRuns {
             // Unacknowledged within the wait: the machine stops it once
             // the link drops; settle it here so the run is not left live.
             if self.spawn_of(place).as_deref() == Some(spawn_id.as_str()) {
-                self.settle(place, &spawn_id, None, None).await;
+                self.settle(place, &spawn_id, None, None, Ending::StreamGap)
+                    .await;
             }
         } else {
             // Restarting between processes: nothing runs on the machine.
@@ -519,8 +532,14 @@ impl MachineRuns {
                 error,
                 ..
             }) => {
-                self.settle(&place, &spawn_id, exit_code.map(i64::from), error)
-                    .await;
+                self.settle(
+                    &place,
+                    &spawn_id,
+                    exit_code.map(i64::from),
+                    error,
+                    Ending::ProcessExit,
+                )
+                .await;
             }
             _ => {}
         }
@@ -589,6 +608,7 @@ impl MachineRuns {
         spawn_id: &str,
         exit_code: Option<i64>,
         error: Option<String>,
+        ending: Ending,
     ) {
         let (restart, wake) = {
             let mut runs = lock(&self.inner.runs);
@@ -661,9 +681,11 @@ impl MachineRuns {
                 let wake = monitor.map(|mut monitor| {
                     // As the home run's monitor: the final line, unterminated
                     // at exit, is checked before the exit wake.
-                    let last = monitor
-                        .decoder
-                        .eof()
+                    // Only the process's own EOF flushes the final line; a
+                    // line cut off by a lost link is a stream gap.
+                    let last = (ending == Ending::ProcessExit)
+                        .then(|| monitor.decoder.eof())
+                        .flatten()
                         .and_then(|line| line.text)
                         .filter(|text| monitor.pattern.as_ref().is_some_and(|p| p.is_match(text)));
                     match (last, &error) {
@@ -736,6 +758,7 @@ impl MachineRuns {
                 &spawn_id,
                 None,
                 Some("remote-script-lost: the machine disconnected".into()),
+                Ending::StreamGap,
             )
             .await;
             return;
@@ -757,8 +780,14 @@ impl MachineRuns {
             .collect();
         for (place, spawn) in lost {
             if let Some(spawn) = spawn {
-                self.settle(&place, &spawn, None, Some(reason.to_owned()))
-                    .await;
+                self.settle(
+                    &place,
+                    &spawn,
+                    None,
+                    Some(reason.to_owned()),
+                    Ending::StreamGap,
+                )
+                .await;
             }
         }
     }
@@ -818,8 +847,14 @@ impl MachineRuns {
             }
         }
         for (place, _, spawn) in &live {
-            self.settle(place, spawn, None, Some(reason.to_owned()))
-                .await;
+            self.settle(
+                place,
+                spawn,
+                None,
+                Some(reason.to_owned()),
+                Ending::StreamGap,
+            )
+            .await;
         }
         let dropped: Vec<RunPlace> = {
             let mut runs = lock(&self.inner.runs);

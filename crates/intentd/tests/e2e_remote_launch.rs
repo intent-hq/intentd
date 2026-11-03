@@ -682,7 +682,8 @@ async fn machine_run_until(
     done: impl Fn(&Value) -> bool,
 ) -> Value {
     let mut id = first_id;
-    timeout(wait(), async {
+    let mut last = Value::Null;
+    let reached = timeout(wait(), async {
         loop {
             id += 1;
             let row = script_row(rpc_ws, (ws_id, script_id), id).await;
@@ -690,12 +691,15 @@ async fn machine_run_until(
             if done(&run) {
                 return run;
             }
+            last = row;
             // timing-guard: poll interval for the machine's script frames to settle the run
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("the machine run reached the expected state")
+    .await;
+    reached.unwrap_or_else(|_| {
+        panic!("the machine run never reached the expected state; last row: {last}")
+    })
 }
 
 /// A remote agent's saved scripts run on its machine: the run, its output,

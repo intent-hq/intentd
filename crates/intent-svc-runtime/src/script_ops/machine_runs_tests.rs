@@ -669,3 +669,29 @@ async fn a_final_line_without_a_newline_matches_before_the_exit() {
     assert!(wakes[0].1.contains("output matched"), "{}", wakes[0].1);
     assert!(wakes[0].1.contains("READY"), "{}", wakes[0].1);
 }
+
+/// Review of intentd#3005: the final-line check runs only on the process's
+/// real exit. A line cut off by a lost link is a stream gap, not EOF: the
+/// monitor wakes with `remote-script-lost`, never a match on the fragment.
+#[tokio::test]
+async fn a_line_cut_off_by_a_lost_link_does_not_match() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    runs.monitor(
+        &place(&agent),
+        &serde_json::json!({ "ttlMs": 60000, "outputPattern": "Listening" }),
+    )
+    .unwrap();
+    frame(&runs, output(&start, 0, "Listening on port 30")).await;
+    runs.link_lost("mac", "remote-script-lost: the machine disconnected")
+        .await;
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert!(wakes[0].1.contains("remote-script-lost"), "{}", wakes[0].1);
+    assert!(!wakes[0].1.contains("output matched"), "{}", wakes[0].1);
+}
