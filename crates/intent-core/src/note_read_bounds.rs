@@ -605,6 +605,14 @@ pub fn comment_list_scope(workspace_id: &str, note_id: &str) -> String {
 /// `commentsTruncated: true` (read the whole thread with
 /// `comment.getThread`). Returns the rows and the `nextToken`.
 ///
+/// `lastActivity` changes when a thread gets a reply, so a plain keyset on
+/// it would skip a thread replied to mid-walk (it jumps ahead of the
+/// cursor). The walk therefore runs in rounds: a round serves the threads
+/// whose activity falls in `(lo, hi]`, where `hi` is the newest activity
+/// when the round starts. Threads that gain activity during the round move
+/// above `hi` and are served by the next round, so no thread is skipped; a
+/// thread can appear twice in one walk, and the later row is the newer one.
+///
 /// # Errors
 /// `"invalid nextToken"` for a token not minted for this note's threads.
 pub fn comment_list_page(
@@ -620,10 +628,48 @@ pub fn comment_list_page(
             .cmp(&a.last_activity)
             .then_with(|| a.thread_id.cmp(&b.thread_id))
     });
-    if let Some(token) = page.next_token.as_deref() {
-        let (key, id) = parse_page_token(token, &scope)?;
-        threads.retain(|t| t.last_activity < key || (t.last_activity == key && t.thread_id > id));
-    }
+    let newest = |threads: &[crate::model::CommentThreadSummary]| {
+        threads.first().map(|t| t.last_activity.clone())
+    };
+    let mut cursor = match page.next_token.as_deref() {
+        None => CommentCursor {
+            lo: None,
+            hi: newest(&threads).unwrap_or_default(),
+            at: None,
+        },
+        Some(token) => {
+            let (key, id) = parse_page_token(token, &scope)?;
+            let key: CommentCursorKey =
+                serde_json::from_str(&key).map_err(|_| "invalid nextToken")?;
+            CommentCursor {
+                lo: key.lo,
+                hi: key.hi,
+                at: key.at.map(|at| (at, id)),
+            }
+        }
+    };
+    // Advance to the next round while this one has nothing left, so a
+    // page is empty only when the walk is over.
+    let window = loop {
+        let window: Vec<_> = threads
+            .iter()
+            .filter(|t| cursor.contains(t))
+            .cloned()
+            .collect();
+        let newer = newest(&threads).filter(|n| *n > cursor.hi);
+        match newer {
+            Some(newer) if window.is_empty() => {
+                cursor = CommentCursor {
+                    lo: Some(cursor.hi),
+                    hi: newer,
+                    at: None,
+                };
+            }
+            _ => break window,
+        }
+    };
+    let all_threads = threads;
+    let threads = window;
     let render =
         |t: &crate::model::CommentThreadSummary| serde_json::to_value(t).unwrap_or_default();
     let shrink = |t: &crate::model::CommentThreadSummary, room: usize| {
@@ -651,9 +697,64 @@ pub fn comment_list_page(
         row
     };
     let (rows, last) = take_page(&threads, page.limit, budget, render, shrink);
-    let next =
-        last.map(|idx| page_token(&scope, &threads[idx].last_activity, &threads[idx].thread_id));
-    Ok((rows, next))
+    let next = match last {
+        Some(idx) => Some(CommentCursor {
+            lo: cursor.lo.clone(),
+            hi: cursor.hi.clone(),
+            at: Some((
+                threads[idx].last_activity.clone(),
+                threads[idx].thread_id.clone(),
+            )),
+        }),
+        // Round done: start another for threads that gained activity.
+        None => newest(&all_threads)
+            .filter(|n| *n > cursor.hi)
+            .map(|newer| CommentCursor {
+                lo: Some(cursor.hi.clone()),
+                hi: newer,
+                at: None,
+            }),
+    };
+    Ok((rows, next.map(|c| c.token(&scope))))
+}
+
+/// Position of a `comment.list` walk (see [`comment_list_page`]): the
+/// activity window `(lo, hi]` of the current round and the last thread
+/// served in it (`at` = its `lastActivity` and `threadId`).
+struct CommentCursor {
+    lo: Option<String>,
+    hi: String,
+    at: Option<(String, String)>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct CommentCursorKey {
+    lo: Option<String>,
+    hi: String,
+    at: Option<String>,
+}
+
+impl CommentCursor {
+    fn contains(&self, t: &crate::model::CommentThreadSummary) -> bool {
+        let la = &t.last_activity;
+        if *la > self.hi || self.lo.as_ref().is_some_and(|lo| la <= lo) {
+            return false;
+        }
+        match &self.at {
+            None => true,
+            Some((at, id)) => la < at || (la == at && t.thread_id > *id),
+        }
+    }
+
+    fn token(&self, scope: &str) -> String {
+        let key = CommentCursorKey {
+            lo: self.lo.clone(),
+            hi: self.hi.clone(),
+            at: self.at.as_ref().map(|(at, _)| at.clone()),
+        };
+        let id = self.at.as_ref().map_or("*", |(_, id)| id.as_str());
+        page_token(scope, &serde_json::to_string(&key).unwrap_or_default(), id)
+    }
 }
 
 /// One bounded page of a note's checkbox rows for `note.listTasks`: rows
@@ -1247,6 +1348,70 @@ mod tests {
                     .collect(),
             ),
         }
+    }
+
+    /// A reply bumps `lastActivity`, which moved an unserved thread ahead
+    /// of a plain activity keyset so the walk skipped it. Every thread
+    /// replied to mid-walk must still be served, with its newest row last.
+    #[test]
+    fn threads_replied_to_mid_walk_are_not_skipped() {
+        let mut threads: Vec<_> = (0..30)
+            .map(|i| thread(&format!("th{i:02}"), &format!("t{i:03}"), 1))
+            .collect();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut token = None;
+        let mut clock = 100;
+        for _ in 0..50 {
+            let page = PageRequest::new(Some(4), 4, 4, token.take());
+            let (rows, next) =
+                comment_list_page(threads.clone(), "w", "n1", &page, NOTE_READ_BUDGET_BYTES)
+                    .unwrap();
+            seen.extend(rows.iter().map(|r| {
+                (
+                    r["threadId"].as_str().unwrap().to_string(),
+                    r["lastActivity"].as_str().unwrap().to_string(),
+                )
+            }));
+            let Some(next) = next else { break };
+            token = Some(next);
+            // Reply to the oldest thread not served yet, and to one that was.
+            for id in ["th00", "th29"] {
+                if clock < 106 {
+                    clock += 1;
+                    let t = threads.iter_mut().find(|t| t.thread_id == id).unwrap();
+                    t.last_activity = format!("t{clock:03}");
+                }
+            }
+        }
+        assert!(seen.len() > 30, "replied threads were served again");
+        for t in &threads {
+            let last = seen
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == t.thread_id)
+                .unwrap_or_else(|| panic!("{} was skipped", t.thread_id));
+            assert_eq!(
+                last.1, t.last_activity,
+                "{} ends on its newest row",
+                t.thread_id
+            );
+        }
+        assert_eq!(
+            comment_list_page(
+                threads,
+                "w",
+                "n1",
+                &PageRequest::new(
+                    None,
+                    4,
+                    4,
+                    Some(page_token("comment.list:w:n1", "t001", "x"))
+                ),
+                NOTE_READ_BUDGET_BYTES,
+            )
+            .unwrap_err(),
+            "invalid nextToken"
+        );
     }
 
     #[test]
