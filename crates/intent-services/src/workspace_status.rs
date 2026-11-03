@@ -1136,7 +1136,12 @@ pub(crate) struct MonitorPrSignals {
 ///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
-///    never falls through to `complete`/`idle`; a monitor whose PR the
+///    never falls through to `complete`/`idle`. Queue membership is read
+///    across every input of the rung: any open, non-draft PR in the merge
+///    queue — linked, pooled or monitored — yields `pr_queued` even when the
+///    PR the rung would otherwise pick reads ready/open (a workspace
+///    sequencing a cross-repo merge waits on the queue, not the user); a
+///    monitor whose PR the
 ///    workspace already holds as a fresher terminal copy contributes
 ///    nothing ([`terminal_pr_copies`]). When none of those carries
 ///    an open/draft entry but the workspace `prStatus` column is
@@ -1548,33 +1553,41 @@ fn rollup_over_pr_pool(
             .filter(is_open)
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
+    // A PR sitting in the merge queue is beyond "ready" — the queue is
+    // handling it. The signal is the fold-persisted `isInMergeQueue`
+    // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR) or a
+    // host that does report `mergeable_state: "queued"`. Queue membership is
+    // read across EVERY step-4 input — the linked PR, any open pool entry,
+    // and the ACTIVE monitors — not just the PR picked below: a workspace
+    // whose own PR is mergeable while it sequences another PR through the
+    // queue is waiting on the queue, not on the user.
+    let queued_open = |pr: &PullRequestInfo| {
+        pr.status == PullRequestStatus::Open && pr.is_draft != Some(true) && pr_in_merge_queue(pr)
+    };
+    if monitor_prs.queued
+        || active_pr.is_some_and(queued_open)
+        || pull_requests.iter().any(queued_open)
+    {
+        return WorkspaceDisplayStatus::PrQueued;
+    }
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        // A PR sitting in the merge queue is beyond "ready" — the queue is
-        // handling it. The signal is the fold-persisted `isInMergeQueue`
-        // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR)
-        // or a host that does report `mergeable_state: "queued"`.
-        let queued = pr_in_merge_queue(pr);
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
         let clean = pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("clean");
-        return if queued && !draft {
-            WorkspaceDisplayStatus::PrQueued
-        } else if clean && !draft {
+        return if clean && !draft {
             WorkspaceDisplayStatus::PrReady
         } else {
             WorkspaceDisplayStatus::PrOpen
         };
     }
     // Agent-monitored PRs are the same rung as the linked open PR above: an
-    // ACTIVE monitor on an open PR reads `pr_queued`/`pr_ready`/`pr_open`
-    // even when the PR belongs to another repo and never enters the
-    // workspace linkage. A linked open PR wins first only because it carries
-    // richer data; the mapping is identical.
-    if monitor_prs.queued {
-        return WorkspaceDisplayStatus::PrQueued;
-    }
+    // ACTIVE monitor on an open PR reads `pr_ready`/`pr_open` (its queued
+    // signal is folded in above) even when the PR belongs to another repo
+    // and never enters the workspace linkage. A linked open PR wins first
+    // only because it carries richer readiness data; the mapping is
+    // identical.
     if monitor_prs.ready {
         return WorkspaceDisplayStatus::PrReady;
     }
@@ -2574,7 +2587,8 @@ mod display_status {
             ),
             WorkspaceDisplayStatus::InProgress
         );
-        // A linked open PR wins the shared rung even over a queued monitor.
+        // Queue membership is not "richer data" the linked PR owns: a queued
+        // monitor lifts a linked open PR to `pr_queued` too.
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
             super::compute_display_status(
@@ -2588,8 +2602,99 @@ mod display_status {
                 queued,
                 None
             ),
-            WorkspaceDisplayStatus::PrOpen
+            WorkspaceDisplayStatus::PrQueued
         );
+    }
+
+    /// A workspace whose linked PR is mergeable while it watches another
+    /// PR (e.g. the intentd half of a cross-repo change) sitting in the
+    /// merge queue reads `pr_queued`, not `pr_ready`: the user already
+    /// approved the merges and the agent is waiting on the queue, so the
+    /// workspace must not surface as "needs you".
+    #[test]
+    fn queued_monitor_outranks_a_ready_linked_pr() {
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
+        let queued_and_ready = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, true, false)
+        };
+        for (active, pool) in [
+            (Some(&ready), &[][..]),
+            (None, std::slice::from_ref(&ready)),
+        ] {
+            assert_eq!(
+                super::compute_display_status(
+                    sig(false),
+                    false,
+                    active,
+                    pool,
+                    &[],
+                    None,
+                    None,
+                    queued_and_ready,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued
+            );
+        }
+        // Without the queued monitor the same workspace still reads ready.
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                Some(&ready),
+                &[],
+                &[],
+                None,
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    /// An older open pool PR in the merge queue outranks a newer mergeable
+    /// one: the most-recently-updated pick chooses which PR's readiness to
+    /// show, but any queued open PR means the workspace is waiting.
+    #[test]
+    fn any_queued_open_pool_pr_is_pr_queued() {
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        queued.url = ROOT_PR_URL.to_string();
+        queued.is_in_merge_queue = Some(true);
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
+        let pool = [queued.clone(), ready.clone()];
+        assert_eq!(
+            compute_display_status(sig(false), false, None, &pool, None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&ready), &pool, None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // A queued draft never counts, and a merged/closed queued copy is
+        // not open.
+        let mut draft = queued.clone();
+        draft.status = PullRequestStatus::Draft;
+        let mut merged = queued;
+        merged.status = PullRequestStatus::Merged;
+        for other in [draft, merged] {
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&ready),
+                    &[other, ready.clone()],
+                    None,
+                    None
+                ),
+                WorkspaceDisplayStatus::PrReady
+            );
+        }
     }
 
     /// Step 4 via monitors: an ACTIVE monitor on an open PR yields

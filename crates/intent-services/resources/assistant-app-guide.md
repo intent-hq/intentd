@@ -492,7 +492,8 @@ running command script such as a build or test, or an agent's background task su
 a shell command it left running; a dev server or other service script, or an open
 terminal tab, alone does not count. **Waiting** covers workspaces watching something external: a
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
-the merge queue. The **Waiting** filter shows the same workspaces.
+the merge queue (even when another of its PRs is ready to merge). The **Waiting** filter
+shows the same workspaces.
 
 The PR badge in list and board views shows a PR in the merge queue first, then
 draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
