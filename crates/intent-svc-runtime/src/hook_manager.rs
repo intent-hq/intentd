@@ -87,6 +87,10 @@ pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
+/// Largest `cron` expression `hook.schedule` stores, in UTF-8 bytes. A valid
+/// five-field expression is far shorter; padding (repeated list items,
+/// inner whitespace) must not make the stored row unbounded.
+const HOOK_CRON_MAX_BYTES: usize = 4 * 1024;
 /// Wire `hook.list` page params from `wire`: `includeRetired` (lenient as
 /// before paging: a non-boolean reads as `false`), `limit` (1–200, default
 /// 100) and a nonempty `cursor`. The payload sweep scans this function for
@@ -457,6 +461,13 @@ fn parse_schedule_kind(params: &Value) -> Result<ScheduleKind> {
         return Ok(ScheduleKind::Delay(delay_ms));
     }
     if let Some(v) = params.get("cron") {
+        let bytes = v.as_str().map_or(0, str::len);
+        if bytes > HOOK_CRON_MAX_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "hook.schedule: `cron` is {bytes} bytes; the limit is {HOOK_CRON_MAX_BYTES} \
+                 bytes (UTF-8)"
+            )));
+        }
         let expr = v
             .as_str()
             .map(str::trim)
@@ -3355,6 +3366,78 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.cron.as_deref(), Some("*/5 * * * *"));
         assert_eq!(stored.run_at, None);
+    }
+
+    /// `cron` is capped at 4 KiB of UTF-8 before parsing. The padded
+    /// expressions here are valid (inner whitespace), so only the size
+    /// decides: one byte over is refused and nothing is stored; exactly at
+    /// the limit schedules.
+    #[tokio::test]
+    async fn schedule_caps_cron_expression_bytes() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let padded = |total: usize| {
+            let tail = "* * * *";
+            format!("0{}{tail}", " ".repeat(total - 1 - tail.len()))
+        };
+        let over = padded(HOOK_CRON_MAX_BYTES + 1);
+        assert_eq!(over.len(), HOOK_CRON_MAX_BYTES + 1);
+        parse_cron(&over).expect("padding keeps the expression valid");
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "big-cron", "code": "return;", "cron": over }),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`cron`") && msg.contains(&format!("{HOOK_CRON_MAX_BYTES} bytes")),
+            "{msg}"
+        );
+        assert!(svc
+            .store()
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let at = padded(HOOK_CRON_MAX_BYTES);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "max-cron", "code": "return { dispatch: false };", "cron": at }),
+            )
+            .await
+            .expect("cron at the limit schedules");
+        assert_eq!(
+            out["hook"]["cron"].as_str().map(str::len),
+            Some(HOOK_CRON_MAX_BYTES)
+        );
+
+        // A row stored before the cap is not rewritten and stays readable.
+        let scheduled: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        let legacy = Hook {
+            hook_id: HookId::new(),
+            name: "legacy-cron".into(),
+            cron: Some(padded(HOOK_CRON_MAX_BYTES * 2)),
+            ..scheduled
+        };
+        svc.store().insert_hook(&legacy).await.unwrap();
+        let stored = svc.store().get_hook(&legacy.hook_id).await.unwrap();
+        assert_eq!(stored.cron, legacy.cron);
+        let listed = svc.hook_list_op(&ws, None, false).await.unwrap();
+        let row = listed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == "legacy-cron")
+            .expect("legacy hook listed");
+        assert_eq!(
+            row["cron"].as_str().map(str::len),
+            Some(HOOK_CRON_MAX_BYTES * 2)
+        );
     }
 
     /// runAt-kind validation: non-RFC3339 and past timestamps are rejected,

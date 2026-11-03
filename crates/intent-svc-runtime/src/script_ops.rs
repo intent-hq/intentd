@@ -443,6 +443,44 @@ impl Drop for RunReservation {
     }
 }
 
+/// Largest saved `name`, `cwd` or `category`, in UTF-8 bytes. `command` is
+/// not capped: `script.get` serves an oversized command in parts.
+pub(crate) const SCRIPT_TEXT_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Largest saved `env`: all keys plus all values, in UTF-8 bytes.
+pub(crate) const SCRIPT_ENV_MAX_BYTES: usize = 64 * 1024;
+
+/// Write-time size caps for a script definition. Rows saved before the caps
+/// existed are not rewritten; reads keep serving them as stored.
+fn check_script_field_sizes(params: &ScriptCreateParams) -> Result<()> {
+    let text_fields = [
+        ("name", Some(params.name.as_str())),
+        ("cwd", params.cwd.as_deref()),
+        ("category", params.category.as_deref()),
+    ];
+    for (field, value) in text_fields {
+        let bytes = value.map_or(0, str::len);
+        if bytes > SCRIPT_TEXT_FIELD_MAX_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "script.create: `{field}` is {bytes} bytes; the limit is \
+                 {SCRIPT_TEXT_FIELD_MAX_BYTES} bytes (UTF-8)"
+            )));
+        }
+    }
+    let env_bytes: usize = params
+        .env
+        .iter()
+        .flatten()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    if env_bytes > SCRIPT_ENV_MAX_BYTES {
+        return Err(Error::InvalidParams(format!(
+            "script.create: `env` keys and values total {env_bytes} bytes; the limit is \
+             {SCRIPT_ENV_MAX_BYTES} bytes (UTF-8)"
+        )));
+    }
+    Ok(())
+}
+
 impl ScriptManager {
     /// Wire the manager over the shared host/bus/store/registry/bootstrap-locks.
     pub(crate) fn new(
@@ -639,6 +677,8 @@ impl ScriptManager {
         params: ScriptCreateParams,
         scoped: bool,
     ) -> Result<Value> {
+        // Refuse oversized fields before taking any lock or writing anything.
+        check_script_field_sizes(&params)?;
         let id = params
             .script_id
             .filter(|s| !s.is_empty())
@@ -4213,6 +4253,183 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+    }
+
+    fn sized_params(
+        name: String,
+        cwd: Option<String>,
+        category: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
+    ) -> ScriptCreateParams {
+        ScriptCreateParams {
+            name,
+            command: "echo sized".into(),
+            mode: ScriptMode::Command,
+            cwd,
+            category,
+            env,
+            ..Default::default()
+        }
+    }
+
+    fn env_of_bytes(total: usize) -> std::collections::BTreeMap<String, String> {
+        // One key `K` plus a value filling the rest, counted in UTF-8 bytes.
+        std::collections::BTreeMap::from([("K".to_string(), "v".repeat(total - 1))])
+    }
+
+    /// Each capped field one byte over its limit is refused with -32602
+    /// naming the field and limit, and nothing is written.
+    #[intent_test_macros::daemon_test]
+    async fn script_create_refuses_each_oversized_field_and_writes_nothing() {
+        let h = harness().await;
+        let over = "a".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES + 1);
+        let cases = [
+            ("name", sized_params(over.clone(), None, None, None)),
+            (
+                "cwd",
+                sized_params("n".into(), Some(over.clone()), None, None),
+            ),
+            (
+                "category",
+                sized_params("n".into(), None, Some(over.clone()), None),
+            ),
+            (
+                "env",
+                sized_params(
+                    "n".into(),
+                    None,
+                    None,
+                    Some(env_of_bytes(SCRIPT_ENV_MAX_BYTES + 1)),
+                ),
+            ),
+        ];
+        for (field, params) in cases {
+            let err = h
+                .services
+                .script_create(h.ws.clone(), params)
+                .await
+                .expect_err(field);
+            let limit = if field == "env" {
+                SCRIPT_ENV_MAX_BYTES
+            } else {
+                SCRIPT_TEXT_FIELD_MAX_BYTES
+            };
+            match &err {
+                Error::InvalidParams(m) => {
+                    assert!(m.contains(&format!("`{field}`")), "{field}: {m}");
+                    assert!(m.contains(&format!("{limit} bytes")), "{field}: {m}");
+                }
+                other => panic!("{field}: expected InvalidParams, got {other:?}"),
+            }
+        }
+        assert!(h
+            .services
+            .store()
+            .list_all_scripts()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Exactly at each limit is accepted, and multi-byte text is counted in
+    /// UTF-8 bytes rather than characters.
+    #[intent_test_macros::daemon_test]
+    async fn script_create_accepts_fields_at_the_limit_and_counts_utf8_bytes() {
+        let h = harness().await;
+        let at = "a".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES);
+        let id = create(
+            &h,
+            sized_params(
+                at.clone(),
+                Some(at.clone()),
+                Some(at.clone()),
+                Some(env_of_bytes(SCRIPT_ENV_MAX_BYTES)),
+            ),
+        )
+        .await;
+        let got = h.services.script_get(h.ws.clone(), id).await.expect("get");
+        assert_eq!(
+            got["name"].as_str().map(str::len),
+            Some(SCRIPT_TEXT_FIELD_MAX_BYTES)
+        );
+        assert_eq!(
+            got["cwd"].as_str().map(str::len),
+            Some(SCRIPT_TEXT_FIELD_MAX_BYTES)
+        );
+
+        // `é` is two bytes: 2048 of them fit exactly, 2049 do not, even
+        // though 2049 characters is far under 4096.
+        let fits = "é".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES / 2);
+        create(&h, sized_params(fits, None, None, None)).await;
+        let over = "é".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES / 2 + 1);
+        let err = h
+            .services
+            .script_create(h.ws.clone(), sized_params(over, None, None, None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("`name`")),
+            "{err:?}"
+        );
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("K".to_string(), "é".repeat(SCRIPT_ENV_MAX_BYTES / 2));
+        let err = h
+            .services
+            .script_create(
+                h.ws.clone(),
+                sized_params("n".into(), None, None, Some(env)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("`env`")),
+            "{err:?}"
+        );
+    }
+
+    /// A row saved before the caps existed is not rewritten: `script.get`
+    /// and `script.list` still serve it as stored.
+    #[intent_test_macros::daemon_test]
+    async fn script_rows_over_the_new_caps_stay_readable() {
+        let h = harness().await;
+        let name = "n".repeat(SCRIPT_TEXT_FIELD_MAX_BYTES * 2);
+        let env = env_of_bytes(SCRIPT_ENV_MAX_BYTES * 2);
+        h.services
+            .store()
+            .upsert_script(&Script {
+                purpose: intent_core::ScriptPurpose::Saved,
+                archived_at: None,
+                last_run: None,
+                id: "legacy-over-cap".into(),
+                workspace_id: h.ws.0.clone(),
+                name: name.clone(),
+                command: "echo legacy".into(),
+                cwd: None,
+                env: Some(env.clone()),
+                mode: ScriptMode::Command,
+                category: None,
+                source: "user".into(),
+                auto_start: Some(false),
+                created_at: now_iso(),
+                updated_at: None,
+            })
+            .await
+            .unwrap();
+        // A restart reloads stored rows into the registry `script.list` reads.
+        h.services.hydrate_scripts().await.expect("hydrate");
+        let got = h
+            .services
+            .script_get(h.ws.clone(), "legacy-over-cap".into())
+            .await
+            .expect("legacy row readable");
+        assert_eq!(got["name"], name);
+        assert_eq!(got["env"]["K"].as_str().map(str::len), Some(env["K"].len()));
+        let listed = h.services.script_list(h.ws.clone()).await.expect("list");
+        assert!(listed["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "legacy-over-cap"));
     }
 
     #[intent_test_macros::daemon_test]
