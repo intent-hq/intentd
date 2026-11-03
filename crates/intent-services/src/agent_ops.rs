@@ -6074,7 +6074,7 @@ impl Services {
         if let Some(parent) = &parent_agent_id {
             let parent_depth = self
                 .store
-                .get_agent_session(parent)
+                .get_agent_session_summary(parent)
                 .await
                 .ok()
                 .and_then(|s| s.delegation_depth)
@@ -6918,7 +6918,7 @@ impl Services {
         // failing the idempotent delete. When the caller declares a
         // workspace, reject a cross-workspace bare-id probe by mapping to
         // `NotFound` before touching the store.
-        let session_observation = self.store.get_agent_session(&agent_id).await;
+        let session_observation = self.store.get_agent_session_summary(&agent_id).await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
         let session_meta = session_observation
             .ok()
@@ -8226,7 +8226,7 @@ impl Services {
         content: Value,
         metadata: Option<Value>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         // Own admission through transcript persistence, events and derived state.
         // Nested drain helpers reuse this permit even if deletion is queued.
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
@@ -8335,7 +8335,7 @@ impl Services {
             metadata: Option<Value>,
             created_at: String,
         }
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
@@ -8494,7 +8494,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<usize> {
-        let session = self.store.get_agent_session(agent_id).await?;
+        let session = self.store.get_agent_session_summary(agent_id).await?;
         let messages = self.store.get_agent_messages(agent_id, None).await?;
         let idx = Self::find_edit_target(&messages, message_id)?;
         let keep = &messages[..idx];
@@ -9250,7 +9250,7 @@ impl Services {
         // editing: true → false ⇒ the message is now ready-to-send. Self-drain.
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
-                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                if let Ok(session) = self.store.get_agent_session_summary(&agent_id).await {
                     manager
                         .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
                         .await;
@@ -9701,7 +9701,12 @@ impl Services {
                 // vanished between the up-front validation and the append
                 // (concurrent delete), fail closed like the guard rather than
                 // auto-queueing a phantom message for a gone agent.
-                if self.store.get_agent_session(&agent_id).await.is_err() {
+                if self
+                    .store
+                    .get_agent_session_summary(&agent_id)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
                     return Err(Error::InvalidParams(format!(
                         "unknown agent id: {}",
@@ -11674,7 +11679,7 @@ impl Services {
                 // cannot be resolved (matches the pre-lift behavior).
                 let parent_home_ws = self
                     .store
-                    .get_agent_session(&parent)
+                    .get_agent_session_summary(&parent)
                     .await
                     .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
                 // Deliver the wake to the parent unconditionally (even if no
@@ -12156,7 +12161,7 @@ impl Services {
         if let Some(parent) = &parent {
             let parent_home_ws = self
                 .store
-                .get_agent_session(parent)
+                .get_agent_session_summary(parent)
                 .await
                 .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             let wake_text = crate::harness::latest().attention_parent_wake(
@@ -12605,7 +12610,7 @@ impl Services {
         // `delegationDepth` (parent depth + 1; P3-1.2b), the depth-limit guard
         // below, and the completion-watch registration.
         let parent_session = match &parent_agent_id {
-            Some(parent) => self.store.get_agent_session(parent).await.ok(),
+            Some(parent) => self.store.get_agent_session_summary(parent).await.ok(),
             None => None,
         };
         let _parent_mutation = parent_session
@@ -13291,7 +13296,7 @@ impl Services {
         // rejection is one clear error before any child is created, not N
         // identical per-task failures.
         if let Some(parent) = &parent_agent_id {
-            let parent_session = self.store.get_agent_session(parent).await.ok();
+            let parent_session = self.store.get_agent_session_summary(parent).await.ok();
             let parent_depth = parent_session
                 .as_ref()
                 .and_then(|s| s.delegation_depth)
@@ -13572,7 +13577,7 @@ impl Services {
                     if !self.has_open_delegation_group(parent) {
                         let parent_home_ws = self
                             .store
-                            .get_agent_session(parent)
+                            .get_agent_session_summary(parent)
                             .await
                             .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
                         let advisory = format!(
@@ -13704,7 +13709,11 @@ impl Services {
         base_commit_sha: String,
         snapshot_commit_sha: Option<String>,
     ) {
-        let session = match self.store.get_agent_session(agent_id).await {
+        let session = match self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!(
@@ -13814,7 +13823,11 @@ impl Services {
         // never fires, leaving the parent in a phantom "waiting" state
         // (mirrors the SUB-1 sender-watch guard below).
         let child_session = self.require_agent_session(&child_agent_id).await?;
-        let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
+        let parent_session = self
+            .store
+            .get_agent_session_summary(&parent_agent_id)
+            .await
+            .ok();
         let parent_deleted = parent_session
             .as_ref()
             .is_some_and(|s| s.status == AgentStatus::Deleted);
@@ -13879,7 +13892,11 @@ impl Services {
         // registration — a caller→target watch on an id that does not exist
         // never fires, leaving the sender in a phantom "waiting" state.
         let target_session = self.require_agent_session(&target_agent_id).await?;
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         let skip = caller_session
             .as_ref()
             .is_some_and(is_delegated_background_task_session);
@@ -14175,7 +14192,11 @@ impl Services {
                 target_agent_id.0
             )));
         }
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the caller's HOME workspace (falls back to the
         // call's workspace when the session lookup failed), mirroring
@@ -14539,7 +14560,11 @@ impl Services {
         // mirroring `agent_watch_completion_op`: fall back to the call's
         // workspace when the session lookup fails; a deleted caller can never
         // receive a wake, so registering for it is refused.
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         if caller_session
             .as_ref()
             .is_some_and(|s| s.status == AgentStatus::Deleted)
@@ -14564,7 +14589,7 @@ impl Services {
             // store failures propagate unchanged.
             let session = self
                 .store
-                .get_agent_session(&target)
+                .get_agent_session_summary(&target)
                 .await
                 .map_err(|e| match e {
                     Error::NotFound(_) => {
@@ -16098,7 +16123,7 @@ impl Services {
         let mut scan = AssignedAgentScan::default();
         for candidate in assigned.iter().rev().cloned() {
             if scan.live_session.is_some() {
-                match self.store.get_agent_session(&candidate).await {
+                match self.store.get_agent_session_summary(&candidate).await {
                     // Retired sessions are never GC'd (the poisoned path
                     // hard-deletes) — leave them untouched here.
                     Ok(session)
@@ -16114,7 +16139,7 @@ impl Services {
                 }
                 continue;
             }
-            match self.store.get_agent_session(&candidate).await {
+            match self.store.get_agent_session_summary(&candidate).await {
                 // Soft-retired: inert — never resumable and never GC'd (the
                 // poisoned path below hard-deletes, which must not touch a
                 // retired session). Treated like a stale assignment (cleaned
@@ -16200,7 +16225,7 @@ impl Services {
         // decision cannot drift between two lookups and a pass here
         // guarantees the later shared gate cannot reject.
         let caller_session = match input.caller_agent_id.as_ref() {
-            Some(caller) => self.store.get_agent_session(caller).await.ok(),
+            Some(caller) => self.store.get_agent_session_summary(caller).await.ok(),
             None => None,
         };
         // monorepo#994: a Deleted caller can never receive the wake (the
@@ -16718,7 +16743,7 @@ impl Services {
         let Some(caller) = input.caller_agent_id.as_ref() else {
             return Ok(None);
         };
-        match self.store.get_agent_session(caller).await {
+        match self.store.get_agent_session_summary(caller).await {
             Ok(session) => Ok(Some(
                 session
                     .metadata
@@ -18120,7 +18145,7 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return;
         };
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         manager
@@ -19464,7 +19489,7 @@ impl Services {
     /// lookup / write-through awaits would let this publisher emit a queue
     /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
-        let workspace_id = match self.store.get_agent_session(agent_id).await {
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
@@ -19724,7 +19749,7 @@ impl Services {
         if &target.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {target_id}")));
         }
-        match self.store.get_agent_session(poisoned_id).await {
+        match self.store.get_agent_session_summary(poisoned_id).await {
             Ok(poisoned) => {
                 if &poisoned.workspace_id != workspace_id {
                     return Err(Error::NotFound(format!("agent session {poisoned_id}")));
@@ -20543,7 +20568,7 @@ impl Services {
             // Guard: `session/load` needs a persisted acpSessionId; without one
             // the provider cannot reload, so leave the row pending for manual
             // retry rather than re-running the whole turn unattended.
-            match self.store.get_agent_session(&agent_id).await {
+            match self.store.get_agent_session_summary(&agent_id).await {
                 Ok(session) if session.acp_session_id.is_none() => {
                     tracing::info!(
                         agent_id = %agent_id,
@@ -20703,7 +20728,7 @@ impl Services {
                 // (and any group) is anchored in the parent's HOME workspace;
                 // fall back to the child's workspace when the parent session
                 // cannot be loaded (matches the pre-lift behavior).
-                let parent_session = self.store.get_agent_session(&parent).await.ok();
+                let parent_session = self.store.get_agent_session_summary(&parent).await.ok();
                 let parent_name = parent_session
                     .as_ref()
                     .map(|s| s.name.clone())
@@ -20997,13 +21022,13 @@ impl Services {
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
 
         // Load the session to check for delegation group membership
-        let session = self.store.get_agent_session(agent_id).await.ok();
+        let session = self.store.get_agent_session_summary(agent_id).await.ok();
         if let Some(session) = &session {
             if let Some(parent_id) = &session.parent_agent_id {
                 // A cross-workspace (chief) parent's group is persisted under
                 // the parent's home workspace — rehydrate it too so this
                 // abandoned child is recorded there (idempotent, best-effort).
-                if let Ok(parent_session) = self.store.get_agent_session(parent_id).await {
+                if let Ok(parent_session) = self.store.get_agent_session_summary(parent_id).await {
                     if parent_session.workspace_id != workspace_id {
                         let _ = self
                             .rehydrate_delegation_groups(&parent_session.workspace_id)

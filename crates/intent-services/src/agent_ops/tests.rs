@@ -49436,6 +49436,153 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     );
 }
 
+/// Make `agent_id`'s stored transcript undecodable so any full transcript
+/// read (`get_agent_messages(.., None)` / `get_agent_session`) fails, while
+/// the metadata lookups keep working.
+async fn poison_transcript(svc: &Services, agent_id: &AgentId) {
+    svc.store()
+        .append_agent_message(
+            agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "first" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+        .bind(&agent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    assert!(
+        svc.store().get_agent_session(agent_id).await.is_err(),
+        "fixture: a full session read must fail on the undecodable row"
+    );
+}
+
+/// Every queue mutation publishes `agent:queue:updated` through
+/// `publish_queue_updated`, which needs only the session's workspace: it must
+/// not read the transcript (a failed full read silently dropped the event).
+#[tokio::test]
+async fn queue_updated_publish_does_not_read_the_transcript() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    poison_transcript(&svc, &id).await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    svc.agent_queue_message_op(id.clone(), "first".into(), None, None, None)
+        .await
+        .expect("queue");
+
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("queue:updated must still be published")
+    .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted");
+    assert_eq!(evt.workspace_id, ws);
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+}
+
+/// `agent.wakeOrCreate` resolves the caller's delegation depth and scans the
+/// task's assigned agents on every call; both read only session metadata. A
+/// full read failed on an undecodable transcript and failed the whole wake,
+/// so the assigned agent must still be reused.
+#[intent_test_macros::daemon_test]
+async fn wake_or_create_does_not_read_the_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "Transcript-free wake").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
+        .await
+        .expect("assign");
+    poison_transcript(&svc, &caller).await;
+    poison_transcript(&svc, &target).await;
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "resume".into(),
+            AgentWakeOrCreateInput {
+                caller_agent_id: Some(caller.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("wake succeeds without reading either transcript");
+    assert_eq!(resp["agentId"].as_str(), Some(target.0.as_str()), "{resp}");
+}
+
+/// The delegation depth guards (`agent.create` and `agent.delegate`) read the
+/// parent's persisted depth. A failed full read fell back to depth 0, so a
+/// parent already at the maximum depth could spawn a child whenever its
+/// transcript could not be decoded.
+#[tokio::test]
+async fn delegation_depth_guards_do_not_read_the_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                metadata: Some(json!({ "delegationDepth": MAX_DELEGATION_DEPTH })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    poison_transcript(&svc, &parent).await;
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("create must be refused when parent at max depth");
+    assert!(
+        err.to_string().contains("maximum delegation depth"),
+        "unexpected err: {err}"
+    );
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("still trying".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect_err("delegate must be refused at max depth");
+    assert!(
+        err.to_string().contains("maximum delegation depth"),
+        "unexpected err: {err}"
+    );
+}
+
 #[tokio::test]
 async fn completion_startup_restores_repeated_parent_without_delivery_and_survives_stop() {
     for grouped in [false, true] {
