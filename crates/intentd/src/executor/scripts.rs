@@ -49,6 +49,10 @@ type Key = (AgentId, String, String);
 struct Process {
     pty_id: PtyId,
     generation: NodeCounter,
+    /// Turns true once its reaper has seen the process exit and recorded
+    /// it, however the kill was started (`scriptStop`, the binding's end or
+    /// the agent's stop). A closed channel counts as exited.
+    reaped: tokio::sync::watch::Receiver<bool>,
 }
 
 /// The script processes of one backend's agents on this machine.
@@ -157,7 +161,15 @@ impl ScriptProcesses {
                 return;
             }
         };
-        lock(&self.running).insert(key.clone(), Process { pty_id, generation });
+        let (reaped_tx, reaped) = tokio::sync::watch::channel(false);
+        lock(&self.running).insert(
+            key.clone(),
+            Process {
+                pty_id,
+                generation,
+                reaped,
+            },
+        );
         let _ = link
             .send(&LinkFrame::ScriptStarted(ScriptStarted {
                 agent_id: key.0.clone(),
@@ -169,7 +181,10 @@ impl ScriptProcesses {
         let this = self.clone();
         let link = link.clone();
         // caller-binding: allow — node-local script process supervision; the node has no service layer
-        tokio::spawn(async move { this.reap(link, key, pty_id, stream).await });
+        tokio::spawn(async move {
+            this.reap(link, key, pty_id, stream).await;
+            reaped_tx.send_replace(true);
+        });
     }
 
     /// Wait for the process to exit, then report it.
@@ -242,6 +257,17 @@ impl ScriptProcesses {
         self.kill_where(|_, p| p.generation == generation).await;
     }
 
+    /// Whether `process` is still recorded as running (until its reaper
+    /// has recorded its exit).
+    #[cfg(test)]
+    pub(super) fn is_running(&self, process: &ScriptProcessRef) -> bool {
+        lock(&self.running).contains_key(&key(
+            &process.agent_id,
+            &process.script_id,
+            &process.spawn_id,
+        ))
+    }
+
     /// Kill every process of `agent_id`.
     pub(super) async fn stop_agent(&self, agent_id: &AgentId) {
         self.kill_where(|key, _| &key.0 == agent_id).await;
@@ -252,19 +278,26 @@ impl ScriptProcesses {
         self.kill_where(|_, _| true).await;
     }
 
+    /// Kill every matching process, then wait until each one's reaper has
+    /// recorded its exit. A process another kill is already tearing down
+    /// (its terminal is gone, so this kill is a no-op) is waited for too.
     async fn kill_where(&self, matches: impl Fn(&Key, &Process) -> bool) {
-        let victims: Vec<PtyId> = lock(&self.running)
+        let victims: Vec<(PtyId, tokio::sync::watch::Receiver<bool>)> = lock(&self.running)
             .iter()
             .filter(|(key, p)| matches(key, p))
-            .map(|(_, p)| p.pty_id)
+            .map(|(_, p)| (p.pty_id, p.reaped.clone()))
             .collect();
         let mut kills = tokio::task::JoinSet::new();
-        for id in victims {
+        for (id, _) in &victims {
             let pty = self.pty.clone();
+            let id = *id;
             // caller-binding: allow — node-local script teardown, joined below
             kills.spawn(async move { pty.kill(id).await });
         }
         while kills.join_next().await.is_some() {}
+        for (_, mut reaped) in victims {
+            let _ = reaped.wait_for(|reaped| *reaped).await;
+        }
     }
 }
 

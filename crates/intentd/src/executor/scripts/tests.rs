@@ -376,3 +376,39 @@ async fn a_descendant_holding_the_terminal_does_not_hold_up_the_exit() {
         .unwrap_or_else(|| panic!("no child pid in {:?}", seen.output));
     gone(child).await;
 }
+
+/// A process an ordinary `scriptStop` is already tearing down still holds
+/// up `stop_agent` (what a final stop runs before it pushes and removes the
+/// checkout): the second kill finds the terminal already taken, so
+/// `stop_agent` must wait for the process's own reaper to record its exit,
+/// not return at once.
+#[tokio::test]
+async fn stop_agent_waits_for_a_teardown_a_script_stop_already_started() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stop");
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    let pid = started_pid(&mut f.head, "p1").await;
+    f.scripts.stop(&f.link, &process(&a, "p1"));
+    // Let the ordinary stop's kill start (and take the terminal) first.
+    tokio::task::yield_now().await;
+    tokio::time::timeout(wait(), f.scripts.stop_agent(&a))
+        .await
+        .unwrap();
+    assert!(
+        !f.scripts.is_running(&process(&a, "p1")),
+        "stop_agent returned before the process's exit was recorded"
+    );
+    assert!(
+        !pid_alive(pid),
+        "stop_agent returned while the script still ran"
+    );
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert!(seen.exited.is_some());
+}
