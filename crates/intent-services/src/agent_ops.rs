@@ -7036,6 +7036,17 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        // Stop the agent's runtime before its rows go (intent-hq/intent#8426):
+        // a local provider tree is killed, a remote agent is stopped on its
+        // machine (freeing its capacity slot). The fence keeps a racing
+        // `agent.sendMessage` from respawning it until the row is deleted —
+        // the same pattern as the `workspace.delete` sweep.
+        let _teardown_fence = match (session_workspace_id.as_ref(), self.agent_manager()) {
+            (Some(_), Some(manager)) => {
+                Some(manager.stop_many(std::slice::from_ref(&agent_id)).await)
+            }
+            _ => None,
+        };
         #[cfg(all(test, unix))]
         self.pending_delete_test_gate
             .pause("agent-secret-window", &agent_id.0)
