@@ -2042,3 +2042,51 @@ async fn node_runner_shutdown_pushes_within_the_final_bound() {
         Some(&FINAL_PUSH_TIMEOUT)
     );
 }
+
+/// A final stop's cleanup already under way when the daemon stops is joined
+/// within the shutdown drain: its push and the checkout's removal finish
+/// while the backend's links are still up (intent-hq/intent#8437).
+#[tokio::test]
+async fn node_runner_shutdown_joins_a_final_stop_cleanup_in_flight() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(1, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+    assert!(h.storage.existing_agent_dir(&id).is_some());
+
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    let cleanup = tokio::spawn(h.runner.final_stop(&id));
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let runner = h.runner.clone();
+    let shutdown = tokio::spawn(async move { runner.shutdown().await });
+    // timing-guard: a short window in which shutdown may not return while the cleanup's push is held
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown returned with a final stop's cleanup still running"
+    );
+
+    release.send(()).unwrap();
+    tokio::time::timeout(wait(), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        h.storage.existing_agent_dir(&id).is_none(),
+        "the cleanup removed the checkout before shutdown returned"
+    );
+    assert_eq!(
+        tokio::time::timeout(wait(), cleanup)
+            .await
+            .unwrap()
+            .unwrap(),
+        Some((StopOutcome::NotRunning, FinalPush::Pushed))
+    );
+}

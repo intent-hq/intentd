@@ -1655,8 +1655,10 @@ impl Runner {
         }
     }
 
-    /// Stop every agent and wait (bounded) until each one's queued output
-    /// and exit are journaled.
+    /// Stop every agent and wait (bounded by [`SHUTDOWN_WAIT`]) until each
+    /// one's last push is done and its queued output and exit are
+    /// journaled, and until every final stop's cleanup already under way
+    /// has pushed and removed its checkout.
     pub(super) async fn shutdown(&self) {
         // Close admission first, under the same lock launches are admitted
         // under, so no agent can start after the stop below.
@@ -1673,7 +1675,10 @@ impl Runner {
             // after a take, so keep draining until nothing is left.
             loop {
                 let pumps = std::mem::take(&mut *lock(&self.inner.pumps));
-                let idle = lock(&self.inner.state).agents.is_empty();
+                let idle = {
+                    let state = lock(&self.inner.state);
+                    state.agents.is_empty() && state.finalizing.is_empty()
+                };
                 if pumps.is_empty() {
                     if idle {
                         break;
