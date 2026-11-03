@@ -12591,7 +12591,7 @@ impl Services {
         let placed = inherits || (input.placement.is_some() && !on_backend);
         if input.tasks.is_some() {
             return self
-                .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, placed)
                 .await;
         }
         // Keep the child's creation, group enrollment and initial send on
@@ -13277,6 +13277,7 @@ impl Services {
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
+        placed: bool,
     ) -> Result<Value> {
         use batch::{
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
@@ -13338,13 +13339,19 @@ impl Services {
         // already spawned. Per-entry `provider`/`model` overrides stay
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
+        // Children placed on a remote machine (inherited from a remote
+        // parent) run the provider there, so this backend's installation
+        // says nothing about it: each child's machine admission checks it
+        // and fails only that child's row.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            self.ensure_provider_available_for(
-                "agent.delegate",
-                provider_param,
-                &self.effective_settings().providers,
-            )?;
+            if !placed {
+                self.ensure_provider_available_for(
+                    "agent.delegate",
+                    provider_param,
+                    &self.effective_settings().providers,
+                )?;
+            }
         }
         // The top-level `specialist` is likewise the batch default shared by
         // every entry that doesn't override it — validate it once up front

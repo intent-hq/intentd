@@ -1142,3 +1142,126 @@ async fn a_remote_agent_reads_workspace_details_but_cannot_set_them() {
     assert_eq!(workspace.title, "Remote");
     f.node.shutdown();
 }
+
+/// A not-started task note in the fixture's workspace.
+async fn seed_task(f: &Fixture, title: &str) -> String {
+    intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        seed_task_as_daemon(f, title),
+    )
+    .await
+}
+
+async fn seed_task_as_daemon(f: &Fixture, title: &str) -> String {
+    use intent_core::WorkspaceApi as _;
+    let note = f
+        .services
+        .create_note(
+            workspace(),
+            intent_core::NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .note;
+    f.services
+        .mark_as_task(
+            workspace(),
+            note.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    note.id.0
+}
+
+/// The batch row for `task` in an `agent.delegate` `tasks` response.
+fn batch_row<'a>(response: &'a Value, task: &str) -> &'a Value {
+    response["tasks"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["taskNoteId"] == json!(task)))
+        .unwrap_or_else(|| panic!("row for {task} in {response}"))
+}
+
+/// A remote agent's batch delegate starts its children on its machine even
+/// when the provider is not available on the backend ("mock" is not
+/// runnable here, only on the machine).
+#[tokio::test]
+async fn a_remote_agents_batch_delegate_needs_the_provider_only_on_its_machine() {
+    let (f, link, machine) = fixture().await;
+    let (parent, _) = f.placed().await;
+    let first = seed_task(&f, "First").await;
+    let second = seed_task(&f, "Second").await;
+    let response = answered(
+        forward(
+            &link,
+            &parent,
+            "agent.delegate",
+            json!({ "tasks": [first, second], "provider": "mock", "model": "mock-model" }),
+        )
+        .await,
+    );
+    for task in [&first, &second] {
+        let row = batch_row(&response, task);
+        assert_eq!(row["disposition"], "started", "{response}");
+        let id = row["agentId"].as_str().unwrap();
+        assert_eq!(
+            placement_of(&f, id).await.expect("placed").node_id,
+            machine.id()
+        );
+    }
+    f.node.shutdown();
+}
+
+/// One batch child the machine refuses fails in its own row; another
+/// eligible task still starts on the machine.
+#[tokio::test]
+async fn a_batch_child_the_machine_refuses_does_not_stop_the_others() {
+    let (f, link, machine) = fixture().await;
+    let (parent, _) = f.placed().await;
+    let refused_task = seed_task(&f, "Refused").await;
+    let eligible = seed_task(&f, "Eligible").await;
+    let response = answered(
+        forward(
+            &link,
+            &parent,
+            "agent.delegate",
+            json!({
+                "tasks": [
+                    { "taskNoteId": refused_task, "model": "no-such-model" },
+                    eligible,
+                ],
+                "provider": "mock",
+                "model": "mock-model",
+            }),
+        )
+        .await,
+    );
+    let row = batch_row(&response, &refused_task);
+    assert_eq!(row["disposition"], "error", "{response}");
+    assert!(
+        row["reason"].as_str().is_some_and(
+            |reason| reason.contains("model-unavailable") || reason.contains("isn't available")
+        ),
+        "{response}"
+    );
+    let row = batch_row(&response, &eligible);
+    assert_eq!(row["disposition"], "started", "{response}");
+    let id = row["agentId"].as_str().unwrap();
+    assert_eq!(
+        placement_of(&f, id).await.expect("placed").node_id,
+        machine.id()
+    );
+    f.node.shutdown();
+}
