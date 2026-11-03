@@ -221,11 +221,14 @@ async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
     let start = last_start(&rec);
     frame(&runs, started(&start)).await;
     frame(&runs, exited(&start, Some(1), None)).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while last_start(&rec).spawn_id == start.spawn_id {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while last_start(&rec).spawn_id == start.spawn_id {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("restarted");
     let state = runs.state(&place(&agent)).unwrap();
@@ -343,7 +346,8 @@ async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
     runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(Duration::from_millis(100));
     let acked = runs
         .end_agent(
             &agent,
@@ -494,7 +498,8 @@ async fn ending_several_agents_waits_once_for_all_their_stops() {
             }
         })
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(Duration::from_millis(300));
     let unacked = runs
         .end_agents(
             &[silent.clone(), prompt.clone()],

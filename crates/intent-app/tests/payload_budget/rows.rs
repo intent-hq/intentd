@@ -308,6 +308,17 @@ fn fixed(method: &'static str, why: &'static str, variants: Vec<Variant>) -> Row
 /// hand their params to.
 const SCRIPT_LIST_PARSE: (&str, &str, &str) = ("intent-core/src/script_lists.rs", "parse", "value");
 
+/// `remote_scripts::machine_run_call`, which `script.*` hands its params to
+/// when they carry `remoteAgentId` (a remote agent's machine run).
+const MACHINE_RUN_PARSE: (&str, &str, &str) =
+    ("intent-svc-runtime/src/remote_scripts.rs", "machine_run_call", "params");
+
+/// The seeded daemon has no remote machines, so no machine run to address.
+const MACHINE_RUN_UNEXERCISED: &[(&str, &str)] = &[(
+    "remoteAgentId",
+    "Addresses a remote agent's machine run (remoteScripts: 1); the seeded daemon has no remote machine.",
+)];
+
 impl Row {
     fn parsed_by(
         mut self,
@@ -1631,7 +1642,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Bytes(8 * 1024),
                 ),
             ],
-        ),
+        )
+        .parsed_by(MACHINE_RUN_PARSE, &[])
+        .skip(MACHINE_RUN_UNEXERCISED),
         fixed(
             "script.status",
             "Runtime state of one script.",
@@ -1640,7 +1653,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 json!({ "workspaceId": ws, "scriptId": s.loud_script }),
                 Fixed("/status"),
             )],
-        ),
+        )
+        .parsed_by(MACHINE_RUN_PARSE, &[])
+        .skip(MACHINE_RUN_UNEXERCISED),
         fixed(
             "scriptMonitor.get",
             "One script monitor.",

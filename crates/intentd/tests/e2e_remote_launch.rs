@@ -708,6 +708,7 @@ async fn machine_runs(
     node_id: &str,
     repo: &Path,
 ) -> String {
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
     let wsapi = r#"wsapi const c = await ws.script.create("mrun", "sleep 1; pwd; echo machine-run", "command", { purpose: "saved" }); const id = c.id ?? c.script.id; const st = await ws.script.start(id); const m = await ws.script.monitor(id, { ttlMs: 600000 }); return JSON.stringify({ id, st, m });"#;
     let reply = turn(rpc_ws, events, (ws_id, agent_id), wsapi, 200).await;
     let body = wsapi_value(&reply);
@@ -813,6 +814,7 @@ async fn machine_runs(
     }
 
     // A service started by the agent, stopped from the app.
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
     let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); return JSON.stringify({ id });"#;
     let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), wsapi, 206).await;
     let body = wsapi_value(&reply);
