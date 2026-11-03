@@ -141,3 +141,59 @@ async fn hook_get_host_part_pages_and_rejects_bad_code_offsets() {
     assert_eq!(whole["code"], "aé");
     assert!(whole.get("codeTruncated").is_none());
 }
+
+/// Drive the prelude's join loop with scripted parts: `globalThis.host` is
+/// swapped for a fake that serves `first` and then `part(n)` for each
+/// continuation call, so the guards can be reached without a real pager.
+fn scripted_join(part: &str) -> String {
+    format!(
+        "let calls = 0; \
+         globalThis.host = async (req) => {{ \
+           if (req.method !== 'hook.get') throw new Error('unexpected ' + req.method); \
+           calls++; \
+           const off = req.args.codeOffset; \
+           if (off === undefined) return {{ hookId: 'h1', code: 'a', codeTruncated: true, codeBytes: 100000, codeOffset: 0, nextCodeOffset: 1 }}; \
+           {part} \
+         }}; \
+         try {{ await ws.hook.get('h1'); return {{ ok: true, calls }}; }} \
+         catch (e) {{ return {{ ok: false, calls, message: String(e.message || e) }}; }}"
+    )
+}
+
+#[tokio::test]
+async fn hook_get_refuses_a_part_that_does_not_move_forward() {
+    let (srv, _api) = server(String::new(), None);
+    let code = scripted_join(
+        "return { hookId: 'h1', code: 'b', codeTruncated: true, codeBytes: 100000, codeOffset: off, nextCodeOffset: off };",
+    );
+    let (is_error, text) = call(&srv, &code).await;
+    assert!(!is_error, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["ok"], json!(false), "{body}");
+    assert_eq!(body["calls"], json!(2), "stops at the stuck part: {body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("incomplete"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn hook_get_stops_after_the_part_cap() {
+    let (srv, _api) = server(String::new(), None);
+    let code = scripted_join(
+        "return { hookId: 'h1', code: 'a', codeTruncated: true, codeBytes: 100000, codeOffset: off, nextCodeOffset: off + 1 };",
+    );
+    let (is_error, text) = call(&srv, &code).await;
+    assert!(!is_error, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["ok"], json!(false), "{body}");
+    assert_eq!(
+        body["calls"],
+        json!(4096),
+        "first part plus 4095 more: {body}"
+    );
+    assert!(
+        body["message"].as_str().unwrap().contains("incomplete"),
+        "{body}"
+    );
+}
