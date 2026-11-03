@@ -28,7 +28,14 @@ Sharing needs the host owner's GitHub or GitLab account connected in **Settings 
 Connections**: without one, new invitation links cannot be created and unused links
 cannot be redeemed until it is reconnected. People who already joined keep access.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts. -->
+GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
+self-managed GitLab account in **Settings → Connections** or during onboarding, by
+device sign-in or a personal access token. With it connected, sharing can pin
+invitations to GitLab accounts and a guest can join with a GitLab identity; on hosts
+that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
+older connected daemon shows an update note instead of the GitLab setup.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
 Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
