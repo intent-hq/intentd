@@ -623,6 +623,7 @@ async fn a_version_gap_is_machine_update_required() {
             ProtocolRange { min: 7, max: 7 },
             ProtocolRange { min: 6, max: 6 },
         ),
+        hint: None,
     };
     assert_eq!(update.update, UpdateSide::Machine);
     let mut old = machine("old", Some(report(MAC, STALE, claude(&["opus"]))));

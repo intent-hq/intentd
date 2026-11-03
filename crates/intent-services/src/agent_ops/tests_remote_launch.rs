@@ -278,7 +278,10 @@ async fn unsupported_placements_are_refused_before_any_effect() {
     let remote = Arc::new(FakeRemote::default());
     let svc = svc.with_remote_launch_port(remote.clone());
     for (placement_json, expected) in [
-        (json!({"target": "local"}), "not \"local\""),
+        (
+            json!({"target": "local", "os": "linux"}),
+            "omit os, arch, nodeId, checkout and exclusive",
+        ),
         (
             json!({"target": "remote", "exclusive": true}),
             "exclusive is not supported",
@@ -298,6 +301,20 @@ async fn unsupported_placements_are_refused_before_any_effect() {
             "{result:?}"
         );
     }
+    assert!(remote.launched.lock().unwrap().is_empty());
+    // `{ target: "local" }` alone runs the agent on the backend.
+    let result = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "local"}))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(remote.needs.lock().unwrap().is_empty());
+    assert!(remote.launched.lock().unwrap().is_empty());
     // A selected profile that does not resolve fails admission, never
     // running on the node's own login instead.
     let result = svc
@@ -820,4 +837,73 @@ async fn the_default_model_sentinel_requests_no_model() {
     .await
     .unwrap();
     assert_eq!(remote.needs.lock().unwrap()[0].model, None);
+}
+
+/// A failed read of a remote parent's session fails its sub-agent's create
+/// and delegate, never quietly running the child on the backend.
+#[tokio::test]
+async fn a_failed_parent_read_fails_the_sub_agent_instead_of_running_it_locally() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let launched = remote.launched.lock().unwrap().len();
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_session")
+            .fetch_one(svc.store().write_pool())
+            .await
+            .unwrap()
+    };
+    let before = count().await;
+    sqlx::query("UPDATE agent_session SET metadata = '{not json' WHERE id = ?")
+        .bind(parent.as_str())
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let caller = intent_core::Caller::Agent {
+        agent_id: parent.clone(),
+    };
+
+    let read =
+        intent_core::with_caller(caller.clone(), svc.inherited_placement(Some(&parent))).await;
+    assert!(matches!(&read, Err(Error::Internal(_))), "{read:?}");
+
+    let created = intent_core::with_caller(caller.clone(), async {
+        svc.agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            Some("sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
+        )
+        .await
+    })
+    .await;
+    assert!(matches!(&created, Err(Error::Internal(_))), "{created:?}");
+
+    let delegated = intent_core::with_caller(caller, async {
+        svc.agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("Do it".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+    })
+    .await;
+    assert!(
+        matches!(&delegated, Err(Error::Internal(_))),
+        "{delegated:?}"
+    );
+
+    assert_eq!(remote.launched.lock().unwrap().len(), launched);
+    assert_eq!(count().await, before, "nothing was created");
 }

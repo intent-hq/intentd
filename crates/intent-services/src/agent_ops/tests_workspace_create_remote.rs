@@ -251,7 +251,10 @@ async fn an_invalid_placement_creates_nothing() {
     let remote = Arc::new(FakeRemote::default());
     let fx = fixture(Some(remote.clone())).await;
     for (placement, expected) in [
-        (json!({"target": "local"}), "not \"local\""),
+        (
+            json!({"target": "local", "os": "linux"}),
+            "omit os, arch, nodeId, checkout and exclusive",
+        ),
         (
             json!({"target": "remote", "exclusive": true}),
             "exclusive is not supported",
@@ -269,6 +272,22 @@ async fn an_invalid_placement_creates_nothing() {
     assert!(remote.needs.lock().unwrap().is_empty());
     assert!(remote.launched.lock().unwrap().is_empty());
     assert_nothing_created(&fx).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_local_placement_creates_the_workspace_on_the_backend() {
+    let remote = Arc::new(FakeRemote::default());
+    let fx = fixture(Some(remote.clone())).await;
+    let result = fx
+        .svc
+        .create_workspace(
+            request(&fx, json!({ "placement": { "target": "local" } })),
+            None,
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(remote.needs.lock().unwrap().is_empty());
+    assert!(remote.launched.lock().unwrap().is_empty());
 }
 
 #[intent_test_macros::daemon_test]

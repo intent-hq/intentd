@@ -3170,6 +3170,14 @@ pub(crate) fn reject_remote_attachments(
     Ok(())
 }
 
+/// The sentence a sub-agent's inherited-placement failure ends with: why
+/// it went to `node_name` and how to run it on the backend instead.
+fn inherited_placement_hint(node_name: &str) -> String {
+    format!(
+        "The sub-agent defaults to \"{node_name}\" because its parent runs there; pass placement {{ target: \"local\" }} to run it on the backend."
+    )
+}
+
 /// The attachment refusal for an agent that runs on another machine: any
 /// non-empty image or file blocks are `-32602`.
 pub(crate) fn reject_attachments_on_remote(
@@ -5815,16 +5823,33 @@ impl Services {
                 model_origin,
             )
             .await?;
-        if let Some(placement) = plan.placement.take() {
-            plan.remote = Some(
-                self.admit_remote_agent(
+        let (placement, inherited_from) = match plan.placement.take() {
+            Some(placement) if placement.runs_on_backend()? => (None, None),
+            Some(placement) => (Some(placement), None),
+            None => match self
+                .inherited_placement(plan.parent_agent_id.as_ref())
+                .await?
+            {
+                Some((placement, node_name)) => (Some(placement), Some(node_name)),
+                None => (None, None),
+            },
+        };
+        if let Some(placement) = placement {
+            let admitted = self
+                .admit_remote_agent(
                     &workspace_id,
                     &plan.provider,
                     plan.model.as_deref(),
                     &placement,
                 )
-                .await?,
-            );
+                .await;
+            plan.remote = Some(match (admitted, inherited_from) {
+                (Ok(view), _) => view,
+                (Err(error), Some(node_name)) => {
+                    return Err(error.with_hint(&inherited_placement_hint(&node_name)))
+                }
+                (Err(error), None) => return Err(error),
+            });
         }
         let remote = plan.remote.clone();
         let mut created = self
@@ -5835,6 +5860,46 @@ impl Services {
                 .await?;
         }
         Ok(created)
+    }
+
+    /// The placement a sub-agent inherits when created with none: its
+    /// parent's machine, when the caller is that parent and it runs on a
+    /// remote machine, with the machine's name for the error hint. Creates
+    /// by the user, by a local agent or for a top-level agent inherit
+    /// nothing, as does a caller with no stored session. A failed read of
+    /// the parent's session is an error, never a silent fallback to the
+    /// backend.
+    async fn inherited_placement(
+        &self,
+        parent: Option<&AgentId>,
+    ) -> Result<Option<(intent_core::placement::AgentPlacement, String)>> {
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        if !matches!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Agent { agent_id }) if agent_id == *parent
+        ) {
+            return Ok(None);
+        }
+        let session = match self.store.get_agent_session_without_messages(parent).await {
+            Ok(session) => session,
+            Err(Error::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            intent_core::placement::AgentPlacement {
+                target: Some(intent_core::placement::PlacementTarget::Remote),
+                node_id: Some(view.node_id),
+                ..Default::default()
+            },
+            view.node_name,
+        )))
     }
 
     /// Admission of a create with a `placement`, before anything is
@@ -5870,6 +5935,9 @@ impl Services {
         let Some(placement) = plan.placement.take() else {
             return Ok(());
         };
+        if placement.runs_on_backend()? {
+            return Ok(());
+        }
         // The first message would be refused on the machine after the
         // workspace exists, so its attachments are refused here instead.
         reject_attachments_on_remote(plan.image_blocks.as_ref(), plan.file_blocks.as_ref())?;
@@ -12499,14 +12567,31 @@ impl Services {
                 "agent.delegate: placement applies to a single delegation; delegate each task that needs one on its own".to_string(),
             ));
         }
-        if input.placement.is_some() && input.isolation.is_some() {
+        let on_backend = match &input.placement {
+            Some(placement) => placement.runs_on_backend()?,
+            None => false,
+        };
+        if input.placement.is_some() && !on_backend && input.isolation.is_some() {
             return Err(Error::InvalidParams(
                 "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
             ));
         }
+        // A remote agent's sub-agents inherit its machine (see the create
+        // seam), so they are placed unless they ask for the backend.
+        let inherits = input.placement.is_none()
+            && self
+                .inherited_placement(parent_agent_id.as_ref())
+                .await?
+                .is_some();
+        if inherits && input.isolation.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: a remote agent's sub-agents run on its machine in their own checkout, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
+            ));
+        }
+        let placed = inherits || (input.placement.is_some() && !on_backend);
         if input.tasks.is_some() {
             return self
-                .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, placed)
                 .await;
         }
         // Keep the child's creation, group enrollment and initial send on
@@ -12719,11 +12804,16 @@ impl Services {
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
                     services.ensure_selectable_provider("agent.delegate", provider_param)?;
-                    services.ensure_provider_available_for(
-                        "agent.delegate",
-                        provider_param,
-                        &services.effective_settings().providers,
-                    )?;
+                    // A placed child's provider runs on its machine, so this
+                    // backend's installation says nothing about it; remote
+                    // admission checks the machine's report instead.
+                    if !placed {
+                        services.ensure_provider_available_for(
+                            "agent.delegate",
+                            provider_param,
+                            &services.effective_settings().providers,
+                        )?;
+                    }
                     Some(provider_param.to_string())
                 } else if model_param.is_none() {
                     resolve_delegate_provider(
@@ -12798,7 +12888,7 @@ impl Services {
         // A placed (remote) child's instructions are assembled from its
         // session on head, so an explicit `behaviorPrompt` must be stored
         // there (it overrides the specialist body, as on `agent.create`).
-        if input.placement.is_some() {
+        if placed {
             if let Some(bp) = input
                 .behavior_prompt
                 .as_deref()
@@ -12859,7 +12949,7 @@ impl Services {
         let mut isolation = input.isolation.clone();
         // A placed agent never takes the legacy CoW path: its node gives it
         // its own checkout.
-        if isolation.is_none() && input.placement.is_none() {
+        if isolation.is_none() && !placed {
             // Check workspace.cowIsolation setting
             // `settings_get` returns the `{ path, value, definition }`
             // envelope (§5.9) — read the nested `value`.
@@ -13187,6 +13277,7 @@ impl Services {
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
+        placed: bool,
     ) -> Result<Value> {
         use batch::{
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
@@ -13248,13 +13339,19 @@ impl Services {
         // already spawned. Per-entry `provider`/`model` overrides stay
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
+        // Children placed on a remote machine (inherited from a remote
+        // parent) run the provider there, so this backend's installation
+        // says nothing about it: each child's machine admission checks it
+        // and fails only that child's row.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            self.ensure_provider_available_for(
-                "agent.delegate",
-                provider_param,
-                &self.effective_settings().providers,
-            )?;
+            if !placed {
+                self.ensure_provider_available_for(
+                    "agent.delegate",
+                    provider_param,
+                    &self.effective_settings().providers,
+                )?;
+            }
         }
         // The top-level `specialist` is likewise the batch default shared by
         // every entry that doesn't override it — validate it once up front

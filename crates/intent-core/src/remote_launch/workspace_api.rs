@@ -3,7 +3,7 @@
 //! A remote agent evaluates its `workspace_api` code on its execution node.
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
-//! namespaces is forwarded to head over the node link (head checks the agent
+//! namespaces (plus `workspace.details`) is forwarded to head over the node link (head checks the agent
 //! is on the link's lease and routes the frame again, never trusting the
 //! node), and everything else is refused with an explicit error instead of
 //! running on the wrong host.
@@ -31,7 +31,12 @@ pub const LOCAL_METHODS: &[&str] = &[
     "file.rename",
     "git.commit",
     "host.exec",
+    "workspace.info",
 ];
+
+/// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
+/// read-only workspace details. The other `workspace.*` stay refused.
+pub const FORWARDED_METHODS: &[&str] = &["workspace.details"];
 
 /// Error code at the start of a refused frame's message.
 pub const UNSUPPORTED_CODE: &str = "remote-agent-unsupported";
@@ -52,6 +57,9 @@ pub enum Route {
 pub fn route(method: &str) -> Route {
     if method.starts_with("help.") || LOCAL_METHODS.contains(&method) {
         return Route::Local;
+    }
+    if FORWARDED_METHODS.contains(&method) {
+        return Route::Forward;
     }
     match method.split_once('.') {
         Some((namespace, rest))
@@ -75,7 +83,7 @@ pub fn unsupported_message(method: &str) -> String {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit and ws.host.exec on their own checkout, and ws.{} through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -101,9 +109,36 @@ mod tests {
             "git.commit",
             "host.exec",
             "help.index",
+            "workspace.info",
         ] {
             assert_eq!(route(method), Route::Local, "{method}");
         }
+    }
+
+    /// Remote agents read their workspace's details through head; the
+    /// workspace setters stay refused (route is per method, not namespace).
+    #[test]
+    fn workspace_details_are_forwarded_and_the_setters_refused() {
+        assert_eq!(route("workspace.details"), Route::Forward);
+        for method in [
+            "workspace.setTitle",
+            "workspace.setStatusMessage",
+            "workspace.setStatusImage",
+            "workspace.setAgentName",
+            "workspace.archive",
+            "workspace.unarchive",
+            "workspace.proposeSibling",
+            "workspace.applyProposal",
+            "workspace.timeline",
+        ] {
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+        }
+        let message = unsupported_message("workspace.setTitle");
+        assert!(
+            message.contains("ws.workspace.info on their own checkout")
+                && message.contains("ws.workspace.details through head"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -129,7 +164,6 @@ mod tests {
             "browser.exec",
             "hook.schedule",
             "desktop.screenshot",
-            "workspace.info",
             "mcp.listTools",
             "file.getAttachment",
             "git.registerRoot",

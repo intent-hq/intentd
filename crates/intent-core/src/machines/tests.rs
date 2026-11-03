@@ -120,6 +120,7 @@ fn machine_update_required_tells_which_side_to_update() {
         machine_version: "0.11.0".into(),
         backend_version: "0.12.0".into(),
         update: UpdateSide::Machine,
+        hint: None,
     };
     assert_eq!(
         machine.message(),
@@ -139,6 +140,7 @@ fn machine_update_required_tells_which_side_to_update() {
         machine_version: "0.13.0".into(),
         backend_version: "0.12.0".into(),
         update: UpdateSide::Backend,
+        hint: None,
     };
     assert_eq!(
         backend.message(),
@@ -158,6 +160,7 @@ fn both_errors_are_invalid_params_with_typed_text_for_mcp() {
         machine_version: "1".into(),
         backend_version: "2".into(),
         update: UpdateSide::Machine,
+        hint: None,
     }));
     assert_eq!(update.code(), -32602);
     let text = update.to_string();
@@ -202,4 +205,47 @@ fn machine_routes_debug_names_every_route() {
     };
     let text = format!("{routes:?}");
     assert!(text.contains("7443") && text.contains("10.0.0.2") && text.contains("tc1"));
+}
+
+/// `Error::with_hint` appends the hint to each admission failure's message
+/// and leaves its code and `error.data` as they were.
+#[test]
+fn a_hint_extends_admission_messages_only() {
+    let hint = "Pass placement { target: \"local\" } to run it on the backend.";
+    let model = ModelUnavailable::new("claude", "opus", [], false);
+    let (message, data) = (model.message(), model.data());
+    let Error::ModelUnavailable(hinted) = Error::ModelUnavailable(Box::new(model)).with_hint(hint)
+    else {
+        panic!("still model-unavailable");
+    };
+    assert_eq!(hinted.message(), format!("{message} {hint}"));
+    assert_eq!(hinted.data(), data);
+
+    let update = MachineUpdateRequired {
+        machine_name: "m".into(),
+        machine_version: "1".into(),
+        backend_version: "2".into(),
+        update: UpdateSide::Machine,
+        hint: None,
+    };
+    let (message, data) = (update.message(), update.data());
+    let Error::MachineUpdateRequired(hinted) =
+        Error::MachineUpdateRequired(Box::new(update)).with_hint(hint)
+    else {
+        panic!("still machine-update-required");
+    };
+    assert_eq!(hinted.message(), format!("{message} {hint}"));
+    assert_eq!(hinted.data(), data);
+
+    let profile = Error::provider_profile(false, "Uses an account folder.", json!({"code":"x"}))
+        .with_hint(hint);
+    assert_eq!(profile.code(), -32602);
+    assert_eq!(
+        profile.to_string(),
+        format!("Uses an account folder. {hint}")
+    );
+    let invalid = Error::InvalidParams("bad".into()).with_hint(hint);
+    assert!(matches!(&invalid, Error::InvalidParams(m) if *m == format!("bad {hint}")));
+    let internal = Error::Internal("boom".into()).with_hint(hint);
+    assert!(matches!(&internal, Error::Internal(m) if m == "boom"));
 }
