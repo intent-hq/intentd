@@ -73,6 +73,9 @@ const INTRUDER_GL_LOGIN: &str = "glab-intruder";
 const OWNER_GH_TOKEN: &str = "gho_e2e_gh_owner_token";
 const OWNER_GH_ID: u64 = 100;
 const OWNER_GH_LOGIN: &str = "gh-owner";
+/// Sharing requires a connected owner forge: hosts that are not testing a
+/// specific owner connection boot with GitHub connected.
+const OWNER_FORGE: &[(&str, &str)] = &[("GITHUB_TOKEN", OWNER_GH_TOKEN)];
 
 /// The bound instance: `sourceControl.gitlab.host` defaults to gitlab.com.
 const HOST: &str = "gitlab.com";
@@ -978,7 +981,9 @@ fn preview_invite_row(
 
 async fn assert_preview_pin_identity_over_wss(method: &str) {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Preview requirements").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1047,11 +1052,14 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
             "exact response shape for {method} {name}"
         );
     }
-    assert_eq!(
-        mock.requests.load(Ordering::SeqCst),
-        0,
-        "preview never calls a forge"
-    );
+    let forge_calls = mock.requests.load(Ordering::SeqCst) - baseline;
+    if method == "invite.inspect" {
+        assert_eq!(forge_calls, 0, "inspect never calls a forge");
+    } else {
+        // A challenge checks only the owner's own forge connection (at most
+        // one `GET /user` per call), never the pinned account's forge.
+        assert!(forge_calls <= 5, "{method}: {forge_calls} forge calls");
+    }
 }
 
 #[tokio::test]
@@ -1068,7 +1076,9 @@ async fn challenge_exposes_pin_identity_including_legacy_and_unpinned_over_wss()
 async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_wss() {
     use intent_core::InviteErrorKind;
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Private requirements").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1122,7 +1132,7 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
     }
     assert_eq!(
         mock.requests.load(Ordering::SeqCst),
-        0,
+        baseline,
         "invalid preview never calls a forge"
     );
 }
@@ -1130,7 +1140,9 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
 #[tokio::test]
 async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Pin enforcement").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1206,7 +1218,10 @@ async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_w
                 .is_none());
         }
     }
-    assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
+    // Each accept checks only the owner's own forge connection (at most one
+    // `GET /user`); the pin is enforced without a forge call.
+    let forge_calls = mock.requests.load(Ordering::SeqCst) - baseline;
+    assert!(forge_calls <= 4, "{forge_calls} forge calls");
 }
 
 /// (a) + (c): a GitLab-only host mints invites and admits a GitLab guest;
