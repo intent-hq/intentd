@@ -5828,7 +5828,7 @@ impl Services {
             Some(placement) => (Some(placement), None),
             None => match self
                 .inherited_placement(plan.parent_agent_id.as_ref())
-                .await
+                .await?
             {
                 Some((placement, node_name)) => (Some(placement), Some(node_name)),
                 None => (None, None),
@@ -5866,30 +5866,38 @@ impl Services {
     /// parent's machine, when the caller is that parent and it runs on a
     /// remote machine, with the machine's name for the error hint. Creates
     /// by the user, by a local agent or for a top-level agent inherit
-    /// nothing.
+    /// nothing. A failed read of the parent's session is an error, never a
+    /// silent fallback to the backend.
     async fn inherited_placement(
         &self,
         parent: Option<&AgentId>,
-    ) -> Option<(intent_core::placement::AgentPlacement, String)> {
-        let parent = parent?;
+    ) -> Result<Option<(intent_core::placement::AgentPlacement, String)>> {
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
         if !matches!(
             intent_core::current_caller(),
             Some(intent_core::Caller::Agent { agent_id }) if agent_id == *parent
         ) {
-            return None;
+            return Ok(None);
         }
-        let session = self.store.get_agent_session(parent).await.ok()?;
-        let view = intent_core::remote_launch::RemotePlacementView::from_metadata(
+        let session = self
+            .store
+            .get_agent_session_without_messages(parent)
+            .await?;
+        let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
             session.metadata.as_ref(),
-        )?;
-        Some((
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((
             intent_core::placement::AgentPlacement {
                 target: Some(intent_core::placement::PlacementTarget::Remote),
                 node_id: Some(view.node_id),
                 ..Default::default()
             },
             view.node_name,
-        ))
+        )))
     }
 
     /// Admission of a create with a `placement`, before anything is
@@ -12571,7 +12579,7 @@ impl Services {
         let inherits = input.placement.is_none()
             && self
                 .inherited_placement(parent_agent_id.as_ref())
-                .await
+                .await?
                 .is_some();
         if inherits && input.isolation.is_some() {
             return Err(Error::InvalidParams(
