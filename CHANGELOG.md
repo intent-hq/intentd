@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.116] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- Bound file, blob and asset reads under the 500 KiB budget ([#2993](https://github.com/intent-hq/intentd/pull/2993))
+- Bound note and comment reads under the 500 KiB budget ([#2991](https://github.com/intent-hq/intentd/pull/2991))
+
+
 ## [0.11.115] - 2026-11-03
 
 ### 🚀 Features
