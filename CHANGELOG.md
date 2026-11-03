@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.114] - 2026-11-03
+
+### 🚀 Features
+
+- *(workspace)* Accept a remote placement for workspace.create's initial agent ([#2982](https://github.com/intent-hq/intentd/pull/2982))
+
+### 🐛 Bug Fixes
+
+- Bind the git connection before a remote launch can check out ([#2986](https://github.com/intent-hq/intentd/pull/2986))
+- *(providers)* Omit host profile names from a guest's providers.catalog ([#2990](https://github.com/intent-hq/intentd/pull/2990))
+- Page specialist, rules and skill lists by default ([#2976](https://github.com/intent-hq/intentd/pull/2976))
+- Bound GitHub and Linear proxy reads under the 500 KiB budget ([#2975](https://github.com/intent-hq/intentd/pull/2975))
+- Bound workspace and agent lists, queues, sessions and diagnostics ([#2979](https://github.com/intent-hq/intentd/pull/2979))
+
+### 📚 Documentation
+
+- *(guide)* Note that guests see agents without the host's profile names ([#2985](https://github.com/intent-hq/intentd/pull/2985))
+- *(guide)* Explain leaving a shared workspace from the workspace menu ([#2987](https://github.com/intent-hq/intentd/pull/2987))
+
+### ⚡ Performance
+
+- *(agents)* Check first-turn naming without loading the full transcript ([#2988](https://github.com/intent-hq/intentd/pull/2988))
+
+
 ## [0.11.113] - 2026-11-03
 
 ### 🚀 Features
