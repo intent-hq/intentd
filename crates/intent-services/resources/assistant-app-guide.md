@@ -46,6 +46,12 @@ These app-version notes qualify every later description in this guide:
   tool that installed it.
 - Hiding the host's provider-profile names from guests requires an app version
   supporting that presentation. Older apps may still display those names.
+- Multiple workspace-wide discussions require matching app and connected-daemon
+  discussion support. Older apps may not offer the management or mention controls
+  described later in this guide.
+- **Leave…** in the workspace sidebar menu requires an app offering that action.
+  Older apps may offer **Settings → Collaboration → Leave** beside the workspace.
+  Access through host membership cannot be left per workspace.
 
 In Home versions with a **Waiting** filter, status grouping separates running work
 from external waits. **Running** covers an agent at work or a running command script
@@ -98,9 +104,7 @@ saved scripts. They cannot edit script commands, control raw terminals, run host
 commands, change credentials, or manage sharing. Host membership retains its existing
 authority. Role downgrades apply to subsequent operations on open connections.
 
-With matching app and connected-daemon discussion support, workspaces support
-multiple workspace-wide discussions. Older apps may not offer the management or
-mention controls described below. Start a discussion by
+Workspaces support multiple workspace-wide discussions. Start a discussion by
 sending its first message; everyone with workspace access can read and participate.
 Workspace owners and managers can rename discussions; only workspace owners can
 delete them, including the default discussion. Open the discussion, then use the
