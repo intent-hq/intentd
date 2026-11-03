@@ -346,6 +346,8 @@ async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
     runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
         .await
         .unwrap();
+    runs.monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .unwrap();
     let deadline = tokio::time::Instant::now()
         + intentd_test_support::test_timeout(Duration::from_millis(100));
     let acked = runs
@@ -356,6 +358,19 @@ async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
         )
         .await;
     assert!(!acked, "nobody acknowledged the stop");
+    // Nobody saw the run end: it is settled as lost with the lease end's
+    // reason (an ordinary stop would end it idle and wake nobody).
+    {
+        let wakes = rec.wakes.lock().unwrap();
+        assert_eq!(wakes.len(), 1, "{wakes:?}");
+        assert!(
+            wakes[0]
+                .1
+                .contains("exited with code -1: remote-script-lost: the machine was removed"),
+            "{}",
+            wakes[0].1
+        );
+    }
     assert!(rec
         .frames
         .lock()
