@@ -901,3 +901,85 @@ touch "${{MAIN_CHECKOUT}}/.should-not-run-{skip_marker_id}"
         "skipWorktree should not execute setup script (marker not found under repo)"
     );
 }
+
+/// Regression: a daemon started by launchd (or Finder) inherits only
+/// `/usr/bin:/bin:/usr/sbin:/sbin`. Saved scripts already run with the
+/// enhanced PATH (inherited dirs + Homebrew + user tool dirs), but the
+/// workspace setup script used the bare inherited PATH, so Homebrew tools
+/// such as `sccache` or `cargo-nextest` were not found and setup failed.
+/// The setup script must see the same enhanced PATH, with the inherited dirs
+/// still first.
+#[tokio::test]
+async fn setup_script_runs_with_enhanced_path_under_sparse_daemon_path() {
+    const SPARSE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("PATH", SPARSE_PATH)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status_resp = common::await_wss_status(&socket).await;
+    let fingerprint = status_resp["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let actual_port = u16::try_from(status_resp["result"]["port"].as_u64().expect("port"))
+        .expect("value fits in u16");
+    let mut wss = wss_connect(actual_port, fingerprint).await;
+
+    let repo_dir = create_test_repo();
+    let run_id = Uuid::new_v4().simple().to_string();
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s' "$PATH" > "${{WORKTREE_PATH}}/setup-path-{run_id}.txt"
+touch "${{WORKTREE_PATH}}/.setup-path-ran-{run_id}"
+"#
+    );
+    let create_resp = wss_rpc(
+        &mut wss,
+        1,
+        "workspace.create",
+        json!({
+            "title": "test-setup-path",
+            "repositoryPath": repo_dir.path().to_string_lossy(),
+            "setupScript": script
+        }),
+    )
+    .await;
+    let workspace_path = PathBuf::from(
+        create_resp["result"]["workspace"]["worktreePath"]
+            .as_str()
+            .unwrap_or_else(|| panic!("worktreePath should be set: {create_resp}")),
+    );
+
+    let marker = workspace_path.join(format!(".setup-path-ran-{run_id}"));
+    let mut found = false;
+    for _ in 0..200 {
+        if marker.exists() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(found, "setup script should have run");
+
+    let seen = std::fs::read_to_string(workspace_path.join(format!("setup-path-{run_id}.txt")))
+        .expect("read setup PATH capture");
+    let dirs: Vec<&str> = seen.split(':').collect();
+    assert!(
+        dirs.contains(&"/opt/homebrew/bin"),
+        "setup script PATH must include Homebrew even when the daemon PATH is sparse; got {seen:?}"
+    );
+    assert!(
+        dirs.contains(&"/usr/local/bin"),
+        "setup script PATH must include /usr/local/bin; got {seen:?}"
+    );
+    assert!(
+        seen.starts_with(SPARSE_PATH),
+        "inherited daemon PATH dirs must keep precedence; got {seen:?}"
+    );
+}
