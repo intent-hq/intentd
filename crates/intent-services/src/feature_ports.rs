@@ -1229,6 +1229,45 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, Result<RemotePlacementView>>;
 
+    /// [`Self::admit`] for an agent whose workspace does not exist yet
+    /// (`workspace.create`'s initial agent): the same checks and machine
+    /// choice, before anything is created, with an empty `base_commit` that
+    /// [`Self::base_commit`] fills once the workspace commits. Refuses as a
+    /// daemon without machines by default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`], except for the workspace's commit.
+    fn admit_new_workspace<'a>(
+        &'a self,
+        svc: &'a Services,
+        placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
+    ) -> BoxFuture<'a, Result<RemotePlacementView>> {
+        let _ = (svc, needs);
+        Box::pin(async move {
+            let failure =
+                PlatformAvailability::none(intent_core::now_iso()).unavailable(placement.clone());
+            Err(Error::PlacementUnavailable(Box::new(failure)))
+        })
+    }
+
+    /// The commit a remote agent of `workspace_id` starts from: its
+    /// checkout's `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParams`] for a workspace without a git repository;
+    /// [`Error::Unsupported`] by default.
+    fn base_commit<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<String>> {
+        let _ = (svc, workspace_id);
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
     /// Whether this port places agents on exposed machines (the backend
     /// side of `remoteMachines.*`), which the `remoteMachines` capability
     /// requires. `false` by default.

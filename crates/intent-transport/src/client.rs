@@ -136,7 +136,9 @@ pub(crate) fn server_json(
 /// Add the capabilities that depend on the running daemon to a successful
 /// hello `frame`: `startupStatus: 1` when the full composition tracks
 /// startup, `remoteMachines: 1` when this backend places agents on exposed
-/// machines (the remote feature, not node mode).
+/// machines (the remote feature, not node mode), together with
+/// `remoteInitialAgent: 1`: `workspace.create` accepts
+/// `initialAgent.placement`.
 pub(crate) fn with_runtime_capabilities(
     frame: Option<String>,
     startup_status: bool,
@@ -154,6 +156,7 @@ pub(crate) fn with_runtime_capabilities(
             }
             if remote_machines {
                 capabilities["remoteMachines"] = json!(1);
+                capabilities["remoteInitialAgent"] = json!(1);
             }
         }
         value.to_string()

@@ -14653,6 +14653,8 @@ mod workspace_apply_proposal_tests {
                         "notificationsMuted": false,
                     })),
                     proposal_origin: None,
+                    notice: None,
+                    initial_agent_launch_failure: None,
                 })
             })
         }

@@ -22152,6 +22152,7 @@ impl WorkspaceApi for Services {
                                 // foreground agent (top-level wins over any
                                 // metadata.isBackground copy).
                                 is_background: Some(false),
+                                placement: agent.placement,
                                 ..Default::default()
                             };
                             // Project-tier root for the plan's failing
@@ -22188,6 +22189,21 @@ impl WorkspaceApi for Services {
                                 )
                             })
                             .await?;
+                            let mut plan = plan;
+                            // A placed initial agent (§5.1, nodes.md): the
+                            // placement, remote compatibility and machine
+                            // choice are checked here, before any workspace
+                            // effect; the start commit is pinned once the
+                            // workspace commits.
+                            if plan.placement.is_some() {
+                                if input.plain_folder == Some(true) {
+                                    return Err(Error::InvalidParams(
+                                        "initialAgent.placement: remote agents need a workspace with a git repository to start from".into(),
+                                    ));
+                                }
+                                boxed_await(|| services.admit_remote_initial_agent(&mut plan))
+                                    .await?;
+                            }
                             Some((plan, prompt, image_blocks))
                         }
                         None => None,
@@ -23996,6 +24012,8 @@ impl WorkspaceApi for Services {
                         .await;
                     }
                     let mut initial_agent = None;
+                    let mut notice = None;
+                    let mut initial_agent_launch_failure = None;
                     if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
                         // `agent.create` — the initial agent opts out of the
@@ -24012,6 +24030,10 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
+                        let base_error =
+                            boxed_await(|| services.pin_remote_base_commit(&ws.id, &mut plan))
+                                .await;
+                        let remote_view = plan.remote.clone();
                         // On that infrastructure failure the create returns
                         // before the setup task below is scheduled, so the
                         // already-inserted row would otherwise read `pending`
@@ -24027,6 +24049,30 @@ impl WorkspaceApi for Services {
                                 return Err(e.into());
                             }
                         };
+                        let mut created = created;
+                        // A placed initial agent starts on its machine; when
+                        // it cannot, the workspace and the placed agent are
+                        // kept, no turn is started, and the create reports
+                        // the failure after the workspace is settled.
+                        let mut launch_failed = false;
+                        if let Some(view) = remote_view {
+                            match boxed_await(|| {
+                                services.start_remote_initial_agent(
+                                    &ws.id,
+                                    &mut created,
+                                    view,
+                                    base_error,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(launched) => notice = launched,
+                                Err(failure) => {
+                                    launch_failed = true;
+                                    initial_agent_launch_failure = Some(failure);
+                                }
+                            }
+                        }
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
@@ -24053,9 +24099,10 @@ impl WorkspaceApi for Services {
                         // attached, else the store-only persist. Best-effort like the
                         // delegate path — the agent holds
                         // `AgentSession.initial_message` for resume.
-                        let has_content = prompt.is_some()
-                            || created_image_blocks.is_some()
-                            || created_file_blocks.is_some();
+                        let has_content = !launch_failed
+                            && (prompt.is_some()
+                                || created_image_blocks.is_some()
+                                || created_file_blocks.is_some());
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
                             // Principal stamp (multiplayer w2): the initial
@@ -24195,6 +24242,8 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                         proposal_origin: None,
+                        notice,
+                        initial_agent_launch_failure,
                     })
                 }),
             ))
@@ -24257,6 +24306,24 @@ impl WorkspaceApi for Services {
                     self.resolve_create_proposal_origin(origin, &result.workspace.id, replayed)
                 })
                 .await;
+            }
+            // The placed initial agent could not start after the workspace
+            // committed (replayed as such on a keyed retry): the documented
+            // `-32603` `launch-failed` error instead of a result.
+            if let Some(failure) = result.initial_agent_launch_failure.take() {
+                tracing::warn!(
+                    method = "workspace.create",
+                    workspace = %result.workspace.id.as_str(),
+                    error = %failure.message,
+                    "workspace.create: the initial agent could not start on its machine"
+                );
+                return Err(Error::RemoteMachine(Box::new(
+                    intent_core::ProviderProfileFailure {
+                        internal: true,
+                        message: failure.message,
+                        data: failure.data,
+                    },
+                )));
             }
             Ok(result)
         })
