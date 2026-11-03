@@ -30,10 +30,10 @@ cannot be redeemed until it is reconnected. People who already joined keep acces
 
 GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.com or
 self-managed GitLab account in **Settings → Connections** or during onboarding, by
-device sign-in or a personal access token. With it connected, **Add codebase → Clone**
-lists GitLab projects, sharing can pin invitations to GitLab accounts, and a guest can
-join with a GitLab identity. An older connected daemon shows an update note instead
-of the GitLab setup.
+device sign-in or a personal access token. With it connected, sharing can pin
+invitations to GitLab accounts and a guest can join with a GitLab identity; on hosts
+that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
+older connected daemon shows an update note instead of the GitLab setup.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
 
