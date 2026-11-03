@@ -956,9 +956,11 @@ touch "${{WORKTREE_PATH}}/.setup-path-ran-{run_id}"
             .unwrap_or_else(|| panic!("worktreePath should be set: {create_resp}")),
     );
 
+    // Generous deadline: the first setup spawn may wait on a cold
+    // login-shell PATH probe before the script starts.
     let marker = workspace_path.join(format!(".setup-path-ran-{run_id}"));
     let mut found = false;
-    for _ in 0..200 {
+    for _ in 0..600 {
         if marker.exists() {
             found = true;
             break;

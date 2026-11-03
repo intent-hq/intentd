@@ -1381,7 +1381,13 @@ impl RuntimePort for RuntimeFeature {
                 // and user tool dirs). A launchd/Finder-started daemon only
                 // inherits /usr/bin:/bin:/usr/sbin:/sbin, so without this a
                 // setup script could not find Homebrew tools like sccache.
-                if let Some(path) = script_ops::enhanced_shell_path() {
+                // Resolved off the async worker: the first call may run the
+                // login-shell probe if the startup prewarm has not finished.
+                let enhanced_path = tokio::task::spawn_blocking(script_ops::enhanced_shell_path)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(path) = enhanced_path {
                     spec.env.push(("PATH".to_string(), path));
                 }
                 spec.env.extend(extra_env);
