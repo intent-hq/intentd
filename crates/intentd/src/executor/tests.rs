@@ -1857,12 +1857,18 @@ async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
     node.stop().await;
 }
 
-/// A machine shutdown over a script whose reaper never finishes still stops
-/// the agent (its last push included) and returns: the scripts' stop is
-/// bounded by the reap wait, inside the shutdown's one bound
+/// The gate the agent's shutdown push meets the test at in
+/// [`shutdown_over_a_stuck_script_stays_within_one_reap_wait`].
+static SHUTDOWN_PUSH: std::sync::LazyLock<Arc<tokio::sync::Barrier>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Barrier::new(2)));
+
+/// A machine shutdown over a script whose reaper never finishes waits for
+/// it once, bounded by the reap wait: the agent's last push starts right
+/// after, and the whole executor shutdown, its links' close included,
+/// returns without a second reap wait at the link's end
 /// (intent-hq/intent#8437).
-#[tokio::test]
-async fn shutdown_over_a_stuck_script_still_stops_the_agent() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
     use intent_core::node_link::ScriptStartCommand;
     let Some(providers) = fixture_providers() else {
         eprintln!("skipping: node not on PATH");
@@ -1870,8 +1876,14 @@ async fn shutdown_over_a_stuck_script_still_stops_the_agent() {
     };
     let dir = tempfile::tempdir().unwrap();
     let admission = CountAdmission::new(4);
-    let node =
-        Running::start_with(dir.path(), MachineApi::new(), admission.clone(), providers).await;
+    let node = Running::start_with_checkouts(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        providers,
+        |storage, _cache| checkout::PlainCheckouts::with_push_gate(storage, SHUTDOWN_PUSH.clone()),
+    )
+    .await;
     let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
         .await
         .unwrap();
@@ -1908,12 +1920,20 @@ async fn shutdown_over_a_stuck_script_still_stops_the_agent() {
             None => panic!("the link closed"),
         }
     }
-    tokio::time::timeout(
-        crate::executor::scripts::reap_wait() + wait(),
-        node.service.shutdown(),
-    )
-    .await
-    .expect("the shutdown hung on the stuck script");
+
+    // One reap wait for the stuck script, plus room to stop the agent and
+    // close the links; a second reap wait at the links' close overruns it.
+    let margin = intentd_test_support::test_timeout(Duration::from_secs(4));
+    let bound = crate::executor::scripts::reap_wait() + margin;
+    let service = node.service.clone();
+    let shutdown = tokio::spawn(async move { service.shutdown().await });
+    tokio::time::timeout(bound, SHUTDOWN_PUSH.wait())
+        .await
+        .expect("the agent's push did not start within one reap wait");
+    tokio::time::timeout(margin, shutdown)
+        .await
+        .expect("the shutdown waited on the stuck script again after the push")
+        .unwrap();
     assert!(
         admission.running.lock().unwrap().is_empty(),
         "shutdown returned with the agent still running"

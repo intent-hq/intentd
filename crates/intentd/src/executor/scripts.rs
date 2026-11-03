@@ -404,9 +404,17 @@ impl ScriptProcesses {
         done
     }
 
-    /// Kill every process started on the link binding `generation`.
+    /// Kill every process started on the link binding `generation`. While
+    /// the machine is shutting down the kills are sent but not waited for:
+    /// [`Self::stop_all`] already waited its one bounded reap wait for the
+    /// same processes, and a link's end must not add another past the
+    /// shutdown's budget (intent-hq/intent#8437).
     pub(super) async fn stop_binding(&self, generation: NodeCounter) {
-        self.kill_where(|_, g| g == generation).await;
+        let waits = self.start_kills(|_, g| g == generation);
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        Self::wait_reaped(waits).await;
     }
 
     /// Whether `process` is still recorded as running (until its reaper
@@ -442,6 +450,15 @@ impl ScriptProcesses {
     /// logged and left. A kill or reaper that panicked counts as not done.
     /// Returns whether everything finished.
     async fn kill_where(&self, matches: impl Fn(&Key, NodeCounter) -> bool) -> bool {
+        Self::wait_reaped(self.start_kills(matches)).await
+    }
+
+    /// Kill every matching process (joining a kill already under way), and
+    /// return what to wait on for each one's teardown and recorded exit.
+    fn start_kills(
+        &self,
+        matches: impl Fn(&Key, NodeCounter) -> bool,
+    ) -> Vec<tokio::sync::watch::Receiver<bool>> {
         let mut waits: Vec<tokio::sync::watch::Receiver<bool>> = Vec::new();
         let victims: Vec<(Key, PtyId, NodeCounter)> = {
             let running = lock(&self.running);
@@ -466,6 +483,12 @@ impl ScriptProcesses {
         {
             waits.push(kill);
         }
+        waits
+    }
+
+    /// Wait, bounded by [`reap_wait`], until every one of `waits` is done.
+    /// Returns whether all were.
+    async fn wait_reaped(waits: Vec<tokio::sync::watch::Receiver<bool>>) -> bool {
         // A kill or reaper whose task ended without finishing (a panic: its
         // sender dropped before `true`) is not done.
         let done = tokio::time::timeout(reap_wait(), async {
