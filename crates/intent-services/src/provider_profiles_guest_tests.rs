@@ -102,3 +102,27 @@ async fn the_durable_host_role_decides_not_the_admitted_one() {
     let promoted = principal(&fx, true).await;
     assert_shows_host_names(&catalog_as(&fx, &promoted, HostRole::Guest).await);
 }
+
+/// Fails closed: a wire caller whose principal the store does not know is
+/// treated as a guest, whatever role its connection was admitted with.
+#[intent_test_macros::daemon_test]
+async fn an_unknown_principal_reads_the_guest_catalog() {
+    let fx = named_fixture().await;
+    let unknown = PrincipalId::new();
+    for role in [HostRole::Guest, HostRole::Member] {
+        assert_hides_host_names(&catalog_as(&fx, &unknown, role).await);
+    }
+}
+
+/// Agents act on host authority, so an agent's read keeps the names.
+#[intent_test_macros::daemon_test]
+async fn an_agent_reads_the_full_catalog() {
+    let fx = named_fixture().await;
+    let caller = Caller::Agent {
+        agent_id: intent_core::AgentId::new(),
+    };
+    let catalog = with_caller(caller, fx.svc.providers_catalog())
+        .await
+        .unwrap();
+    assert_shows_host_names(&catalog);
+}
