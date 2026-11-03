@@ -2305,6 +2305,18 @@ async fn cmd_serve_owned(
             }
             root
         })
+        // Every provider launch gets a private temp folder (`TMPDIR` /
+        // `TMP` / `TEMP`) under a per-daemon root in the OS temp dir, so
+        // agents never share fixed temp file names. The data-dir lock makes
+        // this daemon the root's only user, so the startup sweep (no agent
+        // child is live yet) safely reclaims folders a killed daemon left.
+        .with_agent_tmp_root({
+            let root = intent_core::agent_tmp_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_agent_tmp_root(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "agent temp sweep failed");
+            }
+            root
+        })
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider

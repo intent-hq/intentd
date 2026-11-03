@@ -19,6 +19,7 @@ fn disable_node_compile_cache() {
 pub mod agent_configs;
 pub(crate) mod agent_logs;
 pub mod agent_runtime;
+pub mod agent_tmp;
 pub mod caller;
 pub mod chief_cwd;
 pub mod cli_env;
@@ -82,6 +83,9 @@ pub use agent_configs::{
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
+};
+pub use agent_tmp::{
+    agent_tmp_root, prepare_agent_tmp_root, sweep_agent_tmp_root, AgentTempDir, AGENT_TMP_ENV_KEYS,
 };
 pub use caller::{
     current_caller, is_human_authored_metadata, project_queue_for_caller,

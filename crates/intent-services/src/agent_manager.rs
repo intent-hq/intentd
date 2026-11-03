@@ -2964,6 +2964,13 @@ pub struct AgentManager {
     /// and sweeps leftovers at startup; `None` (tests / bare wiring) falls
     /// back to the OS temp dir.
     agent_config_root: Option<PathBuf>,
+    /// Per-daemon root of each launch's private temp folder
+    /// (`intent_core::agent_tmp`), exported to the child as `TMPDIR` /
+    /// `TMP` / `TEMP` so agents never share fixed temp file names. The
+    /// composition root wires `intent_core::agent_tmp_root(data_dir)` and
+    /// sweeps it at startup; `None` (tests / bare wiring) leaves the child's
+    /// temp variables as inherited.
+    agent_tmp_root: Option<PathBuf>,
     /// Persistent Antigravity conversation profiles, never startup-swept.
     antigravity_state_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
@@ -3257,6 +3264,7 @@ impl AgentManager {
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
             agent_config_root: None,
+            agent_tmp_root: None,
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
@@ -3363,6 +3371,33 @@ impl AgentManager {
     pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_config_root = Some(root.into());
         self
+    }
+
+    /// Set the per-daemon root under which every provider launch gets its own
+    /// temp folder (`TMPDIR` / `TMP` / `TEMP`). The composition root passes
+    /// `intent_core::agent_tmp_root(&config.data_dir)` after sweeping it; the
+    /// root is (re)validated right before each spawn.
+    #[must_use]
+    pub fn with_agent_tmp_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_tmp_root = Some(root.into());
+        self
+    }
+
+    /// The validated agent temp root for the next spawn, created on demand
+    /// (the OS may clean the temp dir while the daemon runs). `None` when no
+    /// root is wired or it cannot be used — the launch then inherits the
+    /// daemon's temp dir rather than failing.
+    fn agent_tmp_root(&self) -> Option<PathBuf> {
+        let root = self.agent_tmp_root.as_ref()?;
+        if let Err(e) = intent_core::prepare_agent_tmp_root(root) {
+            tracing::warn!(
+                error = %e,
+                path = %root.display(),
+                "agent temp root unusable; agents inherit the daemon's temp dir"
+            );
+            return None;
+        }
+        Some(root.clone())
     }
 
     /// Set the private persistent root for Antigravity conversation state.
@@ -3736,6 +3771,7 @@ impl AgentManager {
         // `<data_dir>/agent-configs` when wired (swept at startup so a killed
         // daemon's leftovers don't accumulate, monorepo#1302), else temp dir.
         let config_dir = self.agent_config_dir();
+        let agent_tmp_root = self.agent_tmp_root();
 
         // Generated MCP config (auggie format) pointing at the bridge
         // subcommand, written only for providers that consume an MCP-config flag.
@@ -3893,6 +3929,13 @@ impl AgentManager {
         if spawn_opts.npx_launch_root.is_none() {
             spawn_opts.npx_launch_root = Some(config_dir.as_path());
         }
+        // Each launch gets a private temp folder under the per-daemon root
+        // (`TMPDIR` / `TMP` / `TEMP`), so two agents writing the same fixed
+        // temp file name never overwrite each other. A caller-supplied root
+        // (tests / embedders) wins.
+        if spawn_opts.agent_tmp_root.is_none() {
+            spawn_opts.agent_tmp_root = agent_tmp_root.as_deref();
+        }
         // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
         // boot), so a settings change applies to the next spawned/respawned
         // provider process without a daemon restart (intent-hq/intent#4330).
@@ -3961,7 +4004,7 @@ impl AgentManager {
         } else {
             None
         };
-        let spawned = if let Some(cli) =
+        let mut spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
             // A named profile resolves before account lookup; the spawn layer
@@ -3996,6 +4039,7 @@ impl AgentManager {
             spawn_provider(&spawn_opts, hooks)
         }
         .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+        let agent_tmp_dir = spawned.take_agent_tmp_dir();
         let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
@@ -4020,7 +4064,10 @@ impl AgentManager {
                 self.policy,
                 self.sink.clone(),
             )
-            .with_terminal_host(terminal_host),
+            .with_terminal_host(terminal_host)
+            // Commands the daemon runs for the agent (ACP `terminal/create`)
+            // share the agent process's private temp folder.
+            .with_terminal_env_defaults(agent_tmp_env(agent_tmp_dir.as_ref())),
         );
         let serve_conn = connection.clone();
         let serve_task = intent_core::spawn_daemon(async move {
@@ -4067,6 +4114,7 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                agent_tmp_dir,
                 preparation_guard,
                 cleanup_lease: Some(cleanup_lease),
                 #[cfg(test)]
@@ -14848,7 +14896,19 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts.profile_env = opts.profile_env;
+    spawn_opts.agent_tmp_root = opts.agent_tmp_root;
     spawn_opts
+}
+
+/// The `(name, value)` temp variables pointing at `dir`, for commands the
+/// daemon runs on the agent's behalf; empty without a folder.
+fn agent_tmp_env(dir: Option<&intent_core::AgentTempDir>) -> Vec<(String, String)> {
+    dir.map(|dir| {
+        dir.env()
+            .map(|(key, value)| (key.to_owned(), value.to_string_lossy().into_owned()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Append the github.com-scoped daemon-backed credential-helper env pair
@@ -21748,6 +21808,7 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,

@@ -25,6 +25,8 @@ use intent_providers::{
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 
+use intent_core::AgentTempDir;
+
 use crate::error::{AcpError, AcpResult};
 use crate::io_priority::{
     agent_io_priority, apply_reduced_io_priority, io_priority_shortfall, AgentIoPriority,
@@ -96,6 +98,11 @@ pub struct SpawnOptions<'a> {
     /// `None` for the provider's Default configuration. Applied over the
     /// inherited and captured environment, below Intent's launch wiring.
     pub profile_env: Option<&'a ProfileEnv>,
+    /// Existing root under which [`prepare_provider`] creates this launch's
+    /// private [`AgentTempDir`], exported as `TMPDIR` / `TMP` / `TEMP` so
+    /// agents never share fixed temp file names. `None` leaves the child's
+    /// temp variables as inherited.
+    pub agent_tmp_root: Option<&'a Path>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -160,6 +167,7 @@ impl<'a> SpawnOptions<'a> {
             npx_fallback_package: None,
             node_max_old_space_mb: None,
             profile_env: None,
+            agent_tmp_root: None,
         }
     }
 }
@@ -675,17 +683,19 @@ fn build_command_with_captured_env(
         nice_increment,
         ..AgentPriority::from_env()
     };
-    build_command_in(opts, captured, priority, None, None)
+    build_command_in(opts, captured, priority, None, None, None)
 }
 
 /// [`build_command_with_captured_env`] with the per-spawn [`NpxLaunchDir`]
-/// an npx launch starts in (`None` → see [`process_cwd`]).
+/// an npx launch starts in (`None` → see [`process_cwd`]) and the launch's
+/// private temp folder (`None` → temp variables stay as inherited).
 fn build_command_in(
     opts: &SpawnOptions,
     captured: &BTreeMap<String, String>,
     priority: AgentPriority,
     npx_launch_dir: Option<&Path>,
     args: Option<Vec<String>>,
+    agent_tmp_dir: Option<&AgentTempDir>,
 ) -> Command {
     let args = args.unwrap_or_else(|| build_args(opts));
 
@@ -738,6 +748,15 @@ fn build_command_in(
             continue;
         }
         cmd.env(key, value);
+    }
+
+    // The launch's private temp folder is Intent wiring: it beats every
+    // inherited, captured, profile and caller value so no two agents share
+    // a temp dir (and so a fixed temp file name cannot collide).
+    if let Some(dir) = agent_tmp_dir {
+        for (key, value) in dir.env() {
+            cmd.env(key, value);
+        }
     }
 
     // Enforce both native-subagent denial settings after every env merge.
@@ -798,6 +817,7 @@ pub struct SpawnedAgent {
     child: Child,
     connection: Connection,
     npx_launch_dir: Option<NpxLaunchDir>,
+    agent_tmp_dir: Option<AgentTempDir>,
 }
 
 impl SpawnedAgent {
@@ -851,6 +871,14 @@ impl SpawnedAgent {
         kill_result.and(wait_result)
     }
 
+    /// Move out the launch's private temp folder (see
+    /// [`SpawnOptions::agent_tmp_root`]); call before [`Self::into_parts`].
+    /// The folder is removed when dropped, so the caller keeps it until the
+    /// child's process tree is gone. Dropped with `self` when never taken.
+    pub fn take_agent_tmp_dir(&mut self) -> Option<AgentTempDir> {
+        self.agent_tmp_dir.take()
+    }
+
     /// Decompose into the child, connection and npx launch dir (e.g. to store
     /// separately). The launch dir must be kept alive as long as the child.
     pub fn into_parts(self) -> (Child, Connection, Option<NpxLaunchDir>) {
@@ -873,6 +901,7 @@ impl SpawnedAgent {
 pub struct PreparedProvider {
     pub command: Command,
     npx_launch_dir: Option<NpxLaunchDir>,
+    agent_tmp_dir: Option<AgentTempDir>,
     /// The demotion applied to `command`, checked against the child once it
     /// is spawned.
     priority: AgentPriority,
@@ -897,12 +926,40 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
         None
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
-    let command = build_command_in(opts, captured_credential_env(), priority, launch_cwd, None);
+    let agent_tmp_dir = create_agent_tmp_dir(opts, &command_name);
+    let command = build_command_in(
+        opts,
+        captured_credential_env(),
+        priority,
+        launch_cwd,
+        None,
+        agent_tmp_dir.as_ref(),
+    );
     Ok(PreparedProvider {
         command,
         npx_launch_dir,
+        agent_tmp_dir,
         priority,
     })
+}
+
+/// The launch's private temp folder under [`SpawnOptions::agent_tmp_root`].
+/// Fail-soft: a folder that cannot be created leaves the inherited temp
+/// variables in place rather than failing the launch.
+fn create_agent_tmp_dir(opts: &SpawnOptions, command_name: &str) -> Option<AgentTempDir> {
+    let root = opts.agent_tmp_root?;
+    match AgentTempDir::create(root) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::warn!(
+                command = command_name,
+                root = %root.display(),
+                error = %e,
+                "cannot create agent temp dir; the agent inherits the daemon's temp dir"
+            );
+            None
+        }
+    }
 }
 
 /// Prepare an npm package using launch isolation and environment, without running
@@ -934,6 +991,7 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
         priority,
         Some(dir.path()),
         Some(args),
+        None,
     );
     command
         .stdin(Stdio::null())
@@ -942,6 +1000,7 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
     Ok(PreparedProvider {
         command,
         npx_launch_dir: Some(dir),
+        agent_tmp_dir: None,
         priority,
     })
 }
@@ -964,6 +1023,7 @@ pub fn spawn_prepared_provider(
     let PreparedProvider {
         command: mut cmd,
         npx_launch_dir,
+        agent_tmp_dir,
         priority,
     } = prepared;
     let (launch, target) = opts.launch_target();
@@ -1002,6 +1062,7 @@ pub fn spawn_prepared_provider(
         child,
         connection,
         npx_launch_dir,
+        agent_tmp_dir,
     })
 }
 
@@ -2461,5 +2522,146 @@ mod reduced_priority_tests {
             reduced_priority_shortfall(0x7fff_fff0, DEFAULT_AGENT_NICE),
             None
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod agent_tmp_tests {
+    //! Each launch gets its own `TMPDIR` / `TMP` / `TEMP` folder, so agents
+    //! on one host never share a temp file name; the folder lives as long
+    //! as the launch and is removed with it.
+
+    use super::*;
+    use std::time::Duration;
+
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn tmp_root() -> (tempfile::TempDir, PathBuf) {
+        let base = tempfile::Builder::new()
+            .prefix("intent-acp-agent-tmp-")
+            .tempdir()
+            .expect("temp base");
+        let root = base.path().join("root");
+        intent_core::prepare_agent_tmp_root(&root).expect("prepare root");
+        (base, root)
+    }
+
+    #[test]
+    fn agent_tmp_dir_beats_caller_env_and_is_unset_without_a_root() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let (_base, root) = tmp_root();
+        let mut opts = SpawnOptions::new(provider);
+        opts.extra_env
+            .insert("TMPDIR".to_string(), "/shared/tmp".to_string());
+        let dir = AgentTempDir::create(&root).unwrap();
+        let cmd = build_command_in(
+            &opts,
+            &BTreeMap::new(),
+            AgentPriority::from_env(),
+            None,
+            None,
+            Some(&dir),
+        );
+        for key in intent_core::AGENT_TMP_ENV_KEYS {
+            assert_eq!(
+                env_value(&cmd, key).as_deref(),
+                Some(dir.path().to_str().unwrap()),
+                "{key}"
+            );
+        }
+        // Without a root the caller's value is left alone.
+        let cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), 0);
+        assert_eq!(env_value(&cmd, "TMPDIR").as_deref(), Some("/shared/tmp"));
+        assert_eq!(env_value(&cmd, "TEMP"), None);
+    }
+
+    /// A launch whose root cannot hold a folder still starts, inheriting the
+    /// daemon's temp variables.
+    #[test]
+    fn missing_root_fails_soft() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let (base, _root) = tmp_root();
+        let missing = base.path().join("missing");
+        let mut opts = SpawnOptions::new(provider);
+        opts.agent_tmp_root = Some(&missing);
+        let prepared = prepare_provider(&opts).expect("launch still prepared");
+        assert!(prepared.agent_tmp_dir.is_none());
+        assert_eq!(env_value(&prepared.command, "TEMP"), None);
+    }
+
+    /// Two real launches report distinct private folders through the shell's
+    /// `$TMPDIR` / `$TMP` / `$TEMP` and `mktemp`; each folder exists while its
+    /// child runs and is gone once the launch is killed and dropped.
+    #[tokio::test]
+    async fn two_launches_get_distinct_tmp_dirs_removed_with_the_launch() {
+        let base_provider = *intent_providers::find_provider("auggie").unwrap();
+        let provider = intent_providers::ProviderConfig {
+            command: "sh",
+            base_args: &[
+                "-c",
+                r#"printf '%s\n%s\n%s\n%s\n' "$TMPDIR" "$TMP" "$TEMP" "$(mktemp)" > "$INTENT_TEST_OUT.part" && mv "$INTENT_TEST_OUT.part" "$INTENT_TEST_OUT"; exec sleep 30"#,
+            ],
+            model_flag: None,
+            rules_flag: None,
+            mcp_config_flag: None,
+            quiet_flag: None,
+            supports_mcp_config: false,
+            supports_rules_file: false,
+            ..base_provider
+        };
+        let (base, root) = tmp_root();
+        let mut launches = Vec::new();
+        for tag in ["one", "two"] {
+            let out = base.path().join(format!("{tag}.out"));
+            let mut opts = SpawnOptions::new(&provider);
+            opts.agent_tmp_root = Some(&root);
+            opts.extra_env
+                .insert("INTENT_TEST_OUT".to_string(), out.display().to_string());
+            let agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh");
+            launches.push((agent, out));
+        }
+        let mut dirs = Vec::new();
+        for (_, out) in &launches {
+            let mut report = None;
+            for _ in 0..500 {
+                if let Ok(text) = std::fs::read_to_string(out) {
+                    report = Some(text);
+                    break;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let report = report.expect("child reported its temp dir");
+            let lines: Vec<&str> = report.lines().collect();
+            assert_eq!(lines.len(), 4, "{report}");
+            let dir = PathBuf::from(lines[0]);
+            assert_eq!(lines[1], lines[0], "TMP matches TMPDIR");
+            assert_eq!(lines[2], lines[0], "TEMP matches TMPDIR");
+            assert_eq!(dir.parent(), Some(root.as_path()), "{report}");
+            assert!(
+                Path::new(lines[3]).starts_with(&dir),
+                "mktemp honoured TMPDIR: {report}"
+            );
+            assert!(dir.is_dir());
+            dirs.push(dir);
+        }
+        assert_ne!(dirs[0], dirs[1], "each launch has its own temp dir");
+
+        let (mut first, _) = launches.remove(0);
+        first.kill().await.expect("kill first");
+        drop(first);
+        assert!(!dirs[0].exists(), "first launch's temp dir removed");
+        assert!(dirs[1].is_dir(), "second launch's temp dir untouched");
+
+        let (mut second, _) = launches.remove(0);
+        second.kill().await.expect("kill second");
+        drop(second);
+        assert!(!dirs[1].exists(), "second launch's temp dir removed");
+        assert!(root.is_dir());
     }
 }
