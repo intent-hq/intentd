@@ -5726,7 +5726,13 @@ impl AgentManager {
         {
             return None;
         }
-        let session = self.services.store.get_agent_session(agent_id).await;
+        // Metadata-only lookup: `get_agent_session` also loads and hydrates
+        // the whole transcript, which this per-turn check never reads.
+        let session = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
@@ -20108,6 +20114,45 @@ mod role_reminder_tests {
             .await
             .expect("first turn still names the agent without reading the transcript");
         assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    /// The specialist role reminder is resolved on every turn too, so it must
+    /// use the metadata-only session lookup: `get_agent_session` loads and
+    /// hydrates the whole transcript, and fails on an undecodable row.
+    #[tokio::test]
+    async fn role_reminder_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        assert!(
+            mgr.services.agent_role_reminder(&agent_id).await.is_some(),
+            "fixture: the implementor specialist has a role reminder"
+        );
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+        assert!(
+            mgr.services.agent_role_reminder(&agent_id).await.is_some(),
+            "the role reminder resolves without reading the transcript"
+        );
     }
 
     /// Naming follows the persisted transcript: an `agent.editAndRegenerate`
