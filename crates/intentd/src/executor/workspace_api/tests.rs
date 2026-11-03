@@ -230,7 +230,8 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
         "return await ws.browser.listTabs();",
-        "return await ws.workspace.info();",
+        r#"return await ws.workspace.setTitle("Renamed");"#,
+        "return await ws.workspace.archive();",
         r#"return await ws.file.getAttachment("att-1");"#,
         r#"return await ws.git.registerRoot("sub");"#,
     ] {
@@ -243,6 +244,28 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
     }
     let help = call(&server, r#"return ws.help("note");"#).await;
     assert!(!help.0, "{help:?}");
+}
+
+/// `ws.workspace.info` is answered on the node with the agent's own
+/// checkout there; `details` goes to head.
+#[tokio::test]
+async fn workspace_info_names_the_agents_checkout_on_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .unwrap();
+    let info = ok_json(call(&server, "return JSON.stringify(await ws.workspace.info());").await);
+    assert_eq!(
+        info,
+        json!({ "id": workspace().as_str(), "path": dir.path().to_string_lossy() })
+    );
+    let (failed, text) = call(&server, "return await ws.workspace.details();").await;
+    assert!(failed && text.contains("node-link-unavailable"), "{text}");
 }
 
 #[tokio::test]

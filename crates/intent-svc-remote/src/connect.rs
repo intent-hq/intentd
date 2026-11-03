@@ -317,5 +317,6 @@ fn update_required(
         machine_version: machine_version.unwrap_or("an older version").to_owned(),
         backend_version: env!("CARGO_PKG_VERSION").to_owned(),
         update,
+        hint: None,
     }
 }

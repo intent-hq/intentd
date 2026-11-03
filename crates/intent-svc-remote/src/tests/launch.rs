@@ -857,3 +857,288 @@ async fn connected_machines_count_live_links() {
     disconnected(&fixture.node).await;
     assert_eq!(feature.connected_machines(), 0);
 }
+
+/// The sessions in the fixture's workspace.
+async fn sessions(f: &Fixture) -> Vec<intent_core::AgentSession> {
+    f.services
+        .store()
+        .list_agent_sessions(&workspace())
+        .await
+        .unwrap()
+}
+
+/// A forwarded call's value, or a panic with its refusal.
+fn answered(outcome: LinkOutcome) -> Value {
+    match outcome {
+        LinkOutcome::Ok(value) => value,
+        LinkOutcome::Err(error) => panic!("forwarded call failed: {error:?}"),
+    }
+}
+
+/// A sub-agent `create` frame with the mock provider the machine offers.
+fn child(extra: Value) -> Value {
+    let mut args = json!({
+        "name": "child",
+        "message": "hello",
+        "provider": "mock",
+        "model": "mock-model",
+    });
+    if let (Some(args), Value::Object(extra)) = (args.as_object_mut(), extra) {
+        args.extend(extra);
+    }
+    args
+}
+
+/// The remote placement of `agent`, if it has one.
+async fn placement_of(f: &Fixture, agent: &str) -> Option<RemotePlacementView> {
+    let session = f
+        .services
+        .store()
+        .get_agent_session(&AgentId::from(agent))
+        .await
+        .unwrap();
+    RemotePlacementView::from_metadata(session.metadata.as_ref())
+}
+
+/// A remote agent's sub-agent with no placement runs on the same machine,
+/// launched like an explicit placement, as the parent's child.
+#[tokio::test]
+async fn a_remote_agents_sub_agent_defaults_to_its_machine() {
+    let (f, link, machine) = fixture().await;
+    let (parent, _) = f.placed().await;
+    let created = answered(forward(&link, &parent, "agent.create", child(json!({}))).await);
+    let id = created["agentId"].as_str().unwrap();
+    let view = placement_of(&f, id).await.expect("the child is placed");
+    assert_eq!(view.node_id, machine.id());
+    assert_eq!(view.placement_error, None);
+    assert_eq!(created["nodeId"], json!(machine.id()), "{created}");
+    assert!(
+        created["notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("Test machine")),
+        "{created}"
+    );
+    let session = f
+        .services
+        .store()
+        .get_agent_session(&AgentId::from(id))
+        .await
+        .unwrap();
+    assert_eq!(session.parent_agent_id, Some(parent.clone()));
+
+    // agent.delegate inherits the machine the same way.
+    let delegated = answered(
+        forward(
+            &link,
+            &parent,
+            "agent.delegate",
+            json!({ "taskText": "do it", "provider": "mock", "model": "mock-model" }),
+        )
+        .await,
+    );
+    let id = delegated["agentId"].as_str().unwrap();
+    assert_eq!(
+        placement_of(&f, id).await.expect("placed").node_id,
+        machine.id()
+    );
+    f.node.shutdown();
+}
+
+/// An inherited placement the machine cannot honour fails with the
+/// normal error, never quietly running on the backend, and says how to.
+#[tokio::test]
+async fn an_inherited_placement_fails_without_falling_back() {
+    let (f, link, _machine) = fixture().await;
+    let (parent, _) = f.placed().await;
+    let before = sessions(&f).await.len();
+    let hint = "The sub-agent defaults to \"Test machine\" because its parent runs there; pass placement { target: \"local\" } to run it on the backend.";
+
+    let model = refused(
+        forward(
+            &link,
+            &parent,
+            "agent.create",
+            child(json!({ "model": "no-such-model" })),
+        )
+        .await,
+    );
+    assert!(
+        model.message.contains("isn't available") && model.message.contains(hint),
+        "{model:?}"
+    );
+    assert!(
+        model.message.contains("\"code\":\"model-unavailable\""),
+        "{model:?}"
+    );
+
+    // Both of the machine's slots in use: no-capacity on that machine.
+    let _one = f.node.attach(&AgentId::new(), &workspace());
+    let _two = f.node.attach(&AgentId::new(), &workspace());
+    let full = refused(forward(&link, &parent, "agent.create", child(json!({}))).await);
+    assert!(
+        full.message
+            .starts_with("No capacity on Test machine: 2 of 2 agents running"),
+        "{full:?}"
+    );
+    assert!(full.message.contains(hint), "{full:?}");
+    assert!(
+        full.message.contains("\"code\":\"placement-unavailable\""),
+        "{full:?}"
+    );
+    assert_eq!(sessions(&f).await.len(), before, "nothing was created");
+    f.node.shutdown();
+}
+
+/// `placement: { target: "local" }` runs a remote agent's sub-agent on the
+/// backend; with isolation it may combine on delegate, while isolation on
+/// an inherited placement is refused.
+#[tokio::test]
+async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
+    let (f, link, _machine) = fixture().await;
+    let (parent, _) = f.placed().await;
+    let created = answered(
+        forward(
+            &link,
+            &parent,
+            "agent.create",
+            child(json!({ "placement": { "target": "local" } })),
+        )
+        .await,
+    );
+    let id = created["agentId"].as_str().unwrap();
+    assert!(placement_of(&f, id).await.is_none(), "{created}");
+    assert!(created.get("nodeId").is_none(), "{created}");
+
+    let mixed = refused(
+        forward(
+            &link,
+            &parent,
+            "agent.create",
+            child(json!({ "placement": { "target": "local", "os": "macos" } })),
+        )
+        .await,
+    );
+    assert!(
+        mixed.message.contains(
+            "placement.target \"local\" runs the agent on the backend; omit os, arch, nodeId, checkout and exclusive"
+        ),
+        "{mixed:?}"
+    );
+
+    let isolated = refused(
+        forward(
+            &link,
+            &parent,
+            "agent.delegate",
+            json!({ "taskText": "do it", "provider": "mock", "isolation": "cow" }),
+        )
+        .await,
+    );
+    assert!(
+        isolated.message.contains(
+            "agent.delegate: a remote agent's sub-agents run on its machine in their own checkout, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend"
+        ),
+        "{isolated:?}"
+    );
+    let batch = refused(
+        forward(
+            &link,
+            &parent,
+            "agent.delegate",
+            json!({ "tasks": ["note-1"], "isolation": "cow" }),
+        )
+        .await,
+    );
+    assert!(
+        batch.message.contains("so isolation does not apply"),
+        "{batch:?}"
+    );
+    f.node.shutdown();
+}
+
+/// Creates by the user and by a local agent are unchanged: no placement
+/// means the backend.
+#[tokio::test]
+async fn user_and_local_agent_creates_stay_on_the_backend() {
+    let (f, _link, _machine) = fixture().await;
+    let local = AgentId::new();
+    let now = intent_core::now_iso();
+    sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'local', 'idle', 'mock', ?, ?)")
+        .bind(local.as_str())
+        .bind(workspace().as_str())
+        .bind(&now)
+        .bind(&now)
+        .execute(f.services.store().write_pool())
+        .await
+        .unwrap();
+    let session = f.services.store().get_agent_session(&local).await.unwrap();
+    let host = intent_acp::make_workspace_host_for_bridge(
+        std::sync::Arc::new(f.services.clone()),
+        workspace(),
+        local.clone(),
+        None,
+        f.services.session_agent_features(&session),
+        false,
+        wait(),
+    );
+    let created = host(json!({ "method": "agent.create", "args": child(json!({})) }))
+        .await
+        .expect("a local agent's create");
+    let id = created["agentId"].as_str().unwrap();
+    assert!(placement_of(&f, id).await.is_none(), "{created}");
+
+    let created = with_caller(
+        Caller::Daemon,
+        f.services.agent_create(
+            workspace(),
+            Some("user".into()),
+            Some("mock-model".into()),
+            None,
+            None,
+            None,
+            intent_core::AgentCreateExtra {
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("a user's create");
+    let id = created["agent"]["id"].as_str().unwrap();
+    assert!(placement_of(&f, id).await.is_none(), "{created}");
+    f.node.shutdown();
+}
+
+/// A remote agent reads its workspace's details through head; the
+/// setters, and `workspace.info` (answered on the machine), are refused.
+#[tokio::test]
+async fn a_remote_agent_reads_workspace_details_but_cannot_set_them() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let details = answered(forward(&link, &agent, "workspace.details", json!({})).await);
+    assert_eq!(details["id"], json!(workspace().as_str()), "{details}");
+    assert_eq!(details["title"], json!("Remote"), "{details}");
+    for (method, args) in [
+        ("workspace.setTitle", json!({ "title": "Renamed" })),
+        (
+            "workspace.setStatusMessage",
+            json!({ "statusMessage": "x" }),
+        ),
+        ("workspace.archive", json!({})),
+        ("workspace.info", json!({})),
+    ] {
+        let error = refused(forward(&link, &agent, method, args).await);
+        assert!(
+            error.message.starts_with("remote-agent-unsupported"),
+            "{method}: {error:?}"
+        );
+    }
+    let workspace = f
+        .services
+        .store()
+        .get_workspace(&workspace())
+        .await
+        .unwrap();
+    assert_eq!(workspace.title, "Remote");
+    f.node.shutdown();
+}

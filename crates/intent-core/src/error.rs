@@ -820,6 +820,38 @@ impl Error {
 }
 
 impl Error {
+    /// Append `hint` to an admission failure's message, leaving its code and
+    /// `error.data` unchanged: the typed placement, model and update
+    /// failures, provider-profile and remote-machine failures, and
+    /// invalid params. Other errors are returned as they are.
+    #[must_use]
+    pub fn with_hint(self, hint: &str) -> Self {
+        match self {
+            Self::PlacementUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::PlacementUnavailable(failure)
+            }
+            Self::ModelUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::ModelUnavailable(failure)
+            }
+            Self::MachineUpdateRequired(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::MachineUpdateRequired(failure)
+            }
+            Self::ProviderProfile(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::ProviderProfile(failure)
+            }
+            Self::RemoteMachine(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::RemoteMachine(failure)
+            }
+            Self::InvalidParams(message) => Self::InvalidParams(format!("{message} {hint}")),
+            other => other,
+        }
+    }
+
     /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.
     #[must_use]
     pub fn remote_machine(

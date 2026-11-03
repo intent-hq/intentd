@@ -278,7 +278,10 @@ async fn unsupported_placements_are_refused_before_any_effect() {
     let remote = Arc::new(FakeRemote::default());
     let svc = svc.with_remote_launch_port(remote.clone());
     for (placement_json, expected) in [
-        (json!({"target": "local"}), "not \"local\""),
+        (
+            json!({"target": "local", "os": "linux"}),
+            "omit os, arch, nodeId, checkout and exclusive",
+        ),
         (
             json!({"target": "remote", "exclusive": true}),
             "exclusive is not supported",
@@ -298,6 +301,20 @@ async fn unsupported_placements_are_refused_before_any_effect() {
             "{result:?}"
         );
     }
+    assert!(remote.launched.lock().unwrap().is_empty());
+    // `{ target: "local" }` alone runs the agent on the backend.
+    let result = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "local"}))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(remote.needs.lock().unwrap().is_empty());
+    assert!(remote.launched.lock().unwrap().is_empty());
     // A selected profile that does not resolve fails admission, never
     // running on the node's own login instead.
     let result = svc

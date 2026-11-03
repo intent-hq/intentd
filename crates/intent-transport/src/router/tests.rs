@@ -2714,6 +2714,7 @@ fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
         machine_version: "0.11.0".into(),
         backend_version: "0.12.0".into(),
         update: UpdateSide::Machine,
+        hint: None,
     };
     let rpc = super::domain_to_rpc(intent_core::Error::MachineUpdateRequired(Box::new(update)));
     assert_eq!(rpc.code, -32602);
