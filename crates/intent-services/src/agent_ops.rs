@@ -6918,7 +6918,12 @@ impl Services {
         // failing the idempotent delete. When the caller declares a
         // workspace, reject a cross-workspace bare-id probe by mapping to
         // `NotFound` before touching the store.
-        let session_observation = self.store.get_agent_session_summary(&agent_id).await;
+        //
+        // Deliberately the full read, not the summary: delete runs once per
+        // agent, and repository_pending_delete_tests pin the metadata-error
+        // branch (legacy ack, claim never confirmed) to a failing full read
+        // while scheduling validates with the summary.
+        let session_observation = self.store.get_agent_session(&agent_id).await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
         let session_meta = session_observation
             .ok()
