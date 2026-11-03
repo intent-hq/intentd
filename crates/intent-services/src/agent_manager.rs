@@ -5714,13 +5714,16 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Option<String> {
-        let messages = self
+        // Runs on every turn: probe the `(agent_id, role, seq)` index instead
+        // of loading (and hydrating) the whole transcript, which held
+        // read-pool connections for seconds per turn on long-lived agents.
+        if self
             .services
             .store
-            .get_agent_messages(agent_id, None)
+            .agent_has_assistant_message(agent_id)
             .await
-            .ok()?;
-        if messages.iter().any(|m| m.role == "assistant") {
+            .ok()?
+        {
             return None;
         }
         let session = self.services.store.get_agent_session(agent_id).await;
@@ -20064,6 +20067,106 @@ mod role_reminder_tests {
         );
         assert!(!later.contains("ws.workspace.setAgentName"));
         assert!(later.ends_with("later"));
+    }
+
+    /// The first-turn check runs on every turn, so it must not read the
+    /// transcript: loading and hydrating every message of a long-lived agent
+    /// held read-pool connections for seconds per turn. A prior message whose
+    /// stored content cannot be decoded makes any full transcript read fail
+    /// (and the old check then skipped naming); the probe never decodes
+    /// content, so naming still fires.
+    #[tokio::test]
+    async fn first_turn_naming_check_does_not_read_the_transcript() {
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&agent_id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&agent_id, None)
+                .await
+                .is_err(),
+            "fixture: a full transcript read must fail on the undecodable row"
+        );
+        let instruction = mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .expect("first turn still names the agent without reading the transcript");
+        assert!(instruction.contains("ws.workspace.setAgentName"));
+    }
+
+    /// Naming follows the persisted transcript: an `agent.editAndRegenerate`
+    /// truncation that keeps an assistant reply stays past the first turn,
+    /// and one that drops every reply is a first turn again (unchanged from
+    /// the full-transcript check this probe replaced).
+    #[tokio::test]
+    async fn first_turn_naming_follows_transcript_truncation() {
+        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        let store = &mgr.services.store;
+        let text = |t: &str| serde_json::json!([{ "type": "text", "text": t }]);
+        let first = store
+            .append_agent_message(&agent_id, "user", &text("q1"), &now_iso())
+            .await
+            .unwrap();
+        assert!(mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .is_some());
+        store
+            .append_agent_message(&agent_id, "assistant", &text("a1"), &now_iso())
+            .await
+            .unwrap();
+        let second = store
+            .append_agent_message(&agent_id, "user", &text("q2"), &now_iso())
+            .await
+            .unwrap();
+        store
+            .append_agent_message(&agent_id, "assistant", &text("a2"), &now_iso())
+            .await
+            .unwrap();
+        assert!(mgr
+            .build_first_turn_naming_instruction(&agent_id, &workspace_id)
+            .await
+            .is_none());
+
+        store
+            .truncate_agent_messages_from(&agent_id, second.seq)
+            .await
+            .unwrap();
+        assert!(
+            mgr.build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                .await
+                .is_none(),
+            "an earlier assistant reply survives the truncation"
+        );
+
+        store
+            .truncate_agent_messages_from(&agent_id, first.seq + 1)
+            .await
+            .unwrap();
+        assert!(
+            mgr.build_first_turn_naming_instruction(&agent_id, &workspace_id)
+                .await
+                .is_some(),
+            "no assistant reply is left, so the next turn is a first turn"
+        );
     }
 
     /// Seed an Assistant (chief) chat session alongside the default fixture.

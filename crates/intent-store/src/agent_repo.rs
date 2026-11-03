@@ -73,6 +73,15 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
     FROM agent_session s \
     WHERE s.workspace_id = ?";
 
+/// Bounded probe behind [`Store::agent_has_assistant_message`], extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement. It
+/// must stay a single seek of `idx_agent_message_agent_role_seq` (0064): the
+/// per-turn first-turn naming check runs it on every turn, and the
+/// full-transcript read it replaced held read-pool connections for seconds
+/// on long-lived agents.
+pub(crate) const AGENT_HAS_ASSISTANT_MESSAGE_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant')";
+
 /// Two-phase search SQL behind [`Store::search_agent_messages_fts`],
 /// extracted so the monorepo#4127 plan-shape guard
 /// (`search_messages_fts_ranking_pass_avoids_fat_tables`) runs
@@ -6080,6 +6089,24 @@ impl Store {
             metadata: metadata.cloned(),
             created_at: created_at.to_string(),
         })
+    }
+
+    /// Whether `agent_id` has at least one persisted `assistant` message —
+    /// exactly `get_agent_messages(agent_id, None)?.iter().any(|m| m.role ==
+    /// "assistant")`, without reading or decoding the transcript. One seek of
+    /// the `(agent_id, role, seq)` index, so the cost does not grow with the
+    /// conversation; it answers the per-turn "is this the first turn?" check.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_message(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_MESSAGE_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant message failed: {e}")))?;
+        Ok(exists != 0)
     }
 
     /// Read an agent's messages in chronological (`seq` ascending) order. When
@@ -15645,6 +15672,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The per-turn first-turn probe must stay one index seek: a plan that
+    /// scans `agent_message` (or reads its rows instead of the covering
+    /// index) would bring back the per-turn cost that grew with the transcript.
+    #[tokio::test]
+    async fn agent_has_assistant_message_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-probe-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_MESSAGE_SQL}"
+        ))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert!(!message_steps.is_empty(), "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_message` agrees with the full-transcript check it
+    /// replaced across every write path: append, the `agent.replaceMessages`
+    /// swap, the `agent.editAndRegenerate` truncation, and a direct role
+    /// UPDATE — and is scoped to one agent.
+    #[tokio::test]
+    async fn agent_has_assistant_message_tracks_transcript_writes() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-probe");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-probe".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-probe".to_string());
+        let other = AgentId("agent-assistant-probe-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let full_check = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read")
+                    .iter()
+                    .any(|m| m.role == "assistant")
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        store
+            .append_agent_message(&agent, "assistant", &text("a1"), &ts)
+            .await
+            .expect("append assistant");
+        let user2 = store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+        assert!(
+            !store.agent_has_assistant_message(&other).await.unwrap(),
+            "another agent's assistant rows do not count"
+        );
+
+        // Truncation that keeps an earlier assistant reply.
+        store
+            .truncate_agent_messages_from(&agent, user2.seq)
+            .await
+            .expect("truncate after first reply");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // Truncation back to the first user message drops every reply.
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        // The replaceMessages swap.
+        let reply = text("swapped");
+        store
+            .replace_agent_messages(
+                &agent,
+                &[ReplaceMessage {
+                    role: "assistant",
+                    content: &reply,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // A direct role UPDATE.
+        sqlx::query("UPDATE agent_message SET role = 'user' WHERE agent_id = ?")
+            .bind(&agent.0)
+            .execute(store.write_pool())
+            .await
+            .expect("direct update");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
     }
 
     /// Recompute one session's stats live from `agent_message` — the ground
