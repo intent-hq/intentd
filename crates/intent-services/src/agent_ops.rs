@@ -11044,15 +11044,19 @@ impl Services {
         let resolutions_json = serde_json::to_string(&resolutions)
             .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
         // The created-workspace map follows the resolutions map: an applied
-        // create records its workspace, and entries whose resolution was
-        // evicted (or re-proposed and dismissed) are dropped with it.
+        // create records (or replaces) its workspace, an applied resolution
+        // WITHOUT an id keeps any existing link — a client
+        // `agent.resolveProposal` retry after a partially failed
+        // origin-resolve wrote the link must not drop it — a dismissal drops
+        // the link, and entries whose resolution was evicted go with it.
         let previous_created = session.proposal_created_workspaces();
         let mut created_workspaces = previous_created.clone();
-        created_workspaces.shift_remove(&proposal_id);
         if outcome == PROPOSAL_OUTCOME_APPLIED {
             if let Some(created) = created_workspace_id.as_ref() {
                 created_workspaces.insert(proposal_id.clone(), json!(created.as_str()));
             }
+        } else {
+            created_workspaces.shift_remove(&proposal_id);
         }
         created_workspaces.retain(|id, _| resolutions.contains_key(id));
         let created_changed = created_workspaces != previous_created;

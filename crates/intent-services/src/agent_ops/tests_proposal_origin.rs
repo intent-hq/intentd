@@ -831,3 +831,65 @@ async fn created_workspace_link_follows_the_resolution() {
         "a dismissed re-proposal drops the old link"
     );
 }
+
+/// A created-workspace link written before a later write of the origin
+/// resolve failed survives the client's `agent.resolveProposal` retry (no
+/// created id), and a later applied resolution WITH an id replaces it.
+#[tokio::test]
+async fn applied_retry_without_an_id_keeps_the_created_workspace_link() {
+    let (_t, svc, ws, _bus) = setup().await;
+    let agent = pending_proposal(&svc, &ws, "tc-1").await;
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &agent,
+            intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+            &json!({ "tc-1": "ws-created" }).to_string(),
+            &now_iso(),
+        )
+        .await
+        .expect("write link as the failed origin resolve did");
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        Some("Created workspace x.".to_string()),
+        None,
+    )
+    .await
+    .expect("client fallback resolve");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_created_workspaces().get("tc-1"),
+        Some(&json!("ws-created")),
+        "the retry keeps the card's created-workspace link"
+    );
+
+    let blocks = create_proposal_blocks("tc-1", None);
+    seed(&svc, &ws, &agent, "tc-1", &blocks).await;
+    svc.agent_resolve_proposal_op(
+        ws.clone(),
+        agent.clone(),
+        "tc-1".to_string(),
+        "applied".to_string(),
+        None,
+        Some(WorkspaceId::from("ws-replacement")),
+    )
+    .await
+    .expect("re-proposed card applied with a new workspace");
+    let session = svc
+        .store()
+        .get_agent_session(&agent)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.proposal_created_workspaces().get("tc-1"),
+        Some(&json!("ws-replacement")),
+        "an applied resolution with an id replaces the link"
+    );
+}
