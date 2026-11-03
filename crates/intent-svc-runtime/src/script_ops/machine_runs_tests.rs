@@ -1,0 +1,426 @@
+//! Machine runs: a remote agent's run of a saved script on its machine,
+//! driven over the executor link's script frames.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use intent_core::node_link::{
+    LinkFrame, ScriptExited, ScriptOutput, ScriptStartCommand, ScriptStarted,
+};
+use intent_core::{AgentId, Script, ScriptMode, ScriptPurpose, ScriptStatus, WorkspaceId};
+use intent_services::feature_api::feature_ports::MachineScriptLink;
+
+use super::{Hooks, MachineRuns, RunPlace};
+
+#[derive(Default)]
+struct Recorded {
+    frames: Mutex<Vec<LinkFrame>>,
+    changed: Mutex<Vec<String>>,
+    wakes: Mutex<Vec<(AgentId, String)>>,
+    unreachable: std::sync::atomic::AtomicBool,
+    protocol: std::sync::atomic::AtomicU32,
+}
+
+fn hooks(rec: &Arc<Recorded>) -> Hooks {
+    let links = rec.clone();
+    let changed = rec.clone();
+    let wakes = rec.clone();
+    Hooks {
+        link: Arc::new(move |_agent| {
+            let rec = links.clone();
+            Box::pin(async move {
+                if rec.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(intent_core::Error::Internal("machine-unreachable".into()));
+                }
+                let sender = rec.clone();
+                let protocol = match rec.protocol.load(std::sync::atomic::Ordering::SeqCst) {
+                    0 => 8,
+                    p => p,
+                };
+                Ok(MachineScriptLink {
+                    node_id: "mac".into(),
+                    protocol,
+                    machine_name: "Mac".into(),
+                    machine_version: "0.11.0".into(),
+                    send: Arc::new(move |frame| {
+                        sender.frames.lock().unwrap().push(frame);
+                        Box::pin(async { Ok(()) })
+                    }),
+                })
+            })
+        }),
+        changed: Arc::new(move |_ws, script| {
+            changed.changed.lock().unwrap().push(script);
+            Box::pin(async {})
+        }),
+        wake: Arc::new(move |_ws, agent, content| {
+            wakes.wakes.lock().unwrap().push((agent, content));
+            Box::pin(async {})
+        }),
+        restart_backoff: Duration::from_millis(20),
+        stop_wait: Duration::from_millis(500),
+    }
+}
+
+fn ws() -> WorkspaceId {
+    WorkspaceId::from("ws-1")
+}
+
+fn script(mode: ScriptMode, command: &str) -> Script {
+    Script {
+        purpose: ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
+        id: "s1".into(),
+        workspace_id: "ws-1".into(),
+        name: "build".into(),
+        command: command.into(),
+        cwd: Some("web".into()),
+        env: Some([("A".to_string(), "1".to_string())].into()),
+        mode,
+        category: None,
+        source: "user".into(),
+        auto_start: None,
+        created_at: "t".into(),
+        updated_at: None,
+        remote_author: None,
+    }
+}
+
+fn place(agent: &AgentId) -> RunPlace {
+    RunPlace {
+        workspace_id: ws(),
+        script_id: "s1".into(),
+        agent_id: agent.clone(),
+    }
+}
+
+fn last_start(rec: &Recorded) -> ScriptStartCommand {
+    rec.frames
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|f| match f {
+            LinkFrame::ScriptStart(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("a scriptStart was sent")
+}
+
+async fn frame(runs: &MachineRuns, frame: LinkFrame) {
+    runs.on_frame("mac", frame).await;
+}
+
+fn started(start: &ScriptStartCommand) -> LinkFrame {
+    LinkFrame::ScriptStarted(ScriptStarted {
+        agent_id: start.agent_id.clone(),
+        script_id: start.script_id.clone(),
+        spawn_id: start.spawn_id.clone(),
+        pid: 42,
+    })
+}
+
+fn output(start: &ScriptStartCommand, seq: u64, data: &str) -> LinkFrame {
+    LinkFrame::ScriptOutput(ScriptOutput {
+        agent_id: start.agent_id.clone(),
+        script_id: start.script_id.clone(),
+        spawn_id: start.spawn_id.clone(),
+        seq,
+        data: data.into(),
+    })
+}
+
+fn exited(start: &ScriptStartCommand, code: Option<i32>, error: Option<&str>) -> LinkFrame {
+    LinkFrame::ScriptExited(ScriptExited {
+        agent_id: start.agent_id.clone(),
+        script_id: start.script_id.clone(),
+        spawn_id: start.spawn_id.clone(),
+        exit_code: code,
+        error: error.map(str::to_owned),
+    })
+}
+
+#[tokio::test]
+async fn a_command_run_starts_on_the_machine_and_settles_from_its_frames() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let state = runs
+        .start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    assert_eq!(state.status, ScriptStatus::Starting);
+    let start = last_start(&rec);
+    assert_eq!(start.agent_id, agent);
+    assert_eq!(start.command, "make");
+    assert_eq!(start.cwd.as_deref(), Some("web"));
+    assert_eq!(start.env.len(), 1);
+    assert_ne!(
+        Some(start.spawn_id.clone()),
+        state.run_id,
+        "spawnId is not the runId"
+    );
+
+    frame(&runs, started(&start)).await;
+    assert_eq!(
+        runs.state(&place(&agent)).unwrap().status,
+        ScriptStatus::Running
+    );
+    assert_eq!(runs.state(&place(&agent)).unwrap().pid, Some(42));
+    frame(&runs, output(&start, 0, "hello\n")).await;
+    frame(&runs, exited(&start, Some(2), None)).await;
+    let state = runs.state(&place(&agent)).unwrap();
+    assert_eq!(state.status, ScriptStatus::Exited);
+    assert_eq!(state.exit_code, Some(2));
+    let entries = runs.entries(&ws(), "s1");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["remoteAgentId"], agent.as_str());
+    assert_eq!(entries[0]["nodeId"], "mac");
+    assert_eq!(entries[0]["runtime"]["status"], "exited");
+    assert_eq!(entries[0]["lastRun"]["outcome"], "failed");
+    assert!(runs.output(&place(&agent)).unwrap().contains("hello"));
+    assert!(
+        rec.changed.lock().unwrap().len() >= 3,
+        "each transition is published"
+    );
+}
+
+#[tokio::test]
+async fn frames_of_another_spawn_or_machine_are_ignored() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    let mut stale = start.clone();
+    stale.spawn_id = "old".into();
+    frame(&runs, exited(&stale, Some(0), None)).await;
+    runs.on_frame("other-machine", exited(&start, Some(0), None))
+        .await;
+    assert_eq!(
+        runs.state(&place(&agent)).unwrap().status,
+        ScriptStatus::Starting
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_exits_is_restarted_with_a_new_spawn_and_the_same_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let first = runs
+        .start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    frame(&runs, exited(&start, Some(1), None)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while last_start(&rec).spawn_id == start.spawn_id {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted");
+    let state = runs.state(&place(&agent)).unwrap();
+    assert_eq!(state.run_id, first.run_id, "the runId spans restarts");
+    assert_eq!(state.restart_count, 1);
+}
+
+#[tokio::test]
+async fn stop_waits_for_the_ack_and_a_second_stop_dismisses_the_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    let acker = {
+        let runs = runs.clone();
+        let rec = rec.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            loop {
+                if rec
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|f| matches!(f, LinkFrame::ScriptStop(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            runs.on_frame("mac", exited(&start, Some(143), None)).await;
+        })
+    };
+    let stopped = runs.stop(&place(&agent)).await.unwrap();
+    acker.await.unwrap();
+    assert_eq!(stopped.status, ScriptStatus::Idle);
+    assert_eq!(
+        runs.entries(&ws(), "s1").len(),
+        1,
+        "the stopped run is still listed"
+    );
+    runs.stop(&place(&agent)).await.unwrap();
+    assert!(
+        runs.entries(&ws(), "s1").is_empty(),
+        "a stop of a stopped run dismisses it"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_link_settles_live_runs_and_monitors_wake_their_agent() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    let monitor = runs
+        .monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .unwrap();
+    assert_eq!(monitor["remoteAgentId"], agent.as_str());
+    assert_eq!(monitor["nodeId"], "mac");
+    assert!(runs.live_on("mac"));
+    runs.link_lost("mac", "remote-script-lost: the machine disconnected")
+        .await;
+    assert!(!runs.live_on("mac"));
+    let state = runs.state(&place(&agent)).unwrap();
+    assert_eq!(state.status, ScriptStatus::Exited);
+    assert_eq!(state.exit_code, Some(-1));
+    assert_eq!(
+        state.error.as_deref(),
+        Some("remote-script-lost: the machine disconnected")
+    );
+    assert_eq!(
+        runs.entries(&ws(), "s1")[0]["lastRun"]["outcome"],
+        "interrupted"
+    );
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, agent);
+    assert!(wakes[0].1.contains("remote-script-lost"), "{}", wakes[0].1);
+}
+
+#[tokio::test]
+async fn an_output_pattern_monitor_wakes_once_on_a_matching_line() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    runs.monitor(
+        &place(&agent),
+        &serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready on \\d+" }),
+    )
+    .unwrap();
+    frame(&runs, output(&start, 0, "booting\nready on 3000\n")).await;
+    frame(&runs, output(&start, 1, "ready on 3001\n")).await;
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert!(wakes[0].1.contains("ready on 3000"), "{}", wakes[0].1);
+}
+
+#[tokio::test]
+async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let acked = runs
+        .end_agent(
+            &agent,
+            deadline,
+            "remote-script-lost: the machine was removed",
+        )
+        .await;
+    assert!(!acked, "nobody acknowledged the stop");
+    assert!(rec
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, LinkFrame::ScriptStop(_))));
+    assert!(
+        runs.entries(&ws(), "s1").is_empty(),
+        "its entries are dropped"
+    );
+    // No live run: nothing to wait for.
+    assert!(runs.end_agent(&agent, deadline, "x").await);
+}
+
+#[tokio::test]
+async fn changing_the_definition_cancels_and_drops_every_machine_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let a = AgentId::new();
+    let b = AgentId::new();
+    runs.start(&place(&a), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    runs.start(&place(&b), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    assert_eq!(runs.entries(&ws(), "s1").len(), 2);
+    runs.cancel_script(&ws(), "s1", "script replaced").await;
+    assert!(runs.entries(&ws(), "s1").is_empty());
+    let stops = rec
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| matches!(f, LinkFrame::ScriptStop(_)))
+        .count();
+    assert_eq!(stops, 2);
+}
+
+#[tokio::test]
+async fn start_fails_when_the_machine_is_unreachable_or_too_old_for_a_restart() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    rec.unreachable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = runs
+        .start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("machine-unreachable"), "{error}");
+    assert!(runs.entries(&ws(), "s1").is_empty());
+
+    rec.unreachable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, exited(&start, Some(0), None)).await;
+    rec.protocol.store(7, std::sync::atomic::Ordering::SeqCst);
+    let error = runs
+        .restart(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("machine-update-required"),
+        "{error}"
+    );
+    // A protocol 9 link still runs scripts.
+    rec.protocol.store(9, std::sync::atomic::Ordering::SeqCst);
+    runs.restart(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+}

@@ -836,6 +836,87 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// suppression and exports.
     fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
 
+    /// A remote agent's forwarded `ws.script.*` call (`remoteScripts: 1`):
+    /// `caller` is the agent and its machine. Reads act on any script; runs
+    /// are the caller's machine runs. The error is the frame's message.
+    fn remote_script_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        caller: RemoteScriptCaller,
+        method: &'a str,
+        args: serde_json::Value,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
+        let _ = (svc, caller, args, budget);
+        Box::pin(async move {
+            Err(format!(
+                "remote-agent-unsupported: `{method}` is not supported on remote agents by this backend"
+            ))
+        })
+    }
+
+    /// An app or local-agent `script.<method>` addressed to a remote agent's
+    /// machine run (`remoteAgentId`): `status`, `output`, `stop` or
+    /// `restart` of an existing run; `start` and `run` are refused.
+    fn machine_run_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        method: &'a str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        let _ = (svc, workspace_id, params);
+        Box::pin(async move {
+            Err(Error::InvalidParams(format!(
+                "script.{method}: remoteAgentId is not supported by this daemon"
+            )))
+        })
+    }
+
+    /// A script frame from machine `node_id` (`scriptStarted`,
+    /// `scriptOutput`, `scriptExited`).
+    fn machine_script_frame<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        frame: intent_core::node_link::LinkFrame,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, node_id, frame);
+        Box::pin(async {})
+    }
+
+    /// Machine `node_id`'s link ended: every live machine run on it is lost
+    /// with `reason` (`remote-script-lost: …`).
+    fn machine_link_lost<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (svc, node_id, reason);
+        Box::pin(async {})
+    }
+
+    /// Whether a machine run is live on `node_id` (its link is then wanted).
+    fn machine_runs_live(&self, svc: &Services, node_id: &str) -> bool {
+        let _ = (svc, node_id);
+        false
+    }
+
+    /// Lease end: stop each of `agent_id`'s live machine runs and wait for
+    /// their acknowledgements until `deadline`, then drop its entries.
+    /// Returns whether every stop was acknowledged.
+    fn end_agent_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        let _ = (svc, agent_id, deadline, reason);
+        Box::pin(async { true })
+    }
+
     /// Stop every script of `workspace_id` and refuse new launches while the
     /// returned guard lives (workspace retire).
     fn close_workspace_scripts<'a>(
@@ -1322,6 +1403,26 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>>;
 
+    /// The executor link to `agent_id`'s machine for its machine runs,
+    /// connecting on demand.
+    ///
+    /// # Errors
+    ///
+    /// `machine-unreachable` (with `attempts`) when no link comes up;
+    /// [`Error::Unsupported`] by default.
+    fn machine_script_link<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<MachineScriptLink>> {
+        let _ = (svc, agent_id);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "this daemon has no remote machines".into(),
+            ))
+        })
+    }
+
     /// `remoteMachines.<method>` with `params`, after the services checked
     /// the caller is the owner. A daemon without the remote feature has no
     /// exposed machines to manage.
@@ -1341,6 +1442,42 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
                 "remoteMachines.{method}: this daemon cannot use exposed machines"
             )))
         })
+    }
+}
+
+/// A remote agent calling `ws.script.*` through its machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteScriptCaller {
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    /// Its machine: the `remoteMachines` row id.
+    pub node_id: String,
+}
+
+/// Sends one script frame on a machine's link.
+pub type ScriptFrameSender =
+    Arc<dyn Fn(intent_core::node_link::LinkFrame) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+
+/// The executor link a machine run is driven over.
+#[derive(Clone)]
+pub struct MachineScriptLink {
+    /// The machine: the `remoteMachines` row id.
+    pub node_id: String,
+    /// The protocol the link negotiated; script frames need 8 or later.
+    pub protocol: u32,
+    /// The machine's display name and intentd version, for
+    /// `machine-update-required`.
+    pub machine_name: String,
+    pub machine_version: String,
+    pub send: ScriptFrameSender,
+}
+
+impl std::fmt::Debug for MachineScriptLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineScriptLink")
+            .field("node_id", &self.node_id)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
     }
 }
 

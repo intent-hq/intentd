@@ -34,6 +34,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 
 mod lifecycle;
+pub(crate) mod machine_runs;
 mod monitors;
 mod retirement;
 use lifecycle::RunLease;
@@ -352,6 +353,9 @@ pub struct ScriptManager {
     settings: Option<Arc<intent_services::feature_api::SettingsRegistry>>,
     tasks: Arc<intent_services::feature_api::delivery_tasks::DeliveryTasks>,
     output_store: ScriptOutputStore,
+    /// Remote agents' machine runs (`remoteScripts: 1`), set up once the
+    /// owner's services are attached.
+    machine_runs: Arc<std::sync::OnceLock<machine_runs::MachineRuns>>,
 }
 
 /// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
@@ -519,6 +523,7 @@ impl ScriptManager {
                 &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
                 intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
             ),
+            machine_runs: Arc::default(),
         }
     }
 
@@ -557,8 +562,96 @@ impl ScriptManager {
         services: intent_services::feature_api::Services,
     ) -> Self {
         self.agent_wake = services.feature_agent_wake_port();
-        self.owner_services = Some(services);
+        self.owner_services = Some(services.clone());
+        let _ = self.machine_runs.set(self.new_machine_runs(services));
         self
+    }
+
+    /// The machine-run registry over `services`: links through the
+    /// remote-launch port, wakes through the agent-wake port, and publishes
+    /// `script:changed` through this manager.
+    fn new_machine_runs(
+        &self,
+        services: intent_services::feature_api::Services,
+    ) -> machine_runs::MachineRuns {
+        let link_svc = services.clone();
+        let wake_svc = services;
+        let wake_port = self.agent_wake.clone();
+        let publisher = self.clone();
+        machine_runs::MachineRuns::new(machine_runs::Hooks {
+            link: Arc::new(move |agent| {
+                let svc = link_svc.clone();
+                Box::pin(async move {
+                    svc.feature_remote_launch_port()
+                        .machine_script_link(&svc, &agent)
+                        .await
+                })
+            }),
+            changed: Arc::new(move |ws, id| {
+                let publisher = publisher.clone();
+                Box::pin(async move { publisher.publish_machine_change(&ws, &id).await })
+            }),
+            wake: Arc::new(move |ws, agent, content| {
+                let svc = wake_svc.clone();
+                let port = wake_port.clone();
+                Box::pin(async move {
+                    if let Err(error) = port
+                        .deliver_wake_message(&svc, &ws, &agent, &content, None)
+                        .await
+                    {
+                        tracing::warn!(%error, "machine run: could not wake the monitor's agent");
+                    }
+                })
+            }),
+            restart_backoff: Duration::from_secs(1),
+            stop_wait: Duration::from_secs(10),
+        })
+    }
+
+    /// The machine runs, when the owner's services are attached.
+    pub(crate) fn machine_runs(&self) -> Option<&machine_runs::MachineRuns> {
+        self.machine_runs.get()
+    }
+
+    /// A full script row: the definition, its home run's `runtime`, and its
+    /// `machineRuns` (omitted when it has none).
+    fn row(&self, def: &Script, state: &ScriptRuntimeState) -> Value {
+        let mut row = with_runtime(def, state);
+        self.add_machine_runs(&WorkspaceId::from(def.workspace_id.as_str()), &mut row);
+        row
+    }
+
+    fn add_machine_runs(&self, ws: &WorkspaceId, row: &mut Value) {
+        let (Some(runs), Some(id)) = (self.machine_runs(), row["id"].as_str().map(str::to_owned))
+        else {
+            return;
+        };
+        let entries = runs.entries(ws, &id);
+        if !entries.is_empty() {
+            row["machineRuns"] = Value::Array(entries);
+        }
+    }
+
+    /// Publish a machine run's transition: `script:changed` (`updated`)
+    /// with the full row, never `script:state` or `script:output`.
+    pub(crate) async fn publish_machine_change(&self, ws: &WorkspaceId, id: &str) {
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(ws.clone(), id.to_owned()))
+            .map(|m| (m.def.clone(), m.state.clone()));
+        if let Some((def, state)) = script {
+            publish_event(
+                self.bus.as_ref(),
+                script_event(
+                    ws,
+                    SCRIPT_CHANGED,
+                    json!({"scriptId": id, "action": "updated", "script": self.row(&def, &state)}),
+                ),
+            )
+            .await;
+        }
     }
 
     pub(crate) fn with_tasks(
@@ -670,7 +763,8 @@ impl ScriptManager {
         workspace_id: WorkspaceId,
         params: ScriptCreateParams,
     ) -> Result<Value> {
-        self.create_with_scope(workspace_id, params, false).await
+        self.create_with_scope(workspace_id, params, false, None)
+            .await
     }
 
     /// Wire non-administrators may replace only definitions in this workspace.
@@ -679,7 +773,20 @@ impl ScriptManager {
         workspace_id: WorkspaceId,
         params: ScriptCreateParams,
     ) -> Result<Value> {
-        self.create_with_scope(workspace_id, params, true).await
+        self.create_with_scope(workspace_id, params, true, None)
+            .await
+    }
+
+    /// `script.create` by a remote agent: a new script records `author` as
+    /// its `remoteAuthor`; an upsert keeps the stored one.
+    pub(crate) async fn create_by_remote_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+        author: intent_core::ScriptRemoteAuthor,
+    ) -> Result<Value> {
+        self.create_with_scope(workspace_id, params, true, Some(author))
+            .await
     }
 
     async fn create_with_scope(
@@ -687,6 +794,7 @@ impl ScriptManager {
         workspace_id: WorkspaceId,
         params: ScriptCreateParams,
         scoped: bool,
+        author: Option<intent_core::ScriptRemoteAuthor>,
     ) -> Result<Value> {
         // Refuse oversized fields before taking any lock or writing anything.
         check_script_field_sizes(&params)?;
@@ -734,15 +842,18 @@ impl ScriptManager {
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
         // re-reads definitions from disk — the daemon must tear down the old
         // supervisor/PTY here so a running replaced script is never orphaned.
-        let (source, created_at, updated_at) = {
+        // An upsert keeps the stored `remoteAuthor`; only a new script
+        // records the creating remote agent.
+        let (source, created_at, updated_at, remote_author) = {
             let scripts = self.scripts.lock().unwrap();
             match scripts.get(&(workspace_id.clone(), id.clone())) {
                 Some(old) => (
                     old.def.source.clone(),
                     old.def.created_at.clone(),
                     Some(now_iso()),
+                    old.def.remote_author.clone(),
                 ),
-                None => ("user".to_string(), now_iso(), None),
+                None => ("user".to_string(), now_iso(), None, author),
             }
         };
         // Creation defaults do not reclassify stored definitions. Startup
@@ -793,7 +904,7 @@ impl ScriptManager {
             auto_start: params.auto_start,
             created_at,
             updated_at,
-            remote_author: None,
+            remote_author,
         };
         if self
             .scripts
@@ -809,6 +920,10 @@ impl ScriptManager {
                 "cancelled by definition replacement",
             )
             .await?;
+        }
+        if let Some(runs) = self.machine_runs() {
+            runs.cancel_script(&workspace_id, &id, "cancelled by definition replacement")
+                .await;
         }
         let publication = self.locks.publication_lock(&id);
         let publishing = publication.lock().await;
@@ -1210,6 +1325,12 @@ impl ScriptManager {
                 row["runtime"] =
                     serde_json::to_value(state).map_err(|e| Error::Internal(e.to_string()))?;
                 intent_core::script_lists::bound_error(&mut row["runtime"]);
+                self.add_machine_runs(ws, row);
+                if let Some(entries) = row.get_mut("machineRuns").and_then(Value::as_array_mut) {
+                    for entry in entries {
+                        intent_core::script_lists::bound_error(&mut entry["runtime"]);
+                    }
+                }
             }
         }
         Ok(page)
@@ -1253,7 +1374,7 @@ impl ScriptManager {
         let mut scripts = Vec::new();
         let mut bytes = 0usize;
         for m in &rows {
-            let mut row = with_runtime(&m.def, &m.state);
+            let mut row = self.row(&m.def, &m.state);
             intent_services::feature_api::pagination::bound_row(
                 &mut row,
                 FULL_PAGE_MAX_BYTES - LIST_ENVELOPE_RESERVE,
@@ -1294,7 +1415,7 @@ impl ScriptManager {
             .get(&(ws.clone(), id.to_owned()))
             .map(|m| m.state.clone())
             .unwrap_or_default();
-        Ok(with_runtime(&def, &state))
+        Ok(self.row(&def, &state))
     }
 
     pub(crate) async fn list_filtered(
@@ -1331,7 +1452,7 @@ impl ScriptManager {
             let mut scripts: Vec<(String, Value)> = guard
                 .iter()
                 .filter(|((ws, _), m)| ws == workspace_id && selected(m))
-                .map(|(_, m)| (m.def.created_at.clone(), with_runtime(&m.def, &m.state)))
+                .map(|(_, m)| (m.def.created_at.clone(), self.row(&m.def, &m.state)))
                 .collect();
             if guard.iter().any(|((ws, _), _)| ws == workspace_id) {
                 scripts.sort_by(|a, b| {
@@ -1361,7 +1482,7 @@ impl ScriptManager {
                             .iter()
                             .filter(|((ws, _), m)| ws == workspace_id && selected(m))
                             .map(|(_, m)| {
-                                (m.def.created_at.clone(), with_runtime(&m.def, &m.state))
+                                (m.def.created_at.clone(), self.row(&m.def, &m.state))
                             })
                             .collect();
                         scripts.sort_by(|a, b| {
@@ -1519,7 +1640,7 @@ impl ScriptManager {
                                 .iter()
                                 .filter(|((ws, _), m)| ws == workspace_id && selected(m))
                                 .map(|(_, m)| {
-                                    (m.def.created_at.clone(), with_runtime(&m.def, &m.state))
+                                    (m.def.created_at.clone(), self.row(&m.def, &m.state))
                                 })
                                 .collect();
                             scripts.sort_by(|a, b| {
@@ -1587,6 +1708,10 @@ impl ScriptManager {
                 "cancelled by definition removal",
             )
             .await?;
+        }
+        if let Some(runs) = self.machine_runs() {
+            runs.cancel_script(workspace_id, script_id, "cancelled by definition removal")
+                .await;
         }
         let publication = self.locks.publication_lock(script_id);
         let publishing = publication.lock().await;
@@ -3176,7 +3301,7 @@ impl ScriptManager {
             .lock()
             .unwrap()
             .get(&(ws.clone(), id.to_owned()))
-            .map(|m| with_runtime(&m.def, &m.state));
+            .map(|m| self.row(&m.def, &m.state));
         if let Some(script) = script {
             publish_event(
                 self.bus.as_ref(),
@@ -8086,6 +8211,7 @@ mod tests {
                         ..Default::default()
                     },
                     first_scoped,
+                    None,
                 )
                 .await
         });
@@ -8106,6 +8232,7 @@ mod tests {
                         ..Default::default()
                     },
                     second_scoped,
+                    None,
                 )
                 .await
         });

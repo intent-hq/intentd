@@ -65,7 +65,7 @@ pub(crate) const PRELUDE: &str = r"
 
 /// `budget` is the caller's effective `workspace_api` eval budget; `run`
 /// derives its `timeoutSeconds` ceiling from it.
-pub(crate) async fn dispatch(
+pub async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     budget: Duration,

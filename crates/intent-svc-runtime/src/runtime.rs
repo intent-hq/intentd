@@ -144,6 +144,84 @@ pub fn register(services: Services) -> Services {
 }
 
 impl RuntimePort for RuntimeFeature {
+    fn remote_script_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        caller: intent_services::feature_api::feature_ports::RemoteScriptCaller,
+        method: &'a str,
+        args: serde_json::Value,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
+        Box::pin(crate::remote_scripts::remote_call(
+            svc, caller, method, args, budget,
+        ))
+    }
+
+    fn machine_run_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        method: &'a str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(crate::remote_scripts::machine_run_call(
+            svc,
+            workspace_id,
+            method,
+            params,
+        ))
+    }
+
+    fn machine_script_frame<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        frame: intent_core::node_link::LinkFrame,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.on_frame(node_id, frame).await;
+            }
+        })
+    }
+
+    fn machine_link_lost<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.link_lost(node_id, reason).await;
+            }
+        })
+    }
+
+    fn machine_runs_live(&self, svc: &Services, node_id: &str) -> bool {
+        svc.script_manager()
+            .machine_runs()
+            .is_some_and(|runs| runs.live_on(node_id))
+    }
+
+    fn end_agent_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a intent_core::AgentId,
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            match mgr.machine_runs() {
+                Some(runs) => runs.end_agent(agent_id, deadline, reason).await,
+                None => true,
+            }
+        })
+    }
+
     fn script_list<'a>(
         &'a self,
         svc: &'a Services,
