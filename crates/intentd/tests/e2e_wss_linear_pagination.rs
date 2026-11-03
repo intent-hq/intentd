@@ -445,7 +445,11 @@ async fn search_issues_next_token_round_trips() {
         assert_eq!(calls[0], ("login bug".to_string(), Some(50), None));
         assert_eq!(
             calls[1],
-            ("login bug".to_string(), Some(50), Some("cursor-2".to_string()))
+            (
+                "login bug".to_string(),
+                Some(50),
+                Some("cursor-2".to_string())
+            )
         );
     }
 }
