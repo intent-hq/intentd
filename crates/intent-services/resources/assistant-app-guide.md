@@ -36,6 +36,8 @@ These app-version notes qualify every later description in this guide:
 - Last-top-level **Retire Agent** protection depends on the connected daemon.
   Daemons offering the newer guard reject both manual and agent requests; older
   daemons may allow manual retirement. Start a replacement agent first.
+  Delegated agents bypass only the last-top-level restriction; retirement is
+  still refused while a descendant is running.
 - Same-provider **Retry** on a usage-limit banner requires an app offering it.
   Older apps may offer only **Retry on [provider]** for an available alternative;
   otherwise wait for the limit to reset and continue from the conversation.
