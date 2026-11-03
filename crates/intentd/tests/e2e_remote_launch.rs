@@ -201,7 +201,7 @@ fn try_rev(dir: &Path, name: &str) -> Option<String> {
 /// `mock`, with remote agents on and an executor credential minted for the
 /// backend `backend_id`.
 struct Machine {
-    _daemon: common::DaemonGuard,
+    daemon: common::DaemonGuard,
     port: u16,
     fingerprint: String,
     daemon_id: String,
@@ -243,7 +243,7 @@ async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
     )
     .await;
     Machine {
-        _daemon: daemon,
+        daemon,
         port,
         fingerprint,
         daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
@@ -1235,4 +1235,125 @@ async fn deleting_a_remote_agent_pushes_its_work_then_removes_its_checkout() {
     })
     .await
     .expect("the machine removes the checkout after the push");
+}
+
+/// The machine's own graceful shutdown (a restart or an update) stops its
+/// agents and pushes each one's work a last time, and the backend accepts
+/// that push: a live agent's changes since its last turn-end push land in
+/// its `wip` ref (intent-hq/intent#8437).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_shutdown_pushes_live_agents_work() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote shutdown push e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-shutdown-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let mut machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let wip_ref = format!("refs/intent/ws/{ws_id}/agents/{agent_id}/wip");
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi await ws.file.write("turn.txt", "pushed at turn end"); return "ok";"#,
+        50,
+    )
+    .await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    // The turn-end push lands first.
+    let pushed = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &wip_ref) {
+                if git(&repo, &["ls-tree", "--name-only", &wip]).contains("turn.txt") {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the turn-end push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the turn-end push lands on head");
+
+    // Work since that push, still only in the machine's checkout.
+    let checkout = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id)
+        .join("work");
+    assert!(
+        checkout.join("turn.txt").is_file(),
+        "{}",
+        checkout.display()
+    );
+    std::fs::write(checkout.join("unpushed.txt"), "since the last push").unwrap();
+
+    // The machine's daemon shuts down gracefully, the agent still live.
+    let daemon = machine.daemon.child_mut();
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    daemon
+        .wait_with_timeout(common::test_timeout(Duration::from_secs(120)))
+        .unwrap()
+        .expect("the machine's daemon exits gracefully");
+
+    let wip = try_rev(&repo, &wip_ref).expect("the wip ref exists");
+    let log = std::fs::read_to_string(node_dir.join("machine.log")).unwrap_or_default();
+    assert_ne!(
+        wip, pushed,
+        "the shutdown push did not land on head; machine log:\n{log}"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:unpushed.txt")]),
+        "since the last push"
+    );
 }
