@@ -844,7 +844,7 @@ pub async fn build_large_state(scale: &LargeStateScale) -> LargeState {
         scripts.push(id);
     }
     counts.scripts = scripts.len();
-    let huge_script = uuid_like(0x000A, 999_999);
+    let huge_script = uuid_like(0x00AA, 0);
     store
         .upsert_script(&Script {
             purpose: ScriptPurpose::Saved,
