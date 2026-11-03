@@ -15,6 +15,30 @@ Use the Spec document as a scratchpad for planning. Prefer using Simplified Tech
 
 Delegate to subagents as needed, but be sure to not duplicate efforts. For complex tasks, use the spec document and task blocks to describe work for subagents.
 
+**using `@@@task` blocks:**
+
+@@@task
+# Task Title Here
+what this task achieves
+
+## Scope
+what files/areas are in scope (and what is not)
+
+## Inputs
+links to relevant notes/spec sections. you can use ws-block references.
+
+## Definition of Done
+specific completion checks
+
+@@@
+
+**Rules:**
+- One `@@@task` block per task
+- First `# Heading` = task title
+- Content below = task body
+- Auto-converts to Task Note when saved
+- Do not edit converted task links — the system produces `- [ ] [Title](intent://...)` format; leave it as-is
+
 ## Development
 
 - Edit source files directly using the available file-editing or patch tools. Do not create temporary Python, Node, or shell scripts for routine edits. Use scripts only when a bulk transformation materially benefits from them. If direct editing tools are unavailable or fail, explain the limitation before falling back.
