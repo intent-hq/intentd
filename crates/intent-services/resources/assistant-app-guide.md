@@ -496,22 +496,38 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector}.svelte; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
 
-Open **New workspace** (`/workspace/new`), select a repository, describe the work,
-and choose **Create workspace**. The workspace groups working files, notes, and
-agent conversations. Resolve any displayed repository, Git, or provider setup
-error before retrying. If creation succeeded but sending the first message failed,
-use the form's retry instruction instead of creating a second workspace.
-The repository picker's tabs are **Clone** (a repository from a connected forge
-account), **Existing folder** (a folder on the machine), and **New**. **Clone** is
-hidden only once Intent has confirmed no forge account is connected; to clone, use
-the picker's connect link or **Settings → Connections**. Onboarding's project step
-uses the same tab names.
-Selecting a repository restores the agent setup last used to create a workspace
-there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
-reasoning effort. A repository with no saved setup uses the most recent setup.
-Changes you make in the form are kept when you switch repositories.
+Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
+choose **Create workspace**. The settings beside the prompt (below it on narrow
+windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
+Use **+** below the prompt to add context, or the microphone on the right to dictate.
+These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
+your repositories once each, most recently used first, with search at the top;
+the selected codebase is included even if it has not reached your history yet.
+Use the external-link action beside a codebase to open it in your browser.
+**Add codebase** opens the **Clone**, **Existing folder**, and **New** tabs.
+**Clone** is hidden only once Intent has confirmed no forge account is connected;
+to clone, use the connect link or **Settings → Connections**. Onboarding uses
+the same tab names. Open the agent picker to choose who starts the workspace.
+**Create new or manage specialists** closes the workspace form and opens specialist settings.
+In **Setup script**, search the list and select the repository's config, last-used
+commands, or a template to apply it. **Edit commands** opens the selected script;
+**Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
+**Done** or **Save & Done** keeps your edits; **Cancel** discards them and returns
+to the workspace form.
+For a local repository, use the isolation switch at the bottom of **Branch**.
+With isolation on, agents edit a separate copy. Turn it off to edit files in the
+existing folder on its current branch, without creating a worktree.
+Your prompt draft stays intact. The workspace groups working files, notes, and agent
+conversations. Resolve any displayed repository, Git, or provider setup error
+before retrying. If creation succeeded but sending the first message failed, use
+the form's retry instruction instead of creating a second workspace.
+Selecting a repository restores the setup last used to create a workspace there:
+the agent, provider, model, and reasoning effort. A repository with no saved setup
+uses the most recent setup. Changes you make in the form are kept when you switch
+repositories.
+
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
