@@ -223,6 +223,11 @@ impl StopWait {
 struct Agent {
     id: AgentId,
     workspace_id: WorkspaceId,
+    /// The launch's provider id and model, for the memory report.
+    provider: String,
+    model: Option<String>,
+    /// The provider process's pid while it runs, for the memory sampler.
+    root_pid: Mutex<Option<u32>>,
     /// The commit head launched the agent at, and the checkout cache key.
     base_commit: String,
     repo_key: String,
@@ -618,6 +623,30 @@ impl Runner {
         ids
     }
 
+    /// Every running agent's provider process pid with what its launch
+    /// said, tagged with `owner`, for the memory sampler. Agents still
+    /// starting (no process yet) or already stopped are left out.
+    pub(super) fn agent_roots(
+        &self,
+        owner: &intent_services::RemoteOwner,
+    ) -> Vec<intent_services::RemoteAgentRoot> {
+        lock(&self.inner.state)
+            .agents
+            .values()
+            .filter_map(|agent| {
+                let root_pid = (*lock(&agent.root_pid))?;
+                Some(intent_services::RemoteAgentRoot {
+                    agent_id: agent.id.clone(),
+                    workspace_id: agent.workspace_id.clone(),
+                    provider: agent.provider.clone(),
+                    model: agent.model.clone(),
+                    owner: owner.clone(),
+                    root_pid,
+                })
+            })
+            .collect()
+    }
+
     /// The link agents forward control-plane calls on; the newest session
     /// sets it when it adopts its lease.
     pub(super) fn head_link(&self) -> &HeadLink {
@@ -765,6 +794,9 @@ impl Runner {
         let agent = Arc::new(Agent {
             id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
+            provider: provider.clone(),
+            model: model.clone(),
+            root_pid: Mutex::new(None),
             base_commit,
             repo_key,
             gates: workspace_api::Gates {
@@ -977,6 +1009,7 @@ impl Runner {
                 // Read before waiting: a reaped child no longer reports it,
                 // and its process group can outlive it.
                 let pid = child.id();
+                *lock(&agent.root_pid) = pid;
                 let tracker = pid.map(|pid| {
                     let descendants = agent.descendants.clone();
                     // caller-binding: allow — node-local process snapshot; the node has no service layer
@@ -1015,6 +1048,7 @@ impl Runner {
                 let mut known = agent.descendants.pids();
                 known.extend(marked_processes(&agent.run_marker).await);
                 kill_tree(child, pid, &known).await;
+                *lock(&agent.root_pid) = None;
                 let result = match outcome {
                     Outcome::Exited(code) => (code, None),
                     Outcome::Stopped => (None, None),

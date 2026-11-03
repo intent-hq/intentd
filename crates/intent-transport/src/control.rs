@@ -173,6 +173,18 @@ pub struct SystemStatus {
     /// Idle-triggered update check state (the daemon→sitter SIGUSR2
     /// handshake). Always present on the wire.
     pub idle_update_check: IdleUpdateCheckStatus,
+    /// Live daemon-to-daemon link counts. `None` on daemons that do not
+    /// report them: `remoteLinks` is presence-detected, never null.
+    pub remote_links: Option<RemoteLinks>,
+}
+
+/// `system.status.remoteLinks`: the daemons linked to this one right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteLinks {
+    /// Backends holding an open inbound executor link to this machine.
+    pub backends: usize,
+    /// Exposed machines this daemon, as a backend, holds a live link to.
+    pub machines: usize,
 }
 
 /// The idle-triggered update check state for `system.status`: the daemon
@@ -567,6 +579,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     }
     if let Some(limit) = status.fd_limit {
         obj.insert("fdLimit".into(), limit.into());
+    }
+    if let Some(links) = status.remote_links {
+        obj.insert(
+            "remoteLinks".into(),
+            json!({ "backends": links.backends, "machines": links.machines }),
+        );
     }
     v
 }

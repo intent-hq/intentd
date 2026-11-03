@@ -20700,6 +20700,125 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// Agents this machine runs for another backend (the executor) have no
+/// session row here: `agent.memoryUsage` still lists them, from the launch
+/// the probe reports, tagged with `remoteOwner` and counted in `totalBytes`.
+/// They carry no `agentName` (the launch has none) and omit `model` when the
+/// launch gave none; a local row beside them is unchanged and has no
+/// `remoteOwner`. Rows of both kinds sort together by `memoryBytes`.
+#[tokio::test]
+async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
+    use crate::agent_manager::{
+        AgentMemorySnapshot, ProcessSample, RemoteAgentMemory, RemoteAgentRoot, RemoteOwner,
+        TreeMemoryProbe, TreeSample,
+    };
+    use std::collections::HashMap;
+
+    struct Probe(AgentMemorySnapshot);
+    impl TreeMemoryProbe for Probe {
+        fn sample(&self) -> Option<TreeSample> {
+            Some(TreeSample {
+                memory_bytes: 0,
+                seq: 1,
+                available_memory: None,
+            })
+        }
+        fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+            Some(self.0.clone())
+        }
+    }
+    let proc = |pid: u32, parent_pid: u32, name: &str, memory_bytes: u64| ProcessSample {
+        pid,
+        parent_pid,
+        name: name.to_string(),
+        cmdline: format!("/bin/{name}"),
+        memory_bytes,
+    };
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let local = create_agent(&svc, &ws, "Local").await;
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        sink,
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    let owner = RemoteOwner {
+        backend_id: "head-1".to_string(),
+        backend_name: "Studio".to_string(),
+    };
+    manager.set_tree_probe(Arc::new(Probe(AgentMemorySnapshot {
+        sampled_at: Some("2026-11-03T07:00:00Z".to_string()),
+        processes: HashMap::from([(local.clone(), vec![proc(100, 1, "node", 3_000)])]),
+        remote: vec![
+            RemoteAgentMemory {
+                agent: RemoteAgentRoot {
+                    agent_id: AgentId("agent-remote-big".to_string()),
+                    workspace_id: WorkspaceId("ws-on-head".to_string()),
+                    provider: "claude-code".to_string(),
+                    model: Some("opus".to_string()),
+                    owner: owner.clone(),
+                    root_pid: 500,
+                },
+                processes: vec![proc(500, 1, "claude", 4_000), proc(501, 500, "rg", 1_000)],
+            },
+            RemoteAgentMemory {
+                agent: RemoteAgentRoot {
+                    agent_id: AgentId("agent-remote-small".to_string()),
+                    workspace_id: WorkspaceId("ws-on-head".to_string()),
+                    provider: "codex".to_string(),
+                    model: None,
+                    owner,
+                    root_pid: 600,
+                },
+                processes: vec![proc(600, 1, "codex", 1_000)],
+            },
+        ],
+    })));
+
+    let result = svc.agent_memory_usage().await.expect("memory usage");
+    assert_eq!(result["totalBytes"], json!(9_000), "{result}");
+    let agents = result["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents
+            .iter()
+            .map(|a| a["agentId"].as_str().expect("id"))
+            .collect::<Vec<_>>(),
+        vec!["agent-remote-big", local.0.as_str(), "agent-remote-small"],
+        "local and remote rows sort together: {result}"
+    );
+    assert_eq!(
+        agents[0],
+        json!({
+            "agentId": "agent-remote-big",
+            "workspaceId": "ws-on-head",
+            "provider": "claude-code",
+            "model": "opus",
+            "remoteOwner": { "backendId": "head-1", "backendName": "Studio" },
+            "rootPid": 500,
+            "processCount": 2,
+            "memoryBytes": 5_000,
+            "processes": [
+                { "pid": 500, "parentPid": 1, "name": "claude", "cmdline": "/bin/claude", "memoryBytes": 4_000 },
+                { "pid": 501, "parentPid": 500, "name": "rg", "cmdline": "/bin/rg", "memoryBytes": 1_000 },
+            ],
+        })
+    );
+    assert!(
+        agents[2].get("model").is_none(),
+        "no model: omitted, never null"
+    );
+    assert!(agents[2].get("agentName").is_none());
+    let local_row = &agents[1];
+    assert_eq!(local_row["agentName"], json!("Local"));
+    assert_eq!(local_row["workspaceId"], json!(ws.0));
+    assert!(
+        local_row.get("remoteOwner").is_none(),
+        "local rows carry no owner tag: {local_row}"
+    );
+}
+
 /// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
 /// `conversationBytes` (total persisted conversation size, omitted at zero),
 /// and a conversation past `LARGE_CONVERSATION_WARN_BYTES` raises a
@@ -20907,6 +21026,7 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
                 .then(|| AgentMemorySnapshot {
                     sampled_at: Some("2026-09-20T07:00:00Z".to_string()),
                     processes: self.rows.clone(),
+                    remote: Vec::new(),
                 })
         }
     }

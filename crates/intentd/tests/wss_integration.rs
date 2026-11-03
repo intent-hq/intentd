@@ -6495,6 +6495,7 @@ impl SystemControl for BusyDaemonControl {
             update_supported: true,
             busy_agents: 2,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {
@@ -22855,6 +22856,7 @@ impl SystemControl for WatchHealthControl {
             update_supported: false,
             busy_agents: 0,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {

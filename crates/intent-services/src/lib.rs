@@ -348,7 +348,8 @@ pub mod auggie_discovery {
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes,
     resolve_provider_launch, AgentManager, AgentMemorySnapshot, BusEventSink, ProcessRegistry,
-    ProcessSample, ProviderLaunchSpec, TreeMemoryProbe, TreeSample,
+    ProcessSample, ProviderLaunchSpec, RemoteAgentMemory, RemoteAgentRoot, RemoteOwner,
+    TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -19887,6 +19888,7 @@ impl WorkspaceApi for Services {
             let crate::agent_manager::AgentMemorySnapshot {
                 sampled_at,
                 processes: samples,
+                remote,
             } = snapshot;
             let spawn_details = manager.agent_spawn_details();
 
@@ -19951,6 +19953,44 @@ impl WorkspaceApi for Services {
                         .collect::<Vec<_>>(),
                 });
                 if let Some(model) = model {
+                    row["model"] = serde_json::Value::String(model);
+                }
+                agents.push(row);
+            }
+            // Agents this machine runs for other backends: no session row
+            // here, so the row is what the launch said, tagged with the
+            // backend it runs for. No name (the launch carries none).
+            for crate::agent_manager::RemoteAgentMemory {
+                agent,
+                mut processes,
+            } in remote
+            {
+                let memory_bytes: u64 = processes.iter().map(|p| p.memory_bytes).sum();
+                total_bytes += memory_bytes;
+                processes.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
+                let mut row = serde_json::json!({
+                    "agentId": agent.agent_id.0,
+                    "workspaceId": agent.workspace_id.0,
+                    "provider": agent.provider,
+                    "remoteOwner": {
+                        "backendId": agent.owner.backend_id,
+                        "backendName": agent.owner.backend_name,
+                    },
+                    "rootPid": agent.root_pid,
+                    "processCount": processes.len(),
+                    "memoryBytes": memory_bytes,
+                    "processes": processes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "pid": p.pid,
+                            "parentPid": p.parent_pid,
+                            "name": p.name,
+                            "cmdline": p.cmdline,
+                            "memoryBytes": p.memory_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                if let Some(model) = agent.model {
                     row["model"] = serde_json::Value::String(model);
                 }
                 agents.push(row);

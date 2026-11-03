@@ -845,3 +845,15 @@ async fn a_start_during_a_credential_replacement_waits_and_is_refused() {
         "{error:?}"
     );
 }
+
+/// The connected-machine count is the exposed machines holding a live link
+/// now: one while the link is bound, none once the machine closes it.
+#[tokio::test]
+async fn connected_machines_count_live_links() {
+    let (fixture, link, _machine) = fixture().await;
+    let feature = fixture.services.remote_feature().unwrap();
+    assert_eq!(feature.connected_machines(), 1);
+    link.link.close();
+    disconnected(&fixture.node).await;
+    assert_eq!(feature.connected_machines(), 0);
+}
