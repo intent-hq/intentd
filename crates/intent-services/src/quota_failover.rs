@@ -1112,8 +1112,8 @@ fn remote_backup_failed_text(
     let reason = reason.trim().trim_end_matches('.');
     let advice = match non_account_start_cause(reason, machine) {
         Some(cause) => format!(
-            "{cause}, which is not a sign-in problem. Send your message again to retry, or \
-             create a new agent."
+            "{cause}, which is not a sign-in problem. Retry the message, or create a new \
+             agent."
         ),
         None => {
             format!("Sign in to {backup} on {machine}, or create a new agent with another account.")

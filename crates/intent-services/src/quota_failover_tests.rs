@@ -763,11 +763,13 @@ fn a_backup_start_failure_that_is_not_an_account_problem_names_its_cause() {
         "node-checkout-failed",
         "Mac couldn't fetch the agent's code from this backend",
         "not a sign-in problem",
-        "Send your message again",
+        "Retry the message",
     ] {
         assert!(text.contains(needle), "{needle:?} missing from {text:?}");
     }
     assert!(!text.contains("Sign in"), "{text}");
+    // The failed message is already requeued: resubmitting it would run it twice.
+    assert!(!text.contains("Send your message again"), "{text}");
 }
 
 #[test]

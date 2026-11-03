@@ -1237,7 +1237,8 @@ mod on_demand {
             move |_: &Arc<crate::connector::Shared>| {
                 // The machine admits a dialed connection right after its
                 // upgrade, on its own task: give it that moment.
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let deadline = std::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_secs(2));
                 let mut count = host.git_accepted.load(std::sync::atomic::Ordering::SeqCst);
                 while count == 0 && std::time::Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(5));
