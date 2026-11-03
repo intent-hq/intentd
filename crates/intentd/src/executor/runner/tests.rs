@@ -1826,6 +1826,74 @@ async fn node_runner_repeated_final_stops_share_one_cleanup_and_fence_launches()
     h.runner.stop(&id).wait().await.unwrap();
 }
 
+/// A cleanup that panics leaves nothing behind: its stop and a repeat
+/// waiting on it fail (so the backend resends rather than getting an ack),
+/// a launch of the agent goes ahead instead of waiting forever, and the
+/// next final stop runs the cleanup again.
+#[tokio::test]
+async fn node_runner_a_panicked_final_stop_cleanup_fails_cleanly() {
+    use intent_core::node_link::{FinalPush, StopOutcome};
+    let Some(h) = harness(2, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    h.runner.stop(&id).wait().await.unwrap();
+
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    h.checkouts
+        .panic_push
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = tokio::spawn(h.runner.final_stop(&id));
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let repeat = tokio::spawn(h.runner.final_stop(&id));
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), first).await.unwrap().unwrap(),
+        None
+    );
+    assert_eq!(
+        tokio::time::timeout(wait(), repeat).await.unwrap().unwrap(),
+        None
+    );
+    assert!(
+        h.storage.existing_agent_dir(&id).is_some(),
+        "nothing was removed"
+    );
+
+    // A launch is not left waiting on the dead cleanup.
+    tokio::time::timeout(wait(), h.runner.launch(launch("a1")))
+        .await
+        .expect("the launch waited on a panicked cleanup");
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(&h.runner)
+        .await
+        .iter()
+        .filter(|r| started("a1")(r))
+        .count()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relaunch never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next final stop runs the cleanup again, to the end.
+    assert_eq!(
+        tokio::time::timeout(wait(), h.runner.final_stop(&id))
+            .await
+            .unwrap(),
+        Some((StopOutcome::Stopped, FinalPush::Pushed))
+    );
+    assert!(h.storage.existing_agent_dir(&id).is_none());
+}
+
 /// A final stop whose checkout cannot be removed is not acknowledged, so
 /// the backend resends it.
 #[tokio::test]

@@ -181,6 +181,8 @@ pub(super) struct PlainCheckouts {
     pub(super) fail_removals: std::sync::atomic::AtomicBool,
     /// Fail every checkout, like a base head cannot serve.
     pub(super) fail: std::sync::atomic::AtomicBool,
+    /// Panic in the next push (after any hold), like a bug in the cleanup.
+    pub(super) panic_push: std::sync::atomic::AtomicBool,
     /// Holds the next push: signals the first sender when it starts and
     /// waits for the receiver.
     pub(super) hold_push: std::sync::Mutex<
@@ -215,6 +217,7 @@ impl PlainCheckouts {
             fail: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             hold_push: std::sync::Mutex::default(),
+            panic_push: std::sync::atomic::AtomicBool::new(false),
             notice: std::sync::Mutex::default(),
             hold_sweep: std::sync::Mutex::default(),
         })
@@ -265,6 +268,12 @@ impl Checkouts for PlainCheckouts {
                 let _ = entered.send(());
                 let _ = release.await;
             }
+            assert!(
+                !self
+                    .panic_push
+                    .swap(false, std::sync::atomic::Ordering::SeqCst),
+                "test: the push panicked"
+            );
             ensure!(
                 !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the push"

@@ -192,6 +192,35 @@ struct State {
 /// `None` when it may not be acknowledged.
 type FinalStopDone = Option<(StopOutcome, FinalPush)>;
 
+/// Finishes a final stop's cleanup when its task ends, normally or not:
+/// drops its `finalizing` entry, publishes its answer (`None`, so the stop
+/// is not acknowledged and the backend resends it, unless the cleanup set
+/// one) and wakes launches waiting on it.
+struct FinalizingGuard {
+    runner: Runner,
+    agent_id: AgentId,
+    finished: watch::Sender<Option<FinalStopDone>>,
+    result: FinalStopDone,
+}
+
+impl Drop for FinalizingGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = lock(&self.runner.inner.state);
+            if state
+                .finalizing
+                .get(&self.agent_id)
+                .is_some_and(|done| done.same_channel(&self.finished.subscribe()))
+            {
+                state.finalizing.remove(&self.agent_id);
+            }
+        }
+        self.finished.send_replace(Some(self.result));
+        // A launch waiting for this cleanup goes ahead.
+        self.runner.inner.swept.notify_waiters();
+    }
+}
+
 /// Whether an agent's exit record reached the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExitRecord {
@@ -1399,15 +1428,20 @@ impl Runner {
                 let agent_id = agent_id.clone();
                 // caller-binding: allow — node-local final-stop cleanup that every repeat joins
                 tokio::spawn(async move {
+                    // Ends the cleanup however the task ends (a panic or a
+                    // cancel included): no entry is left for launches to
+                    // wait on or later stops to join.
+                    let mut guard = FinalizingGuard {
+                        runner: runner.clone(),
+                        agent_id: agent_id.clone(),
+                        finished,
+                        result: None,
+                    };
                     // The agent's script runs end first, so nothing still
                     // writes to its checkout while it is pushed and removed.
                     runner.inner.scripts.stop_agent(&agent_id).await;
                     let wait = runner.stop(&agent_id);
-                    let result = runner.finish_final_stop(agent, &agent_id, wait).await;
-                    lock(&runner.inner.state).finalizing.remove(&agent_id);
-                    finished.send_replace(Some(result));
-                    // A launch waiting for this cleanup goes ahead.
-                    runner.inner.swept.notify_waiters();
+                    guard.result = runner.finish_final_stop(agent, &agent_id, wait).await;
                 });
                 done
             }
