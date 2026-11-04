@@ -603,6 +603,9 @@ mod tests_suggested_prompts_contract;
 #[cfg(test)]
 mod tests_proposal_origin;
 
+#[cfg(test)]
+mod tests_unattended_resume;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -20623,6 +20626,76 @@ impl Drop for StartupResumeCandidates {
 }
 
 impl Services {
+    /// Why an unattended resume (the startup sweep, including the forced
+    /// sweep after an update restart, and the wake sweep) must leave
+    /// `agent_id` pending instead of re-running it: its provider is disabled
+    /// in `providers.enabled`, or its sign-in probe reports signed out.
+    /// Re-running such an agent can only fail again, and the failure wakes
+    /// its parent with a stale alert about work it may already have replaced
+    /// (intent-hq/intent#8478). The probe runs when no fresh verdict is
+    /// cached, because the cache is empty right after a restart.
+    ///
+    /// `None` lets the resume proceed: an unknown sign-in, a remote agent
+    /// (its provider runs on another machine), an unresolvable provider and
+    /// a failed session read all stay permissive. A manual resume never
+    /// consults this; it runs and surfaces the provider error to the user.
+    pub(crate) async fn unattended_resume_hold(&self, agent_id: &AgentId) -> Option<String> {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        let settings = self.effective_settings();
+        let saved = session
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let provider = match saved {
+            Some(saved) => crate::agent_session::resolve_provider_id(
+                Some(saved),
+                crate::agent_session::derived_default_provider(&settings).as_deref(),
+            )?,
+            // A legacy row (NULL provider) resumes on the provider
+            // `pin_legacy_session_provider` repairs it onto at spawn: its
+            // last committed turn's, else today's default. Check that one,
+            // not today's default alone; a failed read stays permissive.
+            None => {
+                crate::agent_session::legacy_session_provider(self, &session.workspace_id, agent_id)
+                    .await
+                    .ok()
+                    .flatten()?
+            }
+        };
+        if provider_is_disabled(&provider, settings.providers.enabled.as_ref()) {
+            let display = intent_providers::provider_config(&provider).display_name;
+            return Some(format!(
+                "provider \"{provider}\" ({display}) is not enabled"
+            ));
+        }
+        if self.unattended_resume_sign_in(&provider).await == Some(false) {
+            return Some(crate::provider_auth::not_authenticated_message(&provider));
+        }
+        None
+    }
+
+    /// The sign-in verdict [`Self::unattended_resume_hold`] acts on: a live
+    /// probe in the daemon (the cache is empty right after a restart).
+    /// Unit tests read only the cache, which they seed, so a resume test
+    /// never depends on which provider CLIs the host has installed or
+    /// signed in, and never waits on a probe timeout.
+    async fn unattended_resume_sign_in(&self, provider: &str) -> Option<bool> {
+        #[cfg(test)]
+        {
+            self.selection_auth_verdict(provider).await.ok().flatten()
+        }
+        #[cfg(not(test))]
+        {
+            self.probe_selection_sign_in(provider).await
+        }
+    }
+
     /// Resume one reserved startup candidate, then expose and notify failures.
     /// The notification invalidates the recovery list; it does not declare a
     /// terminal agent failure or drive completion watches.
@@ -20634,7 +20707,16 @@ impl Services {
         candidates: &StartupResumeCandidates,
         agent_id: &AgentId,
     ) -> Result<()> {
-        let result = self.resume_interrupted_agent(agent_id).await;
+        // A held agent goes through the same release + notify path as a failed
+        // resume: the reservation hid its row from `agent.listInterrupted`, and
+        // the `startupRecoveryFailed` update is what makes a window that listed
+        // during the sweep show it again for manual resume.
+        let result = match self.unattended_resume_hold(agent_id).await {
+            Some(reason) => Err(Error::InvalidParams(format!(
+                "left pending for manual resume: {reason}"
+            ))),
+            None => self.resume_interrupted_agent(agent_id).await,
+        };
         candidates.finished(agent_id);
         if result.is_err() {
             // Use the durable pending row's workspace, never a caller-supplied
@@ -20759,6 +20841,14 @@ impl Services {
                     );
                     continue;
                 }
+            }
+            if let Some(reason) = self.unattended_resume_hold(&agent_id).await {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    reason,
+                    "wake-resume: provider cannot run; leaving pending for manual retry"
+                );
+                continue;
             }
             match self.resume_interrupted_agent(&agent_id).await {
                 Ok(()) => {
