@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.128] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Export named workspace-wide discussions ([#3045](https://github.com/intent-hq/intentd/pull/3045))
+- *(acp)* Give specialist, settings and bulk-op proposal cards unique ids ([#3043](https://github.com/intent-hq/intentd/pull/3043))
+- Keep a stopped remote agent's late exit record off its relaunch ([#3044](https://github.com/intent-hq/intentd/pull/3044))
+
+
 ## [0.11.127] - 2026-11-04
 
 ### 🐛 Bug Fixes
