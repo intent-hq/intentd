@@ -501,12 +501,25 @@ async fn wss_call_text(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> String
 /// the `{ subscriptionId }` response (matched on `id`) and the seq-0
 /// `subscription.push` snapshot, and return the snapshot object (§7.1).
 async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str, id: i64) -> Value {
+    let text = chat_subscribe_snapshot_frame(port, cfg, frame, id).await;
+    let snap: Value = serde_json::from_str(&text).expect("json frame");
+    snap["params"]["snapshot"].clone()
+}
+
+/// [`chat_subscribe_snapshot`], returning the literal seq-0
+/// `subscription.push` frame text so callers can measure wire bytes.
+async fn chat_subscribe_snapshot_frame(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    frame: &str,
+    id: i64,
+) -> String {
     let mut ws = connect_ws(port, cfg).await;
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send subscribe");
     let mut sub_resp: Option<Value> = None;
-    let mut snap: Option<Value> = None;
+    let mut snap: Option<(Value, String)> = None;
     while sub_resp.is_none() || snap.is_none() {
         let next = tokio::time::timeout(
             intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
@@ -518,7 +531,7 @@ async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str,
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["method"] == "subscription.push" {
-                    snap = Some(v);
+                    snap = Some((v, text.to_string()));
                 } else if v["id"] == id {
                     sub_resp = Some(v);
                 }
@@ -535,10 +548,10 @@ async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str,
         sub_resp["result"]["subscriptionId"].as_str().is_some(),
         "chat.subscribe returns subscriptionId: {sub_resp}"
     );
-    let snap = snap.unwrap();
+    let (snap, text) = snap.unwrap();
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
-    snap["params"]["snapshot"].clone()
+    text
 }
 
 /// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
@@ -18752,7 +18765,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
 /// Slim page byte budget over the real WSS wire (§5.5): a block-heavy
 /// transcript (the observed 2.87MB-frame class: many messages × ~80 capped
 /// tool blocks each) served with `projection: "slim"` stops early at the
-/// ~512KB page budget — every frame stays bounded by budget + one message —
+/// slim page budget — every frame stays bounded by budget + one message —
 /// the `nextToken` walk reconstructs the full transcript with no gaps or
 /// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
 /// read) stays under the bound too. Slim is the wire default since v8.0,
@@ -18876,6 +18889,167 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         !snap["messages"].as_array().expect("messages").is_empty(),
         "snapshot serves the newest bounded page"
     );
+
+    srv.ws.stop().await;
+}
+
+/// Whole-frame bound for slim conversation pages (§5.5): a transcript of
+/// many medium text messages fills every page right up to the slim page
+/// budget, and the literal JSON-RPC frame — messages, result fields and
+/// envelope — must still fit the 500 KiB (512,000-byte) read payload budget.
+/// Covers the `nextToken` walk at `limit: 10000`, the `aroundIndex` and
+/// `aroundMessageId` seeks, and the `chat.subscribe` seq-0 snapshot. With the
+/// old 512 × 1024 content budget these frames measured ~521-527 KB.
+#[intent_test_macros::daemon_test]
+async fn wss_slim_conversation_frames_fit_read_payload_budget() {
+    use intent_core::AgentId;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Frames"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Frames"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // 150 messages × ~9KB text: text is never slim-capped, so pages fill to
+    // the content budget in small steps and land just under it — the shape
+    // that pushed the old pages past the frame budget.
+    const MESSAGES: usize = 150;
+    let text = "t".repeat(9 * 1024);
+    for m in 0..MESSAGES {
+        let role = if m % 2 == 0 { "user" } else { "assistant" };
+        srv.store
+            .append_agent_message(
+                &agent,
+                role,
+                &json!([{ "type": "text", "text": format!("{m}:{text}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append text message");
+    }
+
+    let assert_frame = |label: &str, frame: &str| {
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "{label}: frame {} bytes exceeds the {READ_PAYLOAD_BUDGET_BYTES}-byte read budget",
+            frame.len()
+        );
+    };
+
+    // nextToken walk at the maximum message limit: every frame fits, the
+    // budget (not the limit) splits the pages, and nothing is lost.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut largest = 0;
+    loop {
+        let token_field = match &token {
+            Some(t) => format!(r#","nextToken":"{t}""#),
+            None => String::new(),
+        };
+        let frame = wss_call_text(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000{token_field}}}}}"#
+            ),
+        )
+        .await;
+        assert_frame("getConversation page", &frame);
+        largest = largest.max(frame.len());
+        let page: Value = serde_json::from_str(&frame).expect("json");
+        let ids: Vec<String> = page["result"]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!ids.is_empty(), "budgeted pages are never empty");
+        walked.splice(0..0, ids);
+        assert!(walked.len() <= MESSAGES, "walk terminates");
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(walked.len(), MESSAGES, "no gaps or duplicates in the walk");
+    assert!(
+        largest > READ_PAYLOAD_BUDGET_BYTES * 9 / 10,
+        "the fixture fills pages near the budget: largest frame {largest}"
+    );
+
+    // Seeks: the target-anchored page grows both ways up to the budget.
+    let around_index = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000,"aroundIndex":75}}}}"#
+        ),
+    )
+    .await;
+    assert_frame("getConversation aroundIndex", &around_index);
+    let seek: Value = serde_json::from_str(&around_index).expect("json");
+    let target_id = seek["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["seq"] == 75)
+        .and_then(|m| m["id"].as_str())
+        .expect("aroundIndex page carries its target")
+        .to_string();
+    let around_message = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000,"aroundMessageId":"{target_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_frame("getConversation aroundMessageId", &around_message);
+
+    // The chat.subscribe seq-0 snapshot reuses the budgeted read; its
+    // subscription.push frame fits too, for both delta encodings.
+    for (id, extra) in [(6, ""), (7, r#","deltaEncoding":"incremental""#)] {
+        let frame = chat_subscribe_snapshot_frame(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"chat.subscribe","params":{{"agentId":"{agent_id}","limit":200{extra}}}}}"#
+            ),
+            id,
+        )
+        .await;
+        assert_frame("chat.subscribe snapshot", &frame);
+        let push: Value = serde_json::from_str(&frame).expect("json");
+        assert!(
+            !push["params"]["snapshot"]["messages"]
+                .as_array()
+                .expect("messages")
+                .is_empty(),
+            "snapshot serves the newest bounded page"
+        );
+    }
 
     srv.ws.stop().await;
 }
