@@ -158,6 +158,9 @@ router discussion.stopAgent
 router event.agentActivity
 router event.query
 router event.workspaceSummary
+router executor.list
+router executor.mint
+router executor.revoke
 router file-tracking.getAgentLocks
 router file-tracking.getChanges
 router file-tracking.loadCommits
@@ -201,6 +204,7 @@ router git.push
 router git.removeLockFile
 router git.renameBranch
 router git.showFile
+router git.showFileChunk
 router git.stage
 router git.stageHunk
 router git.status
@@ -292,6 +296,7 @@ router note.list
 router note.listTasks
 router note.listVersions
 router note.readAsset
+router note.readAssetChunk
 router note.restoreVersion
 router note.saveAsset
 router note.setContent
@@ -316,6 +321,14 @@ router providers.profiles.list
 router providers.profiles.reorder
 router providers.profiles.update
 router providers.profiles.updateDefault
+router remoteLinkTraffic.snapshot
+router remoteLinkTraffic.start
+router remoteLinkTraffic.stop
+router remoteMachines.add
+router remoteMachines.backendInfo
+router remoteMachines.list
+router remoteMachines.refresh
+router remoteMachines.remove
 router repo.list
 router repo.remove
 router repo.warmCache

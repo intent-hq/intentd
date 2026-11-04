@@ -25,6 +25,7 @@ mod sharing;
 mod workspace_auto_archive_disabled;
 mod workspace_delete;
 mod workspace_label;
+mod workspace_plain_folder;
 mod workspace_retired;
 
 mod metadata_key_json;
@@ -4474,6 +4475,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -4520,7 +4522,7 @@ async fn materialize_harness_features_first_write_wins() {
         "lost race adopts the winner's snapshot, not the loser's"
     );
     let row = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get session");
     assert_eq!(
@@ -4568,7 +4570,10 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(m1.seq, 1);
 
     // Round-trip the session with its full message log (chronological order).
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.name, "Builder");
     assert_eq!(loaded.model.as_deref(), Some("opus"));
     assert_eq!(loaded.status, AgentStatus::Pending);
@@ -4593,7 +4598,10 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].seq, 1);
 
-    let listed = store.list_agent_sessions(&ws).await.expect("list");
+    let listed = store
+        .list_agent_sessions_with_transcripts(&ws)
+        .await
+        .expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
@@ -4632,7 +4640,10 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .await
         .expect("set attention request");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("reload");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(loaded.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(
         loaded.attention_request_reason.as_deref(),
@@ -4657,7 +4668,10 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .clear_attention_request(&ws, &agent_id, "t-clear-1")
         .await
         .expect("clear"));
-    let cleared = store.get_agent_session(&agent_id).await.expect("cleared");
+    let cleared = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("cleared");
     assert_eq!(cleared.attention_request_kind, None);
     assert_eq!(cleared.attention_request_reason, None);
     assert_eq!(cleared.attention_request_timestamp, None);
@@ -4716,7 +4730,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .set_attention_request(&ws, &agent_id, "blocker", "sandbox broken", "t-attn")
         .await
         .expect("set attention request");
-    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    let stale = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("snapshot");
     assert_eq!(stale.attention_request_kind.as_deref(), Some("blocker"));
     assert!(store
         .clear_attention_request(&ws, &agent_id, "t-clear")
@@ -4726,7 +4743,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .update_agent_session(&ws, &stale)
         .await
         .expect("racing full-row persist");
-    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.attention_request_kind, None,
         "full-row persist of a stale session must not resurrect a cleared request"
@@ -4735,7 +4755,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
     assert_eq!(after.attention_request_timestamp, None);
 
     // Race B: a stale request-free snapshot must not clobber a fresh request.
-    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    let stale = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("snapshot");
     store
         .set_attention_request(&ws, &agent_id, "discussion", "need a decision", "t-attn-2")
         .await
@@ -4744,7 +4767,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .update_agent_session(&ws, &stale)
         .await
         .expect("racing full-row persist");
-    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.attention_request_kind.as_deref(),
         Some("discussion"),
@@ -4800,7 +4826,10 @@ async fn agent_session_with_messages_is_atomic() {
         .await
         .expect("insert with messages");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].seq, 0);
     assert_eq!(loaded.messages[0].role, "user");
@@ -4823,7 +4852,7 @@ async fn agent_session_with_messages_is_atomic() {
 /// `get_agent_session_status` is the lightweight status-only accessor backing
 /// the STAB-52 queue-drain gate: it returns the persisted status without
 /// loading the message log, tracks `set_agent_session_status` updates, and
-/// mirrors `get_agent_session`'s `NotFound` for missing rows.
+/// mirrors `get_agent_session_with_transcript`'s `NotFound` for missing rows.
 #[tokio::test]
 async fn agent_session_status_only_lookup() {
     let tmp = TempDb::new();
@@ -4991,7 +5020,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
 
     // Verify initial state: stop_reason is None.
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get session");
     assert_eq!(loaded.stop_reason, None);
@@ -5010,7 +5039,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("set status with stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after set");
     assert_eq!(loaded.stop_reason, Some("error".to_string()));
@@ -5023,7 +5052,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("set status without touching stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after unchanged");
     assert_eq!(loaded.stop_reason, Some("error".to_string()));
@@ -5043,7 +5072,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("clear stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after clear");
     assert_eq!(loaded.stop_reason, None);
@@ -5060,7 +5089,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("update with stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after update");
     assert_eq!(loaded.stop_reason, Some("max_turns".to_string()));
@@ -5124,9 +5153,12 @@ async fn agent_message_metadata_round_trip() {
     assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
     assert!(messages[1].metadata.is_none());
 
-    // The metadata payload also round-trips through the get_agent_session
+    // The metadata payload also round-trips through the get_agent_session_with_transcript
     // aggregate loader (transcript embedded on the session).
-    let session = store.get_agent_session(&agent_id).await.expect("get");
+    let session = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.messages[0].metadata.as_ref(), Some(&metadata));
     assert!(session.messages[1].metadata.is_none());
@@ -5429,7 +5461,10 @@ async fn agent_session_gap_fields_round_trip() {
         .await
         .expect("insert session");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.delegation_depth, Some(2));
     assert!(loaded.is_background, "is_background must round-trip");
     assert_eq!(loaded.initial_message.as_deref(), Some("kick off"));
@@ -5455,7 +5490,10 @@ async fn agent_session_gap_fields_round_trip() {
         .update_agent_session(&ws, &updated)
         .await
         .expect("update");
-    let reloaded = store.get_agent_session(&agent_id).await.expect("reload");
+    let reloaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(reloaded.completion_report.as_deref(), Some("done"));
     assert_eq!(reloaded.completion_report_timestamp.as_deref(), Some("t9"));
     // The spawn-time fields survive the update untouched.
@@ -5506,7 +5544,10 @@ async fn transient_streaming_flags_are_never_persisted() {
         .insert_agent_session(&sample_agent_session(&agent_id, &ws))
         .await
         .expect("insert session");
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     let v = serde_json::to_value(&loaded).expect("session json");
     let obj = v.as_object().expect("object");
     for forbidden in [
@@ -5540,7 +5581,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("insert orphan");
     assert_eq!(
         store
-            .get_agent_session(&orphan)
+            .get_agent_session_with_transcript(&orphan)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5558,7 +5599,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("insert child");
     assert_eq!(
         store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5566,7 +5607,10 @@ async fn agent_session_parent_agent_id_round_trips() {
     );
 
     // Update clears the linkage back to None.
-    let mut cleared = store.get_agent_session(&child).await.expect("get");
+    let mut cleared = store
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("get");
     cleared.parent_agent_id = None;
     store
         .update_agent_session(&ws, &cleared)
@@ -5574,7 +5618,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("update");
     assert_eq!(
         store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5600,7 +5644,7 @@ async fn agent_session_specialist_round_trips() {
         .expect("insert plain");
     assert_eq!(
         store
-            .get_agent_session(&plain)
+            .get_agent_session_with_transcript(&plain)
             .await
             .expect("get")
             .specialist,
@@ -5617,14 +5661,17 @@ async fn agent_session_specialist_round_trips() {
         .expect("insert specialist");
     assert_eq!(
         store
-            .get_agent_session(&spec_agent)
+            .get_agent_session_with_transcript(&spec_agent)
             .await
             .expect("get")
             .specialist,
         Some("implementor".to_string())
     );
 
-    let mut updated = store.get_agent_session(&spec_agent).await.expect("get");
+    let mut updated = store
+        .get_agent_session_with_transcript(&spec_agent)
+        .await
+        .expect("get");
     updated.name = "Renamed".to_string();
     store
         .update_agent_session(&ws, &updated)
@@ -5632,7 +5679,7 @@ async fn agent_session_specialist_round_trips() {
         .expect("update");
     assert_eq!(
         store
-            .get_agent_session(&spec_agent)
+            .get_agent_session_with_transcript(&spec_agent)
             .await
             .expect("get")
             .specialist,
@@ -5671,7 +5718,10 @@ async fn agent_acp_session_id_is_write_once() {
         .is_err());
 
     // update_agent_session also refuses to overwrite a set acpSessionId.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.acp_session_id = Some("acp-3".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
@@ -5703,7 +5753,10 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .await
         .expect("cas returns canonical");
     assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
-    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    let stored = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(stored.acp_session_id.as_deref(), Some("acp-1"));
 
     // CAS swap: a matching expected-old replaces with the fresh id (the
@@ -5713,7 +5766,10 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .await
         .expect("cas swaps on match");
     assert_eq!(swapped, "acp-2");
-    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    let stored = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(stored.acp_session_id.as_deref(), Some("acp-2"));
 
     // A missing session surfaces NotFound rather than a silent no-op.
@@ -5739,7 +5795,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("insert session");
 
     // Provider starts unset, so first set (via update) is allowed.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("auggie".to_string());
     s.status = AgentStatus::Active;
     store
@@ -5748,7 +5807,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("set provider");
 
     // Provider can still be changed before first real use (before acp_session_id is set).
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("opencode".to_string());
     store
         .update_agent_session(&ws, &s)
@@ -5762,7 +5824,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("set acp session id");
 
     // Now changing the provider is rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("claude-code".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
@@ -5789,7 +5854,10 @@ async fn agent_provider_immutable_after_acp_session_even_from_none() {
         .expect("set acp session id");
 
     // Now trying to set provider from None→Some should be rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(s.provider, None);
     s.provider = Some("auggie".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
@@ -5811,7 +5879,10 @@ async fn agent_provider_change_rejected_when_setting_acp_session_id() {
         .expect("insert session");
 
     // Set provider first
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("auggie".to_string());
     store
         .update_agent_session(&ws, &s)
@@ -5819,7 +5890,10 @@ async fn agent_provider_change_rejected_when_setting_acp_session_id() {
         .expect("set provider");
 
     // Trying to change provider in the same update that sets acp_session_id should be rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("opencode".to_string());
     s.acp_session_id = Some("acp-1".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
@@ -6382,6 +6456,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: Some(true),
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&script).await.expect("insert");
 
@@ -6414,6 +6489,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&sparse).await.expect("insert sparse");
     let listed = store.list_all_scripts().await.expect("list");
@@ -6426,6 +6502,64 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_remote_author_round_trips_and_reaches_summaries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let remote_author = intent_core::ScriptRemoteAuthor {
+        node_id: "mac-studio".to_string(),
+        agent_id: intent_core::AgentId::from("agent-r1"),
+    };
+    let script = intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
+        id: "s-remote".to_string(),
+        workspace_id: "ws-1".to_string(),
+        name: "test".to_string(),
+        command: "cargo test".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "agent".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+        remote_author: Some(remote_author.clone()),
+    };
+    store.upsert_script(&script).await.expect("insert");
+    store
+        .upsert_scripts(&[intent_core::Script {
+            id: "s-local".to_string(),
+            remote_author: None,
+            ..script.clone()
+        }])
+        .await
+        .expect("bulk insert");
+    let ws = WorkspaceId::from("ws-1");
+    let got = store
+        .get_script_in_workspace(&ws, "s-remote")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.remote_author, Some(remote_author));
+    assert_eq!(
+        serde_json::to_value(&got).unwrap()["remoteAuthor"],
+        serde_json::json!({ "nodeId": "mac-studio", "agentId": "agent-r1" })
+    );
+    let local = store
+        .get_script_in_workspace(&ws, "s-local")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(local.remote_author, None);
+    assert!(serde_json::to_value(&local)
+        .unwrap()
+        .get("remoteAuthor")
+        .is_none());
 }
 
 #[tokio::test]
@@ -6458,6 +6592,7 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
             auto_start: (i % 2 == 0).then_some(true),
             created_at: now_iso(),
             updated_at: None,
+            remote_author: None,
         })
         .collect();
     store.upsert_scripts(&scripts).await.expect("bulk insert");
@@ -6501,6 +6636,7 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store
         .upsert_script(&script("ws-1", "s-1"))
@@ -6863,7 +6999,10 @@ async fn agent_message_append_refreshes_updated_at() {
         .expect("insert session");
 
     // Baseline: the session was inserted with updated_at = "2026-01-01T00:00:00Z".
-    let before = store.get_agent_session(&agent_id).await.expect("get");
+    let before = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(before.updated_at, "2026-01-01T00:00:00Z");
 
     // Append a message with a later timestamp.
@@ -6886,7 +7025,10 @@ async fn agent_message_append_refreshes_updated_at() {
         .expect("refresh timestamp");
 
     // The session's updated_at should now reflect the message timestamp.
-    let after = store.get_agent_session(&agent_id).await.expect("get");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(
         after.updated_at, later,
         "updated_at must advance when a message is appended"

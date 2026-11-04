@@ -285,7 +285,7 @@ async fn script_list_bootstrap_stays_within_statement_budget() {
 }
 
 /// Regression test for intent-hq/monorepo#3018: `agent.getSubscriptions`
-/// used to call `get_agent_session` for every agent present in the payload
+/// used to call `get_agent_session_with_transcript` for every agent present in the payload
 /// (caller + watch children + delegation-group members) just to read
 /// `status`, hydrating each agent's FULL message log — 2 statements per
 /// present agent, with dispatch duration scaling with the watched agents'
@@ -327,7 +327,7 @@ async fn get_subscriptions_stays_within_statement_budget() {
         .to_string();
 
     // Give the caller a transcript — the payload the pre-fix per-agent
-    // `get_agent_session` loop needlessly hydrated.
+    // `get_agent_session_with_transcript` loop needlessly hydrated.
     for i in 0..5 {
         let role = if i % 2 == 0 { "user" } else { "assistant" };
         let resp = rpc_with_params(
@@ -791,7 +791,7 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
 
 /// Regression test for intent-hq/monorepo#4130: `workspace.delete` used to
 /// run 4 statements per contained agent on top of its constant sweep —
-/// `list_agent_sessions` hydrated every session's transcript (message +
+/// `list_agent_sessions_with_transcripts` hydrated every session's transcript (message +
 /// payload SELECTs) just to read `id`/`name`, and the per-agent teardown ran
 /// one `agent_stop_redelivery` DELETE plus one `advisory_wake_delivery` DELETE
 /// each — 128 statements / 180 ms observed for a 30-agent workspace. Preserve

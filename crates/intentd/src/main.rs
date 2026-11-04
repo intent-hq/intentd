@@ -19,8 +19,8 @@ use intent_services::{
     agent_memory_budget_bytes, default_process_cap, host_total_memory_bytes, init_adapter_slots,
     live_adapters, max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes,
     AgentManager, AgentMemorySnapshot, BusEventSink, EventBus, GitStatusRefresher,
-    PermissionPolicy, ProcessSample, Services, TreeMemoryProbe, TreeSample, WatcherRegistry,
-    WorkspaceSetupStates,
+    PermissionPolicy, ProcessSample, RemoteAgentMemory, RemoteAgentRoot, Services, TreeMemoryProbe,
+    TreeSample, WatcherRegistry, WorkspaceSetupStates,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -38,7 +38,11 @@ mod client;
 mod command_evidence;
 mod doctor_codex;
 mod exact_update;
+#[cfg(unix)]
+mod executor;
 mod git_credential;
+#[cfg(unix)]
+mod git_remote_intent;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -125,6 +129,13 @@ enum Command {
         /// lifetime.
         #[arg(long)]
         specialists_dir: Option<std::path::PathBuf>,
+        /// Node mode for this run: orchestration off (no workspaces, local
+        /// agents, hooks, scripts, schedulers, PR or review monitors) and only
+        /// the node-mode method list served; other methods are refused with
+        /// `-32003` `node-mode`. The persisted `daemon.mode = "node"` setting
+        /// does the same on every start; this flag does not change it.
+        #[arg(long)]
+        node: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -273,6 +284,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if let Some(code) = git_remote_intent::dispatch_argv0() {
+        return code;
+    }
     // Freeze process restrictions before runtime/configuration consumers.
     // Ordinary settings cannot relax an opted-in private test profile.
     intent_core::process_policy::ProcessPolicy::current();
@@ -392,11 +407,12 @@ async fn async_main(cli: Cli) -> ExitCode {
                 resume_all,
                 // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
                 specialists_dir: _,
+                node,
             } => {
                 // This measures the entire serve call, including startup and local
                 // destruction on return; cleanup has its own shutdown-only timer.
                 let serve = shutdown::Phase::start("serve_lifetime");
-                match cmd_serve(mode.as_deref(), insecure, resume_all).await {
+                match cmd_serve(mode.as_deref(), insecure, resume_all, node).await {
                     Ok(code) => {
                         serve.complete();
                         code
@@ -1503,9 +1519,12 @@ fn init_tracing(serving: bool) {
 
     // Store::close is also used by offline CLI commands. Keep all lifecycle
     // timing output scoped to serve, independently of the user's RUST_LOG.
+    // The WebSocket library's trace output prints node-link upgrade requests
+    // with their lease token, so it never reaches an output.
     let timing_filter = || {
         tracing_subscriber::filter::filter_fn(move |meta| {
-            serving || !shutdown::is_timing_target(meta.target())
+            (serving || !shutdown::is_timing_target(meta.target()))
+                && !intent_transport::node_link::is_wire_trace(meta.target(), meta.level())
         })
     };
 
@@ -1699,6 +1718,7 @@ async fn cmd_serve(
     mode: Option<&str>,
     insecure: bool,
     resume_all: bool,
+    node: bool,
 ) -> anyhow::Result<ExitCode> {
     // Build-identity banner on entering serve so every startup records
     // which build produced it (monorepo#3649). Same identity
@@ -1780,6 +1800,7 @@ async fn cmd_serve(
             config,
             insecure,
             resume_all,
+            node,
             locality_override,
             prepared,
             &mut bootstrap,
@@ -1810,6 +1831,7 @@ async fn cmd_serve_owned(
     config: Config,
     insecure: bool,
     resume_all: bool,
+    node_flag: bool,
     locality_override: Option<bool>,
     prepared: intent_store::PreparedDaemonStore,
     bootstrap: &mut startup::Bootstrap,
@@ -1835,6 +1857,15 @@ async fn cmd_serve_owned(
     // Snapshot of the effective boot settings for the boot-time reads below
     // (agents.maxConcurrent, server.wsApi.enabled).
     let boot_settings = settings_registry.snapshot();
+    // Node mode is fixed for the process lifetime: `--node` or the persisted
+    // `daemon.mode` read here, once (a later change applies at next start).
+    let node_mode = resolve_node_mode(node_flag, boot_settings.effective.daemon.mode);
+    if node_mode {
+        tracing::info!(
+            flag = node_flag,
+            "node mode: orchestration off, serving the node-mode method list"
+        );
+    }
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
     // runtime. Boot-time auto-start of the listener (see [`boot_ws_listener`]):
@@ -1944,6 +1975,13 @@ async fn cmd_serve_owned(
     // Ownership, effective file settings, TLS and the normal owner token are
     // resolved before binding. No database-dependent principal can enter yet.
     let boot_listener = boot_ws_listener(insecure, boot_settings.effective.server.ws_api.enabled);
+    // The executor link (`/node/*`) is served by every WSS listener this
+    // daemon starts; the executor service behind it is installed once the
+    // store is ready, and until then the link is refused as disabled.
+    #[cfg(unix)]
+    let executor_slot = Arc::new(executor::ExecutorSlot::default());
+    #[cfg(unix)]
+    let executor_links = intent_transport::node_link::ExecutorLinks::new(executor_slot.clone());
     let local = intent_transport::listener::StartupLocalListener::bind(&config.socket_path)?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     bootstrap.stop_local = Some(stop);
@@ -1959,13 +1997,19 @@ async fn cmd_serve_owned(
             ws_options.base_port,
         );
         ws_options.base_port = desired;
-        let server = WsApiServer::new_startup(
+        #[cfg_attr(
+            not(unix),
+            expect(unused_mut, reason = "the executor link is installed on Unix only")
+        )]
+        let mut server = WsApiServer::new_startup(
             bootstrap.dispatch.clone(),
             tls_cert.as_ref(),
             token_store.as_ref(),
             ws_options.clone(),
         )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        #[cfg(unix)]
+        server.install_executor_links(executor_links.clone());
         bootstrap.ws = Some(server.clone());
         let assign = !insecure
             && desired != 0
@@ -2165,7 +2209,8 @@ async fn cmd_serve_owned(
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
-        .with_hooks_max_per_agent(config.hooks_max_per_agent);
+        .with_hooks_max_per_agent(config.hooks_max_per_agent)
+        .with_node_mode(node_mode);
     // Remove secrets journaled by an interrupted profile create/delete.
     services.sweep_provider_profile_secrets().await;
     #[cfg(feature = "repository-test-fixtures")]
@@ -2257,6 +2302,18 @@ async fn cmd_serve_owned(
             let root = intent_core::agent_configs_root(&config.data_dir);
             if let Err(e) = intent_core::sweep_agent_configs(&root) {
                 tracing::warn!(error = %e, path = %root.display(), "agent-configs sweep failed");
+            }
+            root
+        })
+        // Every provider launch gets a private temp folder (`TMPDIR` /
+        // `TMP` / `TEMP`) under a per-daemon root in the OS temp dir, so
+        // agents never share fixed temp file names. The data-dir lock makes
+        // this daemon the root's only user, so the startup sweep (no agent
+        // child is live yet) safely reclaims folders a killed daemon left.
+        .with_agent_tmp_root({
+            let root = intent_core::agent_tmp_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_agent_tmp_root(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "agent temp sweep failed");
             }
             root
         })
@@ -2358,6 +2415,13 @@ async fn cmd_serve_owned(
     };
     let startup_work =
         startup::WorkAdmission::new(startup_error.is_none(), bootstrap.cancellation.clone());
+    // The daemon's own orchestration (agents, workspaces, hooks, scripts,
+    // schedulers, PR monitors): closed in node mode, so none of it is
+    // restored or started while the shutdown join graph stays the same.
+    let orchestration = startup::WorkAdmission::new(
+        startup_error.is_none() && !node_mode,
+        bootstrap.cancellation.clone(),
+    );
     if !startup_work.allowed() {
         bootstrap.dispatch.status().fail();
     }
@@ -2369,7 +2433,7 @@ async fn cmd_serve_owned(
     // before the restart still redelivers the stopped message on the next
     // turn. Restore-only, like the queue rehydration above: it never starts a
     // turn. Best-effort: a failure is logged but never aborts startup.
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match manager.rehydrate_stop_redeliveries().await {
             Ok(0) => {}
             Ok(rehydrated) => tracing::info!(
@@ -2403,7 +2467,7 @@ async fn cmd_serve_owned(
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
     );
-    let startup_candidates = if resume_on_start && startup_work.allowed() {
+    let startup_candidates = if resume_on_start && orchestration.allowed() {
         match services.prepare_startup_resume().await {
             Ok(candidates) => Some(candidates),
             Err(error) => {
@@ -2417,7 +2481,7 @@ async fn cmd_serve_owned(
 
     // Restore groups before watches, without reconciling or waking agents.
     // Live requests must see the complete registries as soon as listeners open.
-    let startup_completions = if startup_work.allowed() {
+    let startup_completions = if orchestration.allowed() {
         Some(services.prepare_startup_completion_recovery().await)
     } else {
         None
@@ -2426,7 +2490,7 @@ async fn cmd_serve_owned(
     // registrations survive daemon restarts; rows whose subscriber agent is
     // gone are pruned. Best-effort: a failure is logged but never aborts
     // startup (agents can re-subscribe).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.heal_event_subscriptions_on_startup().await {
             Ok(0) => {}
             Ok(loaded) => tracing::info!(
@@ -2440,7 +2504,7 @@ async fn cmd_serve_owned(
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.hydrate_scripts().await {
             Ok(0) => {}
             Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
@@ -2452,7 +2516,7 @@ async fn cmd_serve_owned(
     // schedules resume after a restart; hooks whose owning agent is gone are
     // cancelled instead. Best-effort: a failure is logged but never aborts
     // startup (agents can re-schedule).
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.rehydrate_hooks().await {
             Ok(0) => {}
             Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
@@ -2465,7 +2529,7 @@ async fn cmd_serve_owned(
     // monitor is marked for catch-up, so its first poll delivers any change
     // detected across the downtime immediately (no debounce). Best-effort: a
     // failure is logged but never aborts startup.
-    if startup_work.allowed() {
+    if orchestration.allowed() {
         match services.rehydrate_pr_monitors().await {
             Ok(0) => {}
             Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
@@ -2508,6 +2572,24 @@ async fn cmd_serve_owned(
             services_export_sweep.sweep_stale_export_staging().await;
         })
     });
+    // Exposed machines (daemon-to-daemon remote agents) are dialed on
+    // demand; hand the feature the tailcat binary for their tailcat routes.
+    // Node mode never starts a connector.
+    services.configure_remote_machines(Some(tunnel::resolve_tailcat_bin()));
+    // The hook that checks machines' git pushes into agent refs, installed
+    // fresh under the data dir; without it every such push is refused.
+    if let Err(error) = intent_git::node_git::configure_receive_hooks(&config.data_dir) {
+        tracing::error!(%error, "remote machines: could not install the git receive hook; machine pushes will be refused");
+    }
+    // Machines that may still run this backend's agents reconnect on their
+    // own after a restart, in the background, so a machine that is down
+    // never slows the start.
+    let services_remote_resume = services.clone();
+    startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            services_remote_resume.resume_exposed_machines().await;
+        })
+    });
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();
@@ -2527,7 +2609,7 @@ async fn cmd_serve_owned(
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
     let pr_refresh =
-        startup_work.spawn(|| services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60)));
+        orchestration.spawn(|| services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60)));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]
@@ -2539,52 +2621,52 @@ async fn cmd_serve_owned(
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
-    let pr_monitor_loop = startup_work.spawn(|| services.spawn_pr_monitor_loop());
+    let pr_monitor_loop = orchestration.spawn(|| services.spawn_pr_monitor_loop());
     // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
     // There is no scan RPC. Aborted on clean shutdown.
-    let token_usage_scan = startup_work
+    let token_usage_scan = orchestration
         .spawn(|| services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300)));
     // Completion-delivery worker (AS-3): wake parents holding a
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
-    let completion_delivery = startup_work.spawn(|| services.spawn_completion_delivery_loop());
+    let completion_delivery = orchestration.spawn(|| services.spawn_completion_delivery_loop());
     // Auto-commit-on-idle worker (LNI-1, §5.6): subscribe to `agent:idle` and
     // commit each task-linked agent's changes with `Agent-Id:` and
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
-    let auto_commit_loop = startup_work.spawn(|| services.spawn_auto_commit_loop());
+    let auto_commit_loop = orchestration.spawn(|| services.spawn_auto_commit_loop());
     // Idle PR refresh worker: on `agent:idle`, check that workspace's branch
     // PR, git roots, and stale PR monitors once, through the same automatic
     // admission, rate-limit pause, and budgets as the 60 s sweep. No-op-safe
     // without an event bus. Aborted on clean shutdown.
-    let idle_pr_refresh_loop = startup_work.spawn(|| services.spawn_idle_pr_refresh_loop());
+    let idle_pr_refresh_loop = orchestration.spawn(|| services.spawn_idle_pr_refresh_loop());
     // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
     // status, auto-commit policy, and tracked-change events and publish the
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
-    let agent_locks_loop = startup_work.spawn(|| services.spawn_agent_locks_loop());
+    let agent_locks_loop = orchestration.spawn(|| services.spawn_agent_locks_loop());
     // Stale tracked-change sweep (intent-hq/intent#7266): shortly after
     // startup and then periodically, delete working-stage attribution rows
     // whose path git reports clean (ignored, deleted, reverted, committed
     // outside the daemon). Aborted on clean shutdown.
-    let tracked_changes_sweep = startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
+    let tracked_changes_sweep = orchestration.spawn(|| services.spawn_tracked_changes_sweep_loop());
     // Script output cleanup: at startup delete the on-disk output of
     // workspaces that no longer exist, then hourly delete run logs older than
     // `scripts.outputRetentionHours` (read live; `0` disables), keeping the
     // current run of any running script. Aborted on clean shutdown.
-    let script_output_sweep = startup_work.spawn(|| services.spawn_script_output_sweep_loop());
+    let script_output_sweep = orchestration.spawn(|| services.spawn_script_output_sweep_loop());
     // Automatic purge (PROTOCOL §5.1): shortly after startup and then
     // hourly, retire (purge the folders of) workspaces archived longer than
     // `workspace.purgeArchivedAfterDays` (read live; absent = off).
     // Aborted on clean shutdown.
-    let auto_retire_loop = startup_work.spawn(|| services.spawn_auto_retire_loop());
+    let auto_retire_loop = orchestration.spawn(|| services.spawn_auto_retire_loop());
     // Automatic archive (PROTOCOL §5.1): shortly after startup and then
     // hourly, archive workspaces idle longer than
     // `workspace.autoArchiveIdleAfterDays` (read live; default 0 = off).
     // Aborted on clean shutdown.
-    let auto_archive_loop = startup_work.spawn(|| services.spawn_auto_archive_loop());
+    let auto_archive_loop = orchestration.spawn(|| services.spawn_auto_archive_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -2632,7 +2714,7 @@ async fn cmd_serve_owned(
     // like the pre-#592 fetch bug). First tick fires immediately so stuck
     // sandboxes self-heal on startup. Shutdown stops new ticks and joins the active sweep.
     let (stop_merge_retry, merge_retry_stopping) = tokio::sync::watch::channel(false);
-    let merge_retry_task = startup_work
+    let merge_retry_task = orchestration
         .spawn(|| spawn_sandbox_merge_retry_loop(services.clone(), merge_retry_stopping));
     // External MCP servers (§18.3): the health monitor (periodic ping +
     // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
@@ -2640,7 +2722,7 @@ async fn cmd_serve_owned(
     // init below because each handshake can take seconds. The hub is reaped on
     // shutdown so no orphan server processes remain (PTY-host reaping parity).
     let mcp_hub = services.mcp_hub();
-    let mcp_monitor = startup_work.spawn(|| mcp_hub.spawn_health_monitor());
+    let mcp_monitor = orchestration.spawn(|| mcp_hub.spawn_health_monitor());
 
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
@@ -2669,7 +2751,7 @@ async fn cmd_serve_owned(
     // timeout) and the watcher registry (serial FSEvents registrations, which on
     // a loaded macOS `fseventsd` cost seconds each). Shutdown stops new work
     // cooperatively and joins the current operation before closing the store.
-    let mcp_start_task = startup_work.spawn(|| {
+    let mcp_start_task = orchestration.spawn(|| {
         let services = services.clone();
         intent_core::spawn_daemon(async move { services.start_enabled_mcp_servers().await })
     });
@@ -2682,7 +2764,7 @@ async fn cmd_serve_owned(
     let watch_health = intent_services::WatchHealth::default();
     let watch_hub = intent_services::SharedWatchHub::new();
     let (stop_watchers, watcher_shutdown) = tokio::sync::oneshot::channel();
-    let watcher_init_task = startup_work.spawn(|| {
+    let watcher_init_task = orchestration.spawn(|| {
         spawn_watcher_registry_init(
             Arc::clone(&watch_hub),
             bus.clone(),
@@ -2717,6 +2799,10 @@ async fn cmd_serve_owned(
         ws_options: ws_options.clone(),
         reverse_registry: reverse_registry.clone(),
         data_dir: config.data_dir.clone(),
+        #[cfg(unix)]
+        executor_links: Some(executor_links.clone()),
+        #[cfg(not(unix))]
+        executor_links: None,
         state: tokio::sync::Mutex::new(WsRuntimeState {
             ws_server: bootstrap.ws.clone(),
             port: bootstrap.port,
@@ -2734,7 +2820,14 @@ async fn cmd_serve_owned(
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
-    spawn_child_tree_sampler(manager.clone(), &child_usage.clone());
+    #[cfg(unix)]
+    let remote_roots: RemoteRoots = {
+        let slot = executor_slot.clone();
+        Arc::new(move || slot.agent_roots())
+    };
+    #[cfg(not(unix))]
+    let remote_roots: RemoteRoots = Arc::new(Vec::new);
+    spawn_child_tree_sampler(manager.clone(), remote_roots, &child_usage.clone());
     let route_info = spawn_route_info_sampler();
     // Workspaces-root disk sampler: report the volume `workspace.create`
     // actually provisions under, resolved with the same precedence as the
@@ -2781,8 +2874,26 @@ async fn cmd_serve_owned(
         command_scripts.clone(),
     ));
 
+    let remote_links: Arc<dyn Fn() -> intent_transport::RemoteLinks + Send + Sync> = {
+        #[cfg(unix)]
+        let slot = executor_slot.clone();
+        let services = services.clone();
+        Arc::new(move || {
+            use intent_app::remote::RemoteServicesExt as _;
+            intent_transport::RemoteLinks {
+                #[cfg(unix)]
+                backends: slot.linked_backends(),
+                #[cfg(not(unix))]
+                backends: 0,
+                machines: services
+                    .remote_feature()
+                    .map_or(0, intent_app::remote::RemoteFeature::connected_machines),
+            }
+        })
+    };
     let control = Arc::new(DaemonControl {
         startup: Some(bootstrap.dispatch.status().clone()),
+        remote_links,
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
@@ -2862,9 +2973,28 @@ async fn cmd_serve_owned(
     // (multiplayer w4): the same envelope the create fast path resolves.
     if let Some(provider) = pairing_info.clone() {
         services.attach_invite_link_builder(Arc::new(intent_transport::InviteLinkResolver::new(
+            provider.clone(),
+        )));
+        // `executor.mint` reports the same listener routes and fingerprint.
+        services.attach_machine_routes(Arc::new(intent_transport::MachineRoutesResolver::new(
             provider,
         )));
     }
+    // Run backends' remote agents in this daemon (only backends holding an
+    // executor credential the owner minted are admitted), sharing the
+    // process registry's limits.
+    #[cfg(unix)]
+    let executor_service = executor::start_in_daemon(executor::DaemonParts {
+        slot: &executor_slot,
+        services: &services,
+        manager: &manager,
+        settings: &settings_registry,
+        data_dir: &config.data_dir,
+        routes: pairing_info
+            .clone()
+            .map(|p| Arc::new(intent_transport::MachineRoutesResolver::new(p)) as _),
+    })
+    .await;
 
     // Live-reload of config.toml (§9.8): watch the file's parent directory
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
@@ -2958,7 +3088,7 @@ async fn cmd_serve_owned(
     // `resume_interrupted_agent` dedupes against a concurrent
     // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
     // wakeResume is disabled (no tracker exists), honoring the config gate.
-    let wake_resume = if let Some(tracker) = suspend_tracker.clone() {
+    let wake_resume = if let Some(tracker) = suspend_tracker.clone().filter(|_| !node_mode) {
         // Coalesce wake events landing within this window into one sweep.
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
         let services_clone = services.clone();
@@ -3243,6 +3373,16 @@ async fn cmd_serve_owned(
     // teardown). Idle reaping during the run is the M5 `reap_idle` hook. Stop
     // via ServerControl so we stop the runtime listener
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    // Stop the remote agents this machine runs while its links to their
+    // backends are still up: each one's last work is pushed over them, and
+    // stopping the tunnel or the WSS listener closes them
+    // (intent-hq/intent#8437).
+    #[cfg(unix)]
+    if let Some(service) = &executor_service {
+        let phase = shutdown::Phase::start("executor_shutdown");
+        service.shutdown().await;
+        phase.complete();
+    }
     let phase = shutdown::Phase::start("tunnel_stop");
     intent_core::ServerControl::stop_tunnel(control.as_ref()).await;
     phase.complete();
@@ -3351,6 +3491,8 @@ async fn cmd_serve_owned(
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
     startup: Option<intent_core::startup::StartupStatus>,
+    /// Live daemon-to-daemon link counts for `system.status.remoteLinks`.
+    remote_links: Arc<dyn Fn() -> intent_transport::RemoteLinks + Send + Sync>,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
@@ -3906,6 +4048,10 @@ struct ChildTreeSample {
     /// bucket's rows sum to its total by construction. Collected only on
     /// published sweeps — burst sweeps pass no agent roots and produce none.
     agent_processes: std::sync::Arc<HashMap<AgentId, Vec<ProcessSample>>>,
+    /// The agents this machine runs for other backends (the executor), with
+    /// their processes from the same walk. Kept apart from the local buckets:
+    /// the spawn budget's per-agent reads and eviction see local agents only.
+    remote_agents: std::sync::Arc<Vec<RemoteAgentMemory>>,
     /// Host memory available for new allocations (`sysinfo::System::
     /// available_memory`, Linux `MemAvailable`), refreshed in the same sweep
     /// as `memory_bytes` so the spawn budget compares a tree total and the
@@ -3938,8 +4084,38 @@ struct ChildTreeUsage {
     inner: std::sync::RwLock<Option<ChildTreeSample>>,
 }
 
+impl ChildTreeSample {
+    /// `agentMemoryBytes`: every attributed agent's bytes, local and
+    /// executor-run, so it equals `agent.memoryUsage`'s `totalBytes`.
+    fn agent_memory_bytes(&self) -> u64 {
+        let local: u64 = self.agent_bytes.values().sum();
+        let remote: u64 = self
+            .remote_agents
+            .iter()
+            .flat_map(|agent| agent.processes.iter().map(|p| p.memory_bytes))
+            .sum();
+        local.saturating_add(remote)
+    }
+
+    /// `agentProcessCount`: the attributed agents, local and executor-run.
+    fn agent_process_count(&self) -> usize {
+        self.agent_bytes.len() + self.remote_agents.len()
+    }
+}
+
 impl ChildTreeUsage {
+    /// [`Self::store_with_remote`] with no executor-run agents.
+    #[cfg(test)]
     fn store(&self, walk: TreeWalk, available_memory_bytes: Option<u64>) {
+        self.store_with_remote(walk, Vec::new(), available_memory_bytes);
+    }
+
+    fn store_with_remote(
+        &self,
+        walk: TreeWalk,
+        remote_agents: Vec<RemoteAgentMemory>,
+        available_memory_bytes: Option<u64>,
+    ) {
         let TreeWalk {
             count,
             bytes: memory_bytes,
@@ -3957,6 +4133,7 @@ impl ChildTreeUsage {
             peak_memory_bytes,
             agent_bytes: std::sync::Arc::new(agent_bytes),
             agent_processes: std::sync::Arc::new(agent_processes),
+            remote_agents: std::sync::Arc::new(remote_agents),
             available_memory_bytes,
             seq,
             sampled_at: intent_core::now_iso(),
@@ -4026,6 +4203,7 @@ impl TreeMemoryProbe for ChildTreeUsage {
         self.load().map(|s| AgentMemorySnapshot {
             sampled_at: Some(s.sampled_at),
             processes: s.agent_processes.as_ref().clone(),
+            remote: s.remote_agents.as_ref().clone(),
         })
     }
 }
@@ -4095,19 +4273,96 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// The agents this machine runs for other backends, read by the sampler on
+/// each published sweep.
+type RemoteRoots = Arc<dyn Fn() -> Vec<RemoteAgentRoot> + Send + Sync>;
+
 /// One pass of [`walk_descendants`]: the aggregate, the per-agent buckets and
 /// the rows behind them, all from the same traversal.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct TreeWalk {
+#[derive(Debug)]
+struct TreeWalk<K = AgentId> {
     /// Descendant processes found (the root excluded).
     count: usize,
     /// Aggregate resident bytes of those descendants.
     bytes: u64,
     /// Resident bytes credited to each registered agent root.
-    agent_bytes: HashMap<AgentId, u64>,
+    agent_bytes: HashMap<K, u64>,
     /// The processes credited to each agent; a bucket's rows sum to its
     /// `agent_bytes` entry. Empty when `agent_roots` is empty.
-    agent_processes: HashMap<AgentId, Vec<ProcessSample>>,
+    agent_processes: HashMap<K, Vec<ProcessSample>>,
+}
+
+impl<K: Eq + std::hash::Hash> PartialEq for TreeWalk<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count
+            && self.bytes == other.bytes
+            && self.agent_bytes == other.agent_bytes
+            && self.agent_processes == other.agent_processes
+    }
+}
+
+impl<K: Eq + std::hash::Hash> Eq for TreeWalk<K> {}
+
+impl<K> Default for TreeWalk<K> {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            agent_bytes: HashMap::new(),
+            agent_processes: HashMap::new(),
+        }
+    }
+}
+
+/// Whose bucket a registered root opens in the sampler's walk: a local
+/// agent's, or the agent at this index of the executor's roots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum MemoryRoot {
+    Local(AgentId),
+    Remote(usize),
+}
+
+/// Split a sampler walk into the local buckets and the executor-run agents'
+/// rows. An executor root with no process in the walk (it exited between
+/// the roots snapshot and the refresh) has no row, as a local one has none.
+fn split_walk(
+    walk: TreeWalk<MemoryRoot>,
+    remote_roots: Vec<RemoteAgentRoot>,
+) -> (TreeWalk, Vec<RemoteAgentMemory>) {
+    let TreeWalk {
+        count,
+        bytes,
+        agent_bytes,
+        mut agent_processes,
+    } = walk;
+    let local = TreeWalk {
+        count,
+        bytes,
+        agent_bytes: agent_bytes
+            .into_iter()
+            .filter_map(|(root, bytes)| match root {
+                MemoryRoot::Local(agent) => Some((agent, bytes)),
+                MemoryRoot::Remote(_) => None,
+            })
+            .collect(),
+        agent_processes: agent_processes
+            .iter()
+            .filter_map(|(root, rows)| match root {
+                MemoryRoot::Local(agent) => Some((agent.clone(), rows.clone())),
+                MemoryRoot::Remote(_) => None,
+            })
+            .collect(),
+    };
+    let remote = remote_roots
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, agent)| {
+            agent_processes
+                .remove(&MemoryRoot::Remote(index))
+                .map(|processes| RemoteAgentMemory { agent, processes })
+        })
+        .collect();
+    (local, remote)
 }
 
 /// Aggregate process count and resident bytes, plus per-agent buckets and
@@ -4133,18 +4388,18 @@ struct TreeWalk {
 /// live process table. The walk is iterative and visited-guarded: a pid table
 /// sampled while processes exit and get reparented can contain a cycle, and
 /// recursion over a deep chain could blow the stack.
-fn walk_descendants(
+fn walk_descendants<K: Clone + Eq + std::hash::Hash>(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
     describe: &dyn Fn(sysinfo::Pid) -> (String, String),
     root: sysinfo::Pid,
-    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> TreeWalk {
+    agent_roots: &HashMap<sysinfo::Pid, K>,
+) -> TreeWalk<K> {
     let mut walk = TreeWalk::default();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
     // Each frame carries the bucket its subtree inherits: the nearest
     // registered agent root at or above it (`None` outside any agent subtree).
-    let mut stack: Vec<(sysinfo::Pid, Option<&AgentId>)> = vec![(root, None)];
+    let mut stack: Vec<(sysinfo::Pid, Option<&K>)> = vec![(root, None)];
     while let Some((pid, bucket)) = stack.pop() {
         for child in children.get(&pid).into_iter().flatten() {
             if !seen.insert(*child) {
@@ -4187,11 +4442,11 @@ fn walk_descendants(
 /// process, so counting them charged an N-threaded child N+1 times — up to
 /// 219x inflation of `childMemoryBytes` (monorepo#2342). macOS never lists
 /// thread rows, so `thread_kind()` is `None` there and nothing changes.
-fn descendant_tree_usage(
+fn descendant_tree_usage<K: Clone + Eq + std::hash::Hash>(
     sys: &sysinfo::System,
     root: sysinfo::Pid,
-    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
-) -> TreeWalk {
+    agent_roots: &HashMap<sysinfo::Pid, K>,
+) -> TreeWalk<K> {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
         if proc.thread_kind().is_some() {
@@ -4270,7 +4525,11 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
-fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
+fn spawn_child_tree_sampler(
+    manager: Arc<AgentManager>,
+    remote_roots: RemoteRoots,
+    usage: &Arc<ChildTreeUsage>,
+) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
@@ -4338,16 +4597,27 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             // the handles lock + per-descendant bucketing and row building
             // at sub-second cadence would buy nothing — an empty map keeps
             // the walk on its aggregate-only fast path.
-            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
-                manager
-                    .agent_root_pids()
-                    .into_iter()
-                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+            // Executor-run agents (run here for other backends) are credited
+            // the same way, to buckets of their own.
+            let remote = if publish { remote_roots() } else { Vec::new() };
+            let agent_roots: HashMap<sysinfo::Pid, MemoryRoot> = if publish {
+                remote
+                    .iter()
+                    .enumerate()
+                    .map(|(index, agent)| {
+                        (
+                            sysinfo::Pid::from_u32(agent.root_pid),
+                            MemoryRoot::Remote(index),
+                        )
+                    })
+                    .chain(manager.agent_root_pids().into_iter().map(|(pid, agent)| {
+                        (sysinfo::Pid::from_u32(pid), MemoryRoot::Local(agent))
+                    }))
                     .collect()
             } else {
                 HashMap::new()
             };
-            let walk = descendant_tree_usage(&sys, pid, &agent_roots);
+            let (walk, remote) = split_walk(descendant_tree_usage(&sys, pid, &agent_roots), remote);
             let (count, bytes) = (walk.count, walk.bytes);
             if publish {
                 // Host headroom is read only on published sweeps: it is the
@@ -4358,7 +4628,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
                     0 => None,
                     bytes => Some(bytes),
                 };
-                task_usage.store(walk, available);
+                task_usage.store_with_remote(walk, remote, available);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -4402,6 +4672,8 @@ struct WsRuntimeControl {
     reverse_registry: Arc<PrimaryReverseRegistry>,
     /// Data directory for building pairing info provider (§5.2) in `start_ws_listener`.
     data_dir: PathBuf,
+    /// The executor link every started listener serves on `/node/*`.
+    executor_links: Option<Arc<intent_transport::node_link::ExecutorLinks>>,
     /// Mutable runtime state: the live `WsApiServer` (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
     /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
@@ -4588,8 +4860,10 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.as_ref().map(|s| s.count),
             child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
-            agent_memory_bytes: child_tree.as_ref().map(|s| s.agent_bytes.values().sum()),
-            agent_process_count: child_tree.as_ref().map(|s| s.agent_bytes.len()),
+            agent_memory_bytes: child_tree.as_ref().map(ChildTreeSample::agent_memory_bytes),
+            agent_process_count: child_tree
+                .as_ref()
+                .map(ChildTreeSample::agent_process_count),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
@@ -4618,6 +4892,9 @@ impl SystemControl for DaemonControl {
             // In-flight turns: one lock read of the manager's busy set.
             busy_agents: self.manager.list_busy().len(),
             idle_update_check,
+            // Two in-memory reads: the executor's open inbound links and the
+            // exposed-machine connectors' link state.
+            remote_links: Some((self.remote_links)()),
         }
     }
 
@@ -4855,6 +5132,9 @@ impl intent_core::ServerControl for DaemonControl {
                 )
             };
 
+            if let Some(links) = &runtime.executor_links {
+                server.install_executor_links(links.clone());
+            }
             // Install pairing info provider (§5.2) on runtime-started servers
             if let Some(ref ts) = runtime.token_store {
                 let pairing_provider = Arc::new(DaemonPairingInfo {
@@ -5244,6 +5524,12 @@ fn ws_options_from_env() -> WsOptions {
         opts.base_port = port;
     }
     opts
+}
+
+/// Node mode for this run: `intentd serve --node`, or the persisted
+/// `daemon.mode = "node"` setting. The flag never changes the setting.
+fn resolve_node_mode(flag: bool, setting: intent_core::settings_file::DaemonMode) -> bool {
+    flag || setting == intent_core::settings_file::DaemonMode::Node
 }
 
 /// Parse the optional `--mode` locality override (§5.14) into the transport
@@ -6359,7 +6645,9 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
 /// the Settings UI takes effect on the next tick without a restart. The
 /// sweeps themselves are [`intent_services::retention::run_retention_tick`]
 /// (testable in isolation with a fixed `now`); this loop owns only the timer
-/// and the pool maintenance. After
+/// and the pool maintenance. The first tick waits
+/// [`RETENTION_LOOP_START_DELAY`] so a short-lived daemon never starts a
+/// vacuum chunk its shutdown would have to wait for. After
 /// the sweeps each tick runs a time-paced freelist drain
 /// ([`intent_services::retention::run_incremental_vacuum_drain`]): short
 /// `PRAGMA incremental_vacuum` chunks that each hold the single write
@@ -6397,8 +6685,7 @@ fn spawn_stream_retention_loop(
     };
     let vacuum_policy = intent_services::retention::VacuumDrainPolicy::for_tick_interval(interval);
     intent_core::spawn_daemon(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticker = retention_ticker(interval);
         loop {
             ticker.tick().await;
             // Both tool-payload knobs are read live from the registry per tick.
@@ -6418,6 +6705,25 @@ fn spawn_stream_retention_loop(
             }
         }
     })
+}
+
+/// Delay before the retention loop's first tick. A vacuum chunk that is
+/// already running keeps going on the sqlx worker after the loop is aborted,
+/// so the final `wal_checkpoint(TRUNCATE)` in `Store::close` waits for it
+/// (seconds on a loaded runner). Deferring the first sweep and drain means
+/// short-lived daemons (e2e tests, quick restarts) never start one, and keeps
+/// them clear of the startup burst, like [`NOTE_PAGING_CLEANUP_START_DELAY`].
+const RETENTION_LOOP_START_DELAY: Duration = Duration::from_secs(30);
+
+/// The retention loop's timer: first tick after [`RETENTION_LOOP_START_DELAY`],
+/// then every `interval`.
+fn retention_ticker(interval: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + RETENTION_LOOP_START_DELAY,
+        interval,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 /// Delay before the retired note paging cleanup starts, so it stays clear of
@@ -6616,13 +6922,17 @@ fn spawn_sandbox_merge_retry_loop(
     })
 }
 
-/// Test hook: artificial delay (milliseconds) before the watcher registry is
-/// started, standing in for a macOS `fseventsd` that takes seconds per
-/// `FSEventStreamStart` registration. Lets e2e tests prove the listeners bind
-/// off the watcher-init critical path (monorepo#1581). NOTE: this seam is
+/// Test hook: a gate file the watcher registry start blocks on — the thread,
+/// not the task — until it exists, standing in for a macOS `fseventsd` that
+/// takes seconds per `FSEventStreamStart` registration. Lets e2e tests prove
+/// the listeners bind off the watcher-init critical path (monorepo#1581)
+/// while init is provably still held, with no clock. NOTE: this seam is
 /// compiled into release binaries too (release-mode e2e runs need it); it is
-/// inert unless the namespaced env var is set to a positive integer.
-const TEST_WATCHER_INIT_DELAY_MS_ENV: &str = "INTENTD_TEST_WATCHER_INIT_DELAY_MS";
+/// inert unless the namespaced env var names a path.
+const TEST_WATCHER_INIT_GATE_ENV: &str = "INTENTD_TEST_WATCHER_INIT_GATE";
+
+/// How often the watcher-init gate hook looks for its file.
+const TEST_WATCHER_INIT_GATE_POLL: Duration = Duration::from_millis(20);
 
 /// Join admitted MCP startup and health work before the final hub reap.
 async fn settle_mcp_background(
@@ -6645,12 +6955,12 @@ async fn settle_mcp_background(
     }
 }
 
-/// Parse the watcher-init delay override; anything unset, non-numeric, or
-/// non-positive disables the hook.
-fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
+/// Parse the watcher-init gate path; anything unset or blank disables the
+/// hook.
+fn test_watcher_init_gate(raw: Option<&str>) -> Option<PathBuf> {
+    raw.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Start the watcher registry (#611) in the background and hold it for the
@@ -6686,19 +6996,19 @@ fn spawn_watcher_registry_init(
         // worker's remaining tasks to another thread for the duration.
         let registry = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                if let Some(delay) = test_watcher_init_delay(
-                    std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
-                        .ok()
-                        .as_deref(),
+                if let Some(gate) = test_watcher_init_gate(
+                    std::env::var(TEST_WATCHER_INIT_GATE_ENV).ok().as_deref(),
                 ) {
                     tracing::warn!(
-                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        "watcher registry startup: artificial delay (test seam)"
+                        gate = %gate.display(),
+                        "watcher registry startup: waiting for the gate file (test seam)"
                     );
-                    // A *blocking* sleep, standing in for the synchronous
+                    // A *blocking* wait, standing in for the synchronous
                     // FSEvents call: a yielding `tokio::time::sleep` would not
                     // exercise worker starvation at all.
-                    std::thread::sleep(delay);
+                    while !gate.exists() {
+                        std::thread::sleep(TEST_WATCHER_INIT_GATE_POLL);
+                    }
                 }
                 WatcherRegistry::start_with_health(
                     &hub,
@@ -10289,6 +10599,29 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn serve_node_flag_parses_and_defaults_off() {
+        for (args, want) in [
+            (&["intentd", "serve"][..], false),
+            (&["intentd", "serve", "--node"][..], true),
+        ] {
+            match Cli::try_parse_from(args).expect("serve parses").command {
+                Command::Serve { node, .. } => assert_eq!(node, want, "{args:?}"),
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["intentd", "serve", "--node=yes"]).is_err());
+    }
+
+    #[test]
+    fn node_mode_is_the_flag_or_the_setting() {
+        use intent_core::settings_file::DaemonMode;
+        assert!(!resolve_node_mode(false, DaemonMode::Regular));
+        assert!(resolve_node_mode(true, DaemonMode::Regular));
+        assert!(resolve_node_mode(false, DaemonMode::Node));
+        assert!(resolve_node_mode(true, DaemonMode::Node));
+    }
+
+    #[test]
     fn settings_value_accepts_hyphen_leading_values() {
         // `allow_hyphen_values` on the positional: without it clap rejects
         // `-3` as an unknown flag before the coercion layer ever runs.
@@ -10817,28 +11150,21 @@ for line in sys.stdin:
         assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
     }
 
-    // test_watcher_init_delay takes the raw env value as a parameter, so the
+    // test_watcher_init_gate takes the raw env value as a parameter, so the
     // seam is testable without process-env mutation races.
     #[test]
-    fn watcher_init_delay_parses_positive_milliseconds() {
+    fn watcher_init_gate_parses_a_path() {
         assert_eq!(
-            test_watcher_init_delay(Some("250")),
-            Some(Duration::from_millis(250))
-        );
-        assert_eq!(
-            test_watcher_init_delay(Some(" 5000 ")),
-            Some(Duration::from_secs(5))
+            test_watcher_init_gate(Some(" /tmp/gate ")),
+            Some(PathBuf::from("/tmp/gate"))
         );
     }
 
     #[test]
-    fn watcher_init_delay_inert_unless_positive_integer() {
-        // Unset, non-numeric, negative, and zero all leave the hook off.
-        assert_eq!(test_watcher_init_delay(None), None);
-        assert_eq!(test_watcher_init_delay(Some("")), None);
-        assert_eq!(test_watcher_init_delay(Some("soon")), None);
-        assert_eq!(test_watcher_init_delay(Some("-1")), None);
-        assert_eq!(test_watcher_init_delay(Some("0")), None);
+    fn watcher_init_gate_inert_unless_a_path_is_set() {
+        assert_eq!(test_watcher_init_gate(None), None);
+        assert_eq!(test_watcher_init_gate(Some("")), None);
+        assert_eq!(test_watcher_init_gate(Some("  ")), None);
     }
 
     // resolve_ws_listener_port is pure (the env value is a parameter), so the
@@ -11512,7 +11838,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
@@ -11607,6 +11933,67 @@ for line in sys.stdin:
         assert!(walk.agent_processes.is_empty());
     }
 
+    /// Agents the executor runs for other backends open buckets of their
+    /// own in the same walk: their rows carry the launch and owner, their
+    /// bytes count in `agentMemoryBytes` / `agentProcessCount` and in the
+    /// `agent.memoryUsage` snapshot, but never in the local per-agent
+    /// samples the spawn budget evicts by. An executor root with no process
+    /// in the walk gets no row. Local buckets are unchanged.
+    #[test]
+    fn executor_run_agents_get_their_own_buckets_and_count_in_the_totals() {
+        let children = adjacency(&[(1, 10), (10, 11), (1, 20), (20, 21), (1, 40)]);
+        let memory = |pid: sysinfo::Pid| Some(u64::try_from(usize::from(pid)).unwrap() * 100);
+        let local = AgentId::from("agent-local");
+        let owner = intent_services::RemoteOwner {
+            backend_id: "head-1".into(),
+            backend_name: "Studio".into(),
+        };
+        let remote_root = |id: &str, root_pid: u32| RemoteAgentRoot {
+            agent_id: AgentId::from(id),
+            workspace_id: intent_core::WorkspaceId::from("ws-on-head"),
+            provider: "claude-code".into(),
+            model: Some("opus".into()),
+            owner: owner.clone(),
+            root_pid,
+        };
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(10), MemoryRoot::Local(local.clone())),
+            (sysinfo::Pid::from(20), MemoryRoot::Remote(0)),
+            (sysinfo::Pid::from(30), MemoryRoot::Remote(1)),
+        ]);
+        let walk = walk_descendants(&children, &memory, &describe, sysinfo::Pid::from(1), &roots);
+        let (walk, remote) = split_walk(
+            walk,
+            vec![
+                remote_root("agent-remote", 20),
+                remote_root("agent-gone", 30),
+            ],
+        );
+        assert_eq!((walk.count, walk.bytes), (5, 10_200));
+        assert_eq!(walk.agent_bytes, HashMap::from([(local.clone(), 2_100)]));
+        assert_eq!(
+            walk.agent_processes,
+            HashMap::from([(local.clone(), vec![row(10, 1), row(11, 10)])])
+        );
+        assert_eq!(remote.len(), 1, "{remote:?}");
+        assert_eq!(remote[0].agent, remote_root("agent-remote", 20));
+        let mut pids: Vec<u32> = remote[0].processes.iter().map(|p| p.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![20, 21]);
+
+        let usage = ChildTreeUsage::default();
+        usage.store_with_remote(walk, remote.clone(), None);
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.agent_memory_bytes(), 2_100 + 4_100);
+        assert_eq!(sample.agent_process_count(), 2);
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert_eq!(probe.agent_samples(), HashMap::from([(local, 2_100)]));
+        assert_eq!(
+            probe.agent_memory_snapshot().expect("sampled").remote,
+            remote
+        );
+    }
+
     /// An agent root that vanished mid-walk (its memory read fails) still
     /// buckets the live descendants underneath it — the chain below a dead
     /// `npm exec` is exactly the RSS the agent is responsible for.
@@ -11646,7 +12033,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 2, "each pid is counted exactly once");
         assert_eq!(walk.bytes, 20);
@@ -11664,7 +12051,7 @@ for line in sys.stdin:
             &memory,
             &describe,
             sysinfo::Pid::from(1),
-            &HashMap::new(),
+            &HashMap::<sysinfo::Pid, AgentId>::new(),
         );
         assert_eq!(walk.count, 1);
         assert_eq!(walk.bytes, 700);
@@ -11681,7 +12068,7 @@ for line in sys.stdin:
                 &memory,
                 &describe,
                 sysinfo::Pid::from(1),
-                &HashMap::new()
+                &HashMap::<sysinfo::Pid, AgentId>::new()
             ),
             TreeWalk::default()
         );
@@ -11754,7 +12141,8 @@ for line in sys.stdin:
             .values()
             .filter(|p| p.thread_kind().is_some() && p.parent() == Some(child_pid))
             .count();
-        let usage = descendant_tree_usage(&sys, child_pid, &HashMap::new());
+        let usage =
+            descendant_tree_usage(&sys, child_pid, &HashMap::<sysinfo::Pid, AgentId>::new());
         let _ = child.kill();
         let _ = child.wait();
 
@@ -11766,6 +12154,81 @@ for line in sys.stdin:
             usage,
             TreeWalk::default(),
             "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
+        );
+    }
+
+    /// The retention loop must not start a vacuum drain right after startup
+    /// (intentd merge-queue coverage-e2e run 41259421848): an in-flight
+    /// `PRAGMA incremental_vacuum` chunk keeps running on the sqlx worker after
+    /// `retention_task.abort()`, so the final `wal_checkpoint(TRUNCATE)` in
+    /// `Store::close` waited seconds behind it on loaded runners. Short-lived
+    /// daemons must shut down before the first drain ever starts.
+    #[tokio::test]
+    async fn retention_loop_defers_vacuum_drain_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        sqlx::query("CREATE TABLE filler (id INTEGER PRIMARY KEY, data BLOB)")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        for id in 0..64 {
+            sqlx::query("INSERT INTO filler (id, data) VALUES (?, zeroblob(65536))")
+                .bind(id)
+                .execute(store.write_pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE filler")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let freelist = store.freelist_count().await.unwrap();
+        assert!(
+            freelist > 0,
+            "seed should leave a freelist (got {freelist})"
+        );
+        let registry = Arc::new(
+            intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
+        );
+        let retention = spawn_stream_retention_loop(store.clone(), 0, registry);
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        retention.abort();
+        let _ = retention.await;
+        assert_eq!(
+            store.freelist_count().await.unwrap(),
+            freelist,
+            "no vacuum chunk may run during the startup delay"
+        );
+        // An aborted retention loop must not leave close waiting on a drain
+        // or a checked-out connection.
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            store.close(),
+        )
+        .await
+        .expect("close waited on the aborted retention loop");
+    }
+
+    /// The first retention tick (sweeps and vacuum drain) fires after
+    /// [`RETENTION_LOOP_START_DELAY`]; later ticks keep the unchanged interval.
+    #[tokio::test(start_paused = true)]
+    async fn retention_ticker_waits_start_delay_then_keeps_interval() {
+        let interval = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let mut ticker = retention_ticker(interval);
+        assert!(
+            tokio::time::timeout(
+                RETENTION_LOOP_START_DELAY.saturating_sub(Duration::from_millis(1)),
+                ticker.tick()
+            )
+            .await
+            .is_err(),
+            "the first tick must not fire before the start delay"
+        );
+        assert_eq!(ticker.tick().await - start, RETENTION_LOOP_START_DELAY);
+        assert_eq!(
+            ticker.tick().await - start,
+            RETENTION_LOOP_START_DELAY + interval
         );
     }
 }

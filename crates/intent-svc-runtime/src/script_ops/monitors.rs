@@ -26,15 +26,15 @@ fn invalid(message: &str) -> Error {
     Error::InvalidParams(message.into())
 }
 
-struct Options {
-    ttl: i64,
-    run: Option<String>,
-    pattern: Option<regex::Regex>,
-    text: Option<String>,
-    count: Option<u32>,
+pub(super) struct Options {
+    pub(super) ttl: i64,
+    pub(super) run: Option<String>,
+    pub(super) pattern: Option<regex::Regex>,
+    pub(super) text: Option<String>,
+    pub(super) count: Option<u32>,
 }
 impl Options {
-    fn parse(value: &Value) -> Result<Self> {
+    pub(super) fn parse(value: &Value) -> Result<Self> {
         let ttl = value
             .get("ttlMs")
             .and_then(Value::as_i64)

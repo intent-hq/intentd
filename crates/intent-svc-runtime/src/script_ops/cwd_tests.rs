@@ -20,6 +20,7 @@ async fn seed_legacy_script(h: &Harness, params: ScriptCreateParams) -> String {
         updated_at: None,
         archived_at: None,
         last_run: None,
+        remote_author: None,
     };
     h.services.store().upsert_script(&def).await.unwrap();
     id
@@ -87,6 +88,7 @@ async fn script_create_rejects_invalid_cwd_before_persistence() {
                         ..Default::default()
                     },
                     scoped,
+                    None,
                 )
                 .await;
             assert_invalid_script_cwd(result, &cwd);
@@ -153,6 +155,7 @@ async fn assert_invalid_cwd_preserves_predecessor(running: bool) {
                         ..Default::default()
                     },
                     scoped,
+                    None,
                 )
                 .await;
             assert_invalid_script_cwd(result, &cwd);
@@ -236,6 +239,7 @@ async fn script_create_preserves_valid_cwd_semantics() {
                         ..Default::default()
                     },
                     scoped,
+                    None,
                 )
                 .await
                 .unwrap();

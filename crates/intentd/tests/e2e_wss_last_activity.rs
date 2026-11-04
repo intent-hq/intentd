@@ -993,7 +993,7 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
         .await
         .unwrap();
     let session = store
-        .get_agent_session(&intent_core::AgentId::from(agent_id))
+        .get_agent_session_with_transcript(&intent_core::AgentId::from(agent_id))
         .await
         .unwrap();
     let text = session

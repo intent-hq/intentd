@@ -20,9 +20,11 @@ use base64::Engine as _;
 use intent_acp::{
     AcpError, AcpResult, TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo,
 };
-use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
+use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT, TERMINAL_PROCESS};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{
+    LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtyProcess, PtySize, SpawnSpec,
+};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -31,6 +33,9 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use intent_services::feature_api::events::EventBus;
 use intent_services::feature_api::execution_call::expose_git_credential;
+use intent_services::feature_api::pagination::{
+    tail_within_json_bytes, OUTPUT_TAIL_MAX_JSON_BYTES,
+};
 use intent_services::feature_api::shell::{
     default_shell, scrubbed_env_vars_except, shell_true_invocation,
 };
@@ -43,6 +48,16 @@ use intent_services::feature_api::{
 /// — without a `terminal.kill` — never closes the live channel; polling the
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
+
+/// Delay after output before re-reading the foreground program. A program
+/// start or exit almost always prints (the echoed Enter, a new prompt), so
+/// output drives the check; the delay lets the new program take the
+/// foreground first and folds a burst of output into one check.
+const PROCESS_SETTLE: Duration = Duration::from_millis(250);
+
+/// Fallback check for a change with no output (e.g. a job resumed by a
+/// signal from another terminal).
+const PROCESS_IDLE_CHECK: Duration = Duration::from_secs(5);
 
 /// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
 const DEFAULT_TERM: &str = "xterm-256color";
@@ -210,8 +225,8 @@ async fn default_cwd(
     caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Option<PathBuf> {
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return Some(sandbox_path.into());
             }
         }
@@ -350,19 +365,25 @@ pub(crate) async fn kill(pty: &PtyHost, terminal_id: &str) -> Result<Value> {
     Ok(json!({ "ok": true }))
 }
 
-/// Snapshot a PTY's scrollback for replay, base64-encoded (optionally keeping
-/// only the trailing `max_bytes`).
+/// Default and maximum raw bytes `terminal.getBuffer` returns: the newest
+/// 351 KiB of scrollback, whose base64 (479,232 bytes) fits the shared
+/// 480,000-byte page budget.
+pub(crate) const TERMINAL_BUFFER_MAX_BYTES: usize = 351 * 1024;
+
+/// Snapshot a PTY's scrollback for replay, base64-encoded, keeping only the
+/// trailing `max_bytes` (default and maximum [`TERMINAL_BUFFER_MAX_BYTES`]).
 pub(crate) fn get_buffer(
     pty: &PtyHost,
     terminal_id: &str,
     max_bytes: Option<i64>,
 ) -> Result<Value> {
     let id = resolve(terminal_id)?;
-    // Omitted (and legacy negative) bounds retain full-history semantics. A
-    // usable bound takes the ring tail directly, without cloning its prefix.
+    // Omitted (and legacy negative) bounds read the default tail; larger
+    // bounds clamp to it. The ring tail is taken without cloning its prefix.
     let max = max_bytes
         .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(usize::MAX);
+        .unwrap_or(TERMINAL_BUFFER_MAX_BYTES)
+        .min(TERMINAL_BUFFER_MAX_BYTES);
     let snapshot = pty.positioned_scrollback(id, max)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes);
     Ok(json!({
@@ -374,13 +395,16 @@ pub(crate) fn get_buffer(
 }
 
 /// The workspace's live terminals wrapped in the per-boot envelope
-/// `{ terminals: [{ id, name, cwd, isExecutingCommand }], daemonBootId }`
+/// `{ terminals: [{ id, name, cwd, isExecutingCommand, foregroundProcess,
+/// lastProcess }], daemonBootId }`
 /// (§5.13; monorepo#1334). Exited PTYs are omitted while their sessions remain
 /// retained for post-exit output and release. `name` is the display name given
 /// at spawn (`SpawnSpec::name`, e.g. "Setup Script"), else the constant
 /// `"Terminal"`; `cwd` is the working directory resolved at spawn;
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
-/// running command). `daemon_boot_id` is the daemon's per-process boot id, so
+/// running command). `foregroundProcess` / `lastProcess` are the cached
+/// foreground program and the previous one (`null` when none), refreshed by
+/// the output streamer off the read path. `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
 #[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
@@ -400,11 +424,14 @@ pub(crate) fn list(
                 .and_then(|i| i.name.as_deref())
                 .unwrap_or("Terminal");
             let is_executing = info.as_ref().is_some_and(|i| i.alive);
+            let process = info.as_ref().map(|i| i.process.clone()).unwrap_or_default();
             let value = json!({
                 "id": id_str,
                 "name": name,
                 "cwd": cwd,
                 "isExecutingCommand": is_executing,
+                "foregroundProcess": process.foreground,
+                "lastProcess": process.last,
             });
             (id_str, value)
         })
@@ -485,8 +512,16 @@ fn render_output(
         output_lines.pop();
     }
 
+    let joined = output_lines.join("\n");
+    let (body, cut) = tail_within_json_bytes(&joined, OUTPUT_TAIL_MAX_JSON_BYTES);
     let truncated = lines.len() > max_line_count;
-    let header = if truncated {
+    let header = if cut {
+        format!(
+            "Terminal {terminal_id} (cwd: {cwd}) [showing last {} of {} lines; older output omitted to fit the reply size limit]",
+            body.split('\n').count(),
+            lines.len()
+        )
+    } else if truncated {
         format!(
             "Terminal {terminal_id} (cwd: {cwd}) [showing last {max_line_count} of {} lines]",
             lines.len()
@@ -495,10 +530,7 @@ fn render_output(
         format!("Terminal {terminal_id} (cwd: {cwd})")
     };
     let separator = "\u{2500}".repeat(40);
-    Value::String(format!(
-        "{header}\n{separator}\n{}",
-        output_lines.join("\n")
-    ))
+    Value::String(format!("{header}\n{separator}\n{body}"))
 }
 
 /// Strip ANSI escape sequences from terminal output, mirroring the TS
@@ -573,6 +605,8 @@ fn utf8_len(b: u8) -> usize {
 
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
+/// While it runs, it re-reads the foreground program shortly after output
+/// (and on a slow idle fallback) and emits `terminal:process` on each change.
 pub(crate) fn spawn_output_stream(
     tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
@@ -589,6 +623,9 @@ pub(crate) fn spawn_output_stream(
             return;
         };
         let mut live = attachment.live;
+        let process_check = tokio::time::sleep(PROCESS_IDLE_CHECK);
+        tokio::pin!(process_check);
+        let mut process_check_soon = false;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
@@ -603,12 +640,25 @@ pub(crate) fn spawn_output_stream(
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk),
+                    Ok(chunk) => {
+                        emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk);
+                        if !process_check_soon {
+                            process_check_soon = true;
+                            process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_SETTLE);
+                        }
+                    }
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
+                () = &mut process_check => {
+                    if let Ok(Some(process)) = pty.refresh_process(pty_id) {
+                        emit_process(bus.as_ref(), &workspace_id, &terminal_id, &process);
+                    }
+                    process_check_soon = false;
+                    process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_IDLE_CHECK);
+                }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
@@ -666,6 +716,24 @@ fn emit_data(
             ws,
             TERMINAL_DATA,
             json!({ "terminalId": terminal_id, "chunk": chunk, "daemonBootId": daemon_boot_id, "startOffset": output.start_offset.to_string(), "endOffset": output.end_offset.to_string() }),
+        ),
+    );
+}
+
+/// Broadcast a `terminal:process` event with the terminal's foreground program
+/// and the previous one. Transient like `terminal:data`: `terminal.list`
+/// carries the same fields for clients that reconnect.
+fn emit_process(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, process: &PtyProcess) {
+    publish_event_transient(
+        bus,
+        &terminal_event(
+            ws,
+            TERMINAL_PROCESS,
+            json!({
+                "terminalId": terminal_id,
+                "foregroundProcess": process.foreground,
+                "lastProcess": process.last,
+            }),
         ),
     );
 }
@@ -1339,6 +1407,109 @@ mod tests {
             .as_str()
             .expect("formatted")
             .contains("last 2 of 3 lines"));
+    }
+
+    #[test]
+    fn read_output_keeps_newest_lines_within_the_byte_budget() {
+        // 10,000 lines of 100 bytes: the 10,000-line clamp keeps them all, so
+        // only the byte budget bounds the reply.
+        let line = "x".repeat(99);
+        let text = (0..10_000)
+            .map(|i| format!("{i:05}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snapshot = LineSnapshot {
+            bytes: text.into_bytes(),
+            total_lines: 10_000,
+            start_line: 0,
+            end_line: 10_000,
+            retained_has_non_whitespace: true,
+        };
+        let out = render_output(&snapshot, "pty-1", "/tmp", Some(100_000), false, None);
+        let out = out.as_str().expect("formatted");
+        assert!(serde_json::to_string(out).unwrap().len() < OUTPUT_TAIL_MAX_JSON_BYTES + 1024);
+        let header = out.lines().next().unwrap();
+        assert!(
+            header.contains("of 10000 lines; older output omitted"),
+            "{header}"
+        );
+        assert!(out.ends_with(&format!("09999{line}")));
+        // The first kept line is whole.
+        let first = out.lines().nth(2).unwrap();
+        assert_eq!(first.len(), 104, "{first}");
+    }
+
+    #[test]
+    fn paginated_read_output_rebuilds_an_oversized_escape_heavy_line() {
+        let quotes = format!("{}é{}", "\"".repeat(300_000), "\\".repeat(100_000));
+        let text = format!("older\n{quotes}\n");
+        let snapshot = LineSnapshot {
+            bytes: text.clone().into_bytes(),
+            total_lines: 2,
+            start_line: 0,
+            end_line: 2,
+            retained_has_non_whitespace: true,
+        };
+        let first = render_output(&snapshot, "pty-1", "/tmp", Some(50), true, None);
+        assert_eq!(first["lineContinues"], true);
+        let mut newest_first: Vec<String> = Vec::new();
+        let mut page = first;
+        let mut continues = false;
+        loop {
+            let size = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+                "page is {size} bytes"
+            );
+            for (n, item) in page["items"].as_array().unwrap().iter().enumerate() {
+                let item = item.as_str().unwrap();
+                if n == 0 && continues {
+                    let last = newest_first.last_mut().unwrap();
+                    *last = format!("{item}{last}");
+                } else {
+                    newest_first.push(item.to_owned());
+                }
+            }
+            continues = page["lineContinues"] == true;
+            let Some(token) = page["nextToken"].as_str().map(str::to_owned) else {
+                break;
+            };
+            page = render_output(&snapshot, "pty-1", "/tmp", Some(50), false, Some(&token));
+        }
+        newest_first.reverse();
+        assert_eq!(newest_first, vec!["older".to_owned(), quotes]);
+    }
+
+    #[tokio::test]
+    async fn get_buffer_defaults_and_clamps_to_the_reply_cap() {
+        let pty = host();
+        let mut spec = SpawnSpec::new("ws-1", "sh");
+        spec.args = vec![
+            "-c".to_string(),
+            "i=0; while [ $i -lt 9000 ]; do \
+             printf '%063d\\n' $i; i=$((i+1)); done; printf 'buffer-done\\n'"
+                .to_string(),
+        ];
+        let id = pty.spawn(spec).expect("spawn output producer");
+        poll_until(
+            || {
+                let bytes = pty.scrollback(id).ok()?;
+                contains_sub(&bytes, b"buffer-done").then_some(())
+            },
+            LONG_TIMEOUT,
+        )
+        .await
+        .expect("output reaches scrollback");
+        let id = id.to_string();
+        for max in [None, Some(i64::MAX), Some(-1)] {
+            let v = get_buffer(pty.as_ref(), &id, max).unwrap();
+            let data = decode(v["data"].as_str().unwrap());
+            assert_eq!(data.len(), TERMINAL_BUFFER_MAX_BYTES, "{max:?}");
+            assert!(contains_sub(&data, b"buffer-done"));
+            assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        }
+        let small = get_buffer(pty.as_ref(), &id, Some(1024)).unwrap();
+        assert_eq!(decode(small["data"].as_str().unwrap()).len(), 1024);
     }
 
     #[tokio::test]

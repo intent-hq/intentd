@@ -120,6 +120,7 @@ pub async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -137,7 +138,11 @@ pub async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> V
     let deadline = std::time::Instant::now()
         + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
-        let session = svc.store().get_agent_session(id).await.expect("session");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         let texts: Vec<String> = session
             .messages
             .iter()

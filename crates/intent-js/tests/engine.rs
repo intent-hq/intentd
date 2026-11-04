@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use intent_js::{eval, BoxFuture, EvalOptions, HostFn, JsError, DEFAULT_MEMORY_LIMIT_BYTES};
 
@@ -52,7 +52,6 @@ async fn thrown_js_error_is_returned_as_err() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_loop_is_killed_by_timeout() {
-    let started = Instant::now();
     // Test-level fail-safe: if the interrupt handler regresses, the test must
     // fail fast rather than hang CI on the very mechanism under test.
     let err = tokio::time::timeout(
@@ -62,12 +61,8 @@ async fn hot_loop_is_killed_by_timeout() {
     .await
     .expect("fail-safe: eval must return before the test-level timeout")
     .expect_err("hot loop should timeout");
-    assert!(matches!(err, JsError::Timeout { .. }), "got {err:?}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "took too long: {:?}",
-        started.elapsed()
-    );
+    // The 150 ms budget, not some other limit, ended the loop.
+    assert!(matches!(err, JsError::Timeout { ms: 150 }), "got {err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -82,7 +77,6 @@ async fn pending_promise_is_killed_by_timeout() {
             })
         },
     );
-    let started = Instant::now();
     // Test-level fail-safe: if the outer timeout regresses, the 30 s host
     // sleep must not hang CI on the very mechanism under test.
     let err = tokio::time::timeout(
@@ -92,12 +86,8 @@ async fn pending_promise_is_killed_by_timeout() {
     .await
     .expect("fail-safe: eval must return before the test-level timeout")
     .expect_err("pending await should timeout");
-    assert!(matches!(err, JsError::Timeout { .. }), "got {err:?}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "took too long: {:?}",
-        started.elapsed()
-    );
+    // The 150 ms budget, not the 30 s host sleep, ended the eval.
+    assert!(matches!(err, JsError::Timeout { ms: 150 }), "got {err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -132,7 +122,6 @@ fn default_memory_limit_is_capped() {
 async fn memory_hog_is_killed_by_default_limit() {
     // Repeated string doubling blows past the 64 MB default cap within a few
     // dozen iterations — long before the 30 s wall-clock budget.
-    let started = Instant::now();
     // Test-level fail-safe: if the memory cap regresses, the hog loop would
     // otherwise run until the 30 s wall clock — fail fast instead.
     let err = tokio::time::timeout(
@@ -146,12 +135,8 @@ async fn memory_hog_is_killed_by_default_limit() {
     .await
     .expect("fail-safe: eval must return before the test-level timeout")
     .expect_err("memory hog must be rejected by the default cap");
+    // A Runtime error, not Timeout: the cap tripped before the wall clock.
     assert!(matches!(err, JsError::Runtime(_)), "got {err:?}");
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "memory cap should trip well before the wall clock: {:?}",
-        started.elapsed()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

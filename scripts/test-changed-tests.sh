@@ -24,17 +24,29 @@ script="$here/changed-tests.sh"
 script_bash=${CHANGED_TESTS_TEST_BASH:-$BASH}
 temp_dir=$(cd "$(mktemp -d)" && pwd -P)
 bin_dir="$temp_dir/bin"
+trap 'rm -rf "$temp_dir"' EXIT
 # The fixture checkout carries a copy of the script at scripts/ so the script
-# resolves the repo root from its own location, as the real one does.
+# resolves the repo root from its own location, as the real one does, plus
+# every scripts/ helper it calls. script_helpers.py derives that list from the
+# script itself, so a new helper call cannot break this suite with exit 127
+# deep inside a case (intentd#2896), and a call to a missing helper fails here
+# naming it.
 repo="$temp_dir/repo"
 mkdir -p "$bin_dir" "$repo/scripts"
-cp "$script" "$repo/scripts/changed-tests.sh"
-cp "$here/coverage-storage.py" "$repo/scripts/"
-if [[ -f "$here/with-test-policy.sh" ]]; then
-  cp "$here/with-test-policy.sh" "$repo/scripts/"
+if ! helpers=$(python3 -I -B "$here/script_helpers.py" changed-tests.sh); then
+  echo "changed-tests test failed: cannot list the helpers changed-tests.sh calls (see the error above)" >&2
+  exit 1
 fi
+for helper in $helpers; do
+  cp "$here/$helper" "$repo/scripts/"
+done
 script="$repo/scripts/changed-tests.sh"
-trap 'rm -rf "$temp_dir"' EXIT
+# Under GitHub Actions each plan's run goes through ci-killed-rustc-retry.sh,
+# which tees the plan's output (merging its stderr) and needs tools the
+# bin_dir below leaves out. This suite pins changed-tests.sh's own contract,
+# so run it as a local caller would; scripts/test-ci-killed-rustc-retry.sh
+# covers the wrapper.
+unset GITHUB_ACTIONS
 
 fail() {
   echo "changed-tests test failed: $*" >&2
@@ -784,7 +796,9 @@ nogit="$temp_dir/nogit"
 rm -rf "$nogit"
 mkdir -p "$nogit/scripts"
 cp -R "$repo/crates" "$nogit/"
-cp "$script" "$nogit/scripts/"
+for helper in $helpers; do
+  cp "$here/$helper" "$nogit/scripts/"
+done
 mkdir -p "$nogit/.config"
 printf 'not a valid map line\n' >"$nogit/.config/e2e-test-map.txt"
 set +e
@@ -1763,6 +1777,7 @@ echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VER
 # expansions, so reject them by pattern too, then rerun the fixtures under a
 # real Bash 3 when one can be found.
 bash -n "$here/with-test-policy.sh" || fail "with-test-policy.sh does not parse"
+bash -n "$here/ci-killed-rustc-retry.sh" || fail "ci-killed-rustc-retry.sh does not parse"
 bash -n "$script" || fail "changed-tests.sh does not parse"
 bash -n "${BASH_SOURCE[0]}" || fail "test-changed-tests.sh does not parse"
 bash4_constructs='(^|[^A-Za-z0-9_])(declare|local|typeset)([[:blank:]]+-[A-Za-z]+)*[[:blank:]]+-[A-Za-z]*[An][A-Za-z]*([^A-Za-z]|$)|(^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|\$\{([A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*#?!$-])(\[[^]]*\])?(\^\^?|,,?)[^}]*\}|&>>|\|&|;;?&'
@@ -1791,7 +1806,7 @@ gate_sample miss 'echo ${rest%%/*}'
 gate_sample miss 'echo ${path##* -> }'
 gate_sample miss 'x) y ;;'
 gate_sample miss '# mapfile is unavailable on Bash 3'
-gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "${BASH_SOURCE[0]}")
+gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "$here/ci-killed-rustc-retry.sh" "${BASH_SOURCE[0]}")
 [[ -z "$gate_hits" ]] || fail "Bash 4+ constructs found (stock macOS bash is 3.2):"$'\n'"$gate_hits"
 
 # Lookup order, kept in step with the monorepo's scripts/find-bash3.sh (this

@@ -304,9 +304,10 @@ impl Sink<Message> for PingOnlyWs {
 /// faster than any read timeout, the round-trip still gives up at its ONE
 /// absolute deadline instead of restarting the clock per frame (the
 /// pre-fix shape waited forever here and would trip the outer guard).
-/// Bounded from both sides: not before the deadline, and not long after it
-/// (`SLACK` absorbs scheduler jitter on a loaded host, nothing more).
-#[tokio::test]
+/// Bounded from both sides: not before the deadline, and not long after it.
+/// The clock is paused, so the pings and the deadline run on virtual time and
+/// `elapsed` is exact: a clock restarted per frame never reaches the deadline.
+#[tokio::test(start_paused = true)]
 async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings() {
     const DEADLINE: Duration = Duration::from_millis(500);
     const SLACK: Duration = Duration::from_secs(2);
@@ -330,6 +331,7 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
         "gave up before the deadline: {elapsed:?}"
     );
     assert!(
+        // elapsed-assert: allow — paused tokio clock: the pings and the deadline run on virtual time, so elapsed is exact
         elapsed < DEADLINE + SLACK,
         "kept waiting well past the deadline: {elapsed:?}"
     );

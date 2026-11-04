@@ -55,7 +55,11 @@ mod tests {
         let (_tmp, svc, ws) = setup().await;
         let id = AgentId::from("agent-5835");
         seed_agent(&svc, &ws, &id).await;
-        let mut current = svc.store().get_agent_session(&id).await.unwrap();
+        let mut current = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         current.harness_version = "3.3".into();
         let mut previous = current.clone();
         previous.harness_version = "3.2".into();

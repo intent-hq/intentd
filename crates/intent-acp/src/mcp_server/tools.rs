@@ -256,13 +256,13 @@ API:
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`). It covers active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history. Served under the slim projection: oversized tool/image block bodies arrive truncated (`inputTruncated`/`outputTruncated`) with stable block ids — hydrate one in full with `ws.agent.getMessageBlock`. A mid-turn read includes the in-flight turn's partial assistant message (tool calls/blocks streamed so far) as a trailing `inProgress: true` row, so a busy agent's latest activity is visible without waiting for the turn to end.
-  ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers.
+  ws.agent.getMessageBlock(agentId, messageId, blockId, { offset?, maxBytes? }?) → { block, truncated, field, encoding, totalBytes, nextOffset }  // Fetch ONE content block of a persisted message — the on-demand hydration counterpart to the slim `readConversation` truncation markers. Pages are 100 KiB (102,400 bytes): `maxBytes` defaults to it and larger values are clamped down; when `truncated` is true and `nextOffset` is a number, call again with `{ offset: nextOffset }` and append each page's `block[field]` string until `nextOffset` is null (`encoding: "json"` → JSON.parse the joined text). An over-cap image comes back without `data`.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.resolveBlocker(reason) → { ok, resolved, reason }  // After confirming recovery, clear your own pending blocker with a nonblank evidence reason. Returns resolved:false for no blocker, a discussion, or repeat recovery. Preserves questions and other agents. Only a still-blocked linked task resumes; complete/cancelled tasks stay terminal. Ordinary automatic wakes do not clear foreground attention; a daemon-raised provider-stall blocker clears after the agent's next successful turn.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
-  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. Refused (also from hooks) while you are the workspace's last active top-level agent. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { gitRootId?, files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -285,7 +285,7 @@ API:
   ws.script.monitorsPage({ state?, limit?, cursor? }?) → { view: "summary", monitors, nextCursor? }  // One active page owned by you; only state: active. No history.
   ws.script.monitorDetails(monitorId) → monitor  // Selected full active monitor owned by you; finished/foreign/unknown IDs are unavailable.
   ws.script.list({ archive? }?) → [scripts]  // Lists unarchived scripts only. Only archive: active is accepted. Prefer listPage for bounded discovery; known IDs remain available to status/output.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes leave active lists; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes leave active lists; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion. Size limits (UTF-8 bytes): `name`, `cwd` and `category` ≤ 4 KiB each, `env` keys plus values ≤ 64 KiB; `command` has no limit. An over-limit field is refused with an error naming it and nothing is saved.
   ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
   ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
     Example: `const { id } = await ws.script.create("Check", "make check", "command"); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Read available outcomes with known-ID `ws.script.status(id)`; output remains transient across daemon restart.
@@ -308,13 +308,13 @@ API:
   ws.secret.list() → { secrets, pendingRequests }  // Names of your held secrets and your requests still waiting for the user; never values.
   ws.secret.forget(name) → { ok, forgotten }  // Drop one of your held secrets.
 
-  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `cron` ≤ 4 KiB (UTF-8 bytes). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: for `delayMs` hooks `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]); for `cron` hooks it defaults to and is capped at 7 days; a `runAt` hook's expiry is its fire time plus a 1h grace window. The TTL is persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it. A retired hook's script stays recoverable via `ws.hook.get(hookId)`, so re-arming with a fresh `ws.hook.schedule` call never requires keeping the code in context.
   ws.hook.list({ includeRetired? }?) → [hooks]  // List active workspace hooks from every agent. ACTIVE (scheduled|running) hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `code` (the hook script), `state`, `nextRunAt`, `expiresAt` (TTL deadline), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run). `includeRetired: true` appends the retired rows (dispatched|evicted|cancelled|expired) as a LIGHT projection — no `code`, `lastState`, or `lastLogs` — so read a retired hook's script with `ws.hook.get(hookId)`.
-  ws.hook.get(hookId) → hook  // One FULL hook row by id, including `code`, for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
+  ws.hook.get(hookId) → hook  // One FULL hook row by id, including the whole `code` (code too big for one reply is read in parts and joined), for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
@@ -346,7 +346,7 @@ API:
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
   ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
-  ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
+  ws.crossWorkspace.readNote(targetWorkspaceId, noteId, { startLine?, maxLines?, startOffset? }?) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec. A large note returns a page with `truncated: true`; pass `nextStartLine` as `startLine` (and a non-null `nextStartOffset` as `startOffset`, which resumes a cut line) to read on.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
   ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
 
@@ -362,10 +362,10 @@ API:
     Qualified PR/MR watches require addressed support from this session and daemon in addition to the captured `agentFeatures.prMonitor` switch. They are prepared but production-disabled; an installed alias or connected account alone is not support. Native polling needs neither gh nor glab. With support, use the same `gitRootId` or `target` options described under `ws.pr.snapshot`, for example `ws.mr.monitor(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Existing watches keep their original target/account through remote changes and restart; never re-register them against a new origin. Reconnect the original account for `reconnect-required`; restricted, disabled, unsupported or unresolved monitors do not permit a replacement-account fallback. Retained pending changes are not delivery confirmation: use the existing Check/Flush controls with a fresh check for explicit recovery. An unchanged check can leave pending changes intact; interrupted external work cannot be recalled or guaranteed exactly once.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable. The monitor wakes on every newly submitted review, even when the decision is unchanged, and when an approval or change request no longer covers the head.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
-    `mergeQueue?` is `{ position, queueSize?, state?, enqueuedAt?, estimatedTimeToMerge? }` while the PR is queued (`position` 1 = next; `estimatedTimeToMerge` is the host's estimate in seconds). It is informational: queue movement never wakes you, so read it on demand from `ws.pr.snapshot` / `ws.pr.monitors`.
+    `mergeQueue?` is `{ position, queueSize?, state?, enqueuedAt?, estimatedTimeToMerge? }` while the PR is queued (`position` 1 = next; `estimatedTimeToMerge` is the host's estimate in seconds). Position, size and estimate movement is informational and never wakes you, so read it on demand from `ws.pr.snapshot` / `ws.pr.monitors`. The one exception is `state` turning `unmergeable` — the forge says the PR conflicts with an entry ahead and will not merge — which wakes you: its branch is locked while queued, so remove it from the queue (GraphQL `dequeuePullRequest`), then `git fetch origin` and check the conflict is real: `git merge-tree --write-tree origin/gh-readonly-queue/<base>/pr-<ahead>-<sha> <head>` (the merge-group branch of the entry ahead, which holds the base plus every entry ahead; `origin/<base>` when none is ahead). If it is clean the flag was stale, so enqueue the same commit again; otherwise fix the branch, then enqueue it again. The monitor also reports when a still-queued entry recovers.
     A GitHub rate limit never loses the registration: when the forge quota is exhausted the monitor is persisted anyway, its baseline fetch is deferred to the end of the daemon's global forge rate-limit pause, and the call returns `ok: true` with `requirements: null` plus `pausedUntil` (RFC 3339, the pause deadline; also on `monitor.pausedUntil` and named by `monitor.lastError`) — do NOT retry or hand-roll a retry hook: the first post-pause poll adopts the PR's state as the baseline (nothing pending) and the monitor wakes you from there; call `ws.pr.snapshot` once the pause lifts if you need the checklist before then. `pausedUntil` is omitted (never null) while the gate is open at result time — including the rare deferred result whose pause lifted meanwhile (then no `lastError` either, and the row is due on the very next sweep) — and `requirements` is `null` only on a deferred fetch.
     Automatic checks default to 60 seconds while active, then 120/300/600/900 seconds after 15 minutes/1 hour/6 hours/24 hours without note or conversation activity. Ongoing agent work restores active cadence; polling, metadata and merely opening a workspace do not. Shared PRs use the fastest interested workspace and one fetch; slower configured intervals and quota limits still win. Registration, restart catch-up and explicit checks keep their existing behavior.
-    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor. Each change wake's "Where the PR stands now" checklist names the commit its check results belong to (`head: <short sha> (checks below are for this commit)`). A wake can sit in your queue past a push and describe the previous commit, so compare that head with the commit you last pushed before reporting the PR as ready.
+    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor. Each change wake's "Where the PR stands now" checklist names the commit its check results belong to (`head: <short sha> (checks below are for this commit)`). While a wake waits in your queue, a newer change wake for the same monitor removes it and joins the back of the queue, and the merged/closed final wake takes its place; either lists every change since the last wake you actually read, so you get at most one queued wake per monitor. A queued wake can still predate a push the monitor has not reported yet, so compare that head with the commit you last pushed before reporting the PR as ready.
     Active monitors per agent are bounded by `prMonitor.maxPerAgent` (default 5, configurable 1–100 by the user). Raising it supports a multi-repository inventory on one owner; shared polling slows as inventory grows. Lowering it preserves existing watches. Prefer this setting over extra monitor-owner agents or duplicate polling hooks.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
@@ -572,13 +572,13 @@ API:
   ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, activeSubAgents?, unsettledSubAgents?, runningSubAgents?, numQuestionsAsked?, prMonitors?, prs?, tasks?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`). It covers active hooks, sub-agent watches, queued messages, event subscriptions, children executing a live turn (`activeSubAgents`), all non-terminal children including idle/background waiters (`unsettledSubAgents`), and the legacy compatibility field `runningSubAgents` for children in an in-flight status, pending structured questions, and any unresolved blocker/discussion you raised. `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with " (changes pending)" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls). `tasks` counts the workspace's task notes per non-terminal status (`not_started`/`waiting`/`discussion_needed`/`blocked`/`in_progress`/`review_required`, e.g. `{"in_progress":2,"review_required":1}`; `complete`/`cancelled` never listed). Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history. Slim projection: oversized tool/image block bodies arrive truncated with stable block ids. Mid-turn reads append the in-flight turn's partial message as a trailing `inProgress: true` row.
-  ws.agent.getMessageBlock(agentId, messageId, blockId) → { block }  // Fetch ONE full content block of a persisted message — hydrates the truncated slim blocks from `readConversation`.
+  ws.agent.getMessageBlock(agentId, messageId, blockId, { offset?, maxBytes? }?) → { block, truncated, field, encoding, totalBytes, nextOffset }  // Fetch ONE content block of a persisted message — hydrates the truncated slim blocks from `readConversation`. Large bodies page in 100 KiB pieces: repeat with `{ offset: nextOffset }` until `nextOffset` is null.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Report completed or progressing work to your parent. Use `ws.agent.reportBlocker` for infrastructure/environment problems you cannot resolve, or `ws.agent.requestDiscussion` only when an issue in assigned work leaves you unsure how to proceed without a decision. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise attention only when concrete assigned work encounters an issue that leaves you unsure how to proceed without a user or coordinator decision; use ordinary conversation for back-and-forth, routine clarification, and plan approval. Check available context and use your judgment for routine choices first. Applies to direct user assignments and delegated work; a formal task note is not required. `reason` must name the issue and the specific decision needed. Call it BEFORE ending your turn, then end the turn normally. If you have a linked task it moves to `discussion_needed`.
   ws.agent.resolveBlocker(reason) → { ok, resolved, reason }  // After confirming recovery, clear your own pending blocker with a nonblank evidence reason. Returns resolved:false for no blocker, a discussion, or repeat recovery. Preserves questions and other agents. Only a still-blocked linked task resumes; complete/cancelled tasks stay terminal. Ordinary automatic wakes do not clear foreground attention; a daemon-raised provider-stall blocker clears after the agent's next successful turn.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
-  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session; this is TERMINAL for you. The call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. Refused (also from hooks) while you are the workspace's last active top-level agent. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { gitRootId?, files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -601,7 +601,7 @@ API:
   ws.script.monitorsPage({ state?, limit?, cursor? }?) → { view: "summary", monitors, nextCursor? }  // One active page owned by you; only state: active. No history.
   ws.script.monitorDetails(monitorId) → monitor  // Selected full active monitor owned by you; finished/foreign/unknown IDs are unavailable.
   ws.script.list({ archive? }?) → [scripts]  // Lists unarchived scripts only. Only archive: active is accepted. Prefer listPage for bounded discovery; known IDs remain available to status/output.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes leave active lists; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes leave active lists; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion. Size limits (UTF-8 bytes): `name`, `cwd` and `category` ≤ 4 KiB each, `env` keys plus values ≤ 64 KiB; `command` has no limit. An over-limit field is refused with an error naming it and nothing is saved.
   ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
   ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
     Example: `const { id } = await ws.script.create("Check", "make check", "command"); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Read available outcomes with known-ID `ws.script.status(id)`; output remains transient across daemon restart.
@@ -618,13 +618,13 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for SHORT builds/tests/linting that complete within one call, not long gates or services.
     `timeoutSeconds` is capped at the eval budget minus 5s (25s on the default 30s `workspace_api` budget; 55s inside a background hook, whose budget is 60s) and defaults to that ceiling when omitted or non-positive; a larger value is rejected up front (no process is spawned) because a `workspace_api` call cannot outlive its budget and the run timeout kills the process. If the timeout is hit, it returns partial output with `timedOut=true`. For anything longer, use `const {runId}=await ws.script.start(scriptId); if(!runId) throw new Error("Missing start runId"); const watch=await ws.script.monitor(scriptId,{ttlMs:600000,runId}); if(watch.ok) return {waiting:true,runId}; if(watch.reason!=="run-finished") return watch; const unavailable={waiting:false,runId,outputAvailable:false}; try { const before=await ws.script.status(scriptId); if(before.runId!==runId || watch.runId!==runId) return unavailable; const output=await ws.script.output(scriptId); const after=await ws.script.status(scriptId); return after.runId===runId ? {waiting:false,runId,outputAvailable:true,output} : unavailable; } catch { return unavailable; }` Only waiting:true means end the turn to await a wake. Require a nonempty start runId. A run-finished refusal requires immediate known-ID handling; never wait or rearm without that runId. For already-monitored follow the owner instruction. Attribute output to the refused run only when status-before.runId, refusal.runId and status-after.runId agree around the output read; missing/changed identity or any read failure means unavailable attribution. Read `ws.script.output(scriptId)` after an accepted wake. Choose TTL for the expected runtime plus margin. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs | cron | runAt, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs on a schedule until it dispatches. It ends when it returns `{ dispatch: true, message }` (you are woken with the message), throws/times out (evicted, you are woken with the error), is cancelled, or expires. Exactly ONE schedule kind is required: `delayMs` (fixed cadence in ms, min 10000), `cron` (recurring 5-field cron expression, evaluated in UTC, no seconds field), or `runAt` (one-shot fire at a future RFC3339 timestamp; rejects `perpetual` and `ttlMs`, and after the fire the hook retires whether or not it dispatched). `cron` ≤ 4 KiB (UTF-8 bytes). `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: for `delayMs` hooks `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]); for `cron` hooks it defaults to and is capped at 7 days; a `runAt` hook's expiry is its fire time plus a 1h grace window. The TTL is persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it. A retired hook's script stays recoverable via `ws.hook.get(hookId)`, so re-arming with a fresh `ws.hook.schedule` call never requires keeping the code in context.
   ws.hook.list({ includeRetired? }?) → [hooks]  // List active workspace hooks from every agent. ACTIVE (scheduled|running) hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `code` (the hook script), `state`, `nextRunAt`, `expiresAt` (TTL deadline), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run). `includeRetired: true` appends the retired rows (dispatched|evicted|cancelled|expired) as a LIGHT projection — no `code`, `lastState`, or `lastLogs` — so read a retired hook's script with `ws.hook.get(hookId)`.
-  ws.hook.get(hookId) → hook  // One FULL hook row by id, including `code`, for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
+  ws.hook.get(hookId) → hook  // One FULL hook row by id, including the whole `code` (code too big for one reply is read in parts and joined), for active and retired hooks. It is the way to recover a retired (dispatched|evicted|cancelled|expired) hook's script so you can re-arm it with `ws.hook.schedule`.
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run. On a `runAt` hook the triggered run IS the one-shot fire: the hook fires EARLY and retires (whether or not it dispatched) — the one-shot contract is honored over the timestamp, so there is no later run at the original fire time.
 
@@ -656,7 +656,7 @@ API:
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
   ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
-  ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
+  ws.crossWorkspace.readNote(targetWorkspaceId, noteId, { startLine?, maxLines?, startOffset? }?) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec. A large note returns a page with `truncated: true`; pass `nextStartLine` as `startLine` (and a non-null `nextStartOffset` as `startOffset`, which resumes a cut line) to read on.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
   ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
 
@@ -672,10 +672,10 @@ API:
     Qualified PR/MR watches require addressed support from this session and daemon in addition to the captured `agentFeatures.prMonitor` switch. They are prepared but production-disabled; an installed alias or connected account alone is not support. Native polling needs neither gh nor glab. With support, use the same `gitRootId` or `target` options described under `ws.pr.snapshot`, for example `ws.mr.monitor(7, { target: { repository: { provider: "gitlab", instanceBaseUrl: "https://git.example:8443/gitlab", projectPath: "team/sub/app" }, kind: "merge-request", number: 7 } })`. Existing watches keep their original target/account through remote changes and restart; never re-register them against a new origin. Reconnect the original account for `reconnect-required`; restricted, disabled, unsupported or unresolved monitors do not permit a replacement-account fallback. Retained pending changes are not delivery confirmation: use the existing Check/Flush controls with a fresh check for explicit recovery. An unchanged check can leave pending changes intact; interrupted external work cannot be recalled or guaranteed exactly once.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it. `requirements.approvals.latestReviews?` lists each reviewer's latest review, newest first (a standing approval or change request outranks later comment-only reviews such as thread replies; the PR author is skipped) — `{ reviewer, state, submittedAt, commitSha?, onCurrentHead?, id? }` (`state` approved|changes_requested|commented; `onCurrentHead: false` = it covers an older commit) — and is omitted when reviews were unreadable. The monitor wakes on every newly submitted review, even when the decision is unchanged, and when an approval or change request no longer covers the head.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
-    `mergeQueue?` is `{ position, queueSize?, state?, enqueuedAt?, estimatedTimeToMerge? }` while the PR is queued (`position` 1 = next; `estimatedTimeToMerge` is the host's estimate in seconds). It is informational: queue movement never wakes you, so read it on demand from `ws.pr.snapshot` / `ws.pr.monitors`.
+    `mergeQueue?` is `{ position, queueSize?, state?, enqueuedAt?, estimatedTimeToMerge? }` while the PR is queued (`position` 1 = next; `estimatedTimeToMerge` is the host's estimate in seconds). Position, size and estimate movement is informational and never wakes you, so read it on demand from `ws.pr.snapshot` / `ws.pr.monitors`. The one exception is `state` turning `unmergeable` — the forge says the PR conflicts with an entry ahead and will not merge — which wakes you: its branch is locked while queued, so remove it from the queue (GraphQL `dequeuePullRequest`), then `git fetch origin` and check the conflict is real: `git merge-tree --write-tree origin/gh-readonly-queue/<base>/pr-<ahead>-<sha> <head>` (the merge-group branch of the entry ahead, which holds the base plus every entry ahead; `origin/<base>` when none is ahead). If it is clean the flag was stale, so enqueue the same commit again; otherwise fix the branch, then enqueue it again. The monitor also reports when a still-queued entry recovers.
     A GitHub rate limit never loses the registration: when the forge quota is exhausted the monitor is persisted anyway, its baseline fetch is deferred to the end of the daemon's global forge rate-limit pause, and the call returns `ok: true` with `requirements: null` plus `pausedUntil` (RFC 3339, the pause deadline; also on `monitor.pausedUntil` and named by `monitor.lastError`) — do NOT retry or hand-roll a retry hook: the first post-pause poll adopts the PR's state as the baseline (nothing pending) and the monitor wakes you from there; call `ws.pr.snapshot` once the pause lifts if you need the checklist before then. `pausedUntil` is omitted (never null) while the gate is open at result time — including the rare deferred result whose pause lifted meanwhile (then no `lastError` either, and the row is due on the very next sweep) — and `requirements` is `null` only on a deferred fetch.
     Automatic checks default to 60 seconds while active, then 120/300/600/900 seconds after 15 minutes/1 hour/6 hours/24 hours without note or conversation activity. Ongoing agent work restores active cadence; polling, metadata and merely opening a workspace do not. Shared PRs use the fastest interested workspace and one fetch; slower configured intervals and quota limits still win. Registration, restart catch-up and explicit checks keep their existing behavior.
-    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor. Each change wake's "Where the PR stands now" checklist names the commit its check results belong to (`head: <short sha> (checks below are for this commit)`). A wake can sit in your queue past a push and describe the previous commit, so compare that head with the commit you last pushed before reporting the PR as ready.
+    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor. Each change wake's "Where the PR stands now" checklist names the commit its check results belong to (`head: <short sha> (checks below are for this commit)`). While a wake waits in your queue, a newer change wake for the same monitor removes it and joins the back of the queue, and the merged/closed final wake takes its place; either lists every change since the last wake you actually read, so you get at most one queued wake per monitor. A queued wake can still predate a push the monitor has not reported yet, so compare that head with the commit you last pushed before reporting the PR as ready.
     Active monitors per agent are bounded by `prMonitor.maxPerAgent` (default 5, configurable 1–100 by the user). Raising it supports a multi-repository inventory on one owner; shared polling slows as inventory grows. Lowering it preserves existing watches. Prefer this setting over extra monitor-owner agents or duplicate polling hooks.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
@@ -911,37 +911,9 @@ pub fn workspace_api_description(
     if gated.is_empty() && features.task_graph {
         return Cow::Borrowed(base);
     }
-    // Method doc lines sit at exactly two spaces of indentation
-    // (`  ws.<ns>.<method>(...`); their wrapped continuation lines are
-    // indented deeper. Anything else (Rules/Parameters/Examples prose) never
-    // matches a gated `ws.` prefix at indent 2.
-    let mut kept: Vec<&str> = Vec::new();
-    let mut skipping = false;
-    for line in base.lines() {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if indent == 2 && trimmed.starts_with("ws.") {
-            skipping = gated.iter().any(|(prefix, _)| trimmed.starts_with(prefix));
-        } else if indent < 4 || trimmed.is_empty() {
-            skipping = false;
-        }
-        if !skipping {
-            kept.push(line);
-        }
-    }
-    let mut out = String::with_capacity(base.len());
-    let mut prev_blank = false;
-    for line in kept {
-        if line.is_empty() && prev_blank {
-            continue;
-        }
-        prev_blank = line.is_empty();
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !base.ends_with('\n') {
-        out.pop();
-    }
+    let mut out = prune_doc_lines(base, |line| {
+        gated.iter().any(|(prefix, _)| line.starts_with(prefix))
+    });
     // Method-level scrub for `attentionRequests`: the surviving
     // `ws.agent.reportToParent` doc line cross-references the two pruned
     // methods, so drop that clause too.
@@ -998,6 +970,123 @@ pub fn workspace_api_description(
             );
     }
     Cow::Owned(out)
+}
+
+/// Drop every `ws.*` doc line (and its indented continuation lines) whose
+/// text starts with a prefix `gated` accepts; doubled blank lines left by a
+/// removed namespace paragraph collapse to one. Method doc lines and the
+/// `Namespaces` index entries sit at exactly two spaces of indentation
+/// (`  ws.<ns>.<method>(...`); their wrapped continuation lines are indented
+/// deeper. Anything else (Rules/Parameters/Examples prose) never matches a
+/// `ws.` prefix at indent 2.
+fn prune_doc_lines(base: &str, gated: impl Fn(&str) -> bool) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 2 && trimmed.starts_with("ws.") {
+            skipping = gated(trimmed);
+        } else if indent < 4 || trimmed.is_empty() {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = String::with_capacity(base.len());
+    let mut prev_blank = false;
+    for line in kept {
+        if line.is_empty() && prev_blank {
+            continue;
+        }
+        prev_blank = line.is_empty();
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// `ws.*` surfaces that need git or a forge, left out of the `workspace_api`
+/// description and `ws.help` in a plain-folder workspace and refused at
+/// dispatch (§5.1 "Plain-folder workspaces"). Namespace entries end with
+/// `.`; `ws.workspace.proposeSibling` names one method.
+const PLAIN_FOLDER_PREFIXES: &[&str] =
+    &["ws.git.", "ws.pr.", "ws.mr.", "ws.workspace.proposeSibling"];
+
+/// Git, branch and pull-request references outside the pruned doc lines —
+/// the `ws.hook.*` cross-references to `ws.pr.*`, the `ws.help("pr")`
+/// example, and the branch / PR fields of `ws.workspace.details`,
+/// `ws.workspace.setTitle`, `ws.agent.snapshot` and
+/// `ws.crossWorkspace.search` — rewritten for a plain-folder workspace
+/// (which has none of them). Each pair is applied in order to every
+/// occurrence, so the full, compact and condensed variants and the
+/// `host.exec` / `hostExec`-off / chief spellings are all covered (unit tests
+/// pin every `from` to the static description and guard that no git or PR
+/// word survives).
+const PLAIN_FOLDER_XREF_REWRITES: &[(&str, &str)] = &[
+    ("incl. pr.snapshot and host.exec", "incl. host.exec"),
+    (" incl. pr.snapshot", ""),
+    ("including `ws.pr.snapshot` and `ws.host.exec`", "including `ws.host.exec`"),
+    (", including `ws.pr.snapshot`", ""),
+    (PR_MONITOR_HOOK_XREF, ""),
+    ("`ws.help(\"pr\")` returns", "`ws.help(\"note\")` returns"),
+    ("statusImageAssetId, branch, repositoryName", "statusImageAssetId, repositoryName"),
+    ("{ ok, title, branch, skipped? }", "{ ok, title, skipped? }"),
+    (
+        "title. May rename the branch if it is still auto-generated; returns `skipped`",
+        "title. Returns `skipped`",
+    ),
+    ("numQuestionsAsked?, prMonitors?, prs?, tasks?", "numQuestionsAsked?, tasks?"),
+    (
+        " `prMonitors` lists your active PR monitors as `owner/name#123` labels, each suffixed with \" (changes pending)\" while changes await the debounced report. `prs` groups the workspace's tracked open PRs by state (`draft`/`blocked`/`mergeable`/`unknown`, labels like `owner/name#123`; merged/closed excluded) from the workspace repo plus known git roots only (registered secondary roots — no forge calls).",
+        "",
+    ),
+    ("{ query?, pr?, includeRetired?, limit? }", "{ query?, includeRetired?, limit? }"),
+    ("by free text and/or a PR.", "by free text."),
+    (
+        " `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`",
+        " `query` matches title, status message and tags (every term) or note text. Rows: `{ id, title, status, archived, updatedAt, matchedOn, notes?, link, markdownLink }`",
+    ),
+];
+
+/// The documented refusal for a `host({ method })` frame that needs git or a
+/// forge in a plain-folder workspace (§5.1 "Plain-folder error"), or `None`
+/// for every other method. Frame methods carry no `ws.` prefix; `mr.*`
+/// frames are the `ws.mr.*` aliases.
+pub(crate) fn plain_folder_refusal(method: &str) -> Option<String> {
+    let binding = format!("ws.{method}");
+    PLAIN_FOLDER_PREFIXES
+        .iter()
+        .any(|prefix| {
+            if prefix.ends_with('.') {
+                binding.starts_with(prefix)
+            } else {
+                binding == *prefix
+            }
+        })
+        .then(|| format!("{binding} is not available in plain-folder workspaces"))
+}
+
+/// A `workspace_api` description (full, compact or condensed) or `ws.help`
+/// output with the plain-folder surfaces removed: the [`PLAIN_FOLDER_PREFIXES`]
+/// doc lines and index entries plus their cross-references. Applied by the
+/// bridge for plain-folder workspaces only, so every other description is
+/// unchanged by construction.
+#[must_use]
+pub fn plain_folder_description(desc: &str) -> String {
+    let mut out = prune_doc_lines(desc, |line| {
+        PLAIN_FOLDER_PREFIXES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    });
+    for (from, to) in PLAIN_FOLDER_XREF_REWRITES {
+        out = out.replace(from, to);
+    }
+    out
 }
 
 fn workspace_api_description_for_bridge(
@@ -1380,6 +1469,69 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
     }
     if in_delegate && !inserted {
         out.push_str(&model_options_block(model_options));
+        inserted = true;
+    }
+    if !inserted {
+        return None;
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// The continuation line the `ws.agent.delegate` entry gets with the
+/// remote-placement discovery text, which joins `ws.agent.create`.
+pub(crate) const DELEGATE_PLACEMENT_POINTER: &str =
+    "`placement` works here as in `ws.agent.create`, whose entry lists the machines.";
+
+/// Splice `help` (the remote-placement discovery text, one or more lines)
+/// into `base` as continuation lines of the `ws.agent.create` doc entry, and
+/// [`DELEGATE_PLACEMENT_POINTER`] into the `ws.agent.delegate` entry, so a
+/// bridge whose daemon can place agents on exposed machines lists them.
+/// Lines are indented 4 so `[agentFeatures]` pruning and the condensed
+/// rendering treat them as part of that entry. Returns `base` unchanged
+/// when the `ws.agent.create` anchor is absent.
+pub(crate) fn inject_remote_placement_help(base: &str, help: &str) -> String {
+    let Some(with_create) = inject_into_entry(base, "ws.agent.create(", help) else {
+        return base.to_owned();
+    };
+    inject_into_entry(
+        &with_create,
+        "ws.agent.delegate(",
+        DELEGATE_PLACEMENT_POINTER,
+    )
+    .unwrap_or(with_create)
+}
+
+/// Append `text` as continuation lines of the doc entry starting with
+/// `anchor`; `None` when no entry does.
+fn inject_into_entry(base: &str, anchor: &str, text: &str) -> Option<String> {
+    let mut block = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
+        block.push_str("    ");
+        block.push_str(line.trim());
+        block.push('\n');
+    }
+    let mut out = String::with_capacity(base.len() + block.len());
+    let mut in_entry = false;
+    let mut inserted = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_continuation = indent >= 4 && !trimmed.is_empty();
+        if in_entry && !is_continuation && !inserted {
+            out.push_str(&block);
+            inserted = true;
+        }
+        if indent == 2 && trimmed.starts_with("ws.") {
+            in_entry = trimmed.starts_with(anchor);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_entry && !inserted {
+        out.push_str(&block);
         inserted = true;
     }
     if !inserted {
@@ -2005,6 +2157,32 @@ mod tests {
             assert!(
                 help.contains("ws.agent.listSpecialists()"),
                 "ws.help(\"agent\") (is_chief={is_chief}) must include listSpecialists"
+            );
+        }
+    }
+
+    // intentd#2937: GitHub flagged a queue entry UNMERGEABLE with no real
+    // conflict, and re-enqueueing the unchanged commit merged it. The
+    // `ws.help("pr")` advice matches the monitor's change line: verify the
+    // conflict first, re-enqueue the same commit when it is clean.
+    #[test]
+    fn help_pr_says_to_verify_an_unmergeable_queue_entry_before_fixing() {
+        let features = all_gates_open();
+        for is_chief in [false, true] {
+            let help = help_namespace(is_chief, &features, false, "pr").unwrap();
+            for needle in [
+                "GraphQL `dequeuePullRequest`",
+                "`git merge-tree --write-tree origin/gh-readonly-queue/<base>/pr-<ahead>-<sha> <head>`",
+                "enqueue the same commit again",
+            ] {
+                assert!(
+                    help.contains(needle),
+                    "chief={is_chief}: missing {needle:?}"
+                );
+            }
+            assert!(
+                !help.contains("), fix the branch, then enqueue"),
+                "chief={is_chief}"
             );
         }
     }
@@ -2821,6 +2999,9 @@ mod tests {
                 "omit",
                 "`.`",
                 "before replacing",
+                "`category` ≤ 4 KiB",
+                "≤ 64 KiB",
+                "`command` has no limit",
             ] {
                 assert!(line.contains(guidance), "missing {guidance:?}: {line}");
             }
@@ -4023,6 +4204,97 @@ mod script_recipe_tests {
                 intent_js::eval(&code, &intent_js::EvalOptions::default(), None)
                     .await
                     .is_err()
+            );
+        }
+    }
+
+    /// Remote-placement discovery joins the `ws.agent.create` entry as
+    /// continuation lines in both renderings; without it the description is
+    /// unchanged.
+    #[test]
+    fn remote_placement_help_extends_the_create_docs() {
+        let features = intent_core::settings_file::AgentFeaturesSettings::default();
+        let base = crate::mcp_server::tools::workspace_api_description(false, &features);
+        let help = "Remote placement (experimental): node \"Mac\" is connected.\nPass `placement`.";
+        let full = crate::mcp_server::tools::inject_remote_placement_help(&base, help);
+        let create = full
+            .lines()
+            .position(|l| l.starts_with("  ws.agent.create("))
+            .unwrap();
+        let lines: Vec<&str> = full.lines().collect();
+        let injected = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("Remote placement (experimental)")
+            })
+            .unwrap();
+        assert!(injected > create);
+        assert!(lines[create + 1..injected]
+            .iter()
+            .all(|l| l.starts_with("    ")));
+        assert!(lines[injected].starts_with("    "));
+        assert!(lines[injected + 1].starts_with("    Pass `placement`."));
+        assert!(
+            lines[injected + 2].starts_with("  ws."),
+            "the next entry follows"
+        );
+        let delegate = lines
+            .iter()
+            .position(|l| l.starts_with("  ws.agent.delegate("))
+            .unwrap();
+        let pointer = lines
+            .iter()
+            .position(|l| {
+                *l == format!(
+                    "    {}",
+                    crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER
+                )
+            })
+            .unwrap();
+        assert!(pointer > delegate);
+        assert!(lines[delegate + 1..pointer]
+            .iter()
+            .all(|l| l.starts_with("    ")));
+        assert!(
+            lines[pointer + 1].starts_with("  ws."),
+            "the next entry follows"
+        );
+        assert_eq!(
+            full.len(),
+            base.len()
+                + help.len()
+                + 1
+                + 2 * 4
+                + crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER.len()
+                + 4
+                + 1
+        );
+
+        let condensed =
+            crate::mcp_server::tools::condensed_workspace_api_description(false, &features, &[]);
+        let condensed_full =
+            crate::mcp_server::tools::inject_remote_placement_help(&condensed, help);
+        assert!(condensed_full.contains("    Remote placement (experimental)"));
+        assert!(condensed_full.contains(&format!(
+            "    {}",
+            crate::mcp_server::tools::DELEGATE_PLACEMENT_POINTER
+        )));
+    }
+}
+
+#[cfg(test)]
+mod plain_folder_tests {
+    use super::*;
+
+    /// Every rewrite still matches the static description (no stale marker
+    /// silently letting a git or PR mention through).
+    #[test]
+    fn plain_folder_rewrites_match_the_description() {
+        for (from, _) in PLAIN_FOLDER_XREF_REWRITES {
+            assert!(
+                WORKSPACE_API_DESCRIPTION.contains(from),
+                "stale plain-folder rewrite: {from}"
             );
         }
     }

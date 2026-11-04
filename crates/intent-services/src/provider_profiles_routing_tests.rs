@@ -132,7 +132,7 @@ impl Fixture {
         let id = agent_id(response);
         self.svc
             .store()
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .expect("session")
             .provider
@@ -199,7 +199,14 @@ async fn catalog_offers_profiles_and_rename_changes_only_the_label() {
         keys.sort();
         assert_eq!(
             keys,
-            ["backup", "baseProviderId", "id", "name", "providerRef"]
+            [
+                "backup",
+                "baseProviderId",
+                "id",
+                "name",
+                "providerRef",
+                "remoteCompatible"
+            ]
         );
     }
     let rendered = catalog.to_string();
@@ -359,7 +366,7 @@ async fn provider_defaults_walk_the_reference_then_its_base() {
     let session = fx
         .svc
         .store()
-        .get_agent_session(&agent_id(&created))
+        .get_agent_session_with_transcript(&agent_id(&created))
         .await
         .unwrap();
     assert_eq!(session.model.as_deref(), Some("work-model"));
@@ -377,7 +384,12 @@ async fn set_model_switches_profiles_and_rejects_missing_references() {
             .agent_set_model_op(agent.clone(), "same-model".into(), Some(target.clone()))
             .await
             .unwrap();
-        let session = fx.svc.store().get_agent_session(&agent).await.unwrap();
+        let session = fx
+            .svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         assert_eq!(session.provider.as_deref(), Some(target.as_str()));
     }
     let err = fx
@@ -390,7 +402,12 @@ async fn set_model_switches_profiles_and_rejects_missing_references() {
         .await
         .unwrap_err();
     assert_eq!(replacement(&err).1, "profile-missing");
-    let session = fx.svc.store().get_agent_session(&agent).await.unwrap();
+    let session = fx
+        .svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(
         session.provider.as_deref(),
         Some("codex"),

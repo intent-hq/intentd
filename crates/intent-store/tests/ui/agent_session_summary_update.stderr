@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `AgentSessionSummary: FullAgentSessionRow` is not satisfied
+ --> tests/ui/agent_session_summary_update.rs:7:54
+  |
+7 |     let _ = store.update_agent_session(workspace_id, summary);
+  |                   --------------------               ^^^^^^^ the trait `FullAgentSessionRow` is not implemented for `AgentSessionSummary`
+  |                   |
+  |                   required by a bound introduced by this call
+  |
+help: the trait `FullAgentSessionRow` is implemented for `AgentSession`
+ --> src/agent_session_summary.rs
+  |
+  | impl FullAgentSessionRow for AgentSession {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `intent_store::agent_repo::<impl Store>::update_agent_session`
+ --> src/agent_repo.rs
+  |
+  |     pub async fn update_agent_session(
+  |                  -------------------- required by a bound in this associated function
+...
+  |         s: &impl FullAgentSessionRow,
+  |                  ^^^^^^^^^^^^^^^^^^^ required by this bound in `intent_store::agent_repo::<impl Store>::update_agent_session`

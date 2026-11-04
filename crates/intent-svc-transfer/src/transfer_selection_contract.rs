@@ -283,7 +283,10 @@ async fn import_case(
             .await
             .unwrap();
     }
-    let stored_session = store.get_agent_session(&agent).await.unwrap();
+    let stored_session = store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     let (provider, model, effort) =
         intent_services::feature_api::agent_manager::imported_spawn_selection_for_test(
             &stored_session,

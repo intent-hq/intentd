@@ -576,7 +576,6 @@ async fn concurrent_burst_batches_events_correctly() {
     );
 
     // Collect all events from the subscriber.
-    let start = std::time::Instant::now();
     let mut received = Vec::new();
     for _ in 0..TOTAL_EVENTS {
         let batch = timeout(
@@ -589,7 +588,6 @@ async fn concurrent_burst_batches_events_correctly() {
         assert_eq!(batch.len(), 1, "no batching; each event is single-element");
         received.push(batch.into_iter().next().unwrap());
     }
-    let elapsed = start.elapsed();
 
     // All published events should be received (check by id set equality).
     let published_ids: std::collections::HashSet<_> =
@@ -642,15 +640,72 @@ async fn concurrent_burst_batches_events_correctly() {
         TOTAL_EVENTS,
         "all events should be durably stored"
     );
+}
 
-    // Throughput sanity: the burst should complete reasonably fast. With batching,
-    // we expect this to take well under what 510 sequential single-insert transactions
-    // would take (~500ms+ on most systems). Assert an upper bound (e.g. 2s) to catch
-    // regressions where batching breaks.
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "burst should complete in <3s with batching; took {elapsed:?}"
+/// Publishes already queued when the writer looks are persisted together:
+/// one insert call per `WRITER_BATCH_SIZE` events, not one per event. This
+/// is the batching the burst test above relies on, asserted by counting
+/// insert calls rather than timing the burst (a wall-clock bound failed on
+/// loaded CI runners, intentd#2917).
+#[tokio::test]
+async fn queued_publishes_are_persisted_in_full_batches() {
+    use super::bus::WRITER_BATCH_SIZE;
+    const QUEUED: usize = 2 * WRITER_BATCH_SIZE + 5;
+    let (btx, mut brx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+    let btx = super::bus::RawBus::from(btx);
+    let (wtx, wrx) = tokio::sync::mpsc::channel::<super::bus::WriterRequest>(QUEUED);
+    let mut replies = Vec::new();
+    for i in 0..QUEUED {
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        let ev = new_event("test:queued", Some(&format!("p-{i}")), ActorType::Agent);
+        wtx.send((ev, otx)).await.expect("queue publish");
+        replies.push(orx);
+    }
+
+    let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = batches.clone();
+    let writer = tokio::spawn(super::bus::writer_loop(
+        move |events: std::sync::Arc<[NewEvent]>| {
+            let mut seen = seen.lock().expect("batches lock");
+            let base: usize = seen.iter().sum();
+            seen.push(events.len());
+            let stored: Vec<Event> = events
+                .iter()
+                .enumerate()
+                .map(|(i, ev)| stored_event(&format!("evt-{}", base + i), ev))
+                .collect();
+            async move { Ok(stored) }
+        },
+        wrx,
+        btx,
+    ));
+
+    for (i, reply) in replies.into_iter().enumerate() {
+        let stored = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            reply,
+        )
+        .await
+        .expect("publish resolved")
+        .expect("oneshot resolved")
+        .expect("insert succeeds");
+        assert_eq!(stored.id, format!("evt-{i}"), "publish order is kept");
+        assert_eq!(brx.try_recv().expect("broadcast").id, format!("evt-{i}"));
+    }
+    assert_eq!(
+        *batches.lock().expect("batches lock"),
+        vec![WRITER_BATCH_SIZE, WRITER_BATCH_SIZE, 5],
+        "queued publishes must be drained into full batches"
     );
+
+    drop(wtx);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        writer,
+    )
+    .await
+    .expect("writer loop exits on channel close")
+    .expect("writer loop task");
 }
 
 #[tokio::test]
@@ -1107,6 +1162,7 @@ async fn transient_batch_insert_failure_exhausts_retries() {
         elapsed >= super::bus::INSERT_RETRY_DEADLINE,
         "retries span the whole deadline before dropping (elapsed={elapsed:?})"
     );
+    // elapsed-assert: allow — start_paused: tokio::time::Instant is virtual
     assert!(
         elapsed < super::bus::INSERT_RETRY_DEADLINE + 2 * WRITE_POOL_ACQUIRE_TIMEOUT,
         "retry budget is bounded: at most one attempt past the deadline (elapsed={elapsed:?})"

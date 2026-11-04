@@ -103,7 +103,7 @@ async fn archive_sweep_queues_one_consolidated_wake_per_affected_agent() {
     // `created_at` listing; compare as sets).
     let session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     let metadata = session.messages[0].metadata.clone().expect("wake metadata");
@@ -123,7 +123,7 @@ async fn archive_sweep_queues_one_consolidated_wake_per_affected_agent() {
     // B owned nothing the sweep touched: no wake at all.
     let bystander_session = svc
         .store()
-        .get_agent_session(&bystander)
+        .get_agent_session_with_transcript(&bystander)
         .await
         .expect("bystander session");
     assert!(
@@ -181,7 +181,7 @@ async fn golden_archive_sweep_consolidated_notice_bytes() {
     );
     let session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     assert_eq!(

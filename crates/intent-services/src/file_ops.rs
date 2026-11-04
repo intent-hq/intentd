@@ -58,8 +58,8 @@ pub(crate) async fn resolve_root(
 ) -> String {
     // CoW containment: prefer the calling agent's sandbox path when present.
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return sandbox_path;
             }
         }
@@ -245,7 +245,11 @@ pub fn resolve_attachment_source(canonical_root: &str, stored_path: &str) -> Res
 }
 
 /// `file.read` → bare UTF-8 string.
-pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let content = std::fs::read_to_string(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(Value::String(content))
@@ -278,14 +282,7 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     if root.is_empty() {
         return Err(Error::Internal(ACCESS_DENIED.to_string()));
     }
-    if length == 0 {
-        return Err(Error::InvalidParams("length must be positive".to_string()));
-    }
-    if length > READ_CHUNK_MAX_BYTES as u64 {
-        return Err(Error::InvalidParams(format!(
-            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
-        )));
-    }
+    validate_chunk_length(length)?;
     let full = resolve_within(root, path)?;
     let md = std::fs::metadata(&full).map_err(|e: std::io::Error| io_err(&e))?;
     if md.is_dir() {
@@ -311,9 +308,45 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     Ok(json!({ "content": content, "bytesRead": len, "size": size }))
 }
 
+/// Reject a zero or over-cap chunk `length` (-32602), shared by every
+/// windowed read (`file.readChunk`, `git.showFileChunk`,
+/// `note.readAssetChunk`).
+pub(crate) fn validate_chunk_length(length: u64) -> Result<()> {
+    if length == 0 {
+        return Err(Error::InvalidParams("length must be positive".to_string()));
+    }
+    if length > READ_CHUNK_MAX_BYTES as u64 {
+        return Err(Error::InvalidParams(format!(
+            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
+        )));
+    }
+    Ok(())
+}
+
+/// One offset window of an in-memory object as `{ content (base64),
+/// bytesRead, size }`, with the `file.readChunk` rules: a window at/past the
+/// end is empty, one crossing the end is shortened.
+pub(crate) fn window_bytes(bytes: &[u8], offset: u64, length: u64) -> Result<Value> {
+    use base64::Engine as _;
+
+    validate_chunk_length(length)?;
+    let size = bytes.len();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(size);
+    let len = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(size - start);
+    let slice = &bytes[start..start + len];
+    let content = base64::engine::general_purpose::STANDARD.encode(slice);
+    Ok(json!({ "content": content, "bytesRead": len, "size": size }))
+}
+
 /// `file.write` → `{ ok, path, size }` (size = UTF-16 code-unit length, matching
 /// JS `content.length`). Parent directories are created.
-pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn write(root: &str, path: &str, content: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e: std::io::Error| io_err(&e))?;
@@ -570,7 +603,11 @@ pub(crate) fn get_attachment(
 }
 
 /// `file.list` → bare array of `{ name, type }`.
-pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| io_err(&e))? {
@@ -624,7 +661,11 @@ pub(crate) fn tree(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.delete` → `{ ok, path, deleted: true }` (rejects directories).
-pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn delete(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if !full.exists() {
         return Err(Error::Internal(format!("File not found: {path}")));
@@ -639,7 +680,11 @@ pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.mkdir` → `{ ok, path, created: true }` or `{ ok, path, existed: true }`.
-pub(crate) fn mkdir(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn mkdir(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if full.exists() {
         if full.is_dir() {
@@ -743,7 +788,11 @@ fn permissions_octal(_md: &std::fs::Metadata) -> String {
 /// Both endpoints go through [`resolve_within`], so the symlink-aware gate
 /// covers the source and the destination (a rename through an out-of-root
 /// symlinked directory is denied on either side).
-pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
     let old_full = resolve_within(root, old_path)?;
     let new_full = resolve_within(root, new_path)?;
     if !old_full.exists() {

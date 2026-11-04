@@ -27,6 +27,12 @@ def module(name):
     return result
 
 
+# The publish steps run these from a scratch root; their helpers and sibling
+# loads are derived, and a missing one stops the harness here (intentd#2896).
+PUBLISH_SCRIPTS = module('script_helpers').closure(
+    ['install.sh', 'install.ps1', 'refresh-release-published-at.sh', 'reconcile-sitter-intel.py'])
+
+
 def archive(root, target, valid=True):
     suffix = 'zip' if 'windows' in target else 'tar.xz'
     path = root / f'intentd-{target}.{suffix}'
@@ -202,11 +208,8 @@ else:
             old_pair = old.read_bytes(), checksum.read_bytes()
             scripts = root / 'scripts'
             scripts.mkdir()
-            for name in ('install.sh', 'install.ps1', 'refresh-release-published-at.sh', 'optional-intel-release.py'):
+            for name in PUBLISH_SCRIPTS:
                 shutil.copy(ROOT / 'scripts' / name, scripts / name)
-            reconcile = ROOT / 'scripts/reconcile-sitter-intel.py'
-            if reconcile.exists():
-                shutil.copy(reconcile, scripts / reconcile.name)
             bin_dir = root / 'bin'
             bin_dir.mkdir()
             stub = bin_dir / 'gh'

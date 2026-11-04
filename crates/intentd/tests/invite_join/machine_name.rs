@@ -34,7 +34,7 @@ async fn status(socket: &mut Ws) -> Value {
 #[tokio::test]
 async fn collaboration_machine_name_live_both_scopes_owner_only_and_restart() {
     let mock = spawn_mock_forge().await;
-    let mut host = boot(&mock, &[]).await;
+    let mut host = boot(&mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let original = status(&mut owner).await;
     assert_eq!(original.get("collaborationName"), Some(&Value::Null));
@@ -142,7 +142,7 @@ async fn collaboration_machine_name_live_both_scopes_owner_only_and_restart() {
         "Persistent name"
     );
     drop((owner, member, guest, join));
-    restart(&mut host, &mock, &[]).await;
+    restart(&mut host, &mock, OWNER_FORGE).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let mut member = connect_ws(host.port, host.cfg.clone(), &member_token).await;
     let mut guest = connect_ws(host.port, host.cfg.clone(), &guest_token).await;

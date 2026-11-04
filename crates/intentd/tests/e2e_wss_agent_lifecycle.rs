@@ -2319,7 +2319,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store
@@ -2519,6 +2519,161 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     );
 }
 
+/// Per-agent sidebar `pinned` (PROTOCOL §5.5): `agent.update { changes:
+/// { pinned } }` persists the daemon-owned pin, returns it on the
+/// `AgentLite`, emits `agent:updated` carrying the change, never advances
+/// `updatedAt` (a preference, not activity), and rejects a non-boolean with
+/// `-32602`. `AgentLite` (`agent.create` / `agent.update` / `agent.get` /
+/// `agent.list`) always carries the boolean — its presence is the support
+/// signal — while `agent.getSession` serves it only when `true`.
+#[tokio::test]
+async fn agent_pinned_round_trip_over_wss() {
+    let Some(script) = gate("WSS pinned E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 2] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Pinned", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert_eq!(
+        created["agent"]["pinned"],
+        json!(false),
+        "fresh agent is unpinned and the field is present: {created}"
+    );
+    let fresh_session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        fresh_session["session"].get("pinned").is_none(),
+        "agent.getSession omits an unset pin: {fresh_session}"
+    );
+
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": "yes" } }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "non-boolean pinned is -32602: {rejected}"
+    );
+
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let id = intent_core::AgentId(agent_id.clone());
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
+    let old = "2020-01-01T00:00:00.000Z";
+    seeded.updated_at = old.to_string();
+    store
+        .update_agent_session(&seeded.workspace_id, &seeded)
+        .await
+        .unwrap();
+
+    for (rpc_id, pinned) in [(20, true), (21, true), (22, false), (23, true)] {
+        let response = wss_rpc_envelope(
+            &mut rpc,
+            rpc_id,
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": pinned } }),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], rpc_id);
+        assert_eq!(response["result"]["success"], true, "{response}");
+        let agent = &response["result"]["agent"];
+        assert_eq!(agent["updatedAt"], old, "pin is not activity: {agent}");
+        assert_eq!(agent["pinned"], json!(pinned), "{agent}");
+        let mut received = false;
+        for _ in 0..40 {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+                assert_eq!(ev["data"]["pinned"], json!(pinned), "{ev}");
+                assert!(ev["data"].get("updatedAt").is_none());
+                received = true;
+                break;
+            }
+        }
+        assert!(received, "pin change emits agent:updated");
+    }
+
+    let got = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(got["agent"]["pinned"], json!(true), "{got}");
+    assert_eq!(got["agent"]["updatedAt"], old, "{got}");
+    let list = wss_rpc(&mut rpc, 31, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("pinned agent listed")
+        .clone();
+    assert_eq!(listed["pinned"], json!(true), "{listed}");
+    let session = wss_rpc(
+        &mut rpc,
+        32,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(session["session"]["pinned"], json!(true), "{session}");
+}
+
 /// Direct user retirement cancels a real parked ACP turn over authenticated
 /// WSS and preserves the streamed conversation without sending a model message.
 #[intent_test_macros::daemon_test]
@@ -2574,6 +2729,15 @@ async fn agent_retire_stops_running_turn_over_wss() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer = wss_rpc(
+        &mut rpc,
+        9_001,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS peer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    assert!(peer["agent"]["id"].is_string(), "peer created: {peer}");
 
     let sent = wss_rpc(
         &mut rpc,
@@ -7281,7 +7445,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         .iter()
         .any(|n| n["id"] == json!(created_id)));
 
-    // `note.listTasks` returns a bare array (TS parity).
+    // `note.listTasks` returns one page (bounded reads).
     let tasks = wss_rpc(
         &mut rpc,
         7,
@@ -7289,7 +7453,8 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": created_id }),
     )
     .await;
-    assert!(tasks.is_array(), "note.listTasks bare array: {tasks}");
+    assert!(tasks["tasks"].is_array(), "note.listTasks page: {tasks}");
+    assert_eq!(tasks["nextToken"], Value::Null, "one page: {tasks}");
 
     // --- mcp.servers.list — empty on a fresh workspace ----------------------
     let mcp = wss_rpc(&mut rpc, 8, "mcp.servers.list", json!({})).await;
@@ -7684,6 +7849,137 @@ async fn terminal_create_env_over_wss() {
     )
     .await;
     assert_eq!(released["ok"], json!(true));
+}
+
+/// `terminal.list` rows carry `foregroundProcess` / `lastProcess`, and a
+/// `terminal:process` event fires when a job starts and when it ends.
+#[intent_test_macros::daemon_test]
+async fn terminal_process_fields_and_events_over_wss() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["terminal:process"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "{sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "terminal.create",
+        json!({ "workspaceId": ws_id, "cols": 80, "rows": 24, "command": "sh" }),
+    )
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], Value::Null, "{row}");
+
+    let _ = wss_rpc(
+        &mut rpc,
+        4,
+        "terminal.write",
+        // timing-guard: the shell job whose foreground state is observed, not a wait
+        json!({ "terminalId": terminal_id, "data": STANDARD.encode("sleep 30\n") }),
+    )
+    .await;
+
+    let mut events: Vec<Value> = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
+    let started =
+        json!({ "terminalId": terminal_id, "foregroundProcess": "sleep", "lastProcess": null });
+    let ended =
+        json!({ "terminalId": terminal_id, "foregroundProcess": null, "lastProcess": "sleep" });
+    let mut interrupted = false;
+    while !events.contains(&ended) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                let event = &frame["params"]["event"];
+                if frame["method"] != "events.event" || event["type"] != "terminal:process" {
+                    continue;
+                }
+                events.push(event["data"].clone());
+                if !interrupted && events.contains(&started) {
+                    interrupted = true;
+                    let listed = wss_rpc(
+                        &mut rpc,
+                        5,
+                        "terminal.list",
+                        json!({ "workspaceId": ws_id }),
+                    )
+                    .await;
+                    let row = listed["terminals"]
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+                        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+                    assert_eq!(row["foregroundProcess"], "sleep", "{row}");
+                    let _ = wss_rpc(
+                        &mut rpc,
+                        6,
+                        "terminal.write",
+                        json!({ "terminalId": terminal_id, "data": STANDARD.encode("\u{3}") }),
+                    )
+                    .await;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    assert_eq!(events, vec![started, ended], "terminal:process payloads");
+
+    let listed = wss_rpc(
+        &mut rpc,
+        7,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], "sleep", "{row}");
+    let _ = wss_rpc(
+        &mut rpc,
+        8,
+        "terminal.kill",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
 }
 
 /// Regression (paste/echo throughput): `terminal:data` is transient /
@@ -9001,6 +9297,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
              waitedMs={waited_ms}: {drained}"
         );
         assert!(
+            // elapsed-assert: allow — the limit is measured too: the test's clock spans the daemon's wait, so load stretches both and cannot break the containment
             u128::from(waited_ms) <= wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS,
             "daemon-measured wait ({waited_ms}ms) exceeds the observed upper \
              bound {wait_upper_bound:?}: {drained}"

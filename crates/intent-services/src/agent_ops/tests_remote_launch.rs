@@ -1,0 +1,983 @@
+//! Creating agents with a remote `placement`: admission before any effect,
+//! the daemon-owned placement on the created agent, its projection, and
+//! the create seams that carry or refuse a placement.
+
+use std::sync::{Arc, Mutex};
+
+use intent_core::placement::{AgentPlacement, PlatformAvailability};
+use intent_core::remote_launch::{
+    EffectiveIsolation, RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView,
+    REMOTE_PLACEMENT_METADATA_KEY,
+};
+use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, BoxFuture, Error, WorkspaceId};
+use serde_json::{json, Value};
+
+use super::tests::setup;
+use crate::feature_ports::{RemoteLaunchPort, RemoteRuntime};
+use crate::Services;
+
+const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A remote-launch port that admits every placement onto one node and
+/// records what it was asked.
+#[derive(Default)]
+struct FakeRemote {
+    launched: Mutex<Vec<RemoteLaunchRequest>>,
+    needs: Mutex<Vec<RemoteLaunchNeeds>>,
+    fail_launch: bool,
+    /// Each final stop recorded, and whether the agent's script-stop wait
+    /// (`end_agent_machine_runs`) had already run then.
+    final_stops: Mutex<Vec<(AgentId, bool)>>,
+}
+
+fn view(placement: &AgentPlacement) -> RemotePlacementView {
+    let mut resolved = placement.clone();
+    resolved.node_id = Some("node-1".into());
+    RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac Studio".into(),
+        placement: resolved,
+        effective_isolation: EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: BASE.into(),
+    }
+}
+
+impl RemoteLaunchPort for FakeRemote {
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        _reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        let scripts_stopped = crate::test_support::fake_runtime::FakeRuntime::of(svc)
+            .calls()
+            .contains(&"end_agent_machine_runs");
+        for agent in agent_ids {
+            self.final_stops
+                .lock()
+                .unwrap()
+                .push((agent.clone(), scripts_stopped));
+        }
+        Box::pin(async {})
+    }
+
+    fn placements<'a>(
+        &'a self,
+        _svc: &'a Services,
+    ) -> BoxFuture<'a, intent_core::Result<PlatformAvailability>> {
+        Box::pin(async { Ok(PlatformAvailability::none(intent_core::now_iso())) })
+    }
+
+    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { Some("Remote placement: node \"Mac Studio\"".into()) })
+    }
+
+    fn admit<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        placement: &'a AgentPlacement,
+        needs: &'a RemoteLaunchNeeds,
+    ) -> BoxFuture<'a, intent_core::Result<RemotePlacementView>> {
+        self.needs.lock().unwrap().push(needs.clone());
+        Box::pin(async move { Ok(view(placement)) })
+    }
+
+    fn launch<'a>(
+        &'a self,
+        _svc: &'a Services,
+        request: RemoteLaunchRequest,
+    ) -> BoxFuture<'a, intent_core::Result<()>> {
+        Box::pin(async move {
+            self.launched.lock().unwrap().push(request);
+            if self.fail_launch {
+                return Err(Error::Internal("base ref write failed".into()));
+            }
+            Ok(())
+        })
+    }
+
+    fn runtime<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, intent_core::Result<Arc<RemoteRuntime>>> {
+        Box::pin(async { Err(Error::InvalidParams("node-unavailable: test".into())) })
+    }
+}
+
+fn placement(json: Value) -> AgentPlacement {
+    serde_json::from_value(json).unwrap()
+}
+
+async fn create(
+    svc: &Services,
+    ws: &WorkspaceId,
+    extra: AgentCreateExtra,
+) -> intent_core::Result<Value> {
+    svc.agent_create_op(
+        ws.clone(),
+        Some("Remote".into()),
+        Some("sonnet4.5".into()),
+        None,
+        None,
+        None,
+        false,
+        AgentCreateExtra {
+            provider: Some("auggie".into()),
+            ..extra
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let created = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote", "os": "macos"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = &created["agent"];
+    assert_eq!(agent["nodeId"], "node-1");
+    assert_eq!(agent["leaseId"], "lease-1");
+    assert_eq!(agent["nodeName"], "Mac Studio");
+    assert_eq!(agent["effectiveIsolation"], "pending");
+    assert_eq!(
+        agent["placement"],
+        json!({"target": "remote", "os": "macos", "nodeId": "node-1"})
+    );
+    assert!(agent.get("placementError").is_none());
+    let notice = created["notice"].as_str().unwrap();
+    assert!(notice.contains("\"Mac Studio\""), "{notice}");
+    assert!(notice.contains(&BASE[..12]), "{notice}");
+    assert!(
+        notice.contains("Uncommitted changes in the workspace are not carried"),
+        "{notice}"
+    );
+
+    // Placement sees the provider and model, and that no profile is sent.
+    assert_eq!(
+        remote.needs.lock().unwrap().clone(),
+        [RemoteLaunchNeeds {
+            provider: "auggie".into(),
+            model: Some("sonnet4.5".into()),
+            with_profile: false,
+        }]
+    );
+
+    let id = AgentId::from(agent["id"].as_str().unwrap());
+    let launched = remote.launched.lock().unwrap().clone();
+    assert_eq!(launched.len(), 1);
+    assert_eq!(launched[0].agent_id, id);
+    assert_eq!(launched[0].workspace_id, ws);
+    // Every read projection serves the same fields.
+    let got = svc
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert_eq!(got.node_name.as_deref(), Some("Mac Studio"));
+    assert_eq!(got.effective_isolation, Some(EffectiveIsolation::Pending));
+    // List rows carry the placement so the list can badge remote agents;
+    // only the lease stays detail-only.
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let row = serde_json::to_value(listed.iter().find(|a| a.id == id).unwrap()).unwrap();
+    assert_eq!(row["nodeId"], "node-1", "{row}");
+    assert_eq!(row["nodeName"], "Mac Studio", "{row}");
+    assert_eq!(row["effectiveIsolation"], "pending", "{row}");
+    assert_eq!(row["placement"], agent["placement"], "{row}");
+    assert!(row.get("leaseId").is_none(), "{row}");
+}
+
+#[tokio::test]
+async fn list_rows_carry_placement_for_remote_agents_only() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let placed = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote", "os": "macos"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let local = create(&svc, &ws, AgentCreateExtra::default())
+        .await
+        .unwrap();
+    let placed_id = placed["agent"]["id"].as_str().unwrap();
+    let local_id = local["agent"]["id"].as_str().unwrap();
+
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let row =
+        |id: &str| serde_json::to_value(listed.iter().find(|a| a.id.0 == id).unwrap()).unwrap();
+    let placed_row = row(placed_id);
+    for key in ["nodeId", "nodeName", "placement", "effectiveIsolation"] {
+        assert!(
+            placed_row.get(key).is_some(),
+            "remote row lacks `{key}`: {placed_row}"
+        );
+    }
+    assert!(placed_row.get("leaseId").is_none(), "{placed_row}");
+    let local_row = row(local_id);
+    for key in [
+        "nodeId",
+        "leaseId",
+        "nodeName",
+        "placement",
+        "effectiveIsolation",
+        "placementError",
+    ] {
+        assert!(
+            local_row.get(key).is_none(),
+            "local row carries `{key}`: {local_row}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_local_create_carries_no_placement_even_if_the_caller_forges_one() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let forged = json!({ REMOTE_PLACEMENT_METADATA_KEY: view(&AgentPlacement::default()) });
+    let created = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            metadata: Some(forged),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(created["agent"].get("nodeId").is_none(), "{created}");
+    assert!(created.get("notice").is_none());
+    assert!(remote.launched.lock().unwrap().is_empty());
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_none());
+}
+
+#[tokio::test]
+async fn a_placement_no_node_can_take_creates_nothing() {
+    let (_t, svc, ws) = setup().await;
+    // The default port: no execution node.
+    let before = svc.agent_list_op(ws.clone()).await.unwrap().len();
+    let result = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote", "arch": "x86_64"}))),
+            ..Default::default()
+        },
+    )
+    .await;
+    let Err(Error::PlacementUnavailable(failure)) = result else {
+        panic!("expected placement-unavailable, got {result:?}");
+    };
+    assert_eq!(failure.data()["code"], "placement-unavailable");
+    assert_eq!(failure.data()["reason"], "unsupported-platform");
+    assert_eq!(svc.agent_list_op(ws.clone()).await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn unsupported_placements_are_refused_before_any_effect() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    for (placement_json, expected) in [
+        (
+            json!({"target": "local", "os": "linux"}),
+            "omit os, arch, nodeId, checkout and exclusive",
+        ),
+        (
+            json!({"target": "remote", "exclusive": true}),
+            "exclusive is not supported",
+        ),
+    ] {
+        let result = create(
+            &svc,
+            &ws,
+            AgentCreateExtra {
+                placement: Some(placement(placement_json)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.contains(expected)),
+            "{result:?}"
+        );
+    }
+    assert!(remote.launched.lock().unwrap().is_empty());
+    // `{ target: "local" }` alone runs the agent on the backend.
+    let result = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "local"}))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(remote.needs.lock().unwrap().is_empty());
+    assert!(remote.launched.lock().unwrap().is_empty());
+    // A selected profile that does not resolve fails admission, never
+    // running on the node's own login instead.
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code@work",
+            None,
+            &placement(json!({"target": "remote"})),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(Error::ProviderProfile(f))
+            if f.data["code"] == "provider-profile-replacement-required"),
+        "{result:?}"
+    );
+    assert!(remote.launched.lock().unwrap().is_empty());
+}
+
+/// A create that selects a saved provider profile is admitted (its
+/// environment is sent when the agent starts on the node).
+#[tokio::test]
+async fn a_saved_profile_is_admitted_for_a_remote_agent() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let created = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_create_impl(json!({
+            "baseProviderId": "codex",
+            "name": "Work",
+            "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": "sk-test-remote" }],
+        })),
+    )
+    .await
+    .expect("create profile");
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let view = svc
+        .admit_remote_agent(
+            &ws,
+            reference,
+            Some("gpt-5"),
+            &placement(json!({"target": "remote"})),
+        )
+        .await
+        .expect("a resolvable profile is admitted");
+    assert_eq!(view.node_id, "node-1");
+    // The machines report the base provider; the profile's environment is
+    // sent, so their own sign-in does not apply.
+    assert_eq!(
+        remote.needs.lock().unwrap().clone(),
+        [RemoteLaunchNeeds {
+            provider: "codex".into(),
+            model: Some("gpt-5".into()),
+            with_profile: true,
+        }]
+    );
+}
+
+/// A launch that fails after the agent exists leaves it placed (so it can
+/// never run locally) with a placement error, and reports the failure.
+#[tokio::test]
+async fn a_failed_launch_marks_the_agent_and_fails_the_create() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote {
+        fail_launch: true,
+        ..FakeRemote::default()
+    });
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let result = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(Error::Internal(m)) if m.contains("base ref write failed")),
+        "{result:?}"
+    );
+    let id = remote.launched.lock().unwrap()[0].agent_id.clone();
+    let got = svc.agent_get_op(id, Some(ws)).await.unwrap();
+    let error = got.placement_error.expect("placement error recorded");
+    assert_eq!(error.code, "remote-launch-failed");
+    assert!(error.detail.contains("base ref write failed"));
+}
+
+#[tokio::test]
+async fn delegate_takes_a_placement_only_for_a_single_task_without_isolation() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let remote = || Some(placement(json!({"target": "remote"})));
+    let batch = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                placement: remote(),
+                tasks: Some(Vec::new()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&batch, Err(Error::InvalidParams(m)) if m.contains("single delegation")),
+        "{batch:?}"
+    );
+    let cow = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                placement: remote(),
+                isolation: Some("cow".into()),
+                task_text: Some("Do it".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&cow, Err(Error::InvalidParams(m)) if m.contains("cannot be combined")),
+        "{cow:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_placement_wire_shape_is_closed() {
+    let parse = |v: Value| serde_json::from_value::<AgentCreateExtra>(v);
+    assert!(parse(json!({})).unwrap().placement.is_none());
+    assert!(parse(json!({"placement": {}})).unwrap().placement.is_some());
+    assert!(parse(json!({"placement": null})).is_err());
+    assert!(parse(json!({"placement": {"node": "x"}})).is_err());
+    let delegate = |v: Value| serde_json::from_value::<AgentDelegateInput>(v);
+    assert!(delegate(json!({"placement": null})).is_err());
+    assert_eq!(
+        delegate(json!({"placement": {"os": "macos"}}))
+            .unwrap()
+            .placement
+            .unwrap()
+            .os,
+        Some(intent_core::nodes::NodeOs::Macos)
+    );
+    let wake = |v: Value| serde_json::from_value::<intent_core::AgentWakeCreateOptions>(v);
+    assert!(wake(json!({"placement": {"target": "remote"}}))
+        .unwrap()
+        .placement
+        .is_some());
+}
+
+/// Review of intentd#2779: caller metadata that is not an object must not
+/// drop the placement (the agent would then run locally).
+#[tokio::test]
+async fn a_placed_create_keeps_its_placement_with_non_object_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    for metadata in [json!([1, 2]), json!("legacy"), json!(7)] {
+        let created = create(
+            &svc,
+            &ws,
+            AgentCreateExtra {
+                placement: Some(placement(json!({"target": "remote"}))),
+                metadata: Some(metadata.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created["agent"]["nodeId"], "node-1",
+            "{metadata}: {created}"
+        );
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
+        assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_some());
+        assert_eq!(
+            session.metadata.unwrap()["priorNonObjectMetadata"],
+            metadata
+        );
+    }
+}
+
+/// The agent's machine ("node-1"), exposed to this backend with a report
+/// listing `providers`.
+async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::ProviderCapability>) {
+    use intent_core::node_link::{MachineCapabilities, MachineCapacity};
+    let platform = intent_core::placement::AgentPlatform {
+        os: intent_core::nodes::NodeOs::Macos,
+        arch: intent_core::nodes::NodeArch::Aarch64,
+    };
+    let observed_at = intent_core::now_iso();
+    svc.store
+        .save_exposed_machine(&intent_core::machines::ExposedMachine {
+            id: "node-1".into(),
+            name: "Mac Studio".into(),
+            hosts: vec!["10.0.0.1".into()],
+            port: 7443,
+            tc_address: None,
+            fingerprint: "ab".repeat(32),
+            credential_id: intent_core::ids::ExecutorCredentialId::from("cred-1".to_string()),
+            platform: Some(platform),
+            capabilities: Some(MachineCapabilities {
+                platform,
+                intentd_version: "0.11.87".into(),
+                capacity: MachineCapacity {
+                    running_agents: 1,
+                    agent_cap: 4,
+                    charged_memory_bytes: 0,
+                    memory_budget_bytes: None,
+                },
+                providers,
+                observed_at: observed_at.clone(),
+            }),
+            observed_at: Some(observed_at),
+            state: intent_core::machines::RemoteMachineState::Disconnected,
+            added_at: intent_core::now_iso(),
+            last_connected_at: None,
+            node_protocol: None,
+        })
+        .await
+        .unwrap();
+}
+
+fn offered(
+    id: &str,
+    status: intent_core::node_link::ProviderStatus,
+    models: &[&str],
+) -> intent_core::node_link::ProviderCapability {
+    intent_core::node_link::ProviderCapability {
+        id: id.into(),
+        visible: true,
+        status,
+        models: models.iter().map(|m| (*m).to_owned()).collect(),
+        models_stale: false,
+    }
+}
+
+async fn remote_agent(svc: &Services, ws: &WorkspaceId) -> AgentId {
+    let created = create(
+        svc,
+        ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
+async fn daemon_profile(svc: &Services, base: &str, name: &str, env: Value) -> String {
+    let created = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_create_impl(json!({
+            "baseProviderId": base,
+            "name": name,
+            "env": env,
+        })),
+    )
+    .await
+    .expect("create profile");
+    created["profile"]["providerRef"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn assert_not_remote_compatible(
+    result: &intent_core::Result<impl std::fmt::Debug>,
+    reference: &str,
+    key: &str,
+) {
+    let Err(Error::ProviderProfile(failure)) = result else {
+        panic!("expected profile-not-remote-compatible, got {result:?}");
+    };
+    assert!(!failure.internal);
+    assert_eq!(
+        failure.data,
+        json!({
+            "code": "profile-not-remote-compatible",
+            "providerRef": reference,
+            "reason": "account-folder",
+            "keys": [key],
+        })
+    );
+    assert!(
+        failure.message.contains("account folder") && failure.message.contains(key),
+        "{}",
+        failure.message
+    );
+}
+
+/// A configuration that sets an account folder never runs on another
+/// machine, so placement refuses it before asking any machine (§5.54
+/// "Remote compatibility"): a profile, or a bare base whose Default
+/// overrides set one.
+#[tokio::test]
+async fn placement_refuses_a_configuration_tied_to_this_backend() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let folder = daemon_profile(
+        &svc,
+        "codex",
+        "Work",
+        json!([{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }]),
+    )
+    .await;
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            &folder,
+            Some("gpt-5"),
+            &placement(json!({"target": "remote"})),
+        )
+        .await;
+    assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
+
+    intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-a" }],
+        })),
+    )
+    .await
+    .unwrap();
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "remote"})),
+        )
+        .await;
+    assert_not_remote_compatible(&result, "claude-code", "CLAUDE_CONFIG_DIR");
+    assert!(
+        remote.needs.lock().unwrap().is_empty(),
+        "no machine was asked"
+    );
+}
+
+/// A remote agent switches to another model its machine offers: saved, and
+/// the next start relaunches it there.
+#[tokio::test]
+async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![offered(
+            "auggie",
+            ProviderStatus::SignedIn,
+            &["sonnet4.5", "opus4.5"],
+        )],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    svc.agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await
+        .expect("a model the machine lists is accepted");
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.model.as_deref(), Some("opus4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
+/// A model the agent's machine does not list, or a provider it cannot run,
+/// is refused with `model-unavailable` naming that machine only, and nothing
+/// changes.
+#[tokio::test]
+async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![
+            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("claude-code", ProviderStatus::SignedOut, &["opus"]),
+        ],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    for (model, provider) in [("opus4.5", None), ("opus", Some("claude-code"))] {
+        let result = svc
+            .agent_set_model_op(id.clone(), model.into(), provider.map(str::to_owned))
+            .await;
+        let Err(Error::ModelUnavailable(failure)) = &result else {
+            panic!("{model}: expected model-unavailable, got {result:?}");
+        };
+        let data = failure.data();
+        assert_eq!(data["code"], "model-unavailable");
+        assert_eq!(data["model"], model);
+        let machines = data["machines"].as_array().unwrap();
+        assert_eq!(machines.len(), 1, "{data}");
+        assert_eq!(machines[0]["nodeId"], "node-1");
+    }
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
+/// Switching to a profile: an account-folder profile is refused as not
+/// remote-compatible; an API-key profile runs even where the machine's own
+/// sign-in is missing, as at placement.
+#[tokio::test]
+async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
+    use intent_core::node_link::ProviderStatus;
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    expose_node(
+        &svc,
+        vec![
+            offered("auggie", ProviderStatus::SignedIn, &["sonnet4.5"]),
+            offered("codex", ProviderStatus::SignedOut, &["gpt-5"]),
+        ],
+    )
+    .await;
+    let id = remote_agent(&svc, &ws).await;
+    let folder = daemon_profile(
+        &svc,
+        "codex",
+        "Work",
+        json!([{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }]),
+    )
+    .await;
+    let result = svc
+        .agent_set_model_op(id.clone(), "gpt-5".into(), Some(folder.clone()))
+        .await;
+    assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+
+    let api_key = daemon_profile(
+        &svc,
+        "codex",
+        "API key",
+        json!([{ "key": "OPENAI_API_KEY", "kind": "set", "value": "sk-test-remote" }]),
+    )
+    .await;
+    svc.agent_set_model_op(id.clone(), "gpt-5".into(), Some(api_key.clone()))
+        .await
+        .expect("an API-key profile the machine's provider can run is accepted");
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some(api_key.as_str()));
+    assert_eq!(session.model.as_deref(), Some("gpt-5"));
+}
+
+/// A remote agent whose machine is no longer exposed cannot switch: there
+/// is nowhere to relaunch it.
+#[tokio::test]
+async fn a_remote_agent_on_a_removed_machine_cannot_switch() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let id = remote_agent(&svc, &ws).await;
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await;
+    let Err(Error::PlacementUnavailable(failure)) = &result else {
+        panic!("expected placement-unavailable, got {result:?}");
+    };
+    assert_eq!(failure.data()["reason"], "machine-unknown");
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+}
+
+/// Attachments live on head and a remote agent's provider runs on its node,
+/// so a message carrying any is refused before it is stored or queued; the
+/// same message without attachments is accepted.
+#[tokio::test]
+async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let created = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let before = svc.store.get_agent_messages(&id, None).await.unwrap().len();
+    let images = json!([{ "data": "aGVsbG8=", "mimeType": "image/png" }]);
+    let files = json!([{ "attachmentId": "att-1", "fileName": "notes.txt" }]);
+    for (images, files) in [(Some(images.clone()), None), (None, Some(files.clone()))] {
+        let result = svc
+            .agent_send_message_op(id.clone(), "look".into(), None, images, files, None)
+            .await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-agent-unsupported: attachments")),
+            "{result:?}"
+        );
+    }
+    assert_eq!(
+        svc.store.get_agent_messages(&id, None).await.unwrap().len(),
+        before
+    );
+    svc.agent_send_message_op(id.clone(), "look".into(), None, Some(json!([])), None, None)
+        .await
+        .unwrap();
+}
+
+/// The `"default"` model sentinel asks the machines for no particular
+/// model.
+#[tokio::test]
+async fn the_default_model_sentinel_requests_no_model() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    svc.admit_remote_agent(
+        &ws,
+        "auggie",
+        Some("default"),
+        &placement(json!({"target": "remote"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(remote.needs.lock().unwrap()[0].model, None);
+}
+
+/// A failed read of a remote parent's session fails its sub-agent's create
+/// and delegate, never quietly running the child on the backend.
+#[tokio::test]
+async fn a_failed_parent_read_fails_the_sub_agent_instead_of_running_it_locally() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let launched = remote.launched.lock().unwrap().len();
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_session")
+            .fetch_one(svc.store().write_pool())
+            .await
+            .unwrap()
+    };
+    let before = count().await;
+    sqlx::query("UPDATE agent_session SET metadata = '{not json' WHERE id = ?")
+        .bind(parent.as_str())
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let caller = intent_core::Caller::Agent {
+        agent_id: parent.clone(),
+    };
+
+    let read =
+        intent_core::with_caller(caller.clone(), svc.inherited_placement(Some(&parent))).await;
+    assert!(matches!(&read, Err(Error::Internal(_))), "{read:?}");
+
+    let created = intent_core::with_caller(caller.clone(), async {
+        svc.agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            Some("sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
+        )
+        .await
+    })
+    .await;
+    assert!(matches!(&created, Err(Error::Internal(_))), "{created:?}");
+
+    let delegated = intent_core::with_caller(caller, async {
+        svc.agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("Do it".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+    })
+    .await;
+    assert!(
+        matches!(&delegated, Err(Error::Internal(_))),
+        "{delegated:?}"
+    );
+
+    assert_eq!(remote.launched.lock().unwrap().len(), launched);
+    assert_eq!(count().await, before, "nothing was created");
+}
+
+/// Docs K (lease end): `agent.delete` records a remote agent's final stop
+/// only after the bounded wait for its machine runs' script stops, so the
+/// machine never ends a script without a requested stop first.
+#[tokio::test]
+async fn deleting_a_remote_agent_records_its_final_stop_after_the_script_stop_wait() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = crate::test_support::fake_runtime::FakeRuntime::install(svc)
+        .with_remote_launch_port(remote.clone());
+    create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = remote.launched.lock().unwrap()[0].agent_id.clone();
+    svc.agent_delete_op(id.clone(), Some(ws)).await.unwrap();
+    assert_eq!(*remote.final_stops.lock().unwrap(), vec![(id, true)]);
+}

@@ -33,6 +33,7 @@ crates/
 ├── intent-store/          # SQLite + sqlx + migrations
 ├── intent-services/       # WorkspaceApi implementation (business logic)
 ├── intent-svc-transfer/   # feature crate: workspace transfer, above intent-services
+├── intent-svc-remote/     # feature crate: remote agents on an execution node (head connector, journal ingest)
 ├── intent-svc-runtime/    # feature crate: scripts, hooks, terminals, browser tabs, sandboxes
 ├── intent-app/            # registers the feature crates (`compose`)
 ├── intent-transport/      # UDS + WSS listeners, JSON-RPC router
@@ -79,12 +80,13 @@ only on `intent-services`, never on `intent-store`.
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
-| writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, token reader `tokenize` / `Statement::tokens` with bracket depth and `matching_close` / `skip_group`, file walker); "Gates → source lints" below |
+| writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, token reader `tokenize` / `Statement::tokens` with bracket depth and `matching_close` / `skip_group`, file walker, test-code discovery `test_code_files` / `TestCodeText` for a rule that applies only to test code, `read_count_baselines` / `write_count_baselines` for a ratchet baseline kept as one `<crate>.txt` per crate, so PRs fixing different crates never conflict); "Gates → source lints" below |
 | CI release / workflow scripts (`scripts/test-*` in ci.yml's `release-scripts` job) | `make test-release-scripts` (from `packages/intentd`; `make -C packages/intentd test-release-scripts` at the monorepo root) runs every test that job runs, in CI order, and skips suites that need CI-only tooling (release-plz, sccache, cargo-dist) with "SKIP <suite>: needs <X>" — a skipped suite is unverified, so install the tool when your change touches it; run it before pushing a change to `.github/workflows/*.yml` or `scripts/` (CI Gate's job list is pinned by `test-retire-obsolete-merge-runs-workflow.py`, intentd#2499) |
 | a fake Codex/Claude CLI in a test | `intent_providers::test_support::current_cli_version` / `current_cli_script` (enable the intent-providers `test-support` feature from `[dev-dependencies]`); keep a literal version only for tests about that exact version, marked for `cli_fixture_version_lint` |
 | a test that needs a provider "installed", or passes locally but fails on CI with "not installed" | `crates/intent-services/src/test_support/provider_installed.rs` (mark a provider installed; Codex and Claude Code ignore `providers.paths` overrides, so `/bin/sh` overrides do nothing); `scripts/test-without-provider-clis.sh <command>` runs tests with every provider CLI hidden, the way CI's runners lack them (Linux, needs `bwrap`; CI's `check` job asserts its runners have none) |
 | a test that fails only on a busy host, a flake fix to prove, or "is this CI failure mine?" | `make test-stress E='<nextest filterset>' COUNT=200 LOAD=1` (see the root guide → Resuming local Rust gates); run it before and after a fix for comparable evidence |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
+| a new read method, or a read whose reply grows | `crates/intent-app/tests/payload_budget/` — `rows.rs` (one sweep row per `BoundedRead` / `ExternalProxy` method), `seed.rs` (state the large fixture lacks), `baseline.txt` (known offenders); "Payload budget" below |
 
 ## Performance — the RPC cost contract
 
@@ -129,12 +131,49 @@ A PR that adds a field to a list-shaped payload must state which ladder rung the
 sits on. "Computed inline on read" is not an option — that is exactly how the incidents
 above happened.
 
+### Payload budget
+
+Every read reply must stay under `READ_PAYLOAD_BUDGET_BYTES` (500 KiB, in
+`crates/intent-transport/src/catalog.rs`), measured as the JSON-RPC frame on the wire.
+`PAYLOAD_CLASSES` there puts every method in one class; `payload_budget_sweep_ci`
+(`crates/intent-app/tests/payload_budget/`) calls every `BoundedRead` and
+`ExternalProxy` method in every parameter variation, and subscribes to every
+`SNAPSHOT_CHANNELS` channel, over a real UDS connection against the large fixture
+(`intent_services::test_support::large_state`). It also checks each `BulkTransfer`
+method's declared cap. Run it with `make test-select E='test(/payload_budget/)'`; the
+full-scale sweep is `#[ignore]`d and runs with `INTENTD_LARGE_STATE_SCALE=full`.
+- **PR vs nightly:** PRs run the `ci` preset; `nightly-payload-sweep.yml` runs the ignored
+  full-scale sweep and fixture build, and failures file deduplicated `intent-hq/intent`
+  issues (`nightly-payload-report.yml`). Locally (`make test-select` cannot include ignored
+  tests): `INTENTD_LARGE_STATE_SCALE=full cargo test -p intent-app --test payload_budget -- --ignored`.
+
+- **New read method:** classify it in `PAYLOAD_CLASSES`, then add a row to `rows.rs`
+  (variants: no params, the largest `limit`, every optional param, a `max` variant with
+  every include flag on, and a next-page variant for a cursor). Each variant must succeed
+  and prove it reached large data (`Items` near the page limit or `Bytes`); `Fixed` is
+  for replies small by design, needs the row's reason, and still fails on an empty list or
+  object. Missing data goes in `seed.rs`; a method that cannot be driven here goes in a
+  reasoned golden that pins its outcome. The static check fails on a method with no row
+  and on a param no variant sets: router params are read from `router.rs`, a typed params
+  struct from its serde fields, and an arm that hands params on names its parser with
+  `parsed_by`.
+- **Bulk methods:** a `bulk(...)` row is allowed only for a method the app sends on a
+  transfer connection (cloudlands-fe `TRANSFER_METHODS`); the monorepo
+  `check-transfer-methods` consumer check fails otherwise. A whole-object read on the main
+  connection is capped instead (`router/bounded_read.rs`) with a chunk method for the rest.
+- **Baseline:** `baseline.txt` (`baseline-full.txt` for the full preset) lists today's
+  offenders as `<method> <variant> <bytes>`. The sweep fails on a new offender, on growth
+  over 5% above the recorded size, and on a stale line. Fixing an offender means deleting
+  its line; never add one. `PAYLOAD_BUDGET_UPDATE=1` rewrites the file from a run (for
+  review, not to admit a regression); `PAYLOAD_BUDGET_PROBE=1` prints every reply.
+
 ### Runtime backstop
 
 The daemon profiles each RPC dispatch and logs one WARN (method, statement count,
-duration) when a dispatch exceeds the statement-count or duration threshold. Reviewers
-should watch dogfooding logs for these warnings after merging anything that touches a
-read path — a new WARN on a hot RPC is a regression, not noise.
+duration) when a dispatch exceeds the statement-count or duration threshold, and one
+when a reply exceeds the 500 KiB payload budget (`RESPONSE_SIZE_WARN_THRESHOLD_BYTES`).
+Reviewers should watch dogfooding logs for these warnings after merging anything that
+touches a read path — a new WARN on a hot RPC is a regression, not noise.
 
 ## Testing — end-to-end against the real WSS transport
 
@@ -267,8 +306,17 @@ intent-hq/intentd#1853); the `make` targets are the supported path.
 
 `make check` lints only the host target, so code gated to `cfg(unix)` or `cfg(windows)` can be
 clean there and still fail Windows Clippy (an import that only `cfg(unix)` code uses, intentd#2672).
-CI's `windows-cross-lint` job runs the same check on every PR, on Linux, so a local run only
-saves a push round trip; the merge queue's native `windows-lint` job stays the final authority.
+CI's `windows-cross-lint` job runs the same check on every PR and merge-queue entry, on Linux, so
+a local run only saves a push round trip; the push-only `windows` job is the native MSVC check.
+
+macOS has no PR-time or local equivalent: CI's native macOS check and Clippy run only in
+the merge queue, and `cargo clippy --target aarch64-apple-darwin` fails on Linux in the C
+build scripts. Before enqueueing an integration branch or a PR that adds or changes
+`cfg(target_os = …)` / `cfg(unix)` / `cfg(windows)` code, add the `ci:macos` label (or
+`gh workflow run macos-preflight.yml --ref main -f ref=<branch-or-sha>`): the advisory
+`macOS preflight` workflow runs the queue's macOS check and Clippy on the PR head, then
+again on each push while the label stays. It is opt-in because macOS minutes are paid; a
+macOS-only `unused_async` ejected intentd#2910 from the queue.
 
 The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
 integration test is a source-scanning lint, selected by convention — run them all with
@@ -280,15 +328,16 @@ and a row below; `source_lint_discovery_lint` enforces all of this (a `*_lint.rs
 does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob,
 copied scaffolding, a lint with no row or a row with no lint, and a crate missing from or
 stale in the project layout above). Every opt-out marker requires a reason; baselines only ratchet
-down (the lint fails until a fixed file's entry is removed or lowered).
+down (the lint fails until a fixed file's entry is removed or lowered) and keep one file per crate.
 
 | Lint | Fails on | Opt-out / baseline |
 | --- | --- | --- |
 | `repo_slug_fold_lint` | a case-fold call on an `owner` / `repo` / `repository` / `slug` identifier outside `intent_core::RepoRef` (intent-hq/intentd#1809 → #1815); route slug identity through `RepoRef` regardless | `// repo-slug-fold: allow — <reason>` on the line above |
 | `event_type_lint` | a `note:` / `task:` / `workspace:` / `agent:` string literal outside test code not in `intent_core::events::ALL_EVENT_TYPES`; add the type there, regenerate the golden `crates/intent-core/tests/goldens/event_types.json` with `INTENTD_UPDATE_GOLDENS=1`, and emit via the constant | `// event-type-lint: allow — <reason>` on the line above |
 | `running_turn_rule_lint` | an or-pattern outside test code and `crates/intent-core/src/model.rs` spelling exactly `AgentStatus::Pending \| Active \| Processing` (any order, `Self::` / qualified paths, `matches!` or match arm), or a string literal in non-test `crates/intent-store/src/**` containing both `'active'` and `'Processing'` (a hand-written SQL status list) — a fifth copy of the running-turn rule #2058 consolidated onto `AgentStatus::is_running_turn`; call the method, or generate the SQL list from `AgentStatus::ALL` filtered by it as `delegated_counts_sql` does | `// running-turn: allow — <reason>` on the line above the pattern / literal or its statement |
-| `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>`) |
-| `fixed_deadline_lint` | a literal `Duration::from_*(…)` (not scaled by a non-literal `.mul_f64(m)` / `* m`), or a test-code `const` / `static` / `let` bound to exactly one (intentd#2649), used as the budget of `timeout(` / `recv_timeout(` / `wait_timeout(` (either argument, for `Condvar`) / `wait_timeout_while(` / `wait_with_timeout(`, or added to `Instant::now()`, in test code (`crates/*/tests/**`, plus `#[cfg(test)]` / `#[cfg(all(test, …))]` items, `tests.rs` / `*_tests.rs` files, `tests/` dirs and test-module files under `src/`) — it ignores `INTENTD_TEST_TIMEOUT_MULTIPLIER` and flakes on slow coverage runners (intentd#2514); wrap it in `intentd_test_support::test_timeout(…)` (a hang-guard const becomes a `fn` returning it) | `// fixed-deadline: allow — <reason>` on the line above (above a binding, it covers every use); `crates/intent-core/tests/fixed_deadline_baseline.txt` (`<path> <count>`; `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1` only lowers it) |
+| `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/baselines/fixed_sleep/<crate>.txt` (`<path> <count>`) |
+| `fixed_deadline_lint` | a literal `Duration::from_*(…)` (not scaled by a non-literal `.mul_f64(m)` / `* m`), or a test-code `const` / `static` / `let` bound to exactly one (intentd#2649), used as the budget of `timeout(` / `recv_timeout(` / `wait_timeout(` (either argument, for `Condvar`) / `wait_timeout_while(` / `wait_with_timeout(`, or added to `Instant::now()`, in test code (`crates/*/tests/**`, plus `#[cfg(test)]` / `#[cfg(all(test, …))]` items, `tests.rs` / `*_tests.rs` files, `tests/` dirs and test-module files under `src/`) — it ignores `INTENTD_TEST_TIMEOUT_MULTIPLIER` and flakes on slow coverage runners (intentd#2514); wrap it in `intentd_test_support::test_timeout(…)` (a hang-guard const becomes a `fn` returning it) | `// fixed-deadline: allow — <reason>` on the line above (above a binding, it covers every use); `crates/intent-core/tests/baselines/fixed_deadline/<crate>.txt` (`<path> <count>`; none today; `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1` only lowers them) |
+| `elapsed_assert_lint` | an `assert!` / `debug_assert!` / `prop_assert!` in test code (as `source_lint::test_code_files` defines it) whose condition compares a measured duration as the smaller side — `.elapsed()`, a `duration_since` call, or a name with an `elapsed` / `waited` / `took` part, e.g. `assert!(elapsed < Duration::from_secs(3))` — a loaded CI runner can take seconds for any step, so these eject unrelated PRs from the merge queue (intentd#2917; scaling the limit does not help). Assert what the limit stood for with no clock: rows changed, calls made, an operation finishing while the test holds what the slow path waits on, or event order (intentd#2925) | `// elapsed-assert: allow — <reason>` on the line above the comparison or the assertion (e.g. a paused tokio clock); `crates/intent-core/tests/baselines/elapsed_assert/<crate>.txt` (`<path> <count>`; none today; `INTENTD_UPDATE_ELAPSED_ASSERT_BASELINE=1` only lowers them) |
 | `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above (no baseline: every suite is migrated) |
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |

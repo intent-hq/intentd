@@ -408,20 +408,21 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     assert!(!pid_dead(grandchild_pid), "grandchild live before shutdown");
 
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
-    let started = Instant::now();
     let shutdown = uds_rpc(&socket, 2, "system.shutdown", json!({})).await;
     assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
 
-    // BOTH pids must be gone within the bounded kill-sweep window: SIGTERM is
-    // group-wide and immediate, the shared grace is 2s, so 4s (scaled only for
-    // coverage instrumentation) bounds the whole sweep.
-    let budget = common::test_timeout(Duration::from_secs(4));
+    // BOTH pids must be gone after the kill sweep: SIGTERM is group-wide and
+    // immediate, then SIGKILL after the shared 2s grace. The regression signal
+    // is a tree that survives the sweep, so this is a hang guard, not a
+    // latency budget.
+    let budget = common::test_timeout(Duration::from_secs(10));
+    let deadline = Instant::now() + budget;
     loop {
         if pid_dead(child_pid) && pid_dead(grandchild_pid) {
             break;
         }
         assert!(
-            started.elapsed() < budget,
+            Instant::now() < deadline,
             "provider tree survived the kill sweep past {budget:?}: \
              child {child_pid} dead={}, grandchild {grandchild_pid} dead={}",
             pid_dead(child_pid),

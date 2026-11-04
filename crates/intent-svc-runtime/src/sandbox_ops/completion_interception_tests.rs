@@ -136,6 +136,7 @@ async fn create_agent_session(
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store.insert_agent_session(&agent).await.unwrap();
 }
@@ -236,7 +237,10 @@ async fn test_clean_merge_propagates_completion_and_emits_event() {
     };
 
     // Update agent session with sandbox_path
-    let mut session = store.get_agent_session(&child_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(&child_id)
+        .await
+        .unwrap();
     session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     session.sandbox_branch = Some(format!("sb/{}", child_id.0));
     store.update_agent_session(&ws.id, &session).await.unwrap();
@@ -387,7 +391,10 @@ async fn test_conflict_suppresses_completion_and_bounces_agent() {
     };
 
     // Update agent session with sandbox_path
-    let mut session = store.get_agent_session(&child_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(&child_id)
+        .await
+        .unwrap();
     session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     session.sandbox_branch = Some(format!("sb/{}", child_id.0));
     store.update_agent_session(&ws.id, &session).await.unwrap();
@@ -557,7 +564,10 @@ async fn test_retry_cap_exhausted_propagates_with_merge_pending() {
         panic!("Expected Supported outcome");
     };
 
-    let mut session = store.get_agent_session(&child_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(&child_id)
+        .await
+        .unwrap();
     session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     session.sandbox_branch = Some(format!("sb/{}", child_id.0));
     store.update_agent_session(&ws.id, &session).await.unwrap();
@@ -699,7 +709,10 @@ async fn test_bounce_refreshes_sandbox_without_reprovisioning() {
         panic!("Expected Supported outcome");
     };
 
-    let mut session = store.get_agent_session(&child_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(&child_id)
+        .await
+        .unwrap();
     session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     session.sandbox_branch = Some(format!("sb/{}", child_id.0));
     store.update_agent_session(&ws.id, &session).await.unwrap();
@@ -826,7 +839,10 @@ async fn setup_merge_pending_sandbox(
         panic!("Expected Supported outcome");
     };
 
-    let mut session = store.get_agent_session(agent_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(agent_id)
+        .await
+        .unwrap();
     session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     session.sandbox_branch = Some(format!("sb/{}", agent_id.0));
     store.update_agent_session(&ws.id, &session).await.unwrap();

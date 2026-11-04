@@ -27,7 +27,7 @@ use intent_core::events::{
     CHANGES_METRICS_CHANGED, SETTINGS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentSession, AgentStatus, TaskStatus, WorkspaceId};
-use intent_store::NewEvent;
+use intent_store::{AgentSessionSummary, NewEvent};
 
 use crate::events::SubscriptionFilter;
 use crate::{publish_event, system_actor, Services};
@@ -147,7 +147,7 @@ impl Services {
         else {
             return empty;
         };
-        let by_id: HashMap<&str, &AgentSession> =
+        let by_id: HashMap<&str, &AgentSessionSummary> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
         let mut active: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (agent_id, paths) in paths_by_agent {
@@ -223,14 +223,16 @@ impl Services {
 
     /// Recompute `workspace_id`'s lock snapshot and publish
     /// `changes:agent-locks` iff it differs from `last` (the previously
-    /// published snapshot, if any). Returns the fresh snapshot.
+    /// published snapshot, if any). Returns the fresh snapshot. Plain-folder
+    /// workspaces emit no `changes:*` events (§5.1), so nothing is published
+    /// for them.
     pub(crate) async fn refresh_agent_locks(
         &self,
         workspace_id: &WorkspaceId,
         last: Option<&AgentLockSnapshot>,
     ) -> AgentLockSnapshot {
         let snap = self.compute_agent_locks(workspace_id).await;
-        if last != Some(&snap) {
+        if last != Some(&snap) && !self.is_plain_folder(workspace_id).await {
             publish_event(
                 self.event_bus.as_ref(),
                 changes_agent_locks_event(workspace_id, &snap),

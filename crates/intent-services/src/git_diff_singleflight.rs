@@ -19,13 +19,16 @@ use tokio::sync::watch;
 
 /// The full request identity a `git.diffs` call coalesces on. The
 /// `git_root_id` component keeps a registered-root walk (monorepo#2053) from
-/// coalescing with a primary-worktree walk on the same workspace.
+/// coalescing with a primary-worktree walk on the same workspace; the
+/// budget keeps reads packed under different byte limits apart.
 pub(crate) type DiffKey = (
     WorkspaceId,
     Option<Vec<String>>,
     bool,
     Option<String>,
     Option<WorkspaceGitRootId>,
+    // Budget, and the path a `nextToken` resumes after.
+    (crate::git_ops::DiffBudget, Option<String>),
 );
 
 /// The result shape shared across coalesced callers. The payload is `Arc`ed so
@@ -147,7 +150,14 @@ mod tests {
     use super::*;
 
     fn key(ws: &WorkspaceId) -> DiffKey {
-        (ws.clone(), None, false, None, None)
+        (
+            ws.clone(),
+            None,
+            false,
+            None,
+            None,
+            (crate::git_ops::DiffBudget::for_max_bytes(None), None),
+        )
     }
 
     /// The first joiner leads; later joiners follow and receive the leader's
@@ -197,9 +207,23 @@ mod tests {
     async fn distinct_keys_lead_independently() {
         let flights = Arc::new(DiffSingleFlight::default());
         let ws = WorkspaceId::new();
-        let _a = flights.join(&(ws.clone(), None, false, None, None));
+        let _a = flights.join(&(
+            ws.clone(),
+            None,
+            false,
+            None,
+            None,
+            (crate::git_ops::DiffBudget::for_max_bytes(None), None),
+        ));
         assert!(matches!(
-            flights.join(&(ws.clone(), None, true, None, None)),
+            flights.join(&(
+                ws.clone(),
+                None,
+                true,
+                None,
+                None,
+                (crate::git_ops::DiffBudget::for_max_bytes(None), None),
+            )),
             Join::Leader(_)
         ));
     }

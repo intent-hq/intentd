@@ -207,7 +207,7 @@ impl Fixture {
         self.mgr
             .services
             .store
-            .get_agent_session(&self.agent)
+            .get_agent_session_with_transcript(&self.agent)
             .await
             .unwrap()
     }
@@ -241,7 +241,7 @@ async fn timeout_settled(mgr: &AgentManager, agent: &AgentId) {
                 let status = mgr
                     .services
                     .store
-                    .get_agent_session(agent)
+                    .get_agent_session_with_transcript(agent)
                     .await
                     .unwrap()
                     .status;
@@ -719,7 +719,8 @@ async fn a_user_switch_during_the_failing_attempt_is_never_overridden() {
         !fx.mgr
             .services
             .try_quota_failover(&fx.ws, &fx.agent, Some("claude-code"), "429")
-            .await,
+            .await
+            .switched(),
         "the failed attempt ran on Default, not on the user's new choice"
     );
     assert_eq!(fx.row().await.provider.as_deref(), Some(chosen.as_str()));
@@ -1257,7 +1258,10 @@ async fn leaving_home_records_the_return_state_durably() {
         state.return_after
     );
     let reopened = Store::open(&fx.db.path().join("store.db")).await.unwrap();
-    let persisted = reopened.get_agent_session(&fx.agent).await.unwrap();
+    let persisted = reopened
+        .get_agent_session_with_transcript(&fx.agent)
+        .await
+        .unwrap();
     assert_eq!(crate::provider_return::read_state(&persisted), Some(state));
     let full = fx
         .mgr

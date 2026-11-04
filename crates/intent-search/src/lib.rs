@@ -24,7 +24,9 @@ pub use adapters::{
     EventMatch, MessageMatch, NoteMatch,
 };
 pub use cancel::{mint_request_id, CancelRegistry, CancelToken};
-pub use content::{search_in_files, ContentSearchResult, SearchMatch, SearchOpts};
+pub use content::{
+    search_in_files, ContentSearchResult, SearchMatch, SearchOpts, PREVIEW_MAX_CHARS,
+};
 pub use paths::{search_file_names, FileNameResult};
 
 #[cfg(test)]

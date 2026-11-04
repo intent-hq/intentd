@@ -27,7 +27,7 @@ use intent_core::{AgentId, AgentReverseDispatch};
 use intent_sourcecontrol::SourceControl;
 
 use crate::delivery_tasks::DeliveryTasks;
-use crate::feature_ports::{AgentWakePort, RuntimePort, TransferPort};
+use crate::feature_ports::{AgentWakePort, RemoteLaunchPort, RuntimePort, TransferPort};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::model_catalog::ModelCatalogCache;
 use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
@@ -99,9 +99,10 @@ pub mod delivery_tasks {
 /// The feature ports core calls features through.
 pub mod feature_ports {
     pub use crate::feature_ports::{
-        monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity, MergeOutcome,
-        ProvisionOutcome, RuntimePort, ScriptsClosing, SetupScriptRun, TransferPort,
-        UnavailableAgentWake, IMPORT_MAX_CHUNK_BYTES,
+        monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity,
+        MachineScriptLink, MergeOutcome, ProvisionOutcome, RemoteLaunchPort, RemoteRuntime,
+        RemoteScriptCaller, RuntimePort, ScriptFrameSender, ScriptsClosing, SetupScriptRun,
+        TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch, IMPORT_MAX_CHUNK_BYTES,
     };
 }
 
@@ -154,12 +155,14 @@ pub mod events {
 
 /// Workspace file locations.
 pub mod file_ops {
-    pub use crate::file_ops::{resolve_attachment_source, workspace_root};
+    pub use crate::file_ops::{
+        delete, list, mkdir, read, rename, resolve_attachment_source, workspace_root, write,
+    };
 }
 
 /// Workspace git locations.
 pub mod git_ops {
-    pub use crate::git_ops::worktree_path;
+    pub use crate::git_ops::{assert_agent_commit_allowed, worktree_path};
 }
 
 /// The hook wake and notice framing of the latest harness.
@@ -202,7 +205,10 @@ pub mod tests {
 
 /// Cursor pagination over lists and text.
 pub mod pagination {
-    pub use crate::pagination::{page_window, paginate_text_lines};
+    pub use crate::pagination::{
+        bound_row, bound_text_page, floor_char_boundary, page_window, paginate_text_lines,
+        tail_within_json_bytes, text_page_window, OUTPUT_TAIL_MAX_JSON_BYTES,
+    };
 }
 
 /// The refusal for operations on a retired workspace.
@@ -213,7 +219,8 @@ pub mod retire {
 /// Shell selection and environment scrubbing.
 pub mod shell {
     pub use crate::shell::{
-        default_shell, scrubbed_env_vars_except, shell_args, shell_true_invocation,
+        default_shell, enhanced_shell_path, saved_script_env_overlay, scrubbed_env_vars_except,
+        shell_args, shell_true_invocation,
     };
 }
 
@@ -402,6 +409,12 @@ impl Services {
     #[must_use]
     pub fn feature_transfer_port(&self) -> &dyn TransferPort {
         self.ports.transfer()
+    }
+
+    /// The registered remote-launch feature.
+    #[must_use]
+    pub fn feature_remote_launch_port(&self) -> &dyn RemoteLaunchPort {
+        self.ports.remote_launch()
     }
 
     /// Test seam: the model catalog cache, for seeding entries.

@@ -51,18 +51,10 @@ pub(crate) async fn dispatch(
             other => Err(format!("host: unknown method `event.{other}`")),
         }
     };
-    let mut out =
-        if let Some(agent_id) = caller.filter(|_| matches!(method, "query" | "agentActivity")) {
-            intent_core::with_caller(
-                intent_core::Caller::Agent {
-                    agent_id: agent_id.clone(),
-                },
-                read,
-            )
-            .await?
-        } else {
-            read.await?
-        };
+    // The host binds the frame's agent as the ambient caller (hooks
+    // included), so the service-side scoping of `query` / `agentActivity`
+    // already sees the agent.
+    let mut out = read.await?;
     if let Some(agent_id) = caller {
         intent_core::redact_self_queue_events(&mut out, agent_id);
     }

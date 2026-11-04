@@ -61,6 +61,9 @@ pub(crate) struct RuntimeFeature {
     /// tasks themselves observe the same set; rehydrated from the `hook`
     /// table at boot via [`Services::rehydrate_hooks`](crate::hook_manager::HookServicesExt::rehydrate_hooks).
     pub(crate) hook_tasks: hook_manager::HookTasks,
+    /// Remote agents' machine runs, shared by every manager view; set up by
+    /// the first view built over the owner's services.
+    pub(crate) machine_runs: Arc<std::sync::OnceLock<script_ops::machine_runs::MachineRuns>>,
 }
 
 /// The runtime feature state and script output store, on [`Services`].
@@ -101,6 +104,7 @@ impl RuntimeStateExt for Services {
         .with_settings(self.settings_registry())
         .with_output_store(self.script_output_store())
         .with_tasks(self.feature_store_tasks().clone())
+        .with_machine_runs(self.runtime().machine_runs.clone())
         .with_owner_services(self.clone())
     }
 }
@@ -144,6 +148,117 @@ pub fn register(services: Services) -> Services {
 }
 
 impl RuntimePort for RuntimeFeature {
+    fn remote_script_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        caller: intent_services::feature_api::feature_ports::RemoteScriptCaller,
+        method: &'a str,
+        args: serde_json::Value,
+        budget: std::time::Duration,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
+        Box::pin(crate::remote_scripts::remote_call(
+            svc, caller, method, args, budget,
+        ))
+    }
+
+    fn machine_run_call<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        method: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            crate::remote_scripts::machine_run_call(svc, workspace_id, &method, params).await
+        })
+    }
+
+    fn machine_script_frame<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        frame: intent_core::node_link::LinkFrame,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.on_frame(node_id, frame).await;
+            }
+        })
+    }
+
+    fn machine_link_lost<'a>(
+        &'a self,
+        svc: &'a Services,
+        node_id: &'a str,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.link_lost(node_id, reason).await;
+            }
+        })
+    }
+
+    fn machine_runs_live(&self, svc: &Services, node_id: &str) -> bool {
+        svc.script_manager()
+            .machine_runs()
+            .is_some_and(|runs| runs.live_on(node_id))
+    }
+
+    fn machine_runs_final_stop_begun(&self, svc: &Services, agent_id: &intent_core::AgentId) {
+        if let Some(runs) = svc.script_manager().machine_runs() {
+            runs.final_stop_begun(agent_id);
+        }
+    }
+
+    fn machine_runs_final_stop_acked<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a intent_core::AgentId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            if let Some(runs) = mgr.machine_runs() {
+                runs.final_stop_acked(agent_id, reason).await;
+            }
+        })
+    }
+
+    fn end_agents_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agents: &'a [intent_core::AgentId],
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Vec<intent_core::AgentId>> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            match mgr.machine_runs() {
+                Some(runs) => runs.end_agents(agents, deadline, reason).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn end_agent_machine_runs<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a intent_core::AgentId,
+        deadline: tokio::time::Instant,
+        reason: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        let mgr = svc.script_manager();
+        Box::pin(async move {
+            match mgr.machine_runs() {
+                Some(runs) => runs.end_agent(agent_id, deadline, reason).await,
+                None => true,
+            }
+        })
+    }
+
     fn script_list<'a>(
         &'a self,
         svc: &'a Services,
@@ -180,13 +295,15 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             svc.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
-            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
+            let options = intent_core::script_lists::ScriptListOptions::parse_full_pages(&options)?;
             if options.summary {
                 svc.script_manager()
                     .summary_page(&workspace_id, &options)
                     .await
             } else {
-                svc.script_manager().list(&workspace_id).await
+                svc.script_manager()
+                    .full_page(&workspace_id, &options)
+                    .await
             }
         })
     }
@@ -575,6 +692,18 @@ impl RuntimePort for RuntimeFeature {
             svc.require_member(&workspace_id).await?;
             svc.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
                 .await
+        })
+    }
+
+    fn hook_list_page<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_member(&workspace_id).await?;
+            svc.hook_list_page_op(&workspace_id, &params).await
         })
     }
 
@@ -1376,6 +1505,20 @@ impl RuntimePort for RuntimeFeature {
                     ("BRANCH_NAME".to_string(), branch_name),
                     ("SOURCE_BRANCH".to_string(), source_branch),
                 ];
+                // Give the setup script the same enhanced PATH as saved
+                // scripts (inherited dirs first, then Homebrew, login-shell
+                // and user tool dirs). A launchd/Finder-started daemon only
+                // inherits /usr/bin:/bin:/usr/sbin:/sbin, so without this a
+                // setup script could not find Homebrew tools like sccache.
+                // Resolved off the async worker: the first call may run the
+                // login-shell probe if the startup prewarm has not finished.
+                let enhanced_path = tokio::task::spawn_blocking(script_ops::enhanced_shell_path)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(path) = enhanced_path {
+                    spec.env.push(("PATH".to_string(), path));
+                }
                 spec.env.extend(extra_env);
                 match pty_for_setup.spawn(spec) {
                     Ok(pty_id) => {

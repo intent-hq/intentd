@@ -627,6 +627,13 @@ async fn process_captured_frame(
             &method,
             raw.len(),
         );
+        // Node mode — the daemon's own orchestration is off, so only
+        // `NODE_MODE_METHODS` are served, on every transport and to every
+        // caller. Runs before the caller allowlists and every classify and
+        // dispatch path, so no fast path is reachable outside the list.
+        if !method.is_empty() && api.node_mode() && !catalog::node_mode_may_call(&method) {
+            return refuse_node_mode(&method, rpc_id, out_tx).await;
+        }
         // Multiplayer w3 — default-deny allowlist for non-administrator
         // connections. Runs before every classify and dispatch path (control,
         // server/pairing, provider setup, host, browser, client,
@@ -984,18 +991,11 @@ async fn process_captured_frame(
                 )
                 .await;
                 bound = outcome.bound;
-                if control.and_then(|c| c.startup_status()).is_some() {
-                    outcome.frame.map(|frame| {
-                        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
-                        if value.get("result").is_some() {
-                            value["result"]["server"]["capabilities"]["startupStatus"] =
-                                serde_json::json!(1);
-                        }
-                        value.to_string()
-                    })
-                } else {
-                    outcome.frame
-                }
+                client::with_runtime_capabilities(
+                    outcome.frame,
+                    control.and_then(|c| c.startup_status()).is_some(),
+                    api.remote_machines_capability(),
+                )
             })
             .await;
             // REV-2: bind the hello'd identity onto the registry entry; the
@@ -1094,7 +1094,11 @@ async fn process_captured_frame(
                 &method,
                 rpc_id.clone(),
                 out_tx,
-                handle_sub_fast_path(sub, api, bus, out_tx, subs),
+                // Boxed off this frame: `process_captured_frame` sits close to
+                // the default test stack (see `crate::stack_frame`).
+                crate::stack_frame::boxed_await(|| {
+                    handle_sub_fast_path(sub, api, bus, out_tx, subs)
+                }),
             )
             .await;
         }
@@ -1367,6 +1371,26 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
                 &id,
                 catalog::FORBIDDEN_ERROR_CODE,
                 catalog::FORBIDDEN_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
+}
+
+/// Refuse one frame outside [`catalog::NODE_MODE_METHODS`] on a daemon in
+/// node mode: a request echoes `-32003` with `data.code: "node-mode"`, a
+/// notification is dropped without a response. Returns `false` only when the
+/// outbound channel is closed.
+async fn refuse_node_mode(method: &str, rpc_id: Option<Value>, out_tx: &OutboundSender) -> bool {
+    tracing::debug!(method, "refusing RPC: not on the node-mode list");
+    match rpc_id {
+        Some(id) => out_tx
+            .send_priority(events::error_frame_with_data(
+                &id,
+                catalog::FORBIDDEN_ERROR_CODE,
+                catalog::NODE_MODE_ERROR_MESSAGE,
+                &catalog::node_mode_error_data(&format!("{method} is not served in node mode")),
             ))
             .await
             .is_ok(),
@@ -1693,6 +1717,7 @@ pub(crate) async fn handle_sub_fast_path(
                     replace_group,
                     projection,
                     max_content_bytes,
+                    snapshot_limit,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1737,6 +1762,7 @@ pub(crate) async fn handle_sub_fast_path(
                     WorkspaceId::from(workspace_id),
                     projection,
                     max_content_bytes,
+                    snapshot_limit,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -1765,6 +1791,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     note_id,
                     replace_group,
+                    snapshot_limit: _,
                 } = p;
                 let timer =
                     subscriptions::SnapshotTimer::start(Channel::NotePresence, &workspace_id);
@@ -1959,6 +1986,7 @@ pub(crate) async fn handle_sub_fast_path(
                     note_id,
                     replace_group,
                     include_retired,
+                    snapshot_limit,
                 }) => {
                     // Time the request-to-snapshot interval (intent-hq/intent#3707),
                     // started before the replace-group cleanup so a costly
@@ -2011,6 +2039,7 @@ pub(crate) async fn handle_sub_fast_path(
                         out_tx.clone(),
                         timer,
                         include_retired,
+                        snapshot_limit,
                     ));
                     subs.insert(subscription_id, handle, replace_group, None);
                     true
@@ -2157,33 +2186,35 @@ async fn forward_note_subscription(
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
     max_content_bytes: Option<usize>,
+    snapshot_limit: usize,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
 ) {
-    let snapshot = match api.list_notes(&workspace_id).await {
-        Ok(notes) => match projection {
-            Some(intent_core::NoteListProjection::Slim) => Value::Array(
-                notes
-                    .into_iter()
-                    .map(intent_core::note_list_slim_row)
-                    .collect(),
-            ),
-            None => match max_content_bytes {
-                Some(limit) => Value::Array(
-                    notes
-                        .into_iter()
-                        .map(|note| intent_core::note_bounded_row(note, limit))
-                        .collect(),
-                ),
-                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
-            },
-        },
-        Err(_) => Value::Array(Vec::new()),
-    };
-    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    let notes = api.list_notes(&workspace_id).await.unwrap_or_default();
+    let page = intent_core::note_read_bounds::PageRequest::new(
+        Some(snapshot_limit),
+        snapshot_limit,
+        snapshot_limit,
+        None,
+    );
+    let (rows, next) = intent_core::note_read_bounds::note_list_page(
+        notes,
+        workspace_id.as_str(),
+        projection,
+        max_content_bytes,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .unwrap_or_default();
+    let frame = subscriptions::build_paged_snapshot_push(
+        &subscription_id,
+        0,
+        &Value::Array(rows),
+        next.as_deref(),
+    );
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
@@ -2847,6 +2878,9 @@ struct ChannelParams {
     replace_group: Option<String>,
     /// `workspace.subscribe { includeRetired }`; always `false` elsewhere.
     include_retired: bool,
+    /// `comment.subscribe` snapshot page size (bounded reads); `None`
+    /// elsewhere and for an unpaged snapshot.
+    snapshot_limit: Option<usize>,
 }
 
 /// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
@@ -2863,6 +2897,7 @@ fn parse_channel_params(
                 note_id: None,
                 replace_group: p.replace_group,
                 include_retired: p.include_retired,
+                snapshot_limit: None,
             })
         }
         Channel::Comment => {
@@ -2872,6 +2907,7 @@ fn parse_channel_params(
                 note_id: Some(p.note_id),
                 replace_group: p.replace_group,
                 include_retired: false,
+                snapshot_limit: Some(p.snapshot_limit),
             })
         }
         // `note`/`task`/`agent` are all workspace-scoped collections.
@@ -2882,6 +2918,7 @@ fn parse_channel_params(
                 note_id: None,
                 replace_group: p.replace_group,
                 include_retired: false,
+                snapshot_limit: None,
             })
         }
     }
@@ -2946,23 +2983,22 @@ async fn forward_channel_subscription(
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
     include_retired: bool,
+    snapshot_limit: Option<usize>,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
     // `specLinked` flag flipped (monorepo#2407). Seeded from the snapshot's
     // own `list_notes` read — no extra query.
     let mut spec_links = HashSet::new();
-    let snapshot = if channel == Channel::Task {
-        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
-        spec_links = links;
-        snapshot
-    } else if channel == Channel::Workspace {
-        // The workspace subscribe fast-path bypasses router::dispatch, but its
-        // seq-0 aggregate read has the same bounded-statement contract as
-        // workspace.list. Give that read the canonical profiling span so the
-        // runtime guardrail and real-daemon integration tests can attribute
-        // sqlx statements to `workspace.subscribe`.
-        let span = tracing::info_span!(
+    // The workspace / agent channels serve a paged seq-0 snapshot (§6.9
+    // "Paged snapshots"): the first list page plus `nextToken`.
+    // The workspace subscribe fast-path bypasses router::dispatch, but its
+    // seq-0 aggregate read has the same bounded-statement contract as
+    // workspace.list. Give that read the canonical profiling span so the
+    // runtime guardrail and real-daemon integration tests can attribute
+    // sqlx statements to `workspace.subscribe`.
+    let workspace_span = || {
+        tracing::info_span!(
             target: RPC_DISPATCH_SPAN_TARGET,
             RPC_DISPATCH_SPAN_NAME,
             method = "workspace.subscribe",
@@ -2970,9 +3006,39 @@ async fn forward_channel_subscription(
             encode_elapsed_ms = tracing::field::Empty,
             oversized_replacement = tracing::field::Empty,
             encode_failed = tracing::field::Empty,
+        )
+    };
+    let paged = if matches!(channel, Channel::Workspace | Channel::Agent) {
+        let read = subscriptions::paged_collection_snapshot(
+            api.as_ref(),
+            channel,
+            &workspace_id,
+            include_retired,
         );
+        if channel == Channel::Workspace {
+            read.instrument(workspace_span()).await
+        } else {
+            read.await
+        }
+    } else if let (Channel::Comment, Some(limit), Some(note)) =
+        (channel, snapshot_limit, note_id.as_ref())
+    {
+        // Bounded reads: the comment snapshot is the first thread page.
+        Some(subscriptions::comment_snapshot_page(api.as_ref(), &workspace_id, note, limit).await)
+    } else {
+        None
+    };
+    let mut snapshot_next_token = None;
+    let snapshot = if let Some((page, next_token)) = paged {
+        snapshot_next_token = Some(next_token);
+        page
+    } else if channel == Channel::Task {
+        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
+        spec_links = links;
+        snapshot
+    } else if channel == Channel::Workspace {
         subscriptions::workspace_snapshot(api.as_ref(), include_retired)
-            .instrument(span)
+            .instrument(workspace_span())
             .await
     } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
@@ -2980,12 +3046,34 @@ async fn forward_channel_subscription(
     };
     // The global workspace channel discloses ids through `workspace:deleted`
     // tombstones, so a non-administrator subscriber only receives them for
-    // workspaces it has been shown (multiplayer w3); seeded from its own
-    // membership-scoped snapshot, no extra query.
-    let mut visible_workspaces = (channel == Channel::Workspace
-        && crate::context::is_non_administrator_caller())
-    .then(|| subscriptions::visible_workspace_ids(&snapshot));
-    let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    // workspaces it has been shown (multiplayer w3). The seq-0 frame is one
+    // page, but the client loads the rest through `workspace.list`, so the
+    // set is seeded from the caller's whole membership-scoped list.
+    let mut visible_workspaces =
+        if channel == Channel::Workspace && crate::context::is_non_administrator_caller() {
+            let next_token = snapshot_next_token.as_ref().and_then(Option::as_deref);
+            Some(
+                subscriptions::visible_workspace_seed(
+                    api.as_ref(),
+                    &snapshot,
+                    next_token,
+                    include_retired,
+                )
+                .instrument(workspace_span())
+                .await,
+            )
+        } else {
+            None
+        };
+    let frame = match &snapshot_next_token {
+        Some(next_token) => subscriptions::build_paged_snapshot_push(
+            &subscription_id,
+            0,
+            &snapshot,
+            next_token.as_deref(),
+        ),
+        None => subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot),
+    };
     if out_tx.send_bulk(frame).await.is_err() {
         return;
     }

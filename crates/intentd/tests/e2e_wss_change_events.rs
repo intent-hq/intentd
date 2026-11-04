@@ -931,7 +931,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let rows = tasks.as_array().expect("bare array");
+    let rows = tasks["tasks"].as_array().expect("tasks page");
     assert_eq!(rows.len(), 1, "rows: {tasks}");
     assert_eq!(rows[0]["text"], json!("Ship It"));
     assert_eq!(rows[0]["status"], json!("todo"));
@@ -1040,6 +1040,9 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
+    // Bounded reads: `note.listTasks` answers one page `{ tasks, nextToken }`.
+    assert!(tasks["nextToken"].is_null(), "one page: {tasks}");
+    let tasks = &tasks["tasks"];
     assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
     assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
 
@@ -1088,7 +1091,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
+    assert_eq!(tasks["tasks"][0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
@@ -1149,7 +1152,7 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let child_id = tasks[0]["taskNoteId"]
+    let child_id = tasks["tasks"][0]["taskNoteId"]
         .as_str()
         .expect("linked task note id")
         .to_string();
@@ -4387,7 +4390,7 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let rows = tasks.as_array().expect("bare array");
+    let rows = tasks["tasks"].as_array().expect("tasks page");
     assert_eq!(rows.len(), 2, "rows: {tasks}");
     for (i, row) in rows.iter().enumerate() {
         let child_id = row["taskNoteId"].as_str().expect("child id");
@@ -4677,7 +4680,9 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
         &mut rpc,
         4,
         "note.setContent",
-        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3 }),
+        // Bounded reads write guard: replacing a note larger than the read
+        // budget needs the writer's base size.
+        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3, "baseContentBytes": 1_100_000 }),
     )
     .await;
     let updated = 'updated: loop {
@@ -4702,8 +4707,11 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
     );
     assert_eq!(updated["contentLength"].as_i64(), Some(1_100_000));
 
-    // Default (absent projection): full rows, complete content intact — the
-    // pre-8.2 wire shape for existing clients. Explicit "full" matches.
+    // Default (absent projection) and explicit "full": full rows, paged
+    // (bounded reads). The seq-0 snapshot is the first `note.list` page and
+    // fits the read budget; the rest comes from `note.list` with its
+    // `nextToken`, and a row over the budget is cut with the markers.
+    let mut page_id = 10;
     for (id, params) in [
         (1, json!({ "workspaceId": ws_id })),
         (2, json!({ "workspaceId": ws_id, "projection": "full" })),
@@ -4713,17 +4721,38 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
         assert!(res["subscriptionId"].is_string(), "sub: {res}");
         let push = next_subscription_push(&mut full_sub, 10).await;
         assert_eq!(push["kind"], json!("snapshot"), "push kind");
-        let snap = push["snapshot"].as_array().expect("snapshot array");
-        let giant = snap
+        let frame = serde_json::to_string(&push).expect("serialize");
+        assert!(
+            frame.len() < 500 * 1024,
+            "snapshot fits: {} bytes",
+            frame.len()
+        );
+        let mut rows: Vec<Value> = push["snapshot"].as_array().expect("snapshot array").clone();
+        let mut token = push["nextToken"].as_str().map(str::to_string);
+        while let Some(t) = token {
+            page_id += 1;
+            let page = wss_rpc(
+                &mut rpc,
+                page_id,
+                "note.list",
+                json!({ "workspaceId": ws_id, "nextToken": t }),
+            )
+            .await;
+            rows.extend(page["notes"].as_array().expect("notes").iter().cloned());
+            token = page["nextToken"].as_str().map(str::to_string);
+        }
+        let giant = rows
             .iter()
             .find(|n| n["id"] == json!(giant_id))
-            .expect("giant note in snapshot");
+            .expect("giant note listed");
         assert_eq!(
-            giant["content"].as_str().map(str::len),
-            Some(1_100_000),
-            "full snapshot keeps content"
+            giant["contentTruncated"],
+            json!(true),
+            "cut: {}",
+            giant["id"]
         );
-        assert!(giant.get("contentPreview").is_none(), "no preview: {giant}");
+        assert_eq!(giant["contentBytes"].as_u64(), Some(1_100_000));
+        assert!(giant.get("contentPreview").is_none(), "no preview");
     }
 }
 

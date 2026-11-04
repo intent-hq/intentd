@@ -375,7 +375,6 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     assert!(!pid_dead(script_straggler), "script straggler live");
 
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
-    let started_at = Instant::now();
     let shutdown = uds_rpc(&socket, 5, "system.shutdown", json!({})).await;
     assert_eq!(
         shutdown["result"].get("ok"),
@@ -391,12 +390,13 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // CI contention cannot flake it; 10s still sits under the daemon-exit
     // assertion below.
     let budget = common::test_timeout(Duration::from_secs(10));
+    let deadline = Instant::now() + budget;
     loop {
         if pid_dead(term_straggler) && pid_dead(script_straggler) {
             break;
         }
         assert!(
-            started_at.elapsed() < budget,
+            Instant::now() < deadline,
             "PTY children survived the shutdown sweep past {budget:?}: \
              terminal {term_straggler} dead={}, script {script_straggler} dead={}",
             pid_dead(term_straggler),

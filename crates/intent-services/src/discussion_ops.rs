@@ -144,10 +144,11 @@ impl Services {
         } else {
             DiscussionActor::Human(self.discussion_access(ws, id).await?)
         };
-        let page = self
+        let mut page = self
             .store
             .list_discussion_messages_for(ws, id, before, after, limit, Some(&principal))
             .await?;
+        bound_discussion_page(&mut page, after.is_some());
         let conversation = self.store.discussion_conversation(ws, id).await?;
         Ok(json!({"messages":page.messages,"hasMore":page.has_more,"conversation":conversation}))
     }
@@ -301,7 +302,7 @@ impl Services {
                 EventActor {
                     actor_type: ActorType::Agent,
                     id: Some(agent.0),
-                    name: Some(session.name),
+                    name: Some(session.name.clone()),
                     ..EventActor::default()
                 },
             )
@@ -565,6 +566,50 @@ impl Services {
         }
         Ok(())
     }
+}
+
+/// Serialized-size ceiling for the `messages` of one `discussion.list`
+/// page: 480,000 bytes (the per-page budget shared by bounded reads),
+/// below the 500 KiB read payload budget with room for the conversation and
+/// the envelope. A page of up to 100 messages with
+/// 16 KiB bodies would otherwise reach well past 1.6 MB.
+pub(crate) const DISCUSSION_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Cut a `discussion.list` page (ascending by sequence) to
+/// [`DISCUSSION_PAGE_BUDGET_BYTES`], always keeping one message so a page
+/// with `hasMore` never comes back empty. A latest/`beforeSequence` page
+/// keeps its newest messages and an `afterSequence` page its oldest, so the
+/// caller's usual cursor (oldest or newest returned sequence) resumes at
+/// the cut; any cut sets `has_more`.
+pub(crate) fn bound_discussion_page(
+    page: &mut intent_core::discussion::DiscussionPage,
+    forward: bool,
+) {
+    let sizes: Vec<usize> = page
+        .messages
+        .iter()
+        .map(|m| serde_json::to_vec(m).map_or(usize::MAX, |v| v.len() + 1))
+        .collect();
+    let n = sizes.len();
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for i in 0..n {
+        let size = sizes[if forward { i } else { n - 1 - i }];
+        used = used.saturating_add(size);
+        if keep > 0 && used > DISCUSSION_PAGE_BUDGET_BYTES {
+            break;
+        }
+        keep += 1;
+    }
+    if keep == n {
+        return;
+    }
+    if forward {
+        page.messages.truncate(keep);
+    } else {
+        page.messages.drain(..n - keep);
+    }
+    page.has_more = true;
 }
 
 #[cfg(test)]

@@ -273,6 +273,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session1)
@@ -334,6 +335,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session2)
@@ -402,7 +404,7 @@ async fn resolve_interrupted_resume_and_abandon() {
 
     let resume_agent_id = AgentId(agent_resume.clone());
     let resumed_session = store
-        .get_agent_session(&resume_agent_id)
+        .get_agent_session_with_transcript(&resume_agent_id)
         .await
         .expect("get resumed session");
     let last_user_idx = resumed_session
@@ -470,7 +472,7 @@ async fn resolve_interrupted_resume_and_abandon() {
 
     // Phase 6: Verify the abandoned agent has a system message
     let abandoned_session = store
-        .get_agent_session(&AgentId(agent_abandon.clone()))
+        .get_agent_session_with_transcript(&AgentId(agent_abandon.clone()))
         .await
         .expect("get abandoned session");
     assert!(!abandoned_session.messages.is_empty(), "expected messages");

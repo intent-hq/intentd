@@ -114,6 +114,7 @@ fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
     }
@@ -462,7 +463,11 @@ async fn agent_zero_delay_claim_survives_cancel_and_store_failure() {
         .unwrap());
     resume.notify_one();
     reached(&finished).await;
-    h.services.store.get_agent_session(&h.agent).await.unwrap();
+    h.services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .unwrap();
     assert!(h.request(true).is_err());
 }
 
@@ -480,7 +485,12 @@ async fn cascade_transfers_agent_claim_until_background_completion() {
         .arm("background", &h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
     reached(&pause).await;
-    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
     assert!(h.request(true).is_err());
     assert!(!h
         .services
@@ -749,7 +759,12 @@ async fn original_agent_metadata_error_keeps_legacy_ack_without_confirming_claim
         .execute(h.services.store.write_pool())
         .await
         .unwrap();
-    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
     let finished = h.services.pending_delete_test_gate.completion(&h.agent.0);
     h.services
         .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
@@ -822,7 +837,12 @@ async fn secret_request_racing_agent_delete_does_not_survive() {
     let request_id = ticket["requestId"].as_str().unwrap().to_string();
     resume.notify_one();
     reached(&finished).await;
-    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
     assert!(h
         .services
         .secret_vault

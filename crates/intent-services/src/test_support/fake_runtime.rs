@@ -300,6 +300,17 @@ macro_rules! forward_to_unavailable {
 }
 
 impl RuntimePort for FakeRuntime {
+    fn end_agent_machine_runs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _deadline: tokio::time::Instant,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        self.record("end_agent_machine_runs");
+        Box::pin(async { true })
+    }
+
     fn active_hooks_for_agent<'a>(
         &'a self,
         svc: &'a Services,
@@ -733,6 +744,7 @@ impl RuntimePort for FakeRuntime {
         fn script_run<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, script_id: String, max_lines: Option<i64>, timeout_seconds: Option<i64>) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_schedule<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, agent_id: AgentId, params: serde_json::Value) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_list<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, agent_id: Option<AgentId>, include_retired: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
+        fn hook_list_page<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, params: serde_json::Value) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_get<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, hook_id: intent_core::HookId) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_cancel<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, hook_id: intent_core::HookId, caller: Option<AgentId>) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn hook_run_now<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, hook_id: intent_core::HookId) -> BoxFuture<'a, Result<serde_json::Value>>;

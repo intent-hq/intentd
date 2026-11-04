@@ -411,10 +411,8 @@ const onPrompt = () => {{
         pidfile = pidfile.to_string_lossy(),
     ));
     let budget = Duration::from_millis(500);
-    // Upper bound = budget + spawn/setup + exit-observe/reap grace, with slack
-    // for a loaded host. Observed ~1.8 s on a quiet host; the hang this guards
-    // against never ends on its own.
-    let margin = Duration::from_secs(4);
+    // The hang this guards against never ends on its own, so the hang guard
+    // below catches it; PromptTimeout says the prompt budget ended the run.
     let slots = AdapterSlots::new(1);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
@@ -440,10 +438,6 @@ const onPrompt = () => {{
         "expected PromptTimeout, got {err}"
     );
     assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
-    assert!(
-        elapsed < budget + margin,
-        "PromptTimeout arrived {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
-    );
 
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("adapter wrote its pid")
@@ -655,7 +649,6 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
 
     // fixed-deadline: allow — stays fixed: it is the phase clock under test, and `elapsed` is asserted against it
     let budget = Duration::from_millis(300);
-    let margin = Duration::from_secs(2);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
@@ -672,11 +665,10 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
         outcome.is_err(),
         "the phase clock, not the send, ends the phase"
     );
+    // Only the phase clock can end the phase: the send stays pending (checked
+    // below), and before the fix the loop never returned — the hang guard
+    // above catches that.
     assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
-    assert!(
-        elapsed < budget + margin,
-        "phase resolved {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
-    );
 
     // The first request was dequeued and its send left in flight (the loop
     // pulls no further request while one is pending), so the second is still

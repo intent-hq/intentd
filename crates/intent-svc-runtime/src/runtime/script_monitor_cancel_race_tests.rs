@@ -176,7 +176,7 @@ impl Harness {
 
 async fn messages(svc: &Services, agent: &AgentId) -> usize {
     svc.store()
-        .get_agent_session(agent)
+        .get_agent_session_with_transcript(agent)
         .await
         .expect("session")
         .messages
@@ -184,7 +184,11 @@ async fn messages(svc: &Services, agent: &AgentId) -> usize {
 }
 
 async fn messages_text(svc: &Services, agent: &AgentId) -> String {
-    let session = svc.store().get_agent_session(agent).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(agent)
+        .await
+        .expect("session");
     let blocks: Vec<_> = session.messages.iter().map(|m| &m.content).collect();
     serde_json::to_string(&blocks).expect("serialize content blocks")
 }

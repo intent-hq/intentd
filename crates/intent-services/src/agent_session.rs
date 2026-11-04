@@ -1765,7 +1765,7 @@ pub(crate) fn no_default_provider_error(context: &str) -> Error {
 /// gracefully to today's opaque `Internal` error — the transient classifiers
 /// keep their broader match because their retry/fail-fast outcome is cheap
 /// to get wrong in comparison.
-fn is_acp_auth_required(e: &AcpError) -> bool {
+pub(crate) fn is_acp_auth_required(e: &AcpError) -> bool {
     match e {
         AcpError::Auth(_) => true,
         AcpError::Rpc(rpc) => {
@@ -2349,7 +2349,7 @@ impl Services {
     /// automatic turn on the user's behalf, so uncertainty must fall through
     /// to the observable idle path, never spin a turn on stale state.
     pub(crate) async fn truncation_redrive_eligible(&self, agent_id: &AgentId) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.parent_agent_id.is_none() {
@@ -2928,7 +2928,7 @@ impl Services {
             Ok(true) => {
                 // Report what actually landed: a column a concurrent write
                 // set first keeps that writer's value.
-                let landed = match self.store.get_agent_session(&stored.id).await {
+                let landed = match self.store.get_agent_session_summary(&stored.id).await {
                     Ok(row) => row,
                     Err(e) => {
                         tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
@@ -3104,7 +3104,10 @@ impl Services {
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (provider
         // field → configured default), then build provider-specific _meta.
@@ -3451,7 +3454,7 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = self.store.get_agent_session_summary(agent_id).await?;
         if let Some(session_id) = &stored.acp_session_id {
             if self
                 .store
@@ -3545,7 +3548,8 @@ impl Services {
             &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
         )>,
     ) -> Result<Option<PreparedAcpLoad>> {
-        let stored = boxed_await(|| self.store.get_agent_session(agent_id)).await?;
+        let stored =
+            boxed_await(|| self.store.get_agent_session_without_messages(agent_id)).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
@@ -4354,9 +4358,29 @@ impl Services {
         // BEFORE the terminal emits below, so a redriven attempt never
         // flashes a failed turn at the FE. Any error after streamed content
         // keeps the existing terminal emit path unchanged.
+        // A remote agent's automatic switch (quota failover, or the timed
+        // return home) is unconfirmed until the node runs it: the node
+        // starts the agent asynchronously, so a start failure (a backup not
+        // signed in there, a failed checkout) surfaces as this first prompt
+        // failing before any output. Undo the switch and fail with what to
+        // do — never a silent redrive or a further failover
+        // (intent-hq/intent#8317).
+        let remote_switch_failed = match &result {
+            Err(e)
+                if !updates_applied
+                    && blocks.is_empty()
+                    && !matches!(e, AcpError::PromptIdleTimeout(_))
+                    && self.remote_switch_pending(agent_id) =>
+            {
+                self.fail_remote_failover(workspace_id, agent_id, &e.to_string())
+                    .await
+            }
+            _ => None,
+        };
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
-            && blocks.is_empty();
+            && blocks.is_empty()
+            && remote_switch_failed.is_none();
         // Stale-cancel classification (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
         // `redrive_spurious_cancel` is set only when the turn worker took a
         // fresh stale-cancel mark for this attempt. A client request
@@ -4934,8 +4958,9 @@ impl Services {
             }
             _ => None,
         };
-        let prompt_actionable_error =
-            prompt_auth_error.or_else(|| result.as_ref().err().and_then(prompt_size_error));
+        let prompt_actionable_error = remote_switch_failed
+            .or(prompt_auth_error)
+            .or_else(|| result.as_ref().err().and_then(prompt_size_error));
         // Quota-exhaustion observation: resolved in the SAME pre-persist seam
         // as the auth mapping above, for the same reason — this is the last
         // place the structured `AcpError` still exists, before the final
@@ -4971,20 +4996,26 @@ impl Services {
         // redrives the same user message on the backup. Output this attempt
         // already persisted stays in the transcript. Only a worker-armed turn
         // can fail over, and the chain is bounded per user turn.
-        let quota_failover = prompt_quota_failure
-            && prompt_actionable_error.is_none()
-            && self
-                .try_quota_failover(
-                    workspace_id,
-                    agent_id,
-                    prompt_quota_provider.as_deref(),
-                    &result
-                        .as_ref()
-                        .err()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                )
-                .await;
+        let quota_outcome = if prompt_quota_failure && prompt_actionable_error.is_none() {
+            self.try_quota_failover(
+                workspace_id,
+                agent_id,
+                prompt_quota_provider.as_deref(),
+                &result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+            .await
+        } else {
+            crate::quota_failover::QuotaFailoverOutcome::Terminal
+        };
+        let quota_failover = quota_outcome.switched();
+        // A remote agent whose backups cannot run on its machine fails with
+        // the actionable message instead of the raw quota error.
+        let prompt_actionable_error =
+            prompt_actionable_error.or_else(|| quota_outcome.into_refusal());
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
@@ -5147,8 +5178,8 @@ impl Services {
                 // without a follow-up read. The lookup is a single indexed row
                 // read per idle event; a store error is swallowed and the
                 // event still fires with the base payload.
-                if let Ok(session) = self.store.get_agent_session(agent_id).await {
-                    data["agentName"] = Value::String(session.name);
+                if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    data["agentName"] = Value::String(session.name.clone());
                     data["isBackground"] = Value::Bool(session.is_background);
                     // Mute hint: present only when true (absent ≠ false, like
                     // `workspaceArchived`) so notification clients stay quiet
@@ -5156,7 +5187,7 @@ impl Services {
                     if session.notifications_muted {
                         data["notificationsMuted"] = Value::Bool(true);
                     }
-                    if let Some(report) = session.completion_report {
+                    if let Some(report) = session.completion_report.clone() {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
                     }
@@ -5934,13 +5965,13 @@ impl Services {
         if empty_wake_response {
             data["emptyWakeResponse"] = Value::Bool(true);
         }
-        if let Ok(session) = self.store.get_agent_session(agent_id).await {
-            data["agentName"] = Value::String(session.name);
+        if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+            data["agentName"] = Value::String(session.name.clone());
             data["isBackground"] = Value::Bool(session.is_background);
             if session.notifications_muted {
                 data["notificationsMuted"] = Value::Bool(true);
             }
-            if let Some(report) = session.completion_report {
+            if let Some(report) = session.completion_report.clone() {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);
             }
@@ -6410,6 +6441,11 @@ impl Services {
                 transcript.provider_output_seen = true;
                 self.note_provider_working(agent_id);
             }
+            // A remote agent's pending quota failover is confirmed (and
+            // announced) by its first output on the backup; so is a switch
+            // its user made, once the run producing it is the switched one.
+            self.confirm_remote_model_switch(agent_id);
+            Box::pin(self.complete_remote_failover(workspace_id, agent_id)).await;
             Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
         let message_id = transcript.message_id.clone();
@@ -6815,14 +6851,14 @@ impl Services {
         if event_type == AGENT_FAILED
             && (data.get("parentAgentId").is_none() || data.get("agentName").is_none())
         {
-            if let Ok(session) = self.store.get_agent_session(agent_id).await {
+            if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                 if let Some(map) = data.as_object_mut() {
-                    if let Some(parent) = session.parent_agent_id {
+                    if let Some(parent) = session.parent_agent_id.clone() {
                         map.entry("parentAgentId".to_string())
                             .or_insert(Value::String(parent.0));
                     }
                     map.entry("agentName".to_string())
-                        .or_insert(Value::String(session.name));
+                        .or_insert(Value::String(session.name.clone()));
                 }
             }
         }

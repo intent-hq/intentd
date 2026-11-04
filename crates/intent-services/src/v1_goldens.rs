@@ -787,6 +787,56 @@ fn golden_pr_monitor_checklist_branch_lines() {
     );
 }
 
+/// A queued entry turning `unmergeable` (intentd#2897) is a change line
+/// carrying the dequeue / fix / re-enqueue recovery, the checklist's queue
+/// row says so, and a still-queued recovery reports once.
+#[test]
+fn golden_pr_monitor_unmergeable_queue_entry() {
+    let queued = |state: &str| {
+        let mut s = pr_snapshot("open");
+        s.requirements.is_in_merge_queue = Some(true);
+        s.requirements.merge_queue = Some(intent_sourcecontrol::MergeQueueEntry {
+            position: 2,
+            queue_size: Some(2),
+            state: Some(state.to_string()),
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+        });
+        s
+    };
+    let stuck = queued("unmergeable");
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&queued("queued"), &stuck),
+        vec![
+            "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of it and \
+             will not merge. Its branch is locked while queued, so a push is rejected — remove \
+             it from the queue first (GraphQL dequeuePullRequest), then git fetch origin and \
+             check the conflict is real: git merge-tree --write-tree <entry ahead's merge-group branch \
+             origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is ahead> <this \
+             head>. If that is clean the flag was stale: enqueue the same commit again; otherwise fix the \
+             branch, then enqueue it again"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&stuck, &queued("mergeable")),
+        vec!["merge queue entry is no longer unmergeable (now mergeable)".to_string()]
+    );
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&stuck),
+        "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
+         - in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
+         dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
+         origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
+    );
+}
+
 /// Every checklist names the head commit its check results belong to
 /// (intentd#2875: a wake delivered minutes late reported "12 passed" for the
 /// commit before a push, and the agent called the PR ready). An unknown head
@@ -893,7 +943,7 @@ async fn golden_report_to_parent_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -930,7 +980,7 @@ async fn golden_attention_request_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -990,7 +1040,7 @@ async fn golden_watcher_attention_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -1427,7 +1477,7 @@ async fn v1_pinned_session(
     seed_agent(svc, ws, &owner).await;
     let mut session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     session.harness_version = "1.0".to_string();
@@ -1448,7 +1498,7 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     seed_agent(&svc, &ws, &owner).await;
     let mut session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     assert_eq!(
@@ -1711,6 +1761,7 @@ fn golden_isolation_hints() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,

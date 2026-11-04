@@ -3571,6 +3571,93 @@ mod agent_delta_list_projection {
             );
         }
     }
+
+    /// `agent_get` for one agent whose remote placement is `isolation`
+    /// (`None`: a local agent, no placement fields at all).
+    struct PlacedAgentApi {
+        isolation: Option<&'static str>,
+    }
+
+    impl WorkspaceApi for PlacedAgentApi {
+        fn agent_get(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let mut row = json!({
+                "id": "agent-1",
+                "workspaceId": "w",
+                "name": "Worker",
+                "status": "active",
+                "createdAt": "t0",
+                "updatedAt": "t1",
+                "messageCount": 0,
+                "metadata": { "isBackground": false },
+            });
+            if let Some(isolation) = self.isolation {
+                let placed = json!({
+                    "nodeId": "node-1",
+                    "leaseId": "lease-1",
+                    "nodeName": "Mac mini",
+                    "placement": { "target": "remote", "os": "macos", "nodeId": "node-1" },
+                    "effectiveIsolation": isolation,
+                    "placementError": { "code": "node-capacity", "detail": "full" },
+                });
+                row.as_object_mut()
+                    .unwrap()
+                    .extend(placed.as_object().unwrap().clone());
+            }
+            Box::pin(async move { Ok(serde_json::from_value(row).expect("placed row")) })
+        }
+    }
+
+    /// Remote agents showed "Provisioning" on their list row until opened
+    /// (cloudlands-fe v2.268.0): the list delta stripped the placement
+    /// fields, so the `pending` → `isolated` change never reached the list.
+    /// The delta row now carries them (all but the detail-only `leaseId`),
+    /// and a local agent's row carries none.
+    #[tokio::test]
+    async fn delta_rows_carry_the_remote_placement_and_its_isolation_change() {
+        for isolation in ["pending", "isolated"] {
+            let api = PlacedAgentApi {
+                isolation: Some(isolation),
+            };
+            let d = agent_delta(&api, &agent_event(AGENT_UPDATED))
+                .await
+                .expect("delta");
+            let row = &d["updated"][0];
+            assert_eq!(row["effectiveIsolation"], json!(isolation), "{row}");
+            assert_eq!(row["nodeId"], json!("node-1"), "{row}");
+            assert_eq!(row["nodeName"], json!("Mac mini"), "{row}");
+            assert_eq!(
+                row["placement"],
+                json!({ "target": "remote", "os": "macos", "nodeId": "node-1" })
+            );
+            assert_eq!(row["placementError"]["code"], json!("node-capacity"));
+            assert!(
+                row.get("leaseId").is_none(),
+                "leaseId is detail-only: {row}"
+            );
+        }
+
+        let d = agent_delta(
+            &PlacedAgentApi { isolation: None },
+            &agent_event(AGENT_UPDATED),
+        )
+        .await
+        .expect("delta");
+        let row = d["updated"][0].as_object().expect("row object");
+        for key in [
+            "nodeId",
+            "leaseId",
+            "nodeName",
+            "placement",
+            "effectiveIsolation",
+            "placementError",
+        ] {
+            assert!(!row.contains_key(key), "local agent row carries `{key}`");
+        }
+    }
 }
 
 // --- chat_snapshot bounded seq-0 read (monorepo#958 regression) ------------
@@ -6675,5 +6762,67 @@ mod progressive_history {
             terminal["nextToken"],
             intent_services::pagination::remint_backward_token(1).unwrap()
         );
+    }
+}
+
+/// [`visible_workspace_seed`]: the visible-id seed of a non-administrator's
+/// paged workspace snapshot.
+mod visible_workspace_seed_tests {
+    use super::*;
+    use intent_core::{chief_workspace, BoxFuture, Result, WorkspaceApi, WorkspaceListFilter};
+
+    /// The caller's whole list is `ws-1`..`ws-3`, or a store error.
+    struct SeedApi {
+        fail: bool,
+    }
+
+    impl WorkspaceApi for SeedApi {
+        fn list_workspaces(
+            &self,
+            _filter: WorkspaceListFilter,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    return Err(intent_core::Error::Internal("store down".into()));
+                }
+                Ok(["ws-1", "ws-2", "ws-3"]
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    fn ids(set: &HashSet<String>) -> Vec<&str> {
+        let mut out: Vec<&str> = set.iter().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_complete_page_seeds_its_own_ids() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed = visible_workspace_seed(&SeedApi { fail: false }, &page, None, false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_page_seeds_the_whole_visible_list() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: false }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1", "ws-2", "ws-3"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_full_read_falls_back_to_the_page() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: true }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
     }
 }

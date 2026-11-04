@@ -16,7 +16,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{enum_from_db, enum_to_db, Store};
+use crate::{enum_from_db, enum_to_db, AgentSessionSummary, FullAgentSessionRow, Store};
 
 mod review_context_enrollment;
 pub use review_context_enrollment::{
@@ -49,7 +49,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted";
+    harness_features, retired_at, notifications_muted, pinned";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -72,6 +72,26 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
     s.message_count, s.assistant_message_count, s.conversation_bytes \
     FROM agent_session s \
     WHERE s.workspace_id = ?";
+
+/// Bounded probe behind [`Store::agent_has_assistant_message`], extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement. It
+/// must stay a single seek of `idx_agent_message_agent_role_seq` (0064): the
+/// per-turn first-turn naming check runs it on every turn, and the
+/// full-transcript read it replaced held read-pool connections for seconds
+/// on long-lived agents.
+pub(crate) const AGENT_HAS_ASSISTANT_MESSAGE_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant')";
+
+/// Bounded probe behind [`Store::agent_has_assistant_after_last_user`]:
+/// whether any `assistant` row follows the agent's latest `user` row. Both
+/// lookups seek `idx_agent_message_agent_role_seq` (0064) — the inner one
+/// reads the highest `user` seq, the outer one tests for a later
+/// `assistant` seq — so the cost does not grow with the transcript. With no
+/// `user` row the inner `MAX` is NULL and the probe is false. Extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement.
+pub(crate) const AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ?1 AND role = 'assistant' AND seq > (\
+    SELECT MAX(seq) FROM agent_message WHERE agent_id = ?1 AND role = 'user'))";
 
 /// Two-phase search SQL behind [`Store::search_agent_messages_fts`],
 /// extracted so the monorepo#4127 plan-shape guard
@@ -799,8 +819,11 @@ pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
 /// [`Store::update_agent_session_metadata`]) never set or clear them, so a
 /// caller's stale snapshot cannot erase a newer value or bring back an old
 /// one (PROTOCOL §5.54 shared quota state).
-const DAEMON_OWNED_METADATA_KEYS: [&str; 2] =
-    [MANUAL_CHOICE_METADATA_KEY, PROVIDER_RETURN_METADATA_KEY];
+const DAEMON_OWNED_METADATA_KEYS: [&str; 3] = [
+    MANUAL_CHOICE_METADATA_KEY,
+    PROVIDER_RETURN_METADATA_KEY,
+    intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+];
 
 /// The two binds a whole-document `metadata` write needs (see
 /// [`daemon_owned_preserving_metadata`]): the caller's document without the
@@ -844,16 +867,18 @@ fn daemon_owned_preserving_metadata(
     raw_doc: &str,
     keep_choice_if: &str,
 ) -> String {
-    let [choice, ret] = DAEMON_OWNED_METADATA_KEYS;
+    let [choice, ret, remote] = DAEMON_OWNED_METADATA_KEYS;
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
               AND json_type(metadata) = 'object' \
               AND (json_type(metadata, '$.{choice}') IS NOT NULL \
-                   OR json_type(metadata, '$.{ret}') IS NOT NULL) \
+                   OR json_type(metadata, '$.{ret}') IS NOT NULL \
+                   OR json_type(metadata, '$.{remote}') IS NOT NULL) \
              THEN json_patch({object_doc}, json_object(\
                  '{choice}', CASE WHEN ({keep_choice_if}) \
                                   THEN json(metadata -> '$.{choice}') END, \
-                 '{ret}', json(metadata -> '$.{ret}'))) \
+                 '{ret}', json(metadata -> '$.{ret}'), \
+                 '{remote}', json(metadata -> '$.{remote}'))) \
          ELSE {raw_doc} END"
     )
 }
@@ -1042,7 +1067,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 40-column `agent_session` insert value list onto `query`, in
+/// Bind the full 42-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1093,7 +1118,40 @@ fn bind_session_insert<'q>(
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
         .bind(&s.retired_at)
-        .bind(i64::from(s.notifications_muted)))
+        .bind(i64::from(s.notifications_muted))
+        .bind(i64::from(s.pinned)))
+}
+
+/// Per-session boolean user preferences. Each is written only by its narrow
+/// writer or an explicit patch in [`Store::update_agent_session_with_preferences`],
+/// never by the ordinary full-row update.
+#[derive(Clone, Copy)]
+enum SessionPreference {
+    NotificationsMuted,
+    Pinned,
+}
+
+impl SessionPreference {
+    /// Conditional single-column UPDATE binding `(value, id, workspace_id, value)`.
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => {
+                "UPDATE agent_session SET notifications_muted=? \
+                 WHERE id=? AND workspace_id=? AND notifications_muted != ?"
+            }
+            Self::Pinned => {
+                "UPDATE agent_session SET pinned=? \
+                 WHERE id=? AND workspace_id=? AND pinned != ?"
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => "set notifications muted",
+            Self::Pinned => "set pinned",
+        }
+    }
 }
 
 impl Store {
@@ -1103,7 +1161,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
-    pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
+    pub async fn insert_agent_session(&self, s: &impl FullAgentSessionRow) -> Result<()> {
         self.insert_agent_session_with_task_graph(s, false).await
     }
 
@@ -1115,7 +1173,7 @@ impl Store {
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
     pub async fn insert_agent_session_with_task_graph(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         task_graph_enabled: bool,
     ) -> Result<()> {
         self.insert_agent_session_with_preferences(s, task_graph_enabled, false)
@@ -1128,10 +1186,11 @@ impl Store {
     /// Returns an error if either write fails; neither write is committed.
     pub async fn insert_agent_session_with_preferences(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         task_graph_enabled: bool,
         remember_specialist: bool,
     ) -> Result<()> {
+        let s = s.full_row();
         let mut lifecycle = self.repository_lifecycle_write().await?;
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         let mut tx = if remember_specialist {
@@ -1146,7 +1205,7 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
         match tx.as_mut() {
@@ -1195,9 +1254,10 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_agent_session_with_messages(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<()> {
+        let s = s.full_row();
         let pool = self.write_pool();
         // Clone messages into owned data for the retry closure.
         let owned_messages: Vec<OwnedBatchMessage> = messages
@@ -1224,7 +1284,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -1321,10 +1381,16 @@ impl Store {
 
     /// Fetch a session by id (with its message log), or `NotFound`.
     ///
+    /// This reads and hydrates EVERY `agent_message` row (tool payload bodies
+    /// included), so its cost grows with the conversation. Paths that only
+    /// need session columns use [`Store::get_agent_session_without_messages`]
+    /// (every column) or [`Store::get_agent_session_summary`] (no heavy
+    /// columns) instead.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
-    pub async fn get_agent_session(&self, id: &AgentId) -> Result<AgentSession> {
+    pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
@@ -1341,17 +1407,41 @@ impl Store {
         }
     }
 
+    /// Every persisted session column (the heavy `system_prompt`,
+    /// `image_blocks` and `initial_message` included) WITHOUT the message
+    /// log (`messages` stays empty), or `NotFound` — the bounded
+    /// `agent.getSession` read, which serves a budgeted transcript page
+    /// instead of hydrating the whole log, and the per-turn session lookup
+    /// (`require_agent_session`), which needs `system_prompt` but never the
+    /// transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session failed: {e}")))?;
+        match row {
+            Some(r) => map_session_row(&r),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
     /// Metadata-only session lookup: the session row WITHOUT its message log
     /// (`messages` stays empty), or `NotFound` — the single-session shape of
     /// [`Store::list_agent_session_summaries`]. Used by paths that never read
     /// message bodies (`agent.get` `AgentLite` projection, workspace scope
     /// checks — monorepo#958), skipping the full transcript hydration that
-    /// `get_agent_session` performs.
+    /// `get_agent_session_with_transcript` performs.
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
-    pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSession> {
+    pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSessionSummary> {
         let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
@@ -1367,7 +1457,7 @@ impl Store {
     /// Batched status projection: the persisted [`AgentStatus`] of every id
     /// in `ids`, in ONE `IN`-list query (the `agent.getSubscriptions`
     /// `agentStatuses` map — intent-hq/monorepo#3018). Replaces a per-agent
-    /// `get_agent_session` loop that hydrated each agent's full message log
+    /// `get_agent_session_with_transcript` loop that hydrated each agent's full message log
     /// just to read `status`, so the caller stays at one statement and zero
     /// transcript bytes regardless of how many agents are present. Ids
     /// without a session row are simply absent from the result, and a row
@@ -1477,8 +1567,8 @@ impl Store {
     /// Lightweight status-only lookup used by hot paths that just need the
     /// session's lifecycle status (e.g. the STAB-52 queue-drain gate). Selects
     /// a single column and skips the full message-log fetch that
-    /// `get_agent_session` performs. `NotFound` if the session is absent,
-    /// matching `get_agent_session`.
+    /// `get_agent_session_with_transcript` performs. `NotFound` if the session is absent,
+    /// matching `get_agent_session_with_transcript`.
     ///
     /// # Errors
     ///
@@ -1552,7 +1642,7 @@ impl Store {
 
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
-    /// full message-log fetch that `get_agent_session` performs.
+    /// full message-log fetch that `get_agent_session_with_transcript` performs.
     ///
     /// # Errors
     ///
@@ -1571,7 +1661,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn list_agent_sessions(
+    pub async fn list_agent_sessions_with_transcripts(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
@@ -1605,7 +1695,7 @@ impl Store {
     pub async fn list_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
@@ -1627,7 +1717,7 @@ impl Store {
     pub async fn list_agent_session_summaries_by_workspace(
         &self,
         workspace_ids: &[WorkspaceId],
-    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSession>>> {
+    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSessionSummary>>> {
         if workspace_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1664,7 +1754,7 @@ impl Store {
     pub async fn list_active_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NULL ORDER BY created_at"
@@ -1690,7 +1780,7 @@ impl Store {
     pub async fn list_retired_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
@@ -1744,7 +1834,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         scope: &AgentListRowScope,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = scoped_session_summaries_sql(scope);
         let (_, extra_bind) = scope_predicate(scope);
         let mut query = sqlx::query(&sql).bind(&workspace_id.0);
@@ -2936,15 +3026,16 @@ impl Store {
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None, false)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, None, false)
             .await
     }
 
-    /// Atomically update a session, optional manual specialist memory, and an
-    /// explicitly requested notification-mute patch. Ordinary row writes omit
-    /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// Atomically update a session, optional manual specialist memory, and
+    /// explicitly requested notification-mute / sidebar-pin patches. Ordinary
+    /// row writes omit the patches so stale session snapshots cannot revert
+    /// the user's toggles.
     /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
     /// choice: the same UPDATE clears the Auto-pin mark
     /// (`reasoning_effort_auto`) even when the value is unchanged, so no
@@ -2957,11 +3048,13 @@ impl Store {
     pub async fn update_agent_session_with_preferences(
         &self,
         workspace_id: &WorkspaceId,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        pinned: Option<bool>,
         explicit_effort: bool,
     ) -> Result<()> {
+        let s = s.full_row();
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Lightweight invariant check: read only workspace_id, model,
         // provider, acp_session_id (finding F3: no message fetch). Workspace
@@ -3022,7 +3115,8 @@ impl Store {
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
-        // such a patch can never revert the user's mute.
+        // such a patch can never revert the user's mute. `pinned` (0180) is
+        // the same kind of user toggle and is excluded on the same grounds.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -3043,7 +3137,7 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
         let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist || notifications_muted.is_some() {
+        let mut tx = if remember_specialist || notifications_muted.is_some() || pinned.is_some() {
             Some(
                 self.write_pool()
                     .begin()
@@ -3138,18 +3232,20 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         if let Some(mut tx) = tx {
-            if let Some(muted) = notifications_muted {
-                sqlx::query(
-                    "UPDATE agent_session SET notifications_muted=? \
-                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
-                )
-                .bind(i64::from(muted))
-                .bind(&s.id.0)
-                .bind(&workspace_id.0)
-                .bind(i64::from(muted))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            for (column, value) in [
+                (SessionPreference::NotificationsMuted, notifications_muted),
+                (SessionPreference::Pinned, pinned),
+            ] {
+                if let Some(value) = value {
+                    sqlx::query(column.update_sql())
+                        .bind(i64::from(value))
+                        .bind(&s.id.0)
+                        .bind(&workspace_id.0)
+                        .bind(i64::from(value))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
+                }
             }
             if remember_specialist {
                 crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
@@ -3183,18 +3279,51 @@ impl Store {
         id: &AgentId,
         muted: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=? \
-             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        self.set_agent_session_preference(
+            workspace_id,
+            id,
+            SessionPreference::NotificationsMuted,
+            muted,
         )
-        .bind(i64::from(muted))
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(i64::from(muted))
-        .execute(self.write_pool())
         .await
-        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
-        .rows_affected();
+    }
+
+    /// Set the session's sidebar `pinned` flag (0180) — the store side of
+    /// `agent.update { pinned }`. Same contract as
+    /// [`Store::set_agent_notifications_muted`]: returns `true` when the
+    /// stored value changed, never advances the activity timestamp, and is
+    /// (with explicit patches in mixed updates) the only writer of the column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_pinned(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        pinned: bool,
+    ) -> Result<bool> {
+        self.set_agent_session_preference(workspace_id, id, SessionPreference::Pinned, pinned)
+            .await
+    }
+
+    /// Narrow writer shared by the per-session user-preference flags.
+    async fn set_agent_session_preference(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        preference: SessionPreference,
+        value: bool,
+    ) -> Result<bool> {
+        let rows = sqlx::query(preference.update_sql())
+            .bind(i64::from(value))
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .bind(i64::from(value))
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("{} failed: {e}", preference.label())))?
+            .rows_affected();
         if rows == 0 {
             let exists = sqlx::query_scalar::<_, String>(
                 "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
@@ -4278,7 +4407,7 @@ impl Store {
         updated_at: &str,
     ) -> Result<bool> {
         // Conditional UPDATE: only modify rows where completion_report IS NOT NULL.
-        // This avoids the expensive get_agent_session call (which loads the full
+        // This avoids the expensive get_agent_session_with_transcript call (which loads the full
         // message log) at the start of every turn. rows_affected tells us whether
         // a report was present and cleared.
         let rows = sqlx::query(
@@ -4536,7 +4665,7 @@ impl Store {
         acp_session_id: &str,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
-        let current = self.get_agent_session(id).await?;
+        let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -4587,7 +4716,7 @@ impl Store {
         expected_old: &str,
         new_acp_session_id: &str,
     ) -> Result<String> {
-        let current = self.get_agent_session(id).await?;
+        let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -5068,8 +5197,8 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     )
 }
 
-pub(crate) fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_heavy_cols(row, None, None, None)
+pub(crate) fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSessionSummary> {
+    map_session_row_with_heavy_cols(row, None, None, None).map(AgentSessionSummary::from_session)
 }
 
 fn map_session_row_with_heavy_cols(
@@ -5134,6 +5263,7 @@ fn map_session_row_with_heavy_cols(
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
+        pinned: col::<i64>(row, "pinned")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -6089,6 +6219,43 @@ impl Store {
         })
     }
 
+    /// Whether `agent_id` has at least one persisted `assistant` message —
+    /// exactly `get_agent_messages(agent_id, None)?.iter().any(|m| m.role ==
+    /// "assistant")`, without reading or decoding the transcript. One seek of
+    /// the `(agent_id, role, seq)` index, so the cost does not grow with the
+    /// conversation; it answers the per-turn "is this the first turn?" check.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_message(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_MESSAGE_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant message failed: {e}")))?;
+        Ok(exists != 0)
+    }
+
+    /// Whether an `assistant` message follows `agent_id`'s latest `user`
+    /// message — exactly the transcript test "the last `user` row exists and
+    /// some later row is `assistant`" over `get_agent_messages(agent_id,
+    /// None)`, without reading or decoding the transcript. Two seeks of the
+    /// `(agent_id, role, seq)` index; it answers the quota-failover "was the
+    /// cut-short turn partially answered?" check at turn start.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_after_last_user(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant after last user failed: {e}")))?;
+        Ok(exists != 0)
+    }
+
     /// Read an agent's messages in chronological (`seq` ascending) order. When
     /// `limit` is set, returns the most-recent `limit` messages (still ordered
     /// oldest→newest), matching `agent.getConversation` (PROTOCOL §5.5).
@@ -6743,7 +6910,7 @@ impl Store {
     pub async fn list_child_agent_summaries(
         &self,
         parent_agent_id: &AgentId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session INDEXED BY idx_agent_parent \
              WHERE parent_agent_id = ? ORDER BY created_at"
@@ -6945,14 +7112,9 @@ impl Store {
     }
 
     /// Read an agent's user-role messages as lightweight index items in
-    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
-    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
-    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
-    /// the same expression the FTS index uses), and the preview truncated to
-    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
-    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
-    /// never transferred out of the database or decoded. `metadata` is
-    /// passed through verbatim when present.
+    /// chronological (`seq` ascending) order — the unpaged
+    /// `agent.listUserMessages` projection (PROTOCOL §5.5). Equivalent to
+    /// [`Self::get_agent_user_message_index_page`] with no page bound.
     ///
     /// # Errors
     ///
@@ -6963,9 +7125,52 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
+        Ok(self
+            .get_agent_user_message_index_page(agent_id, preview_chars, None)
+            .await?
+            .items)
+    }
+
+    /// Read an agent's user-role messages as lightweight index items in
+    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// projected inside SQL down to the classification fields
+    /// ([`project_user_message_index_metadata`]), so heavy keys such as an
+    /// event notification's `events` payload never leave the database
+    /// either (intent-hq/intent#8278).
+    ///
+    /// With a `page`, only the newest `page.limit` rows strictly older than
+    /// `page.before_seq` (all rows when `None`) are read, still returned
+    /// oldest→newest; [`UserMessageIndexPage::next_before_seq`] is the `seq`
+    /// of the oldest returned row when older rows remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation or a row decode
+    /// fails.
+    pub async fn get_agent_user_message_index_page(
+        &self,
+        agent_id: &AgentId,
+        preview_chars: usize,
+        page: Option<UserMessageIndexPageRequest>,
+    ) -> Result<UserMessageIndexPage> {
+        let metadata_sql = user_message_index_metadata_sql();
+        let (before_sql, order_sql) = match page {
+            Some(UserMessageIndexPageRequest {
+                before_seq: Some(_),
+                ..
+            }) => ("AND m.seq < ?", "ORDER BY m.seq DESC LIMIT ?"),
+            Some(_) => ("", "ORDER BY m.seq DESC LIMIT ?"),
+            None => ("", "ORDER BY m.seq ASC"),
+        };
         let sql = format!(
-            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
-                    m.metadata, m.created_at, \
+            "SELECT m.id, m.seq, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    {metadata_sql} AS metadata, m.created_at, \
                     (COALESCE(json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
                       AND (json_type(m.metadata, '$.resource') IS NOT NULL \
                         OR json_type(m.metadata, '$.availability') IS NOT NULL), 0) \
@@ -6976,32 +7181,56 @@ impl Store {
                            OR json_type(m.content, block.fullkey || '.messageMetadata.availability') IS NOT NULL)\
                      ) ELSE 0 END) AS qualified_monitor \
              FROM agent_message m \
-             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+             WHERE m.agent_id = ? AND m.role = 'user' {before_sql} {order_sql}"
         );
-        let rows = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql)
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
-            .bind(&agent_id.0)
+            .bind(&agent_id.0);
+        if let Some(page) = page {
+            if let Some(before_seq) = page.before_seq {
+                query = query.bind(before_seq);
+            }
+            // One extra row tells whether older history remains.
+            query = query.bind(i64::try_from(page.limit).unwrap_or(i64::MAX - 1) + 1);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
-        rows.iter()
-            .map(|row| {
-                let metadata: Option<serde_json::Value> =
-                    match col::<Option<String>>(row, "metadata")? {
-                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
-                            Error::Internal(format!("decode message metadata failed: {e}"))
-                        })?),
-                        None => None,
-                    };
-                Ok(UserMessageIndexItem {
-                    qualified_monitor: col(row, "qualified_monitor")?,
-                    id: col(row, "id")?,
-                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
-                    metadata,
-                    created_at: col(row, "created_at")?,
-                })
-            })
-            .collect()
+        let mut items = Vec::with_capacity(rows.len());
+        let mut seqs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let metadata = match col::<Option<String>>(row, "metadata")? {
+                Some(raw) => {
+                    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        Error::Internal(format!("decode message metadata failed: {e}"))
+                    })?;
+                    project_user_message_index_metadata(&value)
+                }
+                None => None,
+            };
+            seqs.push(col::<i64>(row, "seq")?);
+            items.push(UserMessageIndexItem {
+                qualified_monitor: col(row, "qualified_monitor")?,
+                id: col(row, "id")?,
+                preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
+                metadata,
+                created_at: col(row, "created_at")?,
+            });
+        }
+        let mut next_before_seq = None;
+        if let Some(page) = page {
+            if items.len() > page.limit {
+                items.truncate(page.limit);
+                seqs.truncate(page.limit);
+                next_before_seq = seqs.last().copied();
+            }
+            items.reverse();
+        }
+        Ok(UserMessageIndexPage {
+            items,
+            next_before_seq,
+        })
     }
 
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
@@ -7670,8 +7899,9 @@ pub struct ReplaceMessage<'a> {
 
 /// One row of the `agent.listUserMessages` index
 /// ([`Store::get_agent_user_message_index`]): the message id, a bounded
-/// plain-text preview, the verbatim metadata (when present), and the
-/// creation timestamp — never the full content blob.
+/// plain-text preview, the projected classification metadata
+/// ([`project_user_message_index_metadata`], when any field survives), and
+/// the creation timestamp — never the full content blob.
 #[derive(Debug, Clone)]
 pub struct UserMessageIndexItem {
     /// Whole-envelope classification only, never authorization. Kept internal
@@ -7681,6 +7911,138 @@ pub struct UserMessageIndexItem {
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+}
+
+/// A page bound for [`Store::get_agent_user_message_index_page`]: the newest
+/// `limit` user rows whose `seq` is strictly below `before_seq` (no bound
+/// when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessageIndexPageRequest {
+    pub limit: usize,
+    pub before_seq: Option<i64>,
+}
+
+/// The result of [`Store::get_agent_user_message_index_page`]: the items
+/// oldest→newest and, when a paged read left older rows unread, the `seq`
+/// to pass as the next page's `before_seq`.
+#[derive(Debug, Clone)]
+pub struct UserMessageIndexPage {
+    pub items: Vec<UserMessageIndexItem>,
+    pub next_before_seq: Option<i64>,
+}
+
+/// Top-level string metadata fields `agent.listUserMessages` serves: the
+/// authorship markers clients use to tell human rows from automated ones
+/// (PROTOCOL §5.5).
+const USER_MESSAGE_INDEX_STRING_KEYS: [&str; 4] =
+    ["type", "source", "fromAgentId", "fromPrincipalId"];
+
+/// `queueInfo` sub-fields `agent.listUserMessages` serves, with the JSON
+/// type each must have: the dequeue-wait note markers clients strip from
+/// previews.
+const USER_MESSAGE_INDEX_QUEUE_INFO_KEYS: [(&str, IndexValueKind); 3] = [
+    ("queuedAt", IndexValueKind::String),
+    ("waitedMs", IndexValueKind::Number),
+    ("batchId", IndexValueKind::String),
+];
+
+#[derive(Debug, Clone, Copy)]
+enum IndexValueKind {
+    String,
+    Number,
+}
+
+impl IndexValueKind {
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+        }
+    }
+
+    fn sql_types(self) -> &'static str {
+        match self {
+            Self::String => "('text')",
+            Self::Number => "('integer','real')",
+        }
+    }
+}
+
+/// Project persisted user-row metadata down to what `agent.listUserMessages`
+/// serves (PROTOCOL §5.5, intent-hq/intent#8278): the string-valued `type`,
+/// `source`, `fromAgentId` and `fromPrincipalId`, plus `queueInfo` narrowed
+/// to a string `queuedAt`, a numeric `waitedMs` and a string `batchId`.
+/// Every other key — notably an event notification's `events` payload — is
+/// dropped. `None` when nothing survives (including non-object metadata).
+#[must_use]
+pub fn project_user_message_index_metadata(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let source = metadata.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in USER_MESSAGE_INDEX_STRING_KEYS {
+        if let Some(value) = source.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(queue_info) = source
+        .get("queueInfo")
+        .and_then(serde_json::Value::as_object)
+    {
+        let mut projected = serde_json::Map::new();
+        for (key, kind) in USER_MESSAGE_INDEX_QUEUE_INFO_KEYS {
+            if let Some(value) = queue_info.get(key).filter(|v| kind.admits(v)) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        if !projected.is_empty() {
+            out.insert(
+                "queueInfo".to_string(),
+                serde_json::Value::Object(projected),
+            );
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+/// SQL expression pre-trimming `m.metadata` to the same fields as
+/// [`project_user_message_index_metadata`], so only the small projection
+/// leaves `SQLite`. Absent fields come out as JSON `null`; the Rust
+/// projection then drops them, so it stays the single source of truth.
+fn user_message_index_metadata_sql() -> String {
+    let field = |path: &str, types: &str| {
+        format!(
+            "CASE WHEN json_type(m.metadata, '{path}') IN {types} \
+             THEN json_extract(m.metadata, '{path}') END"
+        )
+    };
+    let mut args: Vec<String> = USER_MESSAGE_INDEX_STRING_KEYS
+        .iter()
+        .map(|key| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.{key}"), IndexValueKind::String.sql_types())
+            )
+        })
+        .collect();
+    let queue_args: Vec<String> = USER_MESSAGE_INDEX_QUEUE_INFO_KEYS
+        .iter()
+        .map(|(key, kind)| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.queueInfo.{key}"), kind.sql_types())
+            )
+        })
+        .collect();
+    args.push(format!(
+        "'queueInfo', CASE WHEN json_type(m.metadata, '$.queueInfo') = 'object' \
+         THEN json_object({}) END",
+        queue_args.join(", ")
+    ));
+    format!(
+        "CASE WHEN m.metadata IS NULL THEN NULL ELSE json_object({}) END",
+        args.join(", ")
+    )
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -8098,7 +8460,7 @@ mod tests {
             parent_agent_id: None,
             orphaned_only: false,
         };
-        let ids = |rows: &[AgentSession]| -> std::collections::BTreeSet<String> {
+        let ids = |rows: &[AgentSessionSummary]| -> std::collections::BTreeSet<String> {
             rows.iter().map(|s| s.id.0.clone()).collect()
         };
         let orphan_rows = store
@@ -8693,7 +9055,10 @@ mod tests {
                     .expect("set mute"),
                 changed
             );
-            let stored = store.get_agent_session(&agent).await.expect("reload");
+            let stored = store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload");
             assert_eq!(stored.notifications_muted, muted);
             assert_eq!(
                 stored.updated_at, old,
@@ -8710,7 +9075,10 @@ mod tests {
                 .await,
             Err(Error::NotFound(_))
         ));
-        let stored = store.get_agent_session(&agent).await.expect("reload");
+        let stored = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
         assert!(!stored.notifications_muted);
         assert_eq!(stored.updated_at, old);
     }
@@ -8731,7 +9099,10 @@ mod tests {
         let agent = AgentId("agent-muted-race".to_string());
         seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
 
-        let stale = store.get_agent_session(&agent).await.expect("load session");
+        let stale = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("load session");
         assert!(!stale.notifications_muted);
 
         assert!(store
@@ -8752,7 +9123,10 @@ mod tests {
             .update_agent_session(&ws, &stale)
             .await
             .expect("stale full-row update");
-        let after = store.get_agent_session(&agent).await.expect("reload");
+        let after = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
         assert!(
             after.notifications_muted,
             "full-row update must not clobber notifications_muted"
@@ -8764,7 +9138,7 @@ mod tests {
             .expect("unmute"));
         assert!(
             !store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("reload")
                 .notifications_muted
@@ -8775,6 +9149,95 @@ mod tests {
                 .await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// `set_agent_pinned` (0180) follows the mute contract: it reports whether
+    /// the flag changed, never advances the activity timestamp, is scoped to
+    /// the workspace, and a stale full-row `update_agent_session` carrying the
+    /// pre-toggle flag leaves the persisted pin untouched. An explicit patch in
+    /// a mixed update writes it alongside the row.
+    #[tokio::test]
+    async fn pinned_is_a_preference_that_survives_stale_full_row_update() {
+        let tmp = TempDb::new("test-agent-pinned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-pinned".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-pinned".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        let stale = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("load session");
+        assert!(!stale.pinned, "new sessions are unpinned");
+
+        for (pinned, changed) in [(true, true), (true, false)] {
+            assert_eq!(
+                store
+                    .set_agent_pinned(&ws, &agent, pinned)
+                    .await
+                    .expect("set pinned"),
+                changed
+            );
+            let stored = store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload");
+            assert!(stored.pinned);
+            assert_eq!(stored.updated_at, old, "a pin is not agent activity");
+        }
+
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        assert!(
+            store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload")
+                .pinned,
+            "full-row update must not clobber pinned"
+        );
+
+        let mut mixed = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
+        mixed.name = "Renamed".to_string();
+        mixed.pinned = false;
+        store
+            .update_agent_session_with_preferences(&ws, &mixed, false, None, Some(false), false)
+            .await
+            .expect("mixed update with pin patch");
+        let after = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
+        assert!(!after.pinned, "explicit patch unpins");
+        assert_eq!(after.name, "Renamed");
+        assert!(!after.notifications_muted, "mute untouched by a pin patch");
+
+        assert!(matches!(
+            store
+                .set_agent_pinned(&WorkspaceId("wrong-workspace".to_string()), &agent, true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .set_agent_pinned(&ws, &AgentId("agent-missing".to_string()), true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(
+            !store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload")
+                .pinned
+        );
     }
 
     /// A muted session (`notifications_muted = 1`) never counts as unread:
@@ -8976,6 +9439,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -9061,6 +9525,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -9800,6 +10265,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -11805,7 +12271,10 @@ mod tests {
             .await
             .expect("swap");
         assert_eq!(canonical, "acp-2");
-        let sess = store.get_agent_session(&agent_id).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-2"));
         let rows = store
             .get_workspace_agent_usage_data(&ws_id)
@@ -11962,7 +12431,10 @@ mod tests {
             .set_acp_session_id(&ws_id, &first_set, "acp-first")
             .await
             .expect("first set");
-        let sess = store.get_agent_session(&first_set).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&first_set)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-first"));
 
         // Replace with nothing stored: sets the id and folds the snapshot.
@@ -12216,7 +12688,10 @@ mod tests {
             .expect("commit probe txn");
         drop(conn);
 
-        let sess = store.get_agent_session(&agent_id).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-current"));
         let rows = store
             .get_workspace_agent_usage_data(&ws_id)
@@ -12457,7 +12932,7 @@ mod tests {
             .is_none());
         assert_eq!(
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .reasoning_effort
@@ -12487,7 +12962,10 @@ mod tests {
         session.reasoning_effort = Some("high".to_string());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&agent_id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(full.reasoning_effort.as_deref(), Some("high"));
         let summary = store
             .get_agent_session_summary(&agent_id)
@@ -12500,7 +12978,10 @@ mod tests {
             .update_agent_session(&ws_id, &session)
             .await
             .expect("update");
-        let cleared = store.get_agent_session(&agent_id).await.expect("get");
+        let cleared = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(cleared.reasoning_effort, None, "cleared on update");
     }
 
@@ -12529,7 +13010,10 @@ mod tests {
         session.effort_levels = Some(levels.clone());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&agent_id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(full.effort_levels.as_deref(), Some(levels.as_slice()));
         let summary = store
             .get_agent_session_summary(&agent_id)
@@ -12549,7 +13033,10 @@ mod tests {
             .await
             .expect("set changed");
         assert!(changed, "different set must report a change");
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.effort_levels.as_deref(), Some(with_max.as_slice()));
 
         // The full-row update excludes the column — a stale in-memory session
@@ -12558,7 +13045,10 @@ mod tests {
             .update_agent_session(&ws_id, &session)
             .await
             .expect("full-row update");
-        let preserved = store.get_agent_session(&agent_id).await.expect("get");
+        let preserved = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             preserved.effort_levels.as_deref(),
             Some(with_max.as_slice()),
@@ -12571,7 +13061,10 @@ mod tests {
             .await
             .expect("clear");
         assert!(cleared, "clearing a present set is a change");
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.effort_levels, None);
         let cleared_again = store
             .set_agent_effort_levels(&ws_id, &agent_id, None, &now_iso())
@@ -12667,7 +13160,10 @@ mod tests {
 
         let store = Store::open(&tmp).await.expect("reopen applies 0080");
         for (id, (model, _, expected_model, expected_effort)) in ids.iter().zip(&cases) {
-            let session = store.get_agent_session(id).await.expect("get");
+            let session = store
+                .get_agent_session_with_transcript(id)
+                .await
+                .expect("get");
             assert_eq!(
                 session.model.as_deref(),
                 Some(*expected_model),
@@ -12906,13 +13402,16 @@ mod tests {
 
         // Full-row hydration (0113 already ran on the empty table, so only
         // the backstop can split this row).
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.model.as_deref(), Some("claude-opus-4"));
         assert_eq!(read.provider.as_deref(), Some("anthropic"));
 
         // Summary hydration goes through the same mapping.
         let listed = store
-            .list_agent_sessions(&ws_id)
+            .list_agent_sessions_with_transcripts(&ws_id)
             .await
             .expect("list")
             .into_iter()
@@ -13006,7 +13505,10 @@ mod tests {
 
         // Round trip: reads surface the split identity; persisting it back
         // must pass the guard even though the raw row is still compound.
-        let mut read = store.get_agent_session(&agent_id).await.expect("get");
+        let mut read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.provider.as_deref(), Some("anthropic"));
         read.name = "Renamed".to_string();
         store
@@ -13722,6 +14224,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session)
@@ -13739,11 +14242,11 @@ mod tests {
             .await
             .expect("append message");
 
-        // list_agent_sessions should include messages
+        // list_agent_sessions_with_transcripts should include messages
         let full = store
-            .list_agent_sessions(&ws_id)
+            .list_agent_sessions_with_transcripts(&ws_id)
             .await
-            .expect("list_agent_sessions");
+            .expect("list_agent_sessions_with_transcripts");
         assert_eq!(full.len(), 1, "should have one session");
         assert_eq!(
             full[0].system_prompt.as_deref(),
@@ -13762,7 +14265,7 @@ mod tests {
         assert_eq!(
             full[0].messages.len(),
             1,
-            "list_agent_sessions should include messages"
+            "list_agent_sessions_with_transcripts should include messages"
         );
 
         // list_agent_session_summaries should exclude messages
@@ -13874,6 +14377,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -13967,7 +14471,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap()
                 .reasoning_effort,
@@ -13998,9 +14502,12 @@ mod tests {
             }
         };
         assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
-        let mut row = store.get_agent_session(&agent_id).await.unwrap();
+        let mut row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, false)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -14010,7 +14517,7 @@ mod tests {
         );
         row.reasoning_effort = Some("low".into());
         store
-            .update_agent_session_with_preferences(&ws_id, &row, false, None, true)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, true)
             .await
             .unwrap();
         assert_eq!(
@@ -14089,7 +14596,10 @@ mod tests {
             )
             .await
             .unwrap());
-        let got = store.get_agent_session(&agent_id).await.unwrap();
+        let got = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         assert_eq!(got.provider.as_deref(), Some("codex"));
         assert_eq!(got.model.as_deref(), Some("gpt-5"), "set model kept");
         assert_eq!(got.reasoning_effort.as_deref(), Some("medium"));
@@ -14134,7 +14644,10 @@ mod tests {
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
         // The read backstop splits the seeded compound id on read.
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.model.as_deref(), Some("default"));
         assert_eq!(unchanged.provider.as_deref(), Some("mock"));
 
@@ -14150,7 +14663,10 @@ mod tests {
             )
             .await
             .expect("intentional cross-provider switch");
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.model.as_deref(), Some("grok-4-fast"));
         assert_eq!(after.provider.as_deref(), Some("grok"));
         assert_eq!(after.updated_at, updated_at);
@@ -14202,7 +14718,10 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
         assert_eq!(unchanged.model.as_deref(), Some("opus4.7"));
         assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
@@ -14220,7 +14739,10 @@ mod tests {
             .await
             .expect("stale expected provider is not an error");
         assert!(!landed, "compare-and-set must not land on a mismatch");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
         assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
 
@@ -14237,7 +14759,10 @@ mod tests {
             .await
             .expect("re-home after first real use");
         assert!(landed);
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.provider.as_deref(), Some("codex"));
         assert_eq!(after.model, None, "target CLI default clears the model");
         assert_eq!(after.reasoning_effort, None, "effort never carries over");
@@ -14257,7 +14782,10 @@ mod tests {
             .await
             .expect("re-home with a settings default model");
         assert!(landed);
-        let with_model = store.get_agent_session(&agent_id).await.expect("get");
+        let with_model = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(with_model.provider.as_deref(), Some("mock"));
         assert_eq!(with_model.model.as_deref(), Some("m-1"));
 
@@ -14291,7 +14819,10 @@ mod tests {
                 .expect("NULL column re-home"),
             "None matches a NULL column"
         );
-        let after = store.get_agent_session(&null_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&null_id)
+            .await
+            .expect("get");
         assert_eq!(after.provider.as_deref(), Some("mock"));
     }
 
@@ -14349,7 +14880,10 @@ mod tests {
             .await
             .expect("stale expected provider is not an error");
         assert!(!landed, "compare-and-set must not land on a mismatch");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
 
         // Same provider, but the model moved since the caller's read: no
@@ -14368,7 +14902,10 @@ mod tests {
             .await
             .expect("stale expected model is not an error");
         assert!(!landed, "compare-and-set covers the model too");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
 
         let updated_at = now_iso();
@@ -14386,7 +14923,10 @@ mod tests {
             .await
             .expect("failover after first real use");
         assert!(landed);
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.provider.as_deref(), Some("claude-code@pbackup"));
         assert_eq!(after.model.as_deref(), Some("opus"), "model id unchanged");
         assert_eq!(after.reasoning_effort.as_deref(), Some("high"));
@@ -14424,7 +14964,7 @@ mod tests {
             let agent_id = agent_id.clone();
             async move {
                 store
-                    .get_agent_session(&agent_id)
+                    .get_agent_session_with_transcript(&agent_id)
                     .await
                     .expect("get")
                     .metadata
@@ -14456,7 +14996,10 @@ mod tests {
 
         choose(&store, "opus", "t1").await;
         assert_eq!(token(&store).await.as_deref(), Some("t1"));
-        let row = store.get_agent_session(&agent_id).await.expect("get");
+        let row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(row.metadata.as_ref().unwrap()["keep"], 1, "other keys kept");
         // M1 -> M2 -> M1: the stale t1 reader clears nothing.
         choose(&store, "sonnet", "t2").await;
@@ -14512,11 +15055,76 @@ mod tests {
             )
             .await
             .expect("failover"));
-        let row = store.get_agent_session(&agent_id).await.expect("get");
+        let row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         let metadata = row.metadata.expect("metadata");
         assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
         assert_eq!(metadata["providerReturn"]["home"], "claude-code");
         assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Remote launch: the `remotePlacement` projection mirror is daemon-owned.
+    /// A whole-document metadata write (`agent.update` and friends) can
+    /// neither erase it nor forge one.
+    #[tokio::test]
+    async fn whole_document_writes_cannot_set_or_clear_remote_placement() {
+        use intent_core::now_iso;
+        use intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-remote-placement".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let placed = AgentId("agent-placed".to_string());
+        let local = AgentId("agent-local".to_string());
+        for id in [&placed, &local] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &placed,
+                REMOTE_PLACEMENT_METADATA_KEY,
+                r#"{"nodeId":"node-1"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("set view");
+        let forged =
+            serde_json::json!({ "keep": 1, REMOTE_PLACEMENT_METADATA_KEY: { "nodeId": "forged" } });
+        for id in [&placed, &local] {
+            store
+                .update_agent_session_metadata(&ws_id, id, Some(&forged), &now_iso())
+                .await
+                .expect("whole write");
+        }
+        let placed_meta = store
+            .get_agent_session_with_transcript(&placed)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(
+            placed_meta[REMOTE_PLACEMENT_METADATA_KEY]["nodeId"],
+            "node-1"
+        );
+        assert_eq!(placed_meta["keep"], 1);
+        let local_meta = store
+            .get_agent_session_with_transcript(&local)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(local_meta.get(REMOTE_PLACEMENT_METADATA_KEY).is_none());
+        assert_eq!(local_meta["keep"], 1);
     }
 
     /// Review of intentd#2624: whole-document writes keep the daemon-owned
@@ -14550,7 +15158,10 @@ mod tests {
                 session.provider = Some("claude-code".to_string());
                 session.model = Some("opus".to_string());
                 store.insert_agent_session(&session).await.expect("insert");
-                let mut stale = store.get_agent_session(&agent_id).await.expect("get");
+                let mut stale = store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get");
                 stale.metadata = Some(shape.clone());
                 store
                     .set_agent_session_model_choice(
@@ -14590,7 +15201,7 @@ mod tests {
                         .expect("metadata write");
                 }
                 let metadata = store
-                    .get_agent_session(&agent_id)
+                    .get_agent_session_with_transcript(&agent_id)
                     .await
                     .expect("get")
                     .metadata
@@ -14610,7 +15221,10 @@ mod tests {
         session.provider = Some("claude-code".to_string());
         session.model = Some("opus".to_string());
         store.insert_agent_session(&session).await.expect("insert");
-        let mut stale = store.get_agent_session(&agent_id).await.expect("get");
+        let mut stale = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         stale.metadata = Some(serde_json::json!({
             "keep": 1,
             MANUAL_CHOICE_METADATA_KEY: "old",
@@ -14634,7 +15248,7 @@ mod tests {
                     .expect("metadata write");
             }
             let metadata = store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .expect("get")
                 .metadata
@@ -14664,7 +15278,7 @@ mod tests {
             .await
             .expect("update");
         let metadata = store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("get")
             .metadata
@@ -14706,7 +15320,12 @@ mod tests {
         let get = || {
             let store = store.clone();
             let agent_id = agent_id.clone();
-            async move { store.get_agent_session(&agent_id).await.expect("get") }
+            async move {
+                store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get")
+            }
         };
         let token_in = |s: &AgentSession| {
             s.metadata.as_ref().and_then(|m| {
@@ -14879,7 +15498,10 @@ mod tests {
             )
             .await
             .unwrap());
-        let after = store.get_agent_session(&agent_id).await.unwrap();
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         assert_eq!(after.provider.as_deref(), Some("claude-code@pb"));
         let metadata = after.metadata.unwrap();
         assert_eq!(metadata["providerReturn"]["awayOn"], "claude-code@pb");
@@ -14923,7 +15545,7 @@ mod tests {
             .await
             .unwrap());
         let cleared = store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap()
             .metadata
@@ -15107,7 +15729,10 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.system_prompt, None);
 
         // A model switch lands mid-spawn (after the spawn path read its
@@ -15130,7 +15755,10 @@ mod tests {
             .set_agent_session_system_prompt(&ws_id, &agent_id, "assembled prompt")
             .await
             .expect("persist system prompt");
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.system_prompt.as_deref(), Some("assembled prompt"));
         // The read backstop splits the compound id; the prefix wins over the
         // stored provider column.
@@ -15214,6 +15842,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -15312,6 +15941,271 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The per-turn first-turn probe must stay one index seek: a plan that
+    /// scans `agent_message` (or reads its rows instead of the covering
+    /// index) would bring back the per-turn cost that grew with the transcript.
+    #[tokio::test]
+    async fn agent_has_assistant_message_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-probe-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_MESSAGE_SQL}"
+        ))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert!(!message_steps.is_empty(), "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_message` agrees with the full-transcript check it
+    /// replaced across every write path: append, the `agent.replaceMessages`
+    /// swap, the `agent.editAndRegenerate` truncation, and a direct role
+    /// UPDATE — and is scoped to one agent.
+    #[tokio::test]
+    async fn agent_has_assistant_message_tracks_transcript_writes() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-probe");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-probe".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-probe".to_string());
+        let other = AgentId("agent-assistant-probe-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let full_check = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read")
+                    .iter()
+                    .any(|m| m.role == "assistant")
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        store
+            .append_agent_message(&agent, "assistant", &text("a1"), &ts)
+            .await
+            .expect("append assistant");
+        let user2 = store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+        assert!(
+            !store.agent_has_assistant_message(&other).await.unwrap(),
+            "another agent's assistant rows do not count"
+        );
+
+        // Truncation that keeps an earlier assistant reply.
+        store
+            .truncate_agent_messages_from(&agent, user2.seq)
+            .await
+            .expect("truncate after first reply");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // Truncation back to the first user message drops every reply.
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        // The replaceMessages swap.
+        let reply = text("swapped");
+        store
+            .replace_agent_messages(
+                &agent,
+                &[ReplaceMessage {
+                    role: "assistant",
+                    content: &reply,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // A direct role UPDATE.
+        sqlx::query("UPDATE agent_message SET role = 'user' WHERE agent_id = ?")
+            .bind(&agent.0)
+            .execute(store.write_pool())
+            .await
+            .expect("direct update");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+    }
+
+    /// The quota-failover partial-turn probe must stay index seeks: both
+    /// the `MAX(seq)` user lookup and the later-assistant test read only the
+    /// `(agent_id, role, seq)` covering index, never `agent_message` rows.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-after-user-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL}"
+        ))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert_eq!(message_steps.len(), 2, "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_after_last_user` agrees with the transcript scan
+    /// it replaced: no rows, a trailing user row, an answered turn, system
+    /// rows interleaved after the user row, truncation, and per-agent scope.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_matches_transcript_scan() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-after-user");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-after-user".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-after-user".to_string());
+        let other = AgentId("agent-assistant-after-user-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let scan = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let messages = store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read");
+                messages
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                    .is_some_and(|i| messages[i + 1..].iter().any(|m| m.role == "assistant"))
+            }
+        };
+        let check = |expected: bool| {
+            let store = store.clone();
+            let agent = agent.clone();
+            async move {
+                assert_eq!(
+                    store
+                        .agent_has_assistant_after_last_user(&agent)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(scan(&store, &agent).await, expected);
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("greeting"), &ts)
+            .await
+            .expect("append assistant with no user");
+        check(false).await;
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "system", &text("model changed"), &ts)
+            .await
+            .expect("append system");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("partial"), &ts)
+            .await
+            .expect("append assistant");
+        check(true).await;
+        assert!(
+            !store
+                .agent_has_assistant_after_last_user(&other)
+                .await
+                .unwrap(),
+            "another agent's rows do not count"
+        );
+        store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        check(true).await;
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        check(false).await;
     }
 
     /// Recompute one session's stats live from `agent_message` — the ground
@@ -15614,7 +16508,7 @@ mod tests {
 
     /// `get_agent_user_message_index` (`agent.listUserMessages`, §5.5)
     /// returns only user-role rows, oldest→newest, with previews bounded to
-    /// the requested char count and metadata passed through verbatim; other
+    /// the requested char count and metadata projected; other
     /// roles are excluded in SQL and an empty/unknown agent yields an empty
     /// index.
     #[tokio::test]
@@ -15775,8 +16669,8 @@ mod tests {
         );
         assert_eq!(
             items[1].metadata,
-            Some(serde_json::json!({"automated": true, "source": "hook"})),
-            "metadata passes through verbatim"
+            Some(serde_json::json!({"source": "hook"})),
+            "metadata is projected to the classification fields"
         );
         assert_eq!(
             items[2].preview.chars().count(),
@@ -15803,6 +16697,186 @@ mod tests {
             .await
             .expect("empty index")
             .is_empty());
+    }
+
+    /// Regression for intent-hq/intent#8278: a busy coordinator's
+    /// event-notification rows carry whole event payloads in
+    /// `metadata.events`, which made the index ~20 MB. The index serves only
+    /// the classification fields, trimmed inside SQL, and the SQL pre-trim
+    /// agrees with the Rust projection on every shape.
+    #[tokio::test]
+    async fn get_agent_user_message_index_projects_heavy_metadata() {
+        let tmp = TempDb::new("index-metadata-projection");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-projection".into());
+        let agent = AgentId("agent-index-projection".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let report = "r".repeat(64 * 1024);
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "event_notification",
+                    "events": [{"type": "agent:reportToParent", "report": report}],
+                    "queueInfo": {
+                        "queuedAt": "2026-11-01T07:01:11Z",
+                        "waitedMs": 6200,
+                        "batchId": "b-1",
+                        "queuedMessageId": "q-1",
+                        "extra": {"big": report},
+                    },
+                }),
+                Some(serde_json::json!({
+                    "type": "event_notification",
+                    "queueInfo": {"queuedAt": "2026-11-01T07:01:11Z", "waitedMs": 6200, "batchId": "b-1"},
+                })),
+            ),
+            (
+                serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1", "model": "m"}),
+                Some(
+                    serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1"}),
+                ),
+            ),
+            (
+                serde_json::json!({"type": 7, "source": {"nested": true}, "queueInfo": {"queuedAt": 1, "waitedMs": "x"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"queueInfo": {"queuedMessageId": "q-2"}}),
+                None,
+            ),
+            (serde_json::json!({"userAppMessageId": "app-1"}), None),
+            (
+                serde_json::json!({"queueInfo": {"waitedMs": 1.5}}),
+                Some(serde_json::json!({"queueInfo": {"waitedMs": 1.5}})),
+            ),
+            (serde_json::json!(["not", "an", "object"]), None),
+            (serde_json::json!("string metadata"), None),
+        ];
+        for (metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "row"}]),
+                    Some(metadata),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (metadata, expected)) in index.iter().zip(&cases) {
+            assert_eq!(&item.metadata, expected, "projection of {metadata}");
+            assert_eq!(
+                &project_user_message_index_metadata(metadata),
+                expected,
+                "Rust projection of {metadata}"
+            );
+        }
+        let encoded =
+            serde_json::to_string(&index.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>())
+                .unwrap();
+        assert!(
+            encoded.len() < 1024,
+            "heavy keys never leave the store: {encoded}"
+        );
+    }
+
+    /// A paged index read serves the newest `limit` rows oldest→newest, and
+    /// its `next_before_seq` walks older pages to the start without gaps or
+    /// repeats.
+    #[tokio::test]
+    async fn get_agent_user_message_index_page_walks_newest_first() {
+        let tmp = TempDb::new("index-paging");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-paging".into());
+        let agent = AgentId("agent-index-paging".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..7 {
+            let row = store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": format!("user {n}")}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+            ids.push(row.id);
+            store
+                .append_agent_message(
+                    &agent,
+                    "assistant",
+                    &serde_json::json!([{"type": "text", "text": "reply"}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let page = |before_seq| UserMessageIndexPageRequest {
+            limit: 3,
+            before_seq,
+        };
+        let first = store
+            .get_agent_user_message_index_page(&agent, 300, Some(page(None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            ids[4..].to_vec(),
+            "newest rows, oldest→newest"
+        );
+        let mut walked: Vec<String> = first.items.iter().map(|i| i.id.clone()).collect();
+        let mut cursor = first.next_before_seq;
+        let mut pages = 1;
+        while let Some(before_seq) = cursor {
+            let next = store
+                .get_agent_user_message_index_page(&agent, 300, Some(page(Some(before_seq))))
+                .await
+                .unwrap();
+            let mut older: Vec<String> = next.items.iter().map(|i| i.id.clone()).collect();
+            older.append(&mut walked);
+            walked = older;
+            cursor = next.next_before_seq;
+            pages += 1;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(walked, ids, "pages cover every user row exactly once");
+
+        let exact = store
+            .get_agent_user_message_index_page(
+                &agent,
+                300,
+                Some(UserMessageIndexPageRequest {
+                    limit: 7,
+                    before_seq: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.items.len(), 7);
+        assert_eq!(exact.next_before_seq, None, "no older rows remain");
     }
 
     /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
@@ -15878,7 +16952,7 @@ mod tests {
 
     /// `get_agent_session_summary` returns the session row with `messages`
     /// empty even when a transcript exists, and maps an unknown id to
-    /// `NotFound` (matching `get_agent_session`).
+    /// `NotFound` (matching `get_agent_session_with_transcript`).
     #[tokio::test]
     async fn get_agent_session_summary_excludes_messages() {
         use intent_core::now_iso;
@@ -15926,6 +17000,83 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// A summary omits `system_prompt` (and the other heavy columns), and the
+    /// only way to persist a change found through one is to re-read the full
+    /// row: `AgentSessionSummary` cannot reach `update_agent_session` (pinned
+    /// at compile time by `tests/agent_session_summary_api.rs`). This guards
+    /// the runtime half: the full-row re-read keeps `system_prompt`, so the
+    /// write-back cannot clear it.
+    #[tokio::test]
+    async fn summary_lacks_heavy_columns_and_full_row_write_back_keeps_system_prompt() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-summary-write".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep me".to_string());
+        session.initial_message = Some("first".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let summary = store
+            .get_agent_session_summary(&agent_id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.system_prompt, None, "summary omits system_prompt");
+        assert_eq!(
+            summary.initial_message, None,
+            "summary omits initial_message"
+        );
+
+        let mut full = store
+            .get_agent_session_without_messages(&agent_id)
+            .await
+            .expect("full row");
+        full.name = "Renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &full)
+            .await
+            .expect("update");
+
+        let stored = store
+            .get_agent_session_without_messages(&agent_id)
+            .await
+            .expect("re-read");
+        assert_eq!(stored.name, "Renamed");
+        assert_eq!(stored.system_prompt.as_deref(), Some("keep me"));
+        assert_eq!(stored.initial_message.as_deref(), Some("first"));
+    }
+
+    /// `AgentSessionSummary::from_session` strips the heavy columns and the
+    /// message log, so a summary built from a full row has the same shape as
+    /// a summary read.
+    #[test]
+    fn summary_from_session_strips_heavy_columns() {
+        let ts = intent_core::now_iso();
+        let ws_id = WorkspaceId("ws-summary-shape".to_string());
+        let agent_id = AgentId("agent-summary-shape".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("prompt".to_string());
+        session.initial_message = Some("first".to_string());
+        session.image_blocks = Some(serde_json::json!([{"type": "image"}]));
+        let summary = AgentSessionSummary::from_session(session);
+        assert_eq!(summary.system_prompt, None);
+        assert_eq!(summary.initial_message, None);
+        assert_eq!(summary.image_blocks, None);
+        assert!(summary.messages.is_empty());
+        assert_eq!(summary.into_read_only_session().id, agent_id);
     }
 
     /// `get_agent_statuses` returns every requested id's persisted status in
@@ -16081,7 +17232,10 @@ mod tests {
             .await
             .expect("update metadata");
 
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(after.metadata, Some(metadata.clone()));
         assert_eq!(after.updated_at, later);
         assert_eq!(
@@ -16160,7 +17314,10 @@ mod tests {
                 .remove(&ws)
                 .unwrap(),
         ];
-        let full = store.list_agent_sessions(&ws).await.unwrap();
+        let full = store
+            .list_agent_sessions_with_transcripts(&ws)
+            .await
+            .unwrap();
         let mut individual = Vec::new();
         for session in &full {
             individual.push(store.get_agent_session_summary(&session.id).await.unwrap());
@@ -16172,7 +17329,15 @@ mod tests {
                 let original = full.iter().find(|s| s.id == row.id).unwrap();
                 assert_eq!(row.metadata, original.metadata);
                 let expected = original.metadata.as_ref().and_then(chief_prompt_version);
-                let lite = AgentLite::from_session(row, 0, None, None, None, None, None);
+                let lite = AgentLite::from_session(
+                    row.into_read_only_session(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 assert_eq!(lite.metadata.chief_prompt_version, expected);
                 assert_eq!(
                     serde_json::to_value(lite).unwrap()["metadata"]
@@ -16203,7 +17368,7 @@ mod tests {
         store.update_agent_session(&ws, &stale).await.unwrap();
         assert_eq!(
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .metadata
@@ -16224,7 +17389,7 @@ mod tests {
         stale.name = "Renamed by stale writer".into();
         stale.metadata.as_mut().unwrap()["unrelated"] = json!("preserved");
         store.update_agent_session(&ws, &stale).await.unwrap();
-        let after = store.get_agent_session(&id).await.unwrap();
+        let after = store.get_agent_session_with_transcript(&id).await.unwrap();
         assert_eq!(after.name, stale.name);
         assert_eq!(
             after.metadata,
@@ -16286,7 +17451,10 @@ mod tests {
             .await
             .expect("sibling write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
         assert_eq!(
@@ -16312,7 +17480,10 @@ mod tests {
             .await
             .expect("guard miss is not an error");
         assert!(!wrote, "stale expected value must not write");
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
             serde_json::json!("msg-1"),
@@ -16332,7 +17503,10 @@ mod tests {
             .await
             .expect("guard hit");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-2"));
         assert_eq!(
@@ -16361,7 +17535,10 @@ mod tests {
             .await
             .expect("legacy write");
         assert!(wrote);
-        let after = store.get_agent_session(&legacy).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&legacy)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
         assert_eq!(
@@ -16440,7 +17617,10 @@ mod tests {
             .await
             .expect("no-touch write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
             serde_json::json!("msg-1")
@@ -16463,7 +17643,10 @@ mod tests {
             .await
             .expect("guard miss is not an error");
         assert!(!wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(after.updated_at, pinned);
 
         // Default variant: `Some(ts)` still refreshes the column.
@@ -16480,7 +17663,10 @@ mod tests {
             .await
             .expect("stamping write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.updated_at, later,
             "updated_at: Some(ts) must refresh the column"
@@ -18057,7 +19243,7 @@ mod tests {
             .expect("insert seeded session");
         let stamped = read_id_column(&store, &seeded).await;
         let persisted = store
-            .get_agent_session(&seeded)
+            .get_agent_session_with_transcript(&seeded)
             .await
             .expect("reload seeded session");
         assert_eq!(persisted.messages.len(), 3);
@@ -19387,7 +20573,10 @@ mod tests {
         session.harness_features = Some(snapshot.clone());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&session.id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&session.id)
+            .await
+            .expect("get");
         assert_eq!(full.harness_version, "2.3");
         assert_eq!(full.harness_features, Some(snapshot.clone()));
         let summary = store
@@ -19423,7 +20612,10 @@ mod tests {
         .await
         .expect("raw legacy insert");
 
-        let full = store.get_agent_session(&session.id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&session.id)
+            .await
+            .expect("get");
         assert_eq!(full.harness_version, "1.0", "backfill pins 1.0");
         assert_eq!(full.harness_features, None, "legacy rows carry no snapshot");
         let summary = store
@@ -19516,6 +20708,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

@@ -672,6 +672,12 @@ impl Discovery {
         if background_deferred && result.is_err() {
             self.note_deferred_read(&key.repo);
         }
+        // The record this read just fetched is about to move the workspace
+        // PR pill; hand it to the monitor sweep too, so a monitor on the
+        // same PR cannot keep showing the old lifecycle until its own poll.
+        if let Ok(Value::Record(pr)) = &result {
+            services.observe_pr_record(&key.repo, pr);
+        }
         *entry = Some(Entry {
             started,
             finished: Some(Instant::now()),
@@ -788,7 +794,9 @@ impl Services {
         number: u64,
     ) -> Result<PullRequest> {
         let Some(scope) = sc.cache_scope() else {
-            return sc.get_pr(repo, number).await;
+            let pr = sc.get_pr(repo, number).await?;
+            self.observe_pr_record(repo, &pr);
+            return Ok(pr);
         };
         let Value::Record(pr) = self
             .pr_discovery

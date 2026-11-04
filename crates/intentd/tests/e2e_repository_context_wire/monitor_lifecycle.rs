@@ -35,7 +35,11 @@ async fn idle_model(
                 if let Ok(bytes) = std::fs::read(model) {
                     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
                         if value.as_array().unwrap().len() >= count
-                            && store.get_agent_session(agent).await.unwrap().status
+                            && store
+                                .get_agent_session_with_transcript(agent)
+                                .await
+                                .unwrap()
+                                .status
                                 == intent_core::AgentStatus::RuntimeIdle
                         {
                             assert_eq!(value.as_array().unwrap().len(), count);

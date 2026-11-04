@@ -18,6 +18,11 @@ use super::handle_message;
 
 struct FakeApi;
 
+/// `big:<n>` names a fake object of size `n` in the bounded-read tests.
+fn big_len(name: &str) -> Option<usize> {
+    name.strip_prefix("big:")?.parse().ok()
+}
+
 #[test]
 fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
     use intent_core::execution::{
@@ -164,8 +169,19 @@ impl WorkspaceApi for FakeApi {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
             }
+            if id.as_str() == "ws-plain" {
+                return Ok(Workspace {
+                    branch: String::new(),
+                    worktree_path: None,
+                    plain_folder: true,
+                    ..ws_with(&id)
+                });
+            }
             Ok(ws_with(&id))
         })
+    }
+    fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { id.as_str() == "ws-plain" })
     }
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
@@ -268,6 +284,8 @@ impl WorkspaceApi for FakeApi {
                 workspace: ws,
                 initial_agent: None,
                 proposal_origin: None,
+                notice: None,
+                initial_agent_launch_failure: None,
             })
         })
     }
@@ -496,6 +514,9 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("note".to_string()));
             }
             let mut note = sample_note(&workspace_id);
+            if note_id.as_str() == "huge" {
+                note.content = "x".repeat(600 * 1024);
+            }
             note.id = note_id;
             Ok(note)
         })
@@ -733,13 +754,70 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         asset: String,
     ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+        // `big:<n>` serves `n` base64 quads (3n decoded bytes).
         Box::pin(async move {
+            let data = big_len(&asset).map_or_else(|| "AAAA".to_string(), |n| "QUJD".repeat(n));
             Ok(ReadAssetResult {
                 asset_id: asset,
                 mime_type: "image/png".to_string(),
-                data: "AAAA".to_string(),
+                data,
                 size_kb: 1,
             })
+        })
+    }
+
+    fn read_asset_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "assetId": asset,
+                "mimeType": "image/png",
+                "content": format!("b64:{asset}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
+    }
+
+    fn git_show_file(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // `big:<n>` serves `n` bytes of text; anything else echoes its args.
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            let content = big_len(&file_path).map_or_else(
+                || format!("{scope}{file_path}@{git_ref}"),
+                |n| "x".repeat(n),
+            );
+            Ok(serde_json::json!({ "content": content }))
+        })
+    }
+
+    fn git_show_file_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(serde_json::json!({
+                "content": format!("b64:{scope}{file_path}@{git_ref}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
         })
     }
 
@@ -1720,6 +1798,9 @@ impl WorkspaceApi for FakeApi {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move {
+            if let Some(n) = big_len(&path) {
+                return Ok(Value::String("x".repeat(n)));
+            }
             let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
             Ok(Value::String(format!(
                 "{}:{scope}{path}",
@@ -1938,9 +2019,13 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: intent_core::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({
+                "window": [window.start_line, window.max_lines, window.start_offset],
+                "boundedDefault": bounded_default,
                 "id": note_id.as_str(), "title": "t", "content": "c",
                 "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
                 "sourceWorkspaceTitle": "T", "branch": "b", "lineCount": 1,
@@ -2636,6 +2721,87 @@ async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() 
     assert_eq!(
         v["error"]["data"],
         serde_json::json!({ "code": "base-ref-unresolvable", "baseRef": "no-such-ref" })
+    );
+}
+
+#[test]
+fn placement_unavailable_maps_to_the_documented_error() {
+    // The first `errors` case of monorepo
+    // docs/protocol/fixtures/nodes/platform-routing.json.
+    use intent_core::nodes::{NodeArch, NodeOs};
+    use intent_core::placement::{AgentPlatform, PlatformAvailability};
+    let failure = PlatformAvailability::new(
+        [AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64,
+        }],
+        [],
+        "2026-10-01T00:00:00Z".into(),
+    )
+    .unavailable(serde_json::from_str(r#"{"arch":"x86_64"}"#).unwrap());
+    let rpc = super::domain_to_rpc(intent_core::Error::PlacementUnavailable(Box::new(failure)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "No capacity for x86_64; available: none; supported: linux/x86_64"
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "placement-unavailable",
+            "requested": { "arch": "x86_64" },
+            "reason": "no-capacity",
+            "availablePlatforms": [],
+            "supportedPlatforms": [{ "os": "linux", "arch": "x86_64" }],
+            "availableOs": [],
+            "retryable": true,
+            "observedAt": "2026-10-01T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
+    use intent_core::machines::{MachineUpdateRequired, ModelUnavailable, UpdateSide};
+    let model = ModelUnavailable::new("claude", "opus", [], false);
+    let rpc = super::domain_to_rpc(intent_core::Error::ModelUnavailable(Box::new(model)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Model \"opus\" (claude) isn't available: no machine is exposed to this backend."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "model-unavailable",
+            "provider": "claude",
+            "model": "opus",
+            "machines": [],
+            "retryable": false
+        })
+    );
+
+    let update = MachineUpdateRequired {
+        machine_name: "mac-mini".into(),
+        machine_version: "0.11.0".into(),
+        backend_version: "0.12.0".into(),
+        update: UpdateSide::Machine,
+        hint: None,
+    };
+    let rpc = super::domain_to_rpc(intent_core::Error::MachineUpdateRequired(Box::new(update)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Update Intent on mac-mini (it runs 0.11.0; this backend needs 0.12.0 or newer)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "machine-update-required",
+            "machineVersion": "0.11.0",
+            "backendVersion": "0.12.0",
+            "update": "machine"
+        })
     );
 }
 
@@ -3497,6 +3663,7 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: Some(intent_core::CheckoutMode::Cow),
+        plain_folder: false,
     });
     assert_eq!(rpc.code, -32602);
     assert_eq!(
@@ -3506,10 +3673,176 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
         checkout_mode: None,
+        plain_folder: false,
     });
     assert_eq!(
         rpc.data,
         Some(serde_json::json!({ "code": "retire-unsupported" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+        plain_folder: true,
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "plainFolder": true }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.retire is not available in plain-folder workspaces"
+    );
+}
+
+/// An operation needing git or a forge on a plain-folder workspace (§5.1)
+/// carries `plain-folder-unsupported` with the refused operation.
+#[test]
+fn plain_folder_unsupported_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderUnsupported {
+        operation: "workspace.duplicate",
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-unsupported",
+            "operation": "workspace.duplicate",
+        }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.duplicate is not available in plain-folder workspaces"
+    );
+}
+
+/// Plain-folder create rejections (§5.1 "Plain-folder workspaces") carry the
+/// documented machine-readable `error.data`.
+#[test]
+fn plain_folder_errors_map_to_machine_readable_codes() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderInvalidParams(
+        "isNewRepo cannot be combined with plainFolder".to_string(),
+    ));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "invalid-params" }))
+    );
+    assert!(rpc.message.contains("isNewRepo"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+        intent_core::PlainFolderPathRejection {
+            reason: intent_core::PlainFolderPathReason::InsideGitRepo,
+            path: "/home/u/repo/docs".to_string(),
+            repository_root: Some("/home/u/repo".to_string()),
+        },
+    )));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-path-rejected",
+            "reason": "inside-git-repo",
+            "path": "/home/u/repo/docs",
+            "repositoryRoot": "/home/u/repo",
+        }))
+    );
+    assert!(rpc.message.contains("/home/u/repo"), "{}", rpc.message);
+
+    for (reason, wire) in [
+        (
+            intent_core::PlainFolderPathReason::InsideWorkspacesRoot,
+            "inside-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ContainsWorkspacesRoot,
+            "contains-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::NotADirectory,
+            "not-a-directory",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ParentMissing,
+            "parent-missing",
+        ),
+    ] {
+        let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+            intent_core::PlainFolderPathRejection {
+                reason,
+                path: "/p".to_string(),
+                repository_root: None,
+            },
+        )));
+        assert_eq!(
+            rpc.data,
+            Some(serde_json::json!({
+                "code": "plain-folder-path-rejected", "reason": wire, "path": "/p",
+            })),
+            "{wire}"
+        );
+    }
+}
+
+/// Explicit git and accept-changes mutations on a plain-folder workspace
+/// (§5.1) are refused at the front door with `plain-folder-unsupported`
+/// naming the method; the same call on a git workspace still dispatches.
+#[tokio::test]
+async fn plain_folder_git_mutations_are_refused_at_the_front_door() {
+    for (method, extra) in [
+        ("git.stage", r#","paths":["a.txt"]"#),
+        ("git.push", ""),
+        ("git.createBranch", r#","branchName":"topic""#),
+        (
+            "accept-changes.addRemote",
+            r#","remoteUrl":"https://github.com/o/r.git""#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-plain"{extra}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}: {v}");
+        assert_eq!(
+            v["error"]["data"],
+            serde_json::json!({ "code": "plain-folder-unsupported", "operation": method }),
+            "{method}"
+        );
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(format!(
+                "{method} is not available in plain-folder workspaces"
+            ))
+        );
+    }
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["a.txt"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ok.get("error").is_none(), "{ok}");
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): the key is refused
+/// with `-32602 { code: "invalid-params" }`.
+#[tokio::test]
+async fn workspace_update_rejects_plain_folder() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.update","params":{"workspaceId":"ws-1","plainFolder":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("plainFolder")),
+        "{v}"
     );
 }
 
@@ -3852,14 +4185,139 @@ async fn note_add_returns_bare_result_object() {
 }
 
 #[tokio::test]
-async fn note_list_tasks_returns_bare_array() {
+async fn note_list_tasks_returns_a_page() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
     )
     .await
     .unwrap();
-    assert!(v["result"].is_array());
-    assert_eq!(v["result"][0]["status"], serde_json::json!("todo"));
+    assert!(v["result"]["tasks"].is_array());
+    assert_eq!(v["result"]["tasks"][0]["status"], serde_json::json!("todo"));
+    assert_eq!(v["result"]["nextToken"], Value::Null);
+}
+
+/// Bounded reads write guard: a whole-content write to a note whose default
+/// read is cut needs `baseContentBytes`; small notes and guarded writes pass.
+#[tokio::test]
+async fn whole_content_writes_to_a_cut_note_need_base_content_bytes() {
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.setContent","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{msg}: {v}");
+        assert_eq!(v["error"]["data"]["code"], "content-base-required", "{msg}");
+        assert_eq!(v["error"]["data"]["contentBytes"], 600 * 1024, "{msg}");
+    }
+    // A metadata-only update and a write to a small note are not guarded.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","title":"T"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"n1","content":"short"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+}
+
+/// A default `note.get` of a note over the read budget is cut with the
+/// truncated-read markers.
+#[tokio::test]
+async fn note_get_cuts_a_note_over_the_budget() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"huge"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["note"]["contentTruncated"], true, "{v}");
+    assert_eq!(v["result"]["note"]["contentBytes"], 600 * 1024);
+    assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+}
+
+/// The cut `note.get` row carries `nextContentOffset`; following it with
+/// `contentOffset` reads the rest, so the whole note is recoverable.
+#[tokio::test]
+async fn note_get_content_cursor_reads_the_rest_of_a_cut_note() {
+    let mut content = String::new();
+    let mut offset: Option<u64> = None;
+    for _ in 0..10 {
+        let params = match offset {
+            Some(o) => format!(r#""workspaceId":"ws-1","noteId":"huge","contentOffset":{o}"#),
+            None => r#""workspaceId":"ws-1","noteId":"huge""#.to_string(),
+        };
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{{params}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        let note = &v["result"]["note"];
+        assert_eq!(
+            note["contentOffset"].as_u64(),
+            Some(offset.unwrap_or(0)),
+            "{v}"
+        );
+        content.push_str(note["content"].as_str().unwrap());
+        match note["nextContentOffset"].as_u64() {
+            Some(next) => offset = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(content, "x".repeat(600 * 1024));
+}
+
+/// A `contentOffset` that is not a positive integer inside the content is
+/// `-32602`.
+#[tokio::test]
+async fn note_get_rejects_a_bad_content_offset() {
+    for bad in ["0", "-1", "\"5\"", "614400", "999999999"] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{"workspaceId":"ws-1","noteId":"huge","contentOffset":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "contentOffset={bad}: {v}");
+    }
+}
+
+/// Bounded reads (§5.2): list reads page by default; `limit` must be a
+/// positive integer, `nextToken` a non-empty string minted for this list.
+#[tokio::test]
+async fn list_reads_validate_paging_params() {
+    for method in [
+        r#""note.list","params":{"workspaceId":"ws-1""#,
+        r#""note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1""#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":{method}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(v["result"]["nextToken"], Value::Null, "{method}: {v}");
+        for (param, message) in [
+            (r#""limit":0"#, "limit must be a positive integer"),
+            (r#""limit":"5""#, "limit must be a positive integer"),
+            (r#""nextToken":"""#, "nextToken must be a non-empty string"),
+            (r#""nextToken":7"#, "nextToken must be a non-empty string"),
+            (r#""nextToken":"garbage""#, "invalid nextToken"),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":{method},{param}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {param}: {v}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(message),
+                "{method} {param}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -6380,6 +6838,29 @@ async fn cross_workspace_methods_require_params() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
+
+    // readNote line window: positive integers flow through; others → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","startLine":3,"maxLines":20,"startOffset":7}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["window"], serde_json::json!([3, 20, 7]));
+    assert_eq!(v["result"]["boundedDefault"], serde_json::json!(true));
+    for bad in ["0", "-1", "1.5", "\"2\"", "true"] {
+        for key in ["startLine", "maxLines", "startOffset"] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","{key}":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{key}={bad}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(format!("{key} must be a positive integer"))
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -8126,4 +8607,341 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
         let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":invalid}).to_string()).await.unwrap();
         assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
+}
+
+/// `script.get` (§5.8 bounded reads): a definition whose `command` is over
+/// the read budget is served in parts (`commandOffset` in,
+/// `nextCommandOffset` out) that rebuild it exactly; bad offsets fail
+/// `-32602`.
+mod script_get_paging {
+    use intent_core::{BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    struct BigScript(String);
+
+    impl WorkspaceApi for BigScript {
+        fn script_get(&self, _: WorkspaceId, id: String) -> BoxFuture<'_, Result<Value>> {
+            let command = self.0.clone();
+            Box::pin(async move {
+                Ok(json!({ "id": id, "name": "big", "mode": "command", "command": command }))
+            })
+        }
+    }
+
+    async fn call(api: &BigScript, offset: Option<Value>) -> (Value, usize) {
+        let mut params = json!({ "workspaceId": "ws-1", "scriptId": "s-1" });
+        if let Some(offset) = offset {
+            params["commandOffset"] = offset;
+        }
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "script.get", "params": params })
+            .to_string();
+        let out = handle_message(api, &msg).await.expect("response");
+        (serde_json::from_str(&out).unwrap(), out.len())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_command_is_rebuilt_exactly_across_parts() {
+        let command = format!(
+            "echo '{}' # {}",
+            "\"".repeat(300_001),
+            "é😀\\".repeat(90_000)
+        );
+        let api = BigScript(command.clone());
+        let mut rebuilt = String::new();
+        let mut offset: Option<u64> = None;
+        let mut parts = 0;
+        loop {
+            let (v, frame) = call(&api, offset.map(Value::from)).await;
+            assert!(frame < 500 * 1024, "frame is {frame} bytes");
+            let row = &v["result"];
+            assert_eq!(row["commandTruncated"], true);
+            assert_eq!(row["commandBytes"], command.len());
+            assert_eq!(row["commandOffset"], offset.unwrap_or(0));
+            rebuilt.push_str(row["command"].as_str().unwrap());
+            parts += 1;
+            match row["nextCommandOffset"].as_u64() {
+                Some(next) => offset = Some(next),
+                None => break,
+            }
+        }
+        assert!(parts >= 3, "{parts} parts");
+        assert_eq!(rebuilt, command);
+    }
+
+    #[tokio::test]
+    async fn a_small_command_is_unchanged() {
+        let api = BigScript("make test".into());
+        let (v, _) = call(&api, None).await;
+        assert_eq!(v["result"]["command"], "make test");
+        assert!(v["result"].get("commandTruncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_command_offsets_are_invalid_params() {
+        let api = BigScript("aé".into());
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!("1"),
+            json!(1.5),
+            json!(2),
+            json!(3),
+            json!(9),
+        ] {
+            let (v, _) = call(&api, Some(bad.clone())).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "commandOffset {bad}");
+        }
+        let (v, _) = call(&api, Some(json!(1))).await;
+        assert_eq!(v["result"]["command"], "é");
+        assert_eq!(v["result"]["nextCommandOffset"], Value::Null);
+    }
+}
+
+/// Capped whole-object reads: the legacy shape when it fits, `too-large`
+/// without `maxBytes`, and a truncated reply with `maxBytes`.
+#[tokio::test]
+async fn whole_object_reads_are_bounded() {
+    let cap = 480_000_usize;
+    let req = |method: &str, params: Value| {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+            .to_string()
+    };
+    let big = format!("big:{cap}");
+
+    // file.read: bare string when it fits.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], "ws-1:a.txt");
+    // Over the cap without maxBytes: too-large (or the whole object when the
+    // switch serves it), never a shortened string.
+    let refuse = crate::router::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["code"], -32602, "{v:.200}");
+        assert_eq!(v["error"]["data"]["code"], "too-large");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap);
+        assert_eq!(v["error"]["data"]["maxBytes"], cap);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "file.readChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!("x".repeat(cap)),
+            "whole file"
+        );
+    }
+    // With maxBytes: an object with truncated and totalBytes.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big, "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(
+        v["result"]["content"].as_str().map(str::len),
+        Some(10_000 - 2)
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "ws-1:a.txt", "truncated": false, "totalBytes": 10 })
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 0 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+    assert_eq!(v["error"]["message"], "maxBytes must be a positive integer");
+
+    // git.showFile: { content } when it fits, the same bound otherwise.
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": "a.rs", "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "content": "a.rs@HEAD" }));
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["chunkMethod"], "git.showFileChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!({ "content": "x".repeat(cap) }),
+            "whole blob"
+        );
+    }
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD", "maxBytes": 999_999 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(v["result"]["content"].as_str().map(str::len), Some(cap - 2));
+    assert!(v.to_string().len() < 512_000);
+
+    // note.readAsset: whole, or without its bytes.
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": "a.png" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "AAAA");
+    assert!(v["result"].get("truncated").is_none());
+    let big_asset = format!("big:{}", cap / 4);
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap / 4 * 3);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "note.readAssetChunk");
+    } else {
+        assert_eq!(
+            v["result"]["data"],
+            serde_json::json!("QUJD".repeat(cap / 4)),
+            "whole asset"
+        );
+        assert!(v["result"].get("truncated").is_none());
+    }
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset, "maxBytes": cap }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "", "{v}");
+    assert_eq!(v["result"]["truncated"], true);
+    assert_eq!(v["result"]["totalBytes"], cap / 4 * 3);
+}
+
+#[tokio::test]
+async fn chunk_reads_route_offset_length_and_selector() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.showFileChunk","params":{"workspaceId":"ws-1","filePath":"a.rs","ref":":0","gitRootId":"root-1","offset":8,"length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:root-1:a.rs@:0:8:16", "bytesRead": 16, "size": 1000u64 })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.readAssetChunk","params":{"workspaceId":"ws-1","asset":"a.png","offset":4,"length":2}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["content"], "b64:a.png:4:2");
+    assert_eq!(v["result"]["mimeType"], "image/png");
+    for (method, params) in [
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","length":1}"#,
+        ),
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","offset":0}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","length":1}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","offset":0}"#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(v["error"]["code"], -32602, "{method} {params}: {v}");
+    }
+}
+
+#[test]
+fn git_diff_max_bytes_parses_the_opt_in_and_rejects_bad_values() {
+    use super::git_diff_max_bytes;
+    use serde_json::json;
+    let p = |v: Value| v.as_object().cloned().unwrap();
+    // Absent: the service applies the default (maximum) budget.
+    assert!(matches!(git_diff_max_bytes(&p(json!({}))), Ok(None)));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": null }))),
+        Ok(None)
+    ));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": 100_000 }))),
+        Ok(Some(100_000))
+    ));
+    for bad in [json!(0), json!(-1), json!("big"), json!(1.5)] {
+        let Err(err) = git_diff_max_bytes(&p(json!({ "maxBytes": bad }))) else {
+            panic!("maxBytes {bad} must be rejected");
+        };
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("maxBytes must be a positive integer"));
+    }
+}
+
+#[tokio::test]
+async fn git_diffs_rejects_malformed_max_bytes() {
+    for method in ["git.diffs", "git.branchDiff"] {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": { "workspaceId": WorkspaceId::new().as_str(), "baseRef": "main", "maxBytes": "x" },
+        });
+        let resp = handle_message(&FakeApi, &req.to_string()).await.unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602, "{method}: {v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("maxBytes"),
+            "{method}: {v}"
+        );
+    }
+}
+
+/// `remoteAuthor` is daemon-owned: a `script.create` param carrying it is
+/// refused `-32602 remote-script-author-readonly` from any caller.
+#[test]
+fn script_create_refuses_a_remote_author_param() {
+    let params = serde_json::json!({
+        "workspaceId": "ws", "name": "n", "command": "true", "mode": "command",
+        "remoteAuthor": { "agentId": "a", "nodeId": "n" },
+    });
+    let error = super::parse_script_create(params.as_object().unwrap()).unwrap_err();
+    let text = format!("{error:?}");
+    assert!(text.contains("remote-script-author-readonly"), "{text}");
+    assert!(text.contains("-32602"), "{text}");
 }

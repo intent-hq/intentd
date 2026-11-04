@@ -194,5 +194,6 @@ fn initialization_script(ws: &WorkspaceId, id: &str) -> intent_core::Script {
         purpose: intent_core::ScriptPurpose::Saved,
         archived_at: None,
         last_run: None,
+        remote_author: None,
     }
 }

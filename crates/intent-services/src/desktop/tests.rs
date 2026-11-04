@@ -1021,7 +1021,12 @@ async fn unknown_native_result_invalidates_and_is_never_retried() {
 #[tokio::test]
 async fn desktop_feature_is_frozen_per_session_and_release_is_always_available() {
     let h = Harness::new().await;
-    let mut session = h.services.store.get_agent_session(&h.agent).await.unwrap();
+    let mut session = h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .unwrap();
     assert!(h.services.session_agent_features(&session).desktop_control);
     let settings = h.services.settings_registry.as_ref().unwrap();
     settings
@@ -1274,17 +1279,21 @@ async fn failed_wake_storage_retains_outbox_without_duplicate_memory_deliveries(
     let pending = h.agent("startControl", json!({})).await.unwrap();
     let request = pending["requestId"].as_str().unwrap();
     let payload = json!({"type":"desktop_control","requestId":request,"outcome":"denied","state":{"status":"inactive"},"message":"denied"});
-    h.services
-        .store
-        .desktop_resolve_request(request, &h.workspace, &h.agent, "denied", &payload)
-        .await
-        .unwrap();
+    // Inject the storage failure BEFORE the outcome reaches the outbox: the
+    // startControl task and the watchdog flush the outbox in the background,
+    // and one landing between the resolve and the triggers would deliver the
+    // wake normally (a timing race, 15/20 under stress on a slower schema).
     for sql in [
         "CREATE TRIGGER reject_desktop_message BEFORE INSERT ON agent_message BEGIN SELECT RAISE(ABORT,'injected failure'); END",
         "CREATE TRIGGER reject_desktop_queue BEFORE INSERT ON agent_queue BEGIN SELECT RAISE(ABORT,'injected failure'); END",
     ] {
         sqlx::query(sql).execute(h.services.store.write_pool()).await.unwrap();
     }
+    h.services
+        .store
+        .desktop_resolve_request(request, &h.workspace, &h.agent, "denied", &payload)
+        .await
+        .unwrap();
     h.services.desktop_flush_outbox().await;
     assert_eq!(h.services.store.desktop_outbox().await.unwrap().len(), 1);
     h.services.desktop_flush_outbox().await;

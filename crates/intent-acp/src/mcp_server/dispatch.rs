@@ -182,6 +182,7 @@ impl WorkspaceMcpServer {
             self.is_sub_agent,
             self.workspace_api_timeout,
             pending.clone(),
+            self.frame_router.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -812,10 +813,19 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 /// runner's per-run timeout); bindings that bound a wait by the eval budget
 /// (`ws.script.run`) derive their ceiling from it, so every caller must pass
 /// its real budget.
+///
+/// `owner` is required: every frame runs with `Caller::Agent { owner }`
+/// bound, whatever scope the eval itself runs in. A hook run is daemon work
+/// (`Caller::Daemon`), but its `ws.*` calls act for the hook's owner, so
+/// every agent-only service check (the last-top-level retire guard,
+/// self-queue redaction, repository admission, …) holds from a hook exactly
+/// as it does in the owner's own turn — no per-method allowlist to keep in
+/// sync. Hook-only exceptions are capability removals in the runner's
+/// feature set, never a different identity.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
+    owner: AgentId,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
@@ -824,11 +834,12 @@ pub fn make_workspace_host_for_bridge(
     make_workspace_host_with_pending(
         api,
         workspace_id,
-        caller_agent_id,
+        Some(owner),
         turn_attachments,
         agent_features,
         is_sub_agent,
         eval_budget,
+        None,
         None,
     )
 }
@@ -853,6 +864,7 @@ fn make_workspace_host_with_pending(
     is_sub_agent: bool,
     eval_budget: Duration,
     pending: Option<PendingAttachments>,
+    router: Option<Arc<dyn super::HostFrameRouter>>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
@@ -863,6 +875,10 @@ fn make_workspace_host_with_pending(
         let registry = turn_attachments.clone();
         let features = features.clone();
         let pending = pending.clone();
+        let router = router.clone();
+        let caller_scope = caller_agent_id
+            .clone()
+            .map(|agent_id| intent_core::Caller::Agent { agent_id });
         // Take the frame's sequence number NOW — synchronously, while the JS
         // engine is invoking `host()` — so parallel calls
         // (`Promise.all([...])`) keep call order even when an earlier call's
@@ -873,18 +889,28 @@ fn make_workspace_host_with_pending(
             state.next_seq += 1;
             seq
         });
-        Box::pin(async move {
-            let result = workspace_host_dispatch(
-                api,
-                workspace_id,
-                caller,
-                registry,
-                &features,
-                is_sub_agent,
-                eval_budget,
-                arg,
-            )
-            .await;
+        let frame = async move {
+            let claimed = router.as_ref().and_then(|router| {
+                let method = arg.get("method").and_then(Value::as_str)?;
+                let args = arg.get("args").cloned().unwrap_or(Value::Null);
+                router.route(method, &args)
+            });
+            let result = match claimed {
+                Some(claimed) => claimed.await,
+                None => {
+                    workspace_host_dispatch(
+                        api,
+                        workspace_id,
+                        caller,
+                        registry,
+                        &features,
+                        is_sub_agent,
+                        eval_budget,
+                        arg,
+                    )
+                    .await
+                }
+            };
             match (result, &pending, seq) {
                 (Ok(mut value), Some(pending), Some(seq)) => {
                     collect_binding_attachments(&mut value, pending, seq);
@@ -892,7 +918,18 @@ fn make_workspace_host_with_pending(
                 }
                 (result, ..) => result,
             }
-        }) as BoxFuture<'static, std::result::Result<Value, String>>
+        };
+        // Bind the frame's agent as its caller (multiplayer w1) around the
+        // whole frame, routed or dispatched, so the identity a service sees
+        // is the host's agent no matter which scope invoked `host()`: the
+        // `workspace_api` turn already runs as that agent, and a hook run
+        // (`Caller::Daemon`) or remote-node call must not lend the frame a
+        // different identity. Work a binding spawns inherits it.
+        let frame: BoxFuture<'static, std::result::Result<Value, String>> = match caller_scope {
+            Some(caller) => Box::pin(intent_core::with_caller(caller, frame)),
+            None => Box::pin(frame),
+        };
+        frame
     })
 }
 
@@ -1196,3 +1233,7 @@ mod timeout_override_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_owner_scope_tests.rs"]
+mod owner_scope_tests;

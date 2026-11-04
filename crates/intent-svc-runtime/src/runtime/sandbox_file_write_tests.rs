@@ -109,6 +109,7 @@ async fn file_write_via_sandboxed_agent_is_contained() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     store
         .insert_agent_session(&agent)
@@ -131,7 +132,10 @@ async fn file_write_via_sandboxed_agent_is_contained() {
     };
 
     // Update agent session with sandbox path (simulates delegate flow)
-    let mut updated_agent = store.get_agent_session(&agent_id).await.unwrap();
+    let mut updated_agent = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     updated_agent.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
     updated_agent.updated_at = now_iso();
     store

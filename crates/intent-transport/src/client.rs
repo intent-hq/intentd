@@ -115,7 +115,7 @@ pub(crate) fn server_json(
     build_commit: Option<&str>,
     is_local: bool,
 ) -> Value {
-    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1, "workspaceLabels": 1, "secretRequests": 1, "workspaceAutoArchiveOptOut": 1 });
+    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1, "workspaceLabels": 1, "secretRequests": 1, "workspaceAutoArchiveOptOut": 1, "messageBlockPages": 1, "boundedReads": 1 });
     let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,
@@ -131,6 +131,42 @@ pub(crate) fn server_json(
             .insert("buildCommit".into(), build_commit.into());
     }
     server
+}
+
+/// Add the capabilities that depend on the running daemon to a successful
+/// hello `frame`: `startupStatus: 1` when the full composition tracks
+/// startup, `remoteMachines: 1` when this backend places agents on exposed
+/// machines (the remote feature, not node mode), together with
+/// `remoteInitialAgent: 1`: `workspace.create` accepts
+/// `initialAgent.placement`.
+pub(crate) fn with_runtime_capabilities(
+    frame: Option<String>,
+    startup_status: bool,
+    remote_machines: bool,
+) -> Option<String> {
+    if !startup_status && !remote_machines {
+        return frame;
+    }
+    frame.map(|frame| {
+        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
+        if value.get("result").is_some() {
+            let capabilities = &mut value["result"]["server"]["capabilities"];
+            if startup_status {
+                capabilities["startupStatus"] = json!(1);
+            }
+            if remote_machines {
+                capabilities["remoteMachines"] = json!(1);
+                capabilities["remoteInitialAgent"] = json!(1);
+                // Link traffic capture is served wherever exposed machines
+                // are: never in node mode.
+                capabilities["remoteLinkTraffic"] = json!(1);
+                // Remote agents' saved scripts run on their machines
+                // (nodeProtocol 8): advertised only with `remoteMachines`.
+                capabilities["remoteScripts"] = json!(1);
+            }
+        }
+        value.to_string()
+    })
 }
 
 /// A deliberately compiled test host can exercise the real negotiation path.

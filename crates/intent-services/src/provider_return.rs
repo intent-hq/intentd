@@ -439,7 +439,7 @@ impl Services {
     ) {
         let away = self
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_summary(agent_id)
             .await
             .ok()
             .and_then(|s| read_state(&s))
@@ -476,7 +476,11 @@ impl Services {
     /// the session read can predate a manual choice, even one of the same
     /// selection, and that choice's first turn tries it.
     pub(crate) async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
             return;
         };
         self.return_home_if_due_from(workspace_id, agent_id, session)
@@ -559,6 +563,16 @@ impl Services {
         let Some(current) = session.provider.clone().filter(|p| !p.trim().is_empty()) else {
             return;
         };
+        // A remote agent only goes home when home can run on its machine
+        // (`Services::remote_compatibility`); otherwise it stays away.
+        let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        )
+        .is_some();
+        if remote && !self.remote_agent_can_run(agent_id, &state.home).await {
+            return;
+        }
+        let previous_state = state.clone();
         let current_selection = provider_profiles::canonical_selection(&current);
         state.away_on = current_selection;
         state.returning = Some(ReturnMode::Timer);
@@ -580,6 +594,11 @@ impl Services {
             .await
             .unwrap_or(false);
         if landed {
+            // A remote agent's node replaces its run with one on home, or
+            // the move is undone (see `quota_failover`).
+            if remote {
+                self.note_remote_return_pending(agent_id, &session, &state.home, previous_state);
+            }
             self.invalidate_agent_list_cache(workspace_id);
             self.publish_agent_mutation_event(
                 workspace_id,
@@ -612,7 +631,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
             return;
         };
         self.avoid_exhausted_provider_from(workspace_id, agent_id, &session)
@@ -684,7 +707,7 @@ impl Services {
     /// the in-memory mark does not survive a daemon restart, the persisted
     /// state does. A no-op otherwise.
     pub(crate) async fn rearm_provider_return_if_home(&self, agent_id: &AgentId) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         let Some(state) = read_state(&session) else {
@@ -729,7 +752,7 @@ impl Services {
         {
             return;
         }
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         let Some(state) = read_state(&session) else {
@@ -822,7 +845,7 @@ impl Services {
         from: &str,
         to: &str,
     ) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         read_state(&session).is_some_and(|s| {

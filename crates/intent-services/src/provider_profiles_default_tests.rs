@@ -48,6 +48,7 @@ async fn list_reports_every_unrenamed_default_with_no_entries() {
                 "env": [],
                 "settingsFingerprint": "",
                 "activation": { "runningProcesses": 0 },
+                "remoteCompatible": true,
             })
         })
         .collect();

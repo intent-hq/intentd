@@ -2045,6 +2045,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2094,6 +2095,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2157,6 +2159,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2255,6 +2258,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .unwrap();
@@ -2461,7 +2465,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     assert_ne!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .status,
@@ -2630,7 +2634,12 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         "preempted_by_message"
     );
     let queue = mgr.services.queue_snapshot(&id);
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let failures = mgr
         .services
         .store
@@ -2699,6 +2708,7 @@ fn mock_handle() -> AgentHandle {
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            agent_tmp_dir: None,
             preparation_guard: None,
             cleanup_lease: None,
             cleanup_services: None,
@@ -3131,7 +3141,11 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
     assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
     assert!(!mgr.contains(&id), "the reap dropped the child handle");
     assert!(
-        mgr.services.store.get_agent_session(&id).await.is_ok(),
+        mgr.services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .is_ok(),
         "the reap keeps the session row (only the process dies)"
     );
 
@@ -3567,7 +3581,7 @@ async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
     let status_before = mgr
         .services
         .store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .unwrap()
         .status;
@@ -3583,7 +3597,12 @@ async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
     let after = mgr.services.store.get_workspace(&ws).await.unwrap();
     assert!(after.is_retired(), "row stays Retired: {:?}", after.status);
     assert!(!wt.exists(), "nothing provisioned");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, status_before, "session never went Active");
     assert_ne!(session.status, AgentStatus::Active);
 }
@@ -3736,7 +3755,12 @@ async fn retired_workspace_with_two_agents(
     b: &AgentId,
 ) -> std::path::PathBuf {
     seed_agent(mgr, ws, a).await;
-    let mut other = mgr.services.store.get_agent_session(a).await.unwrap();
+    let mut other = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(a)
+        .await
+        .unwrap();
     other.id = b.clone();
     other.name = "Reviewer".to_string();
     mgr.services
@@ -3813,10 +3837,18 @@ async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents
     );
     assert!(wt.join("README.md").is_file(), "revived");
     assert!(!has_pending_purge_notice(
-        &mgr.services.store.get_agent_session(&a).await.unwrap()
+        &mgr.services
+            .store
+            .get_agent_session_with_transcript(&a)
+            .await
+            .unwrap()
     ));
     assert!(has_pending_purge_notice(
-        &mgr.services.store.get_agent_session(&b).await.unwrap()
+        &mgr.services
+            .store
+            .get_agent_session_with_transcript(&b)
+            .await
+            .unwrap()
     ));
     assert_eq!(
         purge_notices_in_next_prompt(&mgr, &a, &ws).await,
@@ -3830,7 +3862,11 @@ async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents
         "b told on its next turn"
     );
     assert!(!has_pending_purge_notice(
-        &mgr.services.store.get_agent_session(&b).await.unwrap()
+        &mgr.services
+            .store
+            .get_agent_session_with_transcript(&b)
+            .await
+            .unwrap()
     ));
     assert_eq!(
         purge_notices_in_next_prompt(&mgr, &b, &ws).await,
@@ -3861,7 +3897,12 @@ async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_ev
     assert!(!mgr.busy.lock().unwrap().contains(&b), "no turn started");
 
     for id in [&a, &b] {
-        let session = mgr.services.store.get_agent_session(id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         assert!(
             has_pending_purge_notice(&session),
             "{id} has a pending notice"
@@ -4713,7 +4754,12 @@ async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
     let ws = WorkspaceId::from("ws-abort-kick");
     let victim = AgentId::from("a-abort-kick");
     seed_agent(&mgr, &ws, &victim).await;
-    let mut session = mgr.services.store.get_agent_session(&victim).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&victim)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -5292,29 +5338,29 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
     assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
-/// Timing proof for the batch stop path (the `workspace.delete` sweep): N
-/// tracked agents whose children ignore SIGTERM tear down in ~ONE shared
-/// grace window via `stop_many` — mirroring `kill_sweep_tests` — with the
-/// per-agent `stop()` semantics (handle removal, deregistration) applied to
-/// every agent.
+/// The batch stop path (the `workspace.delete` sweep): N tracked agents whose
+/// children survive SIGTERM are all signalled inside ONE shared grace window
+/// via `stop_many` — mirroring `kill_sweep_tests` — with the per-agent
+/// `stop()` semantics (handle removal, deregistration) applied to every
+/// agent.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
+    use super::kill_sweep_tests::{
+        spawn_term_recording_children, wait_for_markers, wait_until_reaped,
+    };
+    use super::term_grace_gate::{self, TermGraceGate};
+
     const N: usize = 4;
-    let grace = super::PROCESS_GROUP_TERM_GRACE;
     let (_tmp, mgr) = manager().await;
+    let dir = test_tempdir("stop-many-sweep");
     let mut ids = Vec::with_capacity(N);
     let mut pids = Vec::with_capacity(N);
-    for i in 0..N {
+    for (i, (child, pid)) in spawn_term_recording_children(dir.path(), N)
+        .into_iter()
+        .enumerate()
+    {
         let id = AgentId::from(format!("a-batch-{i}").as_str());
-        let mut cmd = tokio::process::Command::new("sh");
-        // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
-        // forcing the full grace window to elapse.
-        cmd.args(["-c", "trap '' TERM; sleep 30"]);
-        cmd.process_group(0);
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn().expect("spawn slow child");
-        let pid = child.id().expect("live child has a pid");
         let handle = mock_handle();
         handle
             .execution
@@ -5339,42 +5385,47 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         ids.push(id);
         pids.push(pid);
     }
-    // Let each sh install its trap before SIGTERM arrives.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_markers(dir.path(), "ready", N).await;
 
-    let start = std::time::Instant::now();
-    let fence = mgr.stop_many(&ids).await;
-    let elapsed = start.elapsed();
+    // The gate holds the shared grace window open: every child must get its
+    // SIGTERM inside it. A batch stop that tears agents down one window at a
+    // time never signals the second child, and the wait below hangs into its
+    // guard instead of passing slowly.
+    let gate = TermGraceGate::new();
+    let mgr = Arc::new(mgr);
+    let stop = {
+        let (mgr, ids) = (Arc::clone(&mgr), ids.clone());
+        intent_core::spawn_daemon(term_grace_gate::scope(gate.clone(), async move {
+            mgr.stop_many(&ids).await
+        }))
+    };
+    wait_for_markers(dir.path(), "term", N).await;
+    assert!(
+        !stop.is_finished(),
+        "batch stop returned while its grace window was still open"
+    );
+    for &pid in &pids {
+        assert!(
+            pid_alive(pid),
+            "child {pid} survived SIGTERM inside the window"
+        );
+    }
+    gate.open();
+    let fence = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        stop,
+    )
+    .await
+    .expect("batch stop finishes once its grace window ends")
+    .expect("stop task");
+    assert_eq!(gate.windows(), 1, "the whole batch shares one grace window");
 
-    // Serial teardown would take ~N * grace (8s for 4 children); the shared
-    // window must finish in ~one grace period (<4s total).
-    assert!(
-        elapsed < grace * 2,
-        "batch stop took {elapsed:?}, expected ~one {grace:?} grace window"
-    );
-    // The children ignored SIGTERM, so the full shared grace must have
-    // elapsed (proves the window ran once, not that children died early).
-    assert!(
-        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
-        "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
-    );
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");
     assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
-    // The kill itself, not just the elapsed window: every child must be
-    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
-    // a zombie until its wait task reaps it (stragglers past
-    // KILL_SWEEP_REAP_GRACE reap in the background).
+    // The kill itself: every child is SIGKILLed once the window ends.
     for &pid in &pids {
-        let mut dead = !pid_alive(pid);
-        for _ in 0..100 {
-            if dead {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            dead = !pid_alive(pid);
-        }
-        assert!(dead, "child {pid} killed by the batch sweep");
+        wait_until_reaped(pid).await;
     }
     // The returned fence keeps every swept agent blocked from the
     // lazy-spawn paths until dropped, then re-opens them.
@@ -5798,6 +5849,7 @@ fn track_mock_agent_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
@@ -5959,6 +6011,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
@@ -6352,6 +6405,23 @@ fn test_provider() -> intent_providers::ProviderConfig {
     }
 }
 
+/// Seed a second active top-level session beside `id` (same workspace) so
+/// the last-top-level-agent retire guard lets `id` be retired.
+async fn seed_top_level_peer(mgr: &AgentManager, id: &AgentId) {
+    let mut peer = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
+    peer.id = AgentId::from(format!("{}-peer", id.as_str()));
+    mgr.services
+        .store
+        .insert_agent_session_with_task_graph(&peer, false)
+        .await
+        .expect("insert top-level peer");
+}
+
 async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
     seed_agent_with_task_graph(mgr, ws, id, false).await;
 }
@@ -6419,6 +6489,7 @@ async fn seed_agent_with_task_graph(
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     // The chief row is seeded by migration 0033; every other workspace is
     // created here.
@@ -6446,7 +6517,12 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
                 AgentId::from("antigravity-setup"),
             );
             seed_agent(&mgr, &ws, &id).await;
-            let mut row = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let mut row = mgr
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
             row.provider = Some("antigravity".into());
             row.model = Some("model-a".into());
             row.system_prompt = Some("Required Antigravity instruction".into());
@@ -6504,7 +6580,12 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
                 .await
                 .unwrap_err();
             assert!(!super::is_retryable_spawn_error(&error));
-            let failed = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let failed = mgr
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
             assert_eq!(failed.acp_session_id, row.acp_session_id);
             assert_eq!(failed.model, row.model);
             assert_eq!(failed.effort_levels, row.effort_levels);
@@ -6681,7 +6762,12 @@ async fn start_session_opens_first_session_without_recreate_flag() {
         .expect("first session");
     assert_eq!(sid, MGR_ACP_SID);
     assert!(!mgr.take_recreated(&id), "brand-new agent is not flagged");
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(MGR_ACP_SID));
 }
 
@@ -6703,7 +6789,12 @@ async fn start_session_resumes_when_load_supported() {
         .expect("resume");
     assert_eq!(sid, "existing-id", "session/load resumes the stored id");
     assert!(!mgr.take_recreated(&id), "resume needs no history resend");
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some("existing-id"));
 }
 
@@ -6724,7 +6815,12 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
         .await
         .expect("recreate");
     assert_eq!(sid, MGR_ACP_SID, "fresh session replaces the lost id");
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(MGR_ACP_SID));
     // The recreate flag is set so the next turn resends history; take() clears it.
     assert!(mgr.take_recreated(&id), "recreate flags a history resend");
@@ -6770,7 +6866,7 @@ async fn start_session_private_family_never_uses_ordinary_recreate() {
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -7685,7 +7781,12 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -8090,7 +8191,12 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -8583,7 +8689,12 @@ async fn stop_redelivery_flush_413_retry(
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -9225,7 +9336,12 @@ async fn terminal_failure_persists_error_before_publishing_events() {
             }
         }
     }
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -9359,7 +9475,12 @@ async fn drain_emits_queue_processing_with_turn_id() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-qp-tid"), AgentId::from("a-qp-tid"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -9446,7 +9567,12 @@ async fn drain_emits_queue_processing_with_turn_id() {
 /// tests to distinguish slug-shaped vs custom titles).
 async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, title: &str) {
     seed_agent(mgr, ws, id).await;
-    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
     session.name_explicitly_set = true;
     mgr.services
         .store
@@ -9466,7 +9592,12 @@ async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentI
 /// `acp_session_id` is unset — provider immutability only kicks in after
 /// first real use).
 async fn set_session_provider(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, provider: &str) {
-    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
     session.provider = Some(provider.to_string());
     mgr.services
         .store
@@ -9609,7 +9740,12 @@ async fn build_turn_prompt_naming_instruction_ignores_model_string() {
         AgentId::from("a-compound"),
     );
     seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("auggie".to_string());
     session.model = Some("opencode:kimi-k3".to_string());
     mgr.services
@@ -9999,6 +10135,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
@@ -10176,7 +10313,12 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         "the child handle survives the interrupt (never killed)"
     );
     // The interrupt message was persisted as the next user turn.
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let last = session.messages.last().expect("message persisted");
     assert_eq!(last.role, "user");
     assert!(serde_json::to_string(&last.content)
@@ -10232,7 +10374,12 @@ async fn interrupt_kills_child_for_provider_with_kill_quirk() {
     );
     // The persisted acpSessionId survives the teardown, so the next
     // `agent.sendMessage` respawns the child and resumes the session.
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.acp_session_id.as_deref(),
         Some("acp-int-quirk"),
@@ -10674,6 +10821,7 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
         AgentId::from("retire-running"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     track(&mgr, &id);
     let admission = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let worker = tokio::spawn(std::future::pending::<()>());
@@ -10708,7 +10856,12 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
     assert!(!mgr.contains(&id));
     assert!(!mgr.registry().is_registered(&id));
     assert!(!mgr.workers.lock().unwrap().contains_key(&id));
-    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let row = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(row.retired_at.is_some());
     let messages = mgr
         .services
@@ -10766,6 +10919,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     let ws = WorkspaceId::from("ws-retire-start");
     let id = AgentId::from("retire-start");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.turn_start_pause.lock().unwrap() = Some(pause.clone());
     let starting = tokio::spawn({
@@ -10827,7 +10981,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     assert_eq!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .status,
@@ -10873,6 +11027,7 @@ async fn user_retire_invalidates_admitted_send_across_restore() {
     let ws = WorkspaceId::from("ws-retire-admission");
     let id = AgentId::from("retire-admission");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     // Pause the sender between admission/persistence and worker registration.
     let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     intent_core::with_caller(
@@ -10974,6 +11129,7 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
     let ws = WorkspaceId::from("ws-retire-cleanup");
     let id = AgentId::from("retire-cleanup");
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     let cancelled = mgr.try_begin_turn(&id, &ws).await.unwrap();
     let flush = if matches!(cleanup, RetiredCleanup::Flush) {
         mgr.services.enqueue_message(
@@ -11046,7 +11202,12 @@ async fn assert_retired_cleanup_preserves_fresh_turn(cleanup: RetiredCleanup) {
         mgr.services.agent_activity.lock().unwrap().get(&ws),
         Some(&1)
     );
-    let row = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let row = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         row.status,
         AgentStatus::Active,
@@ -11071,7 +11232,13 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
         AgentId::from("child"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    let mut descendant = mgr.services.store.get_agent_session(&id).await.unwrap();
+    seed_top_level_peer(&mgr, &id).await;
+    let mut descendant = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     descendant.id = child.clone();
     descendant.parent_agent_id = Some(id.clone());
     descendant.status = AgentStatus::Active;
@@ -11106,12 +11273,57 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
         assert!(mgr
             .services
             .store
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .unwrap()
             .retired_at
             .is_none());
     }
+    mgr.stop(&id).await;
+}
+
+/// A user retire of the workspace's last top-level agent is refused before
+/// the running target is stopped: its turn and worker survive untouched.
+#[tokio::test]
+async fn user_retire_last_top_level_rejection_does_not_stop_target() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retire-last-top-level"),
+        AgentId::from("solo"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let aborted = worker.abort_handle();
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    let result = intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        mgr.services
+            .agent_retire(id.clone(), Some(ws.clone()), None),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("last active top-level agent")),
+        "{result:?}"
+    );
+    assert!(!aborted.is_finished());
+    assert!(mgr.is_busy(&id));
+    assert!(mgr.contains(&id));
+    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    assert!(mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap()
+        .retired_at
+        .is_none());
     mgr.stop(&id).await;
 }
 
@@ -11125,6 +11337,7 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
         AgentId::from("self-retire"),
     );
     seed_agent(&mgr, &ws, &id).await;
+    seed_top_level_peer(&mgr, &id).await;
     track(&mgr, &id);
     assert!(mgr.try_begin(&id, &ws).await);
     let worker = tokio::spawn(std::future::pending::<()>());
@@ -11143,7 +11356,7 @@ async fn mcp_retire_leaves_calling_worker_alive_to_finish_response() {
     assert!(mgr
         .services
         .store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .unwrap()
         .retired_at
@@ -12280,7 +12493,12 @@ async fn send_queued_message_now_annotates_stale_redrive() {
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
     // The completion report lands AFTER the enqueue → the entry is stale.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.parent_agent_id = Some(AgentId::from("agent-parent"));
     session.completion_report = Some("work done".to_string());
     session.completion_report_timestamp = Some(now_iso());
@@ -12826,7 +13044,12 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
     assert_eq!(second["messageId"], json!("user-msg-dup"));
 
     // Not double-persisted: exactly ONE user message carries the content.
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let dup_count = session
         .messages
         .iter()
@@ -12908,7 +13131,12 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
         mgr.is_busy(&id),
         "the starting turn keeps its in-flight slot"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_ne!(
         session.status,
         AgentStatus::Error,
@@ -13008,6 +13236,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
@@ -13501,6 +13730,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     mgr.services
         .store
@@ -13577,7 +13807,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         .await
         .expect("re-insert same-slug workspace");
     let sessions = store
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list on recreated ws");
     assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
@@ -13733,7 +13963,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     );
     mgr.services
         .store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row preserved");
 }
@@ -14672,7 +14902,12 @@ async fn try_begin_persists_active_status_and_emits_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     assert!(mgr.try_begin(&id, &ws).await);
 
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Active);
     assert!(stored.is_active);
 
@@ -14708,7 +14943,12 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.end_turn(&id).await;
 
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::RuntimeIdle);
     assert!(!stored.is_active);
 
@@ -14874,7 +15114,12 @@ async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
     let ws = WorkspaceId::from("ws-idle-shutdown");
     let id = AgentId::from("idle-shutdown");
     let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.messages.iter().filter(|m| m.role == "user").count(),
         1,
@@ -14898,7 +15143,12 @@ async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
     );
     // The aborted worker never ran `end_turn`; shutdown must persist the
     // settled status, or the next startup heal treats it as a crashed turn.
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::RuntimeIdle);
     assert!(!stored.is_active);
     assert_eq!(
@@ -14977,7 +15227,12 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
         .await
         .unwrap()
         .is_none());
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::RuntimeIdle,
@@ -15056,7 +15311,12 @@ async fn shutdown_finishes_aborted_end_turn_idle_write() {
     let id = AgentId::from("aborted-end-turn");
     seed_agent(&mgr, &ws, &id).await;
     assert!(mgr.try_begin(&id, &ws).await);
-    let active = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let active = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(active.status, AgentStatus::Active);
     let writer = mgr.services.store.write_pool().begin().await.unwrap();
     let ending = {
@@ -15084,7 +15344,12 @@ async fn shutdown_finishes_aborted_end_turn_idle_write() {
     )
     .await
     .expect("shutdown completes");
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::RuntimeIdle);
     assert_eq!(mgr.services.heal_stale_agent_sessions().await.unwrap(), 0);
     assert!(mgr
@@ -15134,7 +15399,12 @@ async fn shutdown_pending_idle_write_preserves_later_status() {
     )
     .await
     .expect("shutdown completes");
-    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stored = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -15444,7 +15714,12 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
         1,
         "the message stays queued for agent.retry"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::Error, "error status untouched");
     assert!(!session.is_active, "is_active stays 0");
 }
@@ -15500,7 +15775,12 @@ async fn send_message_parks_message_for_poisoned_session() {
         1,
         "the message waits in the queue for agent.retry"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::Error, "error status untouched");
     assert!(!session.is_active, "is_active stays 0");
 }
@@ -15547,7 +15827,12 @@ async fn send_message_direct_response_and_user_echo_carry_turn_id() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-tid-d"), AgentId::from("a-tid-d"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -15622,7 +15907,12 @@ async fn agent_retry_response_carries_redriven_turn_id() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-tid-r"), AgentId::from("a-tid-r"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -15700,7 +15990,12 @@ async fn send_message_still_redrives_ordinary_error_session() {
         AgentId::from("a-plain-err"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -15753,7 +16048,12 @@ async fn send_message_still_redrives_ordinary_error_session() {
     .expect("worker exits after the terminal spawn failure");
 
     // Streak below threshold also stays open: two identical failures…
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     mgr.services.clear_failure_streak(&id);
     mgr.services.record_terminal_failure(&id, "boom");
     mgr.services.record_terminal_failure(&id, "boom");
@@ -16174,7 +16474,7 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
     let session = mgr
         .services
         .store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session");
     assert_eq!(session.stop_reason, Some("boom".to_string()));
@@ -16217,7 +16517,7 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
     let session = mgr
         .services
         .store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session");
     assert_eq!(session.stop_reason, None, "stop_reason cleared");
@@ -16337,7 +16637,12 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
     seed_agent(&mgr, &ws, &id).await;
     // Point the session at the mock provider (immutable once set, but the
     // seeded session has none) so the spawn fails before launching a child.
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -16362,7 +16667,12 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -16376,7 +16686,12 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
     .await
     .expect("worker parks the session in error and exits");
 
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::Error);
     assert!(
         !session.is_active,
@@ -16398,7 +16713,12 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
         "no re-spawned worker"
     );
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.status,
         AgentStatus::Error,
@@ -16421,7 +16741,12 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-p51"), AgentId::from("a-p51"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -16495,7 +16820,12 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -16542,7 +16872,12 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-p51-ok"), AgentId::from("a-p51-ok"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -16564,7 +16899,12 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -16588,7 +16928,12 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -17594,7 +17939,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-547"), AgentId::from("a-547"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -17699,7 +18049,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
         .execute(mgr.services.store.write_pool())
         .await
         .expect("restore agent_message table");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let stop_reason = session.stop_reason.expect("stop_reason persisted");
     assert!(
         stop_reason.contains("persist") && stop_reason.contains("turn not started"),
@@ -17727,7 +18082,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -17785,7 +18145,12 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         AgentId::from("a-547-blip"),
     );
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -17822,7 +18187,12 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -17836,7 +18206,12 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
     .await
     .expect("turn completes after the transient blip self-heals");
 
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::RuntimeIdle, "no Error park");
     let messages = mgr
         .services
@@ -17890,7 +18265,12 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-764-r"), AgentId::from("a-764-r"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -17914,7 +18294,12 @@ async fn pre_output_transport_failure_redrives_silently_once() {
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -17955,7 +18340,12 @@ async fn pre_output_transport_failure_redrives_silently_once() {
         mgr.services.queue_snapshot(&id).is_empty(),
         "no requeue for a silently redriven message"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(session.stop_reason.is_none(), "no error stop_reason");
     // The user row landed exactly once and the redriven turn produced output.
     let messages = mgr
@@ -18052,7 +18442,12 @@ async fn spurious_cancel_scenario(
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -18487,7 +18882,12 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
         "session/prompt: {}",
         crate::provider_auth::not_authenticated_message("mock")
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     // The stop_reason is the wrapped error's Display — identical to what the
     // JSON-RPC layer renders for the returned `InvalidParams`.
     assert_eq!(
@@ -18588,7 +18988,12 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
         mgr.services.take_pending_terminal_error(&id).is_none(),
         "the handler consumed the stashed terminal-error context"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(
         session
             .stop_reason
@@ -18655,7 +19060,12 @@ async fn second_pre_output_transport_failure_scenario() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-764-t"), AgentId::from("a-764-t"));
     seed_agent(&mgr, &ws, &id).await;
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.provider = Some("mock".to_string());
     mgr.services
         .store
@@ -18679,7 +19089,12 @@ async fn second_pre_output_transport_failure_scenario() {
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -18719,7 +19134,12 @@ async fn second_pre_output_transport_failure_scenario() {
         1,
         "failed message requeued for agent.retry"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let stop_reason = session.stop_reason.expect("error stop_reason persisted");
     assert!(
         stop_reason.contains("transport closed before output"),
@@ -18786,7 +19206,12 @@ async fn idle_timeout_injects_warning_and_redrives() {
         intentd_test_support::test_timeout(Duration::from_secs(30)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::RuntimeIdle
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -18824,7 +19249,12 @@ async fn idle_timeout_injects_warning_and_redrives() {
     );
     // Nothing parked or requeued; no stale Error/stop_reason.
     assert!(mgr.services.queue_snapshot(&id).is_empty());
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(session.stop_reason.is_none(), "no error stop_reason");
 
     // Transcript ordering proves the warning turn ran BEFORE the queued
@@ -18932,7 +19362,12 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
         intentd_test_support::test_timeout(Duration::from_secs(60)),
         async {
             loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                let session = mgr
+                    .services
+                    .store
+                    .get_agent_session_with_transcript(&id)
+                    .await
+                    .unwrap();
                 if session.status == AgentStatus::Error
                     && !mgr.is_busy(&id)
                     && mgr.workers.lock().unwrap().is_empty()
@@ -18994,7 +19429,12 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
     );
     // Error park + requeue for agent.retry (the last warning turn is the
     // failed message).
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let stop_reason = session.stop_reason.expect("error stop_reason persisted");
     assert!(
         stop_reason.contains("idle timeout"),
@@ -19625,6 +20065,201 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     assert_eq!(resolved.cwd, std::env::temp_dir());
 }
 
+/// A plain-folder workspace (§5.1) has no worktree and no branch: its agents
+/// spawn in the user's folder at `repository_path`.
+#[tokio::test]
+async fn resolve_spawn_uses_the_plain_folder() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
+    let folder_guard = test_tempdir("intentd-rs-plain-");
+    let folder = folder_guard.path().to_path_buf();
+    let workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-plain"),
+        title: "WS".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(folder.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let resolved =
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("plain folder resolves");
+    assert_eq!(resolved.cwd, folder, "cwd is the plain folder");
+}
+
+/// Every provider onboarding can offer (no env-var or feature-code gate)
+/// resolves the same spawn in a plain-folder workspace as in a git workspace:
+/// every `ResolvedSpawn` field except `cwd` (the user's folder vs the git
+/// checkout) matches, and so do the provider launch args and provider env
+/// derived from it. No provider needs a git-specific launch flag — Codex runs
+/// through its ACP adapter, never `codex exec`, whose git-repository check
+/// (`--skip-git-repo-check`) would refuse a plain folder.
+///
+/// Not covered here: after resolution the agent manager adds git
+/// commit-identity and credential-helper env discovered from the cwd, so a
+/// plain folder (not a repository) gets no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+/// vars; git then falls back to the user's global config. Manual turns are
+/// recorded on the plain-folder provider task.
+#[tokio::test]
+async fn onboarding_providers_resolve_the_same_spawn_in_plain_folder_and_git_workspaces() {
+    let onboarding: Vec<&intent_providers::ProviderConfig> = intent_providers::ACP_PROVIDERS
+        .iter()
+        .filter(|p| p.requires_env_var.is_none() && p.requires_feature_code.is_none())
+        .collect();
+    let ids: Vec<&str> = onboarding.iter().map(|p| p.id).collect();
+    for expected in ["claude-code", "codex", "opencode", "auggie"] {
+        assert!(
+            ids.contains(&expected),
+            "{expected} is offered in onboarding"
+        );
+    }
+    assert!(
+        !ids.contains(&"mock"),
+        "env-gated providers are not offered"
+    );
+
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    let npx_only: Vec<&str> = onboarding
+        .iter()
+        .filter(|p| p.npx_only_package.is_some())
+        .map(|p| p.id)
+        .collect();
+    crate::test_support::provider_installed::mark(&mut settings.providers.paths, &npx_only);
+    for provider in onboarding.iter().filter(|p| p.npx_only_package.is_none()) {
+        settings.providers.paths.insert(
+            provider.primary_binary_provider_id().to_string(),
+            "/bin/sh".to_string(),
+        );
+    }
+
+    let plain_guard = test_tempdir("intentd-rs-plain-providers-");
+    let plain_dir = plain_guard.path().to_path_buf();
+    let git_guard = test_tempdir("intentd-rs-git-providers-");
+    let git_dir = git_guard.path().to_path_buf();
+    git2::Repository::init(&git_dir).expect("git init");
+    let plain = Workspace {
+        id: WorkspaceId::from("ws-plain-providers"),
+        title: "Plain".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(plain_dir.display().to_string()),
+        plain_folder: true,
+        ..Default::default()
+    };
+    let git = Workspace {
+        id: WorkspaceId::from("ws-git-providers"),
+        title: "Git".to_string(),
+        branch: "main".to_string(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        repository_path: Some(git_dir.display().to_string()),
+        worktree_path: Some(git_dir.display().to_string()),
+        ..Default::default()
+    };
+
+    let launch = |resolved: &ResolvedSpawn| {
+        let mut opts = intent_acp::spawn::SpawnOptions::new(&resolved.provider);
+        opts.cwd = Some(&resolved.cwd);
+        opts.model = resolved.model.as_deref();
+        opts.provider_binary = resolved.provider_binary.as_deref();
+        opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
+        opts.npx_fallback_package = resolved.npx_fallback_package;
+        let args = intent_acp::spawn::build_args(&opts);
+        let env = intent_providers::build_provider_env_for_spawn(
+            &resolved.provider,
+            resolved.model.as_deref(),
+            None,
+            None,
+            None,
+            opts.via_npx(),
+            None,
+        );
+        (args, env, resolved.extra_env.clone())
+    };
+
+    for provider in &onboarding {
+        let mut session = session_with_specialist(None);
+        session.provider = Some(provider.id.to_string());
+        let in_plain = resolve_spawn(&session, Some(&plain), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: plain folder resolves: {e}", provider.id));
+        let in_git = resolve_spawn(&session, Some(&git), &settings, None)
+            .unwrap_or_else(|e| panic!("{}: git workspace resolves: {e}", provider.id));
+        assert_eq!(
+            in_plain.cwd, plain_dir,
+            "{}: cwd is the plain folder",
+            provider.id
+        );
+        assert_eq!(
+            in_git.cwd, git_dir,
+            "{}: cwd is the git checkout",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider, in_git.provider,
+            "{}: same provider config",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.selection, in_git.selection,
+            "{}: selection",
+            provider.id
+        );
+        assert_eq!(in_plain.model, in_git.model, "{}: model", provider.id);
+        assert_eq!(
+            in_plain.reasoning_effort, in_git.reasoning_effort,
+            "{}: reasoning effort",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.provider_binary, in_git.provider_binary,
+            "{}: provider binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_binary, in_git.npx_fallback_binary,
+            "{}: npx binary",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.npx_fallback_package, in_git.npx_fallback_package,
+            "{}: npx package",
+            provider.id
+        );
+        assert_eq!(
+            in_plain.unsloth_endpoint, in_git.unsloth_endpoint,
+            "{}: unsloth endpoint",
+            provider.id
+        );
+        let (plain_args, plain_env, plain_extra) = launch(&in_plain);
+        let (git_args, git_env, git_extra) = launch(&in_git);
+        assert_eq!(plain_args, git_args, "{}: same launch args", provider.id);
+        assert_eq!(plain_env, git_env, "{}: same provider env", provider.id);
+        assert_eq!(plain_extra, git_extra, "{}: same extra env", provider.id);
+        assert!(
+            !plain_args.iter().any(|a| a == "--skip-git-repo-check"),
+            "{}: no git-check flag needed",
+            provider.id
+        );
+        if provider.id == "codex" {
+            assert_eq!(
+                in_plain.npx_fallback_package,
+                Some(intent_providers::CODEX_ACP_NPX_PACKAGE),
+                "codex runs its ACP adapter"
+            );
+            assert!(
+                !plain_args.iter().any(|a| a == "exec"),
+                "codex never runs `codex exec`: {plain_args:?}"
+            );
+            assert_eq!(
+                plain_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                git_env.get(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV),
+                "codex agent mode is the same in both workspace kinds"
+            );
+        }
+    }
+}
+
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
 /// direct-mode row missing `worktree_path`, intent-hq/monorepo#2611)
 /// resolves its spawn cwd to the repository folder — never the temp dir.
@@ -20200,7 +20835,12 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     let files = json!([{ "type": "file", "attachmentId": "att-file", "fileName": "context.txt" }]);
     let prepend_images = json!([{ "type": "image", "data": "b3JpZw==", "mimeType": "image/png" }]);
     let metadata = json!({ "type": "image-reference-test" });
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.system_prompt = Some("Undelivered system instructions".into());
     mgr.services
         .store
@@ -20256,7 +20896,12 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     )
     .await
     .expect("failed worker releases its slot and exits");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::Error);
     assert!(!session.is_active);
     let reason = session.stop_reason.unwrap();
@@ -21648,7 +22293,12 @@ mod stale_redrive_tests {
         id: &AgentId,
         report_ts: &str,
     ) {
-        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         session.parent_agent_id = Some(AgentId::from("agent-parent"));
         session.completion_report = Some("work done".to_string());
         session.completion_report_timestamp = Some(report_ts.to_string());
@@ -21657,6 +22307,49 @@ mod stale_redrive_tests {
             .update_agent_session(ws, &session)
             .await
             .expect("set delegated report");
+    }
+
+    /// The stale check runs once per redelivered queued message and reads
+    /// only session metadata, so a transcript that cannot be decoded (any
+    /// full transcript read fails on it) must not turn a stale message fresh.
+    #[tokio::test]
+    async fn stale_check_does_not_read_the_transcript() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-t"), AgentId::from("a-576-t"));
+        seed_agent(&mgr, &ws, &id).await;
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "user",
+                &serde_json::json!([{ "type": "text", "text": "first" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("user message");
+        sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+            .bind(&id.0)
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("corrupt stored content");
+        assert!(
+            mgr.services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .is_err(),
+            "fixture: a full session read must fail on the undecodable row"
+        );
+
+        let mut msg = queued_msg("please continue", &queued_at, false);
+        assert!(
+            mgr.annotate_stale_redrive(&id, &mut msg).await,
+            "the stale check resolves without reading the transcript"
+        );
     }
 
     #[tokio::test]
@@ -21717,7 +22410,12 @@ mod stale_redrive_tests {
         // behavior even with a (vestigial) report on the session.
         let queued_at = now_iso();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.completion_report = Some("work done".to_string());
         session.completion_report_timestamp = Some(now_iso());
         mgr.services
@@ -21737,7 +22435,12 @@ mod stale_redrive_tests {
         let (_tmp, mgr) = manager().await;
         let (ws, id) = (WorkspaceId::from("ws-576-d"), AgentId::from("a-576-d"));
         seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.parent_agent_id = Some(AgentId::from("agent-parent"));
         mgr.services
             .store
@@ -21921,7 +22624,12 @@ mod stale_redrive_tests {
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
                 loop {
-                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    let session = mgr
+                        .services
+                        .store
+                        .get_agent_session_with_transcript(&id)
+                        .await
+                        .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
                         && mgr.workers.lock().unwrap().is_empty()
@@ -21935,7 +22643,12 @@ mod stale_redrive_tests {
         .await
         .expect("stale drained turn completes");
 
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(
             session.completion_report.as_deref(),
             Some("work done"),
@@ -22007,7 +22720,12 @@ mod stale_redrive_tests {
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
                 loop {
-                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    let session = mgr
+                        .services
+                        .store
+                        .get_agent_session_with_transcript(&id)
+                        .await
+                        .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
                         && mgr.workers.lock().unwrap().is_empty()
@@ -22021,7 +22739,12 @@ mod stale_redrive_tests {
         .await
         .expect("fresh drained turn completes");
 
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(
             session.completion_report, None,
             "a fresh turn clears the prior report as today"
@@ -23081,7 +23804,12 @@ mod draining_overlay_tests {
             AgentId::from("a-drain-barrier"),
         );
         seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.provider = Some("mock".to_string());
         mgr.services
             .store
@@ -23156,7 +23884,12 @@ mod draining_overlay_tests {
             intentd_test_support::test_timeout(Duration::from_secs(20)),
             async {
                 loop {
-                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    let session = mgr
+                        .services
+                        .store
+                        .get_agent_session_with_transcript(&id)
+                        .await
+                        .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
                         && mgr.workers.lock().unwrap().is_empty()
@@ -23227,7 +23960,12 @@ mod draining_overlay_tests {
             AgentId::from("a-drain-rollback"),
         );
         seed_agent(&mgr, &ws, &id).await;
-        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.provider = Some("mock".to_string());
         mgr.services
             .store
@@ -23520,6 +24258,7 @@ mod harness_wake_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
@@ -24115,7 +24854,12 @@ mod harness_wake_tests {
             "missing completion must surface failure, not successful compaction"
         );
         assert!(!events.iter().any(|e| e.event_type == "agent:idle"));
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.status, AgentStatus::Error);
         let errors: Vec<_> = events
             .iter()
@@ -24281,7 +25025,12 @@ mod harness_wake_tests {
                 .any(|e| e.event_type == "agent:attention-requested"),
             "empty wake surfaces agent:attention-requested"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(
             session.attention_request_kind.as_deref(),
             Some("blocker"),
@@ -24322,7 +25071,12 @@ mod harness_wake_tests {
                 .any(|e| e.event_type == "agent:attention-requested"),
             "no attention raised for a meaningful wake"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert!(
             session.attention_request_kind.is_none(),
             "no attention request persisted"
@@ -25578,7 +26332,7 @@ mod pending_questions_no_gate {
         let session = mgr
             .services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .expect("session");
         assert!(!session.pending_questions_marker_written(), "legacy shape");
@@ -25610,7 +26364,7 @@ mod pending_questions_no_gate {
         let session = mgr
             .services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .expect("session");
         assert_eq!(
@@ -26307,7 +27061,12 @@ mod attention_request_clear_gates {
         background: bool,
     ) {
         seed_agent(mgr, ws, id).await;
-        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         session.provider = Some("mock".to_string());
         session.parent_agent_id = parent;
         session.is_background = background;
@@ -26411,7 +27170,12 @@ mod attention_request_clear_gates {
             !saw_cleared_event(&mut sub).await,
             "automatic delivery must not emit attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(
             session.attention_request_kind.as_deref(),
             Some("discussion"),
@@ -26463,7 +27227,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "user delivery emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26509,7 +27278,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "drained user-origin entry emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26546,7 +27320,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "drained agent.queueMessage entry emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26587,7 +27366,12 @@ mod attention_request_clear_gates {
             !saw_cleared_event(&mut sub).await,
             "drained automatic entry must not emit attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(
             session.attention_request_kind.as_deref(),
             Some("discussion"),
@@ -26634,7 +27418,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "automatic delivery to a child agent emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26674,7 +27463,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "automatic delivery to a background agent emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26720,7 +27514,12 @@ mod attention_request_clear_gates {
             saw_cleared_event(&mut sub).await,
             "user delivery to a child agent emits attentionRequestCleared"
         );
-        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert_eq!(session.attention_request_kind, None);
         assert_eq!(session.attention_request_reason, None);
         assert_eq!(session.attention_request_timestamp, None);
@@ -26801,7 +27600,12 @@ mod flush_queued_messages_tests {
 
     async fn seed_mock_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         seed_agent(mgr, ws, id).await;
-        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         session.provider = Some("mock".to_string());
         mgr.services
             .store
@@ -27248,7 +28052,12 @@ mod flush_queued_messages_tests {
             intentd_test_support::test_timeout(Duration::from_secs(15)),
             async {
                 loop {
-                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    let session = mgr
+                        .services
+                        .store
+                        .get_agent_session_with_transcript(&id)
+                        .await
+                        .unwrap();
                     if session.status == AgentStatus::RuntimeIdle
                         && !mgr.is_busy(&id)
                         && mgr.workers.lock().unwrap().is_empty()
@@ -28025,7 +28834,7 @@ async fn runtime_characterization_stop_preserves_queue_and_resume_identity() {
     assert_eq!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .acp_session_id,
@@ -28224,7 +29033,7 @@ async fn checkpoint_shutdown_enrolls_agents_with_running_workers() {
     let mut child = mgr
         .services
         .store
-        .get_agent_session(&reported_child)
+        .get_agent_session_with_transcript(&reported_child)
         .await
         .unwrap();
     child.parent_agent_id = Some(AgentId::from("agent-parent"));
@@ -29528,7 +30337,7 @@ async fn submission_correlation_legacy_append_failure_stays_unknown_after_restar
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .status,
@@ -29735,7 +30544,7 @@ async fn submission_correlation_completed_interrupt_replay_is_complete() {
     assert_eq!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .status,
@@ -30396,7 +31205,12 @@ mod profile_routing_tests {
         ] {
             let id = AgentId::from(format!("a-pr1-{base}-{}", provider.len()).as_str());
             session_on(&mgr, &id, provider).await;
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let session = mgr
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
             let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
             assert_eq!(resolved.provider.id, base, "{provider}");
             assert_eq!(resolved.selection, provider, "{provider}");
@@ -30550,7 +31364,12 @@ mod profile_routing_tests {
 
         let gone = AgentId::from("a-pr3-gone");
         let ws = session_on(&mgr, &gone, "codex@pgone").await;
-        let session = mgr.services.store.get_agent_session(&gone).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&gone)
+            .await
+            .unwrap();
         let err = mgr
             .rehome_if_provider_disabled(&gone, &ws, session, &settings)
             .await
@@ -30568,7 +31387,12 @@ mod profile_routing_tests {
             .to_string();
         let work = AgentId::from("a-pr3-work");
         let ws = session_on(&mgr, &work, &reference).await;
-        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&work)
+            .await
+            .unwrap();
         let (kept, rehomed) = mgr
             .rehome_if_provider_disabled(&work, &ws, session, &settings)
             .await
@@ -30580,13 +31404,23 @@ mod profile_routing_tests {
             "codex".to_string(),
             false,
         )]));
-        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let session = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&work)
+            .await
+            .unwrap();
         let err = mgr
             .rehome_if_provider_disabled(&work, &ws, session, &settings)
             .await
             .unwrap_err();
         assert_eq!(replacement_reason(&err), "provider-disabled");
-        let after = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let after = mgr
+            .services
+            .store
+            .get_agent_session_with_transcript(&work)
+            .await
+            .unwrap();
         assert_eq!(
             after.provider.as_deref(),
             Some(reference.as_str()),
@@ -30683,4 +31517,125 @@ mod profile_routing_tests {
             assert_eq!(activation.live_fingerprint(&id, &reference), None);
         }
     }
+}
+
+/// Remote (executor) launches share the slot cap with local agents and are
+/// refused, never queued, when it is full: `try_admit` answers at once with
+/// the running count and the cap.
+#[test]
+fn try_admit_refuses_at_the_shared_slot_cap_without_queueing() {
+    use intent_core::placement::CapacityRefusal;
+    let reg = ProcessRegistry::new(2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    reg.try_admit(&AgentId::from("remote-1"))
+        .expect("one free slot admits");
+    assert_eq!(reg.size(), 2, "the remote agent holds a slot");
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote-2")),
+        Err(CapacityRefusal::Count {
+            running_agents: 2,
+            agent_cap: 2,
+        })
+    );
+    assert!(log.lock().unwrap().is_empty(), "nothing local was evicted");
+    assert_eq!(reg.size(), 2, "a refused launch holds nothing");
+    assert!(
+        reg.inner.lock().unwrap().wait_queue.is_empty(),
+        "a refused launch is not queued"
+    );
+    assert!(reg.deregister(&local));
+    reg.try_admit(&AgentId::from("remote-2"))
+        .expect("the freed local slot admits a remote launch");
+}
+
+/// A remote agent is never an eviction candidate: a local spawn at the cap
+/// waits for a slot instead of killing it.
+#[tokio::test]
+async fn admitted_remote_agents_are_never_evicted_by_local_spawns() {
+    let reg = Arc::new(ProcessRegistry::new(1));
+    let remote = AgentId::from("remote");
+    reg.try_admit(&remote).expect("admits");
+    let local = AgentId::from("local");
+    let waiting = {
+        let reg = reg.clone();
+        tokio::spawn(async move { reg.acquire(&local, claim_all, release_none).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "the local spawn waits for the slot");
+    assert!(
+        reg.is_registered(&remote),
+        "the remote agent was not evicted"
+    );
+    assert!(reg.deregister(&remote));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        waiting,
+    )
+    .await
+    .expect("the released remote slot admits the local spawn")
+    .unwrap();
+}
+
+/// Over the shared memory budget (with the host short of headroom) a remote
+/// launch is refused with the charged and budgeted bytes.
+#[test]
+fn try_admit_refuses_over_the_shared_memory_budget() {
+    use intent_core::placement::CapacityRefusal;
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(5 * gb);
+    probe.set_available_memory(Some(HOST_MEMORY_RESERVE_BYTES - 1));
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let local = AgentId::from("local");
+    reg.register(local.clone(), recording_kill(local.clone(), log.clone()));
+    assert_eq!(
+        reg.try_admit(&AgentId::from("remote")),
+        Err(CapacityRefusal::Memory {
+            charged_memory_bytes: 5 * gb,
+            memory_budget_bytes: 4 * gb,
+        })
+    );
+    assert_eq!(reg.size(), 1, "a refused launch holds nothing");
+    // Under budget, the admission is charged like a local spawn.
+    probe.set(gb);
+    reg.try_admit(&AgentId::from("remote")).expect("admits");
+    assert_eq!(
+        reg.budget_status().map(|(_, charged, _)| charged),
+        Some(Some(gb + PROVISIONAL_AGENT_BYTES))
+    );
+}
+
+/// A remote agent's provider resolves like a local spawn's: the configured
+/// `providers.paths` override wins, a profile resolves to its base, and an
+/// unknown or disabled provider is refused.
+#[cfg(unix)]
+#[test]
+fn resolve_provider_launch_matches_the_local_precedence() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = test_tempdir("resolve-launch");
+    let binary = dir.path().join("opencode");
+    std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    settings
+        .providers
+        .paths
+        .insert("opencode".into(), binary.display().to_string());
+    let spec = crate::resolve_provider_launch("opencode", &settings).expect("resolves");
+    assert_eq!(spec.provider.id, "opencode");
+    assert_eq!(spec.provider_binary.as_deref(), Some(binary.as_path()));
+    assert!(spec.npx_fallback_binary.is_none());
+
+    assert!(matches!(
+        crate::resolve_provider_launch("no-such-provider", &settings),
+        Err(Error::NotFound(_))
+    ));
+    settings.providers.enabled = Some([("opencode".to_owned(), false)].into());
+    assert!(matches!(
+        crate::resolve_provider_launch("opencode", &settings),
+        Err(Error::NotFound(_))
+    ));
 }

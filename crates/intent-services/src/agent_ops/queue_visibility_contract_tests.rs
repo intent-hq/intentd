@@ -203,6 +203,7 @@ impl Fixture {
                             Some(self.agent.clone()),
                             None,
                             None,
+                            None,
                         ),
                     )
                     .await
@@ -413,7 +414,8 @@ async fn self_queue_service_reads_hide_payloads_but_preserve_counts_and_other_ca
         for filter in [None, Some(f.agent.clone())] {
             let diag = with_caller(
                 self_caller.clone(),
-                f.svc.agent_diagnostics(f.ws.clone(), filter, None, None),
+                f.svc
+                    .agent_diagnostics(f.ws.clone(), filter, None, None, None),
             )
             .await
             .unwrap();

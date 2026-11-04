@@ -366,7 +366,7 @@ mod read_owner {
         let committed = serde_json::to_value(
             f.services
                 .store()
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap(),
         )
@@ -461,7 +461,7 @@ mod read_owner {
                 serde_json::to_value(
                     f.services
                         .store()
-                        .get_agent_session(&f.agent)
+                        .get_agent_session_with_transcript(&f.agent)
                         .await
                         .unwrap()
                 )
@@ -619,7 +619,7 @@ mod read_owner {
             .insert_agent_session(
                 &f.services
                     .store()
-                    .get_agent_session(&f.agent)
+                    .get_agent_session_with_transcript(&f.agent)
                     .await
                     .unwrap(),
             )

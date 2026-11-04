@@ -73,6 +73,10 @@ impl FakeControl {
                     running_scripts: 2,
                     restart_deferred_until: Some("2026-09-15T16:30:00Z".to_string()),
                 },
+                remote_links: Some(crate::RemoteLinks {
+                    backends: 1,
+                    machines: 2,
+                }),
             },
             shutdown_called: AtomicBool::new(false),
             credential: None,
@@ -258,6 +262,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         update_supported: false,
         busy_agents: 0,
         idle_update_check: IdleUpdateCheckStatus::default(),
+        remote_links: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -290,6 +295,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("workspacesDiskTotalBytes"));
     // Watcher registry not started yet ⇒ fileWatch is ABSENT, not null.
     assert!(!obj.contains_key("fileWatch"));
+    // A daemon that does not report link counts ⇒ remoteLinks is ABSENT.
+    assert!(!obj.contains_key("remoteLinks"));
     // No descriptor sample / unreadable limit ⇒ fd fields are ABSENT, not null.
     assert!(!obj.contains_key("fdCount"));
     assert!(!obj.contains_key("fdLimit"));
@@ -370,6 +377,23 @@ fn status_json_carries_the_workspaces_disk_fields_when_sampled() {
     let v = status_json(&FakeControl::new().status, true);
     assert_eq!(v["workspacesDiskAvailableBytes"], 250_000_000_000u64);
     assert_eq!(v["workspacesDiskTotalBytes"], 1_000_000_000_000u64);
+}
+
+/// `remoteLinks` carries the live daemon-to-daemon link counts: the
+/// backends linked in to this machine and the exposed machines it is linked
+/// out to, zero when none, and is administrator-only.
+#[test]
+fn status_json_carries_the_remote_link_counts() {
+    let mut status = FakeControl::new().status;
+    let v = status_json(&status, true);
+    assert_eq!(v["remoteLinks"], json!({ "backends": 1, "machines": 2 }));
+    status.remote_links = Some(crate::RemoteLinks::default());
+    let v = status_json(&status, true);
+    assert_eq!(v["remoteLinks"], json!({ "backends": 0, "machines": 0 }));
+    assert!(
+        !super::COLLABORATOR_STATUS_FIELDS.contains(&"remoteLinks"),
+        "link counts stay administrator-only"
+    );
 }
 
 /// The fileWatch object rides `system.status` once the watcher registry is

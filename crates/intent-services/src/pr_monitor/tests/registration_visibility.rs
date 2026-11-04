@@ -64,7 +64,7 @@ async fn reregister_legacy_monitor_restores_visibility_and_polling_after_restart
     );
     assert!(
         !store
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages
@@ -107,7 +107,7 @@ async fn legacy_monitor_repair_clears_old_pending_data_and_is_idempotent() {
     }
     assert!(service
         .store
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .unwrap()
         .messages

@@ -439,6 +439,8 @@ async fn unwatch_before_the_hook_ends_delivers_nothing_to_the_parent() {
 async fn retiring_an_agent_cancels_its_hooks() {
     let f = fixture().await;
     let owner = f.agent("Owner", None).await;
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    f.agent("Peer", None).await;
     let hook = f
         .schedule_hook(&owner, "poller", "return { dispatch: false };")
         .await;

@@ -634,7 +634,7 @@ impl Services {
     /// was registered; a no-op when the name is already current.
     ///
     /// `new_parent_name` is `None` when the caller's current display name
-    /// could not be resolved (e.g. `store.get_agent_session` failed under
+    /// could not be resolved (e.g. `store.get_agent_session_with_transcript` failed under
     /// contention, Copilot #104 thread `PRRT_kwDOS9Wxuc6QKWuU`): the reuse
     /// still proceeds, but the existing stored name is left intact rather
     /// than overwritten with an empty placeholder that would degrade
@@ -643,7 +643,7 @@ impl Services {
     /// `resolved_parent_workspace_id` is `Some` only when the caller resolved
     /// the parent's home workspace from an actual session row (never from a
     /// call-workspace fallback): a watch originally registered with fallback
-    /// anchors (a transient `get_agent_session` failure) has its
+    /// anchors (a transient `get_agent_session_with_transcript` failure) has its
     /// `parent_workspace_id` corrected on reuse, so subsequent wakes and
     /// `agent:subscriptions-changed` land in the parent's true home
     /// workspace. Refreshing only the parent anchor cannot violate the scope
@@ -808,7 +808,7 @@ impl Services {
     pub(crate) fn workspace_has_waiting_agent_subscriptions_in_sessions(
         &self,
         workspace_id: &WorkspaceId,
-        sessions: &[intent_core::AgentSession],
+        sessions: &[intent_store::AgentSessionSummary],
     ) -> bool {
         let parents = self.waiting_subscription_parent_ids(workspace_id);
         Self::sessions_include_waiting_parent(sessions, &parents)
@@ -830,7 +830,7 @@ impl Services {
     }
 
     fn sessions_include_waiting_parent(
-        sessions: &[intent_core::AgentSession],
+        sessions: &[intent_store::AgentSessionSummary],
         parents: &[AgentId],
     ) -> bool {
         !parents.is_empty()
@@ -1985,11 +1985,11 @@ impl Services {
                     let status = serde_json::to_value(session.status).unwrap_or_default();
                     (
                         event_type,
-                        session.workspace_id,
+                        session.workspace_id.clone(),
                         status,
-                        session.completion_report,
-                        session.stop_reason,
-                        Some(session.name),
+                        session.completion_report.clone(),
+                        session.stop_reason.clone(),
+                        Some(session.name.clone()),
                     )
                 }
                 Err(intent_store::Error::NotFound(_)) => (
@@ -2400,7 +2400,7 @@ impl Services {
                                 &mut data, &triggers,
                             );
                         }
-                        let report = session.completion_report;
+                        let report = session.completion_report.clone();
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
                         // for chief-anchored groups).
@@ -2573,7 +2573,7 @@ impl Services {
             // Build event for group recording. Prefer the child's persisted
             // completion_report (set by agent.reportToParent) over the generic
             // summary, mirroring deliver_completion_to_watches logic.
-            let session = self.store.get_agent_session(agent_id).await.ok();
+            let session = self.store.get_agent_session_summary(agent_id).await.ok();
             // monorepo#1016: annotate a suspected stall (idle, no report,
             // assigned task still incomplete) on the recorded line + event
             // data. Best-effort — lookup failures fail open.
@@ -2611,7 +2611,7 @@ impl Services {
                     triggers.push(pair);
                 }
             }
-            let report = session.and_then(|s| s.completion_report);
+            let report = session.and_then(|s| s.completion_report.clone());
             let mut data = event_data.clone();
             if let Some(s) = &stall {
                 s.annotate_event_data(&mut data);
@@ -2870,6 +2870,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 

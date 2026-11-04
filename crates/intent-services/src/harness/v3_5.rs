@@ -58,7 +58,11 @@ mod tests {
         let (_tmp, svc, ws) = setup().await;
         let id = AgentId::from("agent-inline-visual-guidance");
         seed_agent(&svc, &ws, &id).await;
-        let mut visual = svc.store().get_agent_session(&id).await.unwrap();
+        let mut visual = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         visual.harness_version = "3.5".into();
         let mut released = visual.clone();
         released.harness_version = "3.4".into();

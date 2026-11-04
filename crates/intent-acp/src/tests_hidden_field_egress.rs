@@ -140,6 +140,12 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
+        node_id: None,
+        lease_id: None,
+        node_name: None,
+        placement: None,
+        effective_isolation: None,
+        placement_error: None,
         id: AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -186,6 +192,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         metadata: AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,
@@ -206,6 +213,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
             pending_questions_message_id: None,
             pending_proposals: Vec::new(),
             proposal_resolutions: Map::new(),
+            proposal_created_workspaces: serde_json::Map::new(),
             last_seen_message_id: None,
             is_initial_agent: None,
             sponsor_agent_id: None,
@@ -394,6 +402,7 @@ impl WorkspaceApi for FakeApi {
         _agent_id: Option<AgentId>,
         _task_note_id: Option<intent_core::NoteId>,
         _stale_responding_after_ms: Option<i64>,
+        _row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let agents: Vec<Value> = [CALLER, TARGET]
@@ -453,6 +462,7 @@ impl WorkspaceApi for FakeApi {
         message_id: String,
         block_id: String,
         _workspace_id: Option<WorkspaceId>,
+        _page: intent_core::MessageBlockPage,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let mut block = json!({ "id": block_id, "type": "text", "text": "full body" });

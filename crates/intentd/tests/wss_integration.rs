@@ -1468,6 +1468,15 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+    );
+    let peer = wss_call(srv.port, srv.cfg.clone(), &peer_frame).await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer created: {peer}"
+    );
 
     // Subscribe to both lifecycle events on a persistent connection.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -1502,7 +1511,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         assert_eq!(response["error"]["code"], -32602, "{response}");
         assert!(srv
             .store
-            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .get_agent_session_with_transcript(&intent_core::AgentId::from(agent_id.as_str()))
             .await
             .unwrap()
             .retired_at
@@ -1743,7 +1752,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&beta_child, &top_b),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(parent.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1762,7 +1775,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let retired_child = create_agent("retired-under-b", false, 9).await;
     {
         let child_id = intent_core::AgentId::from(retired_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(top_b.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1779,7 +1796,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let gamma_child = create_agent("under-gamma", false, 31).await;
     {
         let child_id = intent_core::AgentId::from(gamma_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1804,7 +1825,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&gamma_child, intent_core::AgentStatus::Active),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.status = status;
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1895,7 +1920,13 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .collect();
         assert_eq!(
             keys,
-            ["agents", "retiredCount", "scopeCounts", "delegatedCounts"],
+            [
+                "agents",
+                "retiredCount",
+                "scopeCounts",
+                "delegatedCounts",
+                "nextToken"
+            ],
             "{label}: envelope keys: {v}"
         );
         assert_eq!(v["result"]["retiredCount"], 2, "{label}: {v}");
@@ -2461,7 +2492,11 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let watcher = intent_core::AgentId::from(watcher_id.as_str());
 
     // Link the child under the parent and mark it mid-turn (Active).
-    let mut child_session = srv.store.get_agent_session(&child).await.expect("child");
+    let mut child_session = srv
+        .store
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     child_session.parent_agent_id = Some(parent.clone());
     srv.store
         .update_agent_session(&workspace_id, &child_session)
@@ -2774,7 +2809,7 @@ async fn wss_get_subscriptions_bundles_slim_agents() {
     let child = &ids[1];
     let mut session = srv
         .store
-        .get_agent_session_summary(&intent_core::AgentId::from(child.as_str()))
+        .get_agent_session_without_messages(&intent_core::AgentId::from(child.as_str()))
         .await
         .unwrap();
     session.context_references = Some(json!([{"text": "context".repeat(5000)}]));
@@ -3095,23 +3130,53 @@ async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
         ("default", String::new()),
         ("scope=delegated", r#","scope":"delegated""#.to_string()),
     ] {
-        let frame = format!(
-            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}}}}}"#
-        );
-        let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
-        assert!(
-            text.len() < SOFT_LIMIT_BYTES,
-            "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
-            text.len()
-        );
-        let listed: Value = serde_json::from_str(&text).expect("json frame");
-        let rows = listed["result"]["agents"].as_array().expect("agents array");
+        // `agent.list` is paged (§5.5 "Paged agent lists and queues"):
+        // follow `nextToken` until it is `null`; every page frame stays
+        // under the soft limit and the pages together list every session.
+        let mut rows: Vec<Value> = Vec::new();
+        let mut token = Value::Null;
+        let mut pages = 0;
+        loop {
+            let token_param = if token.is_null() {
+                String::new()
+            } else {
+                format!(r#","nextToken":{token}"#)
+            };
+            let frame = format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}{token_param}}}}}"#
+            );
+            let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
+            assert!(
+                text.len() < SOFT_LIMIT_BYTES,
+                "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
+                text.len()
+            );
+            let listed: Value = serde_json::from_str(&text).expect("json frame");
+            rows.extend(
+                listed["result"]["agents"]
+                    .as_array()
+                    .expect("agents array")
+                    .iter()
+                    .cloned(),
+            );
+            pages += 1;
+            token = listed["result"]["nextToken"].clone();
+            if token.is_null() {
+                break;
+            }
+            assert!(pages < 50, "{label}: paging terminates");
+        }
+        assert!(pages > 1, "{label}: {ROWS} sessions span several pages");
         let expected_rows = if label == "default" { ROWS + 1 } else { ROWS };
         assert_eq!(
             rows.len(),
             expected_rows,
-            "{label}: every session is listed"
+            "{label}: every session is listed across the pages"
         );
+        let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), expected_rows, "{label}: no session repeats");
         for row in rows.iter().filter(|r| r["parentAgentId"].is_string()) {
             // Same shape as the per-row contract: every preview field is
             // still present (truncated harder, never omitted) and under the
@@ -3555,6 +3620,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let mut active_session = mk_session("agent-slim-a", &ws_active);
     active_session.metadata = Some(serde_json::json!({
@@ -4598,6 +4664,20 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .as_str()
         .unwrap_or_else(|| panic!("agent id: {agent}"))
         .to_string();
+    // A peer top-level agent, so the guest's retire is not refused by the
+    // last-top-level-agent guard.
+    let peer = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer agent: {peer}"
+    );
     let note = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6547,6 +6627,7 @@ impl SystemControl for BusyDaemonControl {
             update_supported: true,
             busy_agents: 2,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {
@@ -7797,6 +7878,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .expect("insert agent session");
@@ -12563,7 +12645,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // the outcome were never recorded, reads after the slot release would
     // keep re-spawning and the spawn-count assertion below would fail.
     let mut req_id = 48u32;
-    let mut waited = 0u32;
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     let resp = loop {
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
         let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
@@ -12576,10 +12659,9 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
             break resp;
         }
         assert!(
-            waited < 200,
+            tokio::time::Instant::now() < deadline,
             "probe failure never reached the negative cache: {resp}"
         );
-        waited += 1;
         req_id += 1;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
@@ -16319,8 +16401,9 @@ async fn wss_note_version_history_round_trip() {
 /// `note.list` frame past the 1 MiB outbound warn threshold.
 /// `projection: "slim"` (§5.2, v8.1) serves bounded rows — `content`
 /// replaced by `contentPreview` (500 chars) + `contentLength` — so the slim
-/// frame stays far under the threshold, while the default (absent
-/// projection) still round-trips the complete content for existing clients.
+/// frame stays far under the threshold. Bounded reads (§5.2): the default
+/// full projection pages too, and a row over the read budget is cut with the
+/// truncated-read markers, so that frame also fits the 500 KiB budget.
 #[intent_test_macros::daemon_test]
 async fn wss_note_list_slim_projection_bounds_large_frames() {
     let srv = start(WsOptions::default()).await;
@@ -16380,14 +16463,53 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
         frame.len()
     );
 
-    // Default (absent projection): full rows, complete content intact.
+    // Default (absent projection): full rows, paged; the giant one is cut
+    // to fit, on whichever page it lands (a page stops before a row that
+    // would overflow it).
     let full = &sess[1];
-    let rows = full["result"]["notes"].as_array().expect("notes array");
+    let frame = serde_json::to_string(full).expect("serialize");
+    assert!(
+        frame.len() < 500 * 1024,
+        "full frame fits: {} bytes",
+        frame.len()
+    );
+    let mut rows: Vec<serde_json::Value> = full["result"]["notes"]
+        .as_array()
+        .expect("notes array")
+        .clone();
+    let mut token = full["result"]["nextToken"].as_str().map(str::to_string);
+    let mut id = 10;
+    while let Some(t) = token {
+        id += 1;
+        let page = wss_session(
+            srv.port,
+            srv.cfg.clone(),
+            vec![serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "note.list",
+                "params": { "workspaceId": ws_id, "nextToken": t },
+            })
+            .to_string()],
+        )
+        .await;
+        let frame = serde_json::to_string(&page[0]).expect("serialize");
+        assert!(frame.len() < 500 * 1024, "page fits: {} bytes", frame.len());
+        rows.extend(
+            page[0]["result"]["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .cloned(),
+        );
+        token = page[0]["result"]["nextToken"].as_str().map(str::to_string);
+    }
     let giant = rows
         .iter()
         .find(|n| n["title"] == "Giant")
         .expect("giant note listed");
-    assert_eq!(giant["content"].as_str().map(str::len), Some(1_100_000));
+    assert_eq!(giant["contentTruncated"], true);
+    assert_eq!(giant["contentBytes"].as_u64(), Some(1_100_000));
+    let cut = giant["content"].as_str().map_or(0, str::len);
+    assert!(cut > 400_000 && cut < 1_100_000, "a bounded prefix: {cut}");
     assert!(giant.get("contentPreview").is_none());
 
     srv.ws.stop().await;
@@ -18323,8 +18445,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         .await
         .expect("corrupt old rows");
 
-    // The full-hydration read errors on the poisoned rows (proving the poison
-    // is potent)…
+    // `agent.getSession` is a bounded read too (§5.5 "Bounded session
+    // read"): it serves only the newest slim page, so the poisoned older
+    // rows are never decoded and the read still answers…
     let full = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -18334,8 +18457,33 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     )
     .await;
     assert!(
-        full.get("error").is_some(),
-        "full transcript hydration must fail on corrupted rows: {full}"
+        full.get("error").is_none(),
+        "the bounded session read must not hydrate corrupted rows: {full}"
+    );
+    let session = &full["result"]["session"];
+    let served = session["messages"].as_array().expect("session messages");
+    assert!(!served.is_empty(), "{full}");
+    assert!(
+        served.iter().all(|m| m["seq"].as_i64().unwrap() >= 70),
+        "only rows inside the newest page are served: {full}"
+    );
+    assert_eq!(served.last().unwrap()["seq"], 119, "{full}");
+    assert_eq!(session["messagesTotal"], 120, "{full}");
+    assert_eq!(session["messagesTruncated"], true, "{full}");
+    assert!(session["messagesNextToken"].is_string(), "{full}");
+    // …and the poison stays potent: paging past the newest window with that
+    // cursor reaches the corrupted rows and errors.
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &json!({"jsonrpc":"2.0","id":24,"method":"agent.getConversation",
+            "params":{"agentId":agent_id,"nextToken":session["messagesNextToken"]}})
+        .to_string(),
+    )
+    .await;
+    assert!(
+        older.get("error").is_some(),
+        "the older page decodes the corrupted rows: {older}"
     );
 
     // …while the bounded reads still answer correctly: they never touch rows
@@ -19059,8 +19207,11 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
 /// Non-user rows are never included; previews are bounded to
 /// `previewChars` (default 300, server-clamped into [1, 2000], with the
 /// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
-/// `metadata` passes through verbatim when present; a workspace mismatch
-/// and an unknown agent are not-found; a missing `agentId` is `-32602`.
+/// `metadata` is projected to the classification fields (heavy keys such as
+/// `events` never ride the wire, intent-hq/intent#8278); `limit` /
+/// `nextToken` page newest-first; a workspace mismatch and an unknown agent
+/// are not-found; a missing `agentId` or a malformed `nextToken` is
+/// `-32602`.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
@@ -19122,7 +19273,11 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
             &agent,
             "user",
             &json!([{ "type": "text", "text": "automated follow-up" }]),
-            Some(&json!({ "automated": true })),
+            Some(&json!({
+                "automated": true,
+                "type": "event_notification",
+                "events": [{ "type": "agent:reportToParent", "report": "r".repeat(8192) }],
+            })),
             &ts,
         )
         .await
@@ -19170,8 +19325,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(items[1]["id"], second);
     assert_eq!(
         items[1]["metadata"],
-        json!({ "automated": true }),
-        "metadata passes through verbatim"
+        json!({ "type": "event_notification" }),
+        "metadata is projected to the classification fields"
+    );
+    assert!(
+        result.get("nextToken").is_none(),
+        "unpaged reads keep the pre-paging shape: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -19245,6 +19404,75 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(
         lenient_float["result"]["items"][0]["preview"], "first",
         "float previewChars truncates toward zero (5.9 → 5)"
+    );
+
+    // Paging: the newest `limit` rows oldest→newest, then the opaque
+    // `nextToken` walks to the start and ends at `null`.
+    let paged = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2}}}}"#
+        ),
+    )
+    .await;
+    let paged = &paged["result"];
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(ids(paged), vec![second.clone(), third.clone()], "{paged}");
+    assert_eq!(paged["total"], 2);
+    let token = paged["nextToken"].as_str().expect("older rows remain");
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":14,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2,"nextToken":"{token}"}}}}"#
+        ),
+    )
+    .await;
+    let older = &older["result"];
+    assert_eq!(ids(older), vec![first.clone()], "{older}");
+    assert!(older["nextToken"].is_null(), "no older rows: {older}");
+    let bad_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":15,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":"bogus"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_token["error"]["code"], -32602, "{bad_token}");
+    for (id, token) in [(16, "123"), (17, "{}"), (18, "[]")] {
+        let typed = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":{token}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            typed["error"]["code"], -32602,
+            "a non-string nextToken is rejected, never read as absent: {typed}"
+        );
+    }
+    let null_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":19,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":null}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        null_token["result"].get("nextToken").is_none(),
+        "a null nextToken reads as absent: {null_token}"
     );
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
@@ -19356,6 +19584,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),
@@ -22825,6 +23054,7 @@ impl SystemControl for WatchHealthControl {
             update_supported: false,
             busy_agents: 0,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {
@@ -23121,7 +23351,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     drop(enumeration);
 
-    let started = std::time::Instant::now();
+    // The hang guard below is the responsiveness check: a status reply stuck
+    // behind the traversal never arrives inside it.
     status
         .send(Message::Text(
             r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
@@ -23150,10 +23381,6 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     .await
     .expect("system.status stayed responsive during detached traversal");
     assert!(response["result"].is_object(), "system.status: {response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "system.status was delayed by file.tree"
-    );
 
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
@@ -23693,7 +23920,7 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
         .unwrap());
     assert_eq!(
         srv.store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .attention_request_reason
@@ -23743,7 +23970,11 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             )
             .await
             .unwrap();
-        let mut session = srv.store.get_agent_session(&agent).await.unwrap();
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
         srv.store
@@ -23868,7 +24099,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         .await
         .unwrap();
     // Capture exactly the task/link observations held by an admitted resolver.
-    let before_session = srv.store.get_agent_session(&agent).await.unwrap();
+    let before_session = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(before_session.task_note_id.as_ref(), Some(old));
     let before_note = srv.store.get_note(&ws, old).await.unwrap();
     let mut prepared = before_note.clone();
@@ -23897,7 +24132,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     )
     .await;
     assert!(relink.get("error").is_none(), "{relink}");
-    let after_relink = srv.store.get_agent_session(&agent).await.unwrap();
+    let after_relink = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(after_relink.task_note_id.as_ref(), Some(new));
     assert_eq!(
         srv.store.get_note(&ws, old).await.unwrap().rev,

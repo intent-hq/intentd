@@ -7232,11 +7232,17 @@ mod workspace_api_tool_tests {
 
         assert_eq!(proposal["kind"], "workspace-create");
         assert_eq!(proposal["payload"]["operation"], "workspace.create");
-        assert_eq!(
-            first["proposalId"], "Create workspace: Follow up",
-            "top-level proposalId is the applyProposal handle (preview.title, no applyToolCallId)"
+        assert_eq!(proposal["preview"]["title"], "Create workspace: Follow up");
+        let first_id = first["proposalId"].as_str().expect("proposalId");
+        assert!(
+            first_id.starts_with("workspace-create-"),
+            "top-level proposalId is the card's unique applyToolCallId: {first_id}"
         );
-        assert_eq!(first["proposalId"], proposal["preview"]["title"]);
+        assert_eq!(first["proposalId"], proposal["applyToolCallId"]);
+        assert_ne!(
+            second["proposalId"], first["proposalId"],
+            "same-titled follow-up cards never share an identity"
+        );
         assert_eq!(create["mode"], "sibling");
         assert_eq!(create["title"], "Follow up");
         assert_eq!(
@@ -10026,6 +10032,7 @@ mod wsapi6_bindings_tests {
         cross_list_siblings_calls: Mutex<u32>,
         cross_list_siblings_include_retired: Mutex<Vec<bool>>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
+        cross_read_note_windows: Mutex<Vec<intent_core::note_read_bounds::LineWindow>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
         /// When set, `browser_exec` shapes this raw FE envelope through the
@@ -10100,7 +10107,11 @@ mod wsapi6_bindings_tests {
             _ws: WorkspaceId,
             target: WorkspaceId,
             note_id: NoteId,
+            window: intent_core::note_read_bounds::LineWindow,
+            bounded_default: bool,
         ) -> BoxFuture<'_, Result<Value>> {
+            assert!(bounded_default, "agents get bounded defaults");
+            self.cross_read_note_windows.lock().unwrap().push(window);
             self.cross_read_note_calls
                 .lock()
                 .unwrap()
@@ -10348,6 +10359,42 @@ mod wsapi6_bindings_tests {
             *api.cross_read_note_calls.lock().unwrap(),
             vec![("sibling-1".to_string(), "n-1".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_read_note_forwards_line_window() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 4, maxLines: 9, startOffset: 12 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let windows = api.cross_read_note_windows.lock().unwrap().clone();
+        assert_eq!(
+            windows,
+            vec![
+                intent_core::note_read_bounds::LineWindow {
+                    start_line: Some(4),
+                    max_lines: Some(9),
+                    start_offset: Some(12),
+                },
+                intent_core::note_read_bounds::LineWindow::default(),
+            ]
+        );
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 0 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("startLine must be a positive integer"));
     }
 
     #[tokio::test]
@@ -10917,6 +10964,12 @@ mod wsapi4_bindings_tests {
         agent_delete_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_retire_calls: Mutex<Vec<RetireCall>>,
         agent_create_calls: Mutex<Vec<CreateCall>>,
+        /// `(method, placement)` of every create / delegate / wakeOrCreate.
+        placements: Mutex<Vec<(&'static str, Option<Value>)>>,
+        /// What `agent_placement_help` answers.
+        placement_help: Mutex<Option<String>>,
+        /// What `is_plain_folder_workspace` answers.
+        plain_folder: Mutex<bool>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
         /// calls — `create({ topLevel: true })` must never make one.
         agent_watch_completion_calls: Mutex<u32>,
@@ -10992,6 +11045,12 @@ mod wsapi4_bindings_tests {
             last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -11038,6 +11097,7 @@ mod wsapi4_bindings_tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
@@ -11058,6 +11118,7 @@ mod wsapi4_bindings_tests {
                 pending_questions_message_id: None,
                 pending_proposals: Vec::new(),
                 proposal_resolutions: serde_json::Map::new(),
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -11326,6 +11387,14 @@ mod wsapi4_bindings_tests {
             context_message: String,
             input: intent_core::AgentWakeOrCreateInput,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "wakeOrCreate",
+                input
+                    .create
+                    .as_ref()
+                    .and_then(|create| create.placement.as_ref())
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_wake_or_create_calls.lock().unwrap().push((
                 task_note_id.as_str().to_string(),
                 context_message,
@@ -11347,6 +11416,14 @@ mod wsapi4_bindings_tests {
             idempotency_key: Option<String>,
             extra: intent_core::AgentCreateExtra,
         ) -> BoxFuture<'_, Result<Value>> {
+            let placed = extra.placement.is_some();
+            self.placements.lock().unwrap().push((
+                "create",
+                extra
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_create_calls.lock().unwrap().push((
                 name,
                 specialist_id,
@@ -11355,7 +11432,25 @@ mod wsapi4_bindings_tests {
                 extra.metadata,
                 extra.is_background,
             ));
-            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+            Box::pin(async move {
+                if placed {
+                    return Ok(json!({
+                        "agent": { "id": "child-1", "name": "child", "nodeId": "node-1", "nodeName": "Mac" },
+                        "notice": "Uncommitted changes in the workspace are not carried",
+                    }));
+                }
+                Ok(json!({ "agent": { "id": "child-1", "name": "child" } }))
+            })
+        }
+
+        fn agent_placement_help(&self, _ws: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+            let help = self.placement_help.lock().unwrap().clone();
+            Box::pin(async move { help })
+        }
+
+        fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
+            let plain = *self.plain_folder.lock().unwrap();
+            Box::pin(async move { plain })
         }
 
         fn agent_watch_completion(
@@ -11374,6 +11469,13 @@ mod wsapi4_bindings_tests {
             input: AgentDelegateInput,
             caller: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "delegate",
+                input
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_delegate_calls.lock().unwrap().push((
                 input.wait_mode.clone(),
                 caller.as_ref().map(|c| c.as_str().to_string()),
@@ -13243,6 +13345,92 @@ mod wsapi4_bindings_tests {
         assert_eq!(calls[0].3.as_ref().unwrap()["type"], json!("agent_message"));
     }
 
+    /// `placement` reaches every create seam unchanged; `null` and invalid
+    /// objects are refused before any call; a remote create reports its
+    /// node and launch notice.
+    #[tokio::test]
+    async fn placement_is_threaded_through_create_delegate_and_wake_or_create() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('n', 'go', { placement: { target: 'remote', os: 'macos' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"nodeName\": \"Mac\"") || text.contains("\"nodeName\":\"Mac\""),
+            "{text}"
+        );
+        assert!(text.contains("not carried"), "{text}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { arch: 'aarch64' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { create: { placement: { target: 'remote' } } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-2', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        assert_eq!(
+            *api.placements.lock().unwrap(),
+            vec![
+                ("create", Some(json!({"target": "remote", "os": "macos"}))),
+                ("delegate", Some(json!({"arch": "aarch64"}))),
+                ("wakeOrCreate", Some(json!({"target": "remote"}))),
+                ("wakeOrCreate", None),
+            ]
+        );
+
+        for code in [
+            "return await ws.agent.create('n', 'go', { placement: null });",
+            "return await ws.agent.create('n', 'go', { placement: { node: 'x' } });",
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { os: 'windows' } });",
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { placement: {} });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{code}: {resp}");
+        }
+        assert_eq!(
+            api.placements.lock().unwrap().len(),
+            4,
+            "refused before any call"
+        );
+    }
+
+    /// `ws.help("agent")` appends the daemon's live placement discovery when
+    /// it has an execution node, and nothing otherwise.
+    #[tokio::test]
+    async fn agent_help_includes_live_placement_discovery() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let plain = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!plain.contains("Remote placement"), "{plain}");
+        *api.placement_help.lock().unwrap() =
+            Some("Remote placement (experimental): node \"Mac\"".into());
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Remote placement (experimental)"), "{text}");
+        let resp = call(&srv, "return await ws.help('note');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
+
+        // Remote agents start from a git commit: a plain folder (§5.1)
+        // never lists placement.
+        *api.plain_folder.lock().unwrap() = true;
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
+    }
+
     #[tokio::test]
     async fn agent_delegate_threads_wait_mode_and_caller() {
         let (srv, api) = server_with_caller("coord-1");
@@ -14310,6 +14498,8 @@ mod workspace_apply_proposal_tests {
         /// Outcome the fake resolver echoes back instead of the requested one
         /// (models the real resolver's "already resolved" idempotent path).
         resolve_persisted_outcome: Mutex<Option<String>>,
+        /// `created_workspace_id` of each resolve call, in call order.
+        resolve_created: Mutex<Vec<Option<String>>>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -14335,6 +14525,12 @@ mod workspace_apply_proposal_tests {
             last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
             id: AgentId::from(CALLER),
             workspace_id: WorkspaceId::from_string(WS),
             parent_agent_id: None,
@@ -14381,6 +14577,7 @@ mod workspace_apply_proposal_tests {
             provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
                 attention_request_reason_truncated: false,
                 completion_report_truncated: false,
@@ -14401,6 +14598,7 @@ mod workspace_apply_proposal_tests {
                 pending_questions_message_id: None,
                 pending_proposals: pending,
                 proposal_resolutions: resolutions,
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -14506,6 +14704,8 @@ mod workspace_apply_proposal_tests {
                         "notificationsMuted": false,
                     })),
                     proposal_origin: None,
+                    notice: None,
+                    initial_agent_launch_failure: None,
                 })
             })
         }
@@ -14517,7 +14717,12 @@ mod workspace_apply_proposal_tests {
             proposal_id: String,
             outcome: String,
             detail: Option<String>,
+            created_workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.resolve_created
+                .lock()
+                .unwrap()
+                .push(created_workspace_id.map(|id| id.as_str().to_string()));
             self.resolve_calls.lock().unwrap().push((
                 workspace_id.as_str().to_string(),
                 agent_id.as_str().to_string(),
@@ -14755,6 +14960,12 @@ mod workspace_apply_proposal_tests {
             detail.as_deref(),
             Some("Created workspace ws-new (Follow up) via ws.workspace.applyProposal")
         );
+        drop(resolves);
+        assert_eq!(
+            *api.resolve_created.lock().unwrap(),
+            vec![Some("ws-new".to_string())],
+            "the applied card records the workspace it created"
+        );
     }
 
     #[tokio::test]
@@ -14851,6 +15062,57 @@ mod workspace_apply_proposal_tests {
             &resp,
             "has no initialAgent; initialPrompt cannot be overridden",
         );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    /// A unique-id follow-up card whose pending entry is its `applyToolCallId`.
+    fn api_with_pending_ids(ids: &[&str]) -> Arc<FakeApi> {
+        let api = Arc::new(FakeApi::default());
+        for (index, id) in ids.iter().enumerate() {
+            let message_id = format!("m-{index}");
+            let mut proposal = sibling_proposal();
+            proposal["applyToolCallId"] = json!(id);
+            proposal["payload"]["params"]["idempotencyKey"] = json!(format!("{KEY}-{index}"));
+            api.pending.lock().unwrap().push(PendingProposal {
+                proposal_id: id.to_string(),
+                message_id: message_id.clone(),
+            });
+            api.messages
+                .lock()
+                .unwrap()
+                .insert(message_id, vec![proposal_block(&proposal)]);
+        }
+        api
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_applies_the_one_pending_unique_id_card() {
+        let api = api_with_pending_ids(&["workspace-create-a"]);
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["proposalId"], "workspace-create-a");
+        assert_eq!(api.resolve_calls.lock().unwrap()[0].2, "workspace-create-a");
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_refuses_an_ambiguous_title() {
+        let api = api_with_pending_ids(&["workspace-create-a", "workspace-create-b"]);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "2 pending proposals are titled");
         assert!(api.create_calls.lock().unwrap().is_empty());
     }
 

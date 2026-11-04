@@ -51,7 +51,7 @@ async fn seed_legacy(
 async fn row(mgr: &AgentManager, agent_id: &AgentId) -> AgentSession {
     mgr.services
         .store
-        .get_agent_session(agent_id)
+        .get_agent_session_with_transcript(agent_id)
         .await
         .unwrap()
 }

@@ -121,10 +121,113 @@ pub(crate) fn max_content_bytes_param(
     }
 }
 
+/// `offset` / `maxBytes` on `agent.getMessageBlock` (capped and paged block
+/// reads, PROTOCOL §5.5): absent or `null` → the default; `offset` a
+/// non-negative integer, `maxBytes` a positive integer (clamped later);
+/// anything else → the documented `-32602`.
+fn parse_message_block_page(
+    params: &Map<String, Value>,
+) -> std::result::Result<intent_core::MessageBlockPage, RpcErr> {
+    let offset = match params.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 0)
+                .ok_or_else(|| invalid_params("offset must be a non-negative integer"))?,
+        ),
+    };
+    let max_bytes = match params.get("maxBytes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            json_integer_at_least(v, 1)
+                .ok_or_else(|| invalid_params("maxBytes must be a positive integer"))?,
+        ),
+    };
+    Ok(intent_core::MessageBlockPage { offset, max_bytes })
+}
+
+/// `maxBytes` on `git.diffs` / `git.branchDiff` (§5.6 "Response budget"):
+/// a positive integer sets the packed result's budget (the daemon clamps it into
+/// [64 KiB, 480,000]); absent / `null` → `None` (the 480,000-byte default);
+/// anything else → `-32602`.
+fn git_diff_max_bytes(params: &Map<String, Value>) -> Result<Option<usize>, RpcErr> {
+    match params.get("maxBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or_else(|| invalid_params("maxBytes must be a positive integer".to_string())),
+    }
+}
+
 fn parse_max_content_bytes(
     params: &Map<String, Value>,
 ) -> std::result::Result<Option<usize>, RpcErr> {
     max_content_bytes_param(params).map_err(invalid_params)
+}
+
+/// The page a list read serves (bounded reads, `server.capabilities.boundedReads`):
+/// `limit` is clamped into `1..=max` (default `default`); `nextToken` must be
+/// a non-empty string.
+fn parse_page_request(
+    params: &Map<String, Value>,
+    default: usize,
+    max: usize,
+) -> std::result::Result<intent_core::note_read_bounds::PageRequest, RpcErr> {
+    let limit = opt_positive_usize(params, "limit")?;
+    let next_token = match params.get("nextToken") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => return Err(invalid_params("nextToken must be a non-empty string")),
+    };
+    Ok(intent_core::note_read_bounds::PageRequest::new(
+        limit, default, max, next_token,
+    ))
+}
+
+/// Bounded-reads write guard: a whole-content write (`note.setContent`, the
+/// content arm of `note.update`) to a note whose default read is cut
+/// ([`intent_core::note_read_bounds::note_default_read_is_cut`]) must send
+/// `baseContentBytes`. A client that read the note by default saw only the
+/// cut prefix; without the guard its save would replace the full text.
+/// `-32602` with `error.data.code: "content-base-required"`; a note that
+/// cannot be read is left to the write's own error.
+async fn require_base_for_cut_note(
+    api: &dyn WorkspaceApi,
+    ws: &WorkspaceId,
+    note_id: &NoteId,
+    base_content_bytes: Option<u64>,
+) -> std::result::Result<(), RpcErr> {
+    if base_content_bytes.is_some() {
+        return Ok(());
+    }
+    let Ok(note) = api.get_note(ws.clone(), note_id.clone()).await else {
+        return Ok(());
+    };
+    if !intent_core::note_read_bounds::note_default_read_is_cut(&note) {
+        return Ok(());
+    }
+    Err(RpcErr {
+        code: INVALID_PARAMS,
+        message: "baseContentBytes is required to replace the content of a note larger than the read budget".to_string(),
+        data: Some(json!({
+            "code": "content-base-required",
+            "contentBytes": note.content.len(),
+        })),
+    })
+}
+
+/// An optional positive integer param (`startLine`, `maxLines`, `limit`):
+/// absent or `null` → `None`; a positive integer → its value; anything else
+/// → `-32602 "<name> must be a positive integer"`.
+fn opt_positive_usize(
+    params: &Map<String, Value>,
+    name: &str,
+) -> std::result::Result<Option<usize>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or_else(|| invalid_params(format!("{name} must be a positive integer"))),
+    }
 }
 
 /// `baseContentBytes` on whole-content note writes (truncated-read write
@@ -206,11 +309,45 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
         // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
-        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
+        // No node can run the requested placement: the documented -32602
+        // with `data.code: "placement-unavailable"` and the alternatives.
+        ref e @ Error::PlacementUnavailable(ref failure) => RpcErr {
             code: e.code(),
-            message: failure.message.clone(),
-            data: Some(failure.data.clone()),
+            message: failure.message(),
+            data: Some(failure.data()),
         },
+        // No exposed machine offers the requested model: -32602 with
+        // `data.code: "model-unavailable"` and what each machine has.
+        ref e @ Error::ModelUnavailable(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
+        // Backend and machine share no node-link version: -32602 with
+        // `data.code: "machine-update-required"` and the side to update.
+        ref e @ Error::MachineUpdateRequired(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
+        // The WSS listener is stopped (`executor.mint` has no routes to
+        // report): -32603 with `data.code: "listener-down"`, as on
+        // `pairing.getInfo`.
+        ref e @ Error::ListenerDown => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "listener-down" })),
+        },
+        // An exposed-machine request failed (`machine-unreachable` with the
+        // routes tried, `machine-revoked`, `machine-in-use`): the
+        // service-built `data` verbatim.
+        ref e @ (Error::RemoteMachine(ref failure) | Error::ProviderProfile(ref failure)) => {
+            RpcErr {
+                code: e.code(),
+                message: failure.message.clone(),
+                data: Some(failure.data.clone()),
+            }
+        }
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
         // category so clients stop showing a bare "Internal error"
@@ -251,11 +388,49 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // `workspace.retire` on a non-worktree checkout (§5.1): -32602 with
         // `data = { code: "retire-unsupported", checkoutMode? }`.
         ref e @ Error::RetireUnsupported {
-            ref checkout_mode, ..
+            ref checkout_mode,
+            plain_folder,
+            ..
         } => {
             let mut data = json!({ "code": "retire-unsupported" });
             if let Some(mode) = checkout_mode {
                 data["checkoutMode"] = json!(mode);
+            }
+            if plain_folder {
+                data["plainFolder"] = json!(true);
+            }
+            RpcErr {
+                code: e.code(),
+                message: e.to_string(),
+                data: Some(data),
+            }
+        }
+        // An operation needing git or a forge on a plain-folder workspace
+        // (§5.1 "Plain-folder workspaces"): -32602 with `data = { code:
+        // "plain-folder-unsupported", operation }`.
+        ref e @ Error::PlainFolderUnsupported { operation } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "plain-folder-unsupported", "operation": operation })),
+        },
+        // Plain-folder create shape rejection (§5.1 "Plain-folder
+        // workspaces"): -32602 with `data = { code: "invalid-params" }`.
+        ref e @ Error::PlainFolderInvalidParams(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "invalid-params" })),
+        },
+        // Plain-folder create path rejection (§5.1): -32602 with
+        // `data = { code: "plain-folder-path-rejected", reason, path,
+        // repositoryRoot? }`.
+        ref e @ Error::PlainFolderPathRejected(ref rejection) => {
+            let mut data = json!({
+                "code": "plain-folder-path-rejected",
+                "reason": rejection.reason.as_str(),
+                "path": rejection.path,
+            });
+            if let Some(root) = &rejection.repository_root {
+                data["repositoryRoot"] = json!(root);
             }
             RpcErr {
                 code: e.code(),
@@ -350,6 +525,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: crate::catalog::FORBIDDEN_ERROR_CODE,
             message: crate::catalog::FORBIDDEN_ERROR_MESSAGE.to_string(),
             data: Some(json!({ "code": "forbidden", "detail": detail })),
+        },
+        // Node mode: the same `-32003` envelope the connection-level
+        // node-mode gate emits, `data.code: "node-mode"`.
+        Error::NodeMode(detail) => RpcErr {
+            code: crate::catalog::FORBIDDEN_ERROR_CODE,
+            message: crate::catalog::NODE_MODE_ERROR_MESSAGE.to_string(),
+            data: Some(crate::catalog::node_mode_error_data(&detail)),
         },
         // Invite / identity-only join refusal (multiplayer w4): the kind's
         // own code with the stable `data.code` so an invite client can route
@@ -606,9 +788,13 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        // Retired workspaces are read-only (§5.1): refuse gated writes
-        // before any handler runs.
-        let result = match crate::retired_gate::check(api, method, &params).await {
+        // Retired workspaces are read-only and plain-folder workspaces have
+        // no git or forge (§5.1): refuse gated writes before any handler runs.
+        let gate = match crate::retired_gate::check(api, method, &params).await {
+            Ok(()) => crate::plain_folder_gate::check(api, method, &params).await,
+            Err(e) => Err(e),
+        };
+        let result = match gate {
             Ok(()) => dispatch(api, method, &params).await,
             Err(e) => Err(domain_to_rpc(e)),
         };
@@ -757,7 +943,286 @@ fn discussion_limit(params: &Map<String, Value>) -> std::result::Result<u32, Rpc
         .map(|v| v.unwrap_or(50))
 }
 
+/// Bytes a single-definition read may carry: the shared 480,000-byte page
+/// budget, so the frame stays under the 500 KiB read payload budget.
+const SINGLE_READ_BUDGET_BYTES: usize = 480_000;
+
+/// `script.get` (bounded reads, §5.8): one definition, with a `command`
+/// too big for one reply served in parts (`commandOffset` in,
+/// `nextCommandOffset` out). Kept out of [`dispatch`] and awaited boxed, so
+/// its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_script_get(
+    params: &Map<String, Value>,
+    api: &dyn WorkspaceApi,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let offset = match params.get("commandOffset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .ok_or_else(|| invalid_params("commandOffset must be a positive integer"))?,
+    };
+    let mut row = api
+        .script_get(ws, require_str_param(params, "scriptId")?)
+        .await
+        .map_err(domain_to_rpc)?;
+    intent_core::text_field_page::page_text_field(
+        &mut row,
+        "command",
+        offset,
+        SINGLE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(row)
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
+/// `note.list` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_list(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => WorkspaceId::from(s),
+        _ => return Err(invalid_params("workspaceId is required")),
+    };
+    let projection = parse_note_list_projection(params)?;
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
+    )?;
+    let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
+    let (rows, next) = intent_core::note_read_bounds::note_list_page(
+        notes,
+        ws_id.as_str(),
+        projection,
+        None,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({ "notes": rows, "nextToken": next }))
+}
+
+/// `note.get` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_get(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let max_content_bytes = parse_max_content_bytes(params)?;
+    let content_offset = opt_positive_usize(params, "contentOffset")?.unwrap_or(0);
+    match api.get_note(ws, note_id).await {
+        // Bounded reads: whatever `maxContentBytes` asks for, the row
+        // is cut to fit the read budget (`contentTruncated`), and
+        // `nextContentOffset` reads the rest, so nothing is lost.
+        Ok(note) => {
+            let row = intent_core::note_read_bounds::note_get_row(
+                &note,
+                max_content_bytes,
+                content_offset,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(|e| invalid_params(e.to_string()))?;
+            Ok(json!({ "note": row }))
+        }
+        Err(Error::NotFound(_)) => Err(not_found("Note not found")),
+        Err(e) => Err(domain_to_rpc(e)),
+    }
+}
+
+/// `note.listTasks` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_note_list_tasks(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::NOTE_TASKS_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_TASKS_MAX_LIMIT,
+    )?;
+    let ws_key = ws.as_str().to_string();
+    let note_key = note_id.as_str().to_string();
+    let tasks = api
+        .list_note_tasks(ws, note_id)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Bounded reads: one page as `{ tasks, nextToken }`.
+    let (rows, next) = intent_core::note_read_bounds::note_tasks_page(
+        &tasks,
+        &ws_key,
+        &note_key,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({ "tasks": rows, "nextToken": next }))
+}
+
+/// `note.lineAttribution.load` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_line_attribution_load(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let window = intent_core::note_read_bounds::LineWindow {
+        start_line: opt_positive_usize(params, "startLine")?,
+        max_lines: opt_positive_usize(params, "maxLines")?,
+        start_offset: None,
+    };
+    let data = api
+        .line_attribution_load(ws, note_id)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Bare LineAttributionData | null so the FE gutter’s
+    // `line-attribution:load` decoder round-trips as-is. A page
+    // that holds fewer than every attributed line (a window, or the
+    // read budget) adds `truncated` and `nextStartLine`.
+    let Some(mut data) = data else {
+        return Ok(Value::Null);
+    };
+    let page = intent_core::note_read_bounds::line_attribution_page(
+        &mut data,
+        window,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    );
+    let mut value = to_result_value(&data)?;
+    if page.truncated {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("truncated".into(), Value::Bool(true));
+            obj.insert("nextStartLine".into(), json!(page.next_start_line));
+        }
+    }
+    Ok(value)
+}
+
+/// `comment.list` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_comment_list(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let since = opt_str(params, "since");
+    let author_type = opt_str(params, "authorType");
+    let status = opt_str(params, "status");
+    let include_comments = parse_bool(params, "includeComments");
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
+    )?;
+    let ws_key = ws.as_str().to_string();
+    let note_key = note_id.as_str().to_string();
+    let result = api
+        .comment_list(ws, note_id, since, author_type, status, include_comments)
+        .await
+        .map_err(domain_to_rpc)?;
+    // Totals count every thread the filters keep, not just this page.
+    let (rows, next) = intent_core::note_read_bounds::comment_list_page(
+        result.threads,
+        &ws_key,
+        &note_key,
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    )
+    .map_err(invalid_params)?;
+    Ok(json!({
+        "threads": rows,
+        "totalThreads": result.total_threads,
+        "totalComments": result.total_comments,
+        "nextToken": next,
+    }))
+}
+
+/// `crossWorkspace.readNote` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn bounded_cross_workspace_read_note(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
+    let note_id = require_note_id(params)?;
+    let window = intent_core::note_read_bounds::LineWindow {
+        start_line: opt_positive_usize(params, "startLine")?,
+        max_lines: opt_positive_usize(params, "maxLines")?,
+        start_offset: opt_positive_usize(params, "startOffset")?,
+    };
+    api.cross_workspace_read_note(ws, target, note_id, window, true)
+        .await
+        .map_err(domain_to_rpc)
+}
+
+/// `note.update` with the cut-note write guard (bounded reads, §5.2). Kept out
+/// of [`dispatch`] and awaited boxed: its locals live across two awaits.
+async fn guarded_note_update(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let input = NoteUpdateInput {
+        content: opt_str(params, "content"),
+        title: opt_str(params, "title"),
+        tags: opt_tags(params, "tags"),
+        expected_version: opt_int(params, "expectedVersion"),
+        base_content_bytes: parse_base_content_bytes(params)?,
+    };
+    if input.content.is_some() {
+        crate::stack_frame::boxed_await(|| {
+            require_base_for_cut_note(api, &ws, &note_id, input.base_content_bytes)
+        })
+        .await?;
+    }
+    let note = api
+        .update_note(ws, note_id, input)
+        .await
+        .map_err(domain_to_rpc)?;
+    Ok(json!({ "note": note }))
+}
+
+/// `note.setContent` with the cut-note write guard (bounded reads, §5.2). Kept out
+/// of [`dispatch`] and awaited boxed: its locals live across two awaits.
+async fn guarded_note_set_content(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let note_id = require_note_id(params)?;
+    let content = require_str_param(params, "content")?;
+    let confirm = parse_confirm(params);
+    let expected_version = opt_int(params, "expectedVersion");
+    let base_content_bytes = parse_base_content_bytes(params)?;
+    crate::stack_frame::boxed_await(|| {
+        require_base_for_cut_note(api, &ws, &note_id, base_content_bytes)
+    })
+    .await?;
+    let result = api
+        .set_note_content_guarded(
+            ws,
+            note_id,
+            content,
+            confirm,
+            expected_version,
+            base_content_bytes,
+            None,
+        )
+        .await
+        .map_err(domain_to_rpc)?;
+    to_result_value(&result)
+}
+
 async fn dispatch(
     api: &dyn WorkspaceApi,
     method: &str,
@@ -934,14 +1399,15 @@ async fn dispatch(
             // Retired rows are opt-in only (§5.1): `includeArchived` alone
             // never returns them.
             let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
-            let workspaces = api
-                .list_workspaces(intent_core::WorkspaceListFilter::new(
-                    include_archived,
-                    include_retired,
-                ))
+            let filter = intent_core::WorkspaceListFilter::new(include_archived, include_retired);
+            // Paged for every caller (§5.1 "Paged workspace lists"): the
+            // reply always carries `nextToken` (`null` after the last page).
+            let (limit, next_token) = list_page_params(params)?;
+            let page = api
+                .list_workspaces_page(filter, false, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(json!({ "workspaces": workspaces }))
+            Ok(json!({ "workspaces": page.workspaces, "nextToken": page.next_token }))
         }
         "workspace.findByPullRequest" => {
             let url = params
@@ -985,6 +1451,10 @@ async fn dispatch(
             }
             if let Some(origin) = res.proposal_origin {
                 result["proposalOrigin"] = json!(origin);
+            }
+            // A placed initial agent's launch notice, as on `agent.create`.
+            if let Some(notice) = res.notice {
+                result["notice"] = json!(notice);
             }
             Ok(result)
         }
@@ -1436,6 +1906,32 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Daemon-to-daemon executor credentials (nodes.md "Machine methods:
+        // executor credentials"): owner-only, daemon-global. The services
+        // recheck the owner role; the minted token is in the result only.
+        "executor.mint" => api
+            .executor_mint(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "executor.list" => api.executor_list().await.map_err(domain_to_rpc),
+        "executor.revoke" => api
+            .executor_revoke(require_str_param(params, "credentialId")?)
+            .await
+            .map_err(domain_to_rpc),
+        // Daemon-to-daemon exposed machines (nodes.md "Backend methods:
+        // exposed machines"): owner-only, daemon-global. The services
+        // recheck the owner role; `add` carries the executor token, which no
+        // result or error ever echoes.
+        "remoteMachines.backendInfo" => remote_machines(api, "backendInfo", params).await,
+        "remoteMachines.add" => remote_machines(api, "add", params).await,
+        "remoteMachines.list" => remote_machines(api, "list", params).await,
+        "remoteMachines.remove" => remote_machines(api, "remove", params).await,
+        "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
+        // Executor-link traffic capture (nodes.md "Link traffic capture"):
+        // owner-only, daemon-global; the services recheck the owner role.
+        "remoteLinkTraffic.start" => remote_link_traffic(api, "start", params).await,
+        "remoteLinkTraffic.stop" => remote_link_traffic(api, "stop", params).await,
+        "remoteLinkTraffic.snapshot" => remote_link_traffic(api, "snapshot", params).await,
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -1660,39 +2156,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "success": true }))
         }
-        "note.list" => {
-            let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
-                Some(s) if !s.is_empty() => WorkspaceId::from(s),
-                _ => return Err(invalid_params("workspaceId is required")),
-            };
-            let projection = parse_note_list_projection(params)?;
-            let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
-            match projection {
-                Some(intent_core::NoteListProjection::Slim) => {
-                    let rows: Vec<Value> = notes
-                        .into_iter()
-                        .map(intent_core::note_list_slim_row)
-                        .collect();
-                    Ok(json!({ "notes": rows }))
-                }
-                None => Ok(json!({ "notes": notes })),
-            }
-        }
-        "note.get" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let max_content_bytes = parse_max_content_bytes(params)?;
-            match api.get_note(ws, note_id).await {
-                Ok(note) => match max_content_bytes {
-                    Some(limit) => {
-                        Ok(json!({ "note": intent_core::note_bounded_row(note, limit) }))
-                    }
-                    None => Ok(json!({ "note": note })),
-                },
-                Err(Error::NotFound(_)) => Err(not_found("Note not found")),
-                Err(e) => Err(domain_to_rpc(e)),
-            }
-        }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
+        "note.list" => crate::stack_frame::boxed_await(|| bounded_note_list(api, params)).await,
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
+        "note.get" => crate::stack_frame::boxed_await(|| bounded_note_get(api, params)).await,
         "note.create" => {
             let ws = require_ws_note(params)?;
             let title = require_str_param(params, "title")?;
@@ -1714,22 +2181,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        "note.update" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let input = NoteUpdateInput {
-                content: opt_str(params, "content"),
-                title: opt_str(params, "title"),
-                tags: opt_tags(params, "tags"),
-                expected_version: opt_int(params, "expectedVersion"),
-                base_content_bytes: parse_base_content_bytes(params)?,
-            };
-            let note = api
-                .update_note(ws, note_id, input)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "note": note }))
-        }
+        // Whole arm boxed: the write guard adds a second await, and locals live
+        // across two awaits would grow every `dispatch` state (see `crate::stack_frame`).
+        "note.update" => crate::stack_frame::boxed_await(|| guarded_note_update(api, params)).await,
         "note.add" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
@@ -1778,26 +2232,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Whole arm boxed: the write guard adds a second await, and locals live
+        // across two awaits would grow every `dispatch` state (see `crate::stack_frame`).
         "note.setContent" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let content = require_str_param(params, "content")?;
-            let confirm = parse_confirm(params);
-            let expected_version = opt_int(params, "expectedVersion");
-            let base_content_bytes = parse_base_content_bytes(params)?;
-            let result = api
-                .set_note_content_guarded(
-                    ws,
-                    note_id,
-                    content,
-                    confirm,
-                    expected_version,
-                    base_content_bytes,
-                    None,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            crate::stack_frame::boxed_await(|| guarded_note_set_content(api, params)).await
         }
         "note.updateMetadata" => {
             let ws = require_ws_note(params)?;
@@ -1821,21 +2259,25 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "note.listTasks" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let tasks = api
-                .list_note_tasks(ws, note_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            // The TS peer returns a bare array.
-            to_result_value(&tasks)
+            crate::stack_frame::boxed_await(|| bounded_note_list_tasks(api, params)).await
         }
         "note.readAsset" => {
             let ws = require_ws_note(params)?;
             let asset = require_str_param(params, "asset")?;
+            let max_bytes = bounded_read::max_bytes_param(params)?;
             let result = api.read_asset(ws, asset).await.map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            bounded_read::bound_asset(to_result_value(&result)?, max_bytes)
+        }
+        "note.readAssetChunk" => {
+            let ws = require_ws_note(params)?;
+            let asset = require_str_param(params, "asset")?;
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.read_asset_chunk(ws, asset, offset, length)
+                .await
+                .map_err(domain_to_rpc)
         }
         "note.saveAsset" => {
             let ws = require_ws_note(params)?;
@@ -1878,16 +2320,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "note.lineAttribution.load" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let data = api
-                .line_attribution_load(ws, note_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            // Bare LineAttributionData | null so the FE gutter’s
-            // `line-attribution:load` decoder round-trips as-is.
-            to_result_value(&data)
+            crate::stack_frame::boxed_await(|| bounded_line_attribution_load(api, params)).await
         }
         "note.lineAttribution.computeNow" => {
             let ws = require_ws_note(params)?;
@@ -2102,18 +2537,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "comment.list" => {
-            let ws = require_ws_note(params)?;
-            let note_id = require_note_id(params)?;
-            let since = opt_str(params, "since");
-            let author_type = opt_str(params, "authorType");
-            let status = opt_str(params, "status");
-            let include_comments = parse_bool(params, "includeComments");
-            let result = api
-                .comment_list(ws, note_id, since, author_type, status, include_comments)
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
+            crate::stack_frame::boxed_await(|| bounded_comment_list(api, params)).await
         }
         "comment.getThread" => {
             let ws = require_ws_note(params)?;
@@ -2257,21 +2683,22 @@ async fn dispatch(
                 RPC_REQUEST_SHAPE_FIELD,
                 agent_list_request_shape(scope.as_ref(), include_retired, retired_only).as_str(),
             );
-            let agents = if let Some(scope) = scope {
-                api.agent_list_scoped(ws.clone(), scope)
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else if retired_only {
-                api.agent_list_retired_only(ws.clone())
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else if include_retired {
-                api.agent_list_including_retired(ws.clone())
-                    .await
-                    .map_err(domain_to_rpc)?
-            } else {
-                api.agent_list(ws.clone()).await.map_err(domain_to_rpc)?
+            // Paged for every caller (§5.5 "Paged agent lists and queues"):
+            // the reply carries `nextToken` (`null` after the last page) next
+            // to the whole-workspace counts.
+            let (limit, token) = list_page_params(params)?;
+            let selection = match scope {
+                Some(scope) => intent_core::AgentListSelection::Scoped(scope),
+                None if retired_only => intent_core::AgentListSelection::RetiredOnly,
+                None if include_retired => intent_core::AgentListSelection::All,
+                None => intent_core::AgentListSelection::Active,
             };
+            let page = api
+                .agent_list_page(ws.clone(), selection, limit, token)
+                .await
+                .map_err(domain_to_rpc)?;
+            let next_token = page.next_token;
+            let agents = page.agents;
             let retired_count = api
                 .agent_retired_count(ws.clone())
                 .await
@@ -2289,6 +2716,7 @@ async fn dispatch(
                 "retiredCount": retired_count,
                 "scopeCounts": scope_counts,
                 "delegatedCounts": delegated_counts,
+                "nextToken": next_token,
             }))
         }
         "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
@@ -2368,8 +2796,10 @@ async fn dispatch(
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
             let preview_chars = opt_int(params, "previewChars");
+            let limit = opt_int(params, "limit");
+            let next_token = opt_str_strict(params, "nextToken")?;
             match api
-                .agent_list_user_messages(agent_id, ws, preview_chars)
+                .agent_list_user_messages(agent_id, ws, preview_chars, limit, next_token)
                 .await
             {
                 Ok(v) => Ok(v),
@@ -2382,8 +2812,9 @@ async fn dispatch(
             let message_id = require_str_param(params, "messageId")?;
             let block_id = require_str_param(params, "blockId")?;
             let ws = opt_workspace_id(params);
+            let page = parse_message_block_page(params)?;
             match api
-                .agent_get_message_block(agent_id, message_id, block_id, ws)
+                .agent_get_message_block(agent_id, message_id, block_id, ws, page)
                 .await
             {
                 Ok(v) => Ok(v),
@@ -2404,7 +2835,7 @@ async fn dispatch(
         "agent.getSession" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            match api.agent_get_session(agent_id, ws).await {
+            match api.agent_get_session_bounded(agent_id, ws).await {
                 Ok(session) => Ok(json!({ "session": session })),
                 Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -2511,6 +2942,13 @@ async fn dispatch(
                 file_blocks: opt_value(params, "fileBlocks"),
                 is_background: opt_bool(params, "isBackground"),
                 name_explicitly_set,
+                // The documented placement object; omitted means local,
+                // `null` or an invalid object is `-32602`.
+                placement: params
+                    .get("placement")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|e| invalid_params(format!("placement: {e}")))?,
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
@@ -2678,7 +3116,7 @@ async fn dispatch(
             let detail = opt_str(params, "detail");
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail)
+                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -2773,11 +3211,11 @@ async fn dispatch(
         "agent.getQueue" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            let result = api
-                .agent_get_queue(agent_id, ws)
+            // Paged for every caller (§5.5 "Paged agent lists and queues").
+            let (limit, token) = list_page_params(params)?;
+            api.agent_get_queue_page(agent_id, ws, limit, token)
                 .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
+                .map_err(domain_to_rpc)
         }
         "agent.workers.list" => {
             let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
@@ -3148,8 +3586,15 @@ async fn dispatch(
             let agent_id = opt_str(params, "agentId").map(AgentId::from);
             let task_note_id = opt_str(params, "taskNoteId").map(NoteId::from);
             let stale_responding_after_ms = opt_int(params, "staleRespondingAfterMs");
+            let row_limit = opt_int(params, "limit");
             let result = api
-                .agent_diagnostics(ws, agent_id, task_note_id, stale_responding_after_ms)
+                .agent_diagnostics(
+                    ws,
+                    agent_id,
+                    task_note_id,
+                    stale_responding_after_ms,
+                    row_limit,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -3554,8 +3999,22 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // walk to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let max_bytes = git_diff_max_bytes(params)?;
+            // §5.6 "Response budget": resumes the file list a previous
+            // page cut (its trailing `{ nextToken }` entry).
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_diffs(ws, paths, staged, commit_hash, git_root_id)
+                .git_diffs_budgeted(
+                    ws,
+                    paths,
+                    staged,
+                    commit_hash,
+                    git_root_id,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3594,11 +4053,35 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // read to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let max_bytes = bounded_read::max_bytes_param(params)?;
             let r = api
                 .git_show_file(ws, file_path, git_ref, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(r)
+            match r.get("content").and_then(Value::as_str) {
+                Some(text) => bounded_read::bound_text(
+                    "git.showFile",
+                    "git.showFileChunk",
+                    text.to_string(),
+                    max_bytes,
+                    |content| json!({ "content": content }),
+                ),
+                None => Ok(r),
+            }
+        }
+        "git.showFileChunk" => {
+            // One offset window of the blob `git.showFile` reads (same
+            // path/ref/root rules), as base64; sent over a transfer
+            // connection when `git.showFile` reports `truncated`.
+            let ws = require_ws_note(params)?;
+            let file_path = require_str_param(params, "filePath")?;
+            let git_ref = require_str_param(params, "ref")?;
+            let git_root_id = opt_git_root_id(params);
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.git_show_file_chunk(ws, file_path, git_ref, git_root_id, offset, length)
+                .await
+                .map_err(domain_to_rpc)
         }
         "git.numstat" => {
             // §5.6 extension: per-file additions/deletions for a workspace's
@@ -3633,8 +4116,20 @@ async fn dispatch(
             }
             let target_ref = opt_nonempty_str(params, "targetRef");
             let paths = opt_str_array(params, "paths");
+            let max_bytes = git_diff_max_bytes(params)?;
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_branch_diff(ws, base_ref, base_sha, target_ref, paths)
+                .git_branch_diff_budgeted(
+                    ws,
+                    base_ref,
+                    base_sha,
+                    target_ref,
+                    paths,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -4879,9 +5374,21 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None, opt_git_root_id(params))
+            let max_bytes = bounded_read::max_bytes_param(params)?;
+            let content = api
+                .file_read(ws, path, None, opt_git_root_id(params))
                 .await
-                .map_err(domain_to_rpc)
+                .map_err(domain_to_rpc)?;
+            match content {
+                Value::String(text) => bounded_read::bound_text(
+                    "file.read",
+                    "file.readChunk",
+                    text,
+                    max_bytes,
+                    Value::String,
+                ),
+                other => Ok(other),
+            }
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
@@ -5064,13 +5571,9 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
         "crossWorkspace.readNote" => {
-            let ws = require_ws_note(params)?;
-            let target = require_str_param(params, "targetWorkspaceId").map(WorkspaceId::from)?;
-            let note_id = require_note_id(params)?;
-            api.cross_workspace_read_note(ws, target, note_id)
-                .await
-                .map_err(domain_to_rpc)
+            crate::stack_frame::boxed_await(|| bounded_cross_workspace_read_note(api, params)).await
         }
         "crossWorkspace.listNotes" => {
             let ws = require_ws_note(params)?;
@@ -5085,12 +5588,7 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
-        "script.get" => {
-            let ws = require_ws_note(params)?;
-            api.script_get(ws, require_str_param(params, "scriptId")?)
-                .await
-                .map_err(domain_to_rpc)
-        }
+        "script.get" => crate::stack_frame::boxed_await(|| bounded_script_get(params, api)).await,
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
@@ -5139,6 +5637,36 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let id = require_str_param(params, "monitorId")?;
             api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "script.start" | "script.stop" | "script.restart" | "script.output" | "script.status"
+        | "script.run"
+            if params.contains_key("remoteAgentId") =>
+        {
+            // A remote agent's machine run (`remoteScripts: 1`): status,
+            // output, stop and restart of an existing run; start and run
+            // are the remote agent's own. Guests keep the home run's narrow
+            // parameter set, plus the run's `remoteAgentId`.
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params.keys().any(|k| {
+                !(["workspaceId", "scriptId", "remoteAgentId"].contains(&k.as_str())
+                    || (method == "script.output" && k == "maxLines"))
+            }) {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId, scriptId and remoteAgentId",
+                ));
+            }
+            let ws = require_ws_note(params)?;
+            require_str_param(params, "scriptId")?;
+            require_str_param(params, "remoteAgentId")?;
+            let method = method.trim_start_matches("script.").to_owned();
+            api.script_machine_run(ws, method, Value::Object(params.clone()))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -5257,8 +5785,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             // Active hooks only by default; `includeRetired` appends the
             // terminal rows as a light projection (no code/lastState/lastLogs).
-            let include_retired = opt_bool(params, "includeRetired").unwrap_or(false);
-            api.hook_list(ws, None, include_retired)
+            // Paged: `limit?` (1–200, default 100), `cursor?`, plus a byte
+            // budget per page; `nextCursor` while more rows follow.
+            api.hook_list_page(ws, Value::Object(params.clone()))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -5310,7 +5839,8 @@ async fn dispatch(
             // Optional workspaceId: present → include the workspace's read-only
             // rule files; omitted → global user-override set only.
             let workspace_id = opt_workspace_id(params);
-            api.rules_list(workspace_id).await.map_err(domain_to_rpc)
+            let listed = api.rules_list(workspace_id).await.map_err(domain_to_rpc)?;
+            catalog_lists::page_rules_list(listed, params)
         }
         "rules.get" => {
             let ws = require_ws_note(params)?;
@@ -5341,7 +5871,7 @@ async fn dispatch(
             };
             let provider = opt_str(params, "provider");
             match api.specialist_list(workspace_path, provider).await {
-                Ok(v) => Ok(v),
+                Ok(v) => catalog_lists::page_specialist_list(v, params),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
@@ -5398,8 +5928,8 @@ async fn dispatch(
         }
         "skill.list" => {
             let ws_id = require_workspace_id(params)?;
-            match api.skill_list(ws_id).await {
-                Ok(v) => Ok(v),
+            match api.skill_list(ws_id.clone()).await {
+                Ok(v) => catalog_lists::page_skill_list(v, params, &ws_id),
                 Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -5654,6 +6184,27 @@ fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, Rp
             "{name} must be a nonempty string of at most 256 bytes without control characters"
         ))),
     }
+}
+
+/// `remoteMachines.<method>` with the request's params object.
+async fn remote_machines(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.remote_machines(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
+}
+
+async fn remote_link_traffic(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.remote_link_traffic(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
 }
 
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
@@ -5912,6 +6463,12 @@ fn strict_opt_str_array(
 /// Build [`ScriptCreateParams`] from `script.create` params: `name`, `command`,
 /// and `mode` (`service`|`command`) are required; the rest are optional.
 fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams, RpcErr> {
+    // `remoteAuthor` is daemon-owned (`remoteScripts: 1`), never a param.
+    if params.contains_key("remoteAuthor") {
+        return Err(invalid_params(
+            "remote-script-author-readonly: remoteAuthor is set by the backend",
+        ));
+    }
     let name = require_str_param(params, "name")?;
     let command = require_str_param(params, "command")?;
     let mode = match require_str_param(params, "mode")?.as_str() {
@@ -5991,6 +6548,25 @@ fn opt_string_map(
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect()
     })
+}
+
+/// Paging params of a bounded list read (`limit?`, `nextToken?`, §5.1 /
+/// §5.5): `limit` must be an integer and `nextToken` a string or `null`
+/// (`-32602` otherwise); defaults and range clamping are the service's.
+fn list_page_params(params: &Map<String, Value>) -> Result<(Option<i64>, Option<String>), RpcErr> {
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .ok_or_else(|| invalid_params("limit must be an integer"))?,
+        ),
+    };
+    let next_token = match params.get("nextToken") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid_params("nextToken must be a string")),
+    };
+    Ok((limit, next_token))
 }
 
 /// Optional integer param from a JSON number (absent/non-number → `None`).
@@ -6443,5 +7019,10 @@ mod response_profile_tests {
     }
 }
 
+mod catalog_lists;
+
 #[cfg(test)]
 mod tests;
+
+mod bounded_read;
+pub use bounded_read::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;

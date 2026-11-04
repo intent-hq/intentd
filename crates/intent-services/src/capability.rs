@@ -83,6 +83,8 @@ pub fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
             host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
         }) => Ok(Some(principal_id)),
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
+        // Never ungated: an executor credential has no method authority.
+        Some(Caller::Executor { .. }) => Err(crate::principal_ops::executor_forbidden()),
         None => {
             static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
             let first = WARNED
@@ -367,7 +369,8 @@ impl Services {
             .store
             .get_agent_session_summary(agent_id)
             .await?
-            .workspace_id)
+            .workspace_id
+            .clone())
     }
 
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
@@ -852,7 +855,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) {
-        let sessions = match self.store.list_agent_sessions(workspace_id).await {
+        let sessions = match self
+            .store
+            .list_agent_sessions_with_transcripts(workspace_id)
+            .await
+        {
             Ok(sessions) => sessions,
             Err(e) => {
                 tracing::warn!(error = %e, workspace = %workspace_id, "members.remove: agent list failed; queued messages kept");
@@ -915,6 +922,28 @@ mod tests {
             Err(Error::NotFound(_)) => "not-found",
             Err(e) => panic!("unexpected error class: {e}"),
         }
+    }
+
+    /// An executor credential has no method authority: the collaborator
+    /// gate refuses it instead of treating it as unconstrained, and so does
+    /// a member-class guard behind it.
+    #[tokio::test]
+    async fn executor_callers_are_refused_not_ungated() {
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        let executor = Caller::Executor {
+            credential_id: intent_core::ExecutorCredentialId::new(),
+            backend_id: "backend-1".into(),
+        };
+        let gate = with_caller(executor.clone(), async {
+            gated_collaborator_caller("test")
+        })
+        .await;
+        assert!(matches!(gate, Err(Error::Forbidden(_))), "{gate:?}");
+        let guard = with_caller(executor.clone(), f.services.require_member(&f.ws)).await;
+        assert_eq!(cell(&guard), "forbidden");
+        let read = with_caller(executor, f.services.get_workspace(f.ws.clone())).await;
+        assert_eq!(cell(&read), "forbidden");
     }
 
     /// Member+ (Read / Steer & edit): every member and every bound

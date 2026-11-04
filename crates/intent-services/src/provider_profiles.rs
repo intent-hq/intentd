@@ -502,37 +502,136 @@ fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-/// Account-directory variables whose leading `~` the daemon expands.
-const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
-
 /// Whether `key` names an account folder (`CLAUDE_CONFIG_DIR` or
 /// `CODEX_HOME`, ignoring ASCII case). Reads return these values unmasked:
 /// a folder path is not a credential. Launch-log redaction still covers
 /// them through `ProfileEnv::secret_values`.
 fn is_folder_path_key(key: &str) -> bool {
-    TILDE_EXPANDED_KEYS
+    intent_acp::profile_env::ACCOUNT_DIR_KEYS
         .iter()
         .any(|k| k.eq_ignore_ascii_case(key))
 }
 
-/// Expand a leading `~` in an account-directory value at resolution time:
-/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
-/// ASCII case), a value of exactly `~` or
-/// one starting with `~/` is joined onto `home` (the daemon user's home).
-/// `~user`, variables and every other key stay literal, and without a home
-/// the value is used as typed. The saved value is never rewritten.
+/// Whether a provider reference can run on a machine other than this
+/// backend (a remote agent's execution node). The one classifier for this
+/// question: remote quota failover asks it today, and agent placement and
+/// the provider picker are meant to share it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteCompatibility {
+    /// Runs anywhere: the machine's own sign-in (no overrides) or an
+    /// environment that only carries values such as API keys.
+    Compatible,
+    /// Tied to this backend.
+    NotRemoteCompatible {
+        /// Why; [`REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER`] today.
+        reason: &'static str,
+        /// The variables that tie it here, as saved.
+        keys: Vec<String>,
+    },
+}
+
+/// [`RemoteCompatibility::NotRemoteCompatible`] reason: the configuration
+/// sets an account folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The folder is
+/// signed in on this backend; another machine may lack it or hold a
+/// different account under the same path, so such a configuration never
+/// runs remotely, whether or not the folder exists there.
+pub const REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER: &str = "account-folder";
+
+/// [`RemoteCompatibility`] of a resolved overlay (`None` = no overrides).
+/// Only a set account folder counts; unsetting one keeps the machine's own
+/// sign-in.
+#[must_use]
+pub fn remote_compatibility_of(env: Option<&intent_acp::ProfileEnv>) -> RemoteCompatibility {
+    classify_set_keys(
+        env.into_iter()
+            .flat_map(intent_acp::ProfileEnv::entries)
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| key),
+    )
+}
+
+/// [`RemoteCompatibility`] of a saved environment document, for reads.
+fn remote_compatibility_of_doc(env: &EnvDoc) -> RemoteCompatibility {
+    classify_set_keys(env.entries.iter().filter_map(|entry| match entry {
+        StoredEnv::Set { key, .. } => Some(key.as_str()),
+        StoredEnv::Unset { .. } => None,
+    }))
+}
+
+/// The one rule: a configuration that sets an account folder is tied here.
+fn classify_set_keys<'a>(set_keys: impl Iterator<Item = &'a str>) -> RemoteCompatibility {
+    let keys: Vec<String> = set_keys
+        .filter(|key| is_folder_path_key(key))
+        .map(str::to_owned)
+        .collect();
+    if keys.is_empty() {
+        RemoteCompatibility::Compatible
+    } else {
+        RemoteCompatibility::NotRemoteCompatible {
+            reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+            keys,
+        }
+    }
+}
+
+impl RemoteCompatibility {
+    /// The wire `RemoteIncompatibility` (§5.54 "Remote compatibility"):
+    /// `{ reason, keys }`, `None` when compatible. Names only, never values.
+    #[must_use]
+    pub fn incompatibility_json(&self) -> Option<Value> {
+        match self {
+            Self::Compatible => None,
+            Self::NotRemoteCompatible { reason, keys } => {
+                Some(json!({ "reason": reason, "keys": keys }))
+            }
+        }
+    }
+
+    /// Add `remoteCompatible` and, when false, `remoteIncompatibility` to a
+    /// read row.
+    fn annotate(&self, row: &mut Value) {
+        row["remoteCompatible"] = json!(matches!(self, Self::Compatible));
+        if let Some(incompatibility) = self.incompatibility_json() {
+            row["remoteIncompatibility"] = incompatibility;
+        }
+    }
+}
+
+/// `profile-not-remote-compatible` (§5.54, nodes.md remote machine errors):
+/// `reference` (as given; `display` is its readable name) sets an account
+/// folder, so it cannot run an agent on another machine. `-32602`, with the
+/// variable names but never their values.
+pub(crate) fn not_remote_compatible_error(
+    reference: &str,
+    display: &str,
+    reason: &str,
+    keys: &[String],
+) -> Error {
+    Error::provider_profile(
+        false,
+        format!(
+            "{display} uses an account folder ({}) that only exists on this backend, so it \
+             can't run on another machine. Pick a profile that uses the machine's own sign-in \
+             or an API key.",
+            keys.join(", ")
+        ),
+        json!({
+            "code": PROFILE_NOT_REMOTE_COMPATIBLE,
+            "providerRef": reference,
+            "reason": reason,
+            "keys": keys,
+        }),
+    )
+}
+
+/// `data.code` of [`not_remote_compatible_error`].
+pub const PROFILE_NOT_REMOTE_COMPATIBLE: &str = "profile-not-remote-compatible";
+
+/// Expand a leading `~` in an account-directory value at resolution time
+/// against the daemon user's home ([`intent_acp::profile_env::expand_account_dir`]).
+/// The saved value is never rewritten.
 pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
-    let Some(home) = home.and_then(Path::to_str) else {
-        return value.to_owned();
-    };
-    if !is_folder_path_key(key) {
-        return value.to_owned();
-    }
-    match value.strip_prefix('~') {
-        Some("") => home.to_owned(),
-        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.trim_end_matches('/')),
-        _ => value.to_owned(),
-    }
+    intent_acp::profile_env::expand_account_dir(key, value, home)
 }
 
 /// The daemon user's home directory, as the installed-CLI context resolves
@@ -996,7 +1095,7 @@ async fn load_env(secrets: &AsyncSecretStore, profile_id: &str) -> Result<Option
 }
 
 fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> Value {
-    json!({
+    let mut row = json!({
         "id": meta.id,
         "providerRef": meta.provider_ref(),
         "baseProviderId": meta.base_provider,
@@ -1007,19 +1106,23 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
         "createdAt": meta.created_at,
         "updatedAt": meta.updated_at,
         "activation": { "runningProcesses": running_processes },
-    })
+    });
+    remote_compatibility_of_doc(env).annotate(&mut row);
+    row
 }
 
 /// The wire `DefaultConfig` of one base provider (masked except folder paths).
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
-    json!({
+    let mut row = json!({
         "baseProviderId": base,
         "providerRef": base,
         "name": name.unwrap_or(DEFAULT_NAME),
         "env": env.entries.iter().map(StoredEnv::masked_json).collect::<Vec<_>>(),
         "settingsFingerprint": env.fingerprint,
         "activation": { "runningProcesses": running },
-    })
+    });
+    remote_compatibility_of_doc(env).annotate(&mut row);
+    row
 }
 
 /// Prefix of a Default configuration's activation-registry key. The `:`
@@ -1358,17 +1461,22 @@ fn native_session_binding(stored: &intent_core::AgentSession) -> Option<&str> {
 
 /// Build the launch overlay of a saved environment document. Reserved keys
 /// are dropped even if the stored document was edited outside the daemon,
-/// and `~` in an account directory expands here, before account-home lookup,
-/// isolation and fingerprinting, so every path agrees.
-fn overlay_from(reference: &str, base: &str, doc: EnvDoc) -> intent_acp::ProfileEnv {
-    let home = daemon_home();
+/// and `~` in an account directory expands against `home` here, before
+/// account-home lookup, isolation and fingerprinting, so every path agrees.
+/// `None` keeps values as typed (a remote node expands against its own home).
+fn overlay_from(
+    reference: &str,
+    base: &str,
+    doc: EnvDoc,
+    home: Option<&Path>,
+) -> intent_acp::ProfileEnv {
     let entries = doc
         .entries
         .into_iter()
         .filter(|e| reserved_key_reason(e.key(), base).is_none())
         .map(|e| match e {
             StoredEnv::Set { key, value } => {
-                let value = expand_account_dir(&key, &value, home.as_deref());
+                let value = expand_account_dir(&key, &value, home);
                 (key, Some(value))
             }
             StoredEnv::Unset { key } => (key, None),
@@ -1425,8 +1533,76 @@ impl Services {
         &self,
         reference: &str,
     ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.resolve_profile_env_for(reference, daemon_home().as_deref())
+            .await
+    }
+
+    /// The overlay a remote node launch for `reference` must run with, under
+    /// the same selection gate as a local launch (a missing profile or a
+    /// disabled base fails with `provider-profile-replacement-required` and
+    /// never falls back). `None` means no overrides: the node uses its own
+    /// login. Account directories are returned as typed; the node expands a
+    /// leading `~` against its own home ([`intent_acp::ProfileEnv::for_node`]).
+    ///
+    /// # Errors
+    /// Replacement-required for an unselectable reference; an unreadable
+    /// environment document fails closed.
+    pub async fn resolve_remote_profile_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.ensure_provider_ref_selectable(reference)?;
+        self.resolve_profile_env_for(reference, None).await
+    }
+
+    /// Whether `reference` (a bare base id for its Default configuration,
+    /// overrides included, or a profile reference) can run on another
+    /// machine: [`remote_compatibility_of`] its saved overlay.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_remote_profile_env`]: an unknown or unselectable
+    /// reference, or an unreadable environment document.
+    pub async fn remote_compatibility(&self, reference: &str) -> Result<RemoteCompatibility> {
+        let env = self.resolve_remote_profile_env(reference).await?;
+        Ok(remote_compatibility_of(env.as_ref()))
+    }
+
+    /// [`Self::resolve_remote_profile_env`] for a configuration about to run
+    /// an agent on another machine (placement, or a remote agent's
+    /// `agent.setModel`): refused with [`not_remote_compatible_error`] when
+    /// it sets an account folder. Returns the overlay the machine would get.
+    ///
+    /// # Errors
+    /// `profile-not-remote-compatible`, or as
+    /// [`Self::resolve_remote_profile_env`].
+    pub(crate) async fn resolve_remote_compatible_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        let env = self.resolve_remote_profile_env(reference).await?;
+        if let RemoteCompatibility::NotRemoteCompatible { reason, keys } =
+            remote_compatibility_of(env.as_ref())
+        {
+            let display = if is_qualified_ref(reference) {
+                let profiles = self.provider_profiles.profiles().ok();
+                readable_selection(reference, profiles.as_ref().map(|p| p.as_slice()))
+            } else {
+                format!("The {reference} Default configuration")
+            };
+            return Err(not_remote_compatible_error(
+                reference, &display, reason, &keys,
+            ));
+        }
+        Ok(env)
+    }
+
+    async fn resolve_profile_env_for(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         if !is_qualified_ref(reference) {
-            return self.resolve_default_env(reference).await;
+            return self.resolve_default_env(reference, home).await;
         }
         let missing = || replacement_required(reference, "profile-missing");
         let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
@@ -1444,7 +1620,7 @@ impl Services {
                 "provider profile {reference} environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// The Default configuration's saved overlay (PROTOCOL §5.54 "Default
@@ -1453,7 +1629,11 @@ impl Services {
     /// profile file is unreadable (bare references keep today's behavior
     /// then). A recorded environment whose secret cannot be read fails
     /// closed: the Default never silently runs without its overrides.
-    async fn resolve_default_env(&self, reference: &str) -> Result<Option<intent_acp::ProfileEnv>> {
+    async fn resolve_default_env(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         let Some(base) = PROFILE_BASE_PROVIDERS
             .iter()
             .copied()
@@ -1474,7 +1654,7 @@ impl Services {
                 "the {base} Default configuration environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// Selection gate for a provider reference about to be persisted or
@@ -1759,13 +1939,40 @@ impl Services {
         Ok(self.resolve_profile_env(reference).await?.map(Arc::new))
     }
 
-    /// `providers.catalog` `profiles`: one summary per saved profile, no env
-    /// and no counts. An unreadable profile file yields an empty list.
-    pub(crate) fn provider_profile_summaries(&self) -> Vec<Value> {
-        self.provider_profiles
-            .profiles()
-            .map(|profiles| profiles.iter().map(ProfileMeta::summary_json).collect())
-            .unwrap_or_default()
+    /// `providers.catalog` `profiles`: one summary per saved profile (no env
+    /// values and no counts; an unreadable profile file yields an empty
+    /// list) with its remote compatibility, plus `defaultRemoteIncompatibility`: the Default
+    /// configurations that cannot run on another machine, `None` when none
+    /// (§5.54 "Remote compatibility in the catalog"). A row whose saved
+    /// environment cannot be read carries neither field (clients then treat
+    /// it as compatible and placement decides).
+    pub(crate) async fn provider_profile_catalog(&self) -> (Vec<Value>, Option<Value>) {
+        let profiles = self.provider_profiles.profiles().unwrap_or_default();
+        let mut rows = Vec::with_capacity(profiles.len());
+        for meta in profiles.iter() {
+            let mut row = meta.summary_json();
+            match load_env(&self.secrets, &meta.id).await {
+                Ok(env) => remote_compatibility_of_doc(&env.unwrap_or_default()).annotate(&mut row),
+                Err(e) => {
+                    tracing::warn!(profile = %meta.id, error = %e, "catalog: profile environment unreadable; remote compatibility omitted");
+                }
+            }
+            rows.push(row);
+        }
+        let mut defaults = serde_json::Map::new();
+        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
+            let Ok(env) = self.load_default_env(saved).await else {
+                continue;
+            };
+            if let Some(incompatibility) = remote_compatibility_of_doc(&env).incompatibility_json()
+            {
+                defaults.insert(base.clone(), incompatibility);
+            }
+        }
+        (
+            rows,
+            (!defaults.is_empty()).then_some(Value::Object(defaults)),
+        )
     }
 
     /// `host.providerAuthStatus` for profile references (PROTOCOL §5.54).
@@ -1869,6 +2076,43 @@ impl Services {
             Some(overlay) => crate::provider_auth::cached_profile_auth_verdict(&overlay),
             None => crate::provider_auth::cached_auth_verdict(selection),
         })
+    }
+
+    /// The sign-in of a selection's saved settings, probing when no fresh
+    /// verdict is cached (the [`Self::selection_auth_verdict`] counterpart
+    /// for callers that must decide right after a restart, when the cache is
+    /// empty). `Some(false)` only on an explicit signed-out probe outcome;
+    /// `None` when the provider has no probe, is not installed, the probe is
+    /// inconclusive, or the overlay cannot be resolved. A probe-less
+    /// provider is never reported signed out.
+    #[cfg_attr(
+        test,
+        expect(dead_code, reason = "unit tests read the auth cache only")
+    )]
+    pub(crate) async fn probe_selection_sign_in(&self, selection: &str) -> Option<bool> {
+        let base = intent_providers::find_provider_or_legacy_alias(
+            intent_providers::base_provider_id(selection),
+        )?
+        .id;
+        let override_path = self.effective_settings().providers.paths.get(base).cloned();
+        if may_have_overlay(selection) {
+            match Box::pin(self.resolve_profile_env(selection)).await {
+                Ok(Some(overlay)) => {
+                    let entry = crate::provider_auth::profile_auth_status(
+                        Arc::new(overlay),
+                        false,
+                        override_path,
+                    )
+                    .await;
+                    return entry.get("authenticated").and_then(Value::as_bool);
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        crate::provider_auth::default_sign_in(base, override_path)
+            .await
+            .signed_in
     }
 
     /// `host.providerAuthStatus` rows for Default configurations with saved
@@ -2018,6 +2262,22 @@ impl Services {
             tracing::warn!("a Default configuration environment is missing; launches fail until it is saved again");
         }
         Ok(doc.unwrap_or_default())
+    }
+
+    /// Whether `providers.catalog` is read by a workspace guest of this host,
+    /// who must not learn the host's profile or Default names. The durable
+    /// role decides, re-read per call like [`Self::require_host_execution`],
+    /// so a removed member is a guest from the next read. Fails closed: an
+    /// unknown principal or a failed lookup counts as a guest.
+    pub(crate) async fn catalog_caller_is_guest(&self) -> Result<bool> {
+        let Some(principal_id) = crate::capability::gated_collaborator_caller("providers.catalog")?
+        else {
+            return Ok(false);
+        };
+        Ok(!matches!(
+            self.store.get_host_role(&principal_id).await,
+            Ok(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+        ))
     }
 
     /// `providers.catalog` `defaultNames`: the renamed Default of each base
