@@ -2073,3 +2073,42 @@ fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
         "an enabled provider is not refused as disabled"
     );
 }
+
+/// Disabling a provider changes only the report: an agent already running
+/// on it keeps its process; only its next start is refused.
+#[tokio::test]
+async fn disabling_a_provider_keeps_its_running_agent() {
+    use std::sync::atomic::Ordering;
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        CountAdmission::new(3),
+        providers,
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+
+    node.report.mock_enabled.store(false, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    let running: Vec<_> = node
+        .service
+        .runners_for_test()
+        .iter()
+        .flat_map(Runner::running)
+        .collect();
+    assert_eq!(running, [AgentId::from("a1")]);
+    node.stop().await;
+}
