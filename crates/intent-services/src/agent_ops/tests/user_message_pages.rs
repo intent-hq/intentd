@@ -42,13 +42,11 @@ async fn walk(
         );
         assert_eq!(page["total"], json!(page_ids(&page).len()));
         pages.push(page_ids(&page));
-        match page["nextToken"].as_str() {
-            Some(next) => token = Some(next.to_string()),
-            None => {
-                assert!(page["nextToken"].is_null(), "nextToken always present");
-                break;
-            }
-        }
+        let Some(next) = page["nextToken"].as_str() else {
+            assert!(page["nextToken"].is_null(), "nextToken always present");
+            break;
+        };
+        token = Some(next.to_string());
         assert!(pages.len() < 10_000, "walk terminates");
     }
     let count = pages.len();
