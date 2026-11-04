@@ -608,6 +608,9 @@ mod tests_suggested_prompts_contract;
 mod tests_proposal_origin;
 
 #[cfg(test)]
+mod tests_parent_provider;
+
+#[cfg(test)]
 mod tests_unattended_resume;
 
 /// Resolve the default model from settings when no explicit model is supplied
@@ -1209,10 +1212,13 @@ fn resolve_delegate_reasoning_effort(
 /// 1. The specialist's frontmatter `codingAgent` (3-tier resolution). It
 ///    must be a known, available provider or the delegate fails with a
 ///    clear error (never silently substituted).
-/// 2. The settings-derived default (`model.defaultProvider` —
+/// 2. The delegating agent's own provider (`inherited`), when it is still
+///    selectable, enabled, installed and not known to be signed out
+///    ([`Services::inheritable_parent_provider`], intent-hq/intent#8479).
+/// 3. The settings-derived default (`model.defaultProvider` —
 ///    [`crate::agent_session::derived_default_provider`]), with the same
-///    known/available requirement.
-/// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
+///    known/available requirement as the specialist pin.
+/// 4. None of these is set: a clear `-32602` (monorepo#3044) — the former residual
 ///    `Ok(None)` left the session's `provider` unset, and spawn-time
 ///    resolution bottomed out at the first registered provider (auggie),
 ///    silently spawning a binary that may not be installed. Resolution that
@@ -1221,6 +1227,7 @@ fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
+    inherited: Option<&str>,
 ) -> Result<Option<String>> {
     let settings = services.effective_settings();
 
@@ -1228,6 +1235,12 @@ fn resolve_delegate_provider(
         resolve_specialist_provider(services, "agent.delegate", specialist, workspace_path)?
     {
         return Ok(Some(provider));
+    }
+
+    // The delegating agent's own provider, already vetted by
+    // [`Services::inheritable_parent_provider`] (intent-hq/intent#8479).
+    if let Some(inherited) = inherited {
+        return Ok(Some(inherited.to_string()));
     }
 
     match crate::agent_session::derived_default_provider(&settings) {
@@ -1270,6 +1283,79 @@ fn resolve_specialist_provider(
         )?;
     }
     Ok(provider)
+}
+
+impl Services {
+    /// The provider a child inherits from the agent creating it when the
+    /// caller names none (intent-hq/intent#8479): the parent session's bare
+    /// provider, provided it would pass this backend's create front door —
+    /// enabled, installed and not cached as signed out — and, when the
+    /// caller passed a bare `model`, not provably another provider's model.
+    /// A parent on a named profile passes nothing on: a child never
+    /// inherits its parent's profile (PROTOCOL §5.54). `None` falls back to the
+    /// existing resolution (`model.defaultProvider`), never to an error: an
+    /// unusable parent provider must not block delegation.
+    ///
+    /// A remote parent is skipped: its provider runs on another machine,
+    /// so this backend's installation says nothing about it. Callers also
+    /// skip a child placed on another machine, for the same reason.
+    pub(crate) async fn inheritable_parent_provider(
+        &self,
+        method: &'static str,
+        parent: &AgentId,
+        model: Option<&str>,
+    ) -> Option<String> {
+        let session = self.store.get_agent_session_summary(parent).await.ok()?;
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        let provider = session.provider.filter(|p| !p.trim().is_empty())?;
+        // A child never inherits its parent's named profile (PROTOCOL
+        // §5.54 "Delegation"): no account is inferred for it.
+        if crate::provider_profiles::is_qualified_ref(&provider) {
+            return None;
+        }
+        let services = self.clone();
+        let candidate = provider.clone();
+        let usable = tokio::task::spawn_blocking(move || {
+            services.ensure_selectable_provider(method, &candidate)?;
+            services.ensure_provider_available_for(
+                method,
+                &candidate,
+                &services.effective_settings().providers,
+            )
+        })
+        .await
+        .ok()?;
+        if let Err(error) = usable {
+            tracing::debug!(
+                parent = %parent,
+                provider,
+                %error,
+                "parent provider not usable for a child; using the settings default"
+            );
+            return None;
+        }
+        // The create front door gates on the verdict of the selection's own
+        // saved settings (an overridden Default's overlay, not the bare
+        // install); a cached signed-out or unresolvable verdict there would
+        // reject the child, so fall back instead.
+        match Box::pin(self.selection_auth_verdict(&provider)).await {
+            Ok(Some(false)) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        // A caller-supplied model must be one the inherited provider both
+        // may own and can resolve, the same two checks the create front door
+        // applies; otherwise the default provider keeps it, as before.
+        if let Some(model) = model {
+            let catalog = self.cached_models();
+            ensure_bare_model_matches_provider(method, &catalog, &provider, model).ok()?;
+            ensure_model_offered_by_provider(method, &catalog, &provider, model).ok()?;
+        }
+        Some(provider)
+    }
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
@@ -6291,8 +6377,9 @@ impl Services {
 
         // With neither caller choice supplied, honor the specialist's
         // provider before resolving its model/effort. Explicit model-only
-        // creates deliberately resolve on the settings default provider, as
-        // they do in delegate — which the plan then pins on the row, like
+        // creates deliberately resolve on the settings default provider (a
+        // sub-agent's on its creator's, below), as they do in delegate —
+        // which the plan then pins on the row, like
         // every other effective provider. Persist the effective pin so
         // spawn and previews use the same pair; reject unusable pins here,
         // before even workspace.create's workspace row can be written.
@@ -6314,6 +6401,21 @@ impl Services {
             })??
         } else {
             provider
+        };
+        // A sub-agent created without a provider (and without a specialist
+        // pin) inherits its creator's provider ahead of the settings default
+        // (intent-hq/intent#8479).
+        // A child placed on another machine keeps the existing resolution:
+        // this backend's install and sign-in say nothing about that machine.
+        let placed_remotely = placement
+            .as_ref()
+            .is_some_and(|p| !p.runs_on_backend().unwrap_or(true));
+        let provider = match (provider, &parent_agent_id) {
+            (None, Some(parent)) if !placed_remotely => {
+                self.inheritable_parent_provider(method, parent, model.as_deref())
+                    .await
+            }
+            (provider, _) => provider,
         };
 
         // Resolve the default model when none is explicitly supplied, via the
@@ -12898,6 +13000,19 @@ impl Services {
         // provider guard, default-model and effort resolution — re-reads the
         // specialist tier directories, so it runs on the blocking pool
         // (monorepo#4148).
+        // A child the caller did not pin inherits the delegating agent's own
+        // provider (intent-hq/intent#8479), ahead of `model.defaultProvider`:
+        // a coordinator the user put on one provider must not hand its work
+        // to another one the user may not even be signed in to.
+        // A placed child's provider runs on its machine, so this backend's
+        // install and sign-in say nothing about it: keep the old resolution.
+        let inherited_provider = match (&parent_agent_id, input.provider.as_deref()) {
+            (Some(parent), None) if !placed => {
+                self.inheritable_parent_provider("agent.delegate", parent, input.model.as_deref())
+                    .await
+            }
+            _ => None,
+        };
         let services = self.clone();
         let specialist_param = input.specialist.clone();
         let provider_param_in = input.provider.clone();
@@ -12929,9 +13044,12 @@ impl Services {
                         &services,
                         specialist_param.as_deref(),
                         ws_path.as_deref(),
+                        inherited_provider.as_deref(),
                     )?
                 } else {
-                    None
+                    // An explicit model keeps the parent's provider only when
+                    // that provider can run it (checked by the inheritance).
+                    inherited_provider
                 };
                 // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
                 // effort > specialist frontmatter > unset, validated against the
