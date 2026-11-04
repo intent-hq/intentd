@@ -414,18 +414,17 @@ finding the QR control.
 
 ## Find work on another device
 
-**Settings → Machines** lists the local machine first as **<name> (local)**, then
-the backend this window is connected to as **<name> (connected backend)**, then saved
-remote connections. Each row shows a macOS, Windows or Linux icon by the name and,
-after the version (or the **Available to <backend>** badge), icons for the AI
-providers available on that machine; hover an icon for its name. Providers that are
-switched off or unavailable are hidden, and an unknown or offline machine shows no
-platform or provider icons. In an agent's **Start On** picker, the connected backend
-and remote machines show their platform under the name, such as `Linux x64` or
-`macOS arm64`. **Add machine** opens the connection form; a remote machine's actions
-include **Edit** and **Connect**, with **Test connection** inside its editing panel.
-Workspaces and agents belong to a host, so identify the intended device before explaining missing work or changing
-host settings. **Mobile** follows the active connection and its permissions; do not
+**Settings → Machines** lists **<name> (local)** first, then the backend this window
+is connected to as **<name> (connected backend)**, then saved remote connections.
+Each row shows a macOS, Windows or Linux icon and, after the version (or the
+**Available to <backend>** badge), icons for the AI providers available there; hover
+an icon for its name. Switched-off providers are hidden, and offline or unknown
+machines show no icons. In an agent's **Start On** picker, the connected backend and
+remote machines show their platform under the name, such as `Linux x64`.
+**Add machine** opens the connection form; a remote machine's actions include
+**Edit** and **Connect**, with **Test connection** inside its editing panel.
+Workspaces and agents belong to a host, so identify the intended device before
+explaining missing work or changing host settings. **Mobile** follows the active connection and its permissions; do not
 describe a remote connection's QR as belonging to the local desktop. To pair the
 local machine, connect to it first. For intentd running in WSL on the same Windows
 PC, add a machine with host `localhost`; `intentd pair --host localhost` in WSL prints
