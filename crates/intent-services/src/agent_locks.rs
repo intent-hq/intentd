@@ -27,7 +27,7 @@ use intent_core::events::{
     CHANGES_METRICS_CHANGED, SETTINGS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentSession, AgentStatus, TaskStatus, WorkspaceId};
-use intent_store::NewEvent;
+use intent_store::{AgentSessionSummary, NewEvent};
 
 use crate::events::SubscriptionFilter;
 use crate::{publish_event, system_actor, Services};
@@ -147,7 +147,7 @@ impl Services {
         else {
             return empty;
         };
-        let by_id: HashMap<&str, &AgentSession> =
+        let by_id: HashMap<&str, &AgentSessionSummary> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
         let mut active: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (agent_id, paths) in paths_by_agent {

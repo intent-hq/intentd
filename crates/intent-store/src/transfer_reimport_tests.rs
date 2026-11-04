@@ -537,7 +537,7 @@ async fn assert_recovery_retry(store: &Store) {
         "neither direction of foreign recovery ownership authorizes removal"
     );
     assert!(store
-        .get_agent_session(&AgentId::from("agent-keeper"))
+        .get_agent_session_with_transcript(&AgentId::from("agent-keeper"))
         .await
         .is_ok());
     assert_foreign_keys(store).await;

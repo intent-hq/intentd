@@ -761,7 +761,7 @@ async fn owner_messages(fx: &Fixture) -> String {
     let session = fx
         .services
         .store()
-        .get_agent_session(&fx.agent_id)
+        .get_agent_session_with_transcript(&fx.agent_id)
         .await
         .unwrap();
     serde_json::to_string(&session.messages).unwrap()
@@ -1663,7 +1663,7 @@ async fn a_monitor_owned_by_a_dead_agent_is_adopted_over_wss() {
     let second_session = fx
         .services
         .store()
-        .get_agent_session(&second_id)
+        .get_agent_session_with_transcript(&second_id)
         .await
         .expect("second agent session");
     assert!(
@@ -1719,7 +1719,10 @@ async fn link_task_note_over_wss(
     assert_eq!(marked["ok"], json!(true), "{marked}");
     assert_eq!(marked["status"], json!(status), "{marked}");
     let store = fx.services.store();
-    let mut session = store.get_agent_session(agent_id).await.unwrap();
+    let mut session = store
+        .get_agent_session_with_transcript(agent_id)
+        .await
+        .unwrap();
     session.task_note_id = Some(intent_core::NoteId::from(note_id.clone()));
     store
         .update_agent_session(&fx.ws_id, &session)
@@ -3322,7 +3325,7 @@ async fn qwen_silent_passing_discovery_reports_required_flip_once_over_wss() {
     assert_eq!(
         fx.services
             .store()
-            .get_agent_session(&fx.agent_id)
+            .get_agent_session_with_transcript(&fx.agent_id)
             .await
             .unwrap()
             .messages
@@ -3469,7 +3472,7 @@ async fn qwen_old_snapshot_recovery_and_known_required_flip_over_wss() {
         assert_eq!(
             fx.services
                 .store()
-                .get_agent_session(&fx.agent_id)
+                .get_agent_session_with_transcript(&fx.agent_id)
                 .await
                 .unwrap()
                 .messages
@@ -3616,7 +3619,7 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
     assert_eq!(
         fx.services
             .store()
-            .get_agent_session(&fx.agent_id)
+            .get_agent_session_with_transcript(&fx.agent_id)
             .await
             .unwrap()
             .messages
@@ -3653,7 +3656,7 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
     assert_eq!(
         fx.services
             .store()
-            .get_agent_session(&fx.agent_id)
+            .get_agent_session_with_transcript(&fx.agent_id)
             .await
             .unwrap()
             .messages

@@ -73,7 +73,11 @@ async fn monitor_native_daemon_frontend_handoff() {
                     intentd_test_support::test_timeout(Duration::from_secs(60)),
                     async {
                         loop {
-                            if store.get_agent_session(&id).await.unwrap().status
+                            if store
+                                .get_agent_session_with_transcript(&id)
+                                .await
+                                .unwrap()
+                                .status
                                 == intent_core::AgentStatus::RuntimeIdle
                                 && !store
                                     .list_active_pr_monitors_by_agent(&id)

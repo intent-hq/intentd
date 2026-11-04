@@ -1230,7 +1230,7 @@ async fn transfer_round_trip_between_two_stacks() {
     );
     let live = target
         .store()
-        .get_agent_session(&AgentId::from(AGENT_LIVE))
+        .get_agent_session_with_transcript(&AgentId::from(AGENT_LIVE))
         .await
         .expect("live session on target");
     assert_eq!(live.status, AgentStatus::RuntimeIdle);
@@ -1266,7 +1266,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(live.reasoning_effort, None);
     let idle = target
         .store()
-        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .get_agent_session_with_transcript(&AgentId::from(AGENT_IDLE))
         .await
         .expect("idle session on target");
     assert_eq!(idle.provider.as_deref(), Some(SOURCE_DEFAULT_PROVIDER));
@@ -1286,7 +1286,7 @@ async fn transfer_round_trip_between_two_stacks() {
     );
     let sb = target
         .store()
-        .get_agent_session(&AgentId::from(AGENT_SB))
+        .get_agent_session_with_transcript(&AgentId::from(AGENT_SB))
         .await
         .expect("sb session on target");
     assert_eq!(sb.provider.as_deref(), Some("claude-code"));
@@ -1295,7 +1295,7 @@ async fn transfer_round_trip_between_two_stacks() {
     // The source rows were never written by the export.
     let src_idle = source
         .store()
-        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .get_agent_session_with_transcript(&AgentId::from(AGENT_IDLE))
         .await
         .expect("idle session on source");
     assert_eq!(src_idle.provider, None, "source row untouched");

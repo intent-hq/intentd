@@ -99,7 +99,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         subscriber: &AgentId,
     ) -> Result<()> {
-        match self.store.get_agent_session(subscriber).await {
+        match self.store.get_agent_session_summary(subscriber).await {
             Ok(session) => {
                 if matches!(session.status, intent_core::AgentStatus::Deleted) {
                     return Err(Error::InvalidParams(format!(

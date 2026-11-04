@@ -190,7 +190,7 @@ async fn imported_owner_case(change: Change, runtime: bool) {
     let agent = AgentId::new();
     // This provider deliberately cannot spawn: runtime delivery/append occurs
     // before provider startup, and no external process/account is needed.
-    let session = serde_json::from_value(json!({"id":agent,"workspaceId":ws,"name":"Imported","provider":"unavailable-fence-test-provider","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
+    let session: intent_core::AgentSession = serde_json::from_value(json!({"id":agent,"workspaceId":ws,"name":"Imported","provider":"unavailable-fence-test-provider","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
     store.insert_agent_session(&session).await.unwrap();
     let payload = json!({"id":"imported-fence","content":"original input","queuedAt":now_iso(),"userOrigin":true,"messageMetadata":{"humanAuthor":{"login":"source","displayName":null,"avatarUrl":null},"humanAuthorOriginalMetadata":["preserve",null]}});
     store

@@ -340,7 +340,7 @@ async fn render_original(facts: &PreparedContextFacts) -> Option<String> {
         .owner
         .services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_without_messages(&agent_id)
         .await
         .ok()?;
     // A plain-folder workspace (§5.1) has no git or forge, so its sessions

@@ -156,7 +156,12 @@ impl AgentRuntime for FakeRuntime {
 
 async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -> Arc<FakeRuntime> {
     seed_agent(mgr, ws, id).await;
-    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
     // Resolve the existing mock provider config but never launch its script.
     session.provider = Some("mock".into());
     mgr.services
@@ -294,7 +299,7 @@ async fn fake_runtime_drives_queued_delivery_streaming_and_idle_reap() {
     assert_eq!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .acp_session_id
@@ -547,7 +552,12 @@ async fn a_live_remote_run_is_not_reused_after_an_identity_change() {
     let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
     mgr.ensure_started(&id, &ws).await.unwrap();
     assert!(mgr.contains(&id));
-    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.model = Some("another-model".into());
     mgr.services
         .store
@@ -589,7 +599,7 @@ async fn a_remote_agents_instructions_ride_its_first_prompt() {
             .await
             .unwrap();
         if specialist {
-            let mut session = store.get_agent_session(&id).await.unwrap();
+            let mut session = store.get_agent_session_with_transcript(&id).await.unwrap();
             session.specialist = Some("implementor".into());
             store.update_agent_session(&ws, &session).await.unwrap();
             store
@@ -630,7 +640,11 @@ async fn a_remote_agents_instructions_ride_its_first_prompt() {
             !second.contains(marker),
             "the instructions are sent once: {second}"
         );
-        let persisted = store.get_agent_session(&id).await.unwrap().system_prompt;
+        let persisted = store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap()
+            .system_prompt;
         assert!(persisted.is_some_and(|p| p.contains(marker)));
     }
 }

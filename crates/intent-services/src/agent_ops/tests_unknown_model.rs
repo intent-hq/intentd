@@ -70,7 +70,7 @@ async fn create(
 
 async fn sessions(svc: &Services, ws: &WorkspaceId) -> Vec<intent_core::AgentSession> {
     svc.store()
-        .list_agent_sessions(ws)
+        .list_agent_sessions_with_transcripts(ws)
         .await
         .expect("list sessions")
 }
@@ -257,7 +257,7 @@ async fn wake_or_create_keeps_an_inherited_delisted_model() {
         .expect("assign prev");
     let mut prev_session = svc
         .store()
-        .get_agent_session(&intent_core::AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&intent_core::AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.status = intent_core::AgentStatus::Deleted;

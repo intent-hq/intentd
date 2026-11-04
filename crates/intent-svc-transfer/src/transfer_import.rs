@@ -2818,7 +2818,11 @@ mod tests {
             .unwrap();
         svc.workspace_import_commit_op(id).await.unwrap();
         let agent = intent_core::AgentId::from("agent-live");
-        let session = svc.store().get_agent_session(&agent).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         assert!(!session.is_active);
         assert!(session.acp_session_id.is_none());
         assert!(session.backend_session_id.is_none());
@@ -3560,7 +3564,7 @@ mod tests {
 
         let session = svc
             .store()
-            .get_agent_session(&intent_core::AgentId("agent-live".to_string()))
+            .get_agent_session_with_transcript(&intent_core::AgentId("agent-live".to_string()))
             .await
             .expect("session");
         assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
@@ -3804,7 +3808,7 @@ mod tests {
         assert!(svc.store().get_workspace(&ws).await.is_err());
         assert!(svc
             .store()
-            .get_agent_session(&AgentId::from("agent-live"))
+            .get_agent_session_with_transcript(&AgentId::from("agent-live"))
             .await
             .is_err());
     }

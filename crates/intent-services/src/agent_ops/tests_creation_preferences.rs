@@ -234,7 +234,14 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     )
     .await
     .unwrap_err();
-    assert_eq!(svc.store.list_agent_sessions(&ws).await.unwrap().len(), 1);
+    assert_eq!(
+        svc.store
+            .list_agent_sessions_with_transcripts(&ws)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     svc.agent_update(
         id.clone(),
         Some(ws.clone()),
@@ -244,7 +251,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     .unwrap_err();
     assert_eq!(
         svc.store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .specialist
@@ -253,7 +260,7 @@ async fn creation_preferences_roll_back_insert_and_update_when_memory_write_fail
     );
     assert!(
         !svc.store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .notifications_muted
@@ -497,7 +504,11 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     .await
     .unwrap();
     let id = AgentId(created["agent"]["id"].as_str().unwrap().into());
-    let before = svc.store.get_agent_session(&id).await.unwrap();
+    let before = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let mut sub = bus.subscribe(crate::SubscriptionFilter {
         event_types: vec!["agent:updated".into(), "agent:renamed".into()],
         ..Default::default()
@@ -508,7 +519,11 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     svc.agent_update(id.clone(), Some(ws.clone()), changes.clone())
         .await
         .unwrap_err();
-    let after = svc.store.get_agent_session(&id).await.unwrap();
+    let after = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(after.metadata, before.metadata);
     assert_eq!(after.specialist, before.specialist);
     assert_eq!(after.name, before.name);
@@ -537,7 +552,11 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     svc.agent_update(id.clone(), Some(ws.clone()), changes)
         .await
         .unwrap();
-    let after = svc.store.get_agent_session(&id).await.unwrap();
+    let after = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(after.specialist, None);
     assert_eq!(after.name, "Agent");
     assert!(after.notifications_muted);
@@ -567,7 +586,7 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     svc.store.update_agent_session(&ws, &before).await.unwrap();
     assert!(
         svc.store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .notifications_muted,
@@ -595,7 +614,11 @@ async fn creation_preferences_skipped_placeholder_rename_reports_no_name() {
     .await
     .unwrap();
     let id = AgentId(created["agent"]["id"].as_str().unwrap().into());
-    let before = svc.store.get_agent_session(&id).await.unwrap();
+    let before = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let mut sub = bus.subscribe(crate::SubscriptionFilter {
         event_types: vec!["agent:updated".into(), "agent:renamed".into()],
         ..Default::default()
@@ -607,7 +630,11 @@ async fn creation_preferences_skipped_placeholder_rename_reports_no_name() {
     )
     .await
     .unwrap();
-    let after = svc.store.get_agent_session(&id).await.unwrap();
+    let after = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         after.name, before.name,
         "rename skipped outside manual scope"
@@ -709,7 +736,11 @@ async fn creation_preferences_preserve_unmarked_legacy_and_changed_override_bodi
             .await
             .unwrap();
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        let mut session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         let metadata = session.metadata.as_mut().unwrap().as_object_mut().unwrap();
         if legacy {
             // Old rows did not distinguish a caller override from a frozen body.

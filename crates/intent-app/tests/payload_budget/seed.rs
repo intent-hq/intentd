@@ -460,7 +460,7 @@ pub async fn store(state: &LargeState) -> Seeded {
     // Every agent was interrupted by a restart.
     for (i, agent) in ids.agents.iter().enumerate() {
         let ws = store
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .expect("agent session")
             .workspace_id;
@@ -486,7 +486,10 @@ pub async fn store(state: &LargeState) -> Seeded {
         if active == ACTIVE_AGENTS {
             break;
         }
-        let mut s = store.get_agent_session(agent).await.expect("agent");
+        let mut s = store
+            .get_agent_session_with_transcript(agent)
+            .await
+            .expect("agent");
         if &s.workspace_id != big_ws {
             continue;
         }

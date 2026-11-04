@@ -150,7 +150,7 @@ async fn create_with_proposal_origin_resolves_and_notifies() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert!(
@@ -288,7 +288,7 @@ async fn already_resolved_proposal_keeps_its_outcome() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(
@@ -336,7 +336,7 @@ async fn unknown_agent_or_proposal_still_creates() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(session.pending_proposals().len(), 1, "tc-1 is untouched");
@@ -392,7 +392,7 @@ async fn malformed_origin_is_rejected_before_any_side_effect() {
     );
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(session.pending_proposals().len(), 1);
@@ -431,7 +431,7 @@ async fn failed_create_leaves_the_proposal_pending() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(session.pending_proposals().len(), 1, "still pending");
@@ -513,7 +513,7 @@ async fn in_process_origin_takes_precedence_over_the_wire_param() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(
@@ -554,7 +554,7 @@ async fn non_workspace_create_proposal_is_not_resolved() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(
@@ -625,7 +625,7 @@ async fn origin_is_bound_to_the_cards_idempotency_key() {
 
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(
@@ -689,7 +689,7 @@ async fn replay_naming_a_keyless_card_is_declined() {
     assert_eq!(reported(&replay), Some(outcome("tc-b", "notResolved")));
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     let pending: Vec<String> = session
@@ -744,7 +744,7 @@ async fn origin_lookup_store_error_fails_the_create_and_a_retry_recovers() {
     assert_eq!(workspaces(&svc).await, before, "nothing was created");
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(session.pending_proposals().len(), 1, "card still pending");
@@ -826,7 +826,7 @@ async fn created_workspace_link_follows_the_resolution() {
     .expect("client resolve");
     let session = svc
         .store()
-        .get_agent_session(&other)
+        .get_agent_session_with_transcript(&other)
         .await
         .expect("session");
     assert!(session.proposal_created_workspaces().is_empty());
@@ -845,7 +845,7 @@ async fn created_workspace_link_follows_the_resolution() {
     .expect("dismiss re-proposed card");
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert!(
@@ -891,7 +891,7 @@ async fn applied_retry_without_an_id_keeps_the_created_workspace_link() {
     .expect("client fallback resolve");
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(
@@ -919,7 +919,7 @@ async fn applied_retry_without_an_id_keeps_the_created_workspace_link() {
     .expect("re-proposed card applied with a new workspace");
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert_eq!(

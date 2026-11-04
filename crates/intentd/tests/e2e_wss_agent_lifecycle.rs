@@ -2319,7 +2319,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store
@@ -2610,7 +2610,7 @@ async fn agent_pinned_round_trip_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store

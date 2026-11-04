@@ -237,7 +237,7 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
     // The placement is daemon-owned metadata on the initial agent.
     let session = fx
         .store
-        .get_agent_session(&launched[0].agent_id)
+        .get_agent_session_with_transcript(&launched[0].agent_id)
         .await
         .unwrap();
     assert!(session.is_initial_agent());
@@ -415,7 +415,11 @@ async fn a_failed_start_keeps_the_workspace_and_reports_the_initial_agent() {
 
     // The workspace and its placed initial agent are kept.
     fx.store.get_workspace(&ws).await.expect("workspace kept");
-    let session = fx.store.get_agent_session(&agent_id).await.unwrap();
+    let session = fx
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(session.is_initial_agent());
     let view = RemotePlacementView::from_metadata(session.metadata.as_ref()).expect("placed");
     let error = view.placement_error.expect("placement error recorded");

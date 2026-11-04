@@ -58,8 +58,8 @@ pub(crate) async fn resolve_root(
 ) -> String {
     // CoW containment: prefer the calling agent's sandbox path when present.
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return sandbox_path;
             }
         }

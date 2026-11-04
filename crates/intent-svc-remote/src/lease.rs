@@ -174,7 +174,11 @@ impl HeadLease {
             if lease_agents.contains(&record.agent_id) {
                 continue;
             }
-            let ended = match self.store.get_agent_session(&record.agent_id).await {
+            let ended = match self
+                .store
+                .get_agent_session_with_transcript(&record.agent_id)
+                .await
+            {
                 Ok(session) => crate::final_stop::session_ended(&session),
                 Err(Error::NotFound(_)) => true,
                 Err(_) => false,

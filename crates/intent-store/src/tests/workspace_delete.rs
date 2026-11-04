@@ -88,7 +88,7 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
         .expect("agent deletion reaches retirement");
         assert!(
             matches!(
-                store.get_agent_session(&agent).await,
+                store.get_agent_session_with_transcript(&agent).await,
                 Err(Error::NotFound(_))
             ),
             "SQL commits before retirement joins"

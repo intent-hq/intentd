@@ -432,7 +432,11 @@ impl Services {
         agent_id: &AgentId,
         failed_provider: Option<&str>,
     ) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
             return false;
         };
         let Some((from, tried)) =
@@ -485,7 +489,11 @@ impl Services {
         error_text: &str,
     ) -> QuotaFailoverOutcome {
         use QuotaFailoverOutcome::Terminal;
-        let session = match self.store.get_agent_session(agent_id).await {
+        let session = match self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
             Ok(session) => session,
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "quota failover skipped: session read failed");
@@ -875,7 +883,7 @@ impl Services {
         if pending.kind != RemoteSwitchKind::Failover {
             return;
         }
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         if session.provider.as_deref() != Some(pending.to.as_str()) {

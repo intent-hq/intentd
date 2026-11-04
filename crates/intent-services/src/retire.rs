@@ -270,7 +270,7 @@ impl Services {
             let sessions = self.store.list_agent_session_summaries(&id).await?;
             let ids: Vec<AgentId> = sessions
                 .into_iter()
-                .map(|s| s.id)
+                .map(|s| s.id.clone())
                 .filter(|a| Some(a) != caller_agent_id.as_ref())
                 .collect();
             // Remote agents get final stops, recorded before the checkout
