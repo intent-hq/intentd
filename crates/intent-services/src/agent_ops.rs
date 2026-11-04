@@ -1312,7 +1312,7 @@ impl Services {
         {
             return None;
         }
-        let provider = session.provider.filter(|p| !p.trim().is_empty())?;
+        let provider = session.provider.clone().filter(|p| !p.trim().is_empty())?;
         // A child never inherits its parent's named profile (PROTOCOL
         // §5.54 "Delegation"): no account is inferred for it.
         if crate::provider_profiles::is_qualified_ref(&provider) {
