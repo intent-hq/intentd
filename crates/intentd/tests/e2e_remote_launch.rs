@@ -528,22 +528,15 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         notes.to_string().contains("From the node"),
         "the forwarded note is on head: {notes}"
     );
-    let refused = turn(
+    // Saved scripts (`remoteScripts: 1`): the agent's runs are machine runs.
+    let service_id = machine_runs(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &agent_id),
-        "wsapi return await ws.script.list();",
-        98,
+        &node_id,
+        &repo,
     )
     .await;
-    // The documented refusal is the `remote-agent-unsupported:` code
-    // (this backend does not run remote agents' saved scripts yet); the
-    // prose after it is not a contract.
-    assert!(
-        refused.starts_with("wsapi-error: ")
-            && refused.contains("remote-agent-unsupported: `script.list`"),
-        "{refused}"
-    );
 
     // Stop: the node pushes the agent's work before it exits.
     ok(
@@ -589,6 +582,317 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         std::fs::read_to_string(repo.join("README.md")).unwrap(),
         "dirty on head\n"
     );
+
+    // Lost on disconnect: a live machine run of a machine that goes away
+    // ends `exited`, `-1`, `remote-script-lost: …`, and is not reattached.
+    // A fresh remote agent starts the saved service (any agent may start any
+    // saved script), so the step does not depend on relaunching the agent
+    // stopped above.
+    // Relaunching a remote agent right after `agent.stop` can leave its
+    // first prompt unanswered: intent-hq/intent#8457.
+    let mut create_id = 290;
+    let deadline = tokio::time::Instant::now() + wait();
+    let second = loop {
+        create_id += 1;
+        let response = rpc(
+            &mut rpc_ws,
+            create_id,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "name": "Remote 2",
+                "model": "default",
+                "provider": "mock",
+                "placement": { "target": "remote" },
+            }),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break response["result"]["agent"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+        assert_eq!(
+            response["error"]["data"]["code"], "placement-unavailable",
+            "{response}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the backend redials the machine (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &second),
+        &format!(
+            "wsapi const st = await ws.script.start({service_id:?}); return JSON.stringify({{ marker: \"turn-300\", st }});"
+        ),
+        "turn-300",
+        300,
+    )
+    .await;
+    assert!(started.starts_with("wsapi: "), "{started}");
+    machine_run_until(&mut rpc_ws, (&ws_id, &service_id, &second), 310, |run| {
+        run["runtime"]["status"] == "running"
+    })
+    .await;
+    drop(machine);
+    let lost = machine_run_until(&mut rpc_ws, (&ws_id, &service_id, &second), 400, |run| {
+        run["runtime"]["status"] == "exited"
+    })
+    .await;
+    assert_eq!(lost["runtime"]["exitCode"], -1, "{lost}");
+    assert!(
+        lost["runtime"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("remote-script-lost:"),
+        "{lost}"
+    );
+}
+
+/// [`turn`] for a `wsapi` prompt whose reply carries `marker`. Monitor
+/// wakes, a stop or a relaunch also end turns, so the first
+/// `agent:stream:end` after sending may belong to another turn, and the
+/// agent's `lastAgentResponse` may still be the previous `wsapi:` reply:
+/// only a reply carrying this prompt's own `marker` is accepted.
+async fn wsapi_turn(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    marker: &str,
+    id: i64,
+) -> String {
+    let mut reply = turn(rpc_ws, events, (ws_id, agent_id), content, id).await;
+    let mut next = id + 2;
+    let found = timeout(wait(), async {
+        while !reply.contains(marker) {
+            // timing-guard: poll interval for this turn's reply to be recorded (the stream-end event may have belonged to another turn)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let got = ok(
+                rpc_ws,
+                next,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            next += 1;
+            got["agent"]["lastAgentResponse"]
+                .as_str()
+                .unwrap_or_default()
+                .clone_into(&mut reply);
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "no reply carrying {marker:?}; last reply: {reply}"
+    );
+    reply
+}
+
+/// A `wsapi:` reply's returned value: the agent returns `JSON.stringify(…)`,
+/// which the reply carries as a JSON string.
+fn wsapi_value(reply: &str) -> Value {
+    let raw: Value = serde_json::from_str(
+        reply
+            .strip_prefix("wsapi: ")
+            .unwrap_or_else(|| panic!("{reply}")),
+    )
+    .unwrap();
+    match raw {
+        Value::String(text) => serde_json::from_str(&text).unwrap(),
+        other => other,
+    }
+}
+
+/// The script row of `script_id`, from `script.get`.
+async fn script_row(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, script_id): (&str, &str),
+    id: i64,
+) -> Value {
+    let got = ok(
+        rpc_ws,
+        id,
+        "script.get",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    got.get("script").cloned().unwrap_or(got)
+}
+
+/// Poll the script's first machine run until `done` holds; returns it.
+async fn machine_run_until(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, script_id, agent_id): (&str, &str, &str),
+    first_id: i64,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut id = first_id;
+    let mut last = Value::Null;
+    let reached = timeout(wait(), async {
+        loop {
+            id += 1;
+            let row = script_row(rpc_ws, (ws_id, script_id), id).await;
+            let run = row["machineRuns"]
+                .as_array()
+                .and_then(|runs| runs.iter().find(|run| run["remoteAgentId"] == agent_id))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if done(&run) {
+                return run;
+            }
+            last = row;
+            // timing-guard: poll interval for the machine's script frames to settle the run
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    reached.unwrap_or_else(|_| {
+        panic!("the machine run never reached the expected state; last row: {last}")
+    })
+}
+
+/// A remote agent's saved scripts run on its machine: the run, its output,
+/// its monitor and its stop all reach the backend. Returns the id of a
+/// saved service, stopped, for the caller's disconnect check.
+async fn machine_runs(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    node_id: &str,
+    repo: &Path,
+) -> String {
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
+    let wsapi = r#"wsapi const c = await ws.script.create("mrun", "sleep 1; pwd; echo machine-run", "command", { purpose: "saved" }); const id = c.id ?? c.script.id; const st = await ws.script.start(id); const m = await ws.script.monitor(id, { ttlMs: 600000 }); return JSON.stringify({ id, st, m });"#;
+    let reply = turn(rpc_ws, events, (ws_id, agent_id), wsapi, 200).await;
+    let body = wsapi_value(&reply);
+    let script_id = body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_owned();
+    assert_eq!(body["st"]["status"], "starting", "{body}");
+    assert_eq!(body["m"]["monitor"]["remoteAgentId"], agent_id, "{body}");
+    assert_eq!(body["m"]["monitor"]["nodeId"], node_id, "{body}");
+
+    // The monitor wakes the agent when the run ends on the machine.
+    let end = event(events, "agent:stream:end").await;
+    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    let woken = ok(
+        rpc_ws,
+        202,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let woken = woken["agent"]["lastAgentResponse"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(woken.contains("exited with code 0"), "{woken}");
+
+    let row = script_row(rpc_ws, (ws_id, &script_id), 203).await;
+    assert_eq!(row["remoteAuthor"]["agentId"], agent_id, "{row}");
+    assert_eq!(row["remoteAuthor"]["nodeId"], node_id, "{row}");
+    assert_ne!(
+        row["runtime"]["status"], "running",
+        "the home run never started: {row}"
+    );
+    let run = &row["machineRuns"][0];
+    assert_eq!(run["remoteAgentId"], agent_id, "{row}");
+    assert_eq!(run["nodeId"], node_id, "{row}");
+    assert_eq!(run["runtime"]["status"], "exited", "{row}");
+    assert_eq!(run["runtime"]["exitCode"], 0, "{row}");
+    assert_eq!(run["lastRun"]["outcome"], "succeeded", "{row}");
+
+    // Its output came from the agent's checkout on the machine.
+    let output = ok(
+        rpc_ws,
+        204,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": script_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    let text = output.to_string();
+    assert!(text.contains("machine-run"), "{output}");
+    assert!(
+        !text.contains(&repo.to_string_lossy().into_owned()),
+        "ran on head: {output}"
+    );
+
+    // Only the remote agent starts a run on its machine.
+    let refused = rpc(
+        rpc_ws,
+        205,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": script_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("remote-script-start-remote-only"),
+        "{refused}"
+    );
+
+    // Definition authority: a remote agent changes only scripts it created,
+    // never sets autoStart, and never supplies remoteAuthor.
+    let users = ok(
+        rpc_ws,
+        260,
+        "script.create",
+        json!({ "workspaceId": ws_id, "name": "user-saved", "command": "true", "mode": "command", "purpose": "saved" }),
+    )
+    .await;
+    let users = users.get("script").cloned().unwrap_or(users);
+    let user_script = users["id"].as_str().unwrap().to_owned();
+    for (code, expected) in [
+        (
+            format!("wsapi return await ws.script.remove({user_script:?});"),
+            "remote-script-not-owned",
+        ),
+        (
+            r#"wsapi return await ws.script.create("auto", "true", "service", { autoStart: true });"#.to_owned(),
+            "remote-script-autostart-unsupported",
+        ),
+        (
+            r#"wsapi return await ws.script.create("forged", "true", "command", { remoteAuthor: { agentId: "a", nodeId: "n" } });"#.to_owned(),
+            "remote-script-author-readonly",
+        ),
+    ] {
+        let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &code, expected, 262).await;
+        assert!(
+            reply.starts_with("wsapi-error: ") && reply.contains(expected),
+            "{code}: {reply}"
+        );
+    }
+
+    // A service started by the agent, stopped from the app.
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
+    let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); return JSON.stringify({ marker: "turn-206", id });"#;
+    let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), wsapi, "turn-206", 206).await;
+    let body = wsapi_value(&reply);
+    let service_id = body["id"].as_str().unwrap().to_owned();
+    machine_run_until(rpc_ws, (ws_id, &service_id, agent_id), 210, |run| {
+        run["runtime"]["status"] == "running"
+    })
+    .await;
+    let stopped = ok(
+        rpc_ws,
+        250,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": service_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    assert_eq!(stopped["status"], "idle", "{stopped}");
+    service_id
 }
 
 /// A backend `intentd serve` on `data_dir` with a seeded workspace on
@@ -677,6 +981,8 @@ async fn placement_chooses_among_exposed_machines() {
         "{on}"
     );
     assert_eq!(on["server"]["capabilities"]["remoteLinkTraffic"], 1, "{on}");
+    // Saved scripts for remote agents come only with exposed machines.
+    assert_eq!(on["server"]["capabilities"]["remoteScripts"], 1, "{on}");
 
     let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();

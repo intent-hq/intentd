@@ -18,7 +18,7 @@
 // pid) into its working directory, so tests can check that stop kills the
 // whole process tree. A prompt whose text contains "block" parks until
 // session/cancel; "slow" waits 300 ms; "many" streams 200 extra chunks;
-// "exit" answers and then exits with code 0, leaving its `sleep` child
+// The prompt "exit" (exactly) answers and then exits with code 0, leaving its `sleep` child
 // running; "spawn-exit" starts another `sleep` in its own process group,
 // writes its pid to `late-helper.pid`, answers and exits at once; every turn
 // first streams one agent_message_chunk "echo: <text>". A prompt
@@ -198,7 +198,9 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         send({ id: msg.id, result: { stopReason: 'end_turn' } });
         process.exit(0);
       }
-      if (text.includes('exit')) {
+      // Only the exact prompt: a wake message such as a script monitor's
+      // "… exited with code 0" must not end the provider.
+      if (text === 'exit') {
         send({ id: msg.id, result: { stopReason: 'end_turn' } });
         setTimeout(() => process.exit(0), 50);
         return;

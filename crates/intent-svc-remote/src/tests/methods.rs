@@ -75,14 +75,19 @@ async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
     assert_eq!(machine_json["capabilities"]["capacity"]["agentCap"], 2);
     assert!(machine_json["addedAt"].is_string());
     assert!(machine_json["lastConnectedAt"].is_string());
-    // The negotiated version is stored but not served until the backend
-    // advertises `remoteScripts: 1`.
-    assert!(machine_json.get("nodeProtocol").is_none(), "{machine_json}");
+    // The version the probe's bind negotiated (`remoteScripts: 1`).
+    assert_eq!(
+        machine_json["nodeProtocol"],
+        json!(intent_core::node_link::NODE_LINK_PROTOCOLS.max)
+    );
     assert!(added.get("replacedCredentialId").is_none());
 
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"].as_array().unwrap().len(), 1);
-    assert!(listed["machines"][0].get("nodeProtocol").is_none());
+    assert_eq!(
+        listed["machines"][0]["nodeProtocol"],
+        json!(intent_core::node_link::NODE_LINK_PROTOCOLS.max)
+    );
     for text in [added.to_string(), listed.to_string()] {
         assert!(!text.contains(&machine.token), "never the token");
     }

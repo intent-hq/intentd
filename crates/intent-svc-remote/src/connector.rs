@@ -238,6 +238,12 @@ pub(crate) struct Shared {
     /// The stops a task is resending, with the link generation it resends
     /// on, so one link has one resender per stop.
     resending: Mutex<HashMap<StopId, u64>>,
+    /// Agents whose machine runs an acknowledged final stop settled.
+    #[cfg(test)]
+    final_settles: Mutex<Vec<AgentId>>,
+    /// Agents whose final stop was queued (and so began for their runs).
+    #[cfg(test)]
+    final_begins: Mutex<Vec<AgentId>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
     /// Set once a bind in this process has claimed the agents its welcome
@@ -324,12 +330,49 @@ impl Shared {
     /// capabilities request is waiting.
     fn wants_link(&self) -> bool {
         self.agents.live_count() > 0
+            || self.machine_runs_live()
             || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.claimed.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Whether one of this machine's script runs is live: the machine stops
+    /// a binding's scripts when its link closes, so the link stays up.
+    fn machine_runs_live(&self) -> bool {
+        self.services.as_ref().is_some_and(|svc| {
+            svc.feature_runtime()
+                .machine_runs_live(svc, &self.machine_id())
+        })
+    }
+
+    /// Lease end for `agents`' machine runs: send every stop, wait once
+    /// until `deadline`; the agents whose script stop was unacknowledged.
+    pub(crate) async fn end_agents_machine_runs(
+        &self,
+        agents: &[AgentId],
+        deadline: Instant,
+        reason: &str,
+    ) -> Vec<AgentId> {
+        match &self.services {
+            Some(svc) => {
+                svc.feature_runtime()
+                    .end_agents_machine_runs(svc, agents, deadline, reason)
+                    .await
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Every live script run on this machine is lost with `reason`.
+    pub(crate) async fn machine_runs_lost(&self, reason: &str) {
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_link_lost(svc, &self.machine_id(), reason)
+                .await;
+        }
     }
 
     /// Queue a stop for `agent_id` (reusing its id when one is already
@@ -364,6 +407,16 @@ impl Shared {
     /// stop (or an older final stop). `durable` when its record is in the
     /// store, so the acknowledgement finishes that record.
     fn queue_final_stop(&self, agent_id: &AgentId, stop_id: StopId, durable: bool) {
+        // Every queued final stop (requested, loaded at startup or on a
+        // dial, or claimed at bind) begins for the agent's machine runs: the
+        // machine stops its scripts itself, and none may start until the
+        // stop is over.
+        #[cfg(test)]
+        lock(&self.final_begins).push(agent_id.clone());
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_runs_final_stop_begun(svc, agent_id);
+        }
         let replaced = lock(&self.stops).insert(
             agent_id.clone(),
             QueuedStop {
@@ -504,9 +557,27 @@ impl Shared {
                     continue;
                 }
                 self.confirm_stop(&record.agent_id, stop_id);
+                self.final_stop_over(&record.agent_id).await;
                 continue;
             }
             self.queue_final_stop(&record.agent_id, stop_id, true);
+        }
+    }
+
+    /// `agent_id`'s final stop is over (acknowledged, or dropped past its
+    /// bound): any machine run the machine never reported ending is settled
+    /// now, and its scripts are no longer refused as ending.
+    async fn final_stop_over(&self, agent_id: &AgentId) {
+        #[cfg(test)]
+        lock(&self.final_settles).push(agent_id.clone());
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_runs_final_stop_acked(
+                    svc,
+                    agent_id,
+                    "remote-script-lost: the agent was stopped for good",
+                )
+                .await;
         }
     }
 
@@ -621,6 +692,11 @@ impl Shared {
                     if queued.durable {
                         self.finish_final_stop(&agent_id, stop_id, final_stop).await;
                     }
+                    if queued.final_stop {
+                        // The agent is ended for good, even when a link below
+                        // nodeProtocol 9 got the stop as a plain one.
+                        self.final_stop_over(&agent_id).await;
+                    }
                     self.confirm_stop(&agent_id, stop_id);
                 }
                 Err(error) if link::error_code(&error) == Some(link::codes::TIMEOUT) => {}
@@ -717,6 +793,18 @@ impl Shared {
             "{}: the machine has not acknowledged this agent's earlier stop",
             link::codes::UNAVAILABLE
         )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_begins_for_test(&self) -> Vec<AgentId> {
+        let mut agents = lock(&self.final_begins).clone();
+        agents.dedup();
+        agents
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
+        lock(&self.final_settles).clone()
     }
 
     #[cfg(test)]
@@ -900,6 +988,10 @@ impl RemoteNode {
             protocol: std::sync::atomic::AtomicU32::new(0),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            final_settles: Mutex::default(),
+            #[cfg(test)]
+            final_begins: Mutex::default(),
             route: Mutex::new(None),
             claimed: std::sync::atomic::AtomicBool::new(false),
             claim_lock: tokio::sync::Mutex::new(()),
@@ -926,7 +1018,6 @@ impl RemoteNode {
         Ok(Self { shared })
     }
 
-    #[cfg(test)]
     pub(crate) fn shared(&self) -> Arc<Shared> {
         self.shared.clone()
     }
@@ -1393,6 +1484,10 @@ async fn run(
         });
         shared.disconnected();
         lock(&shared.capability_waiters).clear();
+        // The machine stops this binding's scripts when its link closes.
+        shared
+            .machine_runs_lost("remote-script-lost: the machine disconnected")
+            .await;
         match ended {
             Ended::Shutdown => return,
             Ended::Idle => {
@@ -1485,6 +1580,15 @@ async fn serve(
                         let waiters: Vec<_> = lock(&shared.capability_waiters).drain(..).collect();
                         for waiter in waiters {
                             let _ = waiter.send(capabilities.clone());
+                        }
+                    }
+                    LinkEvent::Frame(frame)
+                        if frame.channel() == intent_core::node_link::LinkChannel::Script =>
+                    {
+                        if let Some(svc) = &shared.services {
+                            svc.feature_runtime()
+                                .machine_script_frame(svc, &shared.machine_id(), frame)
+                                .await;
                         }
                     }
                     LinkEvent::Frame(frame) => {

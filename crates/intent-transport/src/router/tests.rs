@@ -8931,3 +8931,17 @@ async fn git_diffs_rejects_malformed_max_bytes() {
         );
     }
 }
+
+/// `remoteAuthor` is daemon-owned: a `script.create` param carrying it is
+/// refused `-32602 remote-script-author-readonly` from any caller.
+#[test]
+fn script_create_refuses_a_remote_author_param() {
+    let params = serde_json::json!({
+        "workspaceId": "ws", "name": "n", "command": "true", "mode": "command",
+        "remoteAuthor": { "agentId": "a", "nodeId": "n" },
+    });
+    let error = super::parse_script_create(params.as_object().unwrap()).unwrap_err();
+    let text = format!("{error:?}");
+    assert!(text.contains("remote-script-author-readonly"), "{text}");
+    assert!(text.contains("-32602"), "{text}");
+}

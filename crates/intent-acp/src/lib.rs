@@ -58,6 +58,7 @@ pub use mcp_env::is_likely_secret_env_key;
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
+pub use mcp_server::dispatch_script_method;
 pub use mcp_server::{
     make_workspace_host_for_bridge, HostFrameRouter, SpecialistModelOption, SpecialistModelOptions,
     WorkspaceMcpServer, MCP_PROTOCOL_VERSION, WORKSPACE_API_SYSTEM_PROMPT_HEADING,

@@ -1780,6 +1780,12 @@ mod final_stops {
         // The restart: the in-memory queue is gone, the record is not.
         node.shutdown();
         let node = backend.bare(&machine).await;
+        // Loading it begins the agent's final stop before any link, so its
+        // scripts are refused as ending until the ack (review of intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_begins_for_test(),
+            vec![agent.clone()]
+        );
         machine.restart().await;
         let mut link = machine.accept().await;
         assert!(link.hello.lease_agents.contains(&agent));
@@ -1998,6 +2004,13 @@ mod final_stops {
             .unwrap()
             .is_none());
         assert!(!node.shared_ref().has_pending_stops());
+        // The expired stop ends the agent's final stop too: its machine runs
+        // settle and its scripts are no longer refused as ending (review of
+        // intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_settles_for_test(),
+            vec![agent.clone()]
+        );
         // Nothing is left to send: the machine coming back is not dialed.
         machine.restart().await;
         machine.no_link(Duration::from_millis(300)).await;
@@ -2063,6 +2076,12 @@ mod final_stops {
             "the push is still admitted within the grace"
         );
         assert!(!node.shared_ref().has_pending_stops(), "acknowledged once");
+        // The agent is still ended for good: its machine runs settle and its
+        // scripts may no longer be refused as ending (review of intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_settles_for_test(),
+            vec![agent.clone()]
+        );
         let store = backend.store().clone();
         until("the grace ends", || {
             let store = store.clone();

@@ -8247,6 +8247,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
     /// Workspace-scoped.
+    /// `script.<method>` with `remoteAgentId` (`remoteScripts: 1`): that
+    /// remote agent's machine run of the script (`params` are the request's).
+    fn script_machine_run(
+        &self,
+        workspace_id: WorkspaceId,
+        method: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async move {
+            Err(Error::InvalidParams(format!(
+                "script.{method}: remoteAgentId is not supported"
+            )))
+        })
+    }
+
     fn script_start(
         &self,
         workspace_id: WorkspaceId,
