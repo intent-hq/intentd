@@ -374,8 +374,12 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         )
     };
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "settings-change",
+        "applyToolCallId": format!("settings-change-{}", uuid::Uuid::new_v4()),
         "payload": {
             "changes": payload_changes
         },
@@ -848,6 +852,29 @@ mod tests {
             error.contains("cannot be changed from a chat card"),
             "{error}"
         );
+    }
+
+    /// Repeating a settings proposal must yield a distinct card identity, so
+    /// the new card does not inherit the earlier card's applied state
+    /// (intent-hq/intent#8560).
+    #[tokio::test]
+    async fn test_propose_stamps_unique_apply_tool_call_id() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let args = json!([{ "path": "user.name", "value": "Bob" }]);
+        let first = dispatch(&api, &chief_id, "propose", &args).await.unwrap();
+        let second = dispatch(&api, &chief_id, "propose", &args).await.unwrap();
+        let first_id = first["proposal"]["applyToolCallId"]
+            .as_str()
+            .expect("first id");
+        let second_id = second["proposal"]["applyToolCallId"]
+            .as_str()
+            .expect("second id");
+        assert!(first_id.starts_with("settings-change-"), "{first_id}");
+        assert_ne!(first_id, second_id);
+        assert!(super::super::proposal::is_valid_proposal(
+            &first["proposal"]
+        ));
     }
 
     #[tokio::test]
