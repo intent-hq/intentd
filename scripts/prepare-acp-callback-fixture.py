@@ -244,6 +244,12 @@ def node_options_rerun(argv):
                        str(Path(argv[0]).resolve()), *argv[1:]])
 
 
+def node_rerun(directory, argv):
+    """The same invocation with `directory` first on PATH (the version check stays)."""
+    return (f'env PATH={shlex.quote(str(directory))}:"$PATH" '
+            + shlex.join([sys.executable, "-I", "-B", "-S", str(Path(argv[0]).resolve()), *argv[1:]]))
+
+
 def environment(work):
     private = work / "private"
     private.mkdir(mode=0o700, exist_ok=True)
@@ -287,12 +293,78 @@ def command(args, cwd, env, capture=False):
     return (output or b"").decode().strip()
 
 
+class NodeVersionMismatch(InvalidFixture):
+    """The active Node is not the descriptor's; `matching` names an installed one."""
+
+    def __init__(self, found, required, matching):
+        self.found, self.required, self.matching = found, required, matching
+        message = f"Node version mismatch: found {found}, descriptor requires {required}"
+        if matching is None:
+            nvm = nvm_versions_dir()
+            where = "on PATH" + (f" or under {nvm}" if nvm is not None else "")
+            message += (f"; no installed Node {required} was found {where}."
+                        " Install it, then re-run (nothing was downloaded)")
+        else:
+            message += (f"; Node {required} is installed in {matching}. Put it first on PATH,"
+                        f" then re-run: {path_export(matching)}")
+        super().__init__(message)
+
+
+def nvm_versions_dir():
+    root = os.environ.get("NVM_DIR") or (os.environ.get("HOME") and Path(os.environ["HOME"]) / ".nvm")
+    return Path(root) / "versions/node" if root else None
+
+
+def path_export(directory):
+    # "$PATH" must expand in the user's shell, so only the directory is quoted.
+    return f'export PATH={shlex.quote(str(directory))}:"$PATH"'
+
+
+def probe_node_version(node, env):
+    try:
+        result = subprocess.run([str(node), "--version"], env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def matching_node_dir(required, env):
+    """An installed Node directory reporting `required`, or None.
+
+    Only names a candidate for the error message: the pin is never chosen
+    automatically, and nothing is downloaded or repaired. nvm's directory for
+    the version comes first, then PATH entries whose resolved path names it.
+    """
+    nvm = nvm_versions_dir()
+    candidates = [nvm / required / "bin"] if nvm is not None else []
+    candidates += [Path(entry) for entry in env["PATH"].split(os.pathsep) if entry]
+    seen = set()
+    for directory in candidates:
+        node = directory / "node"
+        if not os.access(node, os.X_OK) or not node.is_file():
+            continue
+        resolved = node.resolve()
+        # Only execute installs whose path names the pin: version-manager shims
+        # (asdf, mise, Volta) may install on demand when run.
+        if not any(required.removeprefix("v") in part for part in resolved.parts):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if probe_node_version(resolved, env) == required:
+            return directory
+    return None
+
+
 def node_tool(descriptor, work, env):
     located = shutil.which("node", path=env["PATH"])
-    require(located is not None, "install the descriptor's exact Node version first")
+    required = descriptor["tools"]["node"]
+    require(located is not None, f"install the descriptor's exact Node version ({required}) first")
     node = Path(located).resolve()
     version = command([node, "--version"], work, env, capture=True)
-    require(version == descriptor["tools"]["node"], f"Node version mismatch: {version}")
+    if version != required:
+        raise NodeVersionMismatch(version, required, matching_node_dir(required, env))
     receipt("node-tool", path=str(node), version=version, sha256=digest(node))
     return node
 
@@ -461,6 +533,10 @@ def main():
         if str(error) == NODE_OPTIONS_REFUSAL and os.environ.get("NODE_OPTIONS"):
             message += ("; NODE_OPTIONS is set in this shell (often a host preload such as a"
                         f" monitoring tracer). Re-run without it: {node_options_rerun(sys.argv)}")
+        if isinstance(error, NodeVersionMismatch) and error.matching is not None:
+            # Before the final line: callers such as the monorepo gate report it.
+            print(f"callback fixture: exact re-run with Node {error.required} first on PATH:"
+                  f" {node_rerun(error.matching, sys.argv)}", file=sys.stderr)
         print(message, file=sys.stderr)
         return 1
     return 0
