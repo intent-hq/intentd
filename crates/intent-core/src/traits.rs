@@ -2251,12 +2251,13 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.listUserMessages`: user-role messages of an agent as
     /// lightweight index items, oldest→newest —
     /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total,
-    /// nextToken? }` (PROTOCOL §5.5). `preview` is the extracted plain text
+    /// nextToken }` (PROTOCOL §5.5). `preview` is the extracted plain text
     /// bounded to `preview_chars` characters (`None` → server default,
     /// server-clamped); `metadata` is the row metadata projected to its
-    /// classification fields when any survive. With `limit` or `next_token`
-    /// the read is paged newest-first and the result carries `nextToken`
-    /// (`null` once no older rows remain). Non-user rows are never included.
+    /// classification fields when any survive. Every read is paged
+    /// newest-first (`limit` default 100, max 500, plus a 480,000-byte
+    /// items budget) and carries `nextToken` (`null` once no older rows
+    /// remain). Non-user rows are never included.
     /// Bounded cost: one role-filtered SQL read whose previews and metadata
     /// are trimmed inside SQL — full content and metadata blobs never leave
     /// the database and the transcript is never hydrated. `NotFound` on an

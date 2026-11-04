@@ -545,6 +545,31 @@ fn encode_user_message_index_token(before_seq: i64) -> String {
     format!("{USER_MESSAGE_INDEX_TOKEN_PREFIX}{before_seq}")
 }
 
+/// Serialized-size ceiling of one `agent.listUserMessages` page's items
+/// (PROTOCOL §5.5), so the whole JSON-RPC frame stays under 512,000 bytes.
+pub(crate) const USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Fit one `agent.listUserMessages` page (`items` oldest→newest, `seqs`
+/// their transcript `seq`s) to [`USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES`]:
+/// the newest rows are kept and, when older rows of the page were cut, the
+/// `seq` of the oldest kept row is returned as the next page's bound. A
+/// single row over the budget serves alone with its oversized fields
+/// replaced by `<field>Omitted` / `<field>Bytes` markers.
+fn trim_user_message_index_page(items: &mut Vec<Value>, seqs: &[i64]) -> Option<i64> {
+    let budget = USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES;
+    let sizes: Vec<usize> = items
+        .iter()
+        .map(crate::pagination::serialized_size)
+        .collect();
+    let (lo, _) =
+        crate::pagination::budget_page(&sizes, crate::pagination::BudgetAnchor::Newest, budget);
+    items.drain(..lo);
+    if let [only] = items.as_mut_slice() {
+        crate::pagination::bound_row(only, budget, &["id", "preview", "createdAt"]);
+    }
+    (lo > 0).then(|| seqs[lo])
+}
+
 fn decode_user_message_index_token(token: &str) -> Result<i64> {
     token
         .strip_prefix(USER_MESSAGE_INDEX_TOKEN_PREFIX)
@@ -5379,12 +5404,16 @@ impl Services {
     /// tell automated rows apart (`intent_store::project_user_message_index_metadata`,
     /// intent-hq/intent#8278) and omitted when none survive.
     ///
-    /// Paging is opt-in: with `limit` (clamped into [1, 500]) or
-    /// `next_token` (default limit 100) only the newest rows older than the
-    /// token are read and the result carries `nextToken` — the opaque cursor
-    /// for the next older page, `null` once none remain. Without either, the
-    /// whole index is served and `nextToken` is absent (the pre-paging
-    /// shape). Bounded cost (RPC cost contract): a metadata-only session
+    /// Every read is paged: at most `limit` rows (default 100, clamped into
+    /// [1, 500]) — the newest rows older than `next_token` (the newest
+    /// overall without one) — trimmed newest-first to
+    /// [`USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES`] of serialized items. The
+    /// result always carries `nextToken`, the opaque cursor for the next
+    /// older page (resuming at the first row a count or byte cut left out),
+    /// `null` once none remain. A single row over the budget still serves
+    /// alone with its `metadata` replaced by `metadataOmitted` /
+    /// `metadataBytes` (the row stays readable in full through
+    /// `agent.getConversation`). Bounded cost (RPC cost contract): a metadata-only session
     /// read plus ONE role-filtered index read whose previews and metadata
     /// are trimmed inside SQL — full content and metadata blobs never leave
     /// the database and the transcript is never hydrated.
@@ -5419,18 +5448,14 @@ impl Services {
                 .clamp(1, MAX_PREVIEW_CHARS),
         )
         .expect("clamped to [1, MAX_PREVIEW_CHARS]");
-        let page = (limit.is_some() || next_token.is_some()).then(|| {
-            intent_store::UserMessageIndexPageRequest {
-                limit: usize::try_from(
-                    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT),
-                )
+        let page = intent_store::UserMessageIndexPageRequest {
+            limit: usize::try_from(limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT))
                 .expect("clamped to [1, MAX_PAGE_LIMIT]"),
-                before_seq,
-            }
-        });
+            before_seq,
+        };
         let index = self
             .store
-            .get_agent_user_message_index_page(&agent_id, preview_chars, page)
+            .get_agent_user_message_index_page(&agent_id, preview_chars, Some(page))
             .await?;
         let items = crate::repository_native_wire::monitor::history_index(
             self,
@@ -5440,10 +5465,11 @@ impl Services {
             preview_chars,
         )
         .await?;
-        let total = items.len();
-        let items: Vec<Value> = items
+        let mut seqs = Vec::with_capacity(items.len());
+        let mut items: Vec<Value> = items
             .into_iter()
             .map(|item| {
+                seqs.push(item.seq);
                 let mut obj = json!({
                     "id": item.id,
                     "preview": item.preview,
@@ -5457,13 +5483,18 @@ impl Services {
                 obj
             })
             .collect();
-        let mut result = json!({ "agentId": agent_id.0, "items": items, "total": total });
-        if page.is_some() {
-            result["nextToken"] = index.next_before_seq.map_or(Value::Null, |seq| {
-                Value::String(encode_user_message_index_token(seq))
-            });
-        }
-        Ok(result)
+        let next_before_seq =
+            trim_user_message_index_page(&mut items, &seqs).or(index.next_before_seq);
+        let total = items.len();
+        let next_token = next_before_seq.map_or(Value::Null, |seq| {
+            Value::String(encode_user_message_index_token(seq))
+        });
+        Ok(json!({
+            "agentId": agent_id.0,
+            "items": items,
+            "total": total,
+            "nextToken": next_token,
+        }))
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted

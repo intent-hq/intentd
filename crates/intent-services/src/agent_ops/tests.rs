@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod pending_completion;
+mod user_message_pages;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
