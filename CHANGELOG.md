@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.125] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Page the task.subscribe snapshot through a paged task.list ([#3029](https://github.com/intent-hq/intentd/pull/3029))
+- Page agent.listUserMessages by default under the 500 KiB budget ([#3031](https://github.com/intent-hq/intentd/pull/3031))
+- Tighten file.placeAttachment sourcePath and MCP bridge admission ([#3034](https://github.com/intent-hq/intentd/pull/3034))
+
+
 ## [0.11.124] - 2026-11-04
 
 ### 🚀 Features
