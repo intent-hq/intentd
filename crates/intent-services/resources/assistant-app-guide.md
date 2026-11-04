@@ -196,7 +196,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
-| Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
+| Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
@@ -399,7 +399,7 @@ pairing scanner. The Remote Access reference route is
 `/settings?tab=mobile#websocket-api`. There is no need to expand a device's Edit panel.
 
 For ordinary local-machine pairing, select that machine as the active connection.
-If connected elsewhere, use **Settings → Devices**, then the local machine's
+If connected elsewhere, use **Settings → Machines**, then the local machine's
 **Connect** action, and return to **Mobile**. The QR controls remain visible but
 disabled when **Enable Remote Access** is off, data is loading, or no running listener
 port is available. Explain the required enablement; do not silently change it.
@@ -414,14 +414,21 @@ finding the QR control.
 
 ## Find work on another device
 
-Devices lists the local machine and saved remote connections. **Add device** opens
-the connection form; a remote device's actions include **Edit** and **Connect**,
-with **Test connection** inside its editing panel. Workspaces and agents belong to a
-host, so identify the intended device before explaining missing work or changing
+**Settings → Machines** lists the local machine first as **<name> (local)**, then
+the backend this window is connected to as **<name> (connected backend)**, then saved
+remote connections. Each row shows a macOS, Windows or Linux icon by the name and,
+after the version (or the **Available to <backend>** badge), icons for the AI
+providers available on that machine; hover an icon for its name. Providers that are
+switched off or unavailable are hidden, and an unknown or offline machine shows no
+platform or provider icons. In an agent's **Start On** picker, the connected backend
+and remote machines show their platform under the name, such as `Linux x64` or
+`macOS arm64`. **Add machine** opens the connection form; a remote machine's actions
+include **Edit** and **Connect**, with **Test connection** inside its editing panel.
+Workspaces and agents belong to a host, so identify the intended device before explaining missing work or changing
 host settings. **Mobile** follows the active connection and its permissions; do not
 describe a remote connection's QR as belonging to the local desktop. To pair the
 local machine, connect to it first. For intentd running in WSL on the same Windows
-PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL prints
+PC, add a machine with host `localhost`; `intentd pair --host localhost` in WSL prints
 the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
