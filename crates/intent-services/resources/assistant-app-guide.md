@@ -17,6 +17,12 @@ These app-version notes qualify every later description in this guide:
   developing or testing it, and require an app offering its Labs command and
   **Mobile → Browser access** section. Older apps may lack it;
   **Mobile → Remote Access** is a separate mobile-access feature.
+- The notice about features unavailable in the browser and its **Got it** button
+  apply only to browser builds that show them. Older builds may show no notice;
+  the limitations on features requiring the desktop still apply.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/intent-web/components/. -->
+
 - Agent **Pin to top** and **Unpin** require matching app and daemon agent-pinning
   support. Older app/daemon combinations do not offer that agent-list action.
 - Repository-picker **Clone**, **Existing folder**, and **New** labels apply to the
