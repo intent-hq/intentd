@@ -5301,6 +5301,7 @@ async fn dispatch(
             };
             let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
             let request_id = opt_str_strict(params, "requestId")?;
+            let next_token = opt_str_strict(params, "nextToken")?;
             api.search_notes(
                 query,
                 workspace_id.map(WorkspaceId::from),
@@ -5308,6 +5309,7 @@ async fn dispatch(
                 limit,
                 include_archived,
                 request_id,
+                next_token,
             )
             .await
             .map_err(domain_to_rpc)

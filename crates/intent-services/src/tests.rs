@@ -29277,6 +29277,7 @@ mod search_adapters {
                 None,
                 true,
                 Some("srch-n".into()),
+                None,
             )
             .await
             .unwrap();
@@ -29298,7 +29299,7 @@ mod search_adapters {
         let svc = Services::new_isolated(store);
         for query in ["CAFÉ run", "run checklist", "tagonly", "café:(checkl"] {
             let result = svc
-                .search_notes(query.into(), None, None, None, true, None)
+                .search_notes(query.into(), None, None, None, true, None, None)
                 .await
                 .unwrap();
             assert_eq!(result["indexed"], true);
@@ -29315,7 +29316,15 @@ mod search_adapters {
         }
         // FTS operators are literal search tokens, never parser instructions.
         assert!(svc
-            .search_notes("café OR nonexistent".into(), None, None, None, true, None)
+            .search_notes(
+                "café OR nonexistent".into(),
+                None,
+                None,
+                None,
+                true,
+                None,
+                None
+            )
             .await
             .unwrap()["matches"]
             .as_array()
@@ -29332,7 +29341,7 @@ mod search_adapters {
             .unwrap();
         let svc = Services::new_isolated(store);
         assert!(svc
-            .search_notes("needle".into(), None, None, None, true, None)
+            .search_notes("needle".into(), None, None, None, true, None, None)
             .await
             .is_err());
     }
@@ -29342,7 +29351,7 @@ mod search_adapters {
         let (_tmp, store, _) = store_with_ws().await;
         let svc = Services::new_isolated(store);
         assert!(matches!(
-            svc.search_notes(String::new(), None, None, Some(-1), true, None)
+            svc.search_notes(String::new(), None, None, Some(-1), true, None, None)
                 .await,
             Err(intent_core::Error::InvalidParams(_))
         ));
@@ -29351,7 +29360,7 @@ mod search_adapters {
             (None, Some(WorkspaceId::from(""))),
         ] {
             assert!(matches!(
-                svc.search_notes(String::new(), hard, soft, None, true, None)
+                svc.search_notes(String::new(), hard, soft, None, true, None, None)
                     .await,
                 Err(intent_core::Error::InvalidParams(_))
             ));
@@ -29363,6 +29372,7 @@ mod search_adapters {
                 None,
                 Some(0),
                 true,
+                None,
                 None
             )
             .await,
@@ -29392,6 +29402,7 @@ mod search_adapters {
                 Some(3),
                 false,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -29411,11 +29422,184 @@ mod search_adapters {
                 None,
                 false,
                 None,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(scoped["matches"].as_array().unwrap().len(), 2);
         assert_eq!(scoped["matches"][0]["workspaceId"], ws1.as_str());
+    }
+
+    /// Follow `search.notes` pages from the first, asserting every reply's
+    /// frame fits the read budget; returns the `(workspaceId, noteId)` hits in
+    /// order and the page count.
+    async fn drain_note_search(
+        svc: &Services,
+        query: &str,
+        limit: Option<i64>,
+    ) -> (Vec<(String, String)>, usize) {
+        let mut hits = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = svc
+                .search_notes(query.into(), None, None, limit, true, None, token.clone())
+                .await
+                .unwrap();
+            pages += 1;
+            let frame = json!({ "jsonrpc": "2.0", "id": 1, "result": &page }).to_string();
+            assert!(frame.len() <= 512_000, "frame is {} bytes", frame.len());
+            assert!(page.to_string().len() <= 480_000);
+            let rows = page["matches"].as_array().unwrap();
+            assert!(!rows.is_empty() || page["nextToken"].is_null(), "{page}");
+            for row in rows {
+                hits.push((
+                    row["workspaceId"].as_str().unwrap().to_string(),
+                    row["noteId"].as_str().unwrap().to_string(),
+                ));
+            }
+            match page["nextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => {
+                    assert!(page["nextToken"].is_null(), "{page}");
+                    return (hits, pages);
+                }
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_pages_default_and_clamped_limits_without_losing_hits() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        for i in 0..230 {
+            store
+                .insert_note(&note(&ws, &format!("n-{i:03}"), "pagedterm body"))
+                .await
+                .unwrap();
+        }
+        let svc = Services::new_isolated(store);
+        let first = svc
+            .search_notes("pagedterm".into(), None, None, None, true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first["matches"].as_array().unwrap().len(), 50);
+        assert!(first["nextToken"].is_string());
+        let max = svc
+            .search_notes(
+                "pagedterm".into(),
+                None,
+                None,
+                Some(100_000),
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(max["matches"].as_array().unwrap().len(), 200);
+        for limit in [None, Some(100_000), Some(7)] {
+            let (hits, pages) = drain_note_search(&svc, "pagedterm", limit).await;
+            let unique: std::collections::HashSet<_> = hits.iter().collect();
+            assert_eq!(hits.len(), 230, "limit {limit:?}");
+            assert_eq!(unique.len(), 230, "limit {limit:?}");
+            let per_page = usize::try_from(limit.unwrap_or(50).min(200)).unwrap();
+            assert_eq!(pages, 230usize.div_ceil(per_page), "limit {limit:?}");
+        }
+        let zero = svc
+            .search_notes("pagedterm".into(), None, None, Some(0), true, None, None)
+            .await
+            .unwrap();
+        assert!(zero["matches"].as_array().unwrap().is_empty());
+        assert!(zero["nextToken"].is_null());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_byte_cut_moves_hits_to_the_next_page() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        for i in 0..60 {
+            let mut row = note(&ws, &format!("big-{i:02}"), "bulkyterm");
+            row.title = format!("bulkyterm {}", "t".repeat(30_000));
+            store.insert_note(&row).await.unwrap();
+        }
+        let svc = Services::new_isolated(store);
+        let first = svc
+            .search_notes("bulkyterm".into(), None, None, Some(200), true, None, None)
+            .await
+            .unwrap();
+        let kept = first["matches"].as_array().unwrap().len();
+        assert!(kept > 1 && kept < 60, "{kept} hits on the first page");
+        assert!(first["nextToken"].is_string());
+        let (hits, pages) = drain_note_search(&svc, "bulkyterm", Some(200)).await;
+        let unique: std::collections::HashSet<_> = hits.iter().collect();
+        assert_eq!((hits.len(), unique.len()), (60, 60));
+        assert!(pages > 1);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_omits_the_title_of_a_hit_larger_than_a_page() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let mut huge = note(&ws, "huge", "hugeterm");
+        huge.title = format!("hugeterm {}", "x".repeat(600_000));
+        store.insert_note(&huge).await.unwrap();
+        store
+            .insert_note(&note(&ws, "small", "hugeterm small"))
+            .await
+            .unwrap();
+        let svc = Services::new_isolated(store);
+        let (hits, _) = drain_note_search(&svc, "hugeterm", None).await;
+        assert_eq!(hits.len(), 2);
+        let page = svc
+            .search_notes("hugeterm".into(), Some(ws), None, None, true, None, None)
+            .await
+            .unwrap();
+        let row = page["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["noteId"] == "huge")
+            .unwrap();
+        assert_eq!(row["titleOmitted"], true, "{row}");
+        assert_eq!(row["titleBytes"], huge.title.len());
+        assert!(row.get("title").is_none());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_rejects_a_token_from_another_search() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        for i in 0..3 {
+            store
+                .insert_note(&note(&ws, &format!("t-{i}"), "tokenterm"))
+                .await
+                .unwrap();
+        }
+        let svc = Services::new_isolated(store);
+        let page = svc
+            .search_notes("tokenterm".into(), None, None, Some(1), true, None, None)
+            .await
+            .unwrap();
+        let token = page["nextToken"].as_str().unwrap().to_string();
+        for (query, archived, next) in [
+            ("othertoken", true, token.clone()),
+            ("tokenterm", false, token.clone()),
+            ("tokenterm", true, "not a token".to_string()),
+        ] {
+            assert!(
+                matches!(
+                    svc.search_notes(
+                        query.into(),
+                        None,
+                        None,
+                        Some(1),
+                        archived,
+                        None,
+                        Some(next)
+                    )
+                    .await,
+                    Err(intent_core::Error::InvalidParams(_))
+                ),
+                "{query} {archived}"
+            );
+        }
     }
 
     /// A fake [`ContextEngine`] so the engine-available and graceful-degradation

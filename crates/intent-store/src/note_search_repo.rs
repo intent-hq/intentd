@@ -23,6 +23,9 @@ pub struct NoteFtsOptions<'a> {
     /// with many strong hits cannot crowd others out. `None` keeps every hit;
     /// zero is empty. Negative values are rejected.
     pub per_workspace_limit: Option<i64>,
+    /// Ranked hits skipped before `limit` applies (a page's start). Zero
+    /// leaves the SQL unchanged; negative values are rejected.
+    pub offset: i64,
 }
 
 impl Default for NoteFtsOptions<'_> {
@@ -34,6 +37,7 @@ impl Default for NoteFtsOptions<'_> {
             include_archived: true,
             limit: None,
             per_workspace_limit: None,
+            offset: 0,
         }
     }
 }
@@ -55,8 +59,8 @@ pub struct NoteFtsMatch {
 
 /// Shared with the query-plan regression guard. Binding order: preferred
 /// workspace, MATCH expression, optional hard scope, optional permissions JSON,
-/// optional per-workspace limit, limit. Values are bound, never interpolated
-/// into SQL.
+/// optional per-workspace limit, limit, optional offset (only when positive).
+/// Values are bound, never interpolated into SQL.
 pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
     let mut filters = String::new();
     if options.workspace_id.is_some() {
@@ -68,6 +72,7 @@ pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
     if !options.include_archived {
         filters.push_str(" AND c.is_archived = 0");
     }
+    let offset = if options.offset > 0 { " OFFSET ?" } else { "" };
     let ranked = format!(
         "SELECT c.note_id, c.workspace_id, c.updated_at, \
                 w.archived AS workspace_archived, \
@@ -94,13 +99,13 @@ pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
              ) \
              WHERE workspace_position <= ? \
              ORDER BY adjusted_rank ASC, updated_at DESC, workspace_id ASC, note_id ASC \
-             LIMIT ?"
+             LIMIT ?{offset}"
         )
     } else {
         format!(
             "{ranked} \
              ORDER BY adjusted_rank ASC, c.updated_at DESC, c.workspace_id ASC, c.note_id ASC \
-             LIMIT ?"
+             LIMIT ?{offset}"
         )
     };
     // The LIMIT subquery prevents SQLite flattening it into a full note-table
@@ -135,9 +140,10 @@ impl Store {
     ) -> Result<Vec<NoteFtsMatch>> {
         if options.limit.is_some_and(|limit| limit < 0)
             || options.per_workspace_limit.is_some_and(|limit| limit < 0)
+            || options.offset < 0
         {
             return Err(Error::InvalidParams(
-                "note search limit must be nonnegative".into(),
+                "note search limit and offset must be nonnegative".into(),
             ));
         }
         if match_expr.trim().is_empty()
@@ -166,8 +172,11 @@ impl Store {
         if let Some(per_workspace) = options.per_workspace_limit {
             query = query.bind(per_workspace);
         }
+        query = query.bind(options.limit.unwrap_or(-1));
+        if options.offset > 0 {
+            query = query.bind(options.offset);
+        }
         let rows = query
-            .bind(options.limit.unwrap_or(-1))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("search notes failed: {e}")))?;

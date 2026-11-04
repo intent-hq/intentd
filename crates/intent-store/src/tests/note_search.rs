@@ -486,12 +486,13 @@ async fn note_fts_query_plan_hydrates_only_winners() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = workspace(&store, "plan", false).await;
     let allowed = [ws.clone()];
-    for filtered in [false, true] {
+    for (filtered, offset) in [(false, 0), (true, 0), (false, 20), (true, 20)] {
         let options = NoteFtsOptions {
             workspace_id: filtered.then_some(&ws),
             allowed_workspace_ids: filtered.then_some(&allowed[..]),
             include_archived: !filtered,
             limit: Some(10),
+            offset,
             ..Default::default()
         };
         let sql = format!(
@@ -502,14 +503,14 @@ async fn note_fts_query_plan_hydrates_only_winners() {
         if filtered {
             query = query.bind("plan").bind("[\"plan\"]");
         }
-        let rows = query
-            .bind(10_i64)
-            .fetch_all(store.read_pool())
-            .await
-            .unwrap();
+        query = query.bind(10_i64);
+        if offset > 0 {
+            query = query.bind(offset);
+        }
+        let rows = query.fetch_all(store.read_pool()).await.unwrap();
         let plan: Vec<String> = rows.iter().map(|row| row.get("detail")).collect();
         let joined = plan.join("\n");
-        println!("filtered={filtered}\n{joined}");
+        println!("filtered={filtered} offset={offset}\n{joined}");
         assert!(
             plan.iter()
                 .any(|d| d.contains("note_fts VIRTUAL TABLE INDEX") && d.contains('M')),
@@ -665,5 +666,47 @@ async fn note_fts_per_workspace_limit_applies_before_the_global_limit() {
         .unwrap()
         .is_empty());
     options.per_workspace_limit = Some(-1);
+    assert!(store.search_notes_fts("needle", &options).await.is_err());
+}
+
+#[tokio::test]
+async fn note_fts_offset_pages_the_ranked_order_without_gaps() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let a = workspace(&store, "a", false).await;
+    let b = workspace(&store, "b", false).await;
+    for i in 0..7 {
+        note(&store, &a, &format!("a{i}"), "Needle", "needle").await;
+        note(&store, &b, &format!("b{i}"), "Other", "needle body").await;
+    }
+    let key = |h: &NoteFtsMatch| (h.workspace_id.clone(), h.note_id.clone());
+    for per_workspace_limit in [None, Some(5)] {
+        let mut options = NoteFtsOptions {
+            per_workspace_limit,
+            ..Default::default()
+        };
+        let all: Vec<_> = store
+            .search_notes_fts("needle", &options)
+            .await
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect();
+        let mut paged = Vec::new();
+        options.limit = Some(3);
+        loop {
+            let page = store.search_notes_fts("needle", &options).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            paged.extend(page.iter().map(key));
+            options.offset += 3;
+        }
+        assert_eq!(paged, all, "per_workspace_limit={per_workspace_limit:?}");
+    }
+    let options = NoteFtsOptions {
+        offset: -1,
+        ..Default::default()
+    };
     assert!(store.search_notes_fts("needle", &options).await.is_err());
 }

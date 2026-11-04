@@ -20796,11 +20796,24 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if limit.is_some_and(|n| n < 0) {
                 return Err(Error::InvalidParams("limit must be nonnegative".into()));
             }
+            let scope = search_ops::note_page_scope(
+                &query,
+                workspace_id.as_ref(),
+                prefer_workspace_id.as_ref(),
+                include_archived,
+            );
+            let start = next_token
+                .as_deref()
+                .map(|token| search_ops::decode_note_page_token(token, &scope))
+                .transpose()?
+                .unwrap_or(0);
+            let limit = search_ops::match_limit(limit);
             for (name, id) in [
                 ("workspaceId", &workspace_id),
                 ("preferWorkspaceId", &prefer_workspace_id),
@@ -20825,8 +20838,14 @@ impl WorkspaceApi for Services {
                 prefer_workspace_id: prefer_workspace_id.as_ref(),
                 allowed_workspace_ids: visible.as_deref(),
                 include_archived,
-                limit,
+                // One extra hit tells whether another page follows.
+                limit: Some(if limit == 0 {
+                    0
+                } else {
+                    i64::try_from(limit + 1).unwrap_or(i64::MAX)
+                }),
                 per_workspace_limit: None,
+                offset: i64::try_from(start).unwrap_or(i64::MAX),
             };
             let hits = match intent_search::fts_match_expr(&query) {
                 Some(expr) => self.store.search_notes_fts(&expr, &options).await?,
@@ -20837,7 +20856,7 @@ impl WorkspaceApi for Services {
             // This single indexed query never streams, even for a large hard
             // scope. There is no lingering cancellation registration; cancelling
             // this completed request is the usual no-op success.
-            Ok(serde_json::json!({ "requestId": request_id, "matches": matches, "indexed": true }))
+            search_ops::note_page_reply(request_id, matches, start, limit, &scope)
         })
     }
 

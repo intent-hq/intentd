@@ -58,6 +58,112 @@ pub(crate) fn bound_inline_matches(matches: &mut Vec<Value>) -> bool {
     false
 }
 
+/// `search.notes` result budget: 480,000 serialized bytes (the shared
+/// per-page budget), so the frame stays under 512,000 bytes. Hits past it
+/// move to the next page through `nextToken`; none is dropped.
+pub(crate) const NOTE_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Fields a `search.notes` hit always keeps (the preview is already short);
+/// a single hit over the budget omits its `title` instead (`titleOmitted`,
+/// `titleBytes`; the full title is one `note.get` away).
+const NOTE_HIT_KEEP: &[&str] = &[
+    "noteId",
+    "preview",
+    "workspaceId",
+    "score",
+    "updatedAt",
+    "isArchived",
+    "workspaceArchived",
+];
+
+/// Digest of the request fields that select a `search.notes` result list
+/// (query, hard scope, preference, archive filter), so a `nextToken` cannot
+/// continue a different search and stays small for a long query.
+pub(crate) fn note_page_scope(
+    query: &str,
+    workspace_id: Option<&WorkspaceId>,
+    prefer_workspace_id: Option<&WorkspaceId>,
+    include_archived: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let key = serde_json::json!([
+        "search.notes",
+        query,
+        workspace_id.map(WorkspaceId::as_str),
+        prefer_workspace_id.map(WorkspaceId::as_str),
+        include_archived,
+    ]);
+    Sha256::digest(key.to_string().as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
+/// `nextToken` resuming a `search.notes` result list at ranked `offset`:
+/// versioned JSON scoped to the search ([`note_page_scope`]).
+fn encode_note_page_token(scope: &str, offset: usize) -> String {
+    serde_json::json!({ "version": 1, "method": "search.notes", "scope": scope, "offset": offset })
+        .to_string()
+}
+
+/// The ranked offset a `search.notes` `nextToken` resumes at; a malformed
+/// token or one minted for a different search is `InvalidParams`.
+pub(crate) fn decode_note_page_token(token: &str, scope: &str) -> Result<usize> {
+    let invalid = || Error::InvalidParams("search.notes: invalid or mismatched nextToken".into());
+    let cursor: Value = serde_json::from_str(token).map_err(|_| invalid())?;
+    if cursor.get("version") != Some(&Value::from(1))
+        || cursor.get("method").and_then(Value::as_str) != Some("search.notes")
+        || cursor.get("scope").and_then(Value::as_str) != Some(scope)
+    {
+        return Err(invalid());
+    }
+    cursor
+        .get("offset")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(invalid)
+}
+
+/// Build one `search.notes` page. `hits` are the ranked hits from `start`,
+/// fetched with `limit + 1` so a further page is detectable. The page keeps
+/// at most `limit` hits that fit [`NOTE_PAGE_BUDGET_BYTES`] (always at least
+/// one), and `nextToken` resumes right after the last kept hit (`null` when
+/// none remain).
+pub(crate) fn note_page_reply(
+    request_id: String,
+    hits: Vec<NoteMatch>,
+    start: usize,
+    limit: usize,
+    scope: &str,
+) -> Result<Value> {
+    let more_rows = hits.len() > limit;
+    let mut rows = crate::to_value_vec(hits.into_iter().take(limit).collect())?;
+    let envelope = serde_json::json!({
+        "requestId": request_id,
+        "matches": [],
+        "indexed": true,
+        "nextToken": encode_note_page_token(scope, usize::MAX),
+    });
+    let budget = NOTE_PAGE_BUDGET_BYTES.saturating_sub(intent_core::slim_body_size(&envelope));
+    for row in &mut rows {
+        crate::pagination::bound_row(row, budget.saturating_sub(2), NOTE_HIT_KEEP);
+    }
+    let kept = crate::pagination::fit_rows_to_budget(&rows, budget);
+    let cut = kept < rows.len();
+    rows.truncate(kept);
+    let next_token = (cut || more_rows).then(|| encode_note_page_token(scope, start + kept));
+    Ok(serde_json::json!({
+        "requestId": envelope["requestId"],
+        "matches": rows,
+        "indexed": true,
+        "nextToken": next_token,
+    }))
+}
+
 /// Resolve a workspace's search root (its worktree path), or `None` when the
 /// workspace has no usable path (remote/non-repo) — callers return an empty
 /// result in that case. When `caller_agent_id` is provided and the agent has a

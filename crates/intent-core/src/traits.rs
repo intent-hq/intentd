@@ -7917,7 +7917,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `search.notes`: ranked full-text search across visible workspaces, with
     /// optional hard scope and soft preference. Always returns inline
-    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
+    /// `{ requestId, matches: NoteMatch[], indexed: true, nextToken }`, one
+    /// page of at most `limit` hits (default 50, max 200) within 480,000
+    /// bytes; `nextToken` continues the ranked list (PROTOCOL §5.15).
+    #[expect(clippy::too_many_arguments)]
     fn search_notes(
         &self,
         query: String,
@@ -7926,6 +7929,7 @@ pub trait WorkspaceApi: Send + Sync {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             query,
@@ -7934,6 +7938,7 @@ pub trait WorkspaceApi: Send + Sync {
             limit,
             include_archived,
             request_id,
+            next_token,
         );
         Box::pin(async {
             Err(Error::Internal(
