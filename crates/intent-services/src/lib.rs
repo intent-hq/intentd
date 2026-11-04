@@ -39,13 +39,13 @@ use intent_core::{
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListPage, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
@@ -27834,6 +27834,37 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             store.list_workspace_tasks(&workspace_id, filter).await
+        })
+    }
+
+    fn task_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+        page: intent_core::note_read_bounds::PageRequest,
+    ) -> BoxFuture<'_, Result<TaskListPage>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let filter = match status.as_deref() {
+                Some(s) => Some(parse_task_status_strict(s)?),
+                None => None,
+            };
+            let (result, keys) = store
+                .list_workspace_tasks_keyed(&workspace_id, filter)
+                .await?;
+            let (tasks, next_token) = intent_core::note_read_bounds::task_list_page(
+                keys.into_iter().zip(result.tasks).collect(),
+                workspace_id.as_str(),
+                &page,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(|e| Error::InvalidParams(e.to_string()))?;
+            Ok(TaskListPage {
+                tasks,
+                stats: result.stats,
+                next_token,
+            })
         })
     }
 

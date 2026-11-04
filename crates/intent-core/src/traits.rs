@@ -23,10 +23,11 @@ use crate::model::{
     NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
     ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceListFilter, WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    TaskGetMyTaskResult, TaskListPage, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceListFilter, WorkspaceSetupStatus,
+    WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -1824,6 +1825,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Paged `task.list` (`limit` / `nextToken`, bounded reads): one page of
+    /// the [`Self::task_list`] rows in `(createdAt, id)` order under the
+    /// read budget, plus the same `stats` and the `nextToken` for the rest.
+    /// The `task.subscribe` seq-0 snapshot's token pages on through it.
+    fn task_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+        page: crate::note_read_bounds::PageRequest,
+    ) -> BoxFuture<'_, Result<TaskListPage>> {
+        let _ = (workspace_id, status, page);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_list_page not implemented".to_string(),
             ))
         })
     }

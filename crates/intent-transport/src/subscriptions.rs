@@ -2319,12 +2319,14 @@ pub(crate) fn note_presence_delta(note_id: &NoteId, event: &Event) -> Option<Val
 /// enriched with the additive `specLinked` flag (same semantics as
 /// `task.list`, §5.4); the returned link set seeds the forwarder's stateful
 /// [`task_delta`] mapper so later spec-body edits can be diffed against it
-/// (monorepo#2407). On a read error both degrade to empty rather than
-/// failing the subscription.
+/// (monorepo#2407). The snapshot is the first bounded page (§6.9 "Paged
+/// snapshots"): the third value is the `nextToken` the client passes to the
+/// paged `task.list` for the rest (`None` when the page holds every task).
+/// On a read error all degrade to empty rather than failing the subscription.
 pub(crate) async fn task_snapshot(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
-) -> (Value, HashSet<String>) {
+) -> (Value, HashSet<String>, Option<String>) {
     match api.list_notes(workspace_id).await {
         Ok(notes) => {
             let linked = notes
@@ -2332,14 +2334,20 @@ pub(crate) async fn task_snapshot(
                 .find(|n| n.id.as_str() == "spec")
                 .map(|n| extract_spec_task_ids(&n.content))
                 .unwrap_or_default();
-            let tasks: Vec<Value> = notes
+            let tasks: Vec<Note> = notes
                 .into_iter()
                 .filter(|n| n.metadata.task.is_some())
-                .filter_map(|n| task_note_value(n, &linked))
                 .collect();
-            (Value::Array(tasks), linked)
+            let (rows, next_token) = intent_core::note_read_bounds::task_snapshot_page(
+                tasks,
+                &linked,
+                workspace_id.as_str(),
+                intent_core::note_read_bounds::TASK_LIST_DEFAULT_LIMIT,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            );
+            (Value::Array(rows), linked, next_token)
         }
-        Err(_) => (Value::Array(Vec::new()), HashSet::new()),
+        Err(_) => (Value::Array(Vec::new()), HashSet::new(), None),
     }
 }
 

@@ -179,7 +179,7 @@ pub use model::{
     ScriptLastRun, ScriptMode, ScriptPurpose, ScriptRemoteAuthor, ScriptRunOutcome,
     ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript, SetupScriptGeneratedBy,
     TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskGetMyTaskResult, TaskListPage, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
     TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,

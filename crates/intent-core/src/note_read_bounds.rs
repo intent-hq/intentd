@@ -590,6 +590,116 @@ pub fn note_list_page(
     Ok((rows, next))
 }
 
+/// Paged `task.list` page size (tasks): default and hard maximum of
+/// `limit`. The `task.subscribe` seq-0 snapshot uses the default.
+pub const TASK_LIST_DEFAULT_LIMIT: usize = 200;
+pub const TASK_LIST_MAX_LIMIT: usize = 1_000;
+
+/// The `nextToken` scope of a workspace's task list. The paged `task.list`
+/// and the `task.subscribe` seq-0 snapshot share it, so a snapshot's token
+/// pages on through `task.list`.
+#[must_use]
+pub fn task_list_scope(workspace_id: &str) -> String {
+    format!("task.list:{workspace_id}")
+}
+
+/// One bounded page of a workspace's `task.list` rows: `(createdAt, task)`
+/// pairs in `(createdAt, id)` order after the `page` cursor, at most
+/// `page.limit` rows and `budget` bytes. Rows are the `WorkspaceTask`
+/// projection plus `workspaceId`. A first row over the budget has its
+/// `title` cut to fit (the full title is on `note.get`). Returns the rows
+/// and the `nextToken` (`None` on the last page).
+///
+/// # Errors
+/// `"invalid nextToken"` for a token not minted for this workspace's tasks.
+pub fn task_list_page(
+    mut tasks: Vec<(String, crate::model::WorkspaceTask)>,
+    workspace_id: &str,
+    page: &PageRequest,
+    budget: usize,
+) -> Result<(Vec<serde_json::Value>, Option<String>), &'static str> {
+    let scope = task_list_scope(workspace_id);
+    tasks.sort_by(|a, b| (&a.0, &a.1.id.0).cmp(&(&b.0, &b.1.id.0)));
+    if let Some(token) = page.next_token.as_deref() {
+        let (key, id) = parse_page_token(token, &scope)?;
+        tasks.retain(|(created, t)| (created, &t.id.0) > (&key, &id));
+    }
+    // Paged rows also carry `workspaceId`, so a client that pages a task
+    // snapshot can scope the rows like the note-shaped snapshot rows.
+    let stamp = |task: &crate::model::WorkspaceTask| {
+        let mut row = serde_json::to_value(task).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "workspaceId".to_string(),
+                serde_json::Value::String(workspace_id.to_string()),
+            );
+        }
+        row
+    };
+    let render = |(_, task): &(String, crate::model::WorkspaceTask)| stamp(task);
+    let shrink = |(_, task): &(String, crate::model::WorkspaceTask), room: usize| {
+        let mut task = task.clone();
+        let room = room.saturating_sub(escaped_str_len(workspace_id) + 16);
+        let over = json_len(&task).saturating_sub(room);
+        let mut keep = task.title.len().saturating_sub(over);
+        while !task.title.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        task.title.truncate(keep);
+        while json_len(&task) > room && !task.title.is_empty() {
+            task.title.pop();
+        }
+        stamp(&task)
+    };
+    let (rows, last) = take_page(&tasks, page.limit, budget, render, shrink);
+    let next = last.map(|idx| page_token(&scope, &tasks[idx].0, &tasks[idx].1.id.0));
+    Ok((rows, next))
+}
+
+/// The first page of the `task.subscribe` seq-0 snapshot: the workspace's
+/// task notes (callers pass only notes with task metadata) as full `Note`
+/// rows stamped with `specLinked` (`id` in `linked`), in `(createdAt, id)`
+/// order, at most `limit` rows and `budget` bytes. A first row over the
+/// budget has its `content` cut like `note.get` (`contentTruncated`). The
+/// token pages on through the paged `task.list` ([`task_list_page`]).
+#[must_use]
+pub fn task_snapshot_page<S: std::hash::BuildHasher>(
+    mut notes: Vec<crate::model::Note>,
+    linked: &std::collections::HashSet<String, S>,
+    workspace_id: &str,
+    limit: usize,
+    budget: usize,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    /// Bytes `,"specLinked":false` adds to a row.
+    const SPEC_LINKED_BYTES: usize = 20;
+    let scope = task_list_scope(workspace_id);
+    notes.sort_by(|a, b| (&a.created_at, &a.id.0).cmp(&(&b.created_at, &b.id.0)));
+    let stamp = |mut row: serde_json::Value, note: &crate::model::Note| {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "specLinked".to_string(),
+                serde_json::Value::Bool(linked.contains(note.id.as_str())),
+            );
+        }
+        row
+    };
+    let render = |note: &crate::model::Note| {
+        stamp(
+            serde_json::to_value(note).unwrap_or(serde_json::Value::Null),
+            note,
+        )
+    };
+    let shrink = |note: &crate::model::Note, room: usize| {
+        stamp(
+            note_row_within(note, room.saturating_sub(SPEC_LINKED_BYTES)),
+            note,
+        )
+    };
+    let (rows, last) = take_page(&notes, limit, budget, render, shrink);
+    let next = last.map(|idx| page_token(&scope, &notes[idx].created_at, &notes[idx].id.0));
+    (rows, next)
+}
+
 /// The `nextToken` scope of one note's comment threads, shared by
 /// `comment.list` and the `comment.subscribe` snapshot.
 #[must_use]
@@ -907,6 +1017,151 @@ mod tests {
             rev: 1,
             updated_at: created_at.to_string(),
         }
+    }
+
+    fn test_task_note(id: &str, created_at: &str, content: &str) -> crate::model::Note {
+        let mut note = test_note(id, created_at, content);
+        note.metadata.task = Some(crate::model::TaskMetadata::default());
+        note
+    }
+
+    fn test_task(id: &str, title: &str) -> crate::model::WorkspaceTask {
+        crate::model::WorkspaceTask {
+            id: crate::NoteId::from(id),
+            title: title.to_string(),
+            status: crate::model::TaskStatus::default(),
+            updated_at: "t".to_string(),
+            spec_linked: false,
+            parent_id: None,
+            depends_on: Vec::new(),
+            conflicts_with: Vec::new(),
+            unmet_depends_on: Vec::new(),
+        }
+    }
+
+    /// The task snapshot serves a bounded first page of full task-note rows
+    /// stamped with `specLinked`; its token walks the rest through the paged
+    /// `task.list`, and every task is served exactly once.
+    #[test]
+    fn task_snapshot_page_continues_through_task_list_pages() {
+        let big = "x".repeat(40_000);
+        let notes: Vec<_> = (0..60)
+            .map(|i| {
+                test_task_note(
+                    &format!("t{i:02}"),
+                    &format!("2026-01-01T00:00:{i:02}Z"),
+                    &big,
+                )
+            })
+            .collect();
+        let linked: std::collections::HashSet<String> = ["t03".to_string()].into();
+        let (rows, token) = task_snapshot_page(
+            notes.clone(),
+            &linked,
+            "ws-1",
+            TASK_LIST_DEFAULT_LIMIT,
+            NOTE_READ_BUDGET_BYTES,
+        );
+        assert!(
+            json_len(&rows) <= NOTE_READ_BUDGET_BYTES,
+            "page within the budget"
+        );
+        assert!(rows.len() < 60, "budget cuts the page");
+        assert_eq!(rows[0]["content"], big, "rows are whole notes");
+        assert_eq!(rows[3]["specLinked"], true);
+        assert_eq!(rows[4]["specLinked"], false);
+        let mut ids: Vec<String> = rows
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        let tasks: Vec<_> = notes
+            .iter()
+            .map(|n| (n.created_at.clone(), test_task(n.id.as_str(), &n.title)))
+            .collect();
+        let mut token = token;
+        while let Some(t) = token {
+            let page = PageRequest::new(
+                Some(7),
+                TASK_LIST_DEFAULT_LIMIT,
+                TASK_LIST_MAX_LIMIT,
+                Some(t),
+            );
+            let (rows, next) =
+                task_list_page(tasks.clone(), "ws-1", &page, NOTE_READ_BUDGET_BYTES).unwrap();
+            assert!(rows.len() <= 7);
+            ids.extend(rows.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            token = next;
+        }
+        let expected: Vec<String> = (0..60).map(|i| format!("t{i:02}")).collect();
+        assert_eq!(ids, expected, "every task once, in (createdAt, id) order");
+    }
+
+    #[test]
+    fn task_snapshot_cuts_an_oversized_first_task_note() {
+        let notes = vec![test_task_note(
+            "t1",
+            "2026-01-01T00:00:00Z",
+            &"y".repeat(700_000),
+        )];
+        let (rows, token) = task_snapshot_page(
+            notes,
+            &std::collections::HashSet::new(),
+            "ws-1",
+            TASK_LIST_DEFAULT_LIMIT,
+            NOTE_READ_BUDGET_BYTES,
+        );
+        assert_eq!(token, None);
+        assert!(json_len(&rows) <= NOTE_READ_BUDGET_BYTES);
+        assert_eq!(rows[0]["contentTruncated"], true);
+        assert_eq!(rows[0]["contentBytes"], 700_000);
+        assert_eq!(rows[0]["specLinked"], false);
+    }
+
+    #[test]
+    fn task_list_page_breaks_created_at_ties_by_id_and_rejects_foreign_tokens() {
+        let tasks = vec![
+            ("same".to_string(), test_task("b", "B")),
+            ("same".to_string(), test_task("a", "A")),
+            ("early".to_string(), test_task("c", "C")),
+        ];
+        let first = PageRequest::new(Some(2), TASK_LIST_DEFAULT_LIMIT, TASK_LIST_MAX_LIMIT, None);
+        let (rows, next) =
+            task_list_page(tasks.clone(), "ws-1", &first, NOTE_READ_BUDGET_BYTES).unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["c", "a"]);
+        let next = next.expect("one task left");
+        let page = PageRequest::new(
+            None,
+            TASK_LIST_DEFAULT_LIMIT,
+            TASK_LIST_MAX_LIMIT,
+            Some(next.clone()),
+        );
+        let (rows, last) =
+            task_list_page(tasks.clone(), "ws-1", &page, NOTE_READ_BUDGET_BYTES).unwrap();
+        assert_eq!(rows[0]["id"], "b");
+        assert_eq!(last, None);
+        assert_eq!(
+            task_list_page(tasks.clone(), "ws-2", &page, NOTE_READ_BUDGET_BYTES).unwrap_err(),
+            "invalid nextToken"
+        );
+        let note_token = PageRequest::new(
+            None,
+            TASK_LIST_DEFAULT_LIMIT,
+            TASK_LIST_MAX_LIMIT,
+            Some(page_token(&note_list_scope("ws-1"), "same", "a")),
+        );
+        assert!(task_list_page(tasks, "ws-1", &note_token, NOTE_READ_BUDGET_BYTES).is_err());
+    }
+
+    #[test]
+    fn task_list_page_cuts_an_oversized_title_to_the_budget() {
+        let tasks = vec![("k".to_string(), test_task("t", &"é".repeat(400_000)))];
+        let page = PageRequest::new(None, TASK_LIST_DEFAULT_LIMIT, TASK_LIST_MAX_LIMIT, None);
+        let (rows, next) = task_list_page(tasks, "ws-1", &page, NOTE_READ_BUDGET_BYTES).unwrap();
+        assert_eq!(next, None);
+        assert!(json_len(&rows) <= NOTE_READ_BUDGET_BYTES);
+        assert!(rows[0]["title"].as_str().unwrap().starts_with('é'));
+        assert_eq!(rows[0]["workspaceId"], "ws-1");
     }
 
     fn whole(content: &str) -> NoteLinePage {
