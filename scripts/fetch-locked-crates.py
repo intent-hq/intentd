@@ -9,7 +9,7 @@ by scripts/test-optional-intel-dist.py (runs 39394522385 and 39355882408).
 release-plz.yml's planning job also runs it before `release-plz release-pr`
 (online: `cargo package` re-resolves; run 40430078531), so crate downloads
 are cached with retries; scripts/test-release-plz-network.py keeps it there.
-ci.yml's `check`, `windows-cross-lint` and `coverage-changed` jobs run it
+ci.yml's `check`, `windows-cross-lint`, `macos-cross-lint` and `coverage-changed` jobs run it
 before their first build (PR jobs failed on the HTTP2 framing error, e.g. job
 126375150115); scripts/test-ci-cargo-network.py keeps it there.
 scripts/test-optional-intel-dist-network.py covers the retry handling offline.

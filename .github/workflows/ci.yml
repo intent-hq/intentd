@@ -959,6 +959,10 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: aarch64-apple-darwin
           components: clippy
+      # Download every locked crate once, retrying crates.io blips with
+      # backoff, before the first build (see the workflow env comment).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       # Production configuration first, as in the native `build` leg:
       # --all-targets enables test fixture features and skips their
       # production arms.
