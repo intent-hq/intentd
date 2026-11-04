@@ -1531,3 +1531,76 @@ async fn transfer_abort_mid_relay_cleans_both_sides() {
         "sandbox wip\n"
     );
 }
+
+/// intent-hq/intent#7738: a named workspace-wide discussion passes the
+/// export preflight, so archive construction must accept it too, and the
+/// name and history must survive import.
+#[intent_test_macros::daemon_test]
+async fn named_workspace_discussion_survives_transfer() {
+    use intent_core::discussion::{DiscussionAuthor, DiscussionTarget};
+    let a = TempDir::new("named-discussion-a");
+    let b = TempDir::new("named-discussion-b");
+    let source = fresh_services(&a.0, &a.0.join("workspaces"), &a.0.join("assets")).await;
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    let ws = WorkspaceId::new();
+    source
+        .store()
+        .insert_workspace(&intent_services::feature_api::tests::workspace(&ws))
+        .await
+        .unwrap();
+    let owner = source.store().get_primary_principal().await.unwrap();
+    let author = DiscussionAuthor {
+        principal_id: Some(owner.id.clone()),
+        agent_id: None,
+        login: owner.login.clone(),
+        display_name: owner.display_name.clone(),
+        avatar_url: owner.avatar_url.clone(),
+    };
+    let (sent, _) = source
+        .store()
+        .send_discussion_message(
+            &ws,
+            "first",
+            "named hello",
+            &author,
+            &DiscussionTarget {
+                create_conversation: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let conversation = sent.conversation.id.clone();
+    assert_ne!(conversation, "default");
+    source
+        .store()
+        .manage_discussion(&ws, &owner.id, &conversation, Some("Plans"))
+        .await
+        .unwrap();
+    assert!(!source.store().has_private_discussions(&ws).await.unwrap());
+
+    let exported = source.workspace_export_start_op(ws.clone()).await.unwrap();
+    let export = exported["exportId"].as_str().unwrap();
+    assert!(
+        wait_ready(&source, export).await,
+        "the archive guard must agree with the preflight"
+    );
+    let (size, sha, manifest) = ready_meta(&source, export);
+    relay(&source, &target, export, &manifest, size, &sha).await;
+
+    let imported = target
+        .store()
+        .discussion_conversation(&ws, &conversation)
+        .await
+        .unwrap();
+    assert_eq!(imported.kind, "workspace");
+    assert_eq!(imported.name.as_deref(), Some("Plans"));
+    let page = target
+        .store()
+        .list_discussion_messages_in(&ws, &conversation, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].body, "named hello");
+    assert!(!target.store().has_private_discussions(&ws).await.unwrap());
+}
