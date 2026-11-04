@@ -20674,13 +20674,16 @@ impl Services {
         candidates: &StartupResumeCandidates,
         agent_id: &AgentId,
     ) -> Result<()> {
-        if let Some(reason) = self.unattended_resume_hold(agent_id).await {
-            candidates.finished(agent_id);
-            return Err(Error::InvalidParams(format!(
+        // A held agent goes through the same release + notify path as a failed
+        // resume: the reservation hid its row from `agent.listInterrupted`, and
+        // the `startupRecoveryFailed` update is what makes a window that listed
+        // during the sweep show it again for manual resume.
+        let result = match self.unattended_resume_hold(agent_id).await {
+            Some(reason) => Err(Error::InvalidParams(format!(
                 "left pending for manual resume: {reason}"
-            )));
-        }
-        let result = self.resume_interrupted_agent(agent_id).await;
+            ))),
+            None => self.resume_interrupted_agent(agent_id).await,
+        };
         candidates.finished(agent_id);
         if result.is_err() {
             // Use the durable pending row's workspace, never a caller-supplied

@@ -4,13 +4,19 @@
 //! can only fail again, and that failure wakes the parent with a stale alert.
 //! The harness's default provider is `auggie`, the provider in the report.
 
+use std::time::Duration;
+
+use intent_core::events::AGENT_UPDATED;
 use intent_core::{now_iso, AgentId, WorkspaceId};
 use intent_store::Store;
 use serde_json::json;
+use tokio::time::timeout;
 
-use super::tests::{create_agent, setup, test_registry_with_default_provider, workspace, TempDb};
+use super::tests::{
+    create_agent, setup, setup_with_bus, test_registry_with_default_provider, workspace, TempDb,
+};
 use crate::test_support::fixtures::EnvGuard;
-use crate::Services;
+use crate::{Services, SubscriptionFilter};
 
 /// Restores the seeded verdict to cached-unknown on drop, so a panicking test
 /// cannot leave a hard-false verdict in the process-wide cache.
@@ -44,9 +50,13 @@ async fn user_messages(svc: &Services, id: &AgentId) -> usize {
 async fn startup_resume_leaves_signed_out_provider_pending() {
     let _env = EnvGuard::apply(&[]);
     let _reset = AuthSeedReset("auggie");
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = interrupted_agent(&svc, &ws).await;
     crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(false));
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
 
     let candidates = svc.prepare_startup_resume().await.unwrap();
     let err = svc
@@ -71,6 +81,18 @@ async fn startup_resume_leaves_signed_out_provider_pending() {
         0,
         "no continuation is delivered to the held agent"
     );
+    // The reservation hid the row from `agent.listInterrupted`; this update is
+    // what makes a window that listed during the sweep show it again.
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("the held agent must publish a recovery-failed update")
+    .expect("subscription closed");
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["startupRecoveryFailed"], json!(true));
 }
 
 #[intent_test_macros::daemon_test]
