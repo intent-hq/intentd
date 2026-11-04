@@ -52,6 +52,16 @@ env:
   # The bigmem heavy slots (intent-cache-bigmem, 30 GB or more): the only heavy
   # slots gh-linux-16x jobs overflow to; 0 sends that overflow to WarpBuild.
   LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
+  # crates.io resilience for every Cargo job, matching release-plz.yml.
+  # Multiplexed HTTP/2 downloads failed PR jobs with "curl failed: [16] Error
+  # in the HTTP2 framing layer" (derive_more in job 126375150115, serde_with
+  # in a `check` run on intentd#3021), each forcing a full re-run. One
+  # connection per transfer avoids the framing error, and cargo retries
+  # other spurious network errors up to 10 times. The heavy PR jobs also
+  # pre-fetch the locked crates with backoff (scripts/fetch-locked-crates.py);
+  # scripts/test-ci-cargo-network.py keeps both in place.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue. Each main push
@@ -557,6 +567,10 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
+      # Download every locked crate once, retrying crates.io blips with
+      # backoff, before the first build (see the workflow env comment).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - name: Format check
         run: cargo fmt --check
       - name: Acquire the shared transfer selection contract
@@ -863,6 +877,10 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-gnu
           components: clippy
+      # Retried crate download before the first build, as in `check`
+      # (`cargo fetch` without --target covers the Windows-only crates too).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       # Non-test production configuration first: --all-targets enables test
       # fixture features and skips their production arms (see the `build`
       # job's comment), so Clippy alone would miss those Windows errors.
@@ -1898,6 +1916,10 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Retried crate download before the first build, as in `check`.
+      - name: Fetch locked crates (retries crates.io network errors)
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
@@ -2250,6 +2272,7 @@ jobs:
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-release-host-network.py
           python3 -B scripts/test-release-plz-network.py
+          python3 -B scripts/test-ci-cargo-network.py
           python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
