@@ -3990,6 +3990,18 @@ fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedTo
     }
 }
 
+/// Apply [`crate::tool_block::fit_oversized_slim_row`] to one slim row and
+/// return its serialized size afterwards (unchanged rows are only measured).
+fn fit_slim_row(message: &mut AgentMessage, budget: usize) -> usize {
+    let bytes = crate::pagination::serialized_size(message);
+    match message.content.as_array_mut() {
+        Some(blocks) if bytes > budget => {
+            crate::tool_block::fit_oversized_slim_row(blocks, bytes, budget)
+        }
+        _ => bytes,
+    }
+}
+
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
 /// `projection: "slim"`) to one served message. The block bounding itself
 /// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
@@ -4994,9 +5006,13 @@ impl Services {
                 }
                 other => other,
             };
+            // Single-row bound (§5.5): a row that alone is over the budget
+            // is cut to fit first (text previews, then omitted-block stubs;
+            // see `fit_oversized_slim_row`), so the always-served anchor row
+            // can no longer push the frame past the read budget.
             let sizes: Vec<usize> = page
-                .iter()
-                .map(crate::pagination::serialized_size)
+                .iter_mut()
+                .map(|m| fit_slim_row(m, SLIM_PAGE_BUDGET_BYTES))
                 .collect();
             let (lo, hi) = crate::pagination::budget_page(&sizes, anchor, SLIM_PAGE_BUDGET_BYTES);
             if (lo, hi) != (0, page.len()) {
@@ -5045,6 +5061,7 @@ impl Services {
                     let mut row = project_served_message(row);
                     if projection == Some(ConversationProjection::Slim) {
                         row = apply_slim_projection(row, None);
+                        fit_slim_row(&mut row, SLIM_PAGE_BUDGET_BYTES);
                     }
                     let mut row = serde_json::to_value(row).expect("in-progress row serialize");
                     if let Some(obj) = row.as_object_mut() {
@@ -5087,6 +5104,25 @@ impl Services {
                         if lo > 0 {
                             arr.drain(..lo);
                             next_token = crate::pagination::remint_backward_token(page_start + lo);
+                        }
+                        // A protected anchor can keep persisted rows that,
+                        // with the live row, still exceed the budget: cut the
+                        // live row to the room that is left (§5.5 single-row
+                        // bound), so the frame stays within the read budget.
+                        if let Some((live_row, kept)) = arr.split_last_mut() {
+                            let kept_bytes: usize =
+                                kept.iter().map(crate::pagination::serialized_size).sum();
+                            let live_bytes = crate::pagination::serialized_size(live_row);
+                            if let Some(blocks) = live_row
+                                .get_mut("contentBlocks")
+                                .and_then(Value::as_array_mut)
+                            {
+                                crate::tool_block::fit_oversized_slim_row(
+                                    blocks,
+                                    live_bytes,
+                                    SLIM_PAGE_BUDGET_BYTES.saturating_sub(kept_bytes),
+                                );
+                            }
                         }
                     }
                 }
@@ -5139,11 +5175,16 @@ impl Services {
             .store
             .get_agent_message_thumbnails(&agent_id, &ids)
             .await?;
+        // Single-row bound (§5.5): progressive history frames each carry one
+        // row (and the seq-0 snapshot its newest rows), so a row that alone
+        // is over the page budget is cut to fit here, like the page read.
         let page: Vec<_> = page
             .into_iter()
             .map(|m| {
                 let thumbs = thumbnails.get(&m.id);
-                apply_slim_projection(m, thumbs)
+                let mut m = apply_slim_projection(m, thumbs);
+                fit_slim_row(&mut m, SLIM_PAGE_BUDGET_BYTES);
+                m
             })
             .collect();
         Ok(json!({"agentId":agent_id,"messages":page,"totalMessages":total}))
