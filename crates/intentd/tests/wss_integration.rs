@@ -19427,8 +19427,8 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
         "metadata is projected to the classification fields"
     );
     assert!(
-        result.get("nextToken").is_none(),
-        "unpaged reads keep the pre-paging shape: {result}"
+        result["nextToken"].is_null() && result.get("nextToken").is_some(),
+        "default reads are paged; a complete page ends with nextToken null: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -19568,8 +19568,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
         ),
     )
     .await;
+    assert_eq!(
+        null_token["result"]["total"], 3,
+        "a null nextToken reads as absent (the newest page): {null_token}"
+    );
     assert!(
-        null_token["result"].get("nextToken").is_none(),
+        null_token["result"]["nextToken"].is_null(),
         "a null nextToken reads as absent: {null_token}"
     );
 

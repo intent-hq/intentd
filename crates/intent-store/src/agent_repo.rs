@@ -7125,9 +7125,11 @@ impl Store {
                 }
                 None => None,
             };
-            seqs.push(col::<i64>(row, "seq")?);
+            let seq = col::<i64>(row, "seq")?;
+            seqs.push(seq);
             items.push(UserMessageIndexItem {
                 qualified_monitor: col(row, "qualified_monitor")?,
+                seq,
                 id: col(row, "id")?,
                 preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
                 metadata,
@@ -7823,6 +7825,9 @@ pub struct UserMessageIndexItem {
     /// Whole-envelope classification only, never authorization. Kept internal
     /// to Store consumers; public index DTOs must not serialize this field.
     pub qualified_monitor: bool,
+    /// The row's transcript `seq`: the cursor a byte-trimmed page resumes
+    /// below (`agent.listUserMessages` `nextToken`).
+    pub seq: i64,
     pub id: String,
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
