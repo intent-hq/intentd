@@ -580,6 +580,7 @@ fn push_processes(repository: &Path, socket: &Path) -> Vec<String> {
 }
 
 /// Wait until no process of a push is left.
+#[cfg_attr(not(target_os = "linux"), expect(clippy::unused_async))] // only the linux arm awaits
 async fn no_push_processes(repository: &Path, socket: &Path) {
     #[cfg(target_os = "linux")]
     tokio::time::timeout(wait(), async {
