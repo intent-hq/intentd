@@ -443,6 +443,78 @@ fn build_proposal_resource_item(proposal: &Value) -> Value {
     })
 }
 
+/// Bound one slim conversation row that alone is larger than `budget`
+/// serialized bytes (PROTOCOL §5.5 single-row bound). `row_bytes` is the
+/// row's current serialized size; the return value is its size afterwards.
+/// A row at or under budget is left byte-identical, so normal rows and old
+/// apps never see the markers below.
+///
+/// Two steps, each only while the row is still over budget:
+///
+/// 1. Every `text` / `thinking` block whose `text` is longer than
+///    [`SLIM_PROJECTION_BUDGET_BYTES`] keeps a prefix of that many bytes (cut
+///    on a char boundary) and gains `textTruncated: true` plus `textBytes`
+///    (the full UTF-8 length) — the same shape as the tool body caps.
+/// 2. If the block count alone still overflows, blocks are replaced from
+///    the newest (last) one backwards by `{ id, type, bodyOmitted: true }`
+///    stubs until the row fits, so the stubs form one contiguous tail run.
+///
+/// Block ids and order are kept, so every cut body stays reachable through
+/// `agent.getMessageBlock` (persisted rows and the in-flight live turn
+/// alike). A row made only of stubs can in theory still exceed the budget
+/// (tens of thousands of blocks); it then serves as all stubs.
+pub fn fit_oversized_slim_row(blocks: &mut [Value], row_bytes: usize, budget: usize) -> usize {
+    if row_bytes <= budget {
+        return row_bytes;
+    }
+    let mut size = row_bytes;
+    for block in blocks.iter_mut() {
+        if !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("text" | "thinking")
+        ) || block.get("textTruncated").is_some()
+        {
+            continue;
+        }
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if text.len() <= SLIM_PROJECTION_BUDGET_BYTES {
+            continue;
+        }
+        let total = text.len();
+        let cut = (0..=SLIM_PROJECTION_BUDGET_BYTES)
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        let preview = text[..cut].to_string();
+        let before = crate::pagination::serialized_size(block);
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("text".into(), Value::String(preview));
+            obj.insert("textTruncated".into(), Value::Bool(true));
+            obj.insert("textBytes".into(), json!(total));
+        }
+        size = size - before + crate::pagination::serialized_size(block);
+    }
+    for block in blocks.iter_mut().rev() {
+        if size <= budget {
+            break;
+        }
+        let before = crate::pagination::serialized_size(block);
+        let mut stub = Map::new();
+        if let Some(id) = block.get("id") {
+            stub.insert("id".into(), id.clone());
+        }
+        if let Some(kind) = block.get("type") {
+            stub.insert("type".into(), kind.clone());
+        }
+        stub.insert("bodyOmitted".into(), Value::Bool(true));
+        *block = Value::Object(stub);
+        size = size - before + crate::pagination::serialized_size(block);
+    }
+    size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,5 +1039,90 @@ mod tests {
         // Structural corruption outside strings (unquoted garbage) as well.
         let garbage = "{\"ok\": true, \"proposal\": not json at\nall}";
         assert!(lift_proposal_resource(&json!({ "output": garbage })).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fit_oversized_slim_row_tests {
+    use super::*;
+    use crate::pagination::serialized_size;
+
+    fn row(blocks: &[Value]) -> Value {
+        json!({ "id": "m1", "role": "assistant", "contentBlocks": blocks })
+    }
+
+    fn fit(r: &mut Value, budget: usize) -> usize {
+        let bytes = serialized_size(r);
+        let blocks = r["contentBlocks"].as_array_mut().unwrap();
+        fit_oversized_slim_row(blocks, bytes, budget)
+    }
+
+    #[test]
+    fn a_row_at_or_under_budget_is_untouched() {
+        let mut r = row(&[json!({ "id": "m1:0", "type": "text", "text": "x".repeat(10_000) })]);
+        let before = r.clone();
+        let size = serialized_size(&r);
+        assert_eq!(fit(&mut r, size), size);
+        assert_eq!(r, before);
+    }
+
+    #[test]
+    fn oversized_text_and_thinking_become_previews_with_markers() {
+        let text = "é".repeat(300_000);
+        let mut r = row(&[
+            json!({ "id": "m1:0", "type": "thinking", "text": text }),
+            json!({ "id": "m1:1", "type": "text", "text": text }),
+            json!({ "id": "m1:2", "type": "text", "text": "short" }),
+        ]);
+        let size = fit(&mut r, 480_000);
+        assert_eq!(size, serialized_size(&r), "returned size is exact");
+        assert!(size <= 480_000);
+        for b in &r["contentBlocks"].as_array().unwrap()[..2] {
+            let preview = b["text"].as_str().unwrap();
+            assert!(preview.len() <= SLIM_PROJECTION_BUDGET_BYTES);
+            assert!(
+                text.starts_with(preview),
+                "preview is a prefix on a char boundary"
+            );
+            assert_eq!(b["textTruncated"], true);
+            assert_eq!(b["textBytes"], text.len());
+        }
+        assert_eq!(
+            r["contentBlocks"][2],
+            json!({ "id": "m1:2", "type": "text", "text": "short" })
+        );
+    }
+
+    #[test]
+    fn block_count_overflow_stubs_a_contiguous_newest_tail() {
+        let body = "o".repeat(SLIM_PROJECTION_BUDGET_BYTES);
+        let blocks: Vec<Value> = (0..400)
+            .map(|i| {
+                json!({ "id": format!("m1:{i}"), "type": "tool_result",
+                "tool_use_id": format!("tc-{i}"), "output": body, "is_error": false })
+            })
+            .collect();
+        let mut r = row(&blocks);
+        let size = fit(&mut r, 480_000);
+        assert_eq!(size, serialized_size(&r));
+        assert!(size <= 480_000, "row fits: {size}");
+        let out = r["contentBlocks"].as_array().unwrap();
+        assert_eq!(out.len(), 400, "every block keeps its slot");
+        let first_stub = out
+            .iter()
+            .position(|b| b["bodyOmitted"] == true)
+            .expect("some stubs");
+        assert!(first_stub > 0, "oldest blocks keep their bodies");
+        for (i, b) in out.iter().enumerate() {
+            assert_eq!(b["id"], format!("m1:{i}"), "ids and order kept");
+            if i >= first_stub {
+                assert_eq!(
+                    b,
+                    &json!({ "id": format!("m1:{i}"), "type": "tool_result", "bodyOmitted": true })
+                );
+            } else {
+                assert_eq!(b["output"], body);
+            }
+        }
     }
 }

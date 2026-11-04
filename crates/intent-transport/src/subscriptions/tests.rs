@@ -2307,12 +2307,21 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         arr.len()
     );
     let page_bytes = serde_json::to_string(arr).unwrap().len();
-    // One-row floor aside, the kept page hugs the budget: the live turn
-    // (~0.9MB slim) anchors, so allow budget + one row's slack.
+    // The live turn (~0.9MB slim) alone is over the budget, so it is cut to
+    // fit (§5.5 single-row bound): its newest blocks become contiguous
+    // `bodyOmitted` stubs that keep their ids, and the page fits the budget.
     assert!(
-        page_bytes <= SLIM_PAGE_BUDGET_BYTES * 2,
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 64,
         "merged page must be re-budgeted, got {page_bytes} bytes"
     );
+    let live_out = arr.last().unwrap()["contentBlocks"].as_array().unwrap();
+    assert_eq!(live_out.len(), 400, "every live block keeps its slot");
+    let first_stub = live_out
+        .iter()
+        .position(|b| b["bodyOmitted"] == true)
+        .expect("stubs");
+    assert!(live_out[first_stub..].iter().enumerate().all(|(i, b)| *b
+        == json!({ "id": format!("msg-live:{}", first_stub + i), "type": "tool_result", "bodyOmitted": true })));
     // The continuation cursor was re-minted at the oldest KEPT row's seq, so
     // `agent.getConversation {{ nextToken }}` resumes at the first evicted row.
     assert_eq!(snapshot["truncated"], true);
@@ -2435,7 +2444,8 @@ fn twenty_message_live_overlay_caps_full_and_slim_pages_without_losing_history()
 }
 
 /// Byte eviction can shorten a count-bounded page further. An oversized live
-/// anchor still serves alone, and every displaced persisted row is reachable.
+/// anchor is cut to fit (a text preview), so it no longer crowds the page
+/// out, and every displaced persisted row is reachable.
 #[test]
 fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
     for limit in [1, 5, 20, 50] {
@@ -2457,21 +2467,23 @@ fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
                 limit,
             );
             let rows = snapshot["messages"].as_array().unwrap();
-            assert_eq!(
-                rows.len(),
-                if live_bytes > SLIM_PAGE_BUDGET_BYTES {
-                    1
-                } else {
-                    limit.min(4)
-                }
-            );
+            let oversized = live_bytes > SLIM_PAGE_BUDGET_BYTES;
+            // An oversized live row is cut to a ~2KB preview, so all five
+            // persisted rows fit beside it; a 200 KiB one leaves room for 3.
+            assert_eq!(rows.len(), limit.min(if oversized { 6 } else { 4 }));
             assert_eq!(rows.last().unwrap()["id"], "live");
+            let live_block = &rows.last().unwrap()["contentBlocks"][0];
+            assert_eq!(live_block["textTruncated"] == true, oversized);
             let bytes: usize = rows
                 .iter()
                 .map(intent_services::pagination::serialized_size)
                 .sum();
-            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES || rows.len() == 1);
+            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES);
             assert_eq!(snapshot["totalMessages"], 6);
+            if rows.len() == 6 {
+                assert_eq!(snapshot["truncated"], false, "nothing was evicted");
+                continue;
+            }
             assert_eq!(snapshot["truncated"], true);
             let older = intent_services::pagination::page_window(
                 5,

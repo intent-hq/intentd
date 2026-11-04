@@ -1354,8 +1354,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
 /// weigh MBs on its own — added beside an at-budget persisted page, the seq-0
 /// frame would blow the budget the read path just enforced. The live turn is
-/// the newest row and the page's anchor (always kept, even alone over
-/// budget); oldest persisted rows are evicted until the page fits, with
+/// the newest row and the page's anchor (always kept; if it alone is over
+/// budget it is cut to fit, see `fit_oversized_slim_row`); oldest persisted rows are evicted until the page fits, with
 /// `truncated`/`nextToken` re-minted at the first evicted row (row `seq` is
 /// contiguous from 0, so a row's seq IS its global oldest-indexed position)
 /// so the client pulls the evicted rows via `agent.getConversation` exactly
@@ -1442,9 +1442,24 @@ fn rebudget_merged_page(
     };
     let mut lo = arr.len().saturating_sub(limit);
     if projection == Some(ConversationProjection::Slim) {
+        // Single-row bound (§5.5): a row that alone is over the budget — in
+        // practice the live turn — is cut to fit first, so the always-kept
+        // anchor can no longer push the seq-0 frame past the read budget.
         let sizes: Vec<usize> = arr[lo..]
-            .iter()
-            .map(intent_services::pagination::serialized_size)
+            .iter_mut()
+            .map(|row| {
+                let bytes = intent_services::pagination::serialized_size(row);
+                match row.get_mut("contentBlocks").and_then(Value::as_array_mut) {
+                    Some(blocks) if bytes > SLIM_PAGE_BUDGET_BYTES => {
+                        intent_services::tool_block::fit_oversized_slim_row(
+                            blocks,
+                            bytes,
+                            SLIM_PAGE_BUDGET_BYTES,
+                        )
+                    }
+                    _ => bytes,
+                }
+            })
             .collect();
         let (byte_lo, _hi) = intent_services::pagination::budget_page(
             &sizes,

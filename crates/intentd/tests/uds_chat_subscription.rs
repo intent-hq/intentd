@@ -1918,3 +1918,140 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Single-row bound on the live paths (§5.5): mid-turn, the in-flight
+/// assistant message carries ~400 capped tool blocks (alone over the page
+/// budget) beside persisted rows that already fill a page. The seq-0
+/// `chat.subscribe` push and an `includeInProgress` `agent.getConversation`
+/// page both stay within the 500 KiB read budget: the live row is cut to fit
+/// with contiguous newest-last `bodyOmitted` stubs that keep their ids.
+#[intent_test_macros::daemon_test]
+async fn chat_live_turn_over_budget_is_cut_to_fit_read_payload_budget() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    let store = bus.store();
+    let text = "p".repeat(100 * 1024);
+    for i in 0..6 {
+        store
+            .append_agent_message(
+                &agent,
+                "user",
+                &json!([{ "type": "text", "id": format!("p{i}"), "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append persisted row");
+    }
+    let mid = Uuid::now_v7().to_string();
+    let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+    let live_blocks: Vec<Value> = (0..400)
+        .map(|i| {
+            json!({ "type": "tool_result", "id": format!("{mid}:{i}"),
+                "tool_use_id": format!("tc-{i}"), "output": capped, "is_error": false })
+        })
+        .collect();
+    services.set_live_turn(&agent, &mid, live_blocks);
+    services.set_test_busy(&agent, true);
+
+    let check_live_row = |label: &str, row: &Value| {
+        let blocks = row["contentBlocks"].as_array().expect("live blocks");
+        assert_eq!(
+            blocks.len(),
+            400,
+            "{label}: every live block keeps its slot"
+        );
+        let first_stub = blocks
+            .iter()
+            .position(|b| b["bodyOmitted"] == true)
+            .unwrap_or_else(|| panic!("{label}: live row is cut to fit"));
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b["id"], format!("{mid}:{i}"), "{label}: ids and order kept");
+            assert_eq!(
+                b["bodyOmitted"] == true,
+                i >= first_stub,
+                "{label}: one stub tail run"
+            );
+        }
+    };
+
+    for (id, extra) in [
+        (1, json!({})),
+        (2, json!({ "deltaEncoding": "incremental" })),
+    ] {
+        let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+        let mut sub_reader = tokio::io::BufReader::new(sub_read);
+        let mut params = json!({ "agentId": agent_id, "limit": 200 });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        send(
+            &mut sub_write,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": id, "method": "chat.subscribe", "params": params
+            }))
+            .unwrap(),
+        )
+        .await;
+        let resp = read_json(&mut sub_reader).await;
+        assert_eq!(resp["id"], id);
+        let snap = read_json(&mut sub_reader).await;
+        assert_eq!(snap["params"]["kind"], "snapshot");
+        let frame = serde_json::to_string(&snap).unwrap().len();
+        assert!(
+            frame <= READ_PAYLOAD_BUDGET_BYTES,
+            "seq-0 push {frame} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}"
+        );
+        let messages = snap["params"]["snapshot"]["messages"].as_array().unwrap();
+        let live = messages.last().unwrap();
+        assert_eq!(live["id"], mid.as_str());
+        check_live_row("seq-0 snapshot", live);
+    }
+
+    send(
+        &mut rpc_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 12, "method": "agent.getConversation",
+            "params": { "agentId": agent_id, "limit": 10000, "includeInProgress": true }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut rpc_reader).await;
+    let frame = serde_json::to_string(&resp).unwrap().len();
+    assert!(
+        frame <= READ_PAYLOAD_BUDGET_BYTES,
+        "includeInProgress page {frame} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}"
+    );
+    let messages = resp["result"]["messages"].as_array().unwrap();
+    let live = messages.last().unwrap();
+    assert_eq!(live["inProgress"], true);
+    check_live_row("includeInProgress page", live);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

@@ -3272,15 +3272,13 @@ pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 /// to multiple MB (observed: 3,672 capped blocks → 2.87MB frame). A slim
 /// `agent.getConversation` page (and the seq-0 chat snapshot that reuses it)
 /// stops early once its cumulative serialized size would exceed this budget,
-/// re-minting the continuation token at the first excluded message — so the
-/// worst-case slim frame is this budget plus one message's slim size. That
-/// stays under the transport's 1 MiB large-frame warn for typical messages,
-/// but is NOT a hard bound: per-message slim size is unbounded (blocks are
-/// capped individually, block count is not), so a single block-heavy message
-/// can exceed the warn alone — which the at-least-one-message floor accepts
-/// by design, degrading to one whole message per page rather than an
-/// unpageable transcript. Serve-time only; the full (absent-projection) read
-/// is never budgeted.
+/// re-minting the continuation token at the first excluded message. The page
+/// always serves at least one message; a message that alone is over budget
+/// is cut to fit (`intent_services::tool_block::fit_oversized_slim_row`:
+/// text previews with `textTruncated`, then `bodyOmitted` block stubs, all
+/// still readable through `agent.getMessageBlock`), so the page stays within
+/// the budget. Serve-time only; the full (absent-projection) read is never
+/// budgeted.
 ///
 /// Sized at 480,000 bytes like the other bounded reads, so a whole page's
 /// JSON-RPC frame — the messages plus their separators, the result fields

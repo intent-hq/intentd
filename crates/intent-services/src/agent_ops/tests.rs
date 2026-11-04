@@ -7047,8 +7047,8 @@ async fn get_conversation_in_progress_tail_rebudgets_slim_page() {
     assert_eq!(tail["inProgress"], true, "live row always serves (anchor)");
     let page_bytes = serde_json::to_string(&res["messages"]).unwrap().len();
     assert!(
-        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
-        "merged page bounded by budget + one message: {page_bytes}"
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 1024,
+        "merged page bounded by the budget (plus separators): {page_bytes}"
     );
     // Rows evicted by the re-budget stay reachable: the re-minted token
     // resumes at the first evicted row and a token walk reconstructs all 6
@@ -8319,8 +8319,8 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
         assert!(!msgs.is_empty(), "budgeted pages are never empty");
         let page_bytes = serde_json::to_string(&page["messages"]).unwrap().len();
         assert!(
-            page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
-            "page bounded by budget + one message: {page_bytes}"
+            page_bytes <= SLIM_PAGE_BUDGET_BYTES + 1024,
+            "page bounded by the budget (plus separators): {page_bytes}"
         );
         // Transcript-wide semantics are untouched by the trim: totals count
         // the whole transcript and `truncated` still means "older history
@@ -8437,12 +8437,17 @@ async fn get_conversation_slim_budget_counts_attached_author_bytes() {
     assert_eq!(dedup.len(), 12, "token walk has no duplicates");
 }
 
-/// Slim page budget edge: a single message over the whole page budget still
-/// serves alone (never an empty page, no infinite token loop), and the walk
-/// continues past it into older history.
+/// Slim page budget edge (§5.5 single-row bound): a message whose text alone
+/// is over the whole page budget is served cut down to fit — a preview with
+/// `textTruncated` / `textBytes` — instead of over budget, so it shares the
+/// page with older rows, and `agent.getMessageBlock` still rebuilds the full
+/// text byte for byte.
 #[tokio::test]
-async fn get_conversation_slim_single_overbudget_message_still_serves() {
-    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+async fn get_conversation_slim_single_overbudget_message_is_cut_to_fit() {
+    use intent_core::{
+        ConversationProjection, MessageBlockPage, SLIM_PAGE_BUDGET_BYTES,
+        SLIM_PROJECTION_BUDGET_BYTES,
+    };
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "BigOne").await;
     let small = svc
@@ -8480,27 +8485,46 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
         )
         .await
         .expect("page 1");
+    assert!(
+        serde_json::to_string(&p1).unwrap().len() <= SLIM_PAGE_BUDGET_BYTES,
+        "the page fits the budget"
+    );
     let m1 = p1["messages"].as_array().unwrap();
-    assert_eq!(m1.len(), 1, "over-budget message serves alone");
-    assert_eq!(m1[0]["id"], huge.id.as_str());
-    let t = p1["nextToken"].as_str().expect("older rows remain");
-    let p2 = svc
-        .agent_get_conversation_op(
-            id,
-            None,
-            None,
-            Some(t.to_string()),
-            None,
-            None,
-            Some(ConversationProjection::Slim),
-            false,
-        )
-        .await
-        .expect("page 2");
-    let m2 = p2["messages"].as_array().unwrap();
-    assert_eq!(m2.len(), 1);
-    assert_eq!(m2[0]["id"], small.id.as_str());
-    assert!(p2["nextToken"].is_null());
+    assert_eq!(m1.len(), 2, "the cut row no longer crowds out older rows");
+    assert_eq!(m1[0]["id"], small.id.as_str());
+    assert_eq!(m1[1]["id"], huge.id.as_str());
+    let block = &m1[1]["contentBlocks"][0];
+    assert_eq!(block["textTruncated"], true);
+    assert_eq!(block["textBytes"], json!(huge_text.len()));
+    assert_eq!(
+        block["text"].as_str().unwrap(),
+        &huge_text[..SLIM_PROJECTION_BUDGET_BYTES]
+    );
+    assert!(p1["nextToken"].is_null());
+
+    let mut joined = String::new();
+    let mut offset = None;
+    loop {
+        let r = svc
+            .agent_get_message_block_page_op(
+                id.clone(),
+                huge.id.clone(),
+                "h".to_string(),
+                Some(ws.clone()),
+                MessageBlockPage {
+                    offset,
+                    max_bytes: None,
+                },
+            )
+            .await
+            .expect("block page");
+        joined.push_str(r["block"]["text"].as_str().expect("text slice"));
+        match r["nextOffset"].as_u64() {
+            Some(n) => offset = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(joined, huge_text, "getMessageBlock rebuilds the full text");
 }
 
 /// Slim page budget on the seek path (§5.5): an `aroundMessageId` page keeps
