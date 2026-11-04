@@ -66,6 +66,8 @@ jobs:
         run: |
           ./scripts/test-release-cache-smoke.py
           ./scripts/test-changed-tests-stdin.py
+      - name: Workflow lint self-test
+        run: REQUIRE_ACTIONLINT=1 ./scripts/test-lint-workflows.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@1.2.3
@@ -87,14 +89,18 @@ class RunnerTests(unittest.TestCase):
             (self.bin / tool).symlink_to(shutil.which(tool) or sys.executable)
         self.write('dist-workspace.toml', '[dist]\ncargo-dist-version = "0.32.0"\n')
         self.write('scripts/setup-sccache.py', 'VERSION = "0.17.0"\n')
+        self.write('scripts/lint-workflows.sh', 'ACTIONLINT_VERSION="1.7.12"\n')
         self.write('.github/workflows/ci.yml', CI)
         for name, status in [('test-pass.sh', 0), ('test-fail.sh', 3), ('test-dist.sh', 0),
                              ('test-plz.sh', 0), ('test-release-cache-smoke.py', 0),
-                             ('test-changed-tests-stdin.py', 0), ('test-commented.sh', 9)]:
+                             ('test-changed-tests-stdin.py', 0), ('test-commented.sh', 9),
+                             ('test-lint-workflows.sh', 0)]:
             self.script(f'scripts/{name}', f'echo ran {name}\nexit {status}')
         self.tool('dist', 'cargo-dist 0.32.0')
         self.tool('sccache', 'sccache 0.17.0')
         self.tool('release-plz', 'release-plz 1.2.3')
+        self.tool('actionlint', '1.7.12')
+        self.tool('shellcheck', 'ShellCheck - shell script analysis tool\nversion: 0.10.0')
 
     def write(self, path, text):
         (self.root / path).write_text(text)
@@ -149,9 +155,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         ran = [line.split()[1] for line in result.stdout.splitlines() if line.startswith('ran ')]
         self.assertEqual(ran, ['test-pass.sh', 'test-fail.sh', 'test-dist.sh', 'test-release-cache-smoke.py',
-                               'test-changed-tests-stdin.py', 'test-plz.sh'])
+                               'test-changed-tests-stdin.py', 'test-lint-workflows.sh', 'test-plz.sh'])
         self.assertIn('FAILED:  test-fail.sh (exit 3)', result.stdout)
-        self.assertIn('5 passed, 0 skipped, 1 failed', result.stdout)
+        self.assertIn('6 passed, 0 skipped, 1 failed', result.stdout)
 
     def test_list_drops_setup_lines_comments_and_assignments(self):
         result = self.run_runner('--list')
@@ -189,6 +195,29 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('ran test-release-cache-smoke.py', result.stdout)
         self.assertIn('ran test-changed-tests-stdin.py', result.stdout)
         self.assertIn('1 skipped', result.stdout)
+
+    def test_workflow_lint_self_test_runs_with_the_pinned_tools(self):
+        self.script('scripts/test-lint-workflows.sh', 'echo "ran test-lint-workflows.sh REQUIRE=$REQUIRE_ACTIONLINT"')
+        result = self.run_runner()
+        self.assertIn('ran test-lint-workflows.sh REQUIRE=1', result.stdout)
+
+    def test_workflow_lint_self_test_skips_without_the_pinned_tools(self):
+        cases = {
+            'off-pin actionlint': (lambda: self.tool('actionlint', '1.7.7'),
+                                   'needs actionlint 1.7.12 and shellcheck (actionlint found 1.7.7)'),
+            'no actionlint': (lambda: (self.bin / 'actionlint').unlink(),
+                              'needs actionlint 1.7.12 and shellcheck (actionlint not on PATH)'),
+            'no shellcheck': (lambda: (self.bin / 'shellcheck').unlink(),
+                              'needs actionlint 1.7.12 and shellcheck (shellcheck not on PATH)'),
+        }
+        for name, (break_host, reason) in cases.items():
+            with self.subTest(case=name):
+                self.tool('actionlint', '1.7.12')
+                self.tool('shellcheck', 'version: 0.10.0')
+                break_host()
+                result = self.run_runner('--list')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'SKIP test-lint-workflows.sh: {reason}', result.stdout)
 
     def test_sccache_bin_overrides_path_and_newer_sccache_runs(self):
         newer = self.temp / 'sccache-new'

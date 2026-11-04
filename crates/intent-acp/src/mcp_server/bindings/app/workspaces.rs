@@ -1062,8 +1062,12 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .or(workspace.repository_path.as_deref())
         .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkArchive",
             "ids": [id]
@@ -1110,8 +1114,12 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .or(workspace.repository_path.as_deref())
         .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkDelete",
             "ids": [id]
@@ -1183,8 +1191,12 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
     }
 
     let count = ids.len();
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkArchive",
             "ids": ids
@@ -1249,8 +1261,12 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
     }
 
     let count = ids.len();
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkDelete",
             "ids": ids
@@ -2956,6 +2972,42 @@ mod tests {
             preview.get("title").unwrap().as_str().unwrap(),
             "Archive 1 workspace"
         );
+    }
+
+    /// Every bulk-op card gets its own identity: single-workspace archive and
+    /// delete cards all share a title ("Archive 1 workspace"), so a later card
+    /// for another workspace inherited the earlier card's applied state
+    /// (intent-hq/intent#8560).
+    #[tokio::test]
+    async fn test_bulk_op_proposals_stamp_unique_apply_tool_call_ids() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "One"));
+            workspaces.push(make_workspace("ws-2", "Two"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief_id = WorkspaceId::chief();
+        let calls = [
+            ("archive", json!({ "id": "ws-1" })),
+            ("archive", json!({ "id": "ws-2" })),
+            ("delete", json!({ "id": "ws-1" })),
+            ("bulkArchive", json!({ "ids": ["ws-1"] })),
+            ("bulkDelete", json!({ "ids": ["ws-1"] })),
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for (method, args) in calls {
+            let result = dispatch(&api, &chief_id, None, method, &args)
+                .await
+                .unwrap_or_else(|e| panic!("{method}: {e}"));
+            let proposal = &result["proposal"];
+            let id = proposal["applyToolCallId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method}: missing applyToolCallId"));
+            assert!(id.starts_with("bulk-op-"), "{method}: {id}");
+            assert!(ids.insert(id.to_string()), "{method}: duplicate id {id}");
+            assert!(super::super::proposal::is_valid_proposal(proposal));
+        }
     }
 
     #[tokio::test]

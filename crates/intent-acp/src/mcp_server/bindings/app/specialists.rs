@@ -329,8 +329,12 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         "Review and edit the specialist fields before applying.".to_string()
     };
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "specialist-edit",
+        "applyToolCallId": format!("specialist-edit-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": operation,
             "id": draft_id,
@@ -652,6 +656,33 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("Edit specialist:"));
+    }
+
+    /// Two edits of the same specialist share kind and title, so without a
+    /// per-card `applyToolCallId` the second card took the first card's
+    /// applied state and Undo (intent-hq/intent#8560).
+    #[tokio::test]
+    async fn test_propose_stamps_unique_apply_tool_call_id() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let args = json!({ "action": "edit", "id": "implementor", "prompt": "New prompt" });
+        let first = dispatch(&api, &chief_id, "propose", &args).await.unwrap();
+        let second = dispatch(&api, &chief_id, "propose", &args).await.unwrap();
+        let first_id = first["proposal"]["applyToolCallId"]
+            .as_str()
+            .expect("first id");
+        let second_id = second["proposal"]["applyToolCallId"]
+            .as_str()
+            .expect("second id");
+        assert!(first_id.starts_with("specialist-edit-"), "{first_id}");
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            first["proposal"]["preview"]["title"],
+            second["proposal"]["preview"]["title"]
+        );
+        assert!(super::super::proposal::is_valid_proposal(
+            &first["proposal"]
+        ));
     }
 
     #[tokio::test]

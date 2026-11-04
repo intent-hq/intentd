@@ -9,7 +9,7 @@
 # carrying this repo's .github/actionlint.yaml: a broken `run:` block must
 # fail, the configured runner labels must pass, and each ignore must stay
 # scoped. They are skipped when the pinned actionlint or shellcheck is absent,
-# unless REQUIRE_ACTIONLINT=1 (CI's pr-static job sets it). Inside the intent
+# unless REQUIRE_ACTIONLINT=1 (CI's release-scripts job sets it). Inside the intent
 # monorepo the pin is also compared with its scripts/bootstrap-dev-host.sh.
 # Bash 3.2 compatible.
 
