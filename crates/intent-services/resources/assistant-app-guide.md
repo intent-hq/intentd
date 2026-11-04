@@ -13,6 +13,10 @@ These app-version notes qualify every later description in this guide:
 - Tool-output and large-image preview descriptions are for supporting test builds
   until their frontend release is verified. Do not offer them in ordinary help
   based on daemon support alone.
+- **Show full message** and recovery of truncated text, thinking, or omitted blocks
+  require a supporting app and matching daemon. Until their frontend release is
+  verified, treat them as test-build behavior and do not offer them in ordinary
+  help. Older apps may show only a preview without this recovery action.
 - **Browser access** is experimental. Discuss it only when explicitly asked or
   developing or testing it, and require an app offering its Labs command and
   **Mobile → Browser access** section. Older apps may lack it;
