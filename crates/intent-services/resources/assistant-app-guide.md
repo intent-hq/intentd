@@ -23,6 +23,12 @@ These app-version notes qualify every later description in this guide:
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/intent-web/components/. -->
 
+- Browser sign-in codes, **Create sign-in link**, and `npx @intent-hq/web link`
+  require app or package versions offering them. The 400-day session lifetime
+  applies only to supporting versions. Older versions use the access key and may
+  keep a sign-in cookie for a different lifetime, such as 30 days; closing the
+  browser does not necessarily sign out. Do not recommend the link command in
+  ordinary help until the installed package's released support is verified.
 - Agent **Pin to top** and **Unpin** require matching app and daemon agent-pinning
   support. Older app/daemon combinations do not offer that agent-list action.
 - Repository-picker **Clone**, **Existing folder**, and **New** labels apply to the
@@ -629,7 +635,7 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
   available there; a notice listing them appears each time the browser loads Intent,
   and **Got it** closes it.
 
-<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md; packages/cloudlands-fe/src/features/browser-access/main/browser-access-sign-in-codes.ts. -->
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md; packages/cloudlands-fe/src/features/browser-access/main/browser-access-auth.ts; packages/cloudlands-fe/src/features/browser-access/main/browser-access-server.ts. -->
 
 ## Start or continue work
 
