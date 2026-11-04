@@ -359,7 +359,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             )))
             .await
             .unwrap();
-            let mut socket = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+            let mut socket = bridge.connect().await.unwrap();
             let code = format!("await ws.workspace.setStatusMessage('completed ordinary effect'); await ws.{namespace}.snapshot(4); return 'constant';");
             let request = crate::repository_read_source::tests::call(&code);
             socket

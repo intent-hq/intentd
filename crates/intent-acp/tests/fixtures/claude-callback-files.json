@@ -2,7 +2,7 @@
   "format": "intent-local-callback-fixture-v1",
   "coverage": "Every payload file/link below; this manifest itself is covered by the external bundle SHA256. Empty directories are not payload.",
   "source_head": "315e7260e9c6b6721a73ad568a114b9b3794fd28",
-  "source_tree": "953cd7145401c03605f69b7d740e6a532d04e90e",
+  "source_tree": "02471690bca9df2b855843ac0d89dce236133009",
   "local_archive_baseline": "6029fde6f70a82be4871fecb9c7b35816cd0146f",
   "upstream_gitHead": "b264b52bee80e49f20caf1941f7d7cb89edb80c4",
   "source_archive_sha256": "550cf7857583e2503fa54b09d5f4e5b000afe1837484c772b3115d93bd549543",
@@ -32378,8 +32378,8 @@
     },
     "tests/mcp-peer.mjs": {
       "mode": "100644",
-      "sha256": "a3b77f7bac7ffa17feab00074ad91276950c1a2a36fea2fe98f788c10c8a7549",
-      "bytes": 4203
+      "sha256": "556fc0ac85d4fef0498a2573cb965ef07e3c7410d5cb18f2cdf17e078b874d69",
+      "bytes": 4322
     },
     "tests/run-hermetic.mjs": {
       "mode": "100644",

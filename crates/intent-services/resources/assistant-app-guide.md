@@ -288,7 +288,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
-| Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
+| Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
@@ -375,7 +375,21 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+**Built-in coding specialists.** Developer implements directly, plans as needed,
+and delegates focused work to general agents. Lead, Coordinator, Implementor, and
+Verifier are no longer built-in choices for new sessions. Developer defers verification
+until work is complete, minimizes runs, and prefers end-to-end tests with repeatable
+artifacts for complex features. For isolated testing, it identifies failure modes first.
+For UI work, Developer reuses app patterns, preserves user context, and shows
+screenshots of the rendered result. A new harness version
+applies to new sessions; existing sessions keep their captured behavior, and
+custom specialist instructions can override the defaults.
+
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.8/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs}. -->
+
 <!-- Sources: packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts. -->
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{AgentFeaturesSettings.svelte,agent-feature-definitions.ts}; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
@@ -528,7 +542,7 @@ pairing scanner. The Remote Access reference route is
 `/settings?tab=mobile#websocket-api`. There is no need to expand a device's Edit panel.
 
 For ordinary local-machine pairing, select that machine as the active connection.
-If connected elsewhere, use **Settings → Devices**, then the local machine's
+If connected elsewhere, use **Settings → Machines**, then the local machine's
 **Connect** action, and return to **Mobile**. The QR controls remain visible but
 disabled when **Enable Remote Access** is off, data is loading, or no running listener
 port is available. Explain the required enablement; do not silently change it.
@@ -543,17 +557,21 @@ finding the QR control.
 
 ## Find work on another device
 
-Devices lists the local machine and saved remote connections. **Add device** opens
-the connection form; a remote device's actions include **Edit** and **Connect**,
-with **Test connection** inside its editing panel. Workspaces and agents belong to a
-host, so identify the intended device before explaining missing work or changing
-host settings. **Mobile** follows the active connection and its permissions; do not
-describe a remote connection's QR as belonging to the local desktop. To pair the
-local machine, connect to it first. For intentd running in WSL on the same Windows
-PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL prints
-the port and token. Enabling access, changing listening addresses,
-and configuring a tunnel are separate choices from displaying pairing information.
-Read current state and respect the user's requested scope.
+**Settings → Machines** lists **<name> (local)** first, then the backend this window
+is connected to as **<name> (connected backend)**, then saved remote connections. Each
+row shows a macOS, Windows or Linux icon and, after the version (or the **Available to
+<backend>** badge), icons for the AI providers available there; hover an icon for its
+name. Switched-off providers are hidden, and offline or unknown machines show no
+icons. **Add machine** opens the connection form; a remote machine's actions include
+**Edit** and **Connect**, with **Test connection** inside its editing panel.
+Workspaces and agents belong to a host, so identify the intended device before
+explaining missing work or changing host settings. **Mobile** follows the active
+connection and its permissions; do not describe a remote connection's QR as belonging
+to the local desktop. To pair the local machine, connect to it first. For intentd
+running in WSL on the same Windows PC, add a machine with host `localhost`;
+`intentd pair --host localhost` in WSL prints the port and token. Enabling access,
+changing listening addresses, and configuring a tunnel are separate choices from
+displaying pairing information. Read current state and respect the user's requested scope.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 
@@ -1356,9 +1374,9 @@ assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
 
-With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show.
+With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show. A single message too large for one page shows its first part, without the parts that did not fit, and a **Show full message** button that loads the rest.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{ToolCall,ChatImageBlock}.svelte; packages/cloudlands-fe/src/lib/components/chat/block-hydration.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-session/sagas/regenerate-from-message-saga.ts; packages/cloudlands-fe/messages/en.json (chat_toolCall_outputTruncated_label, chat_toolCall_outputTooLarge_label, chat_imageBlock_tooLarge_label). Test-build behavior pending its frontend release. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{ToolCall,ChatImageBlock,ChatMessage}.svelte; packages/cloudlands-fe/src/lib/components/chat/block-hydration.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-session/sagas/regenerate-from-message-saga.ts; packages/cloudlands-fe/messages/en.json (chat_toolCall_outputTruncated_label, chat_toolCall_outputTooLarge_label, chat_imageBlock_tooLarge_label, chat_chatMessage_showFullMessage_button). Test-build behavior pending its frontend release. -->
 
 Agents mention another workspace as a link showing its title rather than its internal ID.
 Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant

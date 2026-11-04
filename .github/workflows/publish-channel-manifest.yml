@@ -144,6 +144,8 @@ jobs:
           # output at all under --quiet, so the fallback fetch drops --quiet
           # to keep git's own diagnostics visible; log loudly if it still
           # fails (intent-hq/monorepo#1921).
+          # Single quotes on purpose: the helper's shell expands GH_TOKEN.
+          # shellcheck disable=SC2016
           auth_helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
           git -c credential.helper= -c credential.helper="$auth_helper" \
             fetch --quiet --force --tags --unshallow 2>/dev/null \

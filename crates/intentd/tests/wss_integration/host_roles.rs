@@ -525,8 +525,8 @@ async fn shared_global_rules_over_wss_preserve_owner_writes_and_workspace_bounda
                 json!({"workspaceId":"global","ruleType":"base-system-prompt","content":"forbidden"}),
             ),
             ("specialist.create", json!({"id":"forbidden","spec":{}})),
-            ("specialist.edit", json!({"id":"implementor","spec":{}})),
-            ("specialist.delete", json!({"id":"implementor"})),
+            ("specialist.edit", json!({"id":"developer","spec":{}})),
+            ("specialist.delete", json!({"id":"developer"})),
             ("settings.list", json!({})),
         ] {
             let denied = reader.call(method, args).await;
@@ -663,10 +663,10 @@ async fn shared_specialist_project_paths_over_wss_require_guest_membership() {
         .await;
     assert_eq!(denied["error"]["code"], -32003, "{denied}");
     let global = guest
-        .call("specialist.get", json!({"id":"implementor"}))
+        .call("specialist.get", json!({"id":"developer"}))
         .await;
     assert_eq!(
-        global["result"]["specialist"]["id"], "implementor",
+        global["result"]["specialist"]["id"], "developer",
         "{global}"
     );
     srv.store

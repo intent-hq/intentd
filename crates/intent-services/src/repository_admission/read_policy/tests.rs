@@ -205,7 +205,7 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
         intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(controlled(&f, control.clone())))
             .await
             .unwrap();
-    let mut socket = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+    let mut socket = bridge.connect().await.unwrap();
     let request = crate::repository_read_source::tests::call("return await ws.pr.snapshot(4);");
     socket
         .write_all(format!("{request}\n").as_bytes())

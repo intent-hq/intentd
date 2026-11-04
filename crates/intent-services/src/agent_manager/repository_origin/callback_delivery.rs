@@ -211,13 +211,21 @@ impl EndpointBlueprint {
         }))
     }
 
-    fn registration(&self, address: String) -> intent_acp::AcpResult<CallbackStdioServer> {
+    fn registration(
+        &self,
+        address: String,
+        token: &str,
+    ) -> intent_acp::AcpResult<CallbackStdioServer> {
         let mut args = self.args_before_address.clone();
         args.push(address);
+        // This endpoint serves its own listener: carry its secret, not the
+        // original session bridge's.
+        let mut env = self.env.clone();
+        env.insert(intent_acp::BRIDGE_TOKEN_ENV.to_string(), token.to_string());
         CallbackStdioServer::new(
             self.command.clone(),
             args,
-            Some(self.env.clone()),
+            Some(env),
             [CallbackTool::WorkspaceApi],
         )
     }
@@ -393,7 +401,7 @@ impl Endpoint {
         }
     }
 
-    fn install_bridge(&self, bridge: McpBridge) -> Option<String> {
+    fn install_bridge(&self, bridge: McpBridge) -> Option<(String, String)> {
         let mut slot = self.bridge.lock().unwrap();
         if self.cancelled.load(Ordering::SeqCst) {
             drop(slot);
@@ -402,8 +410,9 @@ impl Endpoint {
             return None;
         }
         let address = bridge.connect_addr();
+        let token = bridge.auth_token().to_owned();
         *slot = Some(bridge);
-        Some(address)
+        Some((address, token))
     }
 
     async fn cancelled(&self) {
@@ -496,11 +505,11 @@ impl ConfirmedCallbackAttempt {
                 return None;
             }
         };
-        let address = endpoint.install_bridge(bridge)?;
+        let (address, token) = endpoint.install_bridge(bridge)?;
         if !self.current() {
             return None;
         }
-        let server = match self.blueprint.registration(address) {
+        let server = match self.blueprint.registration(address, &token) {
             Ok(server) => server,
             Err(error) => {
                 tracing::debug!(%error, "optional callback command unavailable");

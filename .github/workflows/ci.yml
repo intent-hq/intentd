@@ -24,7 +24,8 @@ on:
   pull_request:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
   # checks plus the Linux `check` job (clippy, source lints),
-  # `windows-cross-lint` (Windows GNU-target Clippy on Linux) and
+  # `windows-cross-lint` (Windows GNU-target Clippy on Linux),
+  # `macos-cross-lint` (macOS-target Clippy on Linux) and
   # `coverage-changed` (the PR's changed tests). The queue reruns `check`,
   # `windows-cross-lint` and `coverage-changed` on the merged tree and
   # adds the Linux/macOS runtime matrices and full
@@ -52,6 +53,16 @@ env:
   # The bigmem heavy slots (intent-cache-bigmem, 30 GB or more): the only heavy
   # slots gh-linux-16x jobs overflow to; 0 sends that overflow to WarpBuild.
   LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
+  # crates.io resilience for every Cargo job, matching release-plz.yml.
+  # Multiplexed HTTP/2 downloads failed PR jobs with "curl failed: [16] Error
+  # in the HTTP2 framing layer" (derive_more in job 126375150115, serde_with
+  # in a `check` run on intentd#3021), each forcing a full re-run. One
+  # connection per transfer avoids the framing error, and cargo retries
+  # other spurious network errors up to 10 times. The heavy PR jobs also
+  # pre-fetch the locked crates with backoff (scripts/fetch-locked-crates.py);
+  # scripts/test-ci-cargo-network.py keeps both in place.
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue. Each main push
@@ -430,6 +441,8 @@ jobs:
           set -euo pipefail
           # A command substitution in an assignment fails the step (set -e,
           # pipefail) when discovery throws; `mapfile < <(...)` would not.
+          # The single-quoted node program uses JS template literals.
+          # shellcheck disable=SC2016
           discovered=$(git ls-files -z -- '*.lock.json' | node -e '
             const fs = require("node:fs");
             for (const file of fs.readFileSync(0, "utf8").split("\0").filter(Boolean)) {
@@ -557,6 +570,10 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
+      # Download every locked crate once, retrying crates.io blips with
+      # backoff, before the first build (see the workflow env comment).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - name: Format check
         run: cargo fmt --check
       - name: Acquire the shared transfer selection contract
@@ -863,6 +880,10 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-gnu
           components: clippy
+      # Retried crate download before the first build, as in `check`
+      # (`cargo fetch` without --target covers the Windows-only crates too).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       # Non-test production configuration first: --all-targets enables test
       # fixture features and skips their production arms (see the `build`
       # job's comment), so Clippy alone would miss those Windows errors.
@@ -870,6 +891,87 @@ jobs:
         run: cargo check --workspace --target x86_64-pc-windows-gnu
       - name: Clippy (Windows GNU target)
         run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+  # macOS cross lint, pull requests only: the production check and
+  # target-gated Clippy for aarch64-apple-darwin on a Linux runner, so a
+  # macOS-only lint error (clippy::unused_async on a fn whose only await is
+  # `#[cfg(target_os = "linux")]`, an import only cfg(macos) code uses) fails
+  # the PR instead of ejecting it from the merge queue (intentd#3002,
+  # merge-group run 41750279308). check/clippy never link, but the -sys build
+  # scripts compile C for the target, which would need the macOS SDK;
+  # scripts/macos-lint-cc.sh stands in for the target C compiler (empty
+  # objects, host preprocessing; see its header). The native
+  # `Clippy (target-gated code)` step in the queue's macOS `build` leg stays
+  # the final authority, so the queue does not repeat this job. Local
+  # equivalent: `make check-macos` from the monorepo root. Same `if` as
+  # `check` minus merge_group: same-repo PRs (route success), skipped on
+  # release-metadata PRs. Runs on route's 8-core cloud Linux runner like
+  # `windows-cross-lint` (the apt fallback needs sudo).
+  macos-cross-lint:
+    if: ${{ !cancelled() && needs.route.result == 'success' && github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    needs: [route, release-fast-path]
+    name: macOS cross lint (aarch64-apple-darwin)
+    runs-on: ${{ fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    # A cold compile (sccache miss, lockfile bump) on 8 cores builds the
+    # workspace twice for a new target, as in `windows-cross-lint`.
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CC_aarch64_apple_darwin: ${{ github.workspace }}/scripts/macos-lint-cc.sh
+      CXX_aarch64_apple_darwin: ${{ github.workspace }}/scripts/macos-lint-cc.sh
+      AR_aarch64_apple_darwin: ar
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # The host build scripts need OpenSSL headers (as in `check`); the
+      # stub compiler needs the host cc, and openssl-src's build perl and make.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            if ! sudo -n true 2>/dev/null; then
+              echo "::error::${RUNNER_NAME:-this runner} lacks libssl-dev and passwordless sudo to install it; macos-cross-lint needs a runner from route's cloud map (never a self-hosted slot)."
+              exit 1
+            fi
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends libssl-dev
+          fi
+          for tool in cc ar perl make; do command -v "$tool" >/dev/null || { echo "::error::$tool not found"; exit 1; }; done
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-apple-darwin
+          components: clippy
+      # Download every locked crate once, retrying crates.io blips with
+      # backoff, before the first build (see the workflow env comment).
+      - name: Fetch locked crates (retries crates.io network errors)
+        run: python3 -I -B scripts/fetch-locked-crates.py
+      # Production configuration first, as in the native `build` leg:
+      # --all-targets enables test fixture features and skips their
+      # production arms.
+      - name: Check (macOS production configuration)
+        run: cargo check --workspace --target aarch64-apple-darwin
+      - name: Clippy (macOS target)
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
   # and full coverage are now job-skipped on every PR, independent of this
@@ -1103,15 +1205,13 @@ jobs:
       # every macOS dev box. Linting here (same invocation as the check job)
       # closes the gap. It runs on merge-queue runs, not on push: the queue
       # tests the actual merged tree, and main's push run builds a tree the
-      # queue already linted. (The Windows equivalent is
-      # `windows-cross-lint` on PRs and in the queue, because the Windows GNU
-      # target needs only MinGW-w64.) It runs on the
-      # native runner rather than as a Linux cross-target run because
-      # `cargo clippy --target <triple>` still executes the native build
-      # scripts (libz-sys and friends try-compile C for the target even when
-      # pkg-config resolves a system lib), which would require a full
-      # darwin cross C toolchain on Linux; the native runner needs
-      # nothing extra and shares this job's warm target dir. release-fast-path's
+      # queue already linted. PRs get the same lint earlier from
+      # `macos-cross-lint`, a Linux cross-target run whose stub C compiler
+      # (scripts/macos-lint-cc.sh) satisfies the build scripts without the
+      # macOS SDK; this native step stays the final authority (real SDK
+      # headers, real compiler) and shares this job's warm target dir.
+      # (The Windows equivalent is `windows-cross-lint` on PRs and in the
+      # queue, because the Windows GNU target needs only MinGW-w64.) release-fast-path's
       # `fast_path` output is pull_request-only, so it is empty on merge_group
       # and the `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
@@ -1560,19 +1660,21 @@ jobs:
       - name: Generate coverage summary
         if: always()
         run: |
-          cd ${{ github.workspace }}
-          echo "## E2E Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # The script tees its summary to coverage-summary.txt; re-running
-          # the report (~30s) is only a fallback for a run that died before
-          # reporting (intent-hq/monorepo#4260).
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cd "${{ github.workspace }}"
+          {
+            echo "## E2E Coverage Report"
+            echo ""
+            echo '```'
+            # The script tees its summary to coverage-summary.txt; re-running
+            # the report (~30s) is only a fallback for a run that died before
+            # reporting (intent-hq/monorepo#4260).
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention: the lcov artifact is a debugging aid
       # only, and an org artifact-quota outage must not fail the required
       # check when all tests passed (monorepo#1163).
@@ -1710,17 +1812,19 @@ jobs:
       - name: Generate coverage summary
         if: always()
         run: |
-          cd ${{ github.workspace }}
-          echo "## Combined Coverage Report (all tests)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # Same reuse-or-fallback as coverage-e2e's summary step.
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cd "${{ github.workspace }}"
+          {
+            echo "## Combined Coverage Report (all tests)"
+            echo ""
+            echo '```'
+            # Same reuse-or-fallback as coverage-e2e's summary step.
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention — same rationale as coverage-e2e's
       # upload step (monorepo#1163).
       - name: Upload coverage artifact
@@ -1898,6 +2002,10 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Retried crate download before the first build, as in `check`.
+      - name: Fetch locked crates (retries crates.io network errors)
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
@@ -2226,6 +2334,34 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # actionlint (pinned in scripts/lint-workflows.sh) plus shellcheck over
+      # .github/workflows, with policy in .github/actionlint.yaml; workflow
+      # YAML and its run: scripts have no other check. It runs here, not in
+      # the PR-only pr-static, so the queue lints the merged tree: a PR whose
+      # CI predated a workflow edit, or two queued PRs that each edit
+      # workflows, would otherwise land an unlinted tree on main (intentd#3036
+      # merged ahead of #3039, which added this lint, that way). Main is
+      # clean, so any finding is new. The ShellCheck fallback needs sudo,
+      # which this job's free standard runner has.
+      - name: Install ShellCheck when absent
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            for attempt in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$attempt" -eq 3 ]; then exit 1; fi
+              sleep $((attempt * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq shellcheck
+          fi
+      - name: Install the pinned actionlint
+        run: |
+          bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      # REQUIRE_ACTIONLINT=1 forbids the self-test's skip of its real cases.
+      - name: Self-test make lint-workflows
+        run: REQUIRE_ACTIONLINT=1 ./scripts/test-lint-workflows.sh
+      - name: Lint GitHub workflows
+        run: make lint-workflows
       # .gitignore covers new caches, but `git add -f` bypasses it; this job
       # also runs in the merge queue and on main, unlike pr-static.
       - name: Reject tracked Python bytecode
@@ -2250,6 +2386,7 @@ jobs:
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-release-host-network.py
           python3 -B scripts/test-release-plz-network.py
+          python3 -B scripts/test-ci-cargo-network.py
           python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
@@ -2335,6 +2472,8 @@ jobs:
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-killed-rustc-retry.sh
         run: ./scripts/test-ci-killed-rustc-retry.sh
+      - name: Test macos-lint-cc.sh
+        run: ./scripts/test-macos-lint-cc.sh
       - name: Test Windows cleanup policy
         run: python3 -I -B scripts/test-windows-ci-cleanup.py
       - name: Test macOS cleanup safety and Cargo lock ownership
@@ -2580,7 +2719,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, macos-cross-lint, build, windows, coverage-e2e, coverage-all, coverage-changed, pr-title, docs-pr-scope, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2596,8 +2735,8 @@ jobs:
               require pr-static "${{ needs.pr-static.result }}"
               # release-fast-path itself is advisory: a failed classifier must
               # degrade to full CI, never block the PR. Release-metadata PRs
-              # skip the three slow compile jobs (`check`, `windows-cross-lint`,
-              # `coverage-changed`; see `check`); the skip is accepted
+              # skip the slow compile jobs (`check`, `windows-cross-lint`,
+              # `macos-cross-lint`, `coverage-changed`; see `check`); the skip is accepted
               # only when the classifier job succeeded and reported the fast
               # path. Any other PR must run them.
               slow=require
@@ -2608,6 +2747,7 @@ jobs:
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               "$slow" check "${{ needs.check.result }}"
               "$slow" windows-cross-lint "${{ needs.windows-cross-lint.result }}"
+              "$slow" macos-cross-lint "${{ needs.macos-cross-lint.result }}"
               optional build "${{ needs.build.result }}"
               optional windows "${{ needs.windows.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
@@ -2629,6 +2769,7 @@ jobs:
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
               require windows-cross-lint "${{ needs.windows-cross-lint.result }}"
+              optional macos-cross-lint "${{ needs.macos-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               optional windows "${{ needs.windows.result }}"
               require coverage-e2e "${{ needs.coverage-e2e.result }}"
@@ -2664,6 +2805,7 @@ jobs:
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
               optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
+              optional macos-cross-lint "${{ needs.macos-cross-lint.result }}"
               "$build" build "${{ needs.build.result }}"
               "$windows" windows "${{ needs.windows.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"

@@ -39,13 +39,13 @@ use intent_core::{
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListPage, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
+    WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
@@ -20843,11 +20843,23 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if limit.is_some_and(|n| n < 0) {
                 return Err(Error::InvalidParams("limit must be nonnegative".into()));
             }
+            let scope = search_ops::note_page_scope(
+                &query,
+                workspace_id.as_ref(),
+                prefer_workspace_id.as_ref(),
+                include_archived,
+            );
+            let anchors = next_token
+                .as_deref()
+                .map(|token| search_ops::decode_note_page_token(token, &scope))
+                .transpose()?;
+            let limit = search_ops::match_limit(limit);
             for (name, id) in [
                 ("workspaceId", &workspace_id),
                 ("preferWorkspaceId", &prefer_workspace_id),
@@ -20867,24 +20879,49 @@ impl WorkspaceApi for Services {
                 .visible_workspace_ids()
                 .await?
                 .map(|ids| ids.into_iter().collect::<Vec<_>>());
-            let options = intent_store::NoteFtsOptions {
+            let mut options = intent_store::NoteFtsOptions {
                 workspace_id: workspace_id.as_ref(),
                 prefer_workspace_id: prefer_workspace_id.as_ref(),
                 allowed_workspace_ids: visible.as_deref(),
                 include_archived,
-                limit,
+                // One extra hit tells whether another page follows.
+                limit: Some(if limit == 0 {
+                    0
+                } else {
+                    i64::try_from(limit + 1).unwrap_or(i64::MAX)
+                }),
                 per_workspace_limit: None,
+                after: None,
             };
             let hits = match intent_search::fts_match_expr(&query) {
-                Some(expr) => self.store.search_notes_fts(&expr, &options).await?,
+                Some(expr) => {
+                    let resume = match anchors {
+                        Some(anchors) => {
+                            search_ops::note_page_resume(&self.store, &expr, &options, anchors)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    options.after = resume.as_ref();
+                    self.store.search_notes_fts(&expr, &options).await?
+                }
                 None => Vec::new(),
             };
+            let keys: Vec<intent_store::NoteFtsCursor> = hits
+                .iter()
+                .map(|hit| intent_store::NoteFtsCursor {
+                    rank: hit.rank,
+                    updated_at: hit.updated_at.clone(),
+                    workspace_id: hit.workspace_id.clone(),
+                    note_id: hit.note_id.clone(),
+                })
+                .collect();
             let matches = search_ops::note_fts_matches(hits, &query);
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             // This single indexed query never streams, even for a large hard
             // scope. There is no lingering cancellation registration; cancelling
             // this completed request is the usual no-op success.
-            Ok(serde_json::json!({ "requestId": request_id, "matches": matches, "indexed": true }))
+            search_ops::note_page_reply(&request_id, matches, &keys, limit, &scope)
         })
     }
 
@@ -21254,6 +21291,15 @@ impl WorkspaceApi for Services {
                     file_ops::AttachmentSource::Bytes(&decoded)
                 }
                 (None, Some(src)) => {
+                    // The source is an arbitrary host path, so this arm is a
+                    // host read: a workspace guest naming `~/.ssh/...` would
+                    // copy the host owner's files into the workspace and read
+                    // them back with `file.read`. Only callers with host
+                    // execution (owner, host members, local agents) may use
+                    // it; guests attach bytes through `data` or the chunked
+                    // upload.
+                    self.require_host_execution("file.placeAttachment sourcePath")
+                        .await?;
                     // Same-host FE fast path: copy a host-local file without
                     // routing its bytes through the wire (streamed by
                     // `fs::copy`, never buffered — the file may exceed the
@@ -27930,6 +27976,37 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             store.list_workspace_tasks(&workspace_id, filter).await
+        })
+    }
+
+    fn task_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+        page: intent_core::note_read_bounds::PageRequest,
+    ) -> BoxFuture<'_, Result<TaskListPage>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let filter = match status.as_deref() {
+                Some(s) => Some(parse_task_status_strict(s)?),
+                None => None,
+            };
+            let (result, keys) = store
+                .list_workspace_tasks_keyed(&workspace_id, filter)
+                .await?;
+            let (tasks, next_token) = intent_core::note_read_bounds::task_list_page(
+                keys.into_iter().zip(result.tasks).collect(),
+                workspace_id.as_str(),
+                &page,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            )
+            .map_err(|e| Error::InvalidParams(e.to_string()))?;
+            Ok(TaskListPage {
+                tasks,
+                stats: result.stats,
+                next_token,
+            })
         })
     }
 

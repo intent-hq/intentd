@@ -545,6 +545,31 @@ fn encode_user_message_index_token(before_seq: i64) -> String {
     format!("{USER_MESSAGE_INDEX_TOKEN_PREFIX}{before_seq}")
 }
 
+/// Serialized-size ceiling of one `agent.listUserMessages` page's items
+/// (PROTOCOL §5.5), so the whole JSON-RPC frame stays under 512,000 bytes.
+pub(crate) const USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Fit one `agent.listUserMessages` page (`items` oldest→newest, `seqs`
+/// their transcript `seq`s) to [`USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES`]:
+/// the newest rows are kept and, when older rows of the page were cut, the
+/// `seq` of the oldest kept row is returned as the next page's bound. A
+/// single row over the budget serves alone with its oversized fields
+/// replaced by `<field>Omitted` / `<field>Bytes` markers.
+fn trim_user_message_index_page(items: &mut Vec<Value>, seqs: &[i64]) -> Option<i64> {
+    let budget = USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES;
+    let sizes: Vec<usize> = items
+        .iter()
+        .map(crate::pagination::serialized_size)
+        .collect();
+    let (lo, _) =
+        crate::pagination::budget_page(&sizes, crate::pagination::BudgetAnchor::Newest, budget);
+    items.drain(..lo);
+    if let [only] = items.as_mut_slice() {
+        crate::pagination::bound_row(only, budget, &["id", "preview", "createdAt"]);
+    }
+    (lo > 0).then(|| seqs[lo])
+}
+
 fn decode_user_message_index_token(token: &str) -> Result<i64> {
     token
         .strip_prefix(USER_MESSAGE_INDEX_TOKEN_PREFIX)
@@ -3965,6 +3990,18 @@ fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedTo
     }
 }
 
+/// Apply [`crate::tool_block::fit_oversized_slim_row`] to one slim row and
+/// return its serialized size afterwards (unchanged rows are only measured).
+fn fit_slim_row(message: &mut AgentMessage, budget: usize) -> usize {
+    let bytes = crate::pagination::serialized_size(message);
+    match message.content.as_array_mut() {
+        Some(blocks) if bytes > budget => {
+            crate::tool_block::fit_oversized_slim_row(blocks, bytes, budget)
+        }
+        _ => bytes,
+    }
+}
+
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
 /// `projection: "slim"`) to one served message. The block bounding itself
 /// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
@@ -4969,9 +5006,13 @@ impl Services {
                 }
                 other => other,
             };
+            // Single-row bound (§5.5): a row that alone is over the budget
+            // is cut to fit first (text previews, then omitted-block stubs;
+            // see `fit_oversized_slim_row`), so the always-served anchor row
+            // can no longer push the frame past the read budget.
             let sizes: Vec<usize> = page
-                .iter()
-                .map(crate::pagination::serialized_size)
+                .iter_mut()
+                .map(|m| fit_slim_row(m, SLIM_PAGE_BUDGET_BYTES))
                 .collect();
             let (lo, hi) = crate::pagination::budget_page(&sizes, anchor, SLIM_PAGE_BUDGET_BYTES);
             if (lo, hi) != (0, page.len()) {
@@ -5020,6 +5061,7 @@ impl Services {
                     let mut row = project_served_message(row);
                     if projection == Some(ConversationProjection::Slim) {
                         row = apply_slim_projection(row, None);
+                        fit_slim_row(&mut row, SLIM_PAGE_BUDGET_BYTES);
                     }
                     let mut row = serde_json::to_value(row).expect("in-progress row serialize");
                     if let Some(obj) = row.as_object_mut() {
@@ -5062,6 +5104,25 @@ impl Services {
                         if lo > 0 {
                             arr.drain(..lo);
                             next_token = crate::pagination::remint_backward_token(page_start + lo);
+                        }
+                        // A protected anchor can keep persisted rows that,
+                        // with the live row, still exceed the budget: cut the
+                        // live row to the room that is left (§5.5 single-row
+                        // bound), so the frame stays within the read budget.
+                        if let Some((live_row, kept)) = arr.split_last_mut() {
+                            let kept_bytes: usize =
+                                kept.iter().map(crate::pagination::serialized_size).sum();
+                            let live_bytes = crate::pagination::serialized_size(live_row);
+                            if let Some(blocks) = live_row
+                                .get_mut("contentBlocks")
+                                .and_then(Value::as_array_mut)
+                            {
+                                crate::tool_block::fit_oversized_slim_row(
+                                    blocks,
+                                    live_bytes,
+                                    SLIM_PAGE_BUDGET_BYTES.saturating_sub(kept_bytes),
+                                );
+                            }
                         }
                     }
                 }
@@ -5114,11 +5175,16 @@ impl Services {
             .store
             .get_agent_message_thumbnails(&agent_id, &ids)
             .await?;
+        // Single-row bound (§5.5): progressive history frames each carry one
+        // row (and the seq-0 snapshot its newest rows), so a row that alone
+        // is over the page budget is cut to fit here, like the page read.
         let page: Vec<_> = page
             .into_iter()
             .map(|m| {
                 let thumbs = thumbnails.get(&m.id);
-                apply_slim_projection(m, thumbs)
+                let mut m = apply_slim_projection(m, thumbs);
+                fit_slim_row(&mut m, SLIM_PAGE_BUDGET_BYTES);
+                m
             })
             .collect();
         Ok(json!({"agentId":agent_id,"messages":page,"totalMessages":total}))
@@ -5379,12 +5445,16 @@ impl Services {
     /// tell automated rows apart (`intent_store::project_user_message_index_metadata`,
     /// intent-hq/intent#8278) and omitted when none survive.
     ///
-    /// Paging is opt-in: with `limit` (clamped into [1, 500]) or
-    /// `next_token` (default limit 100) only the newest rows older than the
-    /// token are read and the result carries `nextToken` — the opaque cursor
-    /// for the next older page, `null` once none remain. Without either, the
-    /// whole index is served and `nextToken` is absent (the pre-paging
-    /// shape). Bounded cost (RPC cost contract): a metadata-only session
+    /// Every read is paged: at most `limit` rows (default 100, clamped into
+    /// [1, 500]) — the newest rows older than `next_token` (the newest
+    /// overall without one) — trimmed newest-first to
+    /// [`USER_MESSAGE_INDEX_PAGE_BUDGET_BYTES`] of serialized items. The
+    /// result always carries `nextToken`, the opaque cursor for the next
+    /// older page (resuming at the first row a count or byte cut left out),
+    /// `null` once none remain. A single row over the budget still serves
+    /// alone with its `metadata` replaced by `metadataOmitted` /
+    /// `metadataBytes` (the row stays readable in full through
+    /// `agent.getConversation`). Bounded cost (RPC cost contract): a metadata-only session
     /// read plus ONE role-filtered index read whose previews and metadata
     /// are trimmed inside SQL — full content and metadata blobs never leave
     /// the database and the transcript is never hydrated.
@@ -5419,18 +5489,14 @@ impl Services {
                 .clamp(1, MAX_PREVIEW_CHARS),
         )
         .expect("clamped to [1, MAX_PREVIEW_CHARS]");
-        let page = (limit.is_some() || next_token.is_some()).then(|| {
-            intent_store::UserMessageIndexPageRequest {
-                limit: usize::try_from(
-                    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT),
-                )
+        let page = intent_store::UserMessageIndexPageRequest {
+            limit: usize::try_from(limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT))
                 .expect("clamped to [1, MAX_PAGE_LIMIT]"),
-                before_seq,
-            }
-        });
+            before_seq,
+        };
         let index = self
             .store
-            .get_agent_user_message_index_page(&agent_id, preview_chars, page)
+            .get_agent_user_message_index_page(&agent_id, preview_chars, Some(page))
             .await?;
         let items = crate::repository_native_wire::monitor::history_index(
             self,
@@ -5440,10 +5506,11 @@ impl Services {
             preview_chars,
         )
         .await?;
-        let total = items.len();
-        let items: Vec<Value> = items
+        let mut seqs = Vec::with_capacity(items.len());
+        let mut items: Vec<Value> = items
             .into_iter()
             .map(|item| {
+                seqs.push(item.seq);
                 let mut obj = json!({
                     "id": item.id,
                     "preview": item.preview,
@@ -5457,13 +5524,18 @@ impl Services {
                 obj
             })
             .collect();
-        let mut result = json!({ "agentId": agent_id.0, "items": items, "total": total });
-        if page.is_some() {
-            result["nextToken"] = index.next_before_seq.map_or(Value::Null, |seq| {
-                Value::String(encode_user_message_index_token(seq))
-            });
-        }
-        Ok(result)
+        let next_before_seq =
+            trim_user_message_index_page(&mut items, &seqs).or(index.next_before_seq);
+        let total = items.len();
+        let next_token = next_before_seq.map_or(Value::Null, |seq| {
+            Value::String(encode_user_message_index_token(seq))
+        });
+        Ok(json!({
+            "agentId": agent_id.0,
+            "items": items,
+            "total": total,
+            "nextToken": next_token,
+        }))
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
@@ -6259,8 +6331,8 @@ impl Services {
             }
         }
         // Specialist alias canonicalization (PROTOCOL §5.11): a `specialist`
-        // naming an alias (e.g. `"coordinator"`) is rewritten to the claiming
-        // specialist's CANONICAL id (`"spec-writer"`) before any downstream
+        // naming a custom alias is rewritten to the claiming
+        // specialist's canonical id before any downstream
         // rung runs, so display-name/model/effort resolution, the prompt
         // snapshot, and the persisted `session.specialist` (surfaced as
         // `metadata.specialist`) all see the canonical id. A directly-known
@@ -6297,7 +6369,7 @@ impl Services {
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
         // name-less `agent.create` / `workspace.create.initialAgent` carrying
-        // a specialist surfaces e.g. "Coordinator" for `spec-writer` instead
+        // a specialist surfaces e.g. "Developer" for `developer` instead
         // of the generic `Agent {6-hex}` fallback. Resolution failure or an
         // unknown specialist never fails the create — the fallback below
         // still applies.
@@ -6579,6 +6651,12 @@ impl Services {
             metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
+            let plain_folder = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(AgentPersistError::store)?
+                .plain_folder;
             // Both snapshot resolutions below walk the specialist tier
             // directories — blocking pool (monorepo#4148).
             let services = self.clone();
@@ -6586,9 +6664,11 @@ impl Services {
             let wp = snapshot_wp.clone();
             let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
                 (
-                    services
-                        .specialists_service()
-                        .resolve_prompt_injection(&spec_id_owned, wp.as_deref()),
+                    services.specialists_service().resolve_prompt_injection_in(
+                        &spec_id_owned,
+                        wp.as_deref(),
+                        plain_folder,
+                    ),
                     services
                         .specialists_service()
                         .resolve_is_orchestrator(&spec_id_owned, wp.as_deref()),
@@ -8117,12 +8197,9 @@ impl Services {
                     session.specialist = if let Some(spec_id) =
                         update_optional_string(value, "specialist")?
                     {
-                        let wp = self
-                            .store
-                            .get_workspace(&session.workspace_id)
-                            .await
-                            .ok()
-                            .and_then(|w| crate::git_ops::worktree_path(&w));
+                        let workspace = self.store.get_workspace(&session.workspace_id).await.ok();
+                        let plain_folder = workspace.as_ref().is_some_and(|w| w.plain_folder);
+                        let wp = workspace.as_ref().and_then(crate::git_ops::worktree_path);
                         // Canonicalization + the refreshed orchestrator-role
                         // snapshot (`specialistIsOrchestrator`, written at
                         // create, re-resolved here so the session-open
@@ -8143,9 +8220,11 @@ impl Services {
                                     .resolve_display_name(&canonical, wp.as_deref());
                                 let injection = remember_specialist
                                     .then(|| {
-                                        services
-                                            .specialists_service()
-                                            .resolve_prompt_injection(&canonical, wp.as_deref())
+                                        services.specialists_service().resolve_prompt_injection_in(
+                                            &canonical,
+                                            wp.as_deref(),
+                                            plain_folder,
+                                        )
                                     })
                                     .flatten();
                                 Ok((canonical, is_orchestrator, display_name, injection))

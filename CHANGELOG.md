@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.128] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- *(transfer)* Export named workspace-wide discussions ([#3045](https://github.com/intent-hq/intentd/pull/3045))
+- *(acp)* Give specialist, settings and bulk-op proposal cards unique ids ([#3043](https://github.com/intent-hq/intentd/pull/3043))
+- Keep a stopped remote agent's late exit record off its relaunch ([#3044](https://github.com/intent-hq/intentd/pull/3044))
+
+
+## [0.11.127] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Describe the Machines list in the assistant guide and rename the Settings: Devices UI target ([#3032](https://github.com/intent-hq/intentd/pull/3032))
+- *(executor)* Push a fresh capabilities report when enabled providers change ([#3040](https://github.com/intent-hq/intentd/pull/3040))
+
+
+## [0.11.126] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- *(search)* Page search.notes within the read payload budget ([#3033](https://github.com/intent-hq/intentd/pull/3033))
+- *(core)* Keep a single huge chat message under the page budget ([#3037](https://github.com/intent-hq/intentd/pull/3037))
+
+
+## [0.11.125] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Page the task.subscribe snapshot through a paged task.list ([#3029](https://github.com/intent-hq/intentd/pull/3029))
+- Page agent.listUserMessages by default under the 500 KiB budget ([#3031](https://github.com/intent-hq/intentd/pull/3031))
+- Tighten file.placeAttachment sourcePath and MCP bridge admission ([#3034](https://github.com/intent-hq/intentd/pull/3034))
+
+
 ## [0.11.124] - 2026-11-04
 
 ### 🚀 Features

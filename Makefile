@@ -8,19 +8,20 @@
 # MAKEFLAGS. In a standalone clone the same targets exit 2 and name the
 # monorepo command. Unknown targets keep make's ordinary "No rule" failure.
 #
-# The one local target, test-release-scripts, needs neither cargo nor the
-# monorepo: it runs the scripts/test-* commands of ci.yml's release-scripts job,
-# skipping suites that need CI-only tooling (scripts/release-scripts-local.py).
+# The local targets need neither cargo nor the monorepo: test-release-scripts
+# runs the scripts/test-* commands of ci.yml's release-scripts job, skipping
+# suites that need CI-only tooling (scripts/release-scripts-local.py), and
+# lint-workflows runs the pinned actionlint like ci.yml's release-scripts job.
 
 MONOREPO_ROOT := ../..
-FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows lint-sources
+FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows check-macos lint-sources
 
 # Forward only to the intent monorepo: an unrelated Makefile two levels up
 # must not be mistaken for it, so ../../.gitmodules has to name this path.
 MONOREPO_PRESENT := $(and $(wildcard $(MONOREPO_ROOT)/Makefile),$(shell grep -Eqs '^[[:space:]]*path[[:space:]]*=[[:space:]]*packages/intentd[[:space:]]*$$' $(MONOREPO_ROOT)/.gitmodules && echo yes))
 
 .DEFAULT_GOAL := help
-.PHONY: help test-release-scripts $(FORWARDED_TARGETS)
+.PHONY: help test-release-scripts lint-workflows $(FORWARDED_TARGETS)
 
 help:
 	@echo "intentd Makefile: forwards the Rust gate targets to the intent monorepo root Makefile."
@@ -33,11 +34,17 @@ help:
 	@echo "E='<nextest filterset>' (test-select, test-stress) and COUNT=N LOAD=1 (test-stress) pass through."
 	@echo "In a standalone clone the targets exit 2 and name the monorepo command."
 	@echo ""
-	@echo "Local target: test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"
-	@echo "that need CI-only tooling (exit 1 only on a real failure)."
+	@echo "Local targets:"
+	@echo "  test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"
+	@echo "    that need CI-only tooling (exit 1 only on a real failure)."
+	@echo "  lint-workflows — run the pinned actionlint with shellcheck over .github/workflows,"
+	@echo "    as ci.yml's release-scripts job does (needs actionlint + shellcheck)."
 
 test-release-scripts:
 	python3 scripts/release-scripts-local.py
+
+lint-workflows:
+	@bash scripts/lint-workflows.sh
 
 ifneq ($(MONOREPO_PRESENT),)
 # One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,

@@ -286,6 +286,13 @@ pub(crate) static V3_7: InstructionSet = InstructionSet {
     ..V3_6
 };
 
+/// Harness v3.8 keeps the private scratch-file guidance and defaults delegation
+/// to general agents unless a specialist is explicitly selected.
+pub(crate) static V3_8: InstructionSet = InstructionSet {
+    common: instr!("v3.8", "common"),
+    ..V3_7
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -680,7 +687,7 @@ mod tests {
     /// The current common body includes workspace links, development-only
     /// visuals, the long-running-process (Intent scripts) guidance and the
     /// private-`$TMPDIR` scratch-file sentence.
-    const COMMON_LATEST: &str = V3_7.common;
+    const COMMON_LATEST: &str = V3_8.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

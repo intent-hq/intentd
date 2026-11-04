@@ -282,6 +282,7 @@ pub(crate) async fn history_index(
             };
             Some(intent_store::UserMessageIndexItem {
                 qualified_monitor: true,
+                seq: item.seq,
                 id: message.id,
                 preview: text.chars().take(preview_chars).collect(),
                 metadata: message

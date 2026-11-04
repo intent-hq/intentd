@@ -2307,12 +2307,21 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         arr.len()
     );
     let page_bytes = serde_json::to_string(arr).unwrap().len();
-    // One-row floor aside, the kept page hugs the budget: the live turn
-    // (~0.9MB slim) anchors, so allow budget + one row's slack.
+    // The live turn (~0.9MB slim) alone is over the budget, so it is cut to
+    // fit (§5.5 single-row bound): its newest blocks become contiguous
+    // `bodyOmitted` stubs that keep their ids, and the page fits the budget.
     assert!(
-        page_bytes <= SLIM_PAGE_BUDGET_BYTES * 2,
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 64,
         "merged page must be re-budgeted, got {page_bytes} bytes"
     );
+    let live_out = arr.last().unwrap()["contentBlocks"].as_array().unwrap();
+    assert_eq!(live_out.len(), 400, "every live block keeps its slot");
+    let first_stub = live_out
+        .iter()
+        .position(|b| b["bodyOmitted"] == true)
+        .expect("stubs");
+    assert!(live_out[first_stub..].iter().enumerate().all(|(i, b)| *b
+        == json!({ "id": format!("msg-live:{}", first_stub + i), "type": "tool_result", "bodyOmitted": true })));
     // The continuation cursor was re-minted at the oldest KEPT row's seq, so
     // `agent.getConversation {{ nextToken }}` resumes at the first evicted row.
     assert_eq!(snapshot["truncated"], true);
@@ -2435,7 +2444,8 @@ fn twenty_message_live_overlay_caps_full_and_slim_pages_without_losing_history()
 }
 
 /// Byte eviction can shorten a count-bounded page further. An oversized live
-/// anchor still serves alone, and every displaced persisted row is reachable.
+/// anchor is cut to fit (a text preview), so it no longer crowds the page
+/// out, and every displaced persisted row is reachable.
 #[test]
 fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
     for limit in [1, 5, 20, 50] {
@@ -2457,21 +2467,23 @@ fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
                 limit,
             );
             let rows = snapshot["messages"].as_array().unwrap();
-            assert_eq!(
-                rows.len(),
-                if live_bytes > SLIM_PAGE_BUDGET_BYTES {
-                    1
-                } else {
-                    limit.min(4)
-                }
-            );
+            let oversized = live_bytes > SLIM_PAGE_BUDGET_BYTES;
+            // An oversized live row is cut to a ~2KB preview, so all five
+            // persisted rows fit beside it; a 200 KiB one leaves room for 3.
+            assert_eq!(rows.len(), limit.min(if oversized { 6 } else { 4 }));
             assert_eq!(rows.last().unwrap()["id"], "live");
+            let live_block = &rows.last().unwrap()["contentBlocks"][0];
+            assert_eq!(live_block["textTruncated"] == true, oversized);
             let bytes: usize = rows
                 .iter()
                 .map(intent_services::pagination::serialized_size)
                 .sum();
-            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES || rows.len() == 1);
+            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES);
             assert_eq!(snapshot["totalMessages"], 6);
+            if rows.len() == 6 {
+                assert_eq!(snapshot["truncated"], false, "nothing was evicted");
+                continue;
+            }
             assert_eq!(snapshot["truncated"], true);
             let older = intent_services::pagination::page_window(
                 5,
@@ -6825,4 +6837,101 @@ mod visible_workspace_seed_tests {
             visible_workspace_seed(&SeedApi { fail: true }, &page, Some("token"), false).await;
         assert_eq!(ids(&seed), ["ws-1"]);
     }
+}
+
+// --- Single-message bound on live chat deltas (§7.1) ----------------------
+
+/// Full mode: once a live text block's accumulated text passes the page
+/// budget, every chunk delta carries the snapshot's preview shape instead of
+/// the whole text, so each chunk frame stays within the read budget.
+#[test]
+fn full_mode_text_chunk_past_budget_sends_the_cut_marker() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let mut s = ChatDeltaState::new(
+        &agent(),
+        DeltaEncoding::Full,
+        Some(ConversationProjection::Slim),
+    );
+    let piece = "t".repeat(64 * 1024);
+    let mut total = 0;
+    for _ in 0..10 {
+        let d = s
+            .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(piece)))
+            .expect("chunk delta");
+        total += piece.len();
+        let frame = build_delta_push("sub-1", 1, &d);
+        assert!(
+            frame.len() <= intent_transport_read_budget(),
+            "chunk frame {} bytes over budget",
+            frame.len()
+        );
+        let entity = d["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(d["updated"].as_array().unwrap())
+            .next()
+            .unwrap();
+        let block = &entity["block"];
+        if total > SLIM_PAGE_BUDGET_BYTES {
+            assert_eq!(block["textTruncated"], true);
+            assert_eq!(block["textBytes"], total);
+            assert_eq!(
+                block["text"].as_str().unwrap().len(),
+                SLIM_PROJECTION_BUDGET_BYTES
+            );
+        } else {
+            assert_eq!(block["text"].as_str().unwrap().len(), total);
+            assert!(block.get("textTruncated").is_none());
+        }
+    }
+    assert!(total > 600 * 1024);
+}
+
+fn intent_transport_read_budget() -> usize {
+    crate::catalog::READ_PAYLOAD_BUDGET_BYTES
+}
+
+/// A delta that fits is returned unchanged; an oversized one is split into
+/// deltas that each fit, keeping entity order and buckets, with `removedIds`
+/// on the last one.
+#[test]
+fn split_chat_delta_bounds_every_part_and_keeps_order() {
+    let small = json!({ "added": [{ "block": { "id": "a" } }], "updated": [], "removedIds": [] });
+    assert_eq!(split_chat_delta(small.clone(), 480_000), vec![small]);
+
+    let body = "x".repeat(2_000);
+    let entity =
+        |i: usize| json!({ "messageId": "m", "block": { "id": format!("m:{i}"), "output": body } });
+    let added: Vec<Value> = (0..150).map(entity).collect();
+    let updated: Vec<Value> = (150..400).map(entity).collect();
+    let delta = json!({ "added": added, "updated": updated, "removedIds": ["m:999"] });
+    let parts = split_chat_delta(delta, 480_000);
+    assert!(parts.len() > 1);
+    let mut ids = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        assert!(intent_services::pagination::serialized_size(part) <= 480_000);
+        let last = i == parts.len() - 1;
+        assert_eq!(
+            part["removedIds"],
+            if last { json!(["m:999"]) } else { json!([]) }
+        );
+        for e in part["added"].as_array().unwrap() {
+            let id = e["block"]["id"].as_str().unwrap().to_string();
+            let n: usize = id[2..].parse().unwrap();
+            assert!(n < 150, "added entities stay added");
+            ids.push(n);
+        }
+        for e in part["updated"].as_array().unwrap() {
+            let id = e["block"]["id"].as_str().unwrap().to_string();
+            let n: usize = id[2..].parse().unwrap();
+            assert!(n >= 150, "updated entities stay updated");
+            ids.push(n);
+        }
+    }
+    assert_eq!(
+        ids,
+        (0..400).collect::<Vec<_>>(),
+        "every entity once, in order"
+    );
 }

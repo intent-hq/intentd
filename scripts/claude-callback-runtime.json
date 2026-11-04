@@ -1,15 +1,15 @@
 {
   "archive_format": "gzip mtime0 filename empty level6; PAX tar sorted paths uid/gid/mtime0 uname/gname empty",
   "artifact": {
-    "bytes": 257668229,
-    "identity": "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597",
-    "manifest_sha256": "6bb9e9870a2268114f1fe6281ffc0bc06cc07edb8fa3abd8367d4949492ab098",
-    "sha256": "6a746cba7099fb6c5d0ed406376ce518b09ead204b63aa15a183863fa9b5852d"
+    "bytes": 257668333,
+    "identity": "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1",
+    "manifest_sha256": "e0f2dbba8ea948c8986e60845187bb4dda81eda3fede18ba3ae77bc25768fdb0",
+    "sha256": "7810ef655aee3a1dc6c4eb406d3d32a50d87c9c501d3cdd340ea9caf93d0775f"
   },
   "format": "intent-claude-runtime-descriptor-v1",
   "identity_contract": "SHA256(canonical inventory JSON + newline). manifest.json is the separately hashed envelope {identity,inventory}, never a member of its own inventory. The deterministic gzip/PAX archive digest below is an external pin. Only this adjacent descriptor is trusted.",
   "inputs": {
-    "fixture_manifest_sha256": "025d3bb6287fe5ae9334d675edc2f605e64c5af0aadabee3d90e26bd4d7e665c",
+    "fixture_manifest_sha256": "b8b945a1ee78a7eb10b5954b31751fbb4ce8b1494a98b53971fb899b46c454ae",
     "lock_sha256": "818dfaa3a07e5585c850cee35d86e69cb86932fd6c9f245c6851e3fd3c208da4",
     "node": {
       "bytes": 126595440,
@@ -32398,7 +32398,7 @@
       "published_parent_sha256": "60326dd11884e968259bd9e3650ec60980d6507a18d1c58d3d9b447d3b8069e6",
       "source_archive_sha256": "550cf7857583e2503fa54b09d5f4e5b000afe1837484c772b3115d93bd549543",
       "source_head": "315e7260e9c6b6721a73ad568a114b9b3794fd28",
-      "source_tree": "953cd7145401c03605f69b7d740e6a532d04e90e",
+      "source_tree": "02471690bca9df2b855843ac0d89dce236133009",
       "upstream_gitHead": "b264b52bee80e49f20caf1941f7d7cb89edb80c4"
     },
     "system_libraries": [

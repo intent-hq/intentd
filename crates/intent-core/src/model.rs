@@ -2677,6 +2677,18 @@ pub struct TaskListResult {
     pub stats: WorkspaceTaskStats,
 }
 
+/// A paged `task.list` reply (`limit` / `nextToken`): one bounded page of
+/// `WorkspaceTask` rows in `(createdAt, id)` order, the unchanged
+/// workspace-wide `stats`, and the token for the rest (`None` on the last
+/// page).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListPage {
+    pub tasks: Vec<serde_json::Value>,
+    pub stats: WorkspaceTaskStats,
+    pub next_token: Option<String>,
+}
+
 /// Result of `task.markAsTask`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3281,15 +3293,13 @@ pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 /// to multiple MB (observed: 3,672 capped blocks → 2.87MB frame). A slim
 /// `agent.getConversation` page (and the seq-0 chat snapshot that reuses it)
 /// stops early once its cumulative serialized size would exceed this budget,
-/// re-minting the continuation token at the first excluded message — so the
-/// worst-case slim frame is this budget plus one message's slim size. That
-/// stays under the transport's 1 MiB large-frame warn for typical messages,
-/// but is NOT a hard bound: per-message slim size is unbounded (blocks are
-/// capped individually, block count is not), so a single block-heavy message
-/// can exceed the warn alone — which the at-least-one-message floor accepts
-/// by design, degrading to one whole message per page rather than an
-/// unpageable transcript. Serve-time only; the full (absent-projection) read
-/// is never budgeted.
+/// re-minting the continuation token at the first excluded message. The page
+/// always serves at least one message; a message that alone is over budget
+/// is cut to fit (`intent_services::tool_block::fit_oversized_slim_row`:
+/// text previews with `textTruncated`, then `bodyOmitted` block stubs, all
+/// still readable through `agent.getMessageBlock`), so the page stays within
+/// the budget. Serve-time only; the full (absent-projection) read is never
+/// budgeted.
 ///
 /// Sized at 480,000 bytes like the other bounded reads, so a whole page's
 /// JSON-RPC frame — the messages plus their separators, the result fields
@@ -4164,7 +4174,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.7";
+pub const CURRENT_HARNESS_VERSION: &str = "3.8";
 
 /// Harness versions that receive repository guidance, oldest first. The single
 /// source for every admission gate and boundary test: bumping
@@ -4172,14 +4182,15 @@ pub const CURRENT_HARNESS_VERSION: &str = "3.7";
 /// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`]), and the compile-time
 /// check below fails the build until that is done. Exact strings only, so
 /// malformed or unknown stamps are never admitted.
-pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
+pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
+    "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8",
+];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
+    &["3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8"];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());

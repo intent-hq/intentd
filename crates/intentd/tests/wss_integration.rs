@@ -9777,7 +9777,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","name":"WSS Wide","#,
-            r#""model":"sonnet4.5","provider":"auggie","specialistId":"implementor","#,
+            r#""model":"sonnet4.5","provider":"auggie","specialistId":"developer","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
             r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
@@ -9804,7 +9804,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(created["model"].as_str(), Some("sonnet4.5"));
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
-    assert_eq!(created["metadata"]["specialist"], "implementor");
+    assert_eq!(created["metadata"]["specialist"], "developer");
     assert_eq!(
         created["metadata"]["isBackground"], true,
         "isBackground must persist and be served on the projection: {}",
@@ -18772,7 +18772,8 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
 /// so absent-projection reads get the same budget.
 #[intent_test_macros::daemon_test]
 async fn wss_slim_conversation_pages_are_byte_budgeted() {
-    use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
@@ -18843,12 +18844,11 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         )
         .await;
         let frame_bytes = serde_json::to_string(&page["result"]).unwrap().len();
-        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; allow
-        // budget + one message of headroom, still far under the old
-        // multi-MB frames and the transport's 1 MiB warn threshold.
+        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; the
+        // page budget keeps the whole frame within the read budget.
         assert!(
-            frame_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
-            "slim frame bounded by budget + one message: {frame_bytes}"
+            frame_bytes <= READ_PAYLOAD_BUDGET_BYTES,
+            "slim frame within the read budget: {frame_bytes}"
         );
         let msgs = page["result"]["messages"].as_array().expect("messages");
         assert!(!msgs.is_empty(), "budgeted pages are never empty");
@@ -18882,7 +18882,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     .await;
     let snap_bytes = serde_json::to_string(&snap).unwrap().len();
     assert!(
-        snap_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+        snap_bytes <= READ_PAYLOAD_BUDGET_BYTES,
         "slim seq-0 snapshot bounded: {snap_bytes}"
     );
     assert!(
@@ -19050,6 +19050,225 @@ async fn wss_slim_conversation_frames_fit_read_payload_budget() {
             "snapshot serves the newest bounded page"
         );
     }
+
+    srv.ws.stop().await;
+}
+
+/// Single-row bound over the real WSS wire (§5.5): a message whose text
+/// alone is over the page budget, and one whose ~300 capped tool blocks are,
+/// are each served cut down to fit — a text preview with `textTruncated` /
+/// `textBytes`, and contiguous newest-last `bodyOmitted` stubs that keep
+/// their ids — so every `agent.getConversation` page (`limit: 10000`,
+/// `aroundIndex`, `aroundMessageId`) and `chat.subscribe` seq-0 push (full
+/// and incremental) stays within the 500 KiB read budget, and
+/// `agent.getMessageBlock` still rebuilds the full text and any stubbed block.
+#[intent_test_macros::daemon_test]
+async fn wss_single_over_budget_row_is_cut_to_fit_read_payload_budget() {
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Huge"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Huge"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // seq 0: small; seq 1: one 600 KB text block; seq 2: ~300 large
+    // tool_result blocks (each capped at ~2KB, ~650 KB in aggregate); seq 3:
+    // small.
+    let huge_text: String = (0..600_000u32)
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).unwrap()))
+        .collect();
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let tool_blocks: Vec<serde_json::Value> = (0..300)
+        .map(|p| {
+            json!({ "type": "tool_result", "id": format!("tool:{p}"),
+                "tool_use_id": format!("tc-{p}"), "output": big, "is_error": false })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for (role, blocks) in [
+        (
+            "user",
+            json!([{ "type": "text", "id": "s0", "text": "hello" }]),
+        ),
+        (
+            "assistant",
+            json!([{ "type": "text", "id": "huge", "text": huge_text }]),
+        ),
+        ("assistant", json!(tool_blocks)),
+        (
+            "user",
+            json!([{ "type": "text", "id": "s3", "text": "bye" }]),
+        ),
+    ] {
+        let row = srv
+            .store
+            .append_agent_message(&agent, role, &blocks, &now_iso())
+            .await
+            .expect("append message");
+        ids.push(row.id);
+    }
+
+    let assert_frame = |label: &str, frame: &str| {
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "{label}: frame {} bytes exceeds the {READ_PAYLOAD_BUDGET_BYTES}-byte read budget",
+            frame.len()
+        );
+    };
+    let call = |id: u32, params: String| {
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            wss_call_text(
+                port,
+                cfg,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.getConversation","params":{params}}}"#
+                ),
+            )
+            .await
+        }
+    };
+
+    // nextToken walk at the maximum limit: every frame fits and every row
+    // is served exactly once.
+    let mut by_id = std::collections::HashMap::new();
+    let mut token: Option<String> = None;
+    loop {
+        let token_field = token
+            .as_ref()
+            .map(|t| format!(r#","nextToken":"{t}""#))
+            .unwrap_or_default();
+        let frame = call(
+            3,
+            format!(r#"{{"agentId":"{agent_id}","limit":10000{token_field}}}"#),
+        )
+        .await;
+        assert_frame("getConversation page", &frame);
+        let page: Value = serde_json::from_str(&frame).expect("json");
+        for m in page["result"]["messages"].as_array().expect("messages") {
+            let id = m["id"].as_str().unwrap().to_string();
+            assert!(by_id.insert(id, m.clone()).is_none(), "no duplicates");
+        }
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+        assert!(by_id.len() <= 4, "walk terminates");
+    }
+    assert_eq!(by_id.len(), 4, "no gaps");
+
+    let text_row = &by_id[&ids[1]];
+    let text_block = &text_row["contentBlocks"][0];
+    assert_eq!(text_block["textTruncated"], true);
+    assert_eq!(text_block["textBytes"], 600_000);
+    assert!(huge_text.starts_with(text_block["text"].as_str().unwrap()));
+
+    let tool_row = &by_id[&ids[2]];
+    let blocks = tool_row["contentBlocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 300, "every block keeps its slot");
+    let first_stub = blocks
+        .iter()
+        .position(|b| b["bodyOmitted"] == true)
+        .expect("block count overflow stubs the newest blocks");
+    assert!(first_stub > 0);
+    for (i, b) in blocks.iter().enumerate() {
+        assert_eq!(b["id"], format!("tool:{i}"), "ids and order kept");
+        assert_eq!(
+            b["bodyOmitted"] == true,
+            i >= first_stub,
+            "stubs are one tail run"
+        );
+    }
+
+    // Seeks centred on each oversized row.
+    for (id, seek) in [
+        (4, r#""aroundIndex":1"#.to_string()),
+        (5, format!(r#""aroundMessageId":"{}""#, ids[2])),
+    ] {
+        let frame = call(
+            id,
+            format!(r#"{{"agentId":"{agent_id}","limit":10000,{seek}}}"#),
+        )
+        .await;
+        assert_frame("getConversation seek", &frame);
+    }
+
+    // chat.subscribe seq-0 snapshots, full and incremental.
+    for (id, extra) in [(6, ""), (7, r#","deltaEncoding":"incremental""#)] {
+        let frame = chat_subscribe_snapshot_frame(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"chat.subscribe","params":{{"agentId":"{agent_id}","limit":200{extra}}}}}"#
+            ),
+            id,
+        )
+        .await;
+        assert_frame("chat.subscribe snapshot", &frame);
+    }
+
+    // The full text and a stubbed block are still readable by id.
+    let mut joined = String::new();
+    let mut offset: Option<u64> = None;
+    loop {
+        let offset_field = offset
+            .map(|o| format!(r#","offset":{o}"#))
+            .unwrap_or_default();
+        let frame = wss_call_text(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{}","blockId":"huge"{offset_field}}}}}"#,
+                ids[1]
+            ),
+        )
+        .await;
+        assert_frame("getMessageBlock page", &frame);
+        let r: Value = serde_json::from_str(&frame).expect("json");
+        joined.push_str(r["result"]["block"]["text"].as_str().expect("text slice"));
+        match r["result"]["nextOffset"].as_u64() {
+            Some(n) => offset = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(joined, huge_text, "getMessageBlock rebuilds the full text");
+    let stub = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{}","blockId":"tool:299"}}}}"#,
+            ids[2]
+        ),
+    )
+    .await;
+    assert_eq!(
+        stub["result"]["block"]["output"], big,
+        "stubbed block is readable"
+    );
 
     srv.ws.stop().await;
 }
@@ -19503,8 +19722,8 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
         "metadata is projected to the classification fields"
     );
     assert!(
-        result.get("nextToken").is_none(),
-        "unpaged reads keep the pre-paging shape: {result}"
+        result["nextToken"].is_null() && result.get("nextToken").is_some(),
+        "default reads are paged; a complete page ends with nextToken null: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -19644,8 +19863,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
         ),
     )
     .await;
+    assert_eq!(
+        null_token["result"]["total"], 3,
+        "a null nextToken reads as absent (the newest page): {null_token}"
+    );
     assert!(
-        null_token["result"].get("nextToken").is_none(),
+        null_token["result"]["nextToken"].is_null(),
         "a null nextToken reads as absent: {null_token}"
     );
 

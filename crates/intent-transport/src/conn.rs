@@ -12,7 +12,9 @@
 use intent_core::events::{
     AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED,
 };
-use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
+};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -2798,10 +2800,15 @@ async fn chat_subscription_loop(
                     if !drained {
                         return "client_closed";
                     }
-                    let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
-                    seq += 1;
-                    if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
-                        return "client_closed";
+                    // Single-message bound (§7.1): a terminal reconcile or
+                    // row delta for a large row is split so each frame
+                    // stays within the read budget.
+                    for part in subscriptions::split_chat_delta(delta, SLIM_PAGE_BUDGET_BYTES) {
+                        let frame = subscriptions::build_delta_push(&subscription_id, seq, &part);
+                        seq += 1;
+                        if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
+                            return "client_closed";
+                        }
                     }
                 }
             }
@@ -3033,8 +3040,11 @@ async fn forward_channel_subscription(
         snapshot_next_token = Some(next_token);
         page
     } else if channel == Channel::Task {
-        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
+        // Bounded reads: the task snapshot is the first `task.list` page.
+        let (snapshot, links, next_token) =
+            subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
         spec_links = links;
+        snapshot_next_token = Some(next_token);
         snapshot
     } else if channel == Channel::Workspace {
         subscriptions::workspace_snapshot(api.as_ref(), include_retired)

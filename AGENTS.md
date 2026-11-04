@@ -82,6 +82,7 @@ only on `intent-services`, never on `intent-store`.
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
 | writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, token reader `tokenize` / `Statement::tokens` with bracket depth and `matching_close` / `skip_group`, file walker, test-code discovery `test_code_files` / `TestCodeText` for a rule that applies only to test code, `read_count_baselines` / `write_count_baselines` for a ratchet baseline kept as one `<crate>.txt` per crate, so PRs fixing different crates never conflict); "Gates → source lints" below |
 | CI release / workflow scripts (`scripts/test-*` in ci.yml's `release-scripts` job) | `make test-release-scripts` (from `packages/intentd`; `make -C packages/intentd test-release-scripts` at the monorepo root) runs every test that job runs, in CI order, and skips suites that need CI-only tooling (release-plz, sccache, cargo-dist) with "SKIP <suite>: needs <X>" — a skipped suite is unverified, so install the tool when your change touches it; run it before pushing a change to `.github/workflows/*.yml` or `scripts/` (CI Gate's job list is pinned by `test-retire-obsolete-merge-runs-workflow.py`, intentd#2499) |
+| a `.github/workflows/*.yml` edit (YAML, expressions, `run:` shell) | `make lint-workflows` (from `packages/intentd`) runs the pinned actionlint with shellcheck, as ci.yml's `release-scripts` job does on PRs and in the merge queue; main is clean, so fix any finding or add a path- and message-scoped ignore with its reason to `.github/actionlint.yaml` (an inline `# shellcheck disable=` for one intentional line). No local actionlint? `bash scripts/lint-workflows.sh --install DIR` fetches the checksum-verified pin |
 | a fake Codex/Claude CLI in a test | `intent_providers::test_support::current_cli_version` / `current_cli_script` (enable the intent-providers `test-support` feature from `[dev-dependencies]`); keep a literal version only for tests about that exact version, marked for `cli_fixture_version_lint` |
 | a test that needs a provider "installed", or passes locally but fails on CI with "not installed" | `crates/intent-services/src/test_support/provider_installed.rs` (mark a provider installed; Codex and Claude Code ignore `providers.paths` overrides, so `/bin/sh` overrides do nothing); `scripts/test-without-provider-clis.sh <command>` runs tests with every provider CLI hidden, the way CI's runners lack them (Linux, needs `bwrap`; CI's `check` job asserts its runners have none) |
 | a test that fails only on a busy host, a flake fix to prove, or "is this CI failure mine?" | `make test-stress E='<nextest filterset>' COUNT=200 LOAD=1` (see the root guide → Resuming local Rust gates); run it before and after a fix for comparable evidence |
@@ -280,6 +281,7 @@ make test-select E='test(/name/)'  # just the tests matching one nextest filters
 make coverage-changed  # the changed selection under cargo llvm-cov (DRY_RUN=1 prints the plan) — CI's coverage-changed job
 make gate     # check, then test
 make check-windows  # cargo check + clippy for x86_64-pc-windows-gnu (needs MinGW-w64), like CI's windows-cross-lint; see below
+make check-macos    # cargo check + clippy for aarch64-apple-darwin from Linux (stub C compiler), like CI's macos-cross-lint; see below
 python3 -I -B scripts/check-rdeps-parity.py  # (from packages/intentd) changed-tests.sh's Cargo.toml scanner must match cargo metadata (CI check job)
 ```
 
@@ -309,14 +311,16 @@ clean there and still fail Windows Clippy (an import that only `cfg(unix)` code 
 CI's `windows-cross-lint` job runs the same check on every PR and merge-queue entry, on Linux, so
 a local run only saves a push round trip; the push-only `windows` job is the native MSVC check.
 
-macOS has no PR-time or local equivalent: CI's native macOS check and Clippy run only in
-the merge queue, and `cargo clippy --target aarch64-apple-darwin` fails on Linux in the C
-build scripts. Before enqueueing an integration branch or a PR that adds or changes
-`cfg(target_os = …)` / `cfg(unix)` / `cfg(windows)` code, add the `ci:macos` label (or
-`gh workflow run macos-preflight.yml --ref main -f ref=<branch-or-sha>`): the advisory
-`macOS preflight` workflow runs the queue's macOS check and Clippy on the PR head, then
-again on each push while the label stays. It is opt-in because macOS minutes are paid; a
-macOS-only `unused_async` ejected intentd#2910 from the queue.
+macOS works the same way on PRs: CI's `macos-cross-lint` job runs the check and Clippy for
+`aarch64-apple-darwin` on Linux for every PR, with `scripts/macos-lint-cc.sh` standing in for
+the darwin C compiler the -sys build scripts call (check/clippy never link, so empty objects
+suffice). `make check-macos` runs the same thing locally on a Linux host. A macOS-only
+`unused_async` ejected intentd#2910 and intentd#3002 from the queue before this job existed.
+The queue's native macOS check and Clippy remain the final authority (real SDK headers). To
+get that native signal on a PR head before queueing — a change to the -sys crates, build
+scripts or C dependencies, where the stub compiler proves nothing — add the `ci:macos` label
+(or `gh workflow run macos-preflight.yml --ref main -f ref=<branch-or-sha>`): the advisory,
+opt-in (paid minutes) `macOS preflight` workflow runs the queue's macOS check and Clippy.
 
 The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
 integration test is a source-scanning lint, selected by convention — run them all with

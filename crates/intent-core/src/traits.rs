@@ -23,10 +23,11 @@ use crate::model::{
     NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
     ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceListFilter, WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    TaskGetMyTaskResult, TaskListPage, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceListFilter, WorkspaceSetupStatus,
+    WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -1838,6 +1839,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Paged `task.list` (`limit` / `nextToken`, bounded reads): one page of
+    /// the [`Self::task_list`] rows in `(createdAt, id)` order under the
+    /// read budget, plus the same `stats` and the `nextToken` for the rest.
+    /// The `task.subscribe` seq-0 snapshot's token pages on through it.
+    fn task_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+        page: crate::note_read_bounds::PageRequest,
+    ) -> BoxFuture<'_, Result<TaskListPage>> {
+        let _ = (workspace_id, status, page);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_list_page not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `task.get`: project a single task note into a `WorkspaceTask` (PROTOCOL
     /// §5.4). Errors with `NotFound` when the note is absent/cross-workspace and
     /// `Internal` when the note carries no task metadata.
@@ -2261,12 +2280,13 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.listUserMessages`: user-role messages of an agent as
     /// lightweight index items, oldest→newest —
     /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total,
-    /// nextToken? }` (PROTOCOL §5.5). `preview` is the extracted plain text
+    /// nextToken }` (PROTOCOL §5.5). `preview` is the extracted plain text
     /// bounded to `preview_chars` characters (`None` → server default,
     /// server-clamped); `metadata` is the row metadata projected to its
-    /// classification fields when any survive. With `limit` or `next_token`
-    /// the read is paged newest-first and the result carries `nextToken`
-    /// (`null` once no older rows remain). Non-user rows are never included.
+    /// classification fields when any survive. Every read is paged
+    /// newest-first (`limit` default 100, max 500, plus a 480,000-byte
+    /// items budget) and carries `nextToken` (`null` once no older rows
+    /// remain). Non-user rows are never included.
     /// Bounded cost: one role-filtered SQL read whose previews and metadata
     /// are trimmed inside SQL — full content and metadata blobs never leave
     /// the database and the transcript is never hydrated. `NotFound` on an
@@ -7907,7 +7927,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `search.notes`: ranked full-text search across visible workspaces, with
     /// optional hard scope and soft preference. Always returns inline
-    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
+    /// `{ requestId, matches: NoteMatch[], indexed: true, nextToken }`, one
+    /// page of at most `limit` hits (default 50, max 200) within 480,000
+    /// bytes; `nextToken` continues the ranked list (PROTOCOL §5.15).
+    #[expect(clippy::too_many_arguments)]
     fn search_notes(
         &self,
         query: String,
@@ -7916,6 +7939,7 @@ pub trait WorkspaceApi: Send + Sync {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             query,
@@ -7924,6 +7948,7 @@ pub trait WorkspaceApi: Send + Sync {
             limit,
             include_archived,
             request_id,
+            next_token,
         );
         Box::pin(async {
             Err(Error::Internal(

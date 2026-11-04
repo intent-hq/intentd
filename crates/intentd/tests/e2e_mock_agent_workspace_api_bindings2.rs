@@ -588,7 +588,7 @@ async fn agent_bindings_list_specialists() {
         }
     }
     assert!(
-        rows.iter().any(|r| r["id"] == "implementor"),
+        rows.iter().any(|r| r["id"] == "developer"),
         "bundled tier listed"
     );
     let pinned = rows

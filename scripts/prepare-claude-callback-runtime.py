@@ -30,7 +30,7 @@ import tempfile
 
 
 DESCRIPTOR = Path(__file__).with_name("claude-callback-runtime.json")
-DESCRIPTOR_SHA256 = "592a378105c930444b42ecd2e52bf5c6a017a5539dfe69ef7a94fb570ac9588d"
+DESCRIPTOR_SHA256 = "0f3d23023f1f7be72fcf42a56eda39ee1c0ae50a0deb3579939579bed2d332f6"
 FIXTURE_MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "crates/intent-acp/tests/fixtures/claude-callback-files.json"

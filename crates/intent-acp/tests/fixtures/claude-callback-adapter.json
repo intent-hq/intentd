@@ -709,10 +709,10 @@
         "sha256": "bc20adc1a3e1ce4294d1b8a044e5e1857a03c9adc64ca490da1c7be81219b37b"
       },
       "tests/mcp-peer.mjs": {
-        "bytes": 4203,
-        "git_blob": "e6d164b848acfb8da154929472743d4b1be79316",
+        "bytes": 4322,
+        "git_blob": "bff9c745c6fe2177e2ee1ac47b2ebb49e038adfd",
         "mode": "100644",
-        "sha256": "a3b77f7bac7ffa17feab00074ad91276950c1a2a36fea2fe98f788c10c8a7549"
+        "sha256": "556fc0ac85d4fef0498a2573cb965ef07e3c7410d5cb18f2cdf17e078b874d69"
       },
       "tests/run-hermetic.mjs": {
         "bytes": 3603,
@@ -740,7 +740,7 @@
       }
     },
     "local_archive_baseline": "6029fde6f70a82be4871fecb9c7b35816cd0146f",
-    "tree": "953cd7145401c03605f69b7d740e6a532d04e90e",
+    "tree": "02471690bca9df2b855843ac0d89dce236133009",
     "upstream_git_head": "b264b52bee80e49f20caf1941f7d7cb89edb80c4"
   },
   "expected_payload_entries": 6367,
@@ -755,7 +755,7 @@
   "manifest": {
     "bytes": 1319326,
     "file": "claude-callback-files.json",
-    "sha256": "025d3bb6287fe5ae9334d675edc2f605e64c5af0aadabee3d90e26bd4d7e665c"
+    "sha256": "b8b945a1ee78a7eb10b5954b31751fbb4ce8b1494a98b53971fb899b46c454ae"
   },
   "pack": {
     "entries": {
@@ -1438,9 +1438,9 @@
     "sha256": "84af59d66f97bde126a8d57fe41739b0b552f9aa73642203bb009f22cdd39b14"
   },
   "patch": {
-    "bytes": 52557,
+    "bytes": 52678,
     "file": "claude-callback-canonical.patch",
-    "sha256": "0528aa86b455066d26b1e9388eb164ba564c74f0a38b1a82af671e912471b0cd"
+    "sha256": "ac014a224ed12ba6f8c2878a45fb4c68f51961b6d60db3f5649d1d8052b0d924"
   },
   "platform": "linux",
   "source": {

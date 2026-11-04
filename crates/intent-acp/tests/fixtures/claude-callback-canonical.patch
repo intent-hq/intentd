@@ -952,10 +952,10 @@ index 0000000..a755271
 +});
 diff --git a/tests/mcp-peer.mjs b/tests/mcp-peer.mjs
 new file mode 100644
-index 0000000..e6d164b
+index 0000000..bff9c74
 --- /dev/null
 +++ b/tests/mcp-peer.mjs
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,128 @@
 +import { createServer, connect } from "node:net";
 +import { createInterface } from "node:readline";
 +
@@ -1065,6 +1065,8 @@ index 0000000..e6d164b
 +    socket.once("error", reject);
 +  });
 +  socket.on("error", () => {});
++  const token = config.env?.INTENTD_MCP_BRIDGE_TOKEN;
++  if (token) socket.write(`intentd-mcp-bridge-auth ${token}\n`);
 +  const rpc = new RpcLines(socket, socket);
 +  await rpc.request("initialize", {
 +    protocolVersion: "2024-11-05",

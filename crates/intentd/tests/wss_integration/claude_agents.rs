@@ -991,6 +991,12 @@ async fn claude_agents_preserve_native_aliases_in_catalogs_and_creation() {
         "aliases: [\"review-alias\"]\n",
         "Native prompt.",
     );
+    write_agent(
+        &home.join(".intent/specialists/spec-writer.md"),
+        "Custom coordinator",
+        "aliases: [\"coordinator\"]\n",
+        "Custom planning prompt.",
+    );
     std::fs::create_dir_all(&project).unwrap();
     let (daemon, port, cfg) = boot(dir.path(), &home).await;
     let mut client = connect_ws(port, cfg).await;

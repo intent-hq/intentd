@@ -126,7 +126,7 @@ pub use host_membership_repo::{
     OwnerQueuePermit,
 };
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
-pub use note_search_repo::{NoteFtsMatch, NoteFtsOptions};
+pub use note_search_repo::{NoteFtsCursor, NoteFtsMatch, NoteFtsOptions};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{

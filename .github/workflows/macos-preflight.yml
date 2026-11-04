@@ -3,6 +3,9 @@
 # signal and runs only on merge_group and main pushes, so a long-lived branch
 # could reach the queue never having been compiled for macOS: intentd#2910 was
 # ejected for a macOS-only `clippy::unused_async` (fixed by intentd#2934).
+# ci.yml's PR-time `macos-cross-lint` now catches that class on every PR from
+# Linux (stub C compiler); this native run remains the way to check a PR head
+# against the real SDK, e.g. for a change to C dependencies or build scripts.
 #
 # Never automatic, so ordinary PRs spend no paid macOS minutes:
 # - add the `ci:macos` label to a same-repo PR: it runs now and again on each

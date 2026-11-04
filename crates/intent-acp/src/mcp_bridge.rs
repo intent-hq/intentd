@@ -49,6 +49,68 @@ pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 /// Capacity of the per-connection response channel feeding the writer task.
 const RESPONSE_CHANNEL_CAPACITY: usize = 32;
 
+/// Environment variable carrying a listener's per-agent bridge secret to the
+/// `intentd mcp-bridge` subcommand (and the pi extension). The secret travels
+/// through the child environment, never argv, so other local users cannot
+/// read it from the process list.
+pub const BRIDGE_TOKEN_ENV: &str = "INTENTD_MCP_BRIDGE_TOKEN";
+
+/// Prefix of the authentication line every bridge connection must send first.
+/// Not JSON, so it can never be mistaken for a JSON-RPC frame.
+const BRIDGE_AUTH_PREFIX: &str = "intentd-mcp-bridge-auth ";
+
+/// How long a fresh connection may take to present its authentication line.
+const BRIDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A fresh 256-bit bridge secret, lowercase hex.
+fn new_bridge_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// The authentication line a client sends before any JSON-RPC frame.
+#[must_use]
+pub fn bridge_auth_line(token: &str) -> String {
+    format!("{BRIDGE_AUTH_PREFIX}{token}\n")
+}
+
+/// Read the authentication line straight off the socket, one byte at a time
+/// and never past `max` bytes, so an unauthenticated peer cannot grow memory
+/// with an endless first line and no later frame is buffered before admission.
+async fn read_auth_line<R: AsyncRead + Unpin>(read: &mut R, max: usize) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut line = Vec::with_capacity(max);
+    let mut byte = [0_u8; 1];
+    loop {
+        if read.read(&mut byte).await.ok()? != 1 {
+            return None;
+        }
+        if byte[0] == b'\n' {
+            return String::from_utf8(line).ok();
+        }
+        if line.len() >= max {
+            return None;
+        }
+        line.push(byte[0]);
+    }
+}
+
+/// Length-checked, constant-time comparison of a received first line against
+/// the listener's secret.
+fn bridge_auth_matches(line: &str, token: &str) -> bool {
+    let Some(presented) = line.trim_end_matches('\r').strip_prefix(BRIDGE_AUTH_PREFIX) else {
+        return false;
+    };
+    let (a, b) = (presented.as_bytes(), token.as_bytes());
+    if token.is_empty() || a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Watchdog deadline for a single dispatched request (monorepo#2709). The
 /// dispatch future runs in its own task and the deadline is enforced from the
 /// per-request task via `select!`, so it fires even when the dispatch is
@@ -129,6 +191,7 @@ pub struct McpBridge {
     addr: SocketAddr,
     task: JoinHandle<()>,
     guidance_endpoint: ConnectionToken,
+    token: Arc<str>,
 }
 
 impl McpBridge {
@@ -142,6 +205,28 @@ impl McpBridge {
     #[must_use]
     pub fn connect_addr(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
+    }
+
+    /// The per-listener secret a client must present as its first line
+    /// ([`bridge_auth_line`]). Hand it to the bridge child through
+    /// [`BRIDGE_TOKEN_ENV`], never on its command line.
+    #[must_use]
+    pub fn auth_token(&self) -> &str {
+        &self.token
+    }
+
+    /// Connect to this listener and authenticate, for in-process clients and
+    /// tests. The `intentd mcp-bridge` subprocess authenticates the same way
+    /// with the secret it reads from [`BRIDGE_TOKEN_ENV`].
+    ///
+    /// # Errors
+    /// Returns the connect or write error.
+    pub async fn connect(&self) -> std::io::Result<TcpStream> {
+        let mut stream = TcpStream::connect(self.addr).await?;
+        stream
+            .write_all(bridge_auth_line(&self.token).as_bytes())
+            .await?;
+        Ok(stream)
     }
 
     /// Test-only: handle to the accept-loop task so tests can await abort
@@ -191,6 +276,10 @@ pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
 ) -> std::io::Result<McpBridge> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
+    // Loopback is shared by every local user and reachable cross-protocol, so
+    // a connection must prove it was handed this secret before any dispatch.
+    let token: Arc<str> = Arc::from(new_bridge_token());
+    let accept_token = token.clone();
     let endpoint = ConnectionLifetime::new();
     let guidance_endpoint = endpoint.token();
     // The captured guard also retires guidance if the accept loop exits on its own.
@@ -200,9 +289,11 @@ pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
                 Ok((stream, _peer)) => {
                     let server = server.clone();
                     let connection = ConnectionLifetime::for_endpoint(&endpoint.token());
+                    let token = accept_token.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            serve_connection(server, stream, dispatch_timeout, connection).await
+                            serve_connection(server, stream, dispatch_timeout, connection, &token)
+                                .await
                         {
                             tracing::debug!(error = %e, "mcp bridge connection ended");
                         }
@@ -219,6 +310,7 @@ pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
         addr,
         task,
         guidance_endpoint,
+        token,
     })
 }
 
@@ -255,14 +347,26 @@ async fn serve_connection<S: BridgeDispatch>(
     stream: TcpStream,
     dispatch_timeout: Duration,
     connection: ConnectionLifetime,
+    token: &str,
 ) -> std::io::Result<()> {
-    let (read, write) = stream.into_split();
+    let (mut read, write) = stream.into_split();
+    // The first line must be the listener's secret; anything else (a missing
+    // or oversized line, a JSON-RPC frame, an HTTP request head) closes the
+    // connection before a single message is dispatched.
+    let max = BRIDGE_AUTH_PREFIX.len() + token.len() + 1;
+    match tokio::time::timeout(BRIDGE_AUTH_TIMEOUT, read_auth_line(&mut read, max)).await {
+        Ok(Some(line)) if bridge_auth_matches(&line, token) => {}
+        _ => {
+            tracing::warn!("mcp bridge refused an unauthenticated connection");
+            return Ok(());
+        }
+    }
+    let mut lines = BufReader::new(read).lines();
     let (response_tx, response_rx) = mpsc::channel::<PreparedBridgeLine>(RESPONSE_CHANNEL_CAPACITY);
     let writer = tokio::spawn(write_responses(write, response_rx, connection.token()));
 
     let limiter = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let mut in_flight = JoinSet::new();
-    let mut lines = BufReader::new(read).lines();
     let result = loop {
         tokio::select! {
             // Reap finished request tasks as they complete — not only when
@@ -523,11 +627,20 @@ struct PendingRequest {
 ///
 /// Returns the underlying I/O error if reading stdin or writing stdout fails; connection drops to `addr` are retried, not surfaced.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
+    let token = std::env::var(BRIDGE_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty());
+    if token.is_none() {
+        tracing::warn!(
+            "{BRIDGE_TOKEN_ENV} is not set; the bridge listener will refuse this client"
+        );
+    }
     run_bridge(
         addr,
         tokio::io::stdin(),
         tokio::io::stdout(),
         BridgeRetryConfig::default(),
+        token,
     )
     .await
 }
@@ -539,15 +652,25 @@ pub(crate) async fn run_bridge<R, W>(
     input: R,
     output: W,
     cfg: BridgeRetryConfig,
+    token: Option<String>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let target = addr.to_string();
+    let auth = token.map(|t| Arc::<str>::from(bridge_auth_line(&t)));
     run_bridge_with(addr, input, output, cfg, move || {
         let target = target.clone();
-        async move { TcpStream::connect(&target).await }
+        let auth = auth.clone();
+        async move {
+            let mut stream = TcpStream::connect(&target).await?;
+            // Every (re)connect authenticates before forwarding any frame.
+            if let Some(auth) = auth {
+                stream.write_all(auth.as_bytes()).await?;
+            }
+            Ok(stream)
+        }
     })
     .await
 }

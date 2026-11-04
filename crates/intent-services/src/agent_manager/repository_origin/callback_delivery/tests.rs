@@ -523,8 +523,8 @@ impl Harness {
             resources.notifications = node.notes.clone();
         }
         child.session_mcp_servers = serde_json::from_value(json!([
-            {"name":"workspace-mcp","command":"fixture-mcp","args":[bridge.connect_addr()],"env":[]},
-            {"name":"user-kept","command":"fixture-mcp","args":[user.connect_addr()],"env":[]},
+            {"name":"workspace-mcp","command":"fixture-mcp","args":[bridge.connect_addr()],"env":[{"name":intent_acp::BRIDGE_TOKEN_ENV,"value":bridge.auth_token()}]},
+            {"name":"user-kept","command":"fixture-mcp","args":[user.connect_addr()],"env":[{"name":intent_acp::BRIDGE_TOKEN_ENV,"value":user.auth_token()}]},
         ])).unwrap();
         #[expect(
             clippy::used_underscore_binding,
@@ -589,6 +589,8 @@ impl Harness {
         .await
         .unwrap();
         servers[0]["args"] = json!([bridge.connect_addr()]);
+        servers[0]["env"] =
+            json!([{"name": intent_acp::BRIDGE_TOKEN_ENV, "value": bridge.auth_token()}]);
         let (mut child, _, _) = handle(origin.clone());
         {
             let mut resources = child
@@ -2548,8 +2550,8 @@ impl NativeHarness {
             resources.notifications = node.notes.clone();
         }
         child.session_mcp_servers = serde_json::from_value(json!([
-            {"name":"workspace-mcp","command":"fixture-mcp","args":[bridge.connect_addr()],"env":[]},
-            {"name":"user-kept","command":"fixture-mcp","args":[user.connect_addr()],"env":[]}
+            {"name":"workspace-mcp","command":"fixture-mcp","args":[bridge.connect_addr()],"env":[{"name":intent_acp::BRIDGE_TOKEN_ENV,"value":bridge.auth_token()}]},
+            {"name":"user-kept","command":"fixture-mcp","args":[user.connect_addr()],"env":[{"name":intent_acp::BRIDGE_TOKEN_ENV,"value":user.auth_token()}]}
         ]))
         .unwrap();
         #[expect(
@@ -2664,6 +2666,8 @@ impl NativeHarness {
         .await
         .unwrap();
         servers[0]["args"] = json!([bridge.connect_addr()]);
+        servers[0]["env"] =
+            json!([{"name": intent_acp::BRIDGE_TOKEN_ENV, "value": bridge.auth_token()}]);
         let (mut child, _, _) = handle(origin.clone());
         {
             let mut resources = child
@@ -8288,6 +8292,9 @@ class NormalQueryProcess extends ScriptedQueryProcess {
         const socket = connect(Number(match[1]), '127.0.0.1');
         await new Promise((resolve,reject)=>{socket.once('connect',resolve);socket.once('error',reject);});
         socket.on('error',()=>{});
+        const token = config.env?.INTENTD_MCP_BRIDGE_TOKEN;
+        assert.ok(token, 'the bridge secret rides in the server env');
+        socket.write(`intentd-mcp-bridge-auth ${token}\n`);
         const rpc = new RpcLines(socket,socket);
         await rpc.request('initialize',{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'normal-launch-scripted-native',version:'1'}});
         const tools = await rpc.request('tools/list');
@@ -9350,8 +9357,8 @@ mod genuine_native_startup {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::prelude::*;
 
-    const RUNTIME_ID: &str = "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597";
-    const MANIFEST_SHA: &str = "6bb9e9870a2268114f1fe6281ffc0bc06cc07edb8fa3abd8367d4949492ab098";
+    const RUNTIME_ID: &str = "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1";
+    const MANIFEST_SHA: &str = "e0f2dbba8ea948c8986e60845187bb4dda81eda3fede18ba3ae77bc25768fdb0";
     const BRIDGE_SHA: &str = "1f27c8d949c33878ee43e5d129d817f26cb985383d184be337599a9e9a8aad20";
     const LAUNCHER: &str = "/runtime/bin/claude-agent-acp";
     const BRIDGE: &str = "/bridge/intentd";

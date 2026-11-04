@@ -1006,6 +1006,33 @@ async fn bounded_note_list(
     Ok(json!({ "notes": rows, "nextToken": next }))
 }
 
+/// `task.list` (§5.4). Without `limit` / `nextToken` the reply is the whole
+/// list as before; with either it is one bounded page (bounded reads) as
+/// `{ tasks, stats, nextToken }`, the read the `task.subscribe` snapshot's
+/// `nextToken` continues through. Kept out of [`dispatch`] and awaited
+/// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
+async fn task_list(api: &dyn WorkspaceApi, params: &Map<String, Value>) -> Result<Value, RpcErr> {
+    let ws = require_ws_note(params)?;
+    let status = opt_str(params, "status");
+    let paged = ["limit", "nextToken"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|v| !v.is_null()));
+    if !paged {
+        let result = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
+        return Ok(json!({ "tasks": result.tasks, "stats": result.stats }));
+    }
+    let page = parse_page_request(
+        params,
+        intent_core::note_read_bounds::TASK_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::TASK_LIST_MAX_LIMIT,
+    )?;
+    let result = api
+        .task_list_page(ws, status, page)
+        .await
+        .map_err(domain_to_rpc)?;
+    Ok(json!({ "tasks": result.tasks, "stats": result.stats, "nextToken": result.next_token }))
+}
+
 /// `note.get` (bounded reads, §5.2). Kept out of [`dispatch`] and awaited
 /// boxed, so its locals do not grow `dispatch`'s debug-build poll frame.
 async fn bounded_note_get(
@@ -2461,12 +2488,8 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        "task.list" => {
-            let ws = require_ws_note(params)?;
-            let status = opt_str(params, "status");
-            let result = api.task_list(ws, status).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "tasks": result.tasks, "stats": result.stats }))
-        }
+        // Boxed off `dispatch`'s debug poll frame (see `crate::stack_frame`).
+        "task.list" => crate::stack_frame::boxed_await(|| task_list(api, params)).await,
         "task.get" => {
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
@@ -5298,6 +5321,7 @@ async fn dispatch(
             };
             let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
             let request_id = opt_str_strict(params, "requestId")?;
+            let next_token = opt_str_strict(params, "nextToken")?;
             api.search_notes(
                 query,
                 workspace_id.map(WorkspaceId::from),
@@ -5305,6 +5329,7 @@ async fn dispatch(
                 limit,
                 include_archived,
                 request_id,
+                next_token,
             )
             .await
             .map_err(domain_to_rpc)

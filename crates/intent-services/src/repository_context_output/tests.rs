@@ -159,7 +159,7 @@ async fn tcp_within(server: WorkspaceMcpServer, code: &str, wait: Duration) -> V
     let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(server))
         .await
         .unwrap();
-    let mut stream = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+    let mut stream = bridge.connect().await.unwrap();
     stream
         .write_all(format!("{}\n", call(code)).as_bytes())
         .await

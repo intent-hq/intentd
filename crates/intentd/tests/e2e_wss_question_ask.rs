@@ -689,7 +689,7 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
     let proposal_code = r#"return await ws.workspace.proposeSibling({
         title: "Focused follow-up",
         initialPrompt: "Implement only the focused follow-up and run its tests.",
-        specialist: "implementor"
+        specialist: "developer"
     });"#;
     let behavior = json!({
         "rules": [{
@@ -1701,7 +1701,7 @@ fn mcp_config_files(data_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Extract the bridge `--connect <addr>` from a generated MCP config file.
-fn bridge_addr_from_config(path: &Path) -> String {
+fn bridge_addr_from_config(path: &Path) -> (String, String) {
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read mcp config"))
         .expect("parse mcp config");
     let args = cfg["mcpServers"]["workspace-mcp"]["args"]
@@ -1711,7 +1711,14 @@ fn bridge_addr_from_config(path: &Path) -> String {
         .iter()
         .position(|a| a == "--connect")
         .expect("--connect flag in bridge args");
-    args[idx + 1].as_str().expect("bridge addr").to_string()
+    let token = cfg["mcpServers"]["workspace-mcp"]["env"]["INTENTD_MCP_BRIDGE_TOKEN"]
+        .as_str()
+        .expect("bridge secret in workspace-mcp env")
+        .to_string();
+    (
+        args[idx + 1].as_str().expect("bridge addr").to_string(),
+        token,
+    )
 }
 
 struct BridgeClient {
@@ -1721,15 +1728,21 @@ struct BridgeClient {
 }
 
 impl BridgeClient {
-    async fn connect(addr: &str) -> Self {
+    async fn connect((addr, token): &(String, String)) -> Self {
         use tokio::io::BufReader;
-        let stream = timeout(
+        let mut stream = timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             TcpStream::connect(addr),
         )
         .await
         .expect("bridge connect timeout")
         .expect("bridge connect");
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!("intentd-mcp-bridge-auth {token}\n").as_bytes(),
+        )
+        .await
+        .expect("bridge auth");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
