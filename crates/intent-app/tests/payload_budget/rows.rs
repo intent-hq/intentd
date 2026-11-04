@@ -1909,10 +1909,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
                 next(
                     "nextToken",
-                    json!({ "workspaceId": ws, "limit": 50 }),
+                    json!({ "workspaceId": ws, "limit": 25 }),
                     "/nextToken",
                     "nextToken",
-                    Items("/tasks", 50),
+                    Items("/tasks", 25),
                 ),
             ],
         ),
