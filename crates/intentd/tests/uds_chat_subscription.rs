@@ -2055,3 +2055,282 @@ async fn chat_live_turn_over_budget_is_cut_to_fit_read_payload_budget() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// The `contentBlocks` of message `id` in a messages array (`Null` if absent).
+fn blocks_of(messages: &[Value], id: &str) -> Value {
+    messages
+        .iter()
+        .find(|m| m["id"].as_str() == Some(id))
+        .map_or(Value::Null, |m| m["contentBlocks"].clone())
+}
+
+/// Read delta frames until `done` holds for the reduced transcript, asserting
+/// each frame's literal size against the read budget. Returns the frames.
+async fn read_bounded_deltas(
+    reader: &mut BufReader<OwnedReadHalf>,
+    reconstructed: &mut Vec<Value>,
+    done: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let mut frames = Vec::new();
+    while !done(reconstructed) {
+        let mut line = String::new();
+        let n = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for a delta frame")
+        .expect("read failed");
+        assert!(n > 0, "connection closed unexpectedly");
+        let frame = line.trim_end();
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "delta frame {} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}",
+            frame.len()
+        );
+        let v: Value = serde_json::from_str(frame).expect("json frame");
+        assert_eq!(v["params"]["kind"], "delta");
+        apply_delta(reconstructed, &v["params"]["delta"]);
+        frames.push(v);
+        assert!(frames.len() <= 64, "too many frames");
+    }
+    frames
+}
+
+/// Single-message bound on the live delta paths (§7.1), in both delta
+/// encodings: (1) the end-of-turn reconcile for an assistant row of ~400
+/// capped tool blocks with metadata, and (2) an `agent:message` delta for a
+/// user row over the page budget, are split into frames that each fit the
+/// read budget, and the reduced transcript still equals a fresh
+/// `agent.getConversation` page.
+#[intent_test_macros::daemon_test]
+async fn chat_over_budget_row_deltas_fit_read_payload_budget() {
+    use intent_core::events::AGENT_MESSAGE;
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let store = bus.store();
+    let mut rpc_id = 20;
+    for encoding in [None, Some("incremental")] {
+        rpc_id += 10;
+        let a = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id,
+            "agent.create",
+            json!({ "workspaceId": ws_id, "name": format!("A{rpc_id}") }),
+        )
+        .await;
+        let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+        let agent = AgentId::from(agent_id.as_str());
+
+        let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+        let mut sub_reader = tokio::io::BufReader::new(sub_read);
+        let mut params = json!({ "agentId": agent_id });
+        if let Some(e) = encoding {
+            params["deltaEncoding"] = json!(e);
+        }
+        send(
+            &mut sub_write,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe", "params": params
+            }))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(read_json(&mut sub_reader).await["id"], 1);
+        let snap = read_json(&mut sub_reader).await;
+        let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        // (1) End of a turn whose persisted assistant row is ~400 capped tool
+        // blocks plus metadata: the terminal reconcile is cut and split.
+        let mid = Uuid::now_v7().to_string();
+        let output = "o".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+        let blocks: Vec<Value> = (0..400)
+            .map(|i| {
+                json!({ "type": "tool_result", "id": format!("{mid}:{i}"),
+                    "tool_use_id": format!("tc-{i}"), "output": output, "is_error": false })
+            })
+            .collect();
+        store
+            .append_agent_message_with_id(
+                &agent,
+                &mid,
+                "assistant",
+                &json!(blocks),
+                Some(&json!({ "note": "m".repeat(512) })),
+                &now_iso(),
+            )
+            .await
+            .expect("append assistant row");
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            AGENT_STREAM_END,
+            json!({ "agentId": agent_id, "messageId": mid }),
+        )
+        .await;
+        let want = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id + 1,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let target = blocks_of(&want, &mid);
+        assert_eq!(target.as_array().map(Vec::len), Some(400));
+        let frames = read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+            blocks_of(r, &mid) == target
+        })
+        .await;
+        assert!(
+            frames.len() > 1,
+            "the terminal reconcile was split ({encoding:?})"
+        );
+
+        // (2) A user row over the page budget arriving as `agent:message`.
+        let uid = Uuid::now_v7().to_string();
+        let user_blocks: Vec<Value> = (0..300)
+            .map(|i| json!({ "type": "text", "id": format!("{uid}:{i}"), "text": "u".repeat(1_900) }))
+            .collect();
+        store
+            .append_agent_message_with_id(
+                &agent,
+                &uid,
+                "user",
+                &json!(user_blocks),
+                Some(&json!({ "note": "n".repeat(512) })),
+                &now_iso(),
+            )
+            .await
+            .expect("append user row");
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id, "messageId": uid, "role": "user" }),
+        )
+        .await;
+        let want = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id + 2,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let target = blocks_of(&want, &uid);
+        assert!(
+            target
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["bodyOmitted"] == true)),
+            "the user row is over the budget and served cut"
+        );
+        read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+            blocks_of(r, &uid) == target
+        })
+        .await;
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Full-mode live text past the page budget (§7.1): every chunk frame stays
+/// within the read budget, and once the accumulated text passes the budget
+/// the block carries the snapshot's preview shape (`textTruncated`,
+/// `textBytes`) instead of the whole text.
+#[intent_test_macros::daemon_test]
+async fn chat_full_mode_text_past_budget_sends_cut_marker() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(read_json(&mut sub_reader).await["id"], 1);
+    let _snap = read_json(&mut sub_reader).await;
+
+    let mid = Uuid::now_v7().to_string();
+    let piece = "t".repeat(64 * 1024);
+    let chunks = 10;
+    for _ in 0..chunks {
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            CHAT_STREAM_DELTA,
+            json!({ "agentId": agent_id, "content": piece, "messageId": mid,
+                "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text" }),
+        )
+        .await;
+    }
+    let total = piece.len() * chunks;
+    let mut reconstructed = Vec::new();
+    read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+        r.iter()
+            .any(|m| m["contentBlocks"][0]["textBytes"].as_u64() == Some(total as u64))
+    })
+    .await;
+    let block = &reconstructed[0]["contentBlocks"][0];
+    assert_eq!(block["textTruncated"], true);
+    assert!(
+        block["text"].as_str().unwrap().len() < 4096,
+        "a preview, not the whole text"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

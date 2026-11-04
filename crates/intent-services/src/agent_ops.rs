@@ -3990,12 +3990,6 @@ fn mark_pruned_tool_bodies(content: &mut Value, pruned: &[intent_store::PrunedTo
     }
 }
 
-/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
-/// `projection: "slim"`) to one served message. The block bounding itself
-/// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
-/// `chat.subscribe` stream so deltas and snapshots agree byte-for-byte. Runs
-/// AFTER [`stamp_synthetic_block_ids`] so the flags land on the final served
-/// block identity.
 /// Apply [`crate::tool_block::fit_oversized_slim_row`] to one slim row and
 /// return its serialized size afterwards (unchanged rows are only measured).
 fn fit_slim_row(message: &mut AgentMessage, budget: usize) -> usize {
@@ -4008,6 +4002,12 @@ fn fit_slim_row(message: &mut AgentMessage, budget: usize) -> usize {
     }
 }
 
+/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
+/// `projection: "slim"`) to one served message. The block bounding itself
+/// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
+/// `chat.subscribe` stream so deltas and snapshots agree byte-for-byte. Runs
+/// AFTER [`stamp_synthetic_block_ids`] so the flags land on the final served
+/// block identity.
 fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) -> AgentMessage {
     if let Some(blocks) = message.content.as_array_mut() {
         crate::tool_block::slim_message_blocks(blocks, thumbnails);

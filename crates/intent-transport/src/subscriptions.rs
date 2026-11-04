@@ -1834,7 +1834,10 @@ impl ChatDeltaState {
             }
             let mut block = match self.encoding {
                 DeltaEncoding::Full => {
-                    json!({ "type": block_type, "id": block_id, "text": acc.clone() })
+                    let mut block =
+                        json!({ "type": block_type, "id": block_id, "text": acc.clone() });
+                    bound_live_text(self.projection, &mut block);
+                    block
                 }
                 // Only the fragment travels — per-chunk wire cost is
                 // O(chunk), not O(accumulated text). The accumulation above
@@ -2153,6 +2156,7 @@ impl ChatDeltaState {
                         if let Some(media) = self.media_acc.get(id) {
                             block["media"] = Value::Object(media.clone());
                         }
+                        bound_live_text(self.projection, &mut block);
                         block
                     }
                     _ => block.clone(),
@@ -2253,6 +2257,83 @@ impl ChatDeltaState {
             intent_services::tool_block::slim_tool_block(block);
         }
     }
+}
+
+/// Single-message bound on the live text path (§7.1): under the slim
+/// projection, a full-text `text` / `thinking` block whose accumulated text
+/// has grown past the page budget is sent as the same preview the snapshot
+/// path serves — a prefix plus `textTruncated: true` / `textBytes` — so a
+/// full-mode chunk delta (or the degraded terminal frame) stays within the
+/// read budget. The full text is read through `agent.getMessageBlock`, which
+/// resolves the live turn. Blocks at or under the budget are untouched.
+fn bound_live_text(projection: Option<ConversationProjection>, block: &mut Value) {
+    if projection != Some(ConversationProjection::Slim) {
+        return;
+    }
+    let bytes = intent_services::pagination::serialized_size(block);
+    intent_services::tool_block::fit_oversized_slim_row(
+        std::slice::from_mut(block),
+        bytes,
+        SLIM_PAGE_BUDGET_BYTES,
+    );
+}
+
+/// Split one chat delta whose serialized size is over `budget` into several
+/// deltas that each fit (single-message bound, §7.1). The terminal reconcile
+/// and the `agent:message` row delta wrap every block of a row in its own
+/// entity (message pointer, role, seq, timestamp, `metadata`, …), so a row cut
+/// to fit the page budget can still produce a frame past the read budget.
+/// Entities keep their order (`added` before `updated`) and their bucket;
+/// `removedIds` and any other keys ride on the last delta. A delta that
+/// already fits is returned unchanged, as is a single entity too large on
+/// its own (it cannot be split further).
+pub(crate) fn split_chat_delta(delta: Value, budget: usize) -> Vec<Value> {
+    if intent_services::pagination::serialized_size(&delta) <= budget {
+        return vec![delta];
+    }
+    let Value::Object(mut obj) = delta else {
+        return vec![delta];
+    };
+    let mut take = |key: &str| match obj.remove(key) {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
+    let added = take("added");
+    let updated = take("updated");
+    let empty = json!({ "added": [], "updated": [], "removedIds": [] });
+    let base = intent_services::pagination::serialized_size(&empty);
+    let mut out = Vec::new();
+    let mut cur: (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+    let mut size = base;
+    let entries = added
+        .into_iter()
+        .map(|e| (true, e))
+        .chain(updated.into_iter().map(|e| (false, e)));
+    for (is_added, entity) in entries {
+        let entity_bytes = intent_services::pagination::serialized_size(&entity) + 1;
+        if size + entity_bytes > budget && !(cur.0.is_empty() && cur.1.is_empty()) {
+            let (a, u) = std::mem::take(&mut cur);
+            out.push(json!({ "added": a, "updated": u, "removedIds": [] }));
+            size = base;
+        }
+        size += entity_bytes;
+        if is_added {
+            cur.0.push(entity);
+        } else {
+            cur.1.push(entity);
+        }
+    }
+    let (a, u) = cur;
+    let mut last = Map::new();
+    last.insert("added".into(), Value::Array(a));
+    last.insert("updated".into(), Value::Array(u));
+    last.insert(
+        "removedIds".into(),
+        obj.remove("removedIds").unwrap_or_else(|| json!([])),
+    );
+    last.extend(obj);
+    out.push(Value::Object(last));
+    out
 }
 
 /// Build a single-entity delta envelope, routing the entity to `added` (first
