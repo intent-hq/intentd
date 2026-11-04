@@ -549,9 +549,27 @@ impl Shared {
                     continue;
                 }
                 self.confirm_stop(&record.agent_id, stop_id);
+                self.final_stop_over(&record.agent_id).await;
                 continue;
             }
             self.queue_final_stop(&record.agent_id, stop_id, true);
+        }
+    }
+
+    /// `agent_id`'s final stop is over (acknowledged, or dropped past its
+    /// bound): any machine run the machine never reported ending is settled
+    /// now, and its scripts are no longer refused as ending.
+    async fn final_stop_over(&self, agent_id: &AgentId) {
+        #[cfg(test)]
+        lock(&self.final_settles).push(agent_id.clone());
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_runs_final_stop_acked(
+                    svc,
+                    agent_id,
+                    "remote-script-lost: the agent was stopped for good",
+                )
+                .await;
         }
     }
 
@@ -668,20 +686,8 @@ impl Shared {
                     }
                     if queued.final_stop {
                         // The agent is ended for good, even when a link below
-                        // nodeProtocol 9 got the stop as a plain one: any run
-                        // the machine never reported ending is settled now,
-                        // and its scripts are no longer refused as ending.
-                        #[cfg(test)]
-                        lock(&self.final_settles).push(agent_id.clone());
-                        if let Some(svc) = &self.services {
-                            svc.feature_runtime()
-                                .machine_runs_final_stop_acked(
-                                    svc,
-                                    &agent_id,
-                                    "remote-script-lost: the agent was stopped for good",
-                                )
-                                .await;
-                        }
+                        // nodeProtocol 9 got the stop as a plain one.
+                        self.final_stop_over(&agent_id).await;
                     }
                     self.confirm_stop(&agent_id, stop_id);
                 }

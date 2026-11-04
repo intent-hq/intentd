@@ -924,6 +924,13 @@ impl MachineRuns {
             }
             places
         };
+        // The lease ended: no final stop of these agents is under way any more.
+        {
+            let mut ending = lock(&self.inner.ending);
+            for agent in agents {
+                ending.remove(agent);
+            }
+        }
         for place in dropped {
             self.changed(&place).await;
         }

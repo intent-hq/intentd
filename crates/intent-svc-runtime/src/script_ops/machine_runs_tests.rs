@@ -1043,3 +1043,26 @@ async fn no_start_or_restart_while_a_final_stop_is_under_way() {
     runs.start(&place(&agent), &def).await.unwrap();
     assert_eq!(script_starts(&rec), 2);
 }
+
+/// Review of intentd#3005: a lease end (machine removal, agent delete)
+/// also ends the agent's final stop, so its scripts are no longer refused
+/// as ending without a final-stop ack.
+#[tokio::test]
+async fn a_lease_end_clears_the_final_stop_refusal() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let def = script(ScriptMode::Command, "make");
+    runs.final_stop_begun(&agent);
+    assert!(runs.start(&place(&agent), &def).await.is_err());
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_millis(50));
+    runs.end_agents(
+        std::slice::from_ref(&agent),
+        deadline,
+        "remote-script-lost: the machine was removed",
+    )
+    .await;
+    runs.start(&place(&agent), &def).await.unwrap();
+    assert_eq!(script_starts(&rec), 1);
+}

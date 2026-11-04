@@ -1998,6 +1998,13 @@ mod final_stops {
             .unwrap()
             .is_none());
         assert!(!node.shared_ref().has_pending_stops());
+        // The expired stop ends the agent's final stop too: its machine runs
+        // settle and its scripts are no longer refused as ending (review of
+        // intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_settles_for_test(),
+            vec![agent.clone()]
+        );
         // Nothing is left to send: the machine coming back is not dialed.
         machine.restart().await;
         machine.no_link(Duration::from_millis(300)).await;
