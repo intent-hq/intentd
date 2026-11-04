@@ -20808,11 +20808,10 @@ impl WorkspaceApi for Services {
                 prefer_workspace_id.as_ref(),
                 include_archived,
             );
-            let start = next_token
+            let anchors = next_token
                 .as_deref()
                 .map(|token| search_ops::decode_note_page_token(token, &scope))
-                .transpose()?
-                .unwrap_or(0);
+                .transpose()?;
             let limit = search_ops::match_limit(limit);
             for (name, id) in [
                 ("workspaceId", &workspace_id),
@@ -20833,7 +20832,7 @@ impl WorkspaceApi for Services {
                 .visible_workspace_ids()
                 .await?
                 .map(|ids| ids.into_iter().collect::<Vec<_>>());
-            let options = intent_store::NoteFtsOptions {
+            let mut options = intent_store::NoteFtsOptions {
                 workspace_id: workspace_id.as_ref(),
                 prefer_workspace_id: prefer_workspace_id.as_ref(),
                 allowed_workspace_ids: visible.as_deref(),
@@ -20845,18 +20844,37 @@ impl WorkspaceApi for Services {
                     i64::try_from(limit + 1).unwrap_or(i64::MAX)
                 }),
                 per_workspace_limit: None,
-                offset: i64::try_from(start).unwrap_or(i64::MAX),
+                after: None,
             };
             let hits = match intent_search::fts_match_expr(&query) {
-                Some(expr) => self.store.search_notes_fts(&expr, &options).await?,
+                Some(expr) => {
+                    let resume = match anchors {
+                        Some(anchors) => {
+                            search_ops::note_page_resume(&self.store, &expr, &options, anchors)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    options.after = resume.as_ref();
+                    self.store.search_notes_fts(&expr, &options).await?
+                }
                 None => Vec::new(),
             };
+            let keys: Vec<intent_store::NoteFtsCursor> = hits
+                .iter()
+                .map(|hit| intent_store::NoteFtsCursor {
+                    rank: hit.rank,
+                    updated_at: hit.updated_at.clone(),
+                    workspace_id: hit.workspace_id.clone(),
+                    note_id: hit.note_id.clone(),
+                })
+                .collect();
             let matches = search_ops::note_fts_matches(hits, &query);
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             // This single indexed query never streams, even for a large hard
             // scope. There is no lingering cancellation registration; cancelling
             // this completed request is the usual no-op success.
-            search_ops::note_page_reply(&request_id, matches, start, limit, &scope)
+            search_ops::note_page_reply(&request_id, matches, &keys, limit, &scope)
         })
     }
 

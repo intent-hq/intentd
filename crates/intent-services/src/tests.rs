@@ -29535,10 +29535,10 @@ mod search_adapters {
     }
 
     #[intent_test_macros::daemon_test]
-    async fn notes_search_omits_the_title_of_a_hit_larger_than_a_page() {
+    async fn notes_search_truncates_the_title_of_a_hit_larger_than_a_page() {
         let (_tmp, store, ws) = store_with_ws().await;
         let mut huge = note(&ws, "huge", "hugeterm");
-        huge.title = format!("hugeterm {}", "x".repeat(600_000));
+        huge.title = format!("hugeterm {}", "é".repeat(300_000));
         store.insert_note(&huge).await.unwrap();
         store
             .insert_note(&note(&ws, "small", "hugeterm small"))
@@ -29557,9 +29557,113 @@ mod search_adapters {
             .iter()
             .find(|row| row["noteId"] == "huge")
             .unwrap();
-        assert_eq!(row["titleOmitted"], true, "{row}");
+        assert_eq!(row["titleTruncated"], true);
         assert_eq!(row["titleBytes"], huge.title.len());
-        assert!(row.get("title").is_none());
+        let title = row["title"].as_str().unwrap();
+        assert!(huge.title.starts_with(title));
+        assert!(title.len() > 400_000 && title.len() < huge.title.len());
+        assert!(
+            page["nextToken"].is_string(),
+            "the other hit is on the next page"
+        );
+        let small = svc
+            .search_notes("small".into(), None, None, None, true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(small["matches"][0]["noteId"], "small");
+        assert!(small["matches"][0].get("titleTruncated").is_none());
+    }
+
+    /// Changes between pages never skip a hit that still matches: deleting,
+    /// archiving or re-ranking a note already served re-weights every other
+    /// hit, and the next page still resumes right after the page's end.
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_next_page_survives_changes_to_served_hits() {
+        for change in [
+            "delete-first",
+            "delete-last",
+            "archive-last",
+            "rerank-first",
+        ] {
+            let (_tmp, store, ws) = store_with_ws().await;
+            for i in 0..9 {
+                store
+                    .insert_note(&note(&ws, &format!("k-{i}"), "keysetterm"))
+                    .await
+                    .unwrap();
+            }
+            let svc = Services::new_isolated(store.clone());
+            let all: Vec<String> = svc
+                .search_notes("keysetterm".into(), None, None, None, false, None, None)
+                .await
+                .unwrap()["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["noteId"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(all.len(), 9);
+            let first = svc
+                .search_notes("keysetterm".into(), None, None, Some(3), false, None, None)
+                .await
+                .unwrap();
+            let served: Vec<String> = first["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["noteId"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(served, all[..3]);
+            let target = if change.ends_with("first") {
+                &served[0]
+            } else {
+                &served[2]
+            };
+            let id = intent_core::NoteId::from_string(target);
+            let mut row = store.get_note(&ws, &id).await.unwrap();
+            match change {
+                "delete-first" | "delete-last" => store.delete_note(&ws, &id).await.unwrap(),
+                "archive-last" => {
+                    row.is_archived = true;
+                    store
+                        .update_note_metadata(&store.lock_note_content(&ws, &id).await, &row)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    row.content = format!("keysetterm {}", "filler ".repeat(500));
+                    row.updated_at = "2027-01-01T00:00:00Z".into();
+                    store
+                        .update_note(&store.lock_note_content(&ws, &id).await, &row)
+                        .await
+                        .unwrap();
+                }
+            }
+            let rest = svc
+                .search_notes(
+                    "keysetterm".into(),
+                    None,
+                    None,
+                    Some(50),
+                    false,
+                    None,
+                    first["nextToken"].as_str().map(str::to_string),
+                )
+                .await
+                .unwrap();
+            let next: Vec<String> = rest["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["noteId"].as_str().unwrap().to_string())
+                .collect();
+            for unserved in &all[3..] {
+                assert!(
+                    next.contains(unserved),
+                    "{change}: {unserved} skipped in {next:?}"
+                );
+            }
+        }
     }
 
     #[intent_test_macros::daemon_test]

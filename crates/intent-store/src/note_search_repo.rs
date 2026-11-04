@@ -23,10 +23,26 @@ pub struct NoteFtsOptions<'a> {
     /// with many strong hits cannot crowd others out. `None` keeps every hit;
     /// zero is empty. Negative values are rejected.
     pub per_workspace_limit: Option<i64>,
-    /// Ranked hits skipped before `limit` applies (a page's start). Zero
-    /// leaves the SQL unchanged; negative values are rejected.
-    pub offset: i64,
+    /// Keyset page start: only hits ordered strictly after this sort key
+    /// are returned. `None` leaves the SQL unchanged.
+    pub after: Option<&'a NoteFtsCursor>,
 }
+
+/// One hit's position in the ranked order (adjusted rank ascending, then
+/// `updated_at` descending, then `workspace_id`, `note_id` ascending).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteFtsCursor {
+    pub rank: f64,
+    pub updated_at: String,
+    pub workspace_id: String,
+    pub note_id: String,
+}
+
+/// Strictly-after test for [`NoteFtsCursor`] over the ranked columns,
+/// matching the ORDER BY. Binds: rank, rank, updated_at, updated_at,
+/// workspace_id, workspace_id, note_id.
+const AFTER_CURSOR: &str = "(adjusted_rank > ? OR (adjusted_rank = ? AND (updated_at < ? \
+     OR (updated_at = ? AND (workspace_id > ? OR (workspace_id = ? AND note_id > ?))))))";
 
 impl Default for NoteFtsOptions<'_> {
     fn default() -> Self {
@@ -37,7 +53,7 @@ impl Default for NoteFtsOptions<'_> {
             include_archived: true,
             limit: None,
             per_workspace_limit: None,
-            offset: 0,
+            after: None,
         }
     }
 }
@@ -59,35 +75,19 @@ pub struct NoteFtsMatch {
 
 /// Shared with the query-plan regression guard. Binding order: preferred
 /// workspace, MATCH expression, optional hard scope, optional permissions JSON,
-/// optional per-workspace limit, limit, optional offset (only when positive).
+/// optional per-workspace limit, optional cursor ([`AFTER_CURSOR`]), limit.
 /// Values are bound, never interpolated into SQL.
 pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
-    let mut filters = String::new();
-    if options.workspace_id.is_some() {
-        filters.push_str(" AND c.workspace_id = ?");
-    }
-    if options.allowed_workspace_ids.is_some() {
-        filters.push_str(" AND c.workspace_id IN (SELECT value FROM json_each(?))");
-    }
-    if !options.include_archived {
-        filters.push_str(" AND c.is_archived = 0");
-    }
-    let offset = if options.offset > 0 { " OFFSET ?" } else { "" };
-    let ranked = format!(
-        "SELECT c.note_id, c.workspace_id, c.updated_at, \
-                w.archived AS workspace_archived, \
-                bm25(note_fts, 5.0, 1.0, 2.0) \
-                  - CASE WHEN c.workspace_id = ? THEN 1.0 ELSE 0.0 END \
-                  + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END AS adjusted_rank \
-         FROM note_fts \
-         JOIN note_search_ctx c ON c.search_id = note_fts.rowid \
-         JOIN workspace w ON w.id = c.workspace_id \
-         WHERE note_fts MATCH ?{filters}"
-    );
+    let ranked = note_fts_ranked_sql(options);
     // Optional per-workspace cap: rank within each workspace with the same
     // tie-breaks as the global order, keep the best N, then apply the global
     // limit. Without the cap the SQL is unchanged (query-plan guard).
     let candidates = if options.per_workspace_limit.is_some() {
+        let after = if options.after.is_some() {
+            format!(" AND {AFTER_CURSOR}")
+        } else {
+            String::new()
+        };
         format!(
             "SELECT note_id, workspace_id, updated_at, workspace_archived, adjusted_rank \
              FROM ( \
@@ -97,15 +97,21 @@ pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
                  ) AS workspace_position \
                  FROM ({ranked}) r \
              ) \
-             WHERE workspace_position <= ? \
+             WHERE workspace_position <= ?{after} \
              ORDER BY adjusted_rank ASC, updated_at DESC, workspace_id ASC, note_id ASC \
-             LIMIT ?{offset}"
+             LIMIT ?"
+        )
+    } else if options.after.is_some() {
+        format!(
+            "SELECT * FROM ({ranked}) WHERE {AFTER_CURSOR} \
+             ORDER BY adjusted_rank ASC, updated_at DESC, workspace_id ASC, note_id ASC \
+             LIMIT ?"
         )
     } else {
         format!(
             "{ranked} \
              ORDER BY adjusted_rank ASC, c.updated_at DESC, c.workspace_id ASC, c.note_id ASC \
-             LIMIT ?{offset}"
+             LIMIT ?"
         )
     };
     // The LIMIT subquery prevents SQLite flattening it into a full note-table
@@ -120,7 +126,107 @@ pub(crate) fn search_notes_fts_sql(options: &NoteFtsOptions<'_>) -> String {
     )
 }
 
+/// The ranked candidate rows (no order or limit). Binds: preferred
+/// workspace, MATCH expression, optional hard scope, optional permissions.
+fn note_fts_ranked_sql(options: &NoteFtsOptions<'_>) -> String {
+    let mut filters = String::new();
+    if options.workspace_id.is_some() {
+        filters.push_str(" AND c.workspace_id = ?");
+    }
+    if options.allowed_workspace_ids.is_some() {
+        filters.push_str(" AND c.workspace_id IN (SELECT value FROM json_each(?))");
+    }
+    if !options.include_archived {
+        filters.push_str(" AND c.is_archived = 0");
+    }
+    format!(
+        "SELECT c.note_id, c.workspace_id, c.updated_at, \
+                w.archived AS workspace_archived, \
+                bm25(note_fts, 5.0, 1.0, 2.0) \
+                  - CASE WHEN c.workspace_id = ? THEN 1.0 ELSE 0.0 END \
+                  + CASE WHEN w.archived <> 0 THEN 1.0 ELSE 0.0 END AS adjusted_rank \
+         FROM note_fts \
+         JOIN note_search_ctx c ON c.search_id = note_fts.rowid \
+         JOIN workspace w ON w.id = c.workspace_id \
+         WHERE note_fts MATCH ?{filters}"
+    )
+}
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+/// Bind [`note_fts_ranked_sql`]'s parameters, in its order.
+fn bind_ranked<'q>(
+    sql: &'q str,
+    match_expr: &'q str,
+    options: &NoteFtsOptions<'q>,
+) -> Result<SqliteQuery<'q>> {
+    let mut query = sqlx::query(sql)
+        .bind(options.prefer_workspace_id.map(|id| id.0.as_str()))
+        .bind(match_expr);
+    if let Some(id) = options.workspace_id {
+        query = query.bind(id.0.as_str());
+    }
+    if let Some(ids) = options.allowed_workspace_ids {
+        // One JSON binding avoids SQLite's variable limit on large hosts.
+        let ids: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+        query =
+            query.bind(serde_json::to_string(&ids).map_err(|e| {
+                Error::Internal(format!("encode note search permissions failed: {e}"))
+            })?);
+    }
+    Ok(query)
+}
+
 impl Store {
+    /// Current ranked positions of the given `(workspace_id, note_id)` notes
+    /// under the same search and filters as [`Store::search_notes_fts`]
+    /// (`limit`, `per_workspace_limit` and `after` are ignored). Notes that
+    /// no longer match are absent. A keyset page uses this to re-anchor on
+    /// its previous hits, whose ranks move with the index statistics.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid MATCH expression or database failure.
+    pub async fn note_fts_positions(
+        &self,
+        match_expr: &str,
+        options: &NoteFtsOptions<'_>,
+        notes: &[(String, String)],
+    ) -> Result<Vec<NoteFtsCursor>> {
+        if match_expr.trim().is_empty()
+            || notes.is_empty()
+            || options
+                .allowed_workspace_ids
+                .is_some_and(<[WorkspaceId]>::is_empty)
+        {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT note_id, workspace_id, updated_at, adjusted_rank FROM ({}) \
+             WHERE (workspace_id, note_id) IN ( \
+                 SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') \
+                 FROM json_each(?))",
+            note_fts_ranked_sql(options)
+        );
+        let wanted = serde_json::to_string(notes)
+            .map_err(|e| Error::Internal(format!("encode note search anchors failed: {e}")))?;
+        let rows = bind_ranked(&sql, match_expr, options)?
+            .bind(wanted)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("note search positions failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(NoteFtsCursor {
+                    rank: row.try_get("adjusted_rank")?,
+                    updated_at: row.try_get("updated_at")?,
+                    workspace_id: row.try_get("workspace_id")?,
+                    note_id: row.try_get("note_id")?,
+                })
+            })
+            .collect::<std::result::Result<_, sqlx::Error>>()
+            .map_err(|e| Error::Internal(format!("decode note search position: {e}")))
+    }
+
     /// Search the note FTS index using an already-sanitized MATCH expression
     /// (from `intent_search::fts_match_expr`). An empty expression returns no
     /// hits. Raw user text must be sanitized by the service, as for transcripts.
@@ -140,10 +246,9 @@ impl Store {
     ) -> Result<Vec<NoteFtsMatch>> {
         if options.limit.is_some_and(|limit| limit < 0)
             || options.per_workspace_limit.is_some_and(|limit| limit < 0)
-            || options.offset < 0
         {
             return Err(Error::InvalidParams(
-                "note search limit and offset must be nonnegative".into(),
+                "note search limit must be nonnegative".into(),
             ));
         }
         if match_expr.trim().is_empty()
@@ -156,27 +261,22 @@ impl Store {
             return Ok(Vec::new());
         }
         let sql = search_notes_fts_sql(options);
-        let mut query = sqlx::query(&sql)
-            .bind(options.prefer_workspace_id.map(|id| id.0.as_str()))
-            .bind(match_expr);
-        if let Some(id) = options.workspace_id {
-            query = query.bind(id.0.as_str());
-        }
-        if let Some(ids) = options.allowed_workspace_ids {
-            // One JSON binding avoids SQLite's variable limit on large hosts.
-            let ids: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
-            query = query.bind(serde_json::to_string(&ids).map_err(|e| {
-                Error::Internal(format!("encode note search permissions failed: {e}"))
-            })?);
-        }
+        let mut query = bind_ranked(&sql, match_expr, options)?;
         if let Some(per_workspace) = options.per_workspace_limit {
             query = query.bind(per_workspace);
         }
-        query = query.bind(options.limit.unwrap_or(-1));
-        if options.offset > 0 {
-            query = query.bind(options.offset);
+        if let Some(after) = options.after {
+            query = query
+                .bind(after.rank)
+                .bind(after.rank)
+                .bind(after.updated_at.as_str())
+                .bind(after.updated_at.as_str())
+                .bind(after.workspace_id.as_str())
+                .bind(after.workspace_id.as_str())
+                .bind(after.note_id.as_str());
         }
         let rows = query
+            .bind(options.limit.unwrap_or(-1))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("search notes failed: {e}")))?;
