@@ -83,9 +83,9 @@
     "tab": "devices",
     "scrollSelector": "#devices",
     "highlightSelector": "#devices",
-    "label": "Settings: Devices",
+    "label": "Settings: Machines",
     "route": "/settings?tab=devices#devices",
-    "description": "Saved remote device settings.",
+    "description": "Saved remote machine settings.",
     "hashAliases": [
       "devices",
       "machines"
