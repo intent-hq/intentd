@@ -604,7 +604,7 @@ async fn member_search_inherits_workspaces_but_excludes_chief() {
             HashSet::from([ws])
         );
         let result = svc
-            .search_notes("needle".into(), None, None, None, true, None)
+            .search_notes("needle".into(), None, None, None, true, None, None)
             .await
             .unwrap();
         let text = result.to_string();

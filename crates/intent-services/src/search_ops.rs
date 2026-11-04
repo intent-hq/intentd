@@ -11,7 +11,7 @@ use intent_search::{
     contains_ci, extract_symbol, fts_preview, make_preview, CodebaseMatch, ContentSearchResult,
     EventMatch, MessageMatch, NoteMatch,
 };
-use intent_store::{MessageFtsMatch, NoteFtsMatch, Store};
+use intent_store::{MessageFtsMatch, NoteFtsCursor, NoteFtsMatch, NoteFtsOptions, Store};
 use serde_json::Value;
 
 /// Result sets at or below this many matches are returned inline in the method
@@ -56,6 +56,185 @@ pub(crate) fn bound_inline_matches(matches: &mut Vec<Value>) -> bool {
         }
     }
     false
+}
+
+/// `search.notes` result budget: 480,000 serialized bytes (the shared
+/// per-page budget), so the frame stays under 512,000 bytes. Hits past it
+/// move to the next page through `nextToken`; none is dropped.
+pub(crate) const NOTE_PAGE_BUDGET_BYTES: usize = 480_000;
+
+/// Previous hits a `search.notes` `nextToken` carries as resume anchors.
+const NOTE_PAGE_ANCHORS: usize = 8;
+
+/// Digest of the request fields that select a `search.notes` result list
+/// (query, hard scope, preference, archive filter), so a `nextToken` cannot
+/// continue a different search and stays small for a long query.
+pub(crate) fn note_page_scope(
+    query: &str,
+    workspace_id: Option<&WorkspaceId>,
+    prefer_workspace_id: Option<&WorkspaceId>,
+    include_archived: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let key = serde_json::json!([
+        "search.notes",
+        query,
+        workspace_id.map(WorkspaceId::as_str),
+        prefer_workspace_id.map(WorkspaceId::as_str),
+        include_archived,
+    ]);
+    Sha256::digest(key.to_string().as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )
+}
+
+fn cursor_json(key: &NoteFtsCursor) -> Value {
+    serde_json::json!({
+        "rank": key.rank,
+        "updatedAt": key.updated_at,
+        "workspaceId": key.workspace_id,
+        "noteId": key.note_id,
+    })
+}
+
+/// `nextToken` resuming a `search.notes` result list after `anchors` (the
+/// page's last hits, in ranked order): versioned JSON scoped to the search
+/// ([`note_page_scope`]).
+fn encode_note_page_token(scope: &str, anchors: &[NoteFtsCursor]) -> String {
+    let anchors: Vec<Value> = anchors.iter().map(cursor_json).collect();
+    serde_json::json!({ "version": 2, "method": "search.notes", "scope": scope, "anchors": anchors })
+        .to_string()
+}
+
+/// The resume anchors of a `search.notes` `nextToken`, oldest first; a
+/// malformed token or one minted for a different search is `InvalidParams`.
+pub(crate) fn decode_note_page_token(token: &str, scope: &str) -> Result<Vec<NoteFtsCursor>> {
+    let invalid = || Error::InvalidParams("search.notes: invalid or mismatched nextToken".into());
+    let cursor: Value = serde_json::from_str(token).map_err(|_| invalid())?;
+    if cursor.get("version") != Some(&Value::from(2))
+        || cursor.get("method").and_then(Value::as_str) != Some("search.notes")
+        || cursor.get("scope").and_then(Value::as_str) != Some(scope)
+    {
+        return Err(invalid());
+    }
+    let anchors = cursor
+        .get("anchors")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty() && a.len() <= NOTE_PAGE_ANCHORS)
+        .ok_or_else(invalid)?;
+    anchors
+        .iter()
+        .map(|a| {
+            let text = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+            Some(NoteFtsCursor {
+                rank: a.get("rank").and_then(Value::as_f64)?,
+                updated_at: text("updatedAt")?,
+                workspace_id: text("workspaceId")?,
+                note_id: text("noteId")?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(invalid)
+}
+
+/// Where the next `search.notes` page starts. Ranks move with the index
+/// statistics (deleting one matching note re-weights every other hit), so
+/// the page re-anchors on the newest anchor that still matches and was not
+/// itself edited (same `updatedAt`), at its current position: hits after
+/// it keep their order relative to it and are not skipped. When every
+/// anchor was deleted or edited, the newest anchor's stored key is used.
+pub(crate) async fn note_page_resume(
+    store: &Store,
+    match_expr: &str,
+    options: &NoteFtsOptions<'_>,
+    anchors: Vec<NoteFtsCursor>,
+) -> Result<Option<NoteFtsCursor>> {
+    let ids: Vec<(String, String)> = anchors
+        .iter()
+        .map(|a| (a.workspace_id.clone(), a.note_id.clone()))
+        .collect();
+    let current = store.note_fts_positions(match_expr, options, &ids).await?;
+    let anchored = anchors.iter().rev().find_map(|a| {
+        current.iter().find(|c| {
+            c.workspace_id == a.workspace_id
+                && c.note_id == a.note_id
+                && c.updated_at == a.updated_at
+        })
+    });
+    Ok(anchored.cloned().or_else(|| anchors.last().cloned()))
+}
+
+/// Shorten the `title` of a hit whose serialized size exceeds `budget` to
+/// fit, on a UTF-8 boundary, adding `titleTruncated: true` and `titleBytes`
+/// (the full title's UTF-8 length; `note.get` reads it whole). The title
+/// stays a string so older clients still accept the hit.
+fn fit_note_hit(row: &mut Value, budget: usize) {
+    use crate::pagination::{floor_char_boundary, serialized_size};
+    if serialized_size(row) <= budget {
+        return;
+    }
+    let Some(title) = row.get("title").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    row["titleTruncated"] = Value::Bool(true);
+    row["titleBytes"] = Value::from(title.len());
+    let mut keep = title.len();
+    loop {
+        let over = serialized_size(row).saturating_sub(budget);
+        if over == 0 || keep == 0 {
+            return;
+        }
+        keep = floor_char_boundary(&title, keep.saturating_sub(over));
+        row["title"] = Value::String(title[..keep].to_string());
+    }
+}
+
+/// Build one `search.notes` page from the ranked `hits` after the page
+/// start, fetched with `limit + 1` so a further page is detectable; `keys`
+/// are their sort keys. The page keeps at most `limit` hits that fit
+/// [`NOTE_PAGE_BUDGET_BYTES`] (always at least one), and `nextToken`
+/// resumes right after the last kept hit (`null` when none remain).
+pub(crate) fn note_page_reply(
+    request_id: &str,
+    hits: Vec<NoteMatch>,
+    keys: &[NoteFtsCursor],
+    limit: usize,
+    scope: &str,
+) -> Result<Value> {
+    let more_rows = hits.len() > limit;
+    let mut rows = crate::to_value_vec(hits.into_iter().take(limit).collect())?;
+    // Reserve the largest token any cut could mint.
+    let mut widest: Vec<&NoteFtsCursor> = keys.iter().take(limit).collect();
+    widest.sort_by_key(|k| std::cmp::Reverse(cursor_json(k).to_string().len()));
+    widest.truncate(NOTE_PAGE_ANCHORS);
+    let widest: Vec<NoteFtsCursor> = widest.into_iter().cloned().collect();
+    let envelope = serde_json::json!({
+        "requestId": request_id,
+        "matches": [],
+        "indexed": true,
+        "nextToken": encode_note_page_token(scope, &widest),
+    });
+    let budget = NOTE_PAGE_BUDGET_BYTES.saturating_sub(intent_core::slim_body_size(&envelope));
+    for row in &mut rows {
+        fit_note_hit(row, budget.saturating_sub(3));
+    }
+    let kept = crate::pagination::fit_rows_to_budget(&rows, budget);
+    let cut = kept < rows.len();
+    rows.truncate(kept);
+    let next_token = (kept > 0 && (cut || more_rows)).then(|| {
+        encode_note_page_token(scope, &keys[kept.saturating_sub(NOTE_PAGE_ANCHORS)..kept])
+    });
+    Ok(serde_json::json!({
+        "requestId": request_id,
+        "matches": rows,
+        "indexed": true,
+        "nextToken": next_token,
+    }))
 }
 
 /// Resolve a workspace's search root (its worktree path), or `None` when the

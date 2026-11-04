@@ -321,7 +321,32 @@ async fn indexed_notes_mutations_reconnect_and_large_scoped_inline() {
         .await;
         assert_eq!(got["matches"].as_array().unwrap().len(), 30);
         assert_eq!(got["requestId"], "large-scoped");
+        assert!(got["nextToken"].is_null(), "{got}");
     }
+    let first = search(
+        &mut client,
+        json!({"query":"bulkuniqueterm", "workspaceId":ws, "limit":20}),
+    )
+    .await;
+    assert_eq!(first["matches"].as_array().unwrap().len(), 20);
+    let rest = search(
+        &mut client,
+        json!({"query":"bulkuniqueterm", "workspaceId":ws, "limit":20,
+        "nextToken":first["nextToken"]}),
+    )
+    .await;
+    assert_eq!(rest["matches"].as_array().unwrap().len(), 10);
+    assert!(rest["nextToken"].is_null(), "{rest}");
+    let mut ids: Vec<&str> = first["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(rest["matches"].as_array().unwrap())
+        .map(|hit| hit["noteId"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 30);
     assert_eq!(
         client
             .call("search.cancel", json!({"requestId":"large-scoped"}))

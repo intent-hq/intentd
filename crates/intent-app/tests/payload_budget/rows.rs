@@ -1770,6 +1770,13 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "query": "agent", "workspaceId": ws, "preferWorkspaceId": ws, "limit": 100_000, "includeArchived": true, "requestId": "r-notes" }),
                     Items("/matches", 100),
                 ),
+                next(
+                    "nextToken",
+                    json!({ "query": "agent", "limit": 20 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/matches", 20),
+                ),
             ],
         ),
         fixed(

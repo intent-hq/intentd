@@ -1691,11 +1691,12 @@ impl WorkspaceApi for FakeApi {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
             Ok(
-                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true }),
+                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true, "nextToken":next_token }),
             )
         })
     }
@@ -6299,13 +6300,13 @@ async fn search_notes_routes_filters_and_null_defaults() {
     for (params, expected) in [
         (
             serde_json::json!({"query":"body", "workspaceId":"hard", "preferWorkspaceId":"soft",
-            "limit":0,"includeArchived":false,"requestId":"notes"}),
-            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false}),
+            "limit":0,"includeArchived":false,"requestId":"notes","nextToken":"page-2"}),
+            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false,"nextToken":"page-2"}),
         ),
         (
             serde_json::json!({"query":"body","workspaceId":null,"preferWorkspaceId":null,
-            "limit":null,"includeArchived":null,"requestId":null}),
-            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+            "limit":null,"includeArchived":null,"requestId":null,"nextToken":null}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true,"nextToken":null}),
         ),
         (
             serde_json::json!({"query":"body"}),
@@ -6331,6 +6332,7 @@ async fn search_notes_rejects_invalid_optional_params() {
         ("workspaceId", serde_json::json!("")),
         ("preferWorkspaceId", serde_json::json!(false)),
         ("requestId", serde_json::json!([])),
+        ("nextToken", serde_json::json!(7)),
         ("includeArchived", serde_json::json!("false")),
         ("limit", serde_json::json!(-1)),
         ("limit", serde_json::json!(1.5)),
