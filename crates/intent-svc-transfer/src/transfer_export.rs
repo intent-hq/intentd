@@ -77,16 +77,25 @@ fn private_discussion_export_error() -> Error {
     )
 }
 
+/// Mirrors `Store::has_private_discussions`: only `default` and conversations
+/// with workspace-wide metadata in the same snapshot are transferable.
 fn reject_private_discussion_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
-    if rows.iter().any(|(table, objects)| {
-        (table == "discussion_conversation" && !objects.is_empty())
-            || (table == "workspace_discussion_message"
-                && objects.iter().any(|row| {
-                    row["conversation_id"]
-                        .as_str()
-                        .is_some_and(|id| id != "default")
-                }))
-    }) {
+    let table = |name: &'static str| {
+        rows.iter()
+            .filter(move |(table, _)| table == name)
+            .flat_map(|(_, objects)| objects.iter())
+    };
+    let workspace_wide: std::collections::HashSet<&str> =
+        table("workspace_discussion_conversation")
+            .filter_map(|row| row["id"].as_str())
+            .collect();
+    let private = table("discussion_conversation").next().is_some()
+        || table("workspace_discussion_message").any(|row| {
+            row["conversation_id"]
+                .as_str()
+                .is_some_and(|id| id != "default" && !workspace_wide.contains(id))
+        });
+    if private {
         return Err(private_discussion_export_error());
     }
     Ok(())
@@ -1438,6 +1447,55 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn discussion_export_guard_matches_preflight_privacy() {
+        use serde_json::json;
+        let message = |conversation: &str| json!({"id": "m", "conversation_id": conversation});
+        let rows = |conversations: Vec<serde_json::Value>,
+                    messages: Vec<serde_json::Value>,
+                    private: Vec<serde_json::Value>| {
+            vec![
+                ("discussion_conversation".to_owned(), private),
+                (
+                    "workspace_discussion_conversation".to_owned(),
+                    conversations,
+                ),
+                ("workspace_discussion_message".to_owned(), messages),
+            ]
+        };
+        assert!(
+            reject_private_discussion_export(&rows(vec![], vec![message("default")], vec![]))
+                .is_ok()
+        );
+        assert!(
+            reject_private_discussion_export(&rows(
+                vec![json!({"id": "named", "name": "Plans"})],
+                vec![message("default"), message("named")],
+                vec![],
+            ))
+            .is_ok(),
+            "named workspace-wide history is transferable (intent#7738)"
+        );
+        assert!(
+            reject_private_discussion_export(&rows(
+                vec![json!({"id": "named", "name": "Plans"})],
+                vec![message("unknown")],
+                vec![],
+            ))
+            .is_err(),
+            "history without workspace-wide metadata stays private"
+        );
+        assert!(
+            reject_private_discussion_export(&rows(
+                vec![],
+                vec![],
+                vec![json!({"id": "private", "kind": "direct"})],
+            ))
+            .is_err(),
+            "legacy private conversations are never exported"
         );
     }
 
