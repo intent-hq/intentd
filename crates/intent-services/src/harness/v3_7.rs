@@ -1,10 +1,17 @@
-//! Source-aligned Developer workflow and general-agent delegation.
+//! Harness v3.7 adds a one-sentence common "Scratch Files" section right
+//! after "GitHub & Git Operations": scratch files (drafts, patches, logs) go in the agent's
+//! private `$TMPDIR` (`intent_core::agent_tmp`) or come from `mktemp`, never a
+//! fixed `/tmp/<name>` path shared with other agents (cloudlands-fe#4102:
+//! one agent's `/tmp` PR body was overwritten by another's and posted to the
+//! wrong PR). It is its own section so plain-folder prompts, which drop
+//! the GitHub section, keep it. Every other body, text surfaces, specialists and defaults stay
+//! v3.6's, and earlier sessions keep their prompts byte for byte.
 
 use super::{Doctrine, HarnessEntry};
 
 static DOCTRINE: Doctrine = Doctrine {
     instructions: &crate::instructions::V3_7,
-    specialists: crate::specialists::EMBEDDED_BUNDLED_V3_7,
+    specialists: super::v3_6::ENTRY.doctrine.specialists,
 };
 
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
@@ -17,50 +24,37 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
+    use intent_core::{settings_file::AgentFeaturesSettings, AgentId};
 
-    use sha2::{Digest, Sha256};
+    use crate::v1_goldens::{seed_agent, setup};
 
-    #[test]
-    fn golden_v3_7_specialist_bytes() {
-        for (id, expected) in [
-            (
-                "developer",
-                "88c23a198f88a6bf313618baa69eef3d4acea31268b6a81e88b8d22d9335286d",
-            ),
-            (
-                "pr-reviewer",
-                "cac2b97a8be75d09178f486531ff42c28e4089f3b53e0ae5a7500bb256dabfba",
-            ),
-        ] {
-            let content = super::ENTRY
-                .doctrine
-                .specialists
-                .iter()
-                .find_map(|(candidate, content)| (*candidate == id).then_some(*content))
-                .expect("versioned specialist");
-            let actual = Sha256::digest(content)
-                .iter()
-                .fold(String::new(), |mut hex, byte| {
-                    let _ = write!(hex, "{byte:02x}");
-                    hex
-                });
-            assert_eq!(actual, expected, "{id}");
-        }
-    }
+    /// The whole v3.7 section, from its heading through the blank line
+    /// before the next heading.
+    const PARAGRAPH: &str =
+        "## Scratch Files\n\nYour shell's `$TMPDIR` is a private temp folder for this agent: \
+put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed \
+`/tmp/<name>` path that other agents share.\n\n";
 
     #[test]
-    fn v3_7_versions_workflows_and_removes_specialized_delegation_roles() {
-        let current = super::super::resolve_entry("3.7");
-        let previous = super::super::resolve_entry("3.6");
-        assert_eq!(current.version, "3.7");
+    fn v3_7_only_adds_the_private_tmpdir_sentence() {
+        let current = &super::ENTRY;
+        let previous = crate::harness::resolve_entry("3.6");
+        let common = current.doctrine.instructions.common;
+        assert_eq!(common.matches(PARAGRAPH).count(), 1);
+        assert_eq!(
+            common.replacen(PARAGRAPH, "", 1),
+            previous.doctrine.instructions.common
+        );
+        assert!(!previous.doctrine.instructions.common.contains("$TMPDIR"));
+        let at = common.find(PARAGRAPH).unwrap();
+        assert!(
+            common[..at].ends_with("`gh` CLI.\n\n")
+                && common[at + PARAGRAPH.len()..].starts_with("## Browser tabs\n"),
+            "the section follows GitHub & Git Operations"
+        );
         let (now, then) = (
             current.doctrine.instructions,
             previous.doctrine.instructions,
-        );
-        assert_eq!(
-            now.common,
-            then.common.replace(", specialist: \"implementor\"", "")
         );
         assert_eq!(now.workspace, then.workspace);
         assert_eq!(now.workspace_agent, then.workspace_agent);
@@ -70,38 +64,118 @@ mod tests {
             then.single_workspace_fallback
         );
         assert!(std::ptr::eq(
-            now.plain_folder.unwrap(),
-            then.plain_folder.unwrap()
+            now.plain_folder.expect("plain-folder doctrine"),
+            then.plain_folder.expect("plain-folder doctrine")
         ));
+        // Trait-object vtables can be duplicated across codegen units.
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
+        assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
-        assert_eq!(
-            current.doctrine.specialists.len(),
-            previous.doctrine.specialists.len() - 3
-        );
-        for (old_id, old) in previous.doctrine.specialists {
-            let replacement = current
-                .doctrine
-                .specialists
-                .iter()
-                .find(|(id, _)| id == old_id);
-            if matches!(*old_id, "verifier" | "spec-writer" | "implementor") {
-                assert!(replacement.is_none());
-                continue;
-            }
-            let (new_id, new) = replacement.expect("retained specialist");
-            if matches!(*new_id, "developer" | "pr-reviewer") {
-                assert_ne!(old, new, "{new_id}");
-                let (old_meta, _) = crate::specialists::parse_frontmatter(old);
-                let (new_meta, _) = crate::specialists::parse_frontmatter(new);
-                let keys = &["name", "role", "teamAgents", "icon", "aliases", "model"];
-                for key in keys {
-                    assert_eq!(old_meta.get(*key), new_meta.get(*key), "{new_id}: {key}");
+    }
+
+    #[test]
+    fn plain_folder_prompts_keep_the_section() {
+        let set = super::ENTRY.doctrine.instructions;
+        let features = AgentFeaturesSettings::default();
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            let plain = crate::instructions::get_instruction_with_common_in(
+                set, agent_type, &features, true,
+            );
+            assert!(plain.contains("## Plain folder workspace"), "{agent_type}");
+            assert!(
+                !plain.contains("## GitHub & Git Operations"),
+                "{agent_type}"
+            );
+            assert!(
+                plain.contains(PARAGRAPH),
+                "{agent_type}: plain folder keeps it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tmpdir_guidance_is_session_pinned_and_ungated() {
+        let (_tmp, svc, ws) = setup().await;
+        let id = AgentId::from("agent-private-tmpdir-guidance");
+        seed_agent(&svc, &ws, &id).await;
+        let mut current = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
+        current.harness_version = "3.7".into();
+        let mut previous = current.clone();
+        previous.harness_version = "3.6".into();
+        for scripts in [true, false] {
+            let features = AgentFeaturesSettings {
+                scripts,
+                ..AgentFeaturesSettings::default()
+            };
+            for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+                let mut prompts = Vec::new();
+                for session in [&current, &previous] {
+                    prompts.push(
+                        crate::rules::assemble_system_prompt(
+                            svc.store(),
+                            None,
+                            agent_type,
+                            None,
+                            false,
+                            false,
+                            false,
+                            &features,
+                            None,
+                            Some(session),
+                            None,
+                        )
+                        .await
+                        .expect("assembled prompt"),
+                    );
                 }
-            } else {
-                assert_eq!(old, new, "{new_id}");
+                assert!(
+                    prompts[0].contains(PARAGRAPH),
+                    "{agent_type}: 3.7 carries the sentence"
+                );
+                assert!(
+                    !prompts[1].contains("$TMPDIR"),
+                    "{agent_type}: 3.6 stays frozen"
+                );
+                assert_eq!(
+                    prompts[0].replacen(PARAGRAPH, "", 1),
+                    prompts[1],
+                    "{agent_type}: 3.7 differs from 3.6 only by the sentence"
+                );
             }
+        }
+        let plain = intent_core::Workspace {
+            plain_folder: true,
+            ..Default::default()
+        };
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            let prompt = crate::rules::assemble_system_prompt(
+                svc.store(),
+                None,
+                agent_type,
+                None,
+                false,
+                false,
+                false,
+                &AgentFeaturesSettings::default(),
+                Some(&plain),
+                Some(&current),
+                None,
+            )
+            .await
+            .expect("assembled prompt");
+            assert!(
+                !prompt.contains("## GitHub & Git Operations"),
+                "{agent_type}: plain folder drops the GitHub section"
+            );
+            assert!(
+                prompt.contains(PARAGRAPH),
+                "{agent_type}: plain folder keeps the scratch-file section"
+            );
         }
     }
 }

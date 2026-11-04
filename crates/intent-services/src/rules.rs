@@ -1569,8 +1569,8 @@ This is a test skill.
             Some(temp_dir.path().join("user")),
             Some(temp_dir.path().join("bundled")),
         )
-        .with_embedded(crate::specialists::EMBEDDED_BUNDLED_V3_7);
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/specialists/v3.7");
+        .with_embedded(crate::specialists::EMBEDDED_BUNDLED_V3_8);
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/specialists/v3.8");
         let bundled: Vec<_> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1579,7 +1579,7 @@ This is a test skill.
                 let id = path.file_stem().unwrap().to_str().unwrap();
                 let (body, name, reminder) = service
                     .resolve_prompt_injection_in(id, None, true)
-                    .expect("every v3.7 file must be in the bundled catalog");
+                    .expect("every v3.8 file must be in the bundled catalog");
                 SpecialistPromptInjection {
                     behavior_prompt: body,
                     specialist_name: Some(name),

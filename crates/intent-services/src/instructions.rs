@@ -276,10 +276,21 @@ pub(crate) static V3_6: InstructionSet = InstructionSet {
     ..V3_5
 };
 
-/// Harness v3.7 delegates to general agents unless a specialist is selected.
+/// Harness v3.7 keeps every v3.6 body except the common guidance, which adds
+/// a one-sentence "Scratch Files" section steering scratch files to the
+/// agent's private `$TMPDIR` (`intent_core::agent_tmp`) instead of fixed,
+/// shared `/tmp/<name>` paths. Its own section, so plain-folder composition
+/// (which drops "GitHub & Git Operations") keeps it.
 pub(crate) static V3_7: InstructionSet = InstructionSet {
     common: instr!("v3.7", "common"),
     ..V3_6
+};
+
+/// Harness v3.8 keeps the private scratch-file guidance and defaults delegation
+/// to general agents unless a specialist is explicitly selected.
+pub(crate) static V3_8: InstructionSet = InstructionSet {
+    common: instr!("v3.8", "common"),
+    ..V3_7
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of
@@ -674,8 +685,9 @@ mod tests {
     }
 
     /// The current common body includes workspace links, development-only
-    /// visuals and the long-running-process (Intent scripts) guidance.
-    const COMMON_LATEST: &str = V3_7.common;
+    /// visuals, the long-running-process (Intent scripts) guidance and the
+    /// private-`$TMPDIR` scratch-file sentence.
+    const COMMON_LATEST: &str = V3_8.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

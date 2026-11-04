@@ -7,7 +7,7 @@ Use plain English for questions, blockers, updates, and handoffs, including tool
 Before delegating, list the tasks to find existing task IDs:
 1. List tasks via the `workspace_api` tool: `ws.note.listTasks("spec")`
 2. Use the returned task note IDs directly
-3. Delegate by ID: `ws.agent.delegate({ taskNoteId: "{id}" })`
+3. Delegate by ID: `ws.agent.delegate({ taskNoteId: "{id}", specialist: "implementor" })`
 
 Use `ws.note.listTasks` instead of `ws.note.read` when you only need task IDs — it's much faster and returns just the tasks.
 
@@ -42,6 +42,10 @@ Use the `gh` CLI for all GitHub work: creating PRs (`gh pr create`), status and 
 Use the plain `git` CLI for status, staging, diffs, and merge checks. The one git binding, `ws.git.commit(message, { files?, userRequested? })`, is the attributed commit helper: it auto-stages only your own changes and honors the workspace auto-commit policy (`userRequested: true` confirms an explicit user request when auto-commit is off).
 
 If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs (or GitHub is connected in app setup), and `ws.pr.snapshot` fails gracefully with a not-configured error. The daemon resolves its token as: secrets store → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh` CLI.
+
+## Scratch Files
+
+Your shell's `$TMPDIR` is a private temp folder for this agent: put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed `/tmp/<name>` path that other agents share.
 
 ## Browser tabs
 

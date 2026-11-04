@@ -3269,7 +3269,14 @@ pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 /// by design, degrading to one whole message per page rather than an
 /// unpageable transcript. Serve-time only; the full (absent-projection) read
 /// is never budgeted.
-pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
+///
+/// Sized at 480,000 bytes like the other bounded reads, so a whole page's
+/// JSON-RPC frame — the messages plus their separators, the result fields
+/// (`agentId`, `totalMessages`, cursors) and the response or
+/// `subscription.push` envelope — stays within the 500 KiB (512,000-byte)
+/// read payload budget. The old 512 × 1024 value was larger than that frame
+/// budget before any envelope was added.
+pub const SLIM_PAGE_BUDGET_BYTES: usize = 480_000;
 
 /// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
 /// budget check: string bodies by length, everything else by serialized JSON
@@ -4136,7 +4143,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.7";
+pub const CURRENT_HARNESS_VERSION: &str = "3.8";
 
 /// Harness versions that receive repository guidance, oldest first. The single
 /// source for every admission gate and boundary test: bumping
@@ -4144,14 +4151,15 @@ pub const CURRENT_HARNESS_VERSION: &str = "3.7";
 /// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`]), and the compile-time
 /// check below fails the build until that is done. Exact strings only, so
 /// malformed or unknown stamps are never admitted.
-pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
+pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
+    "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8",
+];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] =
-    &["3.2", "3.3", "3.4", "3.5", "3.6", "3.7"];
+    &["3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8"];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());

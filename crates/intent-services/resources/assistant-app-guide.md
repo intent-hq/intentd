@@ -290,7 +290,7 @@ screenshots of the rendered result. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
-<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.7/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_7.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.8/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs}. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
@@ -455,8 +455,12 @@ user reaches it through a private HTTPS front-end they set up themselves; with
 Tailscale that is `tailscale serve --bg <port>` on the desktop, then the desktop's
 Tailscale address in the browser. Never suggest Tailscale Funnel or another public tunnel.
 
-The browser asks once for the **Access key** shown in that section; **Reset key** signs
-out every browser. In the browser, opening a saved connection opens that backend in a
+The browser asks once for the **Access key** shown in that section, or for a code from
+**Create sign-in link**: a 6-character code (such as `ABC-DEF`) that works once and
+expires after 10 minutes, plus a link once a browser has signed in. Opening the link only
+fills in the code; the user still selects **Sign in**. Sessions survive closing the
+browser and last 400 days from the last visit. **Reset key** signs out every browser and
+cancels unused codes. In the browser, opening a saved connection opens that backend in a
 new tab; adding or forgetting connections stays on the desktop. Desktop-only features
 such as native file dialogs and window controls are unavailable in the browser; a notice
 listing them appears each time the browser loads Intent. If the section shows the port
@@ -494,6 +498,11 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 - Start it with `npx @intent-hq/web` (Node.js 22.22.2+, 24.15.0+ or 26+). It listens
   only on `127.0.0.1:47120` and prints an **access key** on first run;
   `npx @intent-hq/web key` shows it again and `key --reset` signs out every browser.
+- To sign in a phone or another browser without typing the key, run
+  `npx @intent-hq/web link` (add `--url https://<address>` for a link) on the server,
+  even while it runs. The code works once, expires after 10 minutes and goes in the
+  sign-in field. Sessions survive closing the browser and last 400 days from the last
+  visit. Pass the server's `--data-dir` to `key` and `link` if it uses a custom one.
 - Reach it through a private HTTPS front-end such as `tailscale serve --bg 47120`, then
   open the `https://` address and enter the key. Never suggest Tailscale Funnel or
   another public tunnel.
@@ -509,7 +518,7 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
   available there; a notice listing them appears each time the browser loads Intent,
   and **Got it** closes it.
 
-<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
+<!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md; packages/cloudlands-fe/src/features/browser-access/main/browser-access-sign-in-codes.ts. -->
 
 ## Start or continue work
 

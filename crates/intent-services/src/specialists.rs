@@ -216,7 +216,7 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_7;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_8;
 
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
@@ -233,15 +233,15 @@ pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V2_5[8],
 ];
 
-pub(crate) const EMBEDDED_BUNDLED_V3_7: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_BUNDLED_V3_8: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_1[0],
     (
         "developer",
-        include_str!("../resources/specialists/v3.7/developer.md"),
+        include_str!("../resources/specialists/v3.8/developer.md"),
     ),
     (
         "pr-reviewer",
-        include_str!("../resources/specialists/v3.7/pr-reviewer.md"),
+        include_str!("../resources/specialists/v3.8/pr-reviewer.md"),
     ),
     EMBEDDED_BUNDLED_V3_1[4],
     EMBEDDED_BUNDLED_V3_1[6],
@@ -1911,7 +1911,7 @@ impl SpecialistsService {
         self.resolve_prompt_injection_in(id, workspace_path, false)
     }
 
-    /// Apply plain-folder doctrine only to the shipped v3.7 prompts. File
+    /// Apply plain-folder doctrine only to the shipped v3.8 prompts. File
     /// overrides and older session-pinned bundles retain their authored text.
     pub(crate) fn resolve_prompt_injection_in(
         &self,
@@ -1921,7 +1921,7 @@ impl SpecialistsService {
     ) -> Option<(Option<String>, String, Option<String>)> {
         let mut def = self.resolve(id, workspace_path)?;
         if plain_folder && !self.base_replaced && def["source"] == "bundled" {
-            for (candidate, source) in EMBEDDED_BUNDLED_V3_7 {
+            for (candidate, source) in EMBEDDED_BUNDLED_V3_8 {
                 if !matches!(*candidate, "developer" | "pr-reviewer") {
                     continue;
                 }
@@ -2891,7 +2891,7 @@ mod tests {
                 original,
                 svc.resolve_prompt_injection_in(id, None, true).unwrap()
             );
-            let source = EMBEDDED_BUNDLED_V3_7
+            let source = EMBEDDED_BUNDLED_V3_8
                 .iter()
                 .find(|(name, _)| *name == id)
                 .unwrap()
