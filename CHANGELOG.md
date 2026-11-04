@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.126] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- *(search)* Page search.notes within the read payload budget ([#3033](https://github.com/intent-hq/intentd/pull/3033))
+- *(core)* Keep a single huge chat message under the page budget ([#3037](https://github.com/intent-hq/intentd/pull/3037))
+
+
 ## [0.11.125] - 2026-11-04
 
 ### 🐛 Bug Fixes
