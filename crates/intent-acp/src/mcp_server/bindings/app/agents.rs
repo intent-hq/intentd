@@ -37,7 +37,7 @@ const DEFAULT_READ_LIMIT: i64 = 20;
 const MAX_READ_LIMIT: i64 = 100;
 /// Hard cap on `nextToken` continuations a single `readConversation` call
 /// follows when the slim page byte budget (§5.5) trims pages below their
-/// message limit. 100 messages at worst-case one message per 512 KiB page.
+/// message limit. 100 messages at worst-case one message per budgeted page.
 const READ_PAGE_WALK_CAP: usize = 100;
 
 /// Every `ws.app.agents.*` result passes through
@@ -294,7 +294,7 @@ pub(super) async fn read_conversation_for_agent(
     // The conversation is read under the slim projection (§5.5): bounded
     // tool/image block bodies, like every other consumer since v8.0. The
     // slim service read is also BYTE-BUDGETED — one page can carry fewer
-    // messages than its `limit` (512 KiB page budget) — and its
+    // messages than its `limit` (480,000-byte page budget) — and its
     // `totalMessages` is transcript-wide, not page-length. So: take the
     // total from the service, resolve the requested window against it
     // (turn indices are transcript positions), and follow the re-minted

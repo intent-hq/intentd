@@ -2272,7 +2272,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         })
         .collect();
     // Live turn: 400 capped tool_result blocks ≈ 800KB after slimming —
-    // alone over the 512KB budget.
+    // alone over the page budget.
     let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES);
     let live_blocks: Vec<Value> = (0..400)
         .map(|i| {

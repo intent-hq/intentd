@@ -3269,7 +3269,14 @@ pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 /// by design, degrading to one whole message per page rather than an
 /// unpageable transcript. Serve-time only; the full (absent-projection) read
 /// is never budgeted.
-pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
+///
+/// Sized at 480,000 bytes like the other bounded reads, so a whole page's
+/// JSON-RPC frame — the messages plus their separators, the result fields
+/// (`agentId`, `totalMessages`, cursors) and the response or
+/// `subscription.push` envelope — stays within the 500 KiB (512,000-byte)
+/// read payload budget. The old 512 × 1024 value was larger than that frame
+/// budget before any envelope was added.
+pub const SLIM_PAGE_BUDGET_BYTES: usize = 480_000;
 
 /// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
 /// budget check: string bodies by length, everything else by serialized JSON
