@@ -2129,6 +2129,36 @@ mod final_stops {
         node.shutdown();
     }
 
+    /// Review of intentd#3044: a plain stop queued for an agent whose
+    /// session has ended still lets the claim upgrade it to a recorded
+    /// final stop (checkout and placement cleanup), and nothing is parked.
+    #[tokio::test]
+    async fn an_ended_session_with_a_plain_stop_queued_still_gets_a_final_stop_at_bind() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        let node = backend.bare(&machine).await;
+        let agent = placed(&backend, &node, &machine).await;
+        end_session(&backend, &agent, false).await;
+        node.shared().request_stop(&agent);
+        *machine.host.running.lock().unwrap() = vec![agent.clone()];
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        link.replay_complete(0).await;
+        let stop_id = final_stop_for(&mut link, &agent).await;
+        let row = backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .expect("the ended session's stop is recorded as final");
+        assert_eq!(row.stop_id, stop_id.to_string());
+        assert_eq!(row.reason, FinalStopReason::AgentRetired);
+        assert!(!node.shared_ref().is_parked(&agent));
+        assert!(!node.shared_ref().agents.is_attached(&agent));
+        node.shutdown();
+    }
+
     /// #8428: an agent still running at bind whose session was retired or
     /// deleted, with no final stop recorded (a head that crashed between the
     /// session change and the stop, or one from before final stops), gets a

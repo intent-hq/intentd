@@ -608,6 +608,13 @@ impl Shared {
         lock(&self.stops).contains_key(agent_id)
     }
 
+    /// Whether `agent_id` has an unacknowledged final stop.
+    pub(crate) fn final_stop_queued(&self, agent_id: &AgentId) -> bool {
+        lock(&self.stops)
+            .get(agent_id)
+            .is_some_and(|queued| queued.final_stop)
+    }
+
     /// Stop `stop_id` of `agent_id` is acknowledged: it leaves the queue.
     /// An ack never confirms another stop of the same agent.
     fn confirm_stop(&self, agent_id: &AgentId, stop_id: StopId) {
@@ -1861,10 +1868,7 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
                 continue;
             }
         }
-        // An agent with a queued stop is being stopped: parking a runtime
-        // for it would hand a relaunch a runtime that the stopped process's
-        // exit then ends (intent-hq/intent#8457).
-        if shared.stop_queued(agent_id) {
+        if shared.final_stop_queued(agent_id) {
             continue;
         }
         let Some(record) = records.get(agent_id) else {
@@ -1889,7 +1893,10 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
             }
             continue;
         }
-        if !shared.agents.is_attached(agent_id) {
+        // An agent with a plain stop queued is being stopped: parking a
+        // runtime for it would hand a relaunch a runtime that the stopped
+        // process's exit then ends (intent-hq/intent#8457).
+        if !shared.agents.is_attached(agent_id) && !shared.stop_queued(agent_id) {
             let sink = shared.agents.attach(agent_id, record.workspace_id.clone());
             let runtime = Arc::new(RemoteAgentRuntime::new(
                 agent_id.clone(),
