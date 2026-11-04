@@ -226,10 +226,7 @@ struct FixedReport {
 
 impl MachineReport for FixedReport {
     fn providers(&self) -> Vec<ProviderCapability> {
-        if !self
-            .mock_enabled
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if !self.mock_enabled.load(std::sync::atomic::Ordering::SeqCst) {
             return Vec::new();
         }
         let failed = lock(&self.auth_failures).iter().any(|p| p == "mock");
@@ -1985,7 +1982,10 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
 
     node.report.mock_enabled.store(false, Ordering::SeqCst);
     node.service.enabled_providers_changed().await;
-    assert!(pushed(&mut dialed).await.is_empty(), "the reconciled report");
+    assert!(
+        pushed(&mut dialed).await.is_empty(),
+        "the reconciled report"
+    );
     assert!(pushed(&mut dialed).await.is_empty(), "the refreshed report");
     assert_eq!(node.report.reconciles.load(Ordering::SeqCst), 1);
     assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 1);
@@ -2053,9 +2053,8 @@ fn reconciling_follows_the_enabled_set_and_keeps_observations() {
 #[test]
 fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
     let dir = tempfile::tempdir().unwrap();
-    let settings = Arc::new(
-        intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
-    );
+    let settings =
+        Arc::new(intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
     settings
         .apply(&[(
             "providers.enabled".into(),
