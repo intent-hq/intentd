@@ -483,6 +483,12 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 - Reach it through a private HTTPS front-end such as `tailscale serve --bg 47120`, then
   open the `https://` address and enter the key. Never suggest Tailscale Funnel or
   another public tunnel.
+- To sign in another browser without typing the key there, scan the QR code on its
+  sign-in page with a phone, check that the **match code** is the same on both
+  screens, enter the key on the phone and choose **Approve sign-in**. The QR expires
+  after 2 minutes. `npx @intent-hq/web link --url <https address>` prints a one-time
+  link and terminal QR instead (5 minutes by default, `--ttl` up to 15). Both work
+  once and stop working after `key --reset`.
 - If `intentd` is already running on the same machine when `intent-web` starts, it
   appears as **This machine (local)**; if it is missing, restart `intent-web`. Add
   other machines in **Settings → Machines → Add machine** with the host, port and token
