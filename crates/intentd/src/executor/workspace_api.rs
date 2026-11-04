@@ -78,6 +78,10 @@ pub(super) async fn serve(
     let env = path
         .map(|path| ("PATH".to_owned(), path))
         .into_iter()
+        .chain(std::iter::once((
+            intent_acp::BRIDGE_TOKEN_ENV.to_owned(),
+            bridge.auth_token().to_owned(),
+        )))
         .collect();
     let servers = std::collections::BTreeMap::from([(
         "workspace-mcp".to_owned(),

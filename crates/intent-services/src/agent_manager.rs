@@ -2708,12 +2708,17 @@ impl PiExtensionDelivery {
         &self,
         extra_env: &mut BTreeMap<String, String>,
         bridge_connect_addr: String,
+        bridge_token: &str,
     ) {
         extra_env.insert(
             PI_ACP_PI_COMMAND_ENV.to_string(),
             self.wrapper.path.to_string_lossy().into_owned(),
         );
         extra_env.insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
+        extra_env.insert(
+            intent_acp::BRIDGE_TOKEN_ENV.to_string(),
+            bridge_token.to_string(),
+        );
         #[cfg(windows)]
         {
             extra_env.insert(
@@ -3782,7 +3787,8 @@ impl AgentManager {
             let path = config_dir.join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
                 .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
-            std::fs::write(&path, bytes)
+            // The config carries the bridge secret: owner-only permissions.
+            intent_core::write_private(&path, &bytes)
                 .map_err(|e| Error::Internal(format!("write mcp config failed: {e}")))?;
             mcp_config_path = Some(path.to_string_lossy().into_owned());
             mcp_config = Some(TempConfigFile { path });
@@ -3794,7 +3800,10 @@ impl AgentManager {
         // same bridge endpoint.
         let mut env_mcp_config: Option<String> = None;
         if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig {
-            env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
+            env_mcp_config = Some(
+                self.opencode_env_mcp_config(bridge.connect_addr(), bridge.auth_token())
+                    .await?,
+            );
         }
 
         // For pi, MCP delivery rides a bundled pi extension: pi-acp has no
@@ -3823,7 +3832,9 @@ impl AgentManager {
         // every session-open branch.
         let mut session_mcp_servers: Vec<McpServer> = Vec::new();
         if opts.provider.supports_session_mcp_servers {
-            let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            let servers = self
+                .normalized_mcp_servers(bridge.connect_addr(), bridge.auth_token())
+                .await?;
             if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
                 EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
             }) {
@@ -3948,7 +3959,11 @@ impl AgentManager {
                 .acp_node_max_old_space_mb;
         }
         if let Some(delivery) = &pi_extension {
-            delivery.apply_spawn_env(&mut spawn_opts.extra_env, bridge.connect_addr());
+            delivery.apply_spawn_env(
+                &mut spawn_opts.extra_env,
+                bridge.connect_addr(),
+                bridge.auth_token(),
+            );
         }
         if let Some(profile) = &antigravity_profile {
             spawn_opts.extra_env.extend(profile.env().map_err(|err| {
@@ -4234,7 +4249,9 @@ impl AgentManager {
     /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape) from
     /// the normalized spawn server set ([`Self::normalized_mcp_servers`]).
     async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
-        let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+        let servers = self
+            .normalized_mcp_servers(bridge.connect_addr(), bridge.auth_token())
+            .await?;
         Ok(to_auggie_mcp_config(&servers))
     }
 
@@ -4242,8 +4259,8 @@ impl AgentManager {
     /// `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` at spawn for
     /// env-config providers. The bridge entry points at the same endpoint the
     /// auggie `--mcp-config` path uses.
-    async fn opencode_env_mcp_config(&self, connect_addr: String) -> Result<String> {
-        let servers = self.normalized_mcp_servers(connect_addr).await?;
+    async fn opencode_env_mcp_config(&self, connect_addr: String, token: &str) -> Result<String> {
+        let servers = self.normalized_mcp_servers(connect_addr, token).await?;
         serde_json::to_string(&to_opencode_mcp_config(&servers))
             .map_err(|e| Error::Internal(format!("serialize opencode mcp config failed: {e}")))
     }
@@ -4257,7 +4274,11 @@ impl AgentManager {
     /// transports — injects an `Authorization` header from the persisted OAuth
     /// token bag when the catalog entry does not already set one.
     /// `workspace-mcp` is reserved and never overridden.
-    async fn normalized_mcp_servers(&self, connect_addr: String) -> Result<NormalizedMcpServers> {
+    async fn normalized_mcp_servers(
+        &self,
+        connect_addr: String,
+        token: &str,
+    ) -> Result<NormalizedMcpServers> {
         let mut servers = NormalizedMcpServers::new();
         // A whitespace-containing bridge path breaks provider launchers that
         // shell-split the stdio command (monorepo#1049): emit the basename and
@@ -4270,6 +4291,9 @@ impl AgentManager {
         if let Some(path) = path_override {
             env.insert("PATH".to_string(), path);
         }
+        // The listener refuses any connection that does not present this
+        // per-agent secret; it rides in the child env, never argv.
+        env.insert(intent_acp::BRIDGE_TOKEN_ENV.to_string(), token.to_string());
         servers.insert(
             "workspace-mcp".to_string(),
             NormalizedMcpServer::Stdio {
@@ -23956,7 +23980,7 @@ mod pi_extension_delivery_tests {
     fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
         let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let mut extra_env = BTreeMap::new();
-        delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
+        delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string(), "t0ken");
         assert_eq!(
             extra_env.get(PI_ACP_PI_COMMAND_ENV),
             Some(&delivery.wrapper.path.to_string_lossy().into_owned())
@@ -23966,6 +23990,12 @@ mod pi_extension_delivery_tests {
                 .get(INTENTD_MCP_BRIDGE_ADDR_ENV)
                 .map(String::as_str),
             Some("127.0.0.1:9999")
+        );
+        assert_eq!(
+            extra_env
+                .get(intent_acp::BRIDGE_TOKEN_ENV)
+                .map(String::as_str),
+            Some("t0ken")
         );
     }
 

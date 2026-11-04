@@ -21207,6 +21207,15 @@ impl WorkspaceApi for Services {
                     file_ops::AttachmentSource::Bytes(&decoded)
                 }
                 (None, Some(src)) => {
+                    // The source is an arbitrary host path, so this arm is a
+                    // host read: a workspace guest naming `~/.ssh/...` would
+                    // copy the host owner's files into the workspace and read
+                    // them back with `file.read`. Only callers with host
+                    // execution (owner, host members, local agents) may use
+                    // it; guests attach bytes through `data` or the chunked
+                    // upload.
+                    self.require_host_execution("file.placeAttachment sourcePath")
+                        .await?;
                     // Same-host FE fast path: copy a host-local file without
                     // routing its bytes through the wire (streamed by
                     // `fs::copy`, never buffered — the file may exceed the

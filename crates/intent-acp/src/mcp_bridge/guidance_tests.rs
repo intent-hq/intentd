@@ -95,7 +95,7 @@ fn call(id: u64, code: &str) -> Value {
 }
 
 async fn connect(bridge: &McpBridge) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-    let stream = TcpStream::connect(bridge.addr()).await.unwrap();
+    let stream = bridge.connect().await.unwrap();
     let (read, write) = stream.into_split();
     (BufReader::new(read), write)
 }
