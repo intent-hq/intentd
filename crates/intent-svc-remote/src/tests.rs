@@ -1618,6 +1618,8 @@ mod stop_acks {
             _ => None,
         })
         .await;
+        // Head has ingested (and delivered) the old exit before the check.
+        link.acked(1).await;
         let relaunched = tokio::time::timeout(wait(), launching)
             .await
             .unwrap()

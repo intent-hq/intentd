@@ -576,6 +576,8 @@ impl Shared {
                     continue;
                 }
                 self.confirm_stop(&record.agent_id, stop_id);
+                // No ack settles this stop, so nothing tracks its exit.
+                lock(&self.stop_exits).remove(&record.agent_id);
                 self.final_stop_over(&record.agent_id).await;
                 continue;
             }
@@ -718,7 +720,11 @@ impl Shared {
                         // nodeProtocol 9 got the stop as a plain one.
                         self.final_stop_over(&agent_id).await;
                     }
-                    self.stop_exit_acked(&agent_id, acked.outcome);
+                    // Only this stop's own ack settles its exit: one
+                    // replaced meanwhile (by a final stop) leaves it alone.
+                    if self.queued(&agent_id, stop_id).is_some() {
+                        self.stop_exit_acked(&agent_id, acked.outcome);
+                    }
                     self.confirm_stop(&agent_id, stop_id);
                 }
                 Err(error) if link::error_code(&error) == Some(link::codes::TIMEOUT) => {}
@@ -824,19 +830,26 @@ impl Shared {
             .or_insert(StopExit::Pending);
     }
 
-    /// `record` is being ingested: an exit record settles its agent's
-    /// stop, and one a relaunch waits for releases it.
-    fn stop_exit_ingested(&self, record: &intent_core::node_link::JournalRecord) {
-        if !matches!(record.body, JournalBody::Exited { .. }) {
+    /// The agent `record` reports exited, if it is an exit record.
+    fn exited_agent(record: &intent_core::node_link::JournalRecord) -> Option<AgentId> {
+        matches!(record.body, JournalBody::Exited { .. }).then(|| record.agent_id.clone())
+    }
+
+    /// An exit record for `exited` was delivered: it settles its agent's
+    /// stop, and one a relaunch waits for releases it. Called only after
+    /// delivery, so a released relaunch never attaches before the old
+    /// process's exit has reached the old runtime.
+    fn stop_exit_ingested(&self, exited: Option<AgentId>) {
+        let Some(agent_id) = exited else {
             return;
-        }
+        };
         let mut exits = lock(&self.stop_exits);
-        match exits.get(&record.agent_id) {
+        match exits.get(&agent_id) {
             Some(StopExit::Pending) => {
-                exits.insert(record.agent_id.clone(), StopExit::Seen);
+                exits.insert(agent_id, StopExit::Seen);
             }
             Some(StopExit::Owed) => {
-                exits.remove(&record.agent_id);
+                exits.remove(&agent_id);
                 drop(exits);
                 self.stops_changed.send_modify(|n| *n += 1);
             }
@@ -1622,8 +1635,9 @@ async fn serve(
                         match ingest.accept(seq) {
                             Step::Ingest => {
                                 record_placement(shared, &record).await;
-                                shared.stop_exit_ingested(&record);
+                                let exited = Shared::exited_agent(&record);
                                 shared.agents.deliver(record);
+                                shared.stop_exit_ingested(exited);
                             }
                             Step::IngestAfterLoss { lost } => {
                                 tracing::warn!(
@@ -1632,8 +1646,9 @@ async fn serve(
                                     "remote machine: journal records were lost on the machine"
                                 );
                                 record_placement(shared, &record).await;
-                                shared.stop_exit_ingested(&record);
+                                let exited = Shared::exited_agent(&record);
                                 shared.agents.deliver(record);
+                                shared.stop_exit_ingested(exited);
                             }
                             Step::Skip => {}
                             Step::Resync => {
