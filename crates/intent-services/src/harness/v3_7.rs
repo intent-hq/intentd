@@ -1,9 +1,10 @@
-//! Harness v3.7 adds one sentence to the common "GitHub & Git Operations"
-//! section: scratch files (PR bodies, patches, logs) go in the agent's
+//! Harness v3.7 adds a one-sentence common "Scratch Files" section right
+//! after "GitHub & Git Operations": scratch files (drafts, patches, logs) go in the agent's
 //! private `$TMPDIR` (`intent_core::agent_tmp`) or come from `mktemp`, never a
 //! fixed `/tmp/<name>` path shared with other agents (cloudlands-fe#4102:
 //! one agent's `/tmp` PR body was overwritten by another's and posted to the
-//! wrong PR). Every other body, text surfaces, specialists and defaults stay
+//! wrong PR). It is its own section so plain-folder prompts, which drop
+//! the GitHub section, keep it. Every other body, text surfaces, specialists and defaults stay
 //! v3.6's, and earlier sessions keep their prompts byte for byte.
 
 use super::{Doctrine, HarnessEntry};
@@ -27,9 +28,11 @@ mod tests {
 
     use crate::v1_goldens::{seed_agent, setup};
 
-    /// The v3.7 paragraph, including its trailing blank line.
-    const PARAGRAPH: &str = "Your shell's `$TMPDIR` is a private temp folder for this agent: \
-put scratch files (PR bodies, patches, logs) there or use `mktemp`, never a fixed \
+    /// The whole v3.7 section, from its heading through the blank line
+    /// before the next heading.
+    const PARAGRAPH: &str =
+        "## Scratch Files\n\nYour shell's `$TMPDIR` is a private temp folder for this agent: \
+put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed \
 `/tmp/<name>` path that other agents share.\n\n";
 
     #[test]
@@ -43,12 +46,11 @@ put scratch files (PR bodies, patches, logs) there or use `mktemp`, never a fixe
             previous.doctrine.instructions.common
         );
         assert!(!previous.doctrine.instructions.common.contains("$TMPDIR"));
-        let git = common.find("## GitHub & Git Operations\n").unwrap();
         let at = common.find(PARAGRAPH).unwrap();
-        let next = common[git + 1..].find("\n## ").unwrap() + git + 1;
         assert!(
-            git < at && at < next,
-            "the sentence sits in the GitHub & Git Operations section"
+            common[..at].ends_with("`gh` CLI.\n\n")
+                && common[at + PARAGRAPH.len()..].starts_with("## Browser tabs\n"),
+            "the section follows GitHub & Git Operations"
         );
         let (now, then) = (
             current.doctrine.instructions,
@@ -70,6 +72,26 @@ put scratch files (PR bodies, patches, logs) there or use `mktemp`, never a fixe
         assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
+    }
+
+    #[test]
+    fn plain_folder_prompts_keep_the_section() {
+        let set = super::ENTRY.doctrine.instructions;
+        let features = AgentFeaturesSettings::default();
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            let plain = crate::instructions::get_instruction_with_common_in(
+                set, agent_type, &features, true,
+            );
+            assert!(plain.contains("## Plain folder workspace"), "{agent_type}");
+            assert!(
+                !plain.contains("## GitHub & Git Operations"),
+                "{agent_type}"
+            );
+            assert!(
+                plain.contains(PARAGRAPH),
+                "{agent_type}: plain folder keeps it"
+            );
+        }
     }
 
     #[tokio::test]
@@ -121,6 +143,35 @@ put scratch files (PR bodies, patches, logs) there or use `mktemp`, never a fixe
                     "{agent_type}: 3.7 differs from 3.6 only by the sentence"
                 );
             }
+        }
+        let plain = intent_core::Workspace {
+            plain_folder: true,
+            ..Default::default()
+        };
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            let prompt = crate::rules::assemble_system_prompt(
+                svc.store(),
+                None,
+                agent_type,
+                None,
+                false,
+                false,
+                false,
+                &AgentFeaturesSettings::default(),
+                Some(&plain),
+                Some(&current),
+                None,
+            )
+            .await
+            .expect("assembled prompt");
+            assert!(
+                !prompt.contains("## GitHub & Git Operations"),
+                "{agent_type}: plain folder drops the GitHub section"
+            );
+            assert!(
+                prompt.contains(PARAGRAPH),
+                "{agent_type}: plain folder keeps the scratch-file section"
+            );
         }
     }
 }

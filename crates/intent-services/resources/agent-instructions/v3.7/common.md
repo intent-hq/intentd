@@ -43,7 +43,9 @@ Use the plain `git` CLI for status, staging, diffs, and merge checks. The one gi
 
 If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs (or GitHub is connected in app setup), and `ws.pr.snapshot` fails gracefully with a not-configured error. The daemon resolves its token as: secrets store → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh` CLI.
 
-Your shell's `$TMPDIR` is a private temp folder for this agent: put scratch files (PR bodies, patches, logs) there or use `mktemp`, never a fixed `/tmp/<name>` path that other agents share.
+## Scratch Files
+
+Your shell's `$TMPDIR` is a private temp folder for this agent: put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed `/tmp/<name>` path that other agents share.
 
 ## Browser tabs
 

@@ -277,8 +277,10 @@ pub(crate) static V3_6: InstructionSet = InstructionSet {
 };
 
 /// Harness v3.7 keeps every v3.6 body except the common guidance, which adds
-/// one sentence steering scratch files to the agent's private `$TMPDIR`
-/// (intent_core::agent_tmp) instead of fixed, shared `/tmp/<name>` paths.
+/// a one-sentence "Scratch Files" section steering scratch files to the
+/// agent's private `$TMPDIR` (`intent_core::agent_tmp`) instead of fixed,
+/// shared `/tmp/<name>` paths. Its own section, so plain-folder composition
+/// (which drops "GitHub & Git Operations") keeps it.
 pub(crate) static V3_7: InstructionSet = InstructionSet {
     common: instr!("v3.7", "common"),
     ..V3_6
