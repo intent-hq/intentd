@@ -2092,3 +2092,65 @@ mod final_stops {
         node.shutdown();
     }
 }
+
+/// A machine pushes an unsolicited `capabilitiesReply` when its enabled
+/// providers change: the backend records it like a requested one, so a
+/// provider the machine disabled stops being offered at once and one it
+/// enables again comes back.
+#[tokio::test]
+async fn an_unsolicited_capabilities_report_replaces_the_recorded_one() {
+    let (mut machine, backend, node) = exposed().await;
+    let agent = AgentId::new();
+    let _runtime = node.attach(&agent, &workspace());
+    let link = machine.accept().await;
+    link.replay_complete(0).await;
+    bound(&node).await;
+
+    let recorded_providers = || async {
+        backend
+            .store()
+            .get_exposed_machine(&machine.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .capabilities
+            .map(|capabilities| {
+                capabilities
+                    .providers
+                    .into_iter()
+                    .map(|provider| provider.id)
+                    .collect::<Vec<_>>()
+            })
+    };
+    let wait_for = |expected: Vec<String>| {
+        let recorded_providers = &recorded_providers;
+        async move {
+            tokio::time::timeout(wait(), async {
+                while recorded_providers().await.as_ref() != Some(&expected) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the backend records providers {expected:?}"));
+        }
+    };
+
+    let mut disabled = capabilities(0);
+    disabled.providers.clear();
+    link.link
+        .send(&LinkFrame::CapabilitiesReply {
+            capabilities: disabled,
+        })
+        .await
+        .unwrap();
+    wait_for(Vec::new()).await;
+
+    link.link
+        .send(&LinkFrame::CapabilitiesReply {
+            capabilities: capabilities(0),
+        })
+        .await
+        .unwrap();
+    wait_for(vec!["mock".to_owned()]).await;
+    node.shutdown();
+}

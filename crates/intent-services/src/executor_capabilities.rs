@@ -305,6 +305,30 @@ mod tests {
         }
     }
 
+    /// A provider disabled in this machine's own `providers.enabled` is left
+    /// out of its report, so a backend never offers it here.
+    #[tokio::test]
+    async fn launch_statuses_leave_out_a_provider_disabled_on_this_machine() {
+        let dir = crate::test_support::test_tempdir("launch-statuses-disabled");
+        let store = intent_store::Store::open(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+        let settings = std::sync::Arc::new(
+            crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
+        );
+        settings
+            .apply(&[("providers.enabled".into(), json!({ "codex": false }))])
+            .unwrap();
+        let svc = Services::new(store).with_settings_registry(settings);
+        let ids: Vec<_> = svc
+            .executor_provider_launch_statuses()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(!ids.iter().any(|id| id == "codex"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "claude-code"), "{ids:?}");
+    }
+
     /// What the installation says applies to every launch, signed in or not.
     #[test]
     fn a_provider_that_cannot_launch_keeps_its_launch_status() {

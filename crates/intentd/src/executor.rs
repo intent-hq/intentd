@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 
 use intent_core::link_traffic::LinkTraffic;
 use intent_core::machines::{ExecutorCredential, ExecutorLiveStatus, ExecutorLiveness};
-use intent_core::node_link::{LinkHello, LinkWelcome, MachineCapabilities, ProviderCapability};
+use intent_core::node_link::{
+    LinkFrame, LinkHello, LinkWelcome, MachineCapabilities, ProviderCapability,
+};
 use intent_core::nodes::{NodeArch, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_core::ExecutorCredentialId;
@@ -63,6 +65,36 @@ pub(crate) trait MachineReport: Send + Sync {
     /// A launch without a profile failed because `provider`'s default
     /// account is not signed in.
     fn launch_auth_failed(&self, provider: &str);
+    /// The machine's enabled providers may have changed: drop the ones now
+    /// disabled from the cached list and add the ones now enabled with what
+    /// is cheap to know, keeping what was observed of the others. Never
+    /// blocks for long.
+    fn reconcile(&self);
+}
+
+/// Whether a settings change touches the enabled providers, which the
+/// capabilities report follows.
+pub(crate) fn enabled_providers_changed(change: &intent_services::SettingsChanged) -> bool {
+    change.changed.contains("providers.enabled")
+}
+
+/// The cached provider list against `enabled_now` (every enabled provider
+/// with its launch status only): in `enabled_now`'s order, each provider's
+/// cached entry when there is one, else its launch-status entry.
+pub(crate) fn reconcile_providers(
+    cached: &[ProviderCapability],
+    enabled_now: Vec<ProviderCapability>,
+) -> Vec<ProviderCapability> {
+    enabled_now
+        .into_iter()
+        .map(|fresh| {
+            cached
+                .iter()
+                .find(|old| old.id == fresh.id)
+                .cloned()
+                .unwrap_or(fresh)
+        })
+        .collect()
 }
 
 /// What the executor service is built from.
@@ -246,6 +278,38 @@ impl ExecutorService {
         capabilities.capacity = self.deps.admission.capacity();
         capabilities.providers = self.deps.report.providers();
         capabilities
+    }
+
+    /// The machine's enabled providers changed: send every live backend
+    /// link the reconciled report at once, then the fully refreshed one, so
+    /// a backend stops offering a provider disabled here (or offers one
+    /// enabled again) without waiting for its next capabilities request.
+    pub(crate) async fn enabled_providers_changed(&self) {
+        self.deps.report.reconcile();
+        self.push_capabilities().await;
+        self.deps.report.refresh().await;
+        self.push_capabilities().await;
+    }
+
+    /// Send the current report, unasked, on every live backend link.
+    async fn push_capabilities(&self) {
+        let links: Vec<NodeLink> = lock(&self.backends)
+            .values()
+            .flat_map(|backend| backend.links.iter())
+            .filter(|link| !link.is_closed())
+            .cloned()
+            .collect();
+        if links.is_empty() {
+            return;
+        }
+        let capabilities = self.capabilities();
+        for link in links {
+            let _ = link
+                .send(&LinkFrame::CapabilitiesReply {
+                    capabilities: capabilities.clone(),
+                })
+                .await;
+        }
     }
 
     /// Open `credential`'s storage, journal and runner.
@@ -916,6 +980,12 @@ impl MachineReport for DaemonReport {
         drop(failures);
         mark_auth_failed(&mut cache.0, provider);
     }
+
+    fn reconcile(&self) {
+        let enabled_now = self.services.executor_provider_launch_statuses();
+        let mut cache = lock(&self.cache);
+        cache.0 = reconcile_providers(&cache.0, enabled_now);
+    }
 }
 
 /// What [`start_in_daemon`] wires the executor service from.
@@ -988,16 +1058,29 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
     };
     // Keep the provider report warm while any executor credential is
     // active; model discovery may run provider CLIs, so it never runs on a
-    // bind, and never on a machine no backend was given access to.
+    // bind, and never on a machine no backend was given access to. A change
+    // of the enabled providers is reported to the bound backends at once.
     // caller-binding: allow — the executor service's background report refresh
     let refresher = tokio::spawn({
         let report = Arc::downgrade(&report);
         let active_credentials = service.deps.active_credentials.clone();
+        let service = Arc::downgrade(&service);
+        let mut settings = parts.settings.subscribe();
         async move {
             let mut tick = tokio::time::interval(REPORT_POLL);
             let mut last = None;
+            let mut watching = true;
             loop {
-                tick.tick().await;
+                let enabled_changed = tokio::select! {
+                    _ = tick.tick() => false,
+                    changed = settings.changed(), if watching => match changed {
+                        Ok(()) => enabled_providers_changed(&settings.borrow_and_update()),
+                        Err(_) => {
+                            watching = false;
+                            false
+                        }
+                    },
+                };
                 let Some(report) = report.upgrade() else {
                     return;
                 };
@@ -1009,7 +1092,16 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
                     }
                 };
                 let now = std::time::Instant::now();
-                if !active {
+                if enabled_changed {
+                    match service.upgrade() {
+                        Some(service) if active => {
+                            service.enabled_providers_changed().await;
+                            last = Some(now);
+                        }
+                        Some(_) => report.reconcile(),
+                        None => return,
+                    }
+                } else if !active {
                     last = None;
                 } else if report_due(active, last, now) {
                     report.refresh().await;

@@ -218,10 +218,20 @@ struct FixedReport {
     refreshes: std::sync::atomic::AtomicUsize,
     primes: std::sync::atomic::AtomicUsize,
     auth_failures: Mutex<Vec<String>>,
+    /// Reconciles with the enabled set, after which `mock` is reported as
+    /// enabled or not per `mock_enabled`.
+    reconciles: std::sync::atomic::AtomicUsize,
+    mock_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl MachineReport for FixedReport {
     fn providers(&self) -> Vec<ProviderCapability> {
+        if !self
+            .mock_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Vec::new();
+        }
         let failed = lock(&self.auth_failures).iter().any(|p| p == "mock");
         vec![ProviderCapability {
             id: "mock".into(),
@@ -249,6 +259,10 @@ impl MachineReport for FixedReport {
     }
     fn launch_auth_failed(&self, provider: &str) {
         lock(&self.auth_failures).push(provider.to_owned());
+    }
+    fn reconcile(&self) {
+        self.reconciles
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -331,6 +345,8 @@ impl Running {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
+            reconciles: std::sync::atomic::AtomicUsize::new(0),
+            mock_enabled: std::sync::atomic::AtomicBool::new(true),
         });
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
@@ -1939,4 +1955,121 @@ async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
         "shutdown returned with the agent still running"
     );
     node.stop().await;
+}
+
+/// When the machine's enabled providers change, every live backend link
+/// gets the cheap reconciled report at once and then the fully refreshed
+/// one, without asking: a provider the owner disabled drops out of the
+/// backend's placement right away, and one enabled again comes back.
+#[tokio::test]
+async fn an_enabled_providers_change_pushes_the_report_unasked() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    async fn pushed(dialed: &mut DialedLink) -> Vec<String> {
+        loop {
+            match next_frame(dialed).await {
+                Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                    return capabilities.providers.into_iter().map(|p| p.id).collect();
+                }
+                Some(LinkFrame::Journal(_)) => {}
+                other => panic!("expected a pushed capabilities report, got {other:?}"),
+            }
+        }
+    }
+
+    node.report.mock_enabled.store(false, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    assert!(pushed(&mut dialed).await.is_empty(), "the reconciled report");
+    assert!(pushed(&mut dialed).await.is_empty(), "the refreshed report");
+    assert_eq!(node.report.reconciles.load(Ordering::SeqCst), 1);
+    assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 1);
+
+    node.report.mock_enabled.store(true, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    assert_eq!(pushed(&mut dialed).await, ["mock"]);
+    assert_eq!(pushed(&mut dialed).await, ["mock"]);
+    node.stop().await;
+}
+
+/// Only a change of `providers.enabled` re-reports; other settings do not.
+#[test]
+fn only_an_enabled_providers_change_re_reports() {
+    let changed = |paths: &[&str]| intent_services::SettingsChanged {
+        generation: 1,
+        changed: paths.iter().map(|p| (*p).to_owned()).collect(),
+    };
+    assert!(enabled_providers_changed(&changed(&["providers.enabled"])));
+    assert!(enabled_providers_changed(&changed(&[
+        "model.default",
+        "providers.enabled"
+    ])));
+    assert!(!enabled_providers_changed(&changed(&["providers.paths"])));
+    assert!(!enabled_providers_changed(&changed(&[])));
+}
+
+fn observed(id: &str, status: ProviderStatus, models: &[&str]) -> ProviderCapability {
+    ProviderCapability {
+        id: id.into(),
+        visible: true,
+        status,
+        models: models.iter().map(|m| (*m).to_owned()).collect(),
+        models_stale: models.is_empty(),
+    }
+}
+
+/// Reconciling drops a provider disabled since the cached report, adds one
+/// enabled since with its launch status only, and keeps what was observed
+/// of the others.
+#[test]
+fn reconciling_follows_the_enabled_set_and_keeps_observations() {
+    let cached = vec![
+        observed("claude-code", ProviderStatus::SignedIn, &["opus"]),
+        observed("codex", ProviderStatus::SignedOut, &["gpt"]),
+    ];
+    let enabled_now = vec![
+        observed("claude-code", ProviderStatus::Unknown, &[]),
+        observed("opencode", ProviderStatus::Unknown, &[]),
+    ];
+    assert_eq!(
+        reconcile_providers(&cached, enabled_now.clone()),
+        vec![
+            observed("claude-code", ProviderStatus::SignedIn, &["opus"]),
+            observed("opencode", ProviderStatus::Unknown, &[]),
+        ]
+    );
+    assert_eq!(reconcile_providers(&[], enabled_now.clone()), enabled_now);
+}
+
+/// A launch, model switch or failover reaches the machine as a launch of
+/// the provider, which resolves from the machine's own settings: a provider
+/// disabled there is refused before any process starts (journaled as
+/// `node-provider-unavailable`).
+#[test]
+fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
+    );
+    settings
+        .apply(&[(
+            "providers.enabled".into(),
+            serde_json::json!({ "codex": false }),
+        )])
+        .unwrap();
+    let launch = SettingsLaunch(settings);
+    assert_eq!(
+        launch.resolve("codex").err().as_deref(),
+        Some("unknown or disabled")
+    );
+    assert_ne!(
+        launch.resolve("claude-code").err().as_deref(),
+        Some("unknown or disabled"),
+        "an enabled provider is not refused as disabled"
+    );
 }
