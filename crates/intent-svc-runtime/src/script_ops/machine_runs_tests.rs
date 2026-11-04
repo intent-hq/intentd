@@ -880,8 +880,166 @@ async fn a_stopped_runs_monitor_never_wakes_on_the_next_run() {
     assert_ne!(a.spawn_id, b.spawn_id);
     frame(&runs, started(&b)).await;
     frame(&runs, output(&b, 0, "ready\n")).await;
+    // Run A's monitor settled cancelled at its stop; it never matches run B.
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
     assert!(
-        rec.wakes.lock().unwrap().is_empty(),
-        "run A's watch woke on run B"
+        wakes[0].1.contains("was cancelled"),
+        "run A's watch woke on run B: {wakes:?}"
     );
+}
+
+/// Stop `place`'s live run, acknowledging the machine's stop at once.
+async fn stop_acked(runs: &MachineRuns, rec: &Arc<Recorded>, here: &RunPlace) {
+    let acker = {
+        let runs = runs.clone();
+        let rec = rec.clone();
+        tokio::spawn(async move {
+            loop {
+                let stop = rec
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find_map(|f| match f {
+                        LinkFrame::ScriptStop(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                if let Some(stop) = stop {
+                    runs.on_frame(
+                        "mac",
+                        LinkFrame::ScriptExited(ScriptExited {
+                            agent_id: stop.agent_id,
+                            script_id: stop.script_id,
+                            spawn_id: stop.spawn_id,
+                            exit_code: Some(143),
+                            error: None,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    runs.stop(here).await.unwrap();
+    acker.await.unwrap();
+}
+
+/// Review of intentd#3005: as the home run's, a monitored run that is
+/// stopped settles its monitor as cancelled and wakes its owner exactly
+/// once; a manual restart does the same for the old run's monitor.
+#[tokio::test]
+async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
+    for restart in [false, true] {
+        let rec = Arc::new(Recorded::default());
+        let runs = MachineRuns::new(hooks(&rec));
+        let agent = AgentId::new();
+        let def = script(ScriptMode::Service, "serve");
+        let here = place(&agent);
+        runs.start(&here, &def).await.unwrap();
+        frame(&runs, started(&last_start(&rec))).await;
+        runs.monitor(&here, &serde_json::json!({ "ttlMs": 60000 }))
+            .unwrap();
+        if restart {
+            let acker = {
+                let runs = runs.clone();
+                let rec = rec.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let stop = rec
+                            .frames
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .rev()
+                            .find_map(|f| match f {
+                                LinkFrame::ScriptStop(s) => Some(s.clone()),
+                                _ => None,
+                            });
+                        if let Some(stop) = stop {
+                            runs.on_frame(
+                                "mac",
+                                LinkFrame::ScriptExited(ScriptExited {
+                                    agent_id: stop.agent_id,
+                                    script_id: stop.script_id,
+                                    spawn_id: stop.spawn_id,
+                                    exit_code: Some(143),
+                                    error: None,
+                                }),
+                            )
+                            .await;
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            runs.restart(&here, &def).await.unwrap();
+            acker.await.unwrap();
+        } else {
+            stop_acked(&runs, &rec, &here).await;
+        }
+        let wakes = rec.wakes.lock().unwrap();
+        assert_eq!(wakes.len(), 1, "restart={restart}: {wakes:?}");
+        assert!(
+            wakes[0].1.contains("cancelled"),
+            "restart={restart}: {}",
+            wakes[0].1
+        );
+    }
+}
+
+/// Review of intentd#3005: as on the home path, a `runId` that is not the
+/// run's own is rejected `-32602` before the finished check.
+#[tokio::test]
+async fn a_stale_run_id_is_invalid_even_on_a_finished_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    frame(&runs, exited(&last_start(&rec), Some(0), None)).await;
+    let error = runs
+        .monitor(
+            &place(&agent),
+            &serde_json::json!({ "ttlMs": 60000, "runId": "not-this-run" }),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, intent_core::Error::InvalidParams(_)),
+        "{error:?}"
+    );
+}
+
+/// Review of intentd#3005: while an agent's final stop is under way no
+/// start or restart of its machine runs sends a new process to the machine.
+#[tokio::test]
+async fn no_start_or_restart_while_a_final_stop_is_under_way() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let def = script(ScriptMode::Service, "serve");
+    runs.start(&place(&agent), &def).await.unwrap();
+    frame(&runs, started(&last_start(&rec))).await;
+    runs.final_stop_begun(&agent);
+    for result in [
+        runs.restart(&place(&agent), &def).await,
+        runs.start(&place(&agent), &def).await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("remote-script-agent-ending"),
+            "{error}"
+        );
+    }
+    assert_eq!(script_starts(&rec), 1);
+    runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
+        .await;
+    // The final stop is over: a later start (a reused id) is not refused.
+    runs.start(&place(&agent), &def).await.unwrap();
+    assert_eq!(script_starts(&rec), 2);
 }

@@ -238,6 +238,9 @@ pub(crate) struct Shared {
     /// The stops a task is resending, with the link generation it resends
     /// on, so one link has one resender per stop.
     resending: Mutex<HashMap<StopId, u64>>,
+    /// Agents whose machine runs an acknowledged final stop settled.
+    #[cfg(test)]
+    final_settles: Mutex<Vec<AgentId>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
     /// Set once a bind in this process has claimed the agents its welcome
@@ -663,9 +666,13 @@ impl Shared {
                     if queued.durable {
                         self.finish_final_stop(&agent_id, stop_id, final_stop).await;
                     }
-                    if final_stop {
-                        // The machine stopped the agent's scripts first: any
-                        // run it never reported ending is settled now.
+                    if queued.final_stop {
+                        // The agent is ended for good, even when a link below
+                        // nodeProtocol 9 got the stop as a plain one: any run
+                        // the machine never reported ending is settled now,
+                        // and its scripts are no longer refused as ending.
+                        #[cfg(test)]
+                        lock(&self.final_settles).push(agent_id.clone());
                         if let Some(svc) = &self.services {
                             svc.feature_runtime()
                                 .machine_runs_final_stop_acked(
@@ -772,6 +779,11 @@ impl Shared {
             "{}: the machine has not acknowledged this agent's earlier stop",
             link::codes::UNAVAILABLE
         )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
+        lock(&self.final_settles).clone()
     }
 
     #[cfg(test)]
@@ -955,6 +967,8 @@ impl RemoteNode {
             protocol: std::sync::atomic::AtomicU32::new(0),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            final_settles: Mutex::default(),
             route: Mutex::new(None),
             claimed: std::sync::atomic::AtomicBool::new(false),
             claim_lock: tokio::sync::Mutex::new(()),

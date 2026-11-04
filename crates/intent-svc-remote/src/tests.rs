@@ -2063,6 +2063,12 @@ mod final_stops {
             "the push is still admitted within the grace"
         );
         assert!(!node.shared_ref().has_pending_stops(), "acknowledged once");
+        // The agent is still ended for good: its machine runs settle and its
+        // scripts may no longer be refused as ending (review of intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_settles_for_test(),
+            vec![agent.clone()]
+        );
         let store = backend.store().clone();
         until("the grace ends", || {
             let store = store.clone();

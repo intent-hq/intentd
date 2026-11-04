@@ -11,7 +11,7 @@
 //! service's automatic restarts and never crosses the link. Transitions are
 //! published as `script:changed` only (through [`Hooks::changed`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,6 +117,9 @@ struct Inner {
     runs: Mutex<HashMap<RunPlace, Run>>,
     /// Bumped whenever a run settles (exit, loss, stop).
     settled: watch::Sender<u64>,
+    /// Agents whose final stop is under way: no new process starts for
+    /// them until the machine acknowledges it.
+    ending: Mutex<HashSet<AgentId>>,
 }
 
 /// Every machine run of this daemon. Cloning shares them.
@@ -188,8 +191,16 @@ impl MachineRuns {
                 hooks,
                 runs: Mutex::default(),
                 settled: watch::channel(0).0,
+                ending: Mutex::default(),
             }),
         }
+    }
+
+    fn refuse_if_ending(&self, place: &RunPlace) -> Result<()> {
+        if lock(&self.inner.ending).contains(&place.agent_id) {
+            return Err(agent_ending(place));
+        }
+        Ok(())
     }
 
     async fn changed(&self, place: &RunPlace) {
@@ -228,6 +239,7 @@ impl MachineRuns {
     /// `machine-unreachable` when no link comes up; `machine-update-required`
     /// when the machine links below protocol 8.
     pub(crate) async fn start(&self, place: &RunPlace, def: &Script) -> Result<ScriptRuntimeState> {
+        self.refuse_if_ending(place)?;
         if let Some(state) = self.state(place).filter(is_live) {
             return Ok(state);
         }
@@ -235,6 +247,10 @@ impl MachineRuns {
         let spawn_id = new_id();
         let state = {
             let mut runs = lock(&self.inner.runs);
+            // A final stop may have begun while the link was looked up.
+            if lock(&self.inner.ending).contains(&place.agent_id) {
+                return Err(agent_ending(place));
+            }
             // Another start may have won while the link was looked up: it
             // owns the process, so report its run instead of a second one.
             if let Some(live) = runs.get(place).map(|run| &run.state).filter(|s| is_live(s)) {
@@ -294,18 +310,24 @@ impl MachineRuns {
     ///
     /// `InvalidParams` when `place` has no machine run.
     pub(crate) async fn stop(&self, place: &RunPlace) -> Result<ScriptRuntimeState> {
-        let (live, link, spawn_id) = {
+        self.stop_because(place, "the run was stopped").await
+    }
+
+    /// [`Self::stop`], settling the run's monitor as cancelled with `reason`.
+    async fn stop_because(&self, place: &RunPlace, reason: &str) -> Result<ScriptRuntimeState> {
+        let (live, link, spawn_id, cancelled) = {
             let mut runs = lock(&self.inner.runs);
             let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
             if is_live(&run.state) {
                 run.stopping = true;
                 // The run being stopped takes its monitor with it: a watch
-                // never outlives its run into the next one.
-                run.monitor = None;
-                (true, run.link.clone(), run.spawn_id.clone())
+                // never outlives its run into the next one. As the home
+                // run's, the monitor settles cancelled and wakes its owner.
+                let cancelled = cancelled_wake(run, reason);
+                (true, run.link.clone(), run.spawn_id.clone(), cancelled)
             } else {
                 runs.remove(place);
-                (false, None, None)
+                (false, None, None, None)
             }
         };
         if !live {
@@ -338,6 +360,10 @@ impl MachineRuns {
             }
         }
         self.changed(place).await;
+        if let Some(content) = cancelled {
+            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
+                .await;
+        }
         Ok(self.state(place).unwrap_or_default())
     }
 
@@ -354,10 +380,12 @@ impl MachineRuns {
         if !lock(&self.inner.runs).contains_key(place) {
             return Err(no_run(place));
         }
-        // Check the link before stopping, so a refused restart stops nothing.
+        // Check the final stop and the link before stopping, so a refused
+        // restart stops nothing.
+        self.refuse_if_ending(place)?;
         self.link(place).await?;
         if self.state(place).as_ref().is_some_and(is_live) {
-            self.stop(place).await?;
+            self.stop_because(place, "the run was restarted").await?;
         }
         self.start(place, def).await
     }
@@ -642,7 +670,7 @@ impl MachineRuns {
                 && run.fast_restarts < MAX_FAST_RESTARTS;
             if run.stopping {
                 run.stopping = false;
-                run.monitor = None;
+                let cancelled = cancelled_wake(run, "the run was stopped");
                 if run.def.mode == ScriptMode::Command {
                     run.last_run = Some(last_run(
                         &run.state,
@@ -652,7 +680,7 @@ impl MachineRuns {
                     ));
                 }
                 run.state = idle_after(&run.state);
-                (false, None)
+                (false, cancelled)
             } else if restart {
                 run.fast_restarts += 1;
                 run.state.status = ScriptStatus::Restarting;
@@ -754,22 +782,33 @@ impl MachineRuns {
                 // A stop (or a final stop) came during the backoff: the
                 // service stays stopped instead of starting a new process.
                 run.stopping = false;
-                run.monitor = None;
+                let cancelled = cancelled_wake(run, "the run was stopped");
                 run.state = idle_after(&run.state);
-                None
+                Err(cancelled)
             } else {
                 let Some(link) = run.link.clone() else { return };
                 let spawn_id = new_id();
                 run.spawn_id = Some(spawn_id.clone());
                 run.spawned_at = Some(tokio::time::Instant::now());
                 run.state.status = ScriptStatus::Starting;
-                Some((link, run.def.clone(), spawn_id))
+                Ok((link, run.def.clone(), spawn_id))
             }
         };
-        let Some((link, def, spawn_id)) = respawn else {
-            self.bump();
-            self.changed(place).await;
-            return;
+        let (link, def, spawn_id) = match respawn {
+            Ok(respawn) => respawn,
+            Err(cancelled) => {
+                self.bump();
+                self.changed(place).await;
+                if let Some(content) = cancelled {
+                    (self.inner.hooks.wake)(
+                        place.workspace_id.clone(),
+                        place.agent_id.clone(),
+                        content,
+                    )
+                    .await;
+                }
+                return;
+            }
         };
         if (link.send)(start_frame(place, &def, &spawn_id))
             .await
@@ -911,6 +950,7 @@ impl MachineRuns {
     /// agent's scripts itself, so an exit it reports for one of them now
     /// ends that run (no service restart).
     pub(crate) fn final_stop_begun(&self, agent_id: &AgentId) {
+        lock(&self.inner.ending).insert(agent_id.clone());
         for (place, run) in lock(&self.inner.runs).iter_mut() {
             if &place.agent_id == agent_id && is_live(&run.state) {
                 run.stopping = true;
@@ -947,6 +987,7 @@ impl MachineRuns {
             }
             places
         };
+        lock(&self.inner.ending).remove(agent_id);
         for place in dropped {
             self.changed(&place).await;
         }
@@ -1011,6 +1052,14 @@ impl MachineRuns {
         let options = Options::parse(options)?;
         let mut runs = lock(&self.inner.runs);
         let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
+        // As for the home run, a stale `runId` is rejected first.
+        if let Some(run_id) = &options.run {
+            if run.state.run_id.as_ref() != Some(run_id) {
+                return Err(Error::InvalidParams(format!(
+                    "runId {run_id} is not the current run of this machine run"
+                )));
+            }
+        }
         // As for the home run: a run that already finished cannot be
         // watched, its only exit having passed.
         if !is_live(&run.state) {
@@ -1021,13 +1070,6 @@ impl MachineRuns {
                 "scriptId": place.script_id,
                 "runId": run.state.run_id,
             }));
-        }
-        if let Some(run_id) = &options.run {
-            if run.state.run_id.as_ref() != Some(run_id) {
-                return Err(Error::InvalidParams(format!(
-                    "runId {run_id} is not the current run of this machine run"
-                )));
-            }
         }
         let ttl = Duration::from_millis(u64::try_from(options.ttl).unwrap_or(0));
         let created = chrono::Utc::now();
@@ -1130,6 +1172,26 @@ fn last_run(
         stopped_at: now_iso(),
         error,
     }
+}
+
+/// Take `run`'s monitor and, unless it expired, the wake that settles it
+/// cancelled with `reason` (a stop or restart, as the home run's monitor).
+fn cancelled_wake(run: &mut Run, reason: &str) -> Option<String> {
+    let monitor = run.monitor.take()?;
+    (monitor.expires > tokio::time::Instant::now()).then(|| {
+        format!(
+            "Script \"{}\" (machine run on {}) was cancelled: {reason}",
+            run.def.name, run.node_id
+        )
+    })
+}
+
+/// `remote-script-agent-ending`: `place`'s agent is being stopped for good.
+fn agent_ending(place: &RunPlace) -> Error {
+    Error::InvalidParams(format!(
+        "remote-script-agent-ending: agent {} is being stopped for good; its scripts cannot start",
+        place.agent_id
+    ))
 }
 
 fn no_run(place: &RunPlace) -> Error {
