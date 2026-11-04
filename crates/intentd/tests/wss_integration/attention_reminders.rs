@@ -366,7 +366,7 @@ async fn attention_reminders_principals_generations_and_legacy_over_wss() {
     );
     assert_eq!(
         srv.store
-            .get_agent_session(&intent_core::AgentId::from("discussion-agent"))
+            .get_agent_session_summary(&intent_core::AgentId::from("discussion-agent"))
             .await
             .unwrap()
             .attention_request_kind
