@@ -377,12 +377,12 @@ impl MachineRuns {
         place: &RunPlace,
         def: &Script,
     ) -> Result<ScriptRuntimeState> {
-        if !lock(&self.inner.runs).contains_key(place) {
-            return Err(no_run(place));
-        }
         // Check the final stop and the link before stopping, so a refused
         // restart stops nothing.
         self.refuse_if_ending(place)?;
+        if !lock(&self.inner.runs).contains_key(place) {
+            return Err(no_run(place));
+        }
         self.link(place).await?;
         if self.state(place).as_ref().is_some_and(is_live) {
             self.stop_because(place, "the run was restarted").await?;
@@ -924,13 +924,9 @@ impl MachineRuns {
             }
             places
         };
-        // The lease ended: no final stop of these agents is under way any more.
-        {
-            let mut ending = lock(&self.inner.ending);
-            for agent in agents {
-                ending.remove(agent);
-            }
-        }
+        // `ending` stays: an agent in it has a queued final stop, which a
+        // lease end (even a failed removal) does not end; only its ack or
+        // expiry does (`final_stop_acked`).
         for place in dropped {
             self.changed(&place).await;
         }

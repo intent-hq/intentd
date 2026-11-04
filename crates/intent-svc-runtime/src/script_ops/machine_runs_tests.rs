@@ -1044,17 +1044,16 @@ async fn no_start_or_restart_while_a_final_stop_is_under_way() {
     assert_eq!(script_starts(&rec), 2);
 }
 
-/// Review of intentd#3005: a lease end (machine removal, agent delete)
-/// also ends the agent's final stop, so its scripts are no longer refused
-/// as ending without a final-stop ack.
+/// Review of intentd#3005: a lease end that leaves the final stop queued
+/// (a failed `remoteMachines.remove`: stops unacknowledged) keeps refusing the
+/// agent's scripts; only the final stop's ack (or its expiry) ends that.
 #[tokio::test]
-async fn a_lease_end_clears_the_final_stop_refusal() {
+async fn a_failed_removal_keeps_refusing_until_the_final_stop_ends() {
     let rec = Arc::new(Recorded::default());
     let runs = MachineRuns::new(hooks(&rec));
     let agent = AgentId::new();
     let def = script(ScriptMode::Command, "make");
     runs.final_stop_begun(&agent);
-    assert!(runs.start(&place(&agent), &def).await.is_err());
     let deadline =
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_millis(50));
     runs.end_agents(
@@ -1063,6 +1062,22 @@ async fn a_lease_end_clears_the_final_stop_refusal() {
         "remote-script-lost: the machine was removed",
     )
     .await;
+    let timeout = Duration::from_secs(1);
+    for error in [
+        runs.start(&place(&agent), &def).await.unwrap_err(),
+        runs.restart(&place(&agent), &def).await.unwrap_err(),
+        runs.run(&place(&agent), &def, timeout, 10)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("remote-script-agent-ending"),
+            "{error}"
+        );
+    }
+    assert_eq!(script_starts(&rec), 0);
+    runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
+        .await;
     runs.start(&place(&agent), &def).await.unwrap();
     assert_eq!(script_starts(&rec), 1);
 }
