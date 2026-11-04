@@ -3824,7 +3824,7 @@ impl Services {
                 let mut holds = HashSet::new();
                 for agent_id in legacy_agent_ids {
                     if self.questions_pending(&agent_id).await {
-                        if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                        if let Ok(session) = self.store.get_agent_session_summary(&agent_id).await {
                             if let Some(message) = session.pending_questions_message_id() {
                                 legacy_question_reasons
                                     .insert(agent_id.clone(), message.to_string());

@@ -3,10 +3,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use intent_core::{
-    current_caller, AgentId, AgentSession, AgentStatus, AttentionReminderReason, Caller, Error,
-    Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceAttentionReminder,
+    current_caller, AgentId, AgentStatus, AttentionReminderReason, Caller, Error, Result,
+    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceAttentionReminder,
     WorkspaceDisplayStatus, WorkspaceId,
 };
+use intent_store::AgentSessionSummary;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,7 @@ impl Services {
     fn attention_reminder_inputs(
         &self,
         workspace: &Workspace,
-        sessions: &[AgentSession],
+        sessions: &[AgentSessionSummary],
         reasons: Vec<AttentionReminderReason>,
     ) -> AttentionReminderInputs {
         let secret_request_pending = sessions.iter().any(|session| {
@@ -48,7 +49,7 @@ impl Services {
     pub(crate) async fn attention_reminder_reasons(
         &self,
         workspace: &Workspace,
-        sessions: &[AgentSession],
+        sessions: &[AgentSessionSummary],
         state: &HashMap<String, Value>,
         legacy_questions: Option<&HashMap<AgentId, String>>,
     ) -> Result<Vec<AttentionReminderReason>> {
@@ -149,7 +150,7 @@ impl Services {
     pub(crate) async fn enrich_attention_reminder(
         &self,
         workspace: &mut Workspace,
-        sessions: Option<&[AgentSession]>,
+        sessions: Option<&[AgentSessionSummary]>,
         state: Option<&HashMap<String, Value>>,
         legacy_questions: Option<&HashMap<AgentId, String>>,
     ) {
