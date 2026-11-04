@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.124] - 2026-11-04
+
+### 🚀 Features
+
+- *(harness)* Steer scratch files to the agent's private TMPDIR (harness 3.7) ([#3022](https://github.com/intent-hq/intentd/pull/3022))
+
+### 🐛 Bug Fixes
+
+- *(core)* Fit slim conversation pages in the 500 KiB frame budget ([#3025](https://github.com/intent-hq/intentd/pull/3025))
+
+### 🔧 Refactor
+
+- Make cheap agent-session lookups the default ([#3021](https://github.com/intent-hq/intentd/pull/3021))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe sign-in codes and lasting browser sessions ([#3024](https://github.com/intent-hq/intentd/pull/3024))
+
+
 ## [0.11.123] - 2026-11-04
 
 ### 📚 Documentation
