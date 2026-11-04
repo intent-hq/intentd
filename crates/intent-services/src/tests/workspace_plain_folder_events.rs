@@ -140,7 +140,7 @@ async fn agent_subscriptions_receive_file_and_task_events() {
         let session = h
             .svc
             .store()
-            .get_agent_session(&subscriber)
+            .get_agent_session_with_transcript(&subscriber)
             .await
             .expect("subscriber session");
         let text = serde_json::to_string(&session.messages).unwrap();

@@ -943,7 +943,7 @@ async fn golden_report_to_parent_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -980,7 +980,7 @@ async fn golden_attention_request_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -1040,7 +1040,7 @@ async fn golden_watcher_attention_wake_bytes() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let child_name = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child")
         .name;
@@ -1477,7 +1477,7 @@ async fn v1_pinned_session(
     seed_agent(svc, ws, &owner).await;
     let mut session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     session.harness_version = "1.0".to_string();
@@ -1498,7 +1498,7 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     seed_agent(&svc, &ws, &owner).await;
     let mut session = svc
         .store()
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .expect("session");
     assert_eq!(

@@ -260,7 +260,7 @@ impl Services {
         }
         // Load the idle session. A best-effort lookup: a missing session (e.g.,
         // racing delete) is not an auto-commit error — just log and skip.
-        let session = match self.store().get_agent_session(&agent_id).await {
+        let session = match self.store().get_agent_session_summary(&agent_id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(

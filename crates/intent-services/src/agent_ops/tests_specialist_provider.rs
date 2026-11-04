@@ -97,7 +97,7 @@ async fn create(
 async fn assert_pinned(svc: &Services, id: &str) {
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(id))
+        .get_agent_session_with_transcript(&AgentId::from(id))
         .await
         .expect("persisted session");
     assert_eq!(session.provider.as_deref(), Some("auggie"));
@@ -230,7 +230,7 @@ async fn specialist_provider_wake_create_preserves_explicit_choices() {
             .expect("wake creates with explicit choices");
         let session = svc
             .store()
-            .get_agent_session(&AgentId::from(result["agentId"].as_str().unwrap()))
+            .get_agent_session_with_transcript(&AgentId::from(result["agentId"].as_str().unwrap()))
             .await
             .expect("persisted session");
         let use_pin = provider.is_none() && model.is_none();

@@ -531,7 +531,7 @@ async fn user_message_texts(data_dir: &Path, agent_id: &str) -> Vec<String> {
         .await
         .expect("open store");
     let session = store
-        .get_agent_session(&AgentId(agent_id.to_string()))
+        .get_agent_session_with_transcript(&AgentId(agent_id.to_string()))
         .await
         .expect("get agent session");
     session
@@ -778,7 +778,7 @@ async fn abandon_keeps_preserved_queue_inert() {
             .await
             .expect("open store");
         let session = store
-            .get_agent_session(&AgentId(agent_id.clone()))
+            .get_agent_session_with_transcript(&AgentId(agent_id.clone()))
             .await
             .expect("get agent session");
         let last = session.messages.last().expect("expected messages");

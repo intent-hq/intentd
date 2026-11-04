@@ -1133,7 +1133,11 @@ async fn manager_prompt_missing_failed_foreign_pending_and_replaced_owners_never
     let Caller::Agent { agent_id } = &f.caller else {
         unreachable!()
     };
-    let row = f.store.get_agent_session(agent_id).await.unwrap();
+    let row = f
+        .store
+        .get_agent_session_with_transcript(agent_id)
+        .await
+        .unwrap();
     f.physical.retirement().retire();
     let creation = RepositoryCreationOwner::allocate(
         &f.registry,
@@ -1288,7 +1292,11 @@ async fn negotiated_monitor_allocation_case(mode: &str) {
         let Caller::Agent { agent_id } = &f.caller else {
             panic!("original agent")
         };
-        let row = f.store.get_agent_session(agent_id).await.unwrap();
+        let row = f
+            .store
+            .get_agent_session_with_transcript(agent_id)
+            .await
+            .unwrap();
         Some(
             RepositoryCreationOwner::allocate(
                 &f.registry,

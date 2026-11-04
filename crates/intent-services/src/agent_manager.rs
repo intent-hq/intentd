@@ -3217,7 +3217,7 @@ impl AgentManager {
                 // deleted) swallow the lookup error and skip the publish rather than
                 // blocking the registry path. The tracing log still fires above.
                 let workspace_id = match services.store.get_agent_session_summary(&agent_id).await {
-                    Ok(session) => session.workspace_id,
+                    Ok(session) => session.workspace_id.clone(),
                     Err(_) => return,
                 };
                 services
@@ -5786,7 +5786,7 @@ impl AgentManager {
         {
             return None;
         }
-        // Metadata-only lookup: `get_agent_session` also loads and hydrates
+        // Metadata-only lookup: `get_agent_session_with_transcript` also loads and hydrates
         // the whole transcript, which this per-turn check never reads.
         let session = self
             .services
@@ -8374,7 +8374,7 @@ impl AgentManager {
         if session.parent_agent_id.is_none() {
             return false;
         }
-        let Some(report_ts) = session.completion_report_timestamp else {
+        let Some(report_ts) = session.completion_report_timestamp.clone() else {
             return false;
         };
         let (Some(queued), Some(reported)) = (parse_iso(&msg.queued_at), parse_iso(&report_ts))
@@ -10170,7 +10170,7 @@ impl AgentManager {
                 .get_agent_session_summary(agent_id)
                 .await
                 .ok()
-                .and_then(|s| s.acp_session_id)
+                .and_then(|s| s.acp_session_id.clone())
                 .is_some();
         if !cancellable {
             return;
@@ -13030,7 +13030,7 @@ impl AgentManager {
                         return;
                     }
                     if let Ok(session) = services.store.get_agent_session_summary(&id).await {
-                        mgr.try_drain_queue(id, session.workspace_id).await;
+                        mgr.try_drain_queue(id, session.workspace_id.clone()).await;
                     }
                 });
             }
@@ -13049,7 +13049,7 @@ impl AgentManager {
             }
             if let Ok(session) = self.services.store.get_agent_session_summary(&id).await {
                 Arc::clone(self)
-                    .try_drain_queue(id, session.workspace_id)
+                    .try_drain_queue(id, session.workspace_id.clone())
                     .await;
             }
         }
@@ -19911,7 +19911,7 @@ mod role_reminder_tests {
         let mut session = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session");
         session.name = name.to_string();
@@ -19976,7 +19976,7 @@ mod role_reminder_tests {
             let mut session = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .expect("session");
             session.provider = Some(provider.to_string());
@@ -20033,7 +20033,7 @@ mod role_reminder_tests {
                     let mut session = mgr
                         .services
                         .store
-                        .get_agent_session(&agent_id)
+                        .get_agent_session_with_transcript(&agent_id)
                         .await
                         .unwrap();
                     session.provider = Some(provider.to_string());
@@ -20097,7 +20097,7 @@ mod role_reminder_tests {
         let mut session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         session.metadata = Some(serde_json::json!({"specialistName": "Custom Builder"}));
@@ -20223,7 +20223,7 @@ mod role_reminder_tests {
     }
 
     /// The specialist role reminder is resolved on every turn too, so it must
-    /// use the metadata-only session lookup: `get_agent_session` loads and
+    /// use the metadata-only session lookup: `get_agent_session_with_transcript` loads and
     /// hydrates the whole transcript, and fails on an undecodable row.
     #[tokio::test]
     async fn role_reminder_does_not_read_the_transcript() {
@@ -20250,7 +20250,7 @@ mod role_reminder_tests {
         assert!(
             mgr.services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .is_err(),
             "fixture: a full session read must fail on the undecodable row"
@@ -20870,7 +20870,7 @@ mod role_reminder_tests {
         let mut s = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session");
         let ws = s.workspace_id.clone();
@@ -22100,7 +22100,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(
@@ -22253,7 +22253,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22408,7 +22408,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22434,7 +22434,7 @@ mod disabled_provider_rehome_tests {
         let stale = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         // ...and the user's newer pick landing before the re-home write.
@@ -22497,7 +22497,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("codex"));
@@ -22572,7 +22572,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22866,7 +22866,7 @@ mod legacy_feature_freeze_tests {
     async fn stored_features(mgr: &AgentManager, agent_id: &AgentId) -> Option<serde_json::Value> {
         mgr.services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session exists")
             .harness_features
@@ -22902,7 +22902,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(
@@ -22960,7 +22960,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(session.harness_features.is_none(), "row stays NULL");
@@ -22970,7 +22970,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(session.harness_features.is_none(), "row still NULL");
@@ -23047,7 +23047,7 @@ mod transcript_free_turn_start_tests {
     use super::*;
 
     /// Append one user message for `agent_id`, then make its stored content
-    /// undecodable so `get_agent_messages(.., None)` and `get_agent_session`
+    /// undecodable so `get_agent_messages(.., None)` and `get_agent_session_with_transcript`
     /// fail.
     async fn corrupt_transcript(mgr: &AgentManager, agent_id: &AgentId) {
         mgr.services
@@ -23068,7 +23068,7 @@ mod transcript_free_turn_start_tests {
         assert!(
             mgr.services
                 .store
-                .get_agent_session(agent_id)
+                .get_agent_session_with_transcript(agent_id)
                 .await
                 .is_err(),
             "fixture: a full session read must fail on the undecodable row"
@@ -23497,7 +23497,7 @@ mod thought_level_tests {
             let record = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             let opened = AcpSessionOpened {
@@ -23527,7 +23527,7 @@ mod thought_level_tests {
             let stored = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             assert_eq!(stored.effort_levels, Some(option("medium").values));
@@ -23547,7 +23547,7 @@ mod thought_level_tests {
             let record = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             let opened = AcpSessionOpened {
@@ -23583,7 +23583,7 @@ mod thought_level_tests {
             let stored = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             assert!(
@@ -25129,7 +25129,7 @@ mod agent_retry_tests {
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .status,
@@ -25175,7 +25175,7 @@ mod agent_retry_tests {
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .status,
@@ -25219,7 +25219,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::RuntimeIdle);
@@ -25303,7 +25303,7 @@ mod agent_retry_tests {
             let session = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .expect("session");
             assert!(
@@ -25571,7 +25571,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session row");
         (session.status, session.is_active, session.stop_reason)
@@ -26272,7 +26272,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::Pending);
@@ -26294,7 +26294,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::Active);

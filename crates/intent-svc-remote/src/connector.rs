@@ -1675,7 +1675,7 @@ pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bo
         return Ok(true);
     }
     for record in store.list_remote_agents(lease_id).await? {
-        match store.get_agent_session(&record.agent_id).await {
+        match store.get_agent_session_summary(&record.agent_id).await {
             Ok(session) if crate::final_stop::session_ended(&session) => {}
             _ => return Ok(true),
         }
@@ -1793,7 +1793,7 @@ async fn ended_reason(
     use intent_core::remote_launch::FinalStopReason;
     let session = shared
         .store
-        .get_agent_session(&record.agent_id)
+        .get_agent_session_summary(&record.agent_id)
         .await
         .ok()?;
     if !crate::final_stop::session_ended(&session) {

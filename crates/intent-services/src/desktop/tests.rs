@@ -1021,7 +1021,12 @@ async fn unknown_native_result_invalidates_and_is_never_retried() {
 #[tokio::test]
 async fn desktop_feature_is_frozen_per_session_and_release_is_always_available() {
     let h = Harness::new().await;
-    let mut session = h.services.store.get_agent_session(&h.agent).await.unwrap();
+    let mut session = h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .unwrap();
     assert!(h.services.session_agent_features(&session).desktop_control);
     let settings = h.services.settings_registry.as_ref().unwrap();
     settings

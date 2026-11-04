@@ -575,7 +575,11 @@ async fn original_allocation_cannot_initialize_another_database_with_the_same_ob
         .await
         .unwrap();
     foreign.insert_workspace(&f.workspace).await.unwrap();
-    let agent = f.store.get_agent_session(&f.agent).await.unwrap();
+    let agent = f
+        .store
+        .get_agent_session_with_transcript(&f.agent)
+        .await
+        .unwrap();
     foreign.insert_agent_session(&agent).await.unwrap();
     f.registry.install(&foreign).await.unwrap();
     let creator = f.creator(RepositoryCreationIntent::FirstSet);
@@ -585,14 +589,14 @@ async fn original_allocation_cannot_initialize_another_database_with_the_same_ob
         .is_err());
     assert!(f.registry.state.lock().unwrap().origins.is_empty());
     assert!(foreign
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
         .is_none());
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -628,7 +632,7 @@ async fn pending_retirement_during_original_producer_wait_blocks_late_initializa
     assert!(!current(&pending.capture(), f.caller()).await);
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -654,7 +658,7 @@ async fn pending_retirement_after_commit_preserves_effect_without_live_confirmat
     ));
     assert_eq!(
         f.store
-            .get_agent_session(&f.agent)
+            .get_agent_session_with_transcript(&f.agent)
             .await
             .unwrap()
             .acp_session_id
@@ -853,7 +857,7 @@ async fn outcome_preserves_original_producer_error_without_attempting_store() {
     assert!(matches!(result.owner, Err(AdmissionError::Unavailable)));
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -880,7 +884,7 @@ async fn outcome_preserves_producer_success_after_pending_retirement_without_rep
     assert!(matches!(result.owner, Err(AdmissionError::Retired)));
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -926,7 +930,7 @@ async fn outcome_keeps_actual_committed_effect_when_finish_or_consume_rejects_ow
         assert!(result.owner.is_err());
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1009,7 +1013,7 @@ async fn outcome_no_effect_preserves_only_transaction_observations_and_strict_be
         if !missing {
             assert_eq!(
                 f.store
-                    .get_agent_session(&f.agent)
+                    .get_agent_session_with_transcript(&f.agent)
                     .await
                     .unwrap()
                     .acp_session_id
@@ -1039,7 +1043,7 @@ async fn outcome_after_actual_sql_failure_remains_unknown_and_retains_original_b
     assert!(result.owner.is_err());
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -1061,7 +1065,12 @@ async fn outcome_rejects_foreign_store_without_losing_the_actual_producer_result
     let foreign = Store::open(&f.dir.path().join("foreign.db")).await.unwrap();
     foreign.insert_workspace(&f.workspace).await.unwrap();
     foreign
-        .insert_agent_session(&f.store.get_agent_session(&f.agent).await.unwrap())
+        .insert_agent_session(
+            &f.store
+                .get_agent_session_with_transcript(&f.agent)
+                .await
+                .unwrap(),
+        )
         .await
         .unwrap();
     f.registry.install(&foreign).await.unwrap();
@@ -1079,7 +1088,7 @@ async fn outcome_rejects_foreign_store_without_losing_the_actual_producer_result
     assert!(result.owner.is_err());
     for store in [&f.store, &foreign] {
         assert!(store
-            .get_agent_session(&f.agent)
+            .get_agent_session_with_transcript(&f.agent)
             .await
             .unwrap()
             .acp_session_id
@@ -1146,7 +1155,7 @@ async fn compatible_original_producer_error_never_becomes_a_store_attempt() {
     assert!(outcome.owner.is_err());
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -1206,7 +1215,11 @@ async fn compatible_setup_writes_preserve_results_and_retire_only_binding_change
         ));
         let owner = outcome.owner.ok();
         assert_eq!(owner.is_some(), setup == 2);
-        let row = f.store.get_agent_session(&f.agent).await.unwrap();
+        let row = f
+            .store
+            .get_agent_session_with_transcript(&f.agent)
+            .await
+            .unwrap();
         assert_eq!(row.acp_session_id.as_deref(), Some("ordinary"));
         if setup == 2 {
             assert_eq!(row.system_prompt.as_deref(), Some("original prompt"));
@@ -1383,7 +1396,7 @@ async fn compatible_committed_effect_survives_retired_confirmation_or_consumptio
         assert!(outcome.owner.is_err());
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1480,7 +1493,7 @@ async fn compatible_sql_failure_preserves_unknown_receipt_and_original_barrier()
     assert!(outcome.owner.is_err());
     assert!(f
         .store
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
@@ -1516,7 +1529,7 @@ async fn compatible_wrong_loaded_producer_preserves_response_without_changing_in
     assert!(outcome.owner.is_err());
     assert_eq!(
         f.store
-            .get_agent_session(&f.agent)
+            .get_agent_session_with_transcript(&f.agent)
             .await
             .unwrap()
             .acp_session_id
@@ -1532,7 +1545,11 @@ async fn compatible_uses_only_captured_store_even_with_same_observer_and_foreign
         .await
         .unwrap();
     foreign.insert_workspace(&f.workspace).await.unwrap();
-    let row = f.store.get_agent_session(&f.agent).await.unwrap();
+    let row = f
+        .store
+        .get_agent_session_with_transcript(&f.agent)
+        .await
+        .unwrap();
     foreign.insert_agent_session(&row).await.unwrap();
     f.registry.install(&foreign).await.unwrap();
     let creator = f.creator(RepositoryCreationIntent::FirstSet);
@@ -1544,14 +1561,14 @@ async fn compatible_uses_only_captured_store_even_with_same_observer_and_foreign
     assert_eq!(outcome.producer.unwrap(), "response");
     assert!(outcome.owner.is_ok());
     assert!(foreign
-        .get_agent_session(&f.agent)
+        .get_agent_session_with_transcript(&f.agent)
         .await
         .unwrap()
         .acp_session_id
         .is_none());
     assert_eq!(
         f.store
-            .get_agent_session(&f.agent)
+            .get_agent_session_with_transcript(&f.agent)
             .await
             .unwrap()
             .acp_session_id
@@ -1771,7 +1788,11 @@ async fn private_history_bootstrap_mutation_joins_original_transfer_and_preserve
         .unwrap();
     let bootstrap = review.bootstrap().unwrap();
     let sibling_id = AgentId::new();
-    let mut sibling_row = f.store.get_agent_session(&f.agent).await.unwrap();
+    let mut sibling_row = f
+        .store
+        .get_agent_session_with_transcript(&f.agent)
+        .await
+        .unwrap();
     sibling_row.id = sibling_id.clone();
     f.store.insert_agent_session(&sibling_row).await.unwrap();
     let sibling = RepositoryCreationOwner::allocate(
@@ -2770,7 +2791,7 @@ async fn services_original_history_case(variant: &'static str) {
         .unwrap();
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -2832,7 +2853,7 @@ async fn services_original_history_case(variant: &'static str) {
         );
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -2889,7 +2910,7 @@ async fn services_original_history_case(variant: &'static str) {
         }
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -2924,7 +2945,7 @@ async fn services_original_history_case(variant: &'static str) {
         );
         assert_eq!(
             f.store
-                .get_agent_session(&f.agent)
+                .get_agent_session_with_transcript(&f.agent)
                 .await
                 .unwrap()
                 .acp_session_id

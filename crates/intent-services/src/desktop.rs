@@ -475,7 +475,7 @@ impl Services {
             .get_workspace_owner_principal_id(workspace)
             .await?
             .ok_or_else(|| error("forbidden", "Workspace has no owning principal"))?;
-        Ok((owner, session.name))
+        Ok((owner, session.name.clone()))
     }
     async fn desktop_connection(
         &self,
@@ -1207,15 +1207,11 @@ impl Services {
                     )
                 })?;
             self.desktop_validate(&binding).await?;
-            if !self
-                .session_agent_features(
-                    &self
-                        .store
-                        .get_agent_session_summary(&live.binding.agent_id)
-                        .await?,
-                )
-                .desktop_control
-            {
+            let session = self
+                .store
+                .get_agent_session_summary(&live.binding.agent_id)
+                .await?;
+            if !self.session_agent_features(&session).desktop_control {
                 return Err(error(
                     "forbidden",
                     "Desktop method is disabled in settings (agentFeatures.desktopControl = false)",
@@ -1343,7 +1339,11 @@ impl Services {
             .desktop_prepare_connection(
                 &workspace,
                 &agent,
-                self.store.get_agent_session_summary(&agent).await?.name,
+                self.store
+                    .get_agent_session_summary(&agent)
+                    .await?
+                    .name
+                    .clone(),
                 connection.clone(),
             )
             .await?;

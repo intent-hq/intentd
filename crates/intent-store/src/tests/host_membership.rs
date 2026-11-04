@@ -400,7 +400,7 @@ async fn upgrade_from_landed_effort_schema_preserves_baseline_and_sharing() {
     );
     assert_eq!(
         store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .reasoning_effort

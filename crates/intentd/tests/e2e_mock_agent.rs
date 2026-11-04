@@ -179,7 +179,10 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     );
 
     // Conversation persisted (one assistant message from the streamed chunk).
-    let session = store.get_agent_session(&agent_id).await.expect("session");
+    let session = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("session");
     assert!(
         session.messages.iter().any(|m| m.role == "assistant"),
         "assistant message persisted"

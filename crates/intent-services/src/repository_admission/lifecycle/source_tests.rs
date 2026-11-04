@@ -173,7 +173,11 @@ async fn real_agent_aba_never_allows_an_old_physical_origin_to_recapture() {
             agent_id: id.clone(),
         };
         let physical = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
-        let session = f.store.get_agent_session(&id).await.unwrap();
+        let session = f
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         with_repository_lifecycle_source(
             &services,
             internal(caller.clone()).await,

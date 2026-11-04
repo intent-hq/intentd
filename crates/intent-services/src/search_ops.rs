@@ -68,8 +68,8 @@ pub(crate) async fn search_root(
     caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Result<Option<PathBuf>> {
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return Ok(Some(sandbox_path.into()));
             }
         }

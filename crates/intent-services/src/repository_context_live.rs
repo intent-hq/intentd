@@ -396,7 +396,7 @@ impl RepositoryContextOwner {
         };
         let session = services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .map_err(local)?;
         let workspace = session.workspace_id;

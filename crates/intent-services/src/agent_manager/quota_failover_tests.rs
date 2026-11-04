@@ -207,7 +207,7 @@ impl Fixture {
         self.mgr
             .services
             .store
-            .get_agent_session(&self.agent)
+            .get_agent_session_with_transcript(&self.agent)
             .await
             .unwrap()
     }
@@ -241,7 +241,7 @@ async fn timeout_settled(mgr: &AgentManager, agent: &AgentId) {
                 let status = mgr
                     .services
                     .store
-                    .get_agent_session(agent)
+                    .get_agent_session_with_transcript(agent)
                     .await
                     .unwrap()
                     .status;
@@ -1258,7 +1258,10 @@ async fn leaving_home_records_the_return_state_durably() {
         state.return_after
     );
     let reopened = Store::open(&fx.db.path().join("store.db")).await.unwrap();
-    let persisted = reopened.get_agent_session(&fx.agent).await.unwrap();
+    let persisted = reopened
+        .get_agent_session_with_transcript(&fx.agent)
+        .await
+        .unwrap();
     assert_eq!(crate::provider_return::read_state(&persisted), Some(state));
     let full = fx
         .mgr

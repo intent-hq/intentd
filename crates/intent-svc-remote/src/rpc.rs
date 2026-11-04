@@ -105,7 +105,7 @@ impl HeadCalls {
         let session = match self
             .services
             .store()
-            .get_agent_session(&record.agent_id)
+            .get_agent_session_without_messages(&record.agent_id)
             .await
         {
             Ok(session) => session,

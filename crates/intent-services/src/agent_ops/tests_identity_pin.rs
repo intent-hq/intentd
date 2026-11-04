@@ -36,7 +36,7 @@ async fn create_plain(
 
 async fn stored_provider(svc: &Services, id: &AgentId) -> Option<String> {
     svc.store()
-        .get_agent_session(id)
+        .get_agent_session_with_transcript(id)
         .await
         .expect("persisted session")
         .provider
@@ -60,7 +60,11 @@ async fn model_only_create_pins_the_default_provider_across_a_default_change() {
 async fn bare_create_pins_provider_and_model() {
     let (_tmp, svc, ws) = setup().await;
     let id = create_plain(&svc, &ws, None, None).await;
-    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("grok"));
     assert_eq!(session.model.as_deref(), Some("default-model"));
     assert_eq!(session.reasoning_effort.as_deref(), Some("low"));
@@ -102,7 +106,11 @@ async fn mismatched_default_model_falls_back_to_the_catalog_default() {
     );
     set(&svc, "model.default", json!("pinned-model"));
     let id = create_plain(&svc, &ws, None, None).await;
-    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("grok"));
     assert_eq!(session.model.as_deref(), Some("default-model"));
 }
@@ -135,7 +143,7 @@ async fn workspace_api_create_with_model_pins_the_default_provider() {
 async fn make_legacy(svc: &Services, ws: &WorkspaceId, id: &AgentId, last_turn: Option<&str>) {
     let model = svc
         .store()
-        .get_agent_session(id)
+        .get_agent_session_with_transcript(id)
         .await
         .unwrap()
         .model
@@ -206,7 +214,10 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
     let (_tmp, svc, ws) = setup().await;
     let store = svc.store();
     let auto = create_plain(&svc, &ws, Some("default-model"), None).await;
-    let mut row = store.get_agent_session(&auto).await.unwrap();
+    let mut row = store
+        .get_agent_session_with_transcript(&auto)
+        .await
+        .unwrap();
     row.reasoning_effort = None;
     store.update_agent_session(&ws, &row).await.unwrap();
     assert!(store
@@ -220,14 +231,17 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
         .await
         .unwrap());
     // Rewriting the row with the same level keeps the Auto pin.
-    let same = store.get_agent_session(&auto).await.unwrap();
+    let same = store
+        .get_agent_session_with_transcript(&auto)
+        .await
+        .unwrap();
     store.update_agent_session(&ws, &same).await.unwrap();
     svc.agent_set_model_op(auto.clone(), "default-model".into(), None)
         .await
         .unwrap();
     assert_eq!(
         store
-            .get_agent_session(&auto)
+            .get_agent_session_with_transcript(&auto)
             .await
             .unwrap()
             .reasoning_effort
@@ -250,7 +264,7 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
         .unwrap();
     assert_eq!(
         store
-            .get_agent_session(&auto)
+            .get_agent_session_with_transcript(&auto)
             .await
             .unwrap()
             .reasoning_effort,
@@ -259,7 +273,10 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
     );
 
     let chosen = create_plain(&svc, &ws, Some("default-model"), None).await;
-    let mut row = store.get_agent_session(&chosen).await.unwrap();
+    let mut row = store
+        .get_agent_session_with_transcript(&chosen)
+        .await
+        .unwrap();
     row.reasoning_effort = None;
     store.update_agent_session(&ws, &row).await.unwrap();
     store
@@ -272,7 +289,10 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
         )
         .await
         .unwrap();
-    let mut row = store.get_agent_session(&chosen).await.unwrap();
+    let mut row = store
+        .get_agent_session_with_transcript(&chosen)
+        .await
+        .unwrap();
     row.reasoning_effort = Some("low".into());
     store.update_agent_session(&ws, &row).await.unwrap();
     svc.agent_set_model_op(chosen.clone(), "other-model".into(), None)
@@ -280,7 +300,7 @@ async fn model_switch_resets_only_an_auto_pinned_effort() {
         .unwrap();
     assert_eq!(
         store
-            .get_agent_session(&chosen)
+            .get_agent_session_with_transcript(&chosen)
             .await
             .unwrap()
             .reasoning_effort
@@ -297,7 +317,7 @@ async fn explicit_same_value_effort_choice_survives_a_model_switch() {
     let (_tmp, svc, ws) = setup().await;
     let store = svc.store();
     let id = create_plain(&svc, &ws, Some("default-model"), None).await;
-    let mut row = store.get_agent_session(&id).await.unwrap();
+    let mut row = store.get_agent_session_with_transcript(&id).await.unwrap();
     row.reasoning_effort = None;
     store.update_agent_session(&ws, &row).await.unwrap();
     store
@@ -322,7 +342,7 @@ async fn explicit_same_value_effort_choice_survives_a_model_switch() {
         .unwrap();
     assert_eq!(
         store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .reasoning_effort

@@ -594,7 +594,7 @@ async fn admitted_chief_wait_finishes_registration_before_queued_target_deletion
         ("child-a", "child-a-ws"),
         ("child-b", "child-b-ws"),
     ] {
-        let session = serde_json::from_value(json!({
+        let session: intent_core::AgentSession = serde_json::from_value(json!({
             "id": id, "workspaceId": ws, "name": id, "status": "active",
             "createdAt": "t0", "updatedAt": "t0"
         }))
@@ -1477,7 +1477,11 @@ async fn equivalent_transcript_writers_reject_closed_admission_without_side_effe
                 .map(|()| json!(null)),
             _ => unreachable!(),
         };
-        let session = h.store.get_agent_session(&agent).await.unwrap();
+        let session = h
+            .store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         let queue_len = h.svc.queue_snapshot(&agent).len();
         let interrupted = h
             .store
@@ -1556,7 +1560,11 @@ async fn member_removal_overlaps_one_workspace_deletion_without_reopening_or_sto
         deletion.await.unwrap();
         assert!(h.store.get_workspace(&deleting_ws).await.is_err());
         assert!(h.store.get_workspace(&kept_ws).await.is_ok());
-        assert!(h.store.get_agent_session(&kept_agents[0]).await.is_ok());
+        assert!(h
+            .store
+            .get_agent_session_with_transcript(&kept_agents[0])
+            .await
+            .is_ok());
         assert_eq!(h.remaining(&kept_ws).await, ROWS);
     }
 }

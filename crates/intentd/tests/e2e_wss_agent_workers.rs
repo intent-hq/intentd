@@ -1302,7 +1302,7 @@ async fn restart_interrupts_an_idle_agent_with_a_running_worker_over_wss() {
         .await
         .expect("open store");
     let session = store
-        .get_agent_session(&intent_core::AgentId(agent_id.clone()))
+        .get_agent_session_with_transcript(&intent_core::AgentId(agent_id.clone()))
         .await
         .expect("get agent session");
     assert!(

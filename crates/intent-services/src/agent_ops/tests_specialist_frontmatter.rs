@@ -166,7 +166,11 @@ async fn chief_prompt_version_invalidates_only_for_changed_prompt_identity() {
             )
             .await
             .unwrap();
-        let before = svc.store().get_agent_session(&id).await.unwrap();
+        let before = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         svc.agent_update_op(
             id.clone(),
             json!({
@@ -194,7 +198,11 @@ async fn chief_prompt_version_invalidates_only_for_changed_prompt_identity() {
             ));
         }
         svc.agent_update_op(id.clone(), mutation).await.unwrap();
-        let stored = svc.store().get_agent_session(&id).await.unwrap();
+        let stored = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert!(stored
             .metadata
             .as_ref()
@@ -457,7 +465,7 @@ async fn unknown_specialist_rejects_delegate() {
     );
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no child persisted on rejection");
@@ -479,7 +487,7 @@ async fn unknown_specialist_rejects_delegate() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
@@ -902,7 +910,7 @@ async fn unknown_specialist_rejects_create() {
     // No side effect: no session row was persisted.
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no session persisted on rejection");
@@ -948,7 +956,11 @@ async fn specialist_snapshot_persisted_at_create() {
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata snapshot written");
     assert_eq!(
         meta["behaviorPrompt"].as_str(),
@@ -990,7 +1002,11 @@ async fn caller_behavior_prompt_override_preserved() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata");
     assert_eq!(meta["behaviorPrompt"].as_str(), Some("CALLER OVERRIDE"));
     assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
@@ -1030,7 +1046,11 @@ async fn non_object_metadata_left_untouched() {
         .expect("create succeeds with non-object metadata");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.metadata, Some(json!("opaque")));
 }
 
@@ -1065,7 +1085,11 @@ async fn caller_reminder_removed_when_resolution_has_none() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata");
     assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
     assert!(
@@ -1187,7 +1211,11 @@ async fn alias_create_persists_canonical_specialist_id() {
         Some("spec-writer")
     );
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
     // Downstream resolution ran against the canonical specialist: the
     // derived display name and frozen prompt snapshot are spec-writer's.
@@ -1257,7 +1285,11 @@ async fn alias_update_persists_canonical_specialist_id() {
     )
     .await
     .expect("update with alias");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
 
     // A directly-known canonical id is untouched.
@@ -1267,7 +1299,11 @@ async fn alias_update_persists_canonical_specialist_id() {
     )
     .await
     .expect("update with canonical id");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("implementor"));
 
     // An unknown id is rejected with `-32602` and the session is untouched
@@ -1278,7 +1314,11 @@ async fn alias_update_persists_canonical_specialist_id() {
         .expect_err("unknown specialist must reject the update");
     assert!(matches!(err, intent_core::Error::InvalidParams(_)));
     assert!(err.to_string().contains("unknown specialist: no-such"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.specialist.as_deref(),
         Some("implementor"),
@@ -1289,7 +1329,11 @@ async fn alias_update_persists_canonical_specialist_id() {
     svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": null }))
         .await
         .expect("update with null");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist, None);
 }
 
@@ -1402,14 +1446,18 @@ async fn orchestrator_snapshot_persisted_and_frozen_across_file_changes() {
     let orch = create_agent(&svc, &ws, "Orch", None, Some("conductor".into())).await;
     let plain = create_agent(&svc, &ws, "Plain", None, Some("plain".into())).await;
 
-    let orch_session = svc.store().get_agent_session(&orch).await.expect("session");
+    let orch_session = svc
+        .store()
+        .get_agent_session_with_transcript(&orch)
+        .await
+        .expect("session");
     assert_eq!(
         orch_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(true)
     );
     let plain_session = svc
         .store()
-        .get_agent_session(&plain)
+        .get_agent_session_with_transcript(&plain)
         .await
         .expect("session");
     assert_eq!(
@@ -1456,7 +1504,11 @@ async fn caller_orchestrator_key_overwritten_at_create() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(false)
@@ -1473,7 +1525,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     create_specialist_without_model(specialists_dir.path(), "plain");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("plain".into())).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(false)
@@ -1482,7 +1538,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     svc.agent_update_op(id.clone(), json!({ "specialist": "conductor" }))
         .await
         .expect("update to orchestrator");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("conductor"));
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
@@ -1492,7 +1552,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     svc.agent_update_op(id.clone(), json!({ "specialist": null }))
         .await
         .expect("clear specialist");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist, None);
     assert!(session
         .metadata

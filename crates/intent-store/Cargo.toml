@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.11.122"
+version = "0.11.123"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,9 +8,14 @@ license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
 [package.metadata.cargo-shear]
-# Compiled separately by tests/store_pool_api.rs and tests/note_write_lock_api.rs
-# to assert rejected pool and note-write-lock APIs.
-ignored-paths = ["tests/ui/store_pool_*.rs", "tests/ui/note_write_lock_*.rs"]
+# Compiled separately by tests/store_pool_api.rs, tests/note_write_lock_api.rs
+# and tests/agent_session_summary_api.rs to assert rejected pool,
+# note-write-lock and summary write-back APIs.
+ignored-paths = [
+    "tests/ui/store_pool_*.rs",
+    "tests/ui/note_write_lock_*.rs",
+    "tests/ui/agent_session_summary_*.rs",
+]
 
 [features]
 # Note write-lock observation seams (`Store::note_content_lock_users` /
@@ -21,7 +26,7 @@ ignored-paths = ["tests/ui/store_pool_*.rs", "tests/ui/note_write_lock_*.rs"]
 test-support = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.122" }
+intent-core = { path = "../intent-core", version = "0.11.123" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

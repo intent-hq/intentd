@@ -1647,7 +1647,10 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
         let http = ReadServer::new().await;
         let f = LiveFixture::with_version(&http, version).await;
         let store = &f.base.auth.service.store;
-        let original = store.get_agent_session(&f.session.id).await.unwrap();
+        let original = store
+            .get_agent_session_with_transcript(&f.session.id)
+            .await
+            .unwrap();
         let first = tcp(f.server(), "return 41;").await;
         let first_targets = delivered_targets(&first);
         assert_eq!(first_targets.len(), 1);
@@ -1738,7 +1741,10 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
         assert!(ok);
         assert!(frame.to_string().contains("team/continued"));
         assert!(!frame.to_string().contains("group/project"));
-        let saved = store.get_agent_session(&f.session.id).await.unwrap();
+        let saved = store
+            .get_agent_session_with_transcript(&f.session.id)
+            .await
+            .unwrap();
         assert_eq!(saved.harness_version, original.harness_version);
         assert_eq!(saved.harness_features, original.harness_features);
         assert_eq!(saved.acp_session_id, original.acp_session_id);

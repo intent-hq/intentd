@@ -3117,7 +3117,7 @@ impl Services {
         if child_of_caller && self.pr_monitor_child_settled(&session).await {
             return Ok(Some(PrMonitorHolder::SettledChild(owner)));
         }
-        let owner_agent_name = Some(session.name).filter(|n| !n.trim().is_empty());
+        let owner_agent_name = Some(session.name.clone()).filter(|n| !n.trim().is_empty());
         Ok(Some(PrMonitorHolder::Live(PrMonitorRefusal {
             owner,
             owner_agent_name,
@@ -6394,7 +6394,10 @@ mod tests {
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store().close().await;
         let reopened = Store::open(&db.path).await.unwrap();
-        let session = reopened.get_agent_session(&owner).await.unwrap();
+        let session = reopened
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         if closing_manager {
             let queue = reopened.load_all_agent_queues().await.unwrap();
             assert_eq!(queue.len(), 1);
@@ -6501,7 +6504,11 @@ mod tests {
 
     /// The owner's persisted messages, serialized (wake assertions).
     async fn owner_messages(svc: &Services, owner: &AgentId) -> String {
-        let session = svc.store().get_agent_session(owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(owner)
+            .await
+            .unwrap();
         serde_json::to_string(&session.messages).unwrap()
     }
 
@@ -8411,7 +8418,11 @@ mod tests {
             updated_at: ts,
         };
         svc.store().insert_note(&note).await.expect("task note");
-        let mut session = svc.store().get_agent_session(agent_id).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_with_transcript(agent_id)
+            .await
+            .unwrap();
         session.task_note_id = Some(note_id);
         svc.store()
             .update_agent_session(ws, &session)
@@ -8471,7 +8482,11 @@ mod tests {
         assert!(svc.pr_monitors_for_agent(child).await.unwrap().is_empty());
         assert_eq!(svc.pr_monitors_for_agent(parent).await.unwrap().len(), 1);
 
-        let child_session = svc.store().get_agent_session(child).await.unwrap();
+        let child_session = svc
+            .store()
+            .get_agent_session_with_transcript(child)
+            .await
+            .unwrap();
         assert_eq!(
             child_session.messages.len(),
             1,

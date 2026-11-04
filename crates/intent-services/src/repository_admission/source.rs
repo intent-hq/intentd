@@ -164,11 +164,11 @@ pub(crate) async fn read_agent_identity(
         return Err(AdmissionError::Denied);
     }
     Ok(Some(RepositoryAgentIdentity {
-        id: session.id,
-        workspace_id: session.workspace_id,
-        parent_agent_id: session.parent_agent_id,
-        backend_session_id: session.backend_session_id,
-        acp_session_id: session.acp_session_id,
+        id: session.id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        parent_agent_id: session.parent_agent_id.clone(),
+        backend_session_id: session.backend_session_id.clone(),
+        acp_session_id: session.acp_session_id.clone(),
     }))
 }
 

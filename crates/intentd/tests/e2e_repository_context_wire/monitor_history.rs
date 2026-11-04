@@ -936,7 +936,10 @@ async fn native_daemon_case(
         intentd_test_support::test_timeout(Duration::from_secs(45)),
         async {
             loop {
-                let session = store.get_agent_session(&agent).await.unwrap();
+                let session = store
+                    .get_agent_session_with_transcript(&agent)
+                    .await
+                    .unwrap();
                 if model.exists() && session.status == intent_core::AgentStatus::RuntimeIdle {
                     break;
                 }
@@ -954,7 +957,10 @@ async fn native_daemon_case(
     )
     .await
     .expect("native daemon turn did not complete");
-    let session = store.get_agent_session(&agent).await.unwrap();
+    let session = store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     let session_id = session
         .acp_session_id
         .as_ref()
@@ -1038,7 +1044,10 @@ async fn native_daemon_case(
                         let current: Value =
                             serde_json::from_slice(&std::fs::read(&model).unwrap()).unwrap();
                         let row = store.get_pr_monitor(&rows[0].monitor_id).await.unwrap();
-                        let session = store.get_agent_session(&agent).await.unwrap();
+                        let session = store
+                            .get_agent_session_with_transcript(&agent)
+                            .await
+                            .unwrap();
                         if current.as_array().unwrap().len() >= 3
                             && row.pending_changes.is_empty()
                             && session.status == intent_core::AgentStatus::RuntimeIdle
@@ -1203,7 +1212,10 @@ async fn native_daemon_case(
                     intentd_test_support::test_timeout(Duration::from_secs(45)),
                     async {
                         loop {
-                            let current = store.get_agent_session(&agent).await.unwrap();
+                            let current = store
+                                .get_agent_session_with_transcript(&agent)
+                                .await
+                                .unwrap();
                             if current.status == intent_core::AgentStatus::Error {
                                 break;
                             }
@@ -1222,7 +1234,7 @@ async fn native_daemon_case(
             );
             assert_eq!(
                 store
-                    .get_agent_session(&agent)
+                    .get_agent_session_with_transcript(&agent)
                     .await
                     .unwrap()
                     .acp_session_id
@@ -1255,7 +1267,10 @@ async fn native_daemon_case(
             intentd_test_support::test_timeout(Duration::from_secs(45)),
             async {
                 loop {
-                    let current = store.get_agent_session(&agent).await.unwrap();
+                    let current = store
+                        .get_agent_session_with_transcript(&agent)
+                        .await
+                        .unwrap();
                     if model.exists() && current.status == intent_core::AgentStatus::RuntimeIdle {
                         break;
                     }
@@ -1335,7 +1350,7 @@ async fn native_daemon_case(
         }
         assert_eq!(
             store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .acp_session_id

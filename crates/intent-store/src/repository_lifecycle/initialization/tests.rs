@@ -296,7 +296,7 @@ impl Fixture {
 
     async fn id(&self) -> Option<String> {
         self.store
-            .get_agent_session(&self.agent.id)
+            .get_agent_session_with_transcript(&self.agent.id)
             .await
             .unwrap()
             .acp_session_id
@@ -797,7 +797,11 @@ async fn ignored_update_cannot_commit_trigger_effects_as_confirmed_no_effect() {
         .execute(f.store.write_pool()).await.unwrap();
     assert!(f.initialize(first("A")).await.is_err());
     assert_eq!(
-        f.store.get_agent_session(&f.agent.id).await.unwrap().name,
+        f.store
+            .get_agent_session_with_transcript(&f.agent.id)
+            .await
+            .unwrap()
+            .name,
         f.agent.name
     );
     assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
@@ -889,7 +893,7 @@ async fn same_observer_on_different_database_does_not_bridge_claim_domain() {
     assert_eq!(f.id().await, None);
     assert_eq!(
         other
-            .get_agent_session(&f.agent.id)
+            .get_agent_session_with_transcript(&f.agent.id)
             .await
             .unwrap()
             .acp_session_id,
@@ -1200,7 +1204,7 @@ async fn outcome_trigger_rollback_or_changed_winner_remains_unknown_not_no_effec
         assert!(result.confirmation.is_err());
         assert_eq!(f.id().await, None);
         assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
-        assert_eq!(f.store.get_agent_session(&f.agent.id).await.unwrap().name, f.agent.name);
+        assert_eq!(f.store.get_agent_session_with_transcript(&f.agent.id).await.unwrap().name, f.agent.name);
     }
 }
 
