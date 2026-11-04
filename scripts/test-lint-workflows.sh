@@ -115,6 +115,13 @@ else
   fail "lint call: got $(cat "$calls"), want $want_calls"
 fi
 
+# Called by bare name from scripts/ (no slash in BASH_SOURCE).
+: >"$calls"
+status=0
+output=$(cd "$fake/scripts" && PATH=$stub_bin STUB_CALLS=$calls STUB_VERSION=$pin "$BASH" lint-workflows.sh 2>&1) || status=$?
+expect "a bare-name call from scripts/ still finds the repo root" 0 "is clean"
+if ! grep -qx "cwd=$fake" "$calls"; then fail "bare-name call: lint did not run from the repo root: $(cat "$calls")"; fi
+
 STUB_VERSION=v$pin run_lint "$stub_bin"
 expect "a v-prefixed go-install version matches the pin" 0 "is clean"
 

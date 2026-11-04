@@ -51,7 +51,13 @@ actionlint_sha256() {
   esac
 }
 
-script_dir=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)
+# Builtins only (no dirname), so the self-test can run it under a PATH of
+# stubs; a bare-name call (`bash lint-workflows.sh` from scripts/) has no slash.
+case ${BASH_SOURCE[0]} in
+  */*) script_dir=${BASH_SOURCE[0]%/*} ;;
+  *) script_dir=. ;;
+esac
+script_dir=$(cd "$script_dir" && pwd -P)
 repo_root=$(cd "$script_dir/.." && pwd -P)
 install_hint="run make bootstrap-dev-host in the intent monorepo, or scripts/lint-workflows.sh --install DIR and put DIR on PATH"
 
