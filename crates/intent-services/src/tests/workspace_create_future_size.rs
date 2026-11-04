@@ -67,6 +67,7 @@ async fn workspace_create_future_size_stays_within_budget() {
          called, so the block size was not recorded; update this test to measure the block"
     );
     let input = std::mem::size_of::<WorkspaceCreate>();
+    eprintln!("workspace.create future sizes: block={block}, wrapper={wrapper}, input={input}");
 
     let measured = [
         ("workspace.create block", block, CREATE_BLOCK_BUDGET),

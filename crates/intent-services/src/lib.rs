@@ -21663,6 +21663,8 @@ impl WorkspaceApi for Services {
                 services.prepare_create_proposal_origin(&mut input, requested_key.as_deref())
             })
             .await?;
+            // The original key is needed only through proposal validation.
+            drop(requested_key);
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
