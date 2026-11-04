@@ -20856,7 +20856,7 @@ impl WorkspaceApi for Services {
             // This single indexed query never streams, even for a large hard
             // scope. There is no lingering cancellation registration; cancelling
             // this completed request is the usual no-op success.
-            search_ops::note_page_reply(request_id, matches, start, limit, &scope)
+            search_ops::note_page_reply(&request_id, matches, start, limit, &scope)
         })
     }
 

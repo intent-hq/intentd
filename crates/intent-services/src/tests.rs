@@ -29458,12 +29458,11 @@ mod search_adapters {
                     row["noteId"].as_str().unwrap().to_string(),
                 ));
             }
-            match page["nextToken"].as_str() {
-                Some(next) => token = Some(next.to_string()),
-                None => {
-                    assert!(page["nextToken"].is_null(), "{page}");
-                    return (hits, pages);
-                }
+            if let Some(next) = page["nextToken"].as_str() {
+                token = Some(next.to_string());
+            } else {
+                assert!(page["nextToken"].is_null(), "{page}");
+                return (hits, pages);
             }
         }
     }

@@ -134,7 +134,7 @@ pub(crate) fn decode_note_page_token(token: &str, scope: &str) -> Result<usize> 
 /// one), and `nextToken` resumes right after the last kept hit (`null` when
 /// none remain).
 pub(crate) fn note_page_reply(
-    request_id: String,
+    request_id: &str,
     hits: Vec<NoteMatch>,
     start: usize,
     limit: usize,
@@ -157,7 +157,7 @@ pub(crate) fn note_page_reply(
     rows.truncate(kept);
     let next_token = (cut || more_rows).then(|| encode_note_page_token(scope, start + kept));
     Ok(serde_json::json!({
-        "requestId": envelope["requestId"],
+        "requestId": request_id,
         "matches": rows,
         "indexed": true,
         "nextToken": next_token,
