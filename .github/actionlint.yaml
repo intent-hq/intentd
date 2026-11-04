@@ -6,7 +6,7 @@ self-hosted-runner:
     - gh-windows-16x
     - m1mac
 
-# Run by `make lint-workflows` (scripts/lint-workflows.sh; CI's pr-static job).
+# Run by `make lint-workflows` (scripts/lint-workflows.sh; CI's release-scripts job).
 # Keep every ignore scoped to the narrowest path and message, with its reason;
 # a one-off intentional pattern gets an inline `# shellcheck disable=` instead.
 paths:
