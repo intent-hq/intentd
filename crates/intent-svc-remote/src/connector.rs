@@ -1340,6 +1340,11 @@ async fn run(
             Ok(connected) => connected,
             Err(failure) => {
                 tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
+                // Persist the resting state before revocation ends agents.
+                // `end_all` drops `running()` to zero, and a list between
+                // that and this write still reads `disconnected`
+                // (intent-hq/intent#8484).
+                shared.record_failure(&failure).await;
                 if matches!(failure, ConnectFailure::Revoked(_)) {
                     // Revocation stopped this binding's agents on the
                     // machine: their stops are moot, and they no longer run.
@@ -1353,7 +1358,6 @@ async fn run(
                         tracing::info!(machine = %target.id, ended, "remote machine: revoked; its agents ended");
                     }
                 }
-                shared.record_failure(&failure).await;
                 shared.announce().await;
                 for waiter in waiters.drain(..) {
                     let _ = waiter.send(Err(failure.clone()));
