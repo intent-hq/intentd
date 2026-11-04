@@ -241,6 +241,9 @@ pub(crate) struct Shared {
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
     final_settles: Mutex<Vec<AgentId>>,
+    /// Agents whose final stop was queued (and so began for their runs).
+    #[cfg(test)]
+    final_begins: Mutex<Vec<AgentId>>,
     /// The label of the route the current (or last) link bound on.
     route: Mutex<Option<String>>,
     /// Set once a bind in this process has claimed the agents its welcome
@@ -404,6 +407,16 @@ impl Shared {
     /// stop (or an older final stop). `durable` when its record is in the
     /// store, so the acknowledgement finishes that record.
     fn queue_final_stop(&self, agent_id: &AgentId, stop_id: StopId, durable: bool) {
+        // Every queued final stop (requested, loaded at startup or on a
+        // dial, or claimed at bind) begins for the agent's machine runs: the
+        // machine stops its scripts itself, and none may start until the
+        // stop is over.
+        #[cfg(test)]
+        lock(&self.final_begins).push(agent_id.clone());
+        if let Some(svc) = &self.services {
+            svc.feature_runtime()
+                .machine_runs_final_stop_begun(svc, agent_id);
+        }
         let replaced = lock(&self.stops).insert(
             agent_id.clone(),
             QueuedStop {
@@ -450,11 +463,6 @@ impl Shared {
             }
             None => None,
         };
-        // The machine stops the agent's scripts itself during a final stop.
-        if let Some(svc) = &self.services {
-            svc.feature_runtime()
-                .machine_runs_final_stop_begun(svc, agent_id);
-        }
         self.agents.close(agent_id);
         let (stop_id, durable) = match recorded {
             Some(stop_id) => (stop_id, true),
@@ -788,6 +796,13 @@ impl Shared {
     }
 
     #[cfg(test)]
+    pub(crate) fn final_begins_for_test(&self) -> Vec<AgentId> {
+        let mut agents = lock(&self.final_begins).clone();
+        agents.dedup();
+        agents
+    }
+
+    #[cfg(test)]
     pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
         lock(&self.final_settles).clone()
     }
@@ -975,6 +990,8 @@ impl RemoteNode {
             resending: Mutex::new(HashMap::new()),
             #[cfg(test)]
             final_settles: Mutex::default(),
+            #[cfg(test)]
+            final_begins: Mutex::default(),
             route: Mutex::new(None),
             claimed: std::sync::atomic::AtomicBool::new(false),
             claim_lock: tokio::sync::Mutex::new(()),

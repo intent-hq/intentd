@@ -1780,6 +1780,12 @@ mod final_stops {
         // The restart: the in-memory queue is gone, the record is not.
         node.shutdown();
         let node = backend.bare(&machine).await;
+        // Loading it begins the agent's final stop before any link, so its
+        // scripts are refused as ending until the ack (review of intentd#3005).
+        assert_eq!(
+            node.shared_ref().final_begins_for_test(),
+            vec![agent.clone()]
+        );
         machine.restart().await;
         let mut link = machine.accept().await;
         assert!(link.hello.lease_agents.contains(&agent));
