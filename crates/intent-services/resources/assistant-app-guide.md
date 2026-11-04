@@ -52,6 +52,10 @@ These app-version notes qualify every later description in this guide:
   tool that installed it.
 - Hiding the host's provider-profile names from guests requires an app version
   supporting that presentation. Older apps may still display those names.
+- Proposal cards showing **Open workspace** whoever applied them, and reporting
+  a deleted workspace, require an app supporting those behaviors. Older apps may
+  offer **Open workspace** only when they have the local creation result; use the
+  existing workspace entry otherwise.
 - GitLab setup without a Labs switch requires an app version offering it and
   matching daemon support. Older apps may still gate GitLab settings and onboarding
   behind Labs; those flows remain experimental. Discuss them only when explicitly
@@ -727,7 +731,7 @@ uses the most recent setup. Changes you make in the form are kept when you switc
 repositories.
 
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
