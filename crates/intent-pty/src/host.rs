@@ -264,12 +264,27 @@ pub struct PtyInfo {
     pub alive: bool,
     /// Display name given at spawn, if any (`SpawnSpec::name`).
     pub name: Option<String>,
+    /// Foreground program state last seen by [`PtyHost::refresh_process`].
+    pub process: PtyProcess,
+}
+
+/// The program a PTY's user is running, as seen through its foreground
+/// process group. The spawned process itself (the shell) never counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PtyProcess {
+    /// Name of the foreground process group leader; `None` while only the
+    /// spawned process holds the foreground.
+    pub foreground: Option<String>,
+    /// The most recent program that has since left the foreground.
+    pub last: Option<String>,
 }
 
 struct PtySession {
     scope: String,
     /// Display name given at spawn (`SpawnSpec::name`), if any.
     name: Option<String>,
+    /// Foreground program state, updated by [`PtyHost::refresh_process`].
+    process: Mutex<PtyProcess>,
     /// Whether this PTY is surfaced through `terminal.list`.
     listed: bool,
     /// Working directory resolved at spawn (`spec.cwd`, else the daemon's cwd).
@@ -498,6 +513,7 @@ impl PtyHost {
         let session = Arc::new(PtySession {
             scope: spec.scope,
             name: spec.name,
+            process: Mutex::default(),
             listed: spec.listed,
             cwd,
             pid,
@@ -814,12 +830,39 @@ impl PtyHost {
     pub fn info(&self, id: PtyId) -> Option<PtyInfo> {
         let session = self.sessions.lock().unwrap().get(&id).cloned()?;
         let alive = matches!(session.child.lock().unwrap().try_wait(), Ok(None));
+        let process = session.process.lock().unwrap().clone();
         Some(PtyInfo {
             scope: session.scope.clone(),
             cwd: session.cwd.clone(),
             alive,
             name: session.name.clone(),
+            process,
         })
+    }
+
+    /// Re-read the PTY's foreground process group and update its
+    /// [`PtyProcess`]. Returns the new state only when it changed. When one
+    /// program leaves the foreground it becomes `last`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
+    pub fn refresh_process(&self, id: PtyId) -> Result<Option<PtyProcess>> {
+        let session = self.get(id)?;
+        let foreground = foreground_program(&session);
+        let mut process = session.process.lock().unwrap();
+        if process.foreground == foreground {
+            return Ok(None);
+        }
+        if let Some(previous) = process.foreground.take() {
+            process.last = Some(previous);
+        }
+        process.foreground = foreground;
+        Ok(Some(process.clone()))
     }
 
     /// Number of PTYs currently tracked.
@@ -1047,6 +1090,51 @@ fn master_pending(session: &PtySession) -> bool {
 #[cfg(not(unix))]
 fn master_pending(_session: &PtySession) -> bool {
     false
+}
+
+/// Name of the PTY's foreground process group leader, or `None` when it is
+/// the spawned process itself (the shell) or cannot be read.
+#[cfg(unix)]
+fn foreground_program(session: &PtySession) -> Option<String> {
+    let leader = session
+        .master
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .process_group_leader()?;
+    let leader = u32::try_from(leader).ok()?;
+    if Some(leader) == session.pid {
+        return None;
+    }
+    process_name(leader)
+}
+
+#[cfg(not(unix))]
+fn foreground_program(_session: &PtySession) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = comm.trim_end();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn process_name(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut buf = [0u8; 256];
+    let size = u32::try_from(buf.len()).ok()?;
+    // SAFETY: `buf` is writable for `size` bytes for the duration of the call.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), size) };
+    let len = usize::try_from(len).ok().filter(|&n| n > 0)?;
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_name(_pid: u32) -> Option<String> {
+    None
 }
 
 /// Per-PTY exit watcher (own thread): poll until the child is reaped (latching
@@ -1405,6 +1493,54 @@ mod tests {
 
         host.kill(named_id).await;
         host.kill(unnamed_id).await;
+    }
+
+    /// Poll `refresh_process` until the tracked state matches `want`.
+    async fn wait_for_process(host: &PtyHost, id: PtyId, want: &PtyProcess) -> PtyProcess {
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        loop {
+            let _ = host.refresh_process(id).unwrap();
+            let seen = host.info(id).unwrap().process;
+            if &seen == want || Instant::now() >= deadline {
+                return seen;
+            }
+            tokio::time::sleep(REAP_POLL).await;
+        }
+    }
+
+    /// A job started from an interactive shell becomes the foreground
+    /// program, and moves to `last` once the shell takes the foreground back.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn refresh_process_tracks_foreground_job_then_last() {
+        let host = PtyHost::new();
+        let id = host.spawn(SpawnSpec::new("s", "sh")).unwrap();
+        assert_eq!(
+            wait_for_process(&host, id, &PtyProcess::default()).await,
+            PtyProcess::default(),
+            "only the shell is running"
+        );
+
+        host.write(id, b"sleep 30\n").unwrap();
+        let running = PtyProcess {
+            foreground: Some("sleep".to_string()),
+            last: None,
+        };
+        assert_eq!(wait_for_process(&host, id, &running).await, running);
+        assert_eq!(
+            host.refresh_process(id).unwrap(),
+            None,
+            "no change, no update"
+        );
+
+        host.write(id, b"\x03").unwrap();
+        let exited = PtyProcess {
+            foreground: None,
+            last: Some("sleep".to_string()),
+        };
+        assert_eq!(wait_for_process(&host, id, &exited).await, exited);
+
+        host.kill(id).await;
     }
 
     /// The output sink sees every byte, in order, even when scrollback keeps
