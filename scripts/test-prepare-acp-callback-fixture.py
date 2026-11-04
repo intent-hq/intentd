@@ -9,7 +9,10 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import platform
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -128,7 +131,8 @@ class ProvisionerTests(unittest.TestCase):
         self.fixture = Fixture(self.root)
         # No network or real Node/npm process is allowed in this suite.
         self.addCleanup(patch.stopall)
-        patch.dict(os.environ, {"NODE_OPTIONS": ""}).start()
+        # An empty nvm root keeps mismatch hints independent of the host's Nodes.
+        patch.dict(os.environ, {"NODE_OPTIONS": "", "NVM_DIR": str(self.root / "nvm")}).start()
         patch.object(PREP, "node_tool", return_value=Path("/synthetic/node")).start()
         patch.object(PREP.urllib.request, "urlopen", side_effect=AssertionError("offline test attempted network")).start()
 
@@ -346,6 +350,79 @@ class ProvisionerTests(unittest.TestCase):
     def test_actual_node_version_check_refuses_wrong_version(self):
         with patch.object(PREP.shutil, "which", return_value="/synthetic/node"), patch.object(PREP, "command", return_value="v22.0.0"):
             self.refused(ORIGINAL_NODE_TOOL, self.fixture.descriptor, self.root, {"PATH": ""}, match="Node version mismatch")
+
+    def fake_node(self, directory, version):
+        directory.mkdir(parents=True, exist_ok=True)
+        node = directory / "node"
+        node.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version}'\n")
+        node.chmod(0o755)
+        return directory
+
+    def mismatch(self, path=""):
+        with patch.object(PREP.shutil, "which", return_value="/synthetic/node"), \
+                patch.object(PREP, "command", return_value="v22.0.0"), \
+                self.assertRaises(PREP.NodeVersionMismatch) as caught:
+            ORIGINAL_NODE_TOOL(self.fixture.descriptor, self.root, {"PATH": path})
+        return caught.exception
+
+    def test_node_mismatch_names_both_versions_and_the_installed_nvm_node(self):
+        required = self.fixture.descriptor["tools"]["node"]
+        installed = self.fake_node(self.root / "nvm/versions/node" / required / "bin", required)
+        error = self.mismatch()
+        self.assertEqual((error.found, error.required, error.matching), ("v22.0.0", required, installed))
+        self.assertIn(f"Node version mismatch: found v22.0.0, descriptor requires {required}", str(error))
+        self.assertIn(f"Node {required} is installed in {installed}", str(error))
+        self.assertTrue(str(error).endswith(f'export PATH={PREP.shlex.quote(str(installed))}:"$PATH"'), error)
+
+    def test_node_mismatch_finds_a_matching_node_later_on_path(self):
+        required = self.fixture.descriptor["tools"]["node"]
+        wrong = self.fake_node(self.root / "wrong bin", "v22.0.0")
+        right = self.fake_node(self.root / "right bin", required)
+        self.assertEqual(self.mismatch(os.pathsep.join([str(wrong), str(right)])).matching, right)
+
+    def test_node_mismatch_without_an_installed_match_refuses_without_guessing(self):
+        required = self.fixture.descriptor["tools"]["node"]
+        # A directory named for the pin is not trusted unless the binary agrees.
+        self.fake_node(self.root / "nvm/versions/node" / required / "bin", "v22.0.0")
+        error = self.mismatch(str(self.fake_node(self.root / "other", "v20.0.0")))
+        self.assertIsNone(error.matching)
+        self.assertIn(f"found v22.0.0, descriptor requires {required}", str(error))
+        self.assertIn(f"no installed Node {required} was found on PATH or under {self.root / 'nvm/versions/node'}",
+                      str(error))
+        self.assertIn("nothing was downloaded", str(error))
+        self.assertNotIn("export PATH", str(error))
+
+    def test_missing_node_names_the_required_version(self):
+        with patch.object(PREP.shutil, "which", return_value=None):
+            self.refused(ORIGINAL_NODE_TOOL, self.fixture.descriptor, self.root, {"PATH": ""},
+                         match=f"({self.fixture.descriptor['tools']['node']})")
+
+    @unittest.skipUnless(sys.platform == "linux" and platform.machine().lower() in ("x86_64", "amd64"),
+                         "the real CLI platform check needs Linux x64")
+    def test_cli_node_mismatch_prints_a_rerun_that_passes_the_version_check(self):
+        required = PREP.read_json(PREP.DEFAULT_DESCRIPTOR)["tools"]["node"]
+        active = self.fake_node(self.root / "active bin", "v22.0.0")
+        installed = self.fake_node(self.root / "nvm/versions/node" / required / "bin", required)
+        cache = self.root / "cache dir"
+        env = {**os.environ, "PATH": f"{active}{os.pathsep}{os.environ.get('PATH', '')}"}
+        env.pop("NODE_OPTIONS", None)
+        script = str(Path(PREP.__file__).resolve())
+        first = subprocess.run([sys.executable, "-I", "-B", "-S", script, "--offline", "--cache-dir", str(cache)],
+                               env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(first.returncode, 1, first.stderr)
+        lines = first.stderr.strip().splitlines()
+        self.assertIn(f"Node version mismatch: found v22.0.0, descriptor requires {required}", lines[-1])
+        self.assertIn(f"installed in {installed}", lines[-1])
+        prefix = f"callback fixture: exact re-run with Node {required} first on PATH: "
+        self.assertTrue(lines[-2].startswith(prefix), first.stderr)
+        rerun = lines[-2].removeprefix(prefix)
+        self.assertTrue(rerun.startswith(f'env PATH={PREP.shlex.quote(str(installed))}:"$PATH" '), rerun)
+        second = subprocess.run(["bash", "-c", rerun], env=env, capture_output=True, text=True, timeout=60)
+        # The version check passes; the empty offline cache is the next refusal.
+        self.assertEqual(second.returncode, 1, second.stderr)
+        self.assertNotIn("Node version mismatch", second.stderr)
+        self.assertIn('"event": "node-tool"', second.stderr)
+        self.assertIn("verified fixture cache missing", second.stderr)
 
     def test_npm_mismatch_installs_only_the_exact_isolated_tool(self):
         calls = []
