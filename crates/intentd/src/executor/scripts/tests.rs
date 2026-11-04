@@ -551,3 +551,58 @@ async fn a_panicked_reaper_is_not_counted_reaped() {
         .expect("stop_agent hung on a panicked reaper");
     assert!(!reaped, "a panicked reaper counted as a recorded exit");
 }
+
+/// Once the machine is shutting down no script process starts: a start
+/// after [`ScriptProcesses::stop_all`] is refused (intent-hq/intent#8437).
+#[tokio::test]
+async fn a_start_after_stop_all_is_refused() {
+    let mut f = fixture().await;
+    let agent = AgentId::new();
+    f.scripts.stop_all().await;
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&agent, "p1", "sleep 60"),
+        )
+        .await;
+    let seen = until_exited(&mut f.head, "p1").await;
+    assert_eq!(seen.pid, None, "the process started: {seen:?}");
+    let error = seen.exited.unwrap().error.unwrap();
+    assert!(error.starts_with("node-script-start-failed: "), "{error}");
+}
+
+/// While the machine is shutting down a link's end sends its kills but does
+/// not wait a second reap wait for a process [`ScriptProcesses::stop_all`]
+/// already gave up on (intent-hq/intent#8437).
+#[tokio::test]
+async fn a_link_end_during_shutdown_does_not_wait_again() {
+    let mut f = fixture().await;
+    let a = AgentId::from("a-stuck-link-end");
+    crate::executor::scripts::hold_reaps_for_test(&a);
+    f.scripts
+        .start(
+            &f.link,
+            GEN,
+            Some(checkout(&f)),
+            start(&a, "p1", "sleep 60"),
+        )
+        .await;
+    let seen = loop {
+        let event = tokio::time::timeout(wait(), f.head.events.recv())
+            .await
+            .expect("timed out waiting for scriptStarted")
+            .expect("link closed");
+        if let LinkEvent::Frame(LinkFrame::ScriptStarted(s)) = event {
+            break s;
+        }
+    };
+    assert_eq!(seen.spawn_id, "p1");
+    f.scripts.stop_all().await;
+    // A bound well under one reap wait: waiting again would overrun it.
+    let bound = reap_wait() / 4;
+    tokio::time::timeout(bound, f.scripts.stop_binding(GEN))
+        .await
+        .expect("the link's end waited again for a process stop_all gave up on");
+}

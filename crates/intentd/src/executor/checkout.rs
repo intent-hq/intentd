@@ -195,6 +195,9 @@ pub(super) struct PlainCheckouts {
     pub(super) fail_pin: std::sync::atomic::AtomicBool,
     /// The notice the next checkout reports.
     pub(super) notice: std::sync::Mutex<Option<String>>,
+    /// Every push waits here first, so a test can hold pushes until a
+    /// number of them are under way together.
+    pub(super) push_gate: Option<Arc<tokio::sync::Barrier>>,
     /// Holds the next sweep removal: signals the first sender when it
     /// starts and waits for the receiver.
     pub(super) hold_sweep: std::sync::Mutex<
@@ -219,8 +222,19 @@ impl PlainCheckouts {
             hold_push: std::sync::Mutex::default(),
             panic_push: std::sync::atomic::AtomicBool::new(false),
             notice: std::sync::Mutex::default(),
+            push_gate: None,
             hold_sweep: std::sync::Mutex::default(),
         })
+    }
+
+    /// Checkouts whose every push first waits at `gate`.
+    pub(super) fn with_push_gate(
+        storage: Arc<Storage>,
+        gate: Arc<tokio::sync::Barrier>,
+    ) -> Arc<Self> {
+        let mut checkouts = Arc::into_inner(Self::new(storage)).expect("just created");
+        checkouts.push_gate = Some(gate);
+        Arc::new(checkouts)
     }
 }
 
@@ -274,6 +288,9 @@ impl Checkouts for PlainCheckouts {
                     .swap(false, std::sync::atomic::Ordering::SeqCst),
                 "test: the push panicked"
             );
+            if let Some(gate) = &self.push_gate {
+                gate.wait().await;
+            }
             ensure!(
                 !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the push"
