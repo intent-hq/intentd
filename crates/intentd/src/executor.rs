@@ -72,10 +72,29 @@ pub(crate) trait MachineReport: Send + Sync {
     fn reconcile(&self);
 }
 
-/// Whether a settings change touches the enabled providers, which the
-/// capabilities report follows.
-pub(crate) fn enabled_providers_changed(change: &intent_services::SettingsChanged) -> bool {
-    change.changed.contains("providers.enabled")
+/// The machine's `providers.enabled` as the capabilities report last
+/// followed it. The loop compares values rather than reading a settings
+/// change's paths: the settings watch keeps only the newest change, and a
+/// change seen while the loop could not act must still be reported.
+pub(crate) struct EnabledWatch(Option<std::collections::BTreeMap<String, bool>>);
+
+impl EnabledWatch {
+    pub(crate) fn new(current: Option<std::collections::BTreeMap<String, bool>>) -> Self {
+        Self(current)
+    }
+
+    /// Whether `current` differs from what the report last followed; if so,
+    /// it is what the report follows from now on.
+    pub(crate) fn take_change(
+        &mut self,
+        current: Option<std::collections::BTreeMap<String, bool>>,
+    ) -> bool {
+        if current == self.0 {
+            return false;
+        }
+        self.0 = current;
+        true
+    }
 }
 
 /// The cached provider list against `enabled_now` (every enabled provider
@@ -1065,22 +1084,23 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
         let report = Arc::downgrade(&report);
         let active_credentials = service.deps.active_credentials.clone();
         let service = Arc::downgrade(&service);
-        let mut settings = parts.settings.subscribe();
+        let registry = parts.settings.clone();
+        let mut settings = registry.subscribe();
+        let enabled_now = move || registry.snapshot().effective.providers.enabled.clone();
+        let mut enabled = EnabledWatch::new(enabled_now());
         async move {
             let mut tick = tokio::time::interval(REPORT_POLL);
             let mut last = None;
             let mut watching = true;
             loop {
-                let enabled_changed = tokio::select! {
-                    _ = tick.tick() => false,
-                    changed = settings.changed(), if watching => match changed {
-                        Ok(()) => enabled_providers_changed(&settings.borrow_and_update()),
-                        Err(_) => {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    changed = settings.changed(), if watching => {
+                        if changed.is_err() {
                             watching = false;
-                            false
                         }
-                    },
-                };
+                    }
+                }
                 let Some(report) = report.upgrade() else {
                     return;
                 };
@@ -1091,6 +1111,7 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
                         continue;
                     }
                 };
+                let enabled_changed = enabled.take_change(enabled_now());
                 let now = std::time::Instant::now();
                 if enabled_changed {
                     match service.upgrade() {

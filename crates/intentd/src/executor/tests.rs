@@ -1997,20 +1997,32 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
     node.stop().await;
 }
 
-/// Only a change of `providers.enabled` re-reports; other settings do not.
+/// The report follows the enabled set by value: a change is reported once,
+/// however many settings notices it arrived in (or none, when a newer
+/// notice replaced it), and changing back before the loop acts reports
+/// nothing.
 #[test]
-fn only_an_enabled_providers_change_re_reports() {
-    let changed = |paths: &[&str]| intent_services::SettingsChanged {
-        generation: 1,
-        changed: paths.iter().map(|p| (*p).to_owned()).collect(),
+fn an_enabled_set_change_is_taken_once_by_value() {
+    let set = |pairs: &[(&str, bool)]| {
+        Some(
+            pairs
+                .iter()
+                .map(|(id, on)| ((*id).to_owned(), *on))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
     };
-    assert!(enabled_providers_changed(&changed(&["providers.enabled"])));
-    assert!(enabled_providers_changed(&changed(&[
-        "model.default",
-        "providers.enabled"
-    ])));
-    assert!(!enabled_providers_changed(&changed(&["providers.paths"])));
-    assert!(!enabled_providers_changed(&changed(&[])));
+    let mut watch = EnabledWatch::new(None);
+    assert!(!watch.take_change(None), "unchanged");
+    assert!(
+        watch.take_change(set(&[("codex", false)])),
+        "disabled codex"
+    );
+    assert!(
+        !watch.take_change(set(&[("codex", false)])),
+        "already taken"
+    );
+    assert!(watch.take_change(set(&[("codex", true)])), "enabled again");
+    assert!(watch.take_change(None), "back to the default");
 }
 
 fn observed(id: &str, status: ProviderStatus, models: &[&str]) -> ProviderCapability {

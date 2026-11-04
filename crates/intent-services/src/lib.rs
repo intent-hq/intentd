@@ -335,10 +335,8 @@ pub use settings::{
     migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
     tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
-pub(crate) use settings_registry::KNOWN_PATHS;
-pub use settings_registry::{
-    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy,
-};
+pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
+pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
 /// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
