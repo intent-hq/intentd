@@ -4004,7 +4004,7 @@ impl AgentManager {
         } else {
             None
         };
-        let mut spawned = if let Some(cli) =
+        let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
             // A named profile resolves before account lookup; the spawn layer
@@ -4039,8 +4039,7 @@ impl AgentManager {
             spawn_provider(&spawn_opts, hooks)
         }
         .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
-        let agent_tmp_dir = spawned.take_agent_tmp_dir();
-        let (child, connection, npx_launch_dir) = spawned.into_parts();
+        let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
         // (a respawn installed a newer child with its own watcher).

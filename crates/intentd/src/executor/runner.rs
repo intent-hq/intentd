@@ -1203,10 +1203,14 @@ impl Runner {
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
-        let (child, connection, npx_launch_dir) = spawned.into_parts();
+        let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the
         // agent is gone.
         *lock(&agent.npx_launch_dir) = npx_launch_dir;
+        // Remote agents set no `agent_tmp_root`, so no private temp folder
+        // was created for this launch.
+        debug_assert!(agent_tmp_dir.is_none());
+        drop(agent_tmp_dir);
         let connection = Arc::new(connection);
         let handler = ClientRequestHandler::new(
             agent.workspace_id.clone(),

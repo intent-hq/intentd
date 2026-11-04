@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Name prefix of the per-daemon root (`<prefix><8 hex>` in the OS temp dir).
+/// Name prefix of the per-daemon root (`<prefix><16 hex>` in the OS temp dir).
 pub const AGENT_TMP_ROOT_PREFIX: &str = "intentd-tmp-";
 
 /// Name prefix of one launch's folder under the root (`<prefix><12 hex>`).
@@ -41,8 +41,8 @@ pub fn agent_tmp_root(data_dir: &Path) -> PathBuf {
 #[must_use]
 pub fn agent_tmp_root_in(temp_base: &Path, data_dir: &Path) -> PathBuf {
     temp_base.join(format!(
-        "{AGENT_TMP_ROOT_PREFIX}{:08x}",
-        fold32(fnv1a64(data_dir.as_os_str().as_encoded_bytes()))
+        "{AGENT_TMP_ROOT_PREFIX}{:016x}",
+        fnv1a64(data_dir.as_os_str().as_encoded_bytes())
     ))
 }
 
@@ -57,9 +57,17 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-#[expect(clippy::cast_possible_truncation)] // folding to 32 bits is the point
-fn fold32(hash: u64) -> u32 {
-    (hash ^ (hash >> 32)) as u32
+/// Create one directory (parent must exist), owner-only (`0700`) on Unix.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
 }
 
 /// Create `root` owner-only, or confirm an existing one is a real directory
@@ -74,13 +82,7 @@ fn fold32(hash: u64) -> u32 {
 /// `PermissionDenied` / `InvalidInput` error when an existing entry is a
 /// symlink, not a directory, or owned by another user.
 pub fn prepare_agent_tmp_root(root: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(root) {
+    match create_private_dir(root) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
@@ -112,22 +114,36 @@ pub fn prepare_agent_tmp_root(root: &Path) -> std::io::Result<()> {
 
 /// Remove everything under `root` (crash recovery at daemon startup, before
 /// any agent spawns). A missing root is a no-op; a root that fails
-/// [`prepare_agent_tmp_root`]'s ownership check is left untouched.
+/// [`prepare_agent_tmp_root`]'s ownership check is left untouched. An entry
+/// that cannot be removed (say, a file an agent created with `sudo`) is
+/// logged and skipped so it does not shield the entries after it; the next
+/// startup retries it.
 ///
 /// # Errors
 ///
-/// Returns the first I/O error from validating, listing or removing entries.
+/// Returns the I/O error from validating or listing `root`.
 pub fn sweep_agent_tmp_root(root: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(root).is_err() {
         return Ok(());
     }
     prepare_agent_tmp_root(root)?;
     for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                tracing::warn!(root = %root.display(), error = %e, "agent temp sweep: unreadable entry");
+                continue;
+            }
+        };
+        let removed = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = removed {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e, "agent temp sweep: entry not removed");
+            }
         }
     }
     Ok(())
@@ -151,13 +167,7 @@ impl AgentTempDir {
     pub fn create(root: &Path) -> std::io::Result<Self> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let path = root.join(format!("{AGENT_TMP_DIR_PREFIX}{}", &id[..12]));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&path)?;
+        create_private_dir(&path)?;
         Ok(Self { path })
     }
 
@@ -208,7 +218,7 @@ mod tests {
         assert_ne!(a, agent_tmp_root_in(base, Path::new("/data/two")));
         let name = a.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(AGENT_TMP_ROOT_PREFIX), "{name}");
-        assert_eq!(name.len(), AGENT_TMP_ROOT_PREFIX.len() + 8, "{name}");
+        assert_eq!(name.len(), AGENT_TMP_ROOT_PREFIX.len() + 16, "{name}");
     }
 
     /// Pinned so an accidental hash change (which would orphan every
@@ -269,6 +279,39 @@ mod tests {
         sweep_agent_tmp_root(&root).unwrap();
         assert!(!leaked_path.exists());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    /// An entry the sweep cannot remove (a read-only folder holding a file,
+    /// like one an agent made with `sudo`) does not shield the entries after
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_skips_unremovable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let stuck = root.join("a-stuck");
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("f"), "x").unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        for i in 0..4 {
+            let dir = root.join(format!("a-leftover{i}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("f"), "x").unwrap();
+        }
+        sweep_agent_tmp_root(&root).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            left.iter().all(|p| *p == stuck),
+            "only the unremovable entry may remain: {left:?}"
+        );
+        if stuck.exists() {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     #[test]

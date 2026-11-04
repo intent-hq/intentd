@@ -871,18 +871,24 @@ impl SpawnedAgent {
         kill_result.and(wait_result)
     }
 
-    /// Move out the launch's private temp folder (see
-    /// [`SpawnOptions::agent_tmp_root`]); call before [`Self::into_parts`].
-    /// The folder is removed when dropped, so the caller keeps it until the
-    /// child's process tree is gone. Dropped with `self` when never taken.
-    pub fn take_agent_tmp_dir(&mut self) -> Option<AgentTempDir> {
-        self.agent_tmp_dir.take()
-    }
-
-    /// Decompose into the child, connection and npx launch dir (e.g. to store
-    /// separately). The launch dir must be kept alive as long as the child.
-    pub fn into_parts(self) -> (Child, Connection, Option<NpxLaunchDir>) {
-        (self.child, self.connection, self.npx_launch_dir)
+    /// Decompose into the child, connection, npx launch dir and private temp
+    /// folder (see [`SpawnOptions::agent_tmp_root`]), e.g. to store them
+    /// separately. Both directories are removed when dropped, so keep them
+    /// alive as long as the child's process tree.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Child,
+        Connection,
+        Option<NpxLaunchDir>,
+        Option<AgentTempDir>,
+    ) {
+        (
+            self.child,
+            self.connection,
+            self.npx_launch_dir,
+            self.agent_tmp_dir,
+        )
     }
 }
 
@@ -2628,7 +2634,7 @@ mod agent_tmp_tests {
         let mut dirs = Vec::new();
         for (_, out) in &launches {
             let mut report = None;
-            for _ in 0..500 {
+            for _ in 0..3000 {
                 if let Ok(text) = std::fs::read_to_string(out) {
                     report = Some(text);
                     break;
