@@ -603,6 +603,9 @@ mod tests_suggested_prompts_contract;
 #[cfg(test)]
 mod tests_proposal_origin;
 
+#[cfg(test)]
+mod tests_unattended_resume;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -20623,6 +20626,43 @@ impl Drop for StartupResumeCandidates {
 }
 
 impl Services {
+    /// Why an unattended resume (the startup sweep, including the forced
+    /// sweep after an update restart, and the wake sweep) must leave
+    /// `agent_id` pending instead of re-running it: its provider is disabled
+    /// in `providers.enabled`, or its sign-in probe reports signed out.
+    /// Re-running such an agent can only fail again, and the failure wakes
+    /// its parent with a stale alert about work it may already have replaced
+    /// (intent-hq/intent#8478). The probe runs when no fresh verdict is
+    /// cached, because the cache is empty right after a restart.
+    ///
+    /// `None` lets the resume proceed: an unknown sign-in, a remote agent
+    /// (its provider runs on another machine), an unresolvable provider and
+    /// a failed session read all stay permissive. A manual resume never
+    /// consults this; it runs and surfaces the provider error to the user.
+    pub(crate) async fn unattended_resume_hold(&self, agent_id: &AgentId) -> Option<String> {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        let settings = self.effective_settings();
+        let provider = crate::agent_session::resolve_provider_id(
+            session.provider.as_deref(),
+            crate::agent_session::derived_default_provider(&settings).as_deref(),
+        )?;
+        if provider_is_disabled(&provider, settings.providers.enabled.as_ref()) {
+            let display = intent_providers::provider_config(&provider).display_name;
+            return Some(format!(
+                "provider \"{provider}\" ({display}) is not enabled"
+            ));
+        }
+        if self.probe_selection_sign_in(&provider).await == Some(false) {
+            return Some(crate::provider_auth::not_authenticated_message(&provider));
+        }
+        None
+    }
+
     /// Resume one reserved startup candidate, then expose and notify failures.
     /// The notification invalidates the recovery list; it does not declare a
     /// terminal agent failure or drive completion watches.
@@ -20634,6 +20674,12 @@ impl Services {
         candidates: &StartupResumeCandidates,
         agent_id: &AgentId,
     ) -> Result<()> {
+        if let Some(reason) = self.unattended_resume_hold(agent_id).await {
+            candidates.finished(agent_id);
+            return Err(Error::InvalidParams(format!(
+                "left pending for manual resume: {reason}"
+            )));
+        }
         let result = self.resume_interrupted_agent(agent_id).await;
         candidates.finished(agent_id);
         if result.is_err() {
@@ -20759,6 +20805,14 @@ impl Services {
                     );
                     continue;
                 }
+            }
+            if let Some(reason) = self.unattended_resume_hold(&agent_id).await {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    reason,
+                    "wake-resume: provider cannot run; leaving pending for manual retry"
+                );
+                continue;
             }
             match self.resume_interrupted_agent(&agent_id).await {
                 Ok(()) => {

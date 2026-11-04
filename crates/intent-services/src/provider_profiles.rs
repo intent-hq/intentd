@@ -2078,6 +2078,39 @@ impl Services {
         })
     }
 
+    /// The sign-in of a selection's saved settings, probing when no fresh
+    /// verdict is cached (the [`Self::selection_auth_verdict`] counterpart
+    /// for callers that must decide right after a restart, when the cache is
+    /// empty). `Some(false)` only on an explicit signed-out probe outcome;
+    /// `None` when the provider has no probe, is not installed, the probe is
+    /// inconclusive, or the overlay cannot be resolved. A probe-less
+    /// provider is never reported signed out.
+    pub(crate) async fn probe_selection_sign_in(&self, selection: &str) -> Option<bool> {
+        let base = intent_providers::find_provider_or_legacy_alias(
+            intent_providers::base_provider_id(selection),
+        )?
+        .id;
+        let override_path = self.effective_settings().providers.paths.get(base).cloned();
+        if may_have_overlay(selection) {
+            match Box::pin(self.resolve_profile_env(selection)).await {
+                Ok(Some(overlay)) => {
+                    let entry = crate::provider_auth::profile_auth_status(
+                        Arc::new(overlay),
+                        false,
+                        override_path,
+                    )
+                    .await;
+                    return entry.get("authenticated").and_then(Value::as_bool);
+                }
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        crate::provider_auth::default_sign_in(base, override_path)
+            .await
+            .signed_in
+    }
+
     /// `host.providerAuthStatus` rows for Default configurations with saved
     /// overrides: each is probed with its overlay and cached under its
     /// reference plus fingerprint (never the base verdict). An unresolvable
