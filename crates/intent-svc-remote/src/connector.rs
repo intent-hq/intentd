@@ -184,8 +184,9 @@ pub struct NodeStatus {
 /// Where a stopped agent's exit record is, while it matters to a relaunch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopExit {
-    /// The stop is not acknowledged and no exit record was ingested yet.
-    Pending,
+    /// The stop is not acknowledged and no exit record was ingested yet;
+    /// `sent` once a stop frame for it went out (on any link).
+    Pending { sent: bool },
     /// An exit record was ingested before the acknowledgement.
     Seen,
     /// Acknowledged as `stopped` with no exit record ingested yet: the
@@ -607,13 +608,6 @@ impl Shared {
         lock(&self.stops).contains_key(agent_id)
     }
 
-    /// Whether `agent_id` has an unacknowledged final stop.
-    pub(crate) fn final_stop_queued(&self, agent_id: &AgentId) -> bool {
-        lock(&self.stops)
-            .get(agent_id)
-            .is_some_and(|queued| queued.final_stop)
-    }
-
     /// Stop `stop_id` of `agent_id` is acknowledged: it leaves the queue.
     /// An ack never confirms another stop of the same agent.
     fn confirm_stop(&self, agent_id: &AgentId, stop_id: StopId) {
@@ -659,6 +653,7 @@ impl Shared {
     async fn send_queued(&self, link: &NodeLink) {
         let speaks_final = self.speaks_final_stops();
         for (agent_id, queued) in self.queued_stops() {
+            self.stop_exit_sending(&agent_id);
             if link
                 .send(&LinkFrame::Stop {
                     agent_id,
@@ -706,6 +701,7 @@ impl Shared {
             .filter(|_| !link.is_closed())
         {
             let final_stop = queued.final_stop && self.speaks_final_stops();
+            let resent = self.stop_exit_sending(&agent_id);
             match link
                 .stop_with(agent_id.clone(), stop_id, final_stop, delays.next_delay())
                 .await
@@ -723,7 +719,7 @@ impl Shared {
                     // Only this stop's own ack settles its exit: one
                     // replaced meanwhile (by a final stop) leaves it alone.
                     if self.queued(&agent_id, stop_id).is_some() {
-                        self.stop_exit_acked(&agent_id, acked.outcome);
+                        self.stop_exit_acked(&agent_id, acked.outcome, resent);
                     }
                     self.confirm_stop(&agent_id, stop_id);
                 }
@@ -827,7 +823,17 @@ impl Shared {
     fn watch_stop_exit(&self, agent_id: &AgentId) {
         lock(&self.stop_exits)
             .entry(agent_id.clone())
-            .or_insert(StopExit::Pending);
+            .or_insert(StopExit::Pending { sent: false });
+    }
+
+    /// A stop frame for `agent_id` is going out. Whether one went out
+    /// before: if so, a `not-running` ack may answer an agent the earlier
+    /// frame already stopped, whose exit record is still on its way.
+    fn stop_exit_sending(&self, agent_id: &AgentId) -> bool {
+        match lock(&self.stop_exits).get_mut(agent_id) {
+            Some(StopExit::Pending { sent }) => std::mem::replace(sent, true),
+            _ => false,
+        }
     }
 
     /// The agent `record` reports exited, if it is an exit record.
@@ -845,7 +851,7 @@ impl Shared {
         };
         let mut exits = lock(&self.stop_exits);
         match exits.get(&agent_id) {
-            Some(StopExit::Pending) => {
+            Some(StopExit::Pending { .. }) => {
                 exits.insert(agent_id, StopExit::Seen);
             }
             Some(StopExit::Owed) => {
@@ -857,13 +863,17 @@ impl Shared {
         }
     }
 
-    /// The machine acknowledged `agent_id`'s stop with `outcome`. A
-    /// `stopped` agent's exit record was journaled before the ack, but it
-    /// may still be on its way: owed until ingested. Otherwise nothing is
-    /// owed.
-    fn stop_exit_acked(&self, agent_id: &AgentId, outcome: StopOutcome) {
+    /// The machine acknowledged `agent_id`'s stop with `outcome`, answering
+    /// a resend when `resent`. A `stopped` agent's exit record was
+    /// journaled before the ack, but it may still be on its way: owed until
+    /// ingested. A resend answered `not-running` may find the agent the
+    /// earlier frame stopped still exiting (the machine answers
+    /// `not-running` until its exit is journaled), so its record is owed
+    /// too. A first stop answered `not-running` owes nothing.
+    fn stop_exit_acked(&self, agent_id: &AgentId, outcome: StopOutcome, resent: bool) {
+        let owed = outcome == StopOutcome::Stopped || resent;
         let mut exits = lock(&self.stop_exits);
-        if outcome == StopOutcome::Stopped && exits.get(agent_id) == Some(&StopExit::Pending) {
+        if owed && matches!(exits.get(agent_id), Some(StopExit::Pending { .. })) {
             exits.insert(agent_id.clone(), StopExit::Owed);
         } else if exits.get(agent_id) != Some(&StopExit::Owed) {
             exits.remove(agent_id);
@@ -1317,7 +1327,11 @@ impl RemoteNode {
     /// `node-link-unavailable` when no link comes up within the grace.
     pub async fn launch(&self, command: LaunchCommand) -> Result<Arc<RemoteAgentRuntime>> {
         let parked = lock(&self.shared.parked).remove(&command.agent_id);
-        if let Some(runtime) = parked.filter(|runtime| runtime.is_running()) {
+        // A parked runtime is the stopping process's while a stop for it is
+        // queued: the relaunch waits for that stop below instead.
+        if let Some(runtime) = parked
+            .filter(|runtime| runtime.is_running() && !self.shared.stop_queued(&command.agent_id))
+        {
             return Ok(runtime);
         }
         // Never launch behind this agent's unacknowledged stop: a resend of
@@ -1791,7 +1805,7 @@ pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bo
 /// stop held in memory, with a new id; one whose session has ended
 /// (retired, deleted or completed) gets a recorded final stop; one with a
 /// recorded final stop already has it queued. Each is resent until
-/// acknowledged, and none is parked. One head knows but has not attached
+/// acknowledged, and none is parked; nor is one with a plain stop queued. One head knows but has not attached
 /// since it started gets a runtime, kept until the agent manager takes it,
 /// so its output is not dropped.
 ///
@@ -1847,7 +1861,10 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
                 continue;
             }
         }
-        if shared.final_stop_queued(agent_id) {
+        // An agent with a queued stop is being stopped: parking a runtime
+        // for it would hand a relaunch a runtime that the stopped process's
+        // exit then ends (intent-hq/intent#8457).
+        if shared.stop_queued(agent_id) {
             continue;
         }
         let Some(record) = records.get(agent_id) else {
