@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # `make lint-workflows`: actionlint over .github/workflows, including the
-# ShellCheck pass over `run:` scripts. CI's pr-static job runs it on every PR.
+# ShellCheck pass over `run:` scripts. CI's release-scripts job runs it on every
+# PR, in the merge queue and on main.
 #
 # Workflow YAML has no type system we control, and nothing checked it here:
 # main's ci.yml alone carried 15 shellcheck findings, so a reviewer changing a

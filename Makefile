@@ -11,7 +11,7 @@
 # The local targets need neither cargo nor the monorepo: test-release-scripts
 # runs the scripts/test-* commands of ci.yml's release-scripts job, skipping
 # suites that need CI-only tooling (scripts/release-scripts-local.py), and
-# lint-workflows runs the pinned actionlint like ci.yml's pr-static job.
+# lint-workflows runs the pinned actionlint like ci.yml's release-scripts job.
 
 MONOREPO_ROOT := ../..
 FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows check-macos lint-sources
@@ -38,7 +38,7 @@ help:
 	@echo "  test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"
 	@echo "    that need CI-only tooling (exit 1 only on a real failure)."
 	@echo "  lint-workflows — run the pinned actionlint with shellcheck over .github/workflows,"
-	@echo "    as ci.yml's pr-static job does (needs actionlint + shellcheck)."
+	@echo "    as ci.yml's release-scripts job does (needs actionlint + shellcheck)."
 
 test-release-scripts:
 	python3 scripts/release-scripts-local.py

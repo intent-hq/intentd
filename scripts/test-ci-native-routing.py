@@ -41,6 +41,16 @@ WINDOWS_LINT_JOBS = {"windows-cross-lint"}
 # ejecting it from the queue (intentd#3002). PR-only: the queue's native
 # `Clippy (target-gated code)` step in `build` stays the final authority.
 MACOS_LINT_JOBS = {"macos-cross-lint"}
+# actionlint + shellcheck over .github/workflows run in release-scripts, which
+# CI Gate requires on PRs and in the merge queue: the queue lints the merged
+# tree, so a PR whose CI predated a workflow edit, or two queued PRs that each
+# edit workflows, cannot land an unlinted tree on main (intentd#3036 merged
+# ahead of #3039, which added the lint, that way).
+WORKFLOW_LINT_JOB = "release-scripts"
+WORKFLOW_LINT_STEPS = (
+    "REQUIRE_ACTIONLINT=1 ./scripts/test-lint-workflows.sh",
+    "make lint-workflows",
+)
 REQUIRED = {
     "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | MACOS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_LINT_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
@@ -310,6 +320,28 @@ def gate_errors(workflow):
                     errors.append(f"{event}: {name}={result}")
     errors.extend(fast_path_gate_errors(workflow, expected))
     errors.extend(release_push_gate_errors(workflow, expected))
+    return errors
+
+
+def workflow_lint_errors(workflow):
+    """The workflow lint runs, unconditionally, in one job that PRs and the queue require."""
+    errors = []
+    job = workflow["jobs"][WORKFLOW_LINT_JOB]
+    for event in ("pull_request", "merge_group"):
+        if WORKFLOW_LINT_JOB not in REQUIRED[event]:
+            errors.append(f"{event}: CI Gate must require {WORKFLOW_LINT_JOB}")
+        if scheduled(workflow, event)[WORKFLOW_LINT_JOB] != "success":
+            errors.append(f"{event}: {WORKFLOW_LINT_JOB} does not run")
+    commands = [step.get("run", "") for step in job["steps"]]
+    if [c for c in commands if c in WORKFLOW_LINT_STEPS] != list(WORKFLOW_LINT_STEPS):
+        errors.append(f"{WORKFLOW_LINT_JOB}: must run {list(WORKFLOW_LINT_STEPS)} in order")
+    if job.get("continue-on-error") or any(step.get("continue-on-error") or step.get("if")
+                                           for step in job["steps"] if step.get("run") in WORKFLOW_LINT_STEPS):
+        errors.append(f"{WORKFLOW_LINT_JOB}: the lint steps must be unconditional and fatal")
+    # One job runs the lint, so a run never pays for it twice.
+    for name, other in workflow["jobs"].items():
+        if name != WORKFLOW_LINT_JOB and "lint-workflows" in "\n".join(s.get("run", "") for s in other.get("steps", [])):
+            errors.append(f"{name}: lint-workflows belongs only in {WORKFLOW_LINT_JOB}")
     return errors
 
 
@@ -1807,6 +1839,34 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertEqual(self.workflow["jobs"]["cache-smoke"]["uses"], "./.github/workflows/cache-smoke.yml")
         release = yaml.safe_load((ROOT / ".github/workflows/v-release.yml").read_text())
         self.assertIn("github.event_name != 'pull_request'", release["jobs"]["build-local-artifacts"]["if"])
+
+    def test_workflow_lint_runs_on_prs_and_queue_on_a_free_runner(self):
+        self.assertEqual(workflow_lint_errors(self.workflow), [])
+        # The ShellCheck fallback needs sudo, so the job keeps its free
+        # standard runner and never takes a self-hosted slot.
+        result = run_route(self.workflow, org=[small_slot()] * 3, eventName="merge_group")
+        self.assertEqual(json.loads(result["outputs"]["slots"])[WORKFLOW_LINT_JOB], ["ubuntu-24.04"])
+
+    def test_mutations_cannot_drop_the_queue_workflow_lint(self):
+        def drop_lint(workflow):
+            job = workflow["jobs"][WORKFLOW_LINT_JOB]
+            job["steps"] = [s for s in job["steps"] if s.get("run") != "make lint-workflows"]
+
+        def skip_self_test(workflow):
+            step = next(s for s in workflow["jobs"][WORKFLOW_LINT_JOB]["steps"] if s.get("run") == WORKFLOW_LINT_STEPS[0])
+            step["if"] = "github.event_name == 'pull_request'"
+
+        def pr_only(workflow):
+            workflow["jobs"][WORKFLOW_LINT_JOB]["if"] = "github.event_name == 'pull_request'"
+
+        def duplicated(workflow):
+            workflow["jobs"]["pr-static"]["steps"].append({"run": "make lint-workflows"})
+
+        for mutate in (drop_lint, skip_self_test, pr_only, duplicated):
+            with self.subTest(mutation=mutate.__name__):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow)
+                self.assertTrue(workflow_lint_errors(workflow))
 
     def test_pr_static_does_not_compile_or_install_application_dependencies(self):
         job = self.workflow["jobs"]["pr-static"]
