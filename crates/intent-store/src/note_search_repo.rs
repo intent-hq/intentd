@@ -39,8 +39,8 @@ pub struct NoteFtsCursor {
 }
 
 /// Strictly-after test for [`NoteFtsCursor`] over the ranked columns,
-/// matching the ORDER BY. Binds: rank, rank, updated_at, updated_at,
-/// workspace_id, workspace_id, note_id.
+/// matching the ORDER BY. Binds: rank, rank, `updated_at`, `updated_at`,
+/// `workspace_id`, `workspace_id`, `note_id`.
 const AFTER_CURSOR: &str = "(adjusted_rank > ? OR (adjusted_rank = ? AND (updated_at < ? \
      OR (updated_at = ? AND (workspace_id > ? OR (workspace_id = ? AND note_id > ?))))))";
 
