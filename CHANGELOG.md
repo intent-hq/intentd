@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.123] - 2026-11-04
+
+### 📚 Documentation
+
+- *(assistant-guide)* Mention the web build's experimental notice ([#3019](https://github.com/intent-hq/intentd/pull/3019))
+
+
 ## [0.11.122] - 2026-11-04
 
 ### 🚀 Features
