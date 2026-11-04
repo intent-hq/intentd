@@ -2230,3 +2230,44 @@ async fn node_runner_shutdown_rebounds_an_exit_push_in_flight() {
         &[WIP_PUSH_TIMEOUT, FINAL_PUSH_TIMEOUT]
     );
 }
+
+/// A turn-end push that starts while a final stop is still stopping the
+/// agent's scripts (its flag set, the agent still running) gives way when
+/// the daemon then stops too: the exit push starts at once instead of
+/// queueing behind a bounded turn-end push (intent-hq/intent#8437).
+#[tokio::test]
+async fn node_runner_shutdown_cancels_a_turn_end_push_during_a_final_stop() {
+    use crate::executor::checkout::FINAL_PUSH_TIMEOUT;
+    let Some(h) = harness(1, &[]) else { return };
+    let id = AgentId::from("a1");
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "started", started("a1")).await;
+    // The final stop's script-stop phase: its flag is set and the agent
+    // still runs.
+    // (No reference to the agent is kept: its journal pump ends when the
+    // last one is dropped.)
+    lock(&h.runner.inner.state)
+        .agents
+        .get(&id)
+        .unwrap()
+        .final_stop
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    // Never released: only the shutdown can end this push.
+    let (_release, release_rx) = tokio::sync::oneshot::channel::<()>();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    h.runner.prompt(&id, "t1".into(), text("hello")).await;
+    tokio::time::timeout(wait(), entered)
+        .await
+        .unwrap()
+        .unwrap();
+
+    tokio::time::timeout(wait(), h.runner.shutdown())
+        .await
+        .expect("shutdown waited on the turn-end push of a final stop");
+    assert_eq!(
+        h.checkouts.push_timeouts.lock().unwrap().as_slice(),
+        &[FINAL_PUSH_TIMEOUT, FINAL_PUSH_TIMEOUT],
+        "the turn-end push gave way and the exit push ran"
+    );
+}

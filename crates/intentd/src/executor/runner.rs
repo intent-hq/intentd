@@ -1411,18 +1411,24 @@ impl Runner {
                 .checkouts
                 .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout)
         };
-        let pushed = if final_stop || closing {
+        let pushed = if kind == Push::Exit && (final_stop || closing) {
             // The agent's last push here, bounded like a final stop's.
             push(FINAL_PUSH_TIMEOUT).await
         } else {
-            // An ordinary push (up to `WIP_PUSH_TIMEOUT`) would hold the
-            // lock past the shutdown budget, so shutdown cancels it. Head's
-            // ref update is atomic: its refs are left old or whole.
-            let ordinary = tokio::select! {
-                pushed = push(WIP_PUSH_TIMEOUT) => Some(pushed),
+            // Any other push gives way to shutdown: an ordinary one (up to
+            // `WIP_PUSH_TIMEOUT`), or a turn's end during a final stop's
+            // script stop, would hold the lock past the shutdown budget.
+            // Head's ref update is atomic: its refs are left old or whole.
+            let timeout = if final_stop {
+                FINAL_PUSH_TIMEOUT
+            } else {
+                WIP_PUSH_TIMEOUT
+            };
+            let raced = tokio::select! {
+                pushed = push(timeout) => Some(pushed),
                 Ok(_) = shutting_down.wait_for(|closing| *closing) => None,
             };
-            match (ordinary, kind) {
+            match (raced, kind) {
                 (Some(pushed), _) => pushed,
                 // An exit push is the last one: send it again, bounded.
                 (None, Push::Exit) => push(FINAL_PUSH_TIMEOUT).await,
