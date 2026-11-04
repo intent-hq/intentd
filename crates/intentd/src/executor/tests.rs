@@ -1961,13 +1961,6 @@ async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
 #[tokio::test]
 async fn an_enabled_providers_change_pushes_the_report_unasked() {
     use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let node = Running::start(dir.path(), 3).await;
-    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
-        .await
-        .unwrap();
-    replay_complete(&mut dialed).await;
-
     async fn pushed(dialed: &mut DialedLink) -> Vec<String> {
         loop {
             match next_frame(dialed).await {
@@ -1979,6 +1972,13 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
             }
         }
     }
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
 
     node.report.mock_enabled.store(false, Ordering::SeqCst);
     node.service.enabled_providers_changed().await;
