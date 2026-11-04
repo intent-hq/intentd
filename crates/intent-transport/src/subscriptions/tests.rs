@@ -2272,7 +2272,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         })
         .collect();
     // Live turn: 400 capped tool_result blocks ≈ 800KB after slimming —
-    // alone over the 512KB budget.
+    // alone over the page budget.
     let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES);
     let live_blocks: Vec<Value> = (0..400)
         .map(|i| {
@@ -2442,7 +2442,7 @@ fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
         for live_bytes in [200 * 1024, 600 * 1024] {
             let messages: Vec<Value> = (0..5)
             .map(|seq| json!({ "id": format!("m-{seq}"), "seq": seq,
-                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(90 * 1024) }] }))
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(80 * 1024) }] }))
             .collect();
             let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
             "truncated": false, "nextToken": null });
