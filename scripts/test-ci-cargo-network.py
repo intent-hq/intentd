@@ -22,7 +22,7 @@ RELEASE_PLZ = ROOT / '.github/workflows/release-plz.yml'
 FETCH_RUN = 'python3 -I -B scripts/fetch-locked-crates.py'
 NETWORK_ENV = {'CARGO_HTTP_MULTIPLEXING': 'false', 'CARGO_NET_RETRY': '10'}
 # PR-reachable jobs that build the workspace; each fetches before its first build.
-FETCH_JOBS = ('check', 'windows-cross-lint', 'coverage-changed')
+FETCH_JOBS = ('check', 'windows-cross-lint', 'macos-cross-lint', 'coverage-changed')
 TOOLCHAIN = 'dtolnay/rust-toolchain@'
 
 

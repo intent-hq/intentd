@@ -36,15 +36,20 @@ RUNTIME = {"deb-packaging", "release-scripts", "pi-session-paths"}
 # requested on pull_request or merge_group.
 WINDOWS_JOBS = {"windows", "install-ps1"}
 WINDOWS_LINT_JOBS = {"windows-cross-lint"}
+# PRs also lint the macOS target on Linux (a stub C compiler stands in for
+# the darwin SDK), so a macOS-only Clippy error fails the PR instead of
+# ejecting it from the queue (intentd#3002). PR-only: the queue's native
+# `Clippy (target-gated code)` step in `build` stays the final authority.
+MACOS_LINT_JOBS = {"macos-cross-lint"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
+    "pull_request": ALWAYS_REQUIRED | WINDOWS_LINT_JOBS | MACOS_LINT_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_LINT_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
 PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
-FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
+FAST_PATH_SKIPS = {"check", "windows-cross-lint", "macos-cross-lint", "coverage-changed"}
 # Main pushes skip the Windows post-merge job and the paid macOS build when
 # release-fast-path reports release_push=true (a tree auto-cut-alpha just
 # required green plus release metadata; see
@@ -76,6 +81,12 @@ WINDOWS_LINT_STEPS = {
     "Check (Windows GNU production configuration)": "cargo check --workspace --target x86_64-pc-windows-gnu",
     "Clippy (Windows GNU target)": "cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
 }
+# The macOS lint, in order, in the PR-only `macos-cross-lint` job.
+MACOS_LINT_STEPS = {
+    "Check (macOS production configuration)": "cargo check --workspace --target aarch64-apple-darwin",
+    "Clippy (macOS target)": "cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings",
+}
+MACOS_LINT_STUB = "${{ github.workspace }}/scripts/macos-lint-cc.sh"
 # Every Windows runtime proof, in order, in the push-only `windows` job.
 WINDOWS_STEPS = {
     "Headless workspace setup (Windows runtime)": None,
@@ -525,6 +536,48 @@ def cross_lint_errors(workflow):
     return errors
 
 
+def macos_cross_lint_errors(workflow):
+    """The macOS lint: required on PRs only, on Linux, through the stub compiler, every step in order."""
+    name = "macos-cross-lint"
+    job = workflow["jobs"].get(name)
+    if not job:
+        return [f"{name}: missing PR job"]
+    errors = []
+    if job.get("continue-on-error") or "strategy" in job:
+        errors.append(f"{name}: job must stay required")
+    runs_on = str(job.get("runs-on", ""))
+    if "macos" in runs_on.lower() or "needs.route.outputs.cloud" not in runs_on:
+        errors.append(f"{name}: must run on route's cloud Linux runner")
+    env = job.get("env", {})
+    for var in ("CC_aarch64_apple_darwin", "CXX_aarch64_apple_darwin"):
+        if env.get(var) != MACOS_LINT_STUB:
+            errors.append(f"{name}: {var} must be the stub compiler")
+    for event in REQUIRED:
+        for fork in (False, True):
+            route = scheduled(workflow, event, fork=fork)["route"]
+            runs = condition(job["if"], {**context(event, fork=fork), "needs.route.result": route},
+                             success=route == "success")
+            if runs != (event == "pull_request" and not fork):
+                errors.append(f"{name}: wrong selection for {event}/fork={fork}")
+    steps = job["steps"]
+    found = [step.get("name") for step in steps if step.get("name") in MACOS_LINT_STEPS]
+    if found != list(MACOS_LINT_STEPS):
+        errors.append(f"{name}: lint steps missing or reordered {found}")
+    for lint, command in MACOS_LINT_STEPS.items():
+        step = next((s for s in steps if s.get("name") == lint), None)
+        if not step or step.get("run") != command or step.get("continue-on-error") or "if" in step or step.get("env"):
+            errors.append(f"{lint}: missing required macOS lint in {name}")
+    toolchain = next((s for s in steps if str(s.get("uses", "")).startswith("dtolnay/rust-toolchain@")), {})
+    if toolchain.get("with", {}).get("targets") != "aarch64-apple-darwin" or "clippy" not in str(
+            toolchain.get("with", {}).get("components", "")):
+        errors.append(f"{name}: toolchain must add the darwin target and clippy")
+    tests = workflow["jobs"]["release-scripts"]["steps"]
+    if not any(step.get("run") == "./scripts/test-macos-lint-cc.sh" and not step.get("if")
+               and not step.get("continue-on-error") for step in tests):
+        errors.append(f"{name}: the stub compiler suite must run in release-scripts")
+    return errors
+
+
 def windows_job_errors(workflow, name, event, proofs):
     """One routed Windows job: required, runs only on `event`, every proof in order."""
     errors = []
@@ -592,6 +645,7 @@ def native_errors(workflow):
         for event in ("merge_group", "push"):
             if condition(step.get("if", True), context(event, platform="macOS")) != (event == "merge_group"):
                 errors.append(f"{name}: wrong selection for {event}/macOS")
+    errors += macos_cross_lint_errors(workflow)
     lifecycle = steps.get(MACOS_LIFECYCLE_STEP, {})
     if lifecycle.get("run") != "python3 -I -B scripts/test-daemon-lifecycle.py":
         errors.append(f"{MACOS_LIFECYCLE_STEP}: must run the real lifecycle proof")
@@ -1605,6 +1659,8 @@ class NativeRoutingTests(unittest.TestCase):
                 jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "", head_ref=RELEASE_BRANCH)
                 for name in FAST_PATH_SKIPS:
                     expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" else "success"
+                    if event == "merge_group" and name not in REQUIRED["merge_group"]:
+                        expected = "skipped"
                     self.assertEqual(jobs[name], expected, f"{event}/{fast_path}: {name}")
         # A failed or skipped route still skips the slow jobs, and CI Gate
         # rejects that skip on a PR without a reported fast path.
@@ -1634,6 +1690,7 @@ class NativeRoutingTests(unittest.TestCase):
             "optional-check": ('"$slow" check', "optional check"),
             "optional-coverage": ('"$slow" coverage-changed', "optional coverage-changed"),
             "optional-windows-cross-lint": ('"$slow" windows-cross-lint', "optional windows-cross-lint"),
+            "optional-macos-cross-lint": ('"$slow" macos-cross-lint', "optional macos-cross-lint"),
         }
         for label, (old, new) in mutations.items():
             with self.subTest(mutation=label):
@@ -1678,6 +1735,63 @@ class NativeRoutingTests(unittest.TestCase):
             expected = "skipped" if event == "push" else "success"
             self.assertEqual(scheduled(self.workflow, event)["windows-cross-lint"], expected, event)
         self.assertEqual(scheduled(self.workflow, "pull_request", fork=True)["windows-cross-lint"], "skipped")
+
+    def test_macos_cross_lint_runs_on_prs_on_a_cloud_linux_runner(self):
+        # The macOS lint for PRs: the production check and Clippy for
+        # aarch64-apple-darwin, denying warnings, on a Linux runner, with
+        # scripts/macos-lint-cc.sh as the target C compiler. The queue and
+        # main skip it: the queue's native macOS `build` leg lints for real.
+        self.assertEqual(macos_cross_lint_errors(self.workflow), [])
+        job = self.workflow["jobs"]["macos-cross-lint"]
+        commands = [str(step.get("run", "")) for step in job["steps"]]
+        self.assertEqual([run for run in commands if "cargo " in run], list(MACOS_LINT_STEPS.values()))
+        self.assertIn("['gh-linux-8x']", job["runs-on"])
+        self.assertEqual(job["env"]["AR_aarch64_apple_darwin"], "ar")
+        for event in REQUIRED:
+            expected = "success" if event == "pull_request" else "skipped"
+            self.assertEqual(scheduled(self.workflow, event)["macos-cross-lint"], expected, event)
+        self.assertEqual(scheduled(self.workflow, "pull_request", fork=True)["macos-cross-lint"], "skipped")
+        self.assertTrue((ROOT / "scripts/macos-lint-cc.sh").stat().st_mode & 0o111)
+        # The native queue step stays the final authority.
+        build = {step.get("name"): step for step in self.workflow["jobs"]["build"]["steps"]}
+        self.assertTrue(condition(build["Clippy (target-gated code)"]["if"], context("merge_group")))
+
+    def test_mutations_cannot_weaken_the_macos_cross_lint(self):
+        def step(w, name):
+            return next(s for s in w["jobs"]["macos-cross-lint"]["steps"] if s.get("name") == name)
+        cases = {
+            "queue-too": lambda w: w["jobs"]["macos-cross-lint"].__setitem__("if", w["jobs"]["macos-cross-lint"]["if"].replace(
+                "github.event_name == 'pull_request'", "(github.event_name == 'pull_request' || github.event_name == 'merge_group')")),
+            "push": lambda w: w["jobs"]["macos-cross-lint"].__setitem__("if", "github.event_name == 'push'"),
+            "on-macos": lambda w: w["jobs"]["macos-cross-lint"].__setitem__("runs-on", "macos-15"),
+            "optional": lambda w: w["jobs"]["macos-cross-lint"].__setitem__("continue-on-error", True),
+            "real-cc": lambda w: w["jobs"]["macos-cross-lint"]["env"].__setitem__("CC_aarch64_apple_darwin", "clang"),
+            "no-cxx": lambda w: w["jobs"]["macos-cross-lint"]["env"].pop("CXX_aarch64_apple_darwin"),
+            "host-target": lambda w: step(w, "Clippy (macOS target)").__setitem__(
+                "run", "cargo clippy --workspace --all-targets -- -D warnings"),
+            "warnings": lambda w: step(w, "Clippy (macOS target)").__setitem__(
+                "run", "cargo clippy --workspace --all-targets --target aarch64-apple-darwin"),
+            "skip-check": lambda w: step(w, "Check (macOS production configuration)").__setitem__("if", False),
+            "drop-clippy": lambda w: w["jobs"]["macos-cross-lint"]["steps"].remove(step(w, "Clippy (macOS target)")),
+            "no-target": lambda w: next(s for s in w["jobs"]["macos-cross-lint"]["steps"]
+                                        if str(s.get("uses", "")).startswith("dtolnay/"))["with"].__setitem__("targets", ""),
+            "unwired-suite": lambda w: w["jobs"]["release-scripts"]["steps"].remove(next(
+                s for s in w["jobs"]["release-scripts"]["steps"] if s.get("run") == "./scripts/test-macos-lint-cc.sh")),
+            "removed": lambda w: w["jobs"].pop("macos-cross-lint"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(mutation=label):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow)
+                self.assertTrue(macos_cross_lint_errors(workflow))
+
+    def test_gate_requires_macos_cross_lint_on_prs(self):
+        workflow = copy.deepcopy(self.workflow)
+        step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
+        step["run"] = step["run"].replace("${{ needs.macos-cross-lint.result }}", "success")
+        self.assertIn("pull_request: macos-cross-lint=skipped", gate_errors(workflow))
+        workflow["jobs"]["gate"]["needs"].remove("macos-cross-lint")
+        self.assertIn("gate dependencies changed", gate_errors(workflow))
 
     def test_mutation_cannot_drop_gate_dependency(self):
         workflow = copy.deepcopy(self.workflow)
