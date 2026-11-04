@@ -6331,8 +6331,8 @@ impl Services {
             }
         }
         // Specialist alias canonicalization (PROTOCOL §5.11): a `specialist`
-        // naming an alias (e.g. `"coordinator"`) is rewritten to the claiming
-        // specialist's CANONICAL id (`"spec-writer"`) before any downstream
+        // naming a custom alias is rewritten to the claiming
+        // specialist's canonical id before any downstream
         // rung runs, so display-name/model/effort resolution, the prompt
         // snapshot, and the persisted `session.specialist` (surfaced as
         // `metadata.specialist`) all see the canonical id. A directly-known
@@ -6369,7 +6369,7 @@ impl Services {
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
         // name-less `agent.create` / `workspace.create.initialAgent` carrying
-        // a specialist surfaces e.g. "Coordinator" for `spec-writer` instead
+        // a specialist surfaces e.g. "Developer" for `developer` instead
         // of the generic `Agent {6-hex}` fallback. Resolution failure or an
         // unknown specialist never fails the create — the fallback below
         // still applies.
@@ -6651,6 +6651,12 @@ impl Services {
             metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
+            let plain_folder = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .map_err(AgentPersistError::store)?
+                .plain_folder;
             // Both snapshot resolutions below walk the specialist tier
             // directories — blocking pool (monorepo#4148).
             let services = self.clone();
@@ -6658,9 +6664,11 @@ impl Services {
             let wp = snapshot_wp.clone();
             let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
                 (
-                    services
-                        .specialists_service()
-                        .resolve_prompt_injection(&spec_id_owned, wp.as_deref()),
+                    services.specialists_service().resolve_prompt_injection_in(
+                        &spec_id_owned,
+                        wp.as_deref(),
+                        plain_folder,
+                    ),
                     services
                         .specialists_service()
                         .resolve_is_orchestrator(&spec_id_owned, wp.as_deref()),
@@ -8189,12 +8197,9 @@ impl Services {
                     session.specialist = if let Some(spec_id) =
                         update_optional_string(value, "specialist")?
                     {
-                        let wp = self
-                            .store
-                            .get_workspace(&session.workspace_id)
-                            .await
-                            .ok()
-                            .and_then(|w| crate::git_ops::worktree_path(&w));
+                        let workspace = self.store.get_workspace(&session.workspace_id).await.ok();
+                        let plain_folder = workspace.as_ref().is_some_and(|w| w.plain_folder);
+                        let wp = workspace.as_ref().and_then(crate::git_ops::worktree_path);
                         // Canonicalization + the refreshed orchestrator-role
                         // snapshot (`specialistIsOrchestrator`, written at
                         // create, re-resolved here so the session-open
@@ -8215,9 +8220,11 @@ impl Services {
                                     .resolve_display_name(&canonical, wp.as_deref());
                                 let injection = remember_specialist
                                     .then(|| {
-                                        services
-                                            .specialists_service()
-                                            .resolve_prompt_injection(&canonical, wp.as_deref())
+                                        services.specialists_service().resolve_prompt_injection_in(
+                                            &canonical,
+                                            wp.as_deref(),
+                                            plain_folder,
+                                        )
                                     })
                                     .flatten();
                                 Ok((canonical, is_orchestrator, display_name, injection))

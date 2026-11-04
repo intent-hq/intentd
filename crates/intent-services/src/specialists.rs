@@ -216,7 +216,7 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_8;
 
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
@@ -231,6 +231,21 @@ pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V2_5[6],
     EMBEDDED_BUNDLED_V2_5[7],
     EMBEDDED_BUNDLED_V2_5[8],
+];
+
+pub(crate) const EMBEDDED_BUNDLED_V3_8: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_1[0],
+    (
+        "developer",
+        include_str!("../resources/specialists/v3.8/developer.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v3.8/pr-reviewer.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_1[4],
+    EMBEDDED_BUNDLED_V3_1[6],
+    EMBEDDED_BUNDLED_V3_1[8],
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
@@ -500,7 +515,7 @@ const INHERITED_CONFIG_KEYS: &[&str] = &[
 ];
 
 /// Wire/frontmatter values accepted for the `role` enum on write (PROTOCOL
-/// §5.11): `orchestrator` (powers the team-mode card), `internal` (excluded
+/// §5.11): `orchestrator` (team-mode card and restricted editing tools), `internal` (excluded
 /// from the New Workspace modal's single-agent picker only), or the
 /// explicit-clear empty string.
 const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
@@ -1893,7 +1908,51 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<(Option<String>, String, Option<String>)> {
-        let def = self.resolve(id, workspace_path)?;
+        self.resolve_prompt_injection_in(id, workspace_path, false)
+    }
+
+    /// Apply plain-folder doctrine only to the shipped v3.8 prompts. File
+    /// overrides and older session-pinned bundles retain their authored text.
+    pub(crate) fn resolve_prompt_injection_in(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+        plain_folder: bool,
+    ) -> Option<(Option<String>, String, Option<String>)> {
+        let mut def = self.resolve(id, workspace_path)?;
+        if plain_folder && !self.base_replaced && def["source"] == "bundled" {
+            for (candidate, source) in EMBEDDED_BUNDLED_V3_8 {
+                if !matches!(*candidate, "developer" | "pr-reviewer") {
+                    continue;
+                }
+                let (meta, body) = parse_frontmatter(source);
+                if def["id"] != *candidate || def["behaviorPrompt"] != body {
+                    continue;
+                }
+                let body = if *candidate == "developer" {
+                    body.lines()
+                        .filter(|line| {
+                            !line.starts_with("At the start of the conversation, when you've figured out the nature of the task, rename the branch")
+                                && !line.starts_with("- Commit your changes")
+                                && !line.starts_with("- Only open pull requests")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    body.replace(
+                        "PR review specialist conducting a code review for a pull request",
+                        "review specialist reviewing changes in this folder",
+                    )
+                    .replace("PR changes", "changes")
+                    .replace("locations in the PR", "locations in the changes")
+                    .replace("PR Review #[PR_NUMBER]", "Review findings")
+                };
+                def["behaviorPrompt"] = json!(body);
+                if *candidate == "pr-reviewer" && def["name"] == meta["name"] {
+                    def["name"] = json!("Reviewer");
+                }
+            }
+        }
         let behavior_prompt = def
             .get("behaviorPrompt")
             .and_then(Value::as_str)
@@ -2334,16 +2393,28 @@ mod tests {
         assert!(!svc.resolve_is_orchestrator("plain", None));
     }
 
-    /// The bundled orchestrator still resolves as one via its v1.1 `role`
-    /// frontmatter — including through the `coordinator` alias — while the
-    /// bundled internal specialists do not.
     #[test]
-    fn resolve_is_orchestrator_bundled_spec_writer_and_alias() {
+    fn removed_specialists_are_absent_but_historical_bundles_still_resolve() {
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
-        assert!(svc.resolve_is_orchestrator("spec-writer", None));
-        assert!(svc.resolve_is_orchestrator("coordinator", None));
+        for id in [
+            "spec-writer",
+            "coordinator",
+            "lead",
+            "implementor",
+            "verifier",
+        ] {
+            assert!(svc.canonical_id(id, None).is_none(), "{id}");
+            assert!(svc.canonical_id_or_err(id, None).is_err(), "{id}");
+        }
         assert!(!svc.resolve_is_orchestrator("implementor", None));
+        let old = service_over(&dir).with_embedded(EMBEDDED_BUNDLED_V3_1);
+        assert!(old.resolve_is_orchestrator("spec-writer", None));
+        assert!(old.resolve_is_orchestrator("coordinator", None));
+        assert!(old.canonical_id("lead", None).is_none());
+        assert!(svc.resolve("verifier", None).is_none());
+        assert!(old.resolve("verifier", None).is_some());
+        assert!(old.resolve("implementor", None).is_some());
     }
 
     /// Name-based fallback: sessions can carry an orchestrator id without a
@@ -2518,7 +2589,7 @@ mod tests {
     #[test]
     fn bundled_coordinator_alias_resolves_to_spec_writer() {
         let empty = TempSpecialistsDir::new();
-        let svc = service_over(&empty);
+        let svc = service_over(&empty).with_embedded(EMBEDDED_BUNDLED_V3_1);
         assert_eq!(
             svc.canonical_id("coordinator", None).as_deref(),
             Some("spec-writer")
@@ -2538,12 +2609,8 @@ mod tests {
         let empty = TempSpecialistsDir::new();
         let svc = service_over(&empty);
         assert_eq!(
-            svc.canonical_id_or_err("implementor", None).unwrap(),
-            "implementor"
-        );
-        assert_eq!(
-            svc.canonical_id_or_err("coordinator", None).unwrap(),
-            "spec-writer"
+            svc.canonical_id_or_err("developer", None).unwrap(),
+            "developer"
         );
         let err = svc.canonical_id_or_err("nope", None).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
@@ -2631,15 +2698,15 @@ mod tests {
         let user = TempSpecialistsDir::new();
         let replacement = TempSpecialistsDir::new();
         replacement.write(
-            "implementor",
-            "---\nname: \"Replaced Implementor\"\ndescription: \"d\"\n---\n\nreplaced body",
+            "developer",
+            "---\nname: \"Replaced Developer\"\ndescription: \"d\"\n---\n\nreplaced body",
         );
         let svc = SpecialistsService::with_base_replacement(
             Some(user.path.clone()),
             replacement.path.clone(),
         );
-        let def = svc.resolve("implementor", None).expect("resolves");
-        assert_eq!(def["name"], "Replaced Implementor");
+        let def = svc.resolve("developer", None).expect("resolves");
+        assert_eq!(def["name"], "Replaced Developer");
         assert_eq!(def["behaviorPrompt"], "replaced body");
         assert_eq!(def["source"], "bundled");
     }
@@ -2808,6 +2875,45 @@ mod tests {
     }
 
     #[test]
+    fn plain_folder_keeps_git_prompts_and_custom_specialists_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = SpecialistsService::new(
+            Some(dir.path().to_path_buf()),
+            Some(dir.path().join("bundle")),
+        );
+        for id in ["developer", "pr-reviewer"] {
+            let original = svc.resolve_prompt_injection(id, None).unwrap();
+            assert_eq!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, false).unwrap()
+            );
+            assert_ne!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, true).unwrap()
+            );
+            let source = EMBEDDED_BUNDLED_V3_8
+                .iter()
+                .find(|(name, _)| *name == id)
+                .unwrap()
+                .1;
+            std::fs::write(dir.path().join(format!("{id}.md")), source).unwrap();
+            assert_eq!(
+                original,
+                svc.resolve_prompt_injection_in(id, None, true).unwrap()
+            );
+        }
+        let old = SpecialistsService::new(
+            Some(dir.path().join("empty")),
+            Some(dir.path().join("bundle")),
+        )
+        .with_embedded(EMBEDDED_BUNDLED_V3_1);
+        assert_eq!(
+            old.resolve_prompt_injection("developer", None),
+            old.resolve_prompt_injection_in("developer", None, true)
+        );
+    }
+
+    #[test]
     fn resolve_role_reminder_uses_explicit_reminder() {
         let dir = TempSpecialistsDir::new();
         dir.write(
@@ -2847,11 +2953,7 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The nine latest specialist ids embedded via `include_str!` (PP-2).
-    const LATEST_EMBEDDED_IDS: [&str; 9] = [
-        "spec-writer",
-        "implementor",
-        "verifier",
+    const LATEST_EMBEDDED_IDS: [&str; 6] = [
         "developer",
         "chief-of-staff",
         "ralph",
@@ -2861,7 +2963,7 @@ mod tests {
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_nine_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
         // get()/resolve_agent_type()/resolve_role_reminder(). Ralph is the one
         // retired id intentionally omitted from list().
@@ -2880,7 +2982,11 @@ mod tests {
         }
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        assert_eq!(specs.len(), 8, "Ralph is excluded from the catalog");
+        assert_eq!(
+            specs.len(),
+            LATEST_EMBEDDED_IDS.len() - 1,
+            "Ralph is excluded from the catalog"
+        );
         for id in LATEST_EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
         }
@@ -2906,10 +3012,16 @@ mod tests {
         assert_eq!(name, "Ralph");
         assert!(reminder.starts_with("You are Ralph."));
 
-        // Implementor also declares an explicit roleReminder.
-        let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
-        assert_eq!(name, "Implementor");
-        assert!(reminder.starts_with("Stay within task scope."));
+        // Developer also declares an explicit roleReminder.
+        let (name, reminder) = svc.resolve_role_reminder("developer", None).unwrap();
+        assert_eq!(name, "Developer");
+        assert!(!reminder.is_empty());
+        assert_eq!(
+            reminder,
+            svc.get("developer", None).unwrap()["specialist"]["roleReminder"]
+                .as_str()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2991,64 +3103,17 @@ mod tests {
     fn user_file_overrides_embedded_bundled() {
         let dir = TempSpecialistsDir::new();
         dir.write(
-            "implementor",
-            "---\nname: \"Custom Implementor\"\ndescription: \"d\"\n---\n\nCustom body",
+            "developer",
+            "---\nname: \"Custom Developer\"\ndescription: \"d\"\n---\n\nCustom body",
         );
         let svc = service_over(&dir);
-        let got = svc.get("implementor", None).unwrap();
+        let got = svc.get("developer", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
-        assert_eq!(got["specialist"]["name"], "Custom Implementor");
+        assert_eq!(got["specialist"]["name"], "Custom Developer");
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
+        let imp = specs.iter().find(|s| s["id"] == "developer").unwrap();
         assert_eq!(imp["source"], "user", "user tier wins in list too");
-    }
-
-    /// Rot-check regression test: the bundled `verifier.md` prompt must instruct
-    /// the verifier to mark verified tasks complete with `update_note_task_status`
-    /// and explain the completion policy (only APPROVED tasks, DEVIATION/MISSING
-    /// stay in `review_required`). This prevents future prompt rewrites from
-    /// silently dropping the workflow instruction and leaving tasks stuck in
-    /// `review_required`.
-    #[test]
-    fn verifier_prompt_mentions_update_note_task_status_and_marking_complete() {
-        let dir = TempSpecialistsDir::new();
-        let svc = service_over(&dir);
-        let got = svc
-            .get("verifier", None)
-            .expect("embedded verifier resolves");
-        let body = got["specialist"]["behaviorPrompt"]
-            .as_str()
-            .expect("prompt body");
-
-        // Assert the prompt contains the `update_note_task_status` tool.
-        assert!(
-            body.contains("update_note_task_status"),
-            "verifier.md must mention update_note_task_status tool"
-        );
-
-        // Assert the prompt uses object-style call syntax with placeholder noteId value.
-        assert!(
-            body.contains(
-                r#"update_note_task_status({ noteId: "<task-note-id>", status: "complete" })"#
-            ),
-            "verifier.md must show complete object-style call with placeholder noteId"
-        );
-
-        // Assert the prompt instructs marking verified tasks complete with the exact phrase.
-        assert!(
-            body.contains("mark each verified task note `complete`"),
-            "verifier.md must instruct marking verified tasks complete"
-        );
-
-        // Assert the prompt specifies the APPROVED → complete policy and that
-        // tasks with DEVIATION/MISSING stay in review_required.
-        assert!(
-            (body.contains("APPROVED") || body.contains("✅ APPROVED"))
-                && (body.contains("DEVIATION") || body.contains("⚠️ DEVIATION"))
-                && (body.contains("MISSING") || body.contains("❌ MISSING")),
-            "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
-        );
     }
 
     #[test]
@@ -3058,13 +3123,13 @@ mod tests {
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         bundled.write(
-            "verifier",
-            "---\nname: \"Patched Verifier\"\ndescription: \"d\"\n---\n\nPatched body",
+            "developer",
+            "---\nname: \"Patched Developer\"\ndescription: \"d\"\n---\n\nPatched body",
         );
         let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
-        let got = svc.get("verifier", None).unwrap();
+        let got = svc.get("developer", None).unwrap();
         assert_eq!(got["specialist"]["source"], "bundled");
-        assert_eq!(got["specialist"]["name"], "Patched Verifier");
+        assert_eq!(got["specialist"]["name"], "Patched Developer");
         assert_eq!(got["specialist"]["prompt"], "Patched body");
     }
 
@@ -3213,8 +3278,8 @@ mod tests {
         );
         // Over a visible lower tier the unrecognized value does not hide.
         user.write(
-            "implementor",
-            "---\nname: \"Implementor\"\ndescription: \"d\"\nhidden: on\n---\n\nbody",
+            "developer",
+            "---\nname: \"Developer\"\ndescription: \"d\"\nhidden: on\n---\n\nbody",
         );
         let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
         let got = svc.get("chief-of-staff", None).unwrap();
@@ -3222,7 +3287,7 @@ mod tests {
             got["specialist"]["hidden"], true,
             "hidden: yes inherits the embedded floor's hidden: true"
         );
-        let got = svc.get("implementor", None).unwrap();
+        let got = svc.get("developer", None).unwrap();
         assert!(
             got["specialist"].get("hidden").is_none(),
             "hidden: on inherits the embedded floor's not-hidden"
@@ -4262,23 +4327,9 @@ mod tests {
 
     #[test]
     fn embedded_bundle_carries_picker_metadata() {
-        // The latest embedded bundle resolves the picker-metadata fields:
-        // spec-writer is the orchestrator with its advisory roster,
-        // implementor/verifier are internal, and every def carries an icon.
+        // Every retained definition carries an icon.
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
-        let sw = svc.get("spec-writer", None).unwrap();
-        assert_eq!(sw["specialist"]["role"], "orchestrator");
-        assert_eq!(
-            sw["specialist"]["teamAgents"],
-            json!(["implementor", "verifier"])
-        );
-        assert_eq!(sw["specialist"]["icon"], "coordinator");
-        for id in ["implementor", "verifier"] {
-            let got = svc.get(id, None).unwrap();
-            assert_eq!(got["specialist"]["role"], "internal", "{id}");
-            assert_eq!(got["specialist"]["icon"], id, "{id}");
-        }
         for id in LATEST_EMBEDDED_IDS {
             let got = svc.get(id, None).unwrap();
             assert!(

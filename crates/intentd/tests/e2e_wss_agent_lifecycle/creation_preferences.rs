@@ -61,7 +61,7 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
     )
     .await;
     assert_eq!(read, json!({"jsonrpc":"2.0","id":1,"result":{}}));
-    let created = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":first,"specialistId":"coordinator","rememberSpecialist":true,"provider":"mock","model":"default"})).await;
+    let created = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":first,"specialistId":"ui-designer","rememberSpecialist":true,"provider":"mock","model":"default"})).await;
     let id = created["agent"]["id"].as_str().unwrap();
     assert_eq!(
         wss_rpc(
@@ -71,7 +71,7 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
             json!({"workspaceId":first})
         )
         .await,
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
     assert_eq!(
         wss_rpc(
@@ -100,11 +100,11 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
             json!({"workspaceId":first})
         )
         .await,
-        json!({"specialistId":"spec-writer"})
+        json!({"specialistId":"ui-designer"})
     );
-    let updated = wss_rpc(&mut rpc, 8, "agent.update", json!({"agentId":id,"workspaceId":first,"changes":{"specialist":"implementor","rememberSpecialist":true}})).await;
+    let updated = wss_rpc(&mut rpc, 8, "agent.update", json!({"agentId":id,"workspaceId":first,"changes":{"specialist":"developer","rememberSpecialist":true}})).await;
     assert_eq!(updated["success"], true);
-    assert_eq!(updated["agent"]["name"], "Implementor");
+    assert_eq!(updated["agent"]["name"], "Developer");
     assert_eq!(updated["agent"]["nameExplicitlySet"], false);
     wss_rpc(
         &mut rpc,
@@ -135,7 +135,7 @@ async fn creation_preferences_survive_restart_and_rejected_requests_over_wss() {
             json!({"workspaceId":first})
         )
         .await,
-        json!({"jsonrpc":"2.0","id":11,"result":{"specialistId":"implementor"}})
+        json!({"jsonrpc":"2.0","id":11,"result":{"specialistId":"developer"}})
     );
     assert_eq!(
         wss_rpc(
@@ -202,9 +202,9 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
     .await;
     assert!(subscribed["subscriptionId"].is_string());
     for (name, explicit, remember, specialist) in [
-        (Some("Implementor"), Some(false), true, Some("implementor")),
-        (Some("My initial task"), None, true, Some("implementor")),
-        (Some("Legacy custom"), None, false, Some("implementor")),
+        (Some("Developer"), Some(false), true, Some("developer")),
+        (Some("My initial task"), None, true, Some("developer")),
+        (Some("Legacy custom"), None, false, Some("developer")),
         (Some("Agent"), Some(false), true, None),
         (None, Some(false), true, None),
     ] {
@@ -320,12 +320,12 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
                 "agent.update",
                 json!({
                     "workspaceId":ws,"agentId":agent_id,
-                    "changes":{"specialist":"implementor","rememberSpecialist":true}
+                    "changes":{"specialist":"developer","rememberSpecialist":true}
                 }),
             )
             .await;
             assert_eq!(
-                updated["agent"]["name"], "Implementor",
+                updated["agent"]["name"], "Developer",
                 "welcome selection recognizes the daemon-generated General name"
             );
             assert_eq!(
@@ -336,7 +336,7 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
                     json!({"workspaceId":ws})
                 )
                 .await,
-                json!({"specialistId":"implementor"})
+                json!({"specialistId":"developer"})
             );
         }
     }
@@ -404,6 +404,16 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
     .await;
     assert!(subscribed["subscriptionId"].is_string());
 
+    let specialist = wss_rpc(&mut rpc, 39, "specialist.get", json!({"id":"developer"})).await;
+    let reminder = specialist["specialist"]["roleReminder"]
+        .as_str()
+        .expect("bundled reminder");
+    let body = specialist["specialist"]["prompt"]
+        .as_str()
+        .expect("bundled prompt");
+    assert!(!reminder.is_empty());
+    assert!(!body.is_empty());
+
     for custom in [false, true] {
         let created = wss_rpc(
             &mut rpc,
@@ -420,13 +430,13 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
         }
         let created = wss_rpc(&mut rpc, 41, "agent.create", params).await;
         let id = &created["agent"]["id"];
-        let updated = wss_rpc(&mut rpc, 42, "agent.update", json!({"workspaceId":ws,"agentId":id,"changes":{"specialist":"implementor","rememberSpecialist":true}})).await;
+        let updated = wss_rpc(&mut rpc, 42, "agent.update", json!({"workspaceId":ws,"agentId":id,"changes":{"specialist":"developer","rememberSpecialist":true}})).await;
         assert_eq!(
             updated["agent"]["name"],
             if custom {
                 "Custom task name"
             } else {
-                "Implementor"
+                "Developer"
             }
         );
         let content = format!("Welcome instruction first turn custom={custom}");
@@ -467,11 +477,11 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
             .find(|text| text.contains(&content))
             .unwrap();
         assert!(
-            text.contains("Stay within task scope. No refactors, no scope creep."),
+            text.contains(reminder),
             "missing specialist reminder: {text}"
         );
         assert_eq!(
-            text.contains("Implement your assigned task"),
+            text.contains(body),
             !custom,
             "specialist body precedence: {text}"
         );

@@ -99,6 +99,10 @@ async fn delegate_with_no_explicit_model_resolves_configured_default_provider() 
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
     assert_eq!(
+        got.metadata.specialist, None,
+        "omitted specialist creates a general agent"
+    );
+    assert_eq!(
         got.provider.as_deref(),
         Some("mock"),
         "configured default provider persisted on the delegated session, not left unset/Auggie"

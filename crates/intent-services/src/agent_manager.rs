@@ -20043,16 +20043,16 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn specialist_placeholder_naming_instruction_covers_titles_and_providers() {
-        for name in ["Implementor", "Implementor 2", "Implementor 12"] {
+        for name in ["Developer", "Developer 2", "Developer 12"] {
             for title in ["", "Existing workspace title"] {
                 for (provider, tool) in [
                     ("auggie", "workspace_api_workspace-mcp"),
                     ("opencode", "workspace-mcp_workspace_api"),
                     ("codex", "workspace_api"),
                 ] {
-                    let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+                    let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
                     let workspace_id = WorkspaceId::from("ws-1");
-                    configure_agent_name(&mgr, &agent_id, name, false, Some("implementor")).await;
+                    configure_agent_name(&mgr, &agent_id, name, false, Some("developer")).await;
                     set_workspace_title(&mgr, &workspace_id, title).await;
                     let mut session = mgr
                         .services
@@ -20089,11 +20089,11 @@ mod role_reminder_tests {
     async fn explicit_and_task_names_do_not_receive_agent_naming_instruction() {
         for (name, explicitly_set, specialist) in [
             ("User Choice", true, None),
-            ("Implementor", true, Some("implementor")),
-            ("Implementor 2", true, Some("implementor")),
-            ("Fix the sidebar", false, Some("implementor")),
-            ("Implementor for authentication", false, Some("implementor")),
-            ("Implementor 0", false, Some("implementor")),
+            ("Developer", true, Some("developer")),
+            ("Developer 2", true, Some("developer")),
+            ("Fix the sidebar", false, Some("developer")),
+            ("Developer for authentication", false, Some("developer")),
+            ("Developer 0", false, Some("developer")),
             ("Fix the sidebar", false, None),
         ] {
             let (mgr, agent_id, _db) = manager_with(specialist, None).await;
@@ -20177,8 +20177,8 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn agent_naming_instruction_is_first_turn_only() {
-        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
-        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Developer", false, Some("developer")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         let first = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
@@ -20213,8 +20213,8 @@ mod role_reminder_tests {
     /// content, so naming still fires.
     #[tokio::test]
     async fn first_turn_naming_check_does_not_read_the_transcript() {
-        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
-        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Developer", false, Some("developer")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         mgr.services
             .store
@@ -20251,10 +20251,10 @@ mod role_reminder_tests {
     /// hydrates the whole transcript, and fails on an undecodable row.
     #[tokio::test]
     async fn role_reminder_does_not_read_the_transcript() {
-        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
         assert!(
             mgr.services.agent_role_reminder(&agent_id).await.is_some(),
-            "fixture: the implementor specialist has a role reminder"
+            "fixture: the developer specialist has a role reminder"
         );
         mgr.services
             .store
@@ -20291,8 +20291,8 @@ mod role_reminder_tests {
     /// the full-transcript check this probe replaced).
     #[tokio::test]
     async fn first_turn_naming_follows_transcript_truncation() {
-        let (mgr, agent_id, _db) = manager_with(Some("implementor"), None).await;
-        configure_agent_name(&mgr, &agent_id, "Implementor", false, Some("implementor")).await;
+        let (mgr, agent_id, _db) = manager_with(Some("developer"), None).await;
+        configure_agent_name(&mgr, &agent_id, "Developer", false, Some("developer")).await;
         let workspace_id = WorkspaceId::from("ws-1");
         let store = &mgr.services.store;
         let text = |t: &str| serde_json::json!([{ "type": "text", "text": t }]);

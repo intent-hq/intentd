@@ -6108,7 +6108,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             ws.clone(),
             Some("Spec".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -6122,7 +6122,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     let v = serde_json::to_value(&lite).unwrap();
     // Nested metadata object (iOS `parseAgent` reads metadata.specialist /
     // isBackground / createdByAgentId).
-    assert_eq!(v["metadata"]["specialist"], "implementor");
+    assert_eq!(v["metadata"]["specialist"], "developer");
     assert_eq!(v["metadata"]["isBackground"], false);
     assert!(v["metadata"].get("createdByAgentId").is_none());
     // Activity flags are present; an idle agent (no worker, no watches) reports
@@ -10504,7 +10504,7 @@ async fn worst_case_agent_list_row(
         "m".repeat(NAME_CAP)
     ));
     s.reasoning_effort = Some("medium".into());
-    s.specialist = Some("implementor".into());
+    s.specialist = Some("developer".into());
     s.task_note_id = Some(intent_core::NoteId::from(
         "1d8c1e09-41fb-4b83-834a-781d012e2707",
     ));
@@ -33217,7 +33217,7 @@ async fn agent_get_session_projects_full_session_shape() {
             ws.clone(),
             Some("Full".into()),
             Some("auggie:sonnet4.5".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -33240,7 +33240,7 @@ async fn agent_get_session_projects_full_session_shape() {
         .expect("getSession");
     assert_eq!(session.id, id);
     assert_eq!(session.name, "Full");
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     assert_eq!(
         session.system_prompt.as_deref(),
         Some("you are a helpful agent")
@@ -34485,7 +34485,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
             ws.clone(),
             Some("prev".into()),
             Some("gpt-4".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -34546,7 +34546,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     assert_eq!(md["contextReferences"][0]["id"], "note-1");
     assert_eq!(md["skipAutoCommit"], true);
     // Specialist was inherited from the previous (now-deleted) session.
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     // Depth defaults to `0` when neither caller nor explicit depth was given.
     assert_eq!(md["delegationDepth"], 0);
     assert!(!md["taskNoteId"].as_str().unwrap().is_empty());
@@ -34565,7 +34565,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -34586,7 +34586,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
         .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
-    prev_session.specialist = Some("retired-specialist".into());
+    prev_session.specialist = Some("implementor".into());
     prev_session.status = intent_core::AgentStatus::Deleted;
     prev_session.updated_at = intent_core::now_iso();
     svc.store()
@@ -34629,7 +34629,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -34656,7 +34656,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
 
     let input = AgentWakeOrCreateInput {
         create: Some(intent_core::AgentWakeCreateOptions {
-            specialist: Some("verifier".into()),
+            specialist: Some("developer".into()),
             ..Default::default()
         }),
         ..Default::default()
@@ -34674,7 +34674,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
         .expect("load new session");
     assert_eq!(
         session.specialist.as_deref(),
-        Some("verifier"),
+        Some("developer"),
         "stale inherited id falls back to the validated create.specialist"
     );
 }
@@ -34694,7 +34694,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -38498,7 +38498,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
             ws.clone(),
             Some("prev".into()),
             Some("gpt-4".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -38546,7 +38546,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
         .get_agent_session_with_transcript(&AgentId::from(new_id.as_str()))
         .await
         .expect("new session");
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     // The poisoned id is stripped from the task's assigned_agent_ids.
     let note = svc.get_note(ws, note_id).await.expect("note");
     let task = note.metadata.task.expect("task");
@@ -47674,14 +47674,14 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
                     BatchTaskEntry::Id(plain.clone()),
                     BatchTaskEntry::Options(BatchTaskOptions {
                         task_note_id: custom.clone(),
-                        specialist: Some("verifier".into()),
+                        specialist: Some("developer".into()),
                         model: Some("mock:override".into()),
                         provider: None,
                         reasoning_effort: Some("high".into()),
                         agent_instructions: None,
                     }),
                 ]),
-                specialist: Some("implementor".into()),
+                specialist: Some("developer".into()),
                 model: Some("mock:default".into()),
                 ..Default::default()
             },
@@ -47706,7 +47706,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
         .get_agent_session_with_transcript(&AgentId::from(rp["agentId"].as_str().unwrap()))
         .await
         .expect("plain session");
-    assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(plain_session.specialist.as_deref(), Some("developer"));
     // Compound input ids are split on read: bare model + provider column.
     assert_eq!(plain_session.model.as_deref(), Some("default"));
     assert_eq!(plain_session.provider.as_deref(), Some("mock"));
@@ -47718,7 +47718,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
         .get_agent_session_with_transcript(&AgentId::from(rc["agentId"].as_str().unwrap()))
         .await
         .expect("custom session");
-    assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
+    assert_eq!(custom_session.specialist.as_deref(), Some("developer"));
     assert_eq!(custom_session.model.as_deref(), Some("override"));
     assert_eq!(custom_session.provider.as_deref(), Some("mock"));
     assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));
@@ -48671,7 +48671,7 @@ mod resume_tail_recap {
             user("what board formats exist?"),
             assistant("Here are the formats..."),
             user("build a simple local webapp that surfaces the board"),
-            interrupted_assistant("Delegating board webapp — Plan: an implementor builds..."),
+            interrupted_assistant("Delegating board webapp — Plan: an developer builds..."),
         ];
         let recap = build_resume_tail_recap(&messages).expect("recap");
         assert!(recap

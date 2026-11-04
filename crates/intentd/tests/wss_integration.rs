@@ -9701,7 +9701,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","name":"WSS Wide","#,
-            r#""model":"sonnet4.5","provider":"auggie","specialistId":"implementor","#,
+            r#""model":"sonnet4.5","provider":"auggie","specialistId":"developer","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
             r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
@@ -9728,7 +9728,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(created["model"].as_str(), Some("sonnet4.5"));
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
-    assert_eq!(created["metadata"]["specialist"], "implementor");
+    assert_eq!(created["metadata"]["specialist"], "developer");
     assert_eq!(
         created["metadata"]["isBackground"], true,
         "isBackground must persist and be served on the projection: {}",

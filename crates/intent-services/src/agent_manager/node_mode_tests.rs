@@ -24,7 +24,7 @@ async fn node_mode_refuses_the_local_agent_front_doors() {
             AgentId::from("agent-node"),
             WorkspaceId::from("ws-node"),
             "Local agent",
-            "implementor",
+            "developer",
             dir.path().to_path_buf(),
             &opts,
         )
