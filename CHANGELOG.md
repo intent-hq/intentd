@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.127] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Describe the Machines list in the assistant guide and rename the Settings: Devices UI target ([#3032](https://github.com/intent-hq/intentd/pull/3032))
+- *(executor)* Push a fresh capabilities report when enabled providers change ([#3040](https://github.com/intent-hq/intentd/pull/3040))
+
+
 ## [0.11.126] - 2026-11-04
 
 ### 🐛 Bug Fixes
