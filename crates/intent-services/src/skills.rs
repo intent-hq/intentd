@@ -117,21 +117,50 @@ const MAX_REPORTED_COLLISIONS: usize = 1024;
 /// Collisions already reported at warn level, keyed by (name, kept path,
 /// shadowed path). Every skills scan re-detects the same collisions, so
 /// warning on each one flooded the daemon log (intent-hq/intent#8480).
-static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<HashSet<(String, String, String)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+#[derive(Default)]
+struct ReportedCollisions {
+    seen: HashSet<(String, String, String)>,
+    cap_reported: bool,
+}
 
-/// Whether this collision is new to this daemon run: `true` the first time a
-/// (name, kept, shadowed) triple is seen, `false` on every later scan and
-/// once [`MAX_REPORTED_COLLISIONS`] distinct triples have been reported.
-fn first_collision_report(name: &str, kept: &str, shadowed: &str) -> bool {
-    let mut reported = REPORTED_COLLISIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (name.to_owned(), kept.to_owned(), shadowed.to_owned());
-    if reported.contains(&key) || reported.len() >= MAX_REPORTED_COLLISIONS {
-        return false;
+/// How a detected collision should be logged.
+#[derive(Debug, PartialEq, Eq)]
+enum CollisionReport {
+    /// First sighting this daemon run: warn.
+    New,
+    /// Already warned about (or the set is full): debug only.
+    Repeat,
+    /// The set just filled up: warn once that later new collisions are
+    /// logged at debug, so the cut-off is never silent.
+    CapReached,
+}
+
+impl ReportedCollisions {
+    fn record(&mut self, key: (String, String, String)) -> CollisionReport {
+        if self.seen.contains(&key) {
+            return CollisionReport::Repeat;
+        }
+        if self.seen.len() >= MAX_REPORTED_COLLISIONS {
+            if self.cap_reported {
+                return CollisionReport::Repeat;
+            }
+            self.cap_reported = true;
+            return CollisionReport::CapReached;
+        }
+        self.seen.insert(key);
+        CollisionReport::New
     }
-    reported.insert(key)
+}
+
+static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<ReportedCollisions>> =
+    std::sync::LazyLock::new(|| Mutex::new(ReportedCollisions::default()));
+
+fn record_collision(name: &str, kept: &str, shadowed: &str) -> CollisionReport {
+    let key = (name.to_owned(), kept.to_owned(), shadowed.to_owned());
+    REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(key)
 }
 
 /// Public API: discover skills for a workspace
@@ -428,20 +457,27 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                     } else {
                         (&existing.metadata.location, &parsed.metadata.location)
                     };
-                    if first_collision_report(&name, kept, shadowed) {
-                        tracing::warn!(
+                    match record_collision(&name, kept, shadowed) {
+                        CollisionReport::New => tracing::warn!(
                             name = %name,
                             kept = %kept,
                             shadowed = %shadowed,
                             "Skill name collision detected, keeping higher-precedence skill"
-                        );
-                    } else {
-                        tracing::debug!(
+                        ),
+                        CollisionReport::CapReached => tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            limit = MAX_REPORTED_COLLISIONS,
+                            "Skill name collision detected; reported-collision limit reached, \
+                             further new collisions are logged at debug"
+                        ),
+                        CollisionReport::Repeat => tracing::debug!(
                             name = %name,
                             kept = %kept,
                             shadowed = %shadowed,
                             "Skill name collision (already reported)"
-                        );
+                        ),
                     }
                 }
 
@@ -1345,21 +1381,40 @@ mod tests {
         assert!(reported[0].contains("Skill name collision detected"));
     }
 
+    /// Exercises a local set, not the process-wide one, so it cannot hide the
+    /// first warning from `skill_collision_warns_once_across_scans` when tests
+    /// share a process.
     #[test]
-    fn first_collision_report_dedupes_and_is_bounded() {
-        let name = format!("bounded-{}", std::process::id());
-        assert!(first_collision_report(&name, "/kept", "/shadowed"));
-        assert!(!first_collision_report(&name, "/kept", "/shadowed"));
-        assert!(
-            first_collision_report(&name, "/kept", "/other-shadowed"),
+    fn reported_collisions_dedupe_and_warn_once_at_the_cap() {
+        let key = |n: &str, s: &str| (n.to_owned(), "/kept".to_owned(), s.to_owned());
+        let mut reported = ReportedCollisions::default();
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::New);
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::Repeat);
+        assert_eq!(
+            reported.record(key("a", "/other")),
+            CollisionReport::New,
             "a different shadowed path is a new collision"
         );
-        for i in 0..MAX_REPORTED_COLLISIONS {
-            first_collision_report(&format!("{name}-fill-{i}"), "/k", "/s");
+        for i in reported.seen.len()..MAX_REPORTED_COLLISIONS {
+            assert_eq!(
+                reported.record(key(&format!("fill-{i}"), "/s")),
+                CollisionReport::New
+            );
         }
-        assert!(
-            !first_collision_report(&format!("{name}-past-cap"), "/k", "/s"),
-            "past the cap new collisions stay at debug"
+        assert_eq!(
+            reported.record(key("past-cap", "/s")),
+            CollisionReport::CapReached,
+            "the first collision past the cap says so at warn"
+        );
+        assert_eq!(
+            reported.record(key("past-cap-2", "/s")),
+            CollisionReport::Repeat,
+            "later new collisions stay at debug"
+        );
+        assert_eq!(
+            reported.record(key("a", "/s")),
+            CollisionReport::Repeat,
+            "known collisions stay at debug past the cap"
         );
     }
 
