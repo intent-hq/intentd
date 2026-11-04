@@ -110,6 +110,59 @@ static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> 
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static SKILL_IO_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// Upper bound on remembered collisions, so a pathological skill tree cannot
+/// grow the set without limit. Past it, new collisions log at debug.
+const MAX_REPORTED_COLLISIONS: usize = 1024;
+
+/// Collisions already reported at warn level, keyed by (name, kept path,
+/// shadowed path). Every skills scan re-detects the same collisions, so
+/// warning on each one flooded the daemon log (intent-hq/intent#8480).
+#[derive(Default)]
+struct ReportedCollisions {
+    seen: HashSet<(String, String, String)>,
+    cap_reported: bool,
+}
+
+/// How a detected collision should be logged.
+#[derive(Debug, PartialEq, Eq)]
+enum CollisionReport {
+    /// First sighting this daemon run: warn.
+    New,
+    /// Already warned about (or the set is full): debug only.
+    Repeat,
+    /// The set just filled up: warn once that later new collisions are
+    /// logged at debug, so the cut-off is never silent.
+    CapReached,
+}
+
+impl ReportedCollisions {
+    fn record(&mut self, key: (String, String, String)) -> CollisionReport {
+        if self.seen.contains(&key) {
+            return CollisionReport::Repeat;
+        }
+        if self.seen.len() >= MAX_REPORTED_COLLISIONS {
+            if self.cap_reported {
+                return CollisionReport::Repeat;
+            }
+            self.cap_reported = true;
+            return CollisionReport::CapReached;
+        }
+        self.seen.insert(key);
+        CollisionReport::New
+    }
+}
+
+static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<ReportedCollisions>> =
+    std::sync::LazyLock::new(|| Mutex::new(ReportedCollisions::default()));
+
+fn record_collision(name: &str, kept: &str, shadowed: &str) -> CollisionReport {
+    let key = (name.to_owned(), kept.to_owned(), shadowed.to_owned());
+    REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(key)
+}
+
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
     let payload = load_skills_payload(workspace_path).await;
@@ -404,12 +457,28 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                     } else {
                         (&existing.metadata.location, &parsed.metadata.location)
                     };
-                    tracing::warn!(
-                        name = %name,
-                        kept = %kept,
-                        shadowed = %shadowed,
-                        "Skill name collision detected, keeping higher-precedence skill"
-                    );
+                    match record_collision(&name, kept, shadowed) {
+                        CollisionReport::New => tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision detected, keeping higher-precedence skill"
+                        ),
+                        CollisionReport::CapReached => tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            limit = MAX_REPORTED_COLLISIONS,
+                            "Skill name collision detected; reported-collision limit reached, \
+                             further new collisions are logged at debug"
+                        ),
+                        CollisionReport::Repeat => tracing::debug!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision (already reported)"
+                        ),
+                    }
                 }
 
                 if !discovered_by_name.contains_key(&name)
@@ -1270,6 +1339,82 @@ mod tests {
         assert_eq!(
             PathBuf::from(&skills[0].location),
             std::fs::canonicalize(&intent_skill_path).unwrap()
+        );
+    }
+
+    /// intent-hq/intent#8480: every scan re-detects the same collision, so
+    /// the warning is emitted once per daemon run and later scans log at
+    /// debug instead of flooding the daemon log.
+    #[tokio::test]
+    async fn skill_collision_warns_once_across_scans() {
+        clear_cache();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().join("home");
+        let workspace_path = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+        for root in [".augment", ".intent"] {
+            write_skill(
+                &workspace_path.join(root).join("skills"),
+                "noisy-skill",
+                &build_skill_content(
+                    &format!("name: noisy-skill\ndescription: from {root}"),
+                    "Use this skill when needed.",
+                ),
+            )
+            .await;
+        }
+
+        let warnings = crate::test_tracing::Warnings::default();
+        let _guard = warnings.install();
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        for _ in 0..3 {
+            let payload = scan_skills_sync(Some(&workspace), Some(home_dir.clone()));
+            assert_eq!(payload.skills.len(), 1, "the collision still resolves");
+        }
+        let reported = warnings.containing("noisy-skill");
+        assert_eq!(
+            reported.len(),
+            1,
+            "one warning across three scans: {:?}",
+            warnings.all()
+        );
+        assert!(reported[0].contains("Skill name collision detected"));
+    }
+
+    /// Exercises a local set, not the process-wide one, so it cannot hide the
+    /// first warning from `skill_collision_warns_once_across_scans` when tests
+    /// share a process.
+    #[test]
+    fn reported_collisions_dedupe_and_warn_once_at_the_cap() {
+        let key = |n: &str, s: &str| (n.to_owned(), "/kept".to_owned(), s.to_owned());
+        let mut reported = ReportedCollisions::default();
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::New);
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::Repeat);
+        assert_eq!(
+            reported.record(key("a", "/other")),
+            CollisionReport::New,
+            "a different shadowed path is a new collision"
+        );
+        for i in reported.seen.len()..MAX_REPORTED_COLLISIONS {
+            assert_eq!(
+                reported.record(key(&format!("fill-{i}"), "/s")),
+                CollisionReport::New
+            );
+        }
+        assert_eq!(
+            reported.record(key("past-cap", "/s")),
+            CollisionReport::CapReached,
+            "the first collision past the cap says so at warn"
+        );
+        assert_eq!(
+            reported.record(key("past-cap-2", "/s")),
+            CollisionReport::Repeat,
+            "later new collisions stay at debug"
+        );
+        assert_eq!(
+            reported.record(key("a", "/s")),
+            CollisionReport::Repeat,
+            "known collisions stay at debug past the cap"
         );
     }
 
