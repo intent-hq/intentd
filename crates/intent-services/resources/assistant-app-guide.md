@@ -389,6 +389,11 @@ Claude Code and choose **Add profile**. If this opens a name and environment-var
 editor, use that form with the environment-variable rules below; sign in or prepare
 the account outside Intent.
 
+**Default profile availability.** The pinned Default row and its editing controls
+described below require a supporting app. Older app versions may not show this row
+or the **Edit** or **Environment variables** controls; check availability before
+directing users to them.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ProviderProfileDialog,ProviderProfileAddDialog,ProviderProfileEditDialog}.svelte; src/lib/components/settings/profile-kinds/ProviderProfileKindDialog.svelte; src/lib/provider-profile-kinds.ts; src/store/renderer/slices/provider-settings/sagas/provider-profile-setup-saga.ts. -->
 
 **Guided profile setup.** With matching app and daemon support, **Add profile**
@@ -424,15 +429,13 @@ the original configuration is **Codex · Default**. Each profile has its own **F
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
-In app versions with a pinned Default profile, a provider with profiles lists its
-original configuration first, where backups start from. It cannot be moved, and
-shows its name with a **Default** badge once renamed. When offered, choose **Edit**
-in that profile's ⋯ menu, or **Environment variables** in the Codex or Claude Code
-⋯ menu, to rename the original configuration or give it its own environment
-variables (same rules as a profile, without the backup switch); a blank name
-restores **Default**. Older app versions may not show this row or either editing
-control; check availability before directing users to them. Settings → Providers
-does not mark the app's default model or provider; use **Default model** for that.
+Once a provider has profiles, its original configuration is listed first as the
+Default profile, where backups start from; it cannot be moved, and shows its name
+with a **Default** badge once renamed. To rename it or give it its own environment
+variables (same rules as a profile, without the backup switch), choose **Edit** in
+its ⋯ menu, or **Environment variables** in the Codex or Claude Code ⋯ menu; a blank
+name restores **Default**. Settings → Providers does not mark the app's default
+model or provider; use **Default model** for that.
 
 **Backup profiles.** These controls require matching app and daemon support.
 Older apps may support provider profiles without profile ordering or backup
