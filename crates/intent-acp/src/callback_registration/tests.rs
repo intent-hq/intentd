@@ -634,7 +634,11 @@ async fn mcp() -> (crate::McpBridge, Arc<McpApi>) {
 fn mcp_entry(name: &str, bridge: &crate::McpBridge) -> McpServer {
     McpServer::Stdio(
         agent_client_protocol::schema::v1::McpServerStdio::new(name, "fixture-mcp")
-            .args(vec![bridge.connect_addr()]),
+            .args(vec![bridge.connect_addr()])
+            .env(vec![agent_client_protocol::schema::v1::EnvVariable::new(
+                crate::BRIDGE_TOKEN_ENV,
+                bridge.auth_token(),
+            )]),
     )
 }
 fn bridge_registration(query: CallbackQuery, bridge: &crate::McpBridge) -> CallbackRegistration {
@@ -642,7 +646,10 @@ fn bridge_registration(query: CallbackQuery, bridge: &crate::McpBridge) -> Callb
         CallbackStdioServer::new(
             "fixture-mcp".into(),
             vec![bridge.connect_addr()],
-            None,
+            Some(std::collections::BTreeMap::from([(
+                crate::BRIDGE_TOKEN_ENV.to_string(),
+                bridge.auth_token().to_string(),
+            )])),
             [CallbackTool::WorkspaceApi],
         )
         .unwrap(),

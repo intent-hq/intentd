@@ -33,7 +33,7 @@ async fn retired_bridge_refusal(optional: bool) {
     };
     let bridge = serve_workspace_mcp_tcp(Arc::new(server)).await.unwrap();
     let accept_loop = bridge.accept_loop_handle();
-    let socket = TcpStream::connect(bridge.addr()).await.unwrap();
+    let socket = bridge.connect().await.unwrap();
     let (read, mut write) = socket.into_split();
     let mut lines = BufReader::new(read).lines();
     let message = call(
@@ -90,7 +90,7 @@ async fn tcp_final_admission_retirement_orders_and_completed_effects() {
         let api = Arc::new(Api::new());
         let server = Arc::new(server(api.clone(), policy.clone()));
         let bridge = serve_workspace_mcp_tcp(server).await.unwrap();
-        let socket = TcpStream::connect(bridge.addr()).await.unwrap();
+        let socket = bridge.connect().await.unwrap();
         let (read, mut write) = socket.into_split();
         let mut lines = BufReader::new(read).lines();
         let message = call(

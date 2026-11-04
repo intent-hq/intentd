@@ -704,7 +704,7 @@ pub const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("file.getAttachmentInfo", "Read: metadata of a chat attachment. Workspace attachment store."),
     ("file.list", "Read: repo directory listing. Workspace-root confined."),
     ("file.mkdir", "Edit: creates a repo directory. Workspace-root confined."),
-    ("file.placeAttachment", "Edit: copies an attachment into the workspace. Workspace-root confined."),
+    ("file.placeAttachment", "Edit: places an attachment into the workspace. The destination is workspace-root confined; the host-path `sourcePath` arm requires host execution in services, so guests attach inline `data` only."),
     ("file.read", "Read: a repo file. Confined to the workspace or selected registered root."),
     ("file.readChunk", "Read: a byte range of a repo file. Confined to the workspace or selected registered root."),
     ("file.rename", "Edit: renames a repo path. Both ends workspace-root confined."),

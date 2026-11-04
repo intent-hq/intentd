@@ -31,7 +31,7 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
                 .with_caller_agent_id(Some(h.agent.clone())),
         );
         let bridge = intent_acp::serve_workspace_mcp_tcp(server).await.unwrap();
-        let stream = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+        let stream = bridge.connect().await.unwrap();
         let (read, mut write) = stream.into_split();
         let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_api","arguments":{"code":"return await ws.desktop.startControl();","summary":"Verify recovered desktop session"}}});
         write

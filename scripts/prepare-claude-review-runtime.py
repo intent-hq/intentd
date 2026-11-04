@@ -18,8 +18,8 @@ import tempfile
 
 
 HERE = Path(__file__).resolve().parent
-HELPER_SHA256 = "91ce43bc922c89142431351b87b5340f330ee1e8e000615e9c715d5ae2deae3f"
-DESCRIPTOR_SHA256 = "4ef6f96a284fe05da344364eae60a9c8b686b856f3a9c3478ccdb6b285389d02"
+HELPER_SHA256 = "13bdc0a8eb9f5cb4908f17e5b93cf0d2b5f44399db8df7dd0cc445f90a454c1c"
+DESCRIPTOR_SHA256 = "9f9e30e048f9cabbd28ce966fcb362f42cc966c990e679cf6a5ec87661be4043"
 helper = HERE / "prepare-claude-callback-runtime.py"
 if hashlib.sha256(helper.read_bytes()).hexdigest() != HELPER_SHA256:
     raise SystemExit("review runtime refused: installer implementation mismatch")

@@ -74,6 +74,10 @@ function workspaceApi(code) {
       const [host, port] = server.args[server.args.indexOf('--connect') + 1].split(':');
       const socket = net.connect(Number(port), host);
       socket.on('error', reject);
+      // The listener refuses connections that do not first present the
+      // per-agent secret the daemon put in the entry's env.
+      const token = (server.env ?? []).find(({ name }) => name === 'INTENTD_MCP_BRIDGE_TOKEN')?.value;
+      if (token) socket.write(`intentd-mcp-bridge-auth ${token}\n`);
       input = socket;
       output = socket;
       done = () => socket.end();

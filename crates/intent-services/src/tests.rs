@@ -21,6 +21,7 @@ mod home_isolation;
 mod line_attribution_retry;
 mod note_write_lock;
 mod orphan_flag_race;
+mod place_attachment_source_path;
 pub(crate) mod retire_workspace;
 mod skill_list;
 mod task_list_latency;

@@ -40,9 +40,9 @@ class ProbeTests(unittest.TestCase):
     def test_accepted_installer_is_used_without_a_manifest_override(self):
         module = probe.load_installer()
         self.assertEqual(module.configuration().identity,
-                         "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597")
+                         "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1")
         self.assertEqual(module.DESCRIPTOR_SHA256,
-                         "592a378105c930444b42ecd2e52bf5c6a017a5539dfe69ef7a94fb570ac9588d")
+                         "0f3d23023f1f7be72fcf42a56eda39ee1c0ae50a0deb3579939579bed2d332f6")
 
     def test_modified_installer_is_rejected_before_import(self):
         fake_probe = self.root / "probe-claude-callback-native.py"
@@ -429,7 +429,7 @@ class ServicesStartupRunnerTests(unittest.TestCase):
         facts = {
             "runner-verified": {"case": case, "testElf": probe.SERVICES_SHA,
                                 "bridge": probe.BRIDGE_SHA,
-                                "runtimeIdentity": "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597"},
+                                "runtimeIdentity": "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1"},
             "ordinary-started": {"legacy": case == "legacy", "sessionId": "inert-session",
                                  "agent": "inert-agent", "workspace": "inert-workspace",
                                  "adapterPid": 10, "pendingEndpoint": "127.0.0.1:1"},

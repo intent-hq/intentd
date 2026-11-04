@@ -5389,7 +5389,7 @@ mod mcp_bridge_tests {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let stream = bridge.connect().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
 
@@ -5412,12 +5412,129 @@ mod mcp_bridge_tests {
         assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
     }
 
+    /// Read until EOF and return everything the listener sent: an
+    /// unauthenticated connection must be closed without any response line.
+    async fn read_to_eof(stream: TcpStream) -> String {
+        let (read, _w) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut all = String::new();
+        // A reset (unread bytes at close) is as much a refusal as a clean EOF.
+        let _closed = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut all),
+        )
+        .await
+        .expect("the listener closes an unauthenticated connection");
+        all
+    }
+
+    async fn try_send_line(stream: &mut TcpStream, line: &str) {
+        let _ = stream.write_all(format!("{line}\n").as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Security regression: any local process (another OS user, or a browser
+    /// cross-protocol POST) could reach the per-agent loopback listener and
+    /// run `workspace_api` with the agent's authority. A connection whose
+    /// first line is a JSON-RPC frame instead of the bridge secret is closed
+    /// without dispatching anything.
+    #[tokio::test]
+    async fn unauthenticated_connection_is_refused() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+        )
+        .await;
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "", "no response may be served");
+    }
+
+    /// A wrong or truncated secret, or an HTTP request head (cross-protocol
+    /// abuse from a web page), is refused the same way.
+    #[tokio::test]
+    async fn wrong_secret_and_http_preamble_are_refused() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let token = bridge.auth_token().to_owned();
+        let wrong = format!("{}x", &token[..token.len() - 1]);
+        for first in [
+            crate::bridge_auth_line(&wrong),
+            crate::bridge_auth_line(&token[..token.len() - 1]),
+            crate::bridge_auth_line(""),
+            "POST / HTTP/1.1\r\n".to_string(),
+        ] {
+            let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+            stream.write_all(first.as_bytes()).await.unwrap();
+            send_line(
+                &mut stream,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+            )
+            .await;
+            assert_eq!(
+                read_to_eof(stream).await,
+                "",
+                "refused first line: {first:?}"
+            );
+        }
+    }
+
+    /// An unauthenticated peer cannot grow memory with an endless first
+    /// line: the listener reads at most the auth line's length, then closes.
+    #[tokio::test]
+    async fn oversized_first_line_is_refused_without_buffering() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+        let flood = vec![b'a'; 1024 * 1024];
+        let _ = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            stream.write_all(&flood),
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "");
+    }
+
+    /// Each listener mints its own secret, so one agent's secret never opens
+    /// another agent's bridge.
+    #[tokio::test]
+    async fn each_listener_has_a_distinct_secret() {
+        let a = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let b = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        assert_eq!(a.auth_token().len(), 64);
+        assert_ne!(a.auth_token(), b.auth_token());
+        let mut stream = TcpStream::connect(b.addr()).await.unwrap();
+        stream
+            .write_all(crate::bridge_auth_line(a.auth_token()).as_bytes())
+            .await
+            .unwrap();
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "");
+    }
+
     #[tokio::test]
     async fn empty_and_malformed_lines_are_tolerated() {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let mut stream = bridge.connect().await.unwrap();
         // A blank line and a non-JSON line both produce no response and must not
         // close the connection; the follow-up request still gets answered.
         send_line(&mut stream, "").await;
@@ -5439,7 +5556,7 @@ mod mcp_bridge_tests {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let mut stream = bridge.connect().await.unwrap();
         // A notification (no `id`) yields no response, then a request still works.
         send_line(
             &mut stream,
@@ -5500,7 +5617,6 @@ mod mcp_bridge_tests {
         use serde_json::{json, Value};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-        use tokio::net::TcpStream;
         use tokio::sync::Notify;
         use tokio::time::timeout;
 
@@ -5594,7 +5710,7 @@ mod mcp_bridge_tests {
         ) {
             let dispatch = Arc::new(TestDispatch::default());
             let bridge = serve_mcp_tcp(dispatch.clone()).await.unwrap();
-            let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+            let stream = bridge.connect().await.unwrap();
             let (read, write) = stream.into_split();
             (dispatch, bridge, write, BufReader::new(read))
         }
@@ -5746,7 +5862,6 @@ mod mcp_bridge_tests {
         use serde_json::{json, Value};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-        use tokio::net::TcpStream;
         use tokio::time::timeout;
 
         use crate::mcp_bridge::{
@@ -5809,7 +5924,7 @@ mod mcp_bridge_tests {
             let bridge = serve_mcp_tcp_with_timeout(dispatch.clone(), TEST_DEADLINE)
                 .await
                 .unwrap();
-            let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+            let stream = bridge.connect().await.unwrap();
             let (read, write) = stream.into_split();
             (dispatch, bridge, write, BufReader::new(read))
         }
@@ -6020,7 +6135,7 @@ mod mcp_bridge_tests {
             let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
             let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
             let handle = tokio::spawn(async move {
-                run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg).await
+                run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg, None).await
             });
             BridgeHarness {
                 stdin,
@@ -6333,6 +6448,72 @@ mod mcp_bridge_tests {
             let resp = bridge.read_response().await;
             assert_eq!(resp["id"], json!(2));
             assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        /// The bridge authenticates on every connection, including a
+        /// mid-session reconnect: the listener refuses any connection whose
+        /// first line is not the secret, so a reconnect that skipped it would
+        /// silently lose the session.
+        #[tokio::test]
+        async fn every_connect_and_reconnect_presents_the_bridge_secret() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
+            let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
+            let handle = tokio::spawn(async move {
+                run_bridge(
+                    &addr.to_string(),
+                    stdin_remote,
+                    stdout_remote,
+                    fast_cfg(),
+                    Some("s3cret".to_string()),
+                )
+                .await
+            });
+            let mut bridge = BridgeHarness {
+                stdin,
+                stdout: BufReader::new(stdout),
+                handle,
+            };
+            let expected = crate::bridge_auth_line("s3cret");
+            for id in [1, 2] {
+                let (conn, _) = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    listener.accept(),
+                )
+                .await
+                .expect("bridge connected")
+                .unwrap();
+                let (read, mut write) = conn.into_split();
+                let mut lines = BufReader::new(read).lines();
+                bridge.send_request(id).await;
+                let first = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    lines.next_line(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(format!("{first}\n"), expected, "connection {id}");
+                let line = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    lines.next_line(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert_eq!(bridge.read_response().await["id"], json!(id));
+                // Drop the connection; the bridge must reconnect and
+                // authenticate again for the next request.
+            }
         }
 
         /// Regression for monorepo#906: a stdin line that races a *pending*

@@ -275,19 +275,24 @@ impl Harness {
         reason = "observe the actual owned bridge address"
     )]
     async fn tool(&self, code: &str) -> Value {
-        let address = self.manager.handles.lock().unwrap()[&self.row.id]
-            .execution
-            .local
-            .as_ref()
-            .unwrap()
-            .resources
-            .lock()
-            .unwrap()
-            ._mcp_bridge
-            .as_ref()
-            .unwrap()
-            .connect_addr();
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (address, token) = {
+            let handles = self.manager.handles.lock().unwrap();
+            let resources = handles[&self.row.id]
+                .execution
+                .local
+                .as_ref()
+                .unwrap()
+                .resources
+                .lock()
+                .unwrap();
+            let bridge = resources._mcp_bridge.as_ref().unwrap();
+            (bridge.connect_addr(), bridge.auth_token().to_owned())
+        };
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(intent_acp::bridge_auth_line(&token).as_bytes())
+            .await
+            .unwrap();
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{

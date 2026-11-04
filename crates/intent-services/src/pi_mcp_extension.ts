@@ -192,8 +192,10 @@ export class McpLineClient {
   }
 }
 
-/// Dial `host:port` and return a connected [`McpLineClient`].
-export function connectMcpTcp(addr, timeoutMs = CONNECT_TIMEOUT_MS) {
+/// Dial `host:port`, authenticate with the per-agent bridge secret (the
+/// listener refuses any connection whose first line is not
+/// `intentd-mcp-bridge-auth <token>`), and return a connected [`McpLineClient`].
+export function connectMcpTcp(addr, token, timeoutMs = CONNECT_TIMEOUT_MS) {
   const idx = addr.lastIndexOf(":");
   if (idx <= 0) {
     return Promise.reject(new Error(`invalid bridge addr: ${addr}`));
@@ -212,6 +214,7 @@ export function connectMcpTcp(addr, timeoutMs = CONNECT_TIMEOUT_MS) {
     socket.once("connect", () => {
       clearTimeout(timer);
       socket.setNoDelay(true);
+      if (token) socket.write(`intentd-mcp-bridge-auth ${token}\n`);
       resolve(new McpLineClient(socket, socket));
     });
     socket.once("error", (err) => {
@@ -255,12 +258,16 @@ export default async function piMcpExtension(pi) {
     log("INTENTD_MCP_BRIDGE_ADDR not set; workspace MCP tools disabled");
     return;
   }
+  const token = process.env.INTENTD_MCP_BRIDGE_TOKEN;
+  if (!token) {
+    log("INTENTD_MCP_BRIDGE_TOKEN not set; the bridge will refuse this client");
+  }
 
   let clientPromise = null;
   const ensureClient = () => {
     if (!clientPromise) {
       clientPromise = (async () => {
-        const client = await connectMcpTcp(addr);
+        const client = await connectMcpTcp(addr, token);
         try {
           await client.initialize({ name: "intentd-pi-mcp-extension", version: "0.1.0" });
         } catch (err) {

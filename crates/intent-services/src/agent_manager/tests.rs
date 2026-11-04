@@ -17413,26 +17413,31 @@ impl tracing::Subscriber for AgentManagerLogCapture {
 /// bridge's ACTUAL workspace scope, not a proxy for it.
 #[expect(clippy::used_underscore_binding)] // reads the RAII `_mcp_bridge` field; underscore documents production intent
 async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str) -> String {
-    let addr = mgr
-        .handles
-        .lock()
-        .unwrap()
-        .get(id)
-        .expect("the woken agent keeps a live handle")
-        .execution
-        .local
-        .as_ref()
-        .unwrap()
-        .resources
-        .lock()
-        .unwrap()
-        ._mcp_bridge
-        .as_ref()
-        .expect("the live handle serves a workspace_api bridge")
-        .addr();
-    let stream = tokio::net::TcpStream::connect(addr)
+    let (addr, token) = {
+        let handles = mgr.handles.lock().unwrap();
+        let resources = handles
+            .get(id)
+            .expect("the woken agent keeps a live handle")
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap();
+        let bridge = resources
+            ._mcp_bridge
+            .as_ref()
+            .expect("the live handle serves a workspace_api bridge");
+        (bridge.addr(), bridge.auth_token().to_owned())
+    };
+    let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to the agent's mcp bridge");
+    stream
+        .write_all(intent_acp::bridge_auth_line(&token).as_bytes())
+        .await
+        .unwrap();
     let (read, mut write) = stream.into_split();
     let request = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -22095,7 +22100,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
         let mgr = mgr.with_mcp_bridge_exe("/usr/local/bin/intentd");
         let json = mgr
-            .opencode_env_mcp_config("127.0.0.1:9999".to_string())
+            .opencode_env_mcp_config("127.0.0.1:9999".to_string(), "t0ken")
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -22125,7 +22130,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
         let mgr = mgr.with_mcp_bridge_exe("/opt/App Support/bin/intentd");
         let json = mgr
-            .opencode_env_mcp_config("127.0.0.1:9999".to_string())
+            .opencode_env_mcp_config("127.0.0.1:9999".to_string(), "t0ken")
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -22150,6 +22155,27 @@ mod merge_user_mcp_servers_tests {
         );
     }
 
+    /// Security regression: the per-agent bridge secret reaches the
+    /// `intentd mcp-bridge` child through its environment only, never argv,
+    /// where every local user could read it from the process list.
+    #[tokio::test]
+    async fn bridge_secret_rides_in_env_not_argv() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let servers = mgr
+            .normalized_mcp_servers("127.0.0.1:9999".to_string(), "s3cret-token")
+            .await
+            .unwrap();
+        let NormalizedMcpServer::Stdio { args, env, .. } = servers.get("workspace-mcp").unwrap()
+        else {
+            panic!("workspace-mcp is stdio");
+        };
+        assert_eq!(
+            env.get(intent_acp::BRIDGE_TOKEN_ENV).map(String::as_str),
+            Some("s3cret-token")
+        );
+        assert!(args.iter().all(|a| !a.contains("s3cret-token")));
+    }
+
     /// monorepo#1049 — a whitespace-containing bridge path collapses to the
     /// executable basename, and the entry's PATH prepends the parent dir to
     /// the inherited PATH. Asserted on the final (post-baseline-merge) env:
@@ -22160,7 +22186,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
         let mgr = mgr.with_mcp_bridge_exe("/opt/App Support/bin/intentd");
         let servers = mgr
-            .normalized_mcp_servers("127.0.0.1:9999".to_string())
+            .normalized_mcp_servers("127.0.0.1:9999".to_string(), "t0ken")
             .await
             .unwrap();
         let NormalizedMcpServer::Stdio { command, args, env } =
@@ -22190,7 +22216,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
         let mgr = mgr.with_mcp_bridge_exe("/usr/local/bin/intentd");
         let servers = mgr
-            .normalized_mcp_servers("127.0.0.1:9999".to_string())
+            .normalized_mcp_servers("127.0.0.1:9999".to_string(), "t0ken")
             .await
             .unwrap();
         let NormalizedMcpServer::Stdio { command, env, .. } = servers.get("workspace-mcp").unwrap()
