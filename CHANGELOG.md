@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.122] - 2026-11-04
+
+### 🚀 Features
+
+- *(acp)* Give each agent launch its own TMPDIR ([#3011](https://github.com/intent-hq/intentd/pull/3011))
+- Run remote agents' saved scripts on their machine from the backend (remoteScripts, part 2) ([#3005](https://github.com/intent-hq/intentd/pull/3005))
+
+### 🐛 Bug Fixes
+
+- *(skills)* Warn about each skill name collision once per daemon run ([#3014](https://github.com/intent-hq/intentd/pull/3014))
+- *(agents)* Leave signed-out or disabled providers pending on unattended resume ([#3013](https://github.com/intent-hq/intentd/pull/3013))
+- *(agents)* Delegated agents inherit their creator's provider ([#3016](https://github.com/intent-hq/intentd/pull/3016))
+
+
 ## [0.11.121] - 2026-11-04
 
 ### 🐛 Bug Fixes

@@ -345,7 +345,8 @@ the original configuration is **Codex · Default**. In a shared workspace, guest
 an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
-explicit, specialist, or default selection, never the parent's profile.
+explicit or specialist selection, else their parent agent's provider when it is
+enabled, installed and not signed out, else the default; never the parent's profile.
 Once a provider has profiles, its original configuration is listed first as the
 Default profile, where backups start from; it cannot be moved, and shows its name
 with a **Default** badge once renamed. To rename it or give it its own environment
@@ -425,7 +426,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 
 ## Use Intent from a browser on another device (experimental)
 
@@ -445,9 +446,10 @@ Tailscale address in the browser. Never suggest Tailscale Funnel or another publ
 The browser asks once for the **Access key** shown in that section; **Reset key** signs
 out every browser. In the browser, opening a saved connection opens that backend in a
 new tab; adding or forgetting connections stays on the desktop. Desktop-only features
-such as native file dialogs and window controls are unavailable in the browser. If the
-section shows the port is in use, change **Port**. If it says the build does not
-include the browser version, the installed app predates the feature.
+such as native file dialogs and window controls are unavailable in the browser; a notice
+listing them appears each time the browser loads Intent. If the section shows the port
+is in use, change **Port**. If it says the build does not include the browser version,
+the installed app predates the feature.
 
 <!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
@@ -492,7 +494,8 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 - Its data directory (default `~/.local/state/intent-web`) holds machine tokens in
   plain text; treat it like an SSH key. The **Settings → Mobile** tab, iCloud sync of
   saved machines and desktop-only features such as native file dialogs are not
-  available there.
+  available there; a notice listing them appears each time the browser loads Intent,
+  and **Got it** closes it.
 
 <!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
 
