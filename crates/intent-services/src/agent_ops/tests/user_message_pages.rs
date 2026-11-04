@@ -214,3 +214,52 @@ async fn list_user_messages_marks_a_single_oversized_row() {
     let (all, _) = walk(&svc, &id, None, None).await;
     assert_eq!(all, vec![older, huge]);
 }
+
+/// Rows appended between two page fetches never shift or duplicate the
+/// walk: the cursor names a `seq`, so the older page is exactly the rows
+/// below the first page and the new rows appear only on a fresh first page.
+#[tokio::test]
+async fn list_user_messages_cursor_is_append_stable() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "UserPageAppend").await;
+    let mut expected = Vec::new();
+    for n in 0..5 {
+        expected.push(append_user(&svc, &id, &format!("old {n}")).await);
+    }
+
+    let first = svc
+        .agent_list_user_messages_page_op(id.clone(), None, None, Some(2), None)
+        .await
+        .expect("first page");
+    assert_eq!(page_ids(&first), expected[3..].to_vec());
+    let token = first["nextToken"].as_str().expect("older rows").to_string();
+
+    let mut added = Vec::new();
+    for n in 0..3 {
+        added.push(append_user(&svc, &id, &format!("new {n}")).await);
+    }
+
+    let mut walked = page_ids(&first);
+    let mut next = Some(token);
+    while let Some(token) = next {
+        let page = svc
+            .agent_list_user_messages_page_op(id.clone(), None, None, Some(2), Some(token))
+            .await
+            .expect("older page");
+        let mut ids = page_ids(&page);
+        ids.extend(walked);
+        walked = ids;
+        next = page["nextToken"].as_str().map(str::to_string);
+    }
+    assert_eq!(walked, expected, "no shift, no duplicate, no appended row");
+
+    let fresh = svc
+        .agent_list_user_messages_page_op(id.clone(), None, None, Some(2), None)
+        .await
+        .expect("fresh page");
+    assert_eq!(
+        page_ids(&fresh),
+        added[1..].to_vec(),
+        "a fresh walk starts at the new rows"
+    );
+}
