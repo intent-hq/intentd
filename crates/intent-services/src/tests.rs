@@ -33537,7 +33537,10 @@ mod worktree_provisioning {
                 serde_json::json!("codex"),
             )])
             .expect("change default provider");
-        let sessions = store.list_agent_sessions(&ws.id).await.expect("sessions");
+        let sessions = store
+            .list_agent_sessions_with_transcripts(&ws.id)
+            .await
+            .expect("sessions");
         let initial = sessions
             .iter()
             .find(|s| s.is_initial_agent())
@@ -35651,7 +35654,7 @@ mod file_ops_service {
         let agent_id = AgentId::from(result.get("agentId").unwrap().as_str().unwrap());
         svc.await_sandbox_provisioning(&agent_id).await;
         let session = store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("child session");
         if expect_sandbox {
@@ -36559,7 +36562,7 @@ mod heal_stale_agent_sessions {
         // The three stale sessions are now non-active runtime-idle.
         for id in ["stale-active", "stale-processing", "stale-waiting"] {
             let s = store
-                .get_agent_session(&AgentId::from(id))
+                .get_agent_session_with_transcript(&AgentId::from(id))
                 .await
                 .expect("reload");
             assert_eq!(s.status, AgentStatus::RuntimeIdle, "{id} healed to idle");
@@ -36576,7 +36579,7 @@ mod heal_stale_agent_sessions {
             ("untouched-error", AgentStatus::Error),
         ] {
             let s = store
-                .get_agent_session(&AgentId::from(id))
+                .get_agent_session_with_transcript(&AgentId::from(id))
                 .await
                 .expect("reload");
             assert_eq!(s.status, want, "{id} status unchanged");
@@ -36667,7 +36670,7 @@ mod initial_agent_orchestration {
         // Session row: parentless, non-background, specialist/model persisted,
         // prompt kept as `initialMessage` (resume source).
         let session = store
-            .get_agent_session(&AgentId::from(minted.as_str()))
+            .get_agent_session_with_transcript(&AgentId::from(minted.as_str()))
             .await
             .expect("session");
         assert_eq!(session.workspace_id, res.workspace.id);
@@ -36758,7 +36761,7 @@ mod initial_agent_orchestration {
         );
 
         let sessions = store
-            .list_agent_sessions(&first.workspace.id)
+            .list_agent_sessions_with_transcripts(&first.workspace.id)
             .await
             .expect("sessions");
         assert_eq!(sessions.len(), 1, "no duplicate agent row");
@@ -36813,7 +36816,7 @@ mod initial_agent_orchestration {
         );
 
         let sessions = store
-            .list_agent_sessions(&first.workspace.id)
+            .list_agent_sessions_with_transcripts(&first.workspace.id)
             .await
             .expect("sessions");
         assert_eq!(sessions.len(), 1, "no duplicate agent row on replay");
@@ -36866,13 +36869,13 @@ mod initial_agent_orchestration {
             assert_eq!(agent["name"], "Coordinator");
 
             let sessions = store
-                .list_agent_sessions(&res.workspace.id)
+                .list_agent_sessions_with_transcripts(&res.workspace.id)
                 .await
                 .expect("sessions");
             assert_eq!(sessions.len(), 1, "one session row created");
 
             let session = store
-                .get_agent_session(&AgentId::from(minted.as_str()))
+                .get_agent_session_with_transcript(&AgentId::from(minted.as_str()))
                 .await
                 .expect("session");
             assert_eq!(session.workspace_id, res.workspace.id);
@@ -36949,7 +36952,7 @@ mod initial_agent_orchestration {
             .expect("initial agent row persisted");
         let minted = agent["id"].as_str().expect("agent id").to_string();
         let session = store
-            .get_agent_session(&AgentId::from(minted.as_str()))
+            .get_agent_session_with_transcript(&AgentId::from(minted.as_str()))
             .await
             .expect("session");
         assert!(
@@ -44731,7 +44734,7 @@ mod agent_delete_grace_window {
         h.services.store.close().await;
         let reopened = Store::open(&h.tmp.path).await.unwrap();
         assert!(matches!(
-            reopened.get_agent_session(&h.agent).await,
+            reopened.get_agent_session_with_transcript(&h.agent).await,
             Err(Error::NotFound(_))
         ));
         let events = reopened
@@ -45214,7 +45217,11 @@ mod harness_versioning {
 
         // Persisted, not projected: the row itself carries the stamp.
         let id = AgentId::from(agent["id"].as_str().unwrap());
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         assert_eq!(
             session.harness_version,
             intent_core::CURRENT_HARNESS_VERSION
@@ -45252,7 +45259,11 @@ mod harness_versioning {
         assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
         assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
         let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
-        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        let child_row = svc
+            .store()
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .unwrap();
         assert_eq!(
             child_row.harness_version,
             intent_core::CURRENT_HARNESS_VERSION
@@ -45268,7 +45279,11 @@ mod harness_versioning {
             intent_core::CURRENT_HARNESS_VERSION
         );
         assert_eq!(child_full.harness_features, child_row.harness_features);
-        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        let parent = svc
+            .store()
+            .get_agent_session_with_transcript(&parent_id)
+            .await
+            .unwrap();
         assert_eq!(parent.harness_version, "2.9");
         assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
         assert!(!svc.session_agent_features(&parent).peer_agents);
@@ -45294,7 +45309,7 @@ mod harness_versioning {
             .expect("age parent pin");
         assert_eq!(
             svc.store()
-                .get_agent_session(&parent_id)
+                .get_agent_session_with_transcript(&parent_id)
                 .await
                 .expect("parent")
                 .harness_version,
@@ -45308,7 +45323,11 @@ mod harness_versioning {
             "child stamps the current constant, not the parent's 0.9-legacy pin"
         );
         let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
-        let session = svc.store().get_agent_session(&child_id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("get");
         assert_eq!(
             session.harness_version,
             intent_core::CURRENT_HARNESS_VERSION
@@ -45338,7 +45357,11 @@ mod harness_versioning {
         .expect("null out snapshot");
 
         // agent.get projection: current settings overlaid.
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         let lite = svc.project_lite_with_flags(session);
         assert_eq!(lite.harness_version, "1.0");
         let features = lite.harness_features.expect("projected from settings");
@@ -45388,7 +45411,11 @@ mod harness_versioning {
             .await
             .expect("persist older snapshot");
 
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         let features = svc.session_agent_features(&session);
         assert!(svc.effective_settings().agent_features.peer_agents);
         assert!(
@@ -45408,7 +45435,11 @@ mod harness_versioning {
             .await
             .expect("getSession");
         assert_eq!(full.harness_features.as_ref(), Some(&pinned));
-        let stored = svc.store().get_agent_session(&id).await.expect("reread");
+        let stored = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("reread");
         assert_eq!(stored.harness_features, Some(pinned));
     }
 
@@ -45438,7 +45469,11 @@ mod harness_versioning {
             .await
             .expect("pin snapshot");
 
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         let features = svc.session_agent_features(&session);
         assert!(
             !features.host_exec,
@@ -45460,7 +45495,11 @@ mod harness_versioning {
             .execute(svc.store().write_pool())
             .await
             .expect("null out snapshot");
-        let legacy = svc.store().get_agent_session(&id).await.expect("get");
+        let legacy = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         assert_eq!(
             svc.session_agent_features(&legacy),
             svc.effective_settings().agent_features,
@@ -45513,13 +45552,21 @@ mod context_usage_projection {
         let id = create_agent(&svc, &ws).await;
 
         // No report yet: field absent (fresh session / post-restart shape).
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         let lite = svc.project_lite_with_flags(session);
         assert_eq!(lite.context_usage, None, "no report → omitted");
 
         svc.record_context_usage(&id, 53_000, 200_000);
         svc.record_context_usage(&id, 61_500, 200_000);
-        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("get");
         let lite = svc.project_lite_with_flags(session);
         let usage = lite.context_usage.as_ref().expect("latest report overlaid");
         assert_eq!((usage.used, usage.size), (61_500, 200_000), "latest wins");
@@ -45551,7 +45598,11 @@ mod context_usage_projection {
             None,
             "deleted agent's entry dropped"
         );
-        let session = svc.store().get_agent_session(&other).await.expect("get");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&other)
+            .await
+            .expect("get");
         let lite = svc.project_lite_with_flags(session);
         assert_eq!(
             lite.context_usage.map(|u| u.used),
@@ -46619,7 +46670,7 @@ mod derived_workspace_unread {
         assert_eq!(stored.attention, WorkspaceAttention::None);
         let session = h
             .store
-            .get_agent_session(&AgentId::from("agent-a"))
+            .get_agent_session_with_transcript(&AgentId::from("agent-a"))
             .await
             .expect("reload session");
         assert!(session.retired_at.is_some(), "retire must still land");

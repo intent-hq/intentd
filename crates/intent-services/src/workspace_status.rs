@@ -279,7 +279,7 @@ impl Services {
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         external_prs: Option<WorkspaceExternalPrs<'_>>,
     ) {
@@ -293,7 +293,7 @@ impl Services {
     pub(crate) async fn enrich_display_status_with_snapshot(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
     ) {
@@ -310,7 +310,7 @@ impl Services {
     async fn enrich_display_status_inner(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         external_prs: Option<WorkspaceExternalPrs<'_>>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
@@ -871,7 +871,7 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
     ) -> AttentionSignals {
         self.workspace_attention_signals_with_legacy_holds(workspace_id, attention, sessions, None)
             .await
@@ -881,7 +881,7 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         legacy_question_holds: Option<&HashSet<AgentId>>,
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
@@ -889,7 +889,7 @@ impl Services {
             ..AttentionSignals::default()
         };
         let fetched;
-        let sessions: &[intent_core::AgentSession] = match sessions {
+        let sessions: &[intent_store::AgentSessionSummary] = match sessions {
             Some(sessions) => sessions,
             None => match self.store.list_agent_session_summaries(workspace_id).await {
                 Ok(list) => {
@@ -4253,7 +4253,13 @@ mod workspace_needs_attention {
                     .to_string(),
             );
             reads.push(
-                serde_json::to_string(&svc.store.get_agent_session(agent).await.unwrap()).unwrap(),
+                serde_json::to_string(
+                    &svc.store
+                        .get_agent_session_with_transcript(agent)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
             );
         }
         reads.push(
@@ -4689,7 +4695,7 @@ mod workspace_needs_attention {
             .execute(svc.store.write_pool())
             .await
             .expect("drop agent_session table");
-        let sessions = vec![s];
+        let sessions = vec![intent_store::AgentSessionSummary::from_session(s)];
         let got = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::None, Some(&sessions))
             .await;
@@ -4721,6 +4727,8 @@ mod workspace_needs_attention {
         cleared.metadata = Some(json!({
             (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): ""
         }));
+        let summary = intent_store::AgentSessionSummary::from_session;
+        let (pending, resolved, cleared) = (summary(pending), summary(resolved), summary(cleared));
 
         // No sessions/messages persisted at all: every derivation below runs
         // off the supplied summaries alone.
@@ -5765,7 +5773,11 @@ mod display_status_events {
             .clear_attention_request_if_present(&b.id, &h.ws)
             .await;
         assert_silent(&mut sub).await;
-        let reloaded = h.store.get_agent_session(&a.id).await.expect("reload A");
+        let reloaded = h
+            .store
+            .get_agent_session_with_transcript(&a.id)
+            .await
+            .expect("reload A");
         assert_eq!(
             reloaded.attention_request_kind.as_deref(),
             Some("discussion"),

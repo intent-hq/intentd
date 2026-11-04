@@ -3,19 +3,19 @@
 
 use std::collections::HashMap;
 
-use intent_core::{AgentId, AgentSession, Error, Result};
+use intent_core::{AgentId, Error, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::agent_repo::{
     decode_last_tool_use_col, decode_preview_col, map_session_summary_row, SESSION_SUMMARY_COLUMNS,
 };
-use crate::{SessionMessageProjection, Store};
+use crate::{AgentSessionSummary, SessionMessageProjection, Store};
 
 /// List-shaped inputs for one watched agent; no transcript or hook log bodies.
 pub struct SubscriptionAgentProjection {
     /// Metadata-only session with its actual owning workspace.
-    pub session: AgentSession,
+    pub session: AgentSessionSummary,
     /// Persisted bounded previews and trigger-maintained message count.
     pub messages: SessionMessageProjection,
     /// Active hook identity and timing only.

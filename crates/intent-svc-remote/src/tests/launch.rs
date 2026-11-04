@@ -137,7 +137,7 @@ impl Fixture {
         let session = self
             .services
             .store()
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .unwrap();
         RemotePlacementView::from_metadata(session.metadata.as_ref()).unwrap()
@@ -297,7 +297,12 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
     // The node gates the agent's workspace API with its session's
     // captured features (review of intentd#2786).
-    let session = f.services.store().get_agent_session(&agent).await.unwrap();
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(
         launch.agent_features,
         serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
@@ -987,7 +992,7 @@ async fn connected_machines_count_live_links() {
 async fn sessions(f: &Fixture) -> Vec<intent_core::AgentSession> {
     f.services
         .store()
-        .list_agent_sessions(&workspace())
+        .list_agent_sessions_with_transcripts(&workspace())
         .await
         .unwrap()
 }
@@ -1019,7 +1024,7 @@ async fn placement_of(f: &Fixture, agent: &str) -> Option<RemotePlacementView> {
     let session = f
         .services
         .store()
-        .get_agent_session(&AgentId::from(agent))
+        .get_agent_session_with_transcript(&AgentId::from(agent))
         .await
         .unwrap();
     RemotePlacementView::from_metadata(session.metadata.as_ref())
@@ -1046,7 +1051,7 @@ async fn a_remote_agents_sub_agent_defaults_to_its_machine() {
     let session = f
         .services
         .store()
-        .get_agent_session(&AgentId::from(id))
+        .get_agent_session_with_transcript(&AgentId::from(id))
         .await
         .unwrap();
     assert_eq!(session.parent_agent_id, Some(parent.clone()));
@@ -1196,7 +1201,12 @@ async fn user_and_local_agent_creates_stay_on_the_backend() {
         .execute(f.services.store().write_pool())
         .await
         .unwrap();
-    let session = f.services.store().get_agent_session(&local).await.unwrap();
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&local)
+        .await
+        .unwrap();
     let host = intent_acp::make_workspace_host_for_bridge(
         std::sync::Arc::new(f.services.clone()),
         workspace(),

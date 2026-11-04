@@ -193,7 +193,12 @@ async fn a_remote_agent_fails_over_once_the_backup_runs_on_its_node() {
         vec![0, 0],
         "no failover row before the node started the backup"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
     assert_eq!(session.model.as_deref(), Some("opus"));
     assert_ne!(session.status, AgentStatus::Error);
@@ -234,7 +239,12 @@ async fn a_remote_backup_the_node_cannot_start_fails_with_an_actionable_message(
     wait_idle(&mgr, &id).await;
 
     assert_eq!(port.asked.load(Ordering::SeqCst), 2, "no silent retry");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.provider.as_deref(),
         Some("claude-code"),
@@ -307,7 +317,12 @@ async fn a_remote_agent_skips_a_marked_configuration_onto_a_backup_its_node_star
     assert_eq!(primary.stops.load(Ordering::SeqCst), 1, "the old run stops");
     assert_eq!(port.asked.load(Ordering::SeqCst), 2);
     assert_eq!(*port.failover_rows_at_start.lock().unwrap(), vec![0, 0]);
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
     assert_ne!(session.status, AgentStatus::Error);
     let messages = mgr
@@ -346,7 +361,12 @@ async fn a_remote_agent_never_fails_over_to_an_account_folder_backup() {
         1,
         "the backup is never started"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("claude-code"));
     assert_eq!(session.status, AgentStatus::Error);
     let reason = session.stop_reason.unwrap_or_default();
@@ -378,7 +398,12 @@ async fn make_return_due(mgr: &AgentManager, id: &AgentId, ws: &WorkspaceId) {
     mgr.services
         .provider_quota_cache
         .mark_working("claude-code", later, later, || true);
-    let session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
     let mut state = crate::provider_return::read_state(&session).expect("away after failover");
     state.return_after = (chrono::Utc::now() - chrono::Duration::minutes(1))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -458,7 +483,12 @@ async fn a_remote_agents_due_return_home_replaces_the_live_backup_run() {
         1,
         "the backup run stops"
     );
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("claude-code"));
     assert_ne!(
         session.status,
@@ -490,7 +520,12 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
     wait_idle(&mgr, &id).await;
 
     assert_eq!(port.asked.load(Ordering::SeqCst), 3, "no silent retry");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
     assert_eq!(session.status, AgentStatus::Error);
     let state = crate::provider_return::read_state(&session).expect("still away");
@@ -519,7 +554,12 @@ async fn a_remote_return_home_the_node_cannot_start_stays_on_the_backup() {
     assert_eq!(port.asked.load(Ordering::SeqCst), 4, "home is not retried");
     let delivered = format!("{:?}", backup_again.prompts.lock().unwrap());
     assert!(delivered.contains("carry on"), "{delivered}");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(backup.as_str()));
     let state = crate::provider_return::read_state(&session).expect("still away");
     assert_eq!(
@@ -553,7 +593,12 @@ async fn a_backup_that_exits_before_starting_on_the_node_undoes_the_switch() {
 
     assert_eq!(port.asked.load(Ordering::SeqCst), 2, "no silent redrive");
     assert_eq!(backup_run.prompts.lock().unwrap().len(), 1);
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("claude-code"));
     assert_eq!(session.status, AgentStatus::Error);
     assert!(crate::provider_return::read_state(&session).is_none());
@@ -670,7 +715,12 @@ async fn a_remote_agents_model_switch_relaunches_it_on_its_machine_with_history(
     let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
     assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
     assert!(replayed.contains("what was the word?"), "{replayed}");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet"));
     assert_ne!(session.status, AgentStatus::Error);
 }
@@ -758,7 +808,12 @@ async fn a_switch_of_a_stopped_remote_agent_replays_history_at_its_next_start() 
     assert_eq!(port.asked.load(Ordering::SeqCst), 2);
     let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
     assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet"));
 }
 
@@ -809,7 +864,12 @@ async fn a_switched_run_that_exits_before_starting_still_replays_history_next_ti
     let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
     assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
     assert!(replayed.contains("what was the word?"), "{replayed}");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet"));
 }
 
@@ -865,7 +925,12 @@ async fn a_switch_during_a_running_turn_is_not_confirmed_by_the_old_run() {
     let replayed = serde_json::to_string(&second.prompts.lock().unwrap()[0].1).unwrap();
     assert!(replayed.contains("kumquat"), "history replayed: {replayed}");
     assert!(replayed.contains("what was the word?"), "{replayed}");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet"));
     assert_ne!(session.status, AgentStatus::Error);
 }
@@ -900,7 +965,12 @@ async fn a_remote_start_failure_is_requeued_but_never_redriven_on_its_own() {
     wait_idle(&mgr, &id).await;
 
     assert_eq!(port.asked.load(Ordering::SeqCst), 2, "no automatic redrive");
-    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.status, AgentStatus::Error);
     let reason = session.stop_reason.unwrap_or_default();
     assert!(reason.contains("node-checkout-failed"), "{reason}");

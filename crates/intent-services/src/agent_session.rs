@@ -2349,7 +2349,7 @@ impl Services {
     /// automatic turn on the user's behalf, so uncertainty must fall through
     /// to the observable idle path, never spin a turn on stale state.
     pub(crate) async fn truncation_redrive_eligible(&self, agent_id: &AgentId) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.parent_agent_id.is_none() {
@@ -2928,7 +2928,7 @@ impl Services {
             Ok(true) => {
                 // Report what actually landed: a column a concurrent write
                 // set first keeps that writer's value.
-                let landed = match self.store.get_agent_session(&stored.id).await {
+                let landed = match self.store.get_agent_session_summary(&stored.id).await {
                     Ok(row) => row,
                     Err(e) => {
                         tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
@@ -3104,7 +3104,10 @@ impl Services {
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (provider
         // field → configured default), then build provider-specific _meta.
@@ -3451,7 +3454,7 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = self.store.get_agent_session_summary(agent_id).await?;
         if let Some(session_id) = &stored.acp_session_id {
             if self
                 .store
@@ -3545,7 +3548,8 @@ impl Services {
             &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
         )>,
     ) -> Result<Option<PreparedAcpLoad>> {
-        let stored = boxed_await(|| self.store.get_agent_session(agent_id)).await?;
+        let stored =
+            boxed_await(|| self.store.get_agent_session_without_messages(agent_id)).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
@@ -5174,8 +5178,8 @@ impl Services {
                 // without a follow-up read. The lookup is a single indexed row
                 // read per idle event; a store error is swallowed and the
                 // event still fires with the base payload.
-                if let Ok(session) = self.store.get_agent_session(agent_id).await {
-                    data["agentName"] = Value::String(session.name);
+                if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    data["agentName"] = Value::String(session.name.clone());
                     data["isBackground"] = Value::Bool(session.is_background);
                     // Mute hint: present only when true (absent ≠ false, like
                     // `workspaceArchived`) so notification clients stay quiet
@@ -5183,7 +5187,7 @@ impl Services {
                     if session.notifications_muted {
                         data["notificationsMuted"] = Value::Bool(true);
                     }
-                    if let Some(report) = session.completion_report {
+                    if let Some(report) = session.completion_report.clone() {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
                     }
@@ -5961,13 +5965,13 @@ impl Services {
         if empty_wake_response {
             data["emptyWakeResponse"] = Value::Bool(true);
         }
-        if let Ok(session) = self.store.get_agent_session(agent_id).await {
-            data["agentName"] = Value::String(session.name);
+        if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+            data["agentName"] = Value::String(session.name.clone());
             data["isBackground"] = Value::Bool(session.is_background);
             if session.notifications_muted {
                 data["notificationsMuted"] = Value::Bool(true);
             }
-            if let Some(report) = session.completion_report {
+            if let Some(report) = session.completion_report.clone() {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);
             }
@@ -6847,14 +6851,14 @@ impl Services {
         if event_type == AGENT_FAILED
             && (data.get("parentAgentId").is_none() || data.get("agentName").is_none())
         {
-            if let Ok(session) = self.store.get_agent_session(agent_id).await {
+            if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                 if let Some(map) = data.as_object_mut() {
-                    if let Some(parent) = session.parent_agent_id {
+                    if let Some(parent) = session.parent_agent_id.clone() {
                         map.entry("parentAgentId".to_string())
                             .or_insert(Value::String(parent.0));
                     }
                     map.entry("agentName".to_string())
-                        .or_insert(Value::String(session.name));
+                        .or_insert(Value::String(session.name.clone()));
                 }
             }
         }

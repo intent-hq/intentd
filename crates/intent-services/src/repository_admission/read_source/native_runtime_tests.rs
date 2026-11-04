@@ -394,7 +394,7 @@ async fn actual_native_case(variant: &str) {
             assert_eq!(
                 services
                     .store
-                    .get_agent_session(&agent)
+                    .get_agent_session_with_transcript(&agent)
                     .await
                     .unwrap()
                     .acp_session_id

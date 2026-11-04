@@ -267,7 +267,11 @@ async fn a_local_create_carries_no_placement_even_if_the_caller_forges_one() {
     assert!(created.get("notice").is_none());
     assert!(remote.launched.lock().unwrap().is_empty());
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_none());
 }
 
@@ -509,7 +513,11 @@ async fn a_placed_create_keeps_its_placement_with_non_object_metadata() {
             "{metadata}: {created}"
         );
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-        let session = svc.store.get_agent_session(&id).await.unwrap();
+        let session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_some());
         assert_eq!(
             session.metadata.unwrap()["priorNonObjectMetadata"],
@@ -699,7 +707,11 @@ async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
     svc.agent_set_model_op(id.clone(), "opus4.5".into(), None)
         .await
         .expect("a model the machine lists is accepted");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("opus4.5"));
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
@@ -735,7 +747,11 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
         assert_eq!(machines.len(), 1, "{data}");
         assert_eq!(machines[0]["nodeId"], "node-1");
     }
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
@@ -768,7 +784,11 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
         .agent_set_model_op(id.clone(), "gpt-5".into(), Some(folder.clone()))
         .await;
     assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 
     let api_key = daemon_profile(
@@ -781,7 +801,11 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
     svc.agent_set_model_op(id.clone(), "gpt-5".into(), Some(api_key.clone()))
         .await
         .expect("an API-key profile the machine's provider can run is accepted");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(api_key.as_str()));
     assert_eq!(session.model.as_deref(), Some("gpt-5"));
 }
@@ -800,7 +824,11 @@ async fn a_remote_agent_on_a_removed_machine_cannot_switch() {
         panic!("expected placement-unavailable, got {result:?}");
     };
     assert_eq!(failure.data()["reason"], "machine-unknown");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
 }
 

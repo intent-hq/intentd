@@ -571,7 +571,7 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-    ) -> Result<intent_core::AgentSession> {
+    ) -> Result<intent_store::AgentSessionSummary> {
         let session = self.store.get_agent_session_summary(agent_id).await?;
         if &session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {agent_id}")));

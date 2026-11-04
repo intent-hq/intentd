@@ -16,6 +16,8 @@ mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
+mod agent_session_summary;
+pub use agent_session_summary::{AgentSessionSummary, FullAgentSessionRow};
 mod attachment_repo;
 mod browser_tab_repo;
 mod client_repo;

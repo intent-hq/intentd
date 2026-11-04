@@ -60,7 +60,11 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
     let (_tmp, svc, ws) = setup().await;
     let id = AgentId::from("agent-app-file-links");
     seed_agent(&svc, &ws, &id).await;
-    let current = svc.store().get_agent_session(&id).await.unwrap();
+    let current = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         current.harness_version,
         intent_core::CURRENT_HARNESS_VERSION

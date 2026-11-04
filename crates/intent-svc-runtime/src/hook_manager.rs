@@ -2769,7 +2769,11 @@ mod tests {
     #[tokio::test]
     async fn self_queue_owner_hook_retains_stale_warning_without_payloads() {
         let (_db, _root, svc, ws, owner) = setup().await;
-        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(&owner)
+            .await
+            .unwrap();
         session.status = AgentStatus::Idle;
         svc.store()
             .update_agent_session(&ws, &session)
@@ -2864,7 +2868,11 @@ mod tests {
     async fn wait_for_wake(svc: &Services, owner: &AgentId, needle: &str) -> String {
         let deadline = std::time::Instant::now() + poll_deadline();
         loop {
-            let session = svc.store().get_agent_session(owner).await.unwrap();
+            let session = svc
+                .store()
+                .get_agent_session_with_transcript(owner)
+                .await
+                .unwrap();
             let text = serde_json::to_string(&session.messages).unwrap();
             if text.contains(needle) {
                 return text;
@@ -3964,7 +3972,11 @@ mod tests {
         assert!(!svc.hook_task_alive(&hook.hook_id), "no task spawned");
         // Owner was woken with the dispatch message (store-only path — no
         // AgentManager attached in tests).
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("done already"), "{text}");
@@ -4008,7 +4020,11 @@ mod tests {
         assert_eq!(stored.dispatch_count, 1);
         // The wake note says the hook stays active to TTL, and the metadata
         // marks it still active.
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("fired at once"), "{text}");
@@ -5138,7 +5154,11 @@ mod tests {
 
     /// Number of the owner's persisted messages containing `needle`.
     async fn wake_count(svc: &Services, owner: &AgentId, needle: &str) -> usize {
-        let session = svc.store().get_agent_session(owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(owner)
+            .await
+            .unwrap();
         session
             .messages
             .iter()
@@ -5506,7 +5526,11 @@ mod tests {
         assert!(stored.next_run_at.is_none());
         let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
         assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(text.contains("cancelled from the app"), "{text}");
         // Cancellation keeps its own wording — no dispatch/eviction terminal
@@ -5541,7 +5565,11 @@ mod tests {
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("owner cancel");
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         assert!(
             session.messages.is_empty(),
             "owner-initiated cancel must not wake the owner"
@@ -5591,7 +5619,11 @@ mod tests {
             !types.iter().any(|t| t == HOOK_CANCELLED),
             "no cancel event: {types:?}"
         );
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         assert!(session.messages.is_empty(), "owner not woken");
 
         // The owner can still cancel it.
@@ -5790,7 +5822,11 @@ mod tests {
         // NO wake notice from the sweep (contrast the archive sweep, which
         // does notify). The only message is the terminal hook's own earlier
         // dispatch wake.
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(
             !text.contains("cancelled"),
@@ -6866,7 +6902,11 @@ mod tests {
             .await
             .expect("schedule");
         assert_eq!(out["dispatched"], json!(true));
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(text.contains(&format!("ws id {}", ws.0)), "{text}");
     }
@@ -6949,7 +6989,11 @@ mod tests {
         let listed = svc.hook_list_op(&ws, Some(&owner), false).await.unwrap();
         assert_eq!(listed["hooks"][0].get("lastLogs"), None);
         // No `[hook logs]` section on a log-free run's wake path either.
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(!text.contains("[hook logs]"), "{text}");
     }
@@ -7089,7 +7133,11 @@ mod tests {
             .await
             .expect("schedule");
         assert_eq!(out["dispatched"], json!(true));
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("[hook message truncated:"), "marker missing");
@@ -7137,7 +7185,11 @@ mod tests {
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Evicted).await;
         wait_for_wake(&svc, &owner, "[hook message truncated:").await;
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("evicted"), "eviction notice missing");
@@ -7369,7 +7421,11 @@ mod tests {
         // macOS `/tmp` resolves through a `/private` symlink; accept either.
         let canonical = std::fs::canonicalize(root.path())
             .map_or_else(|_| expected.clone(), |p| p.to_string_lossy().into_owned());
-        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(
             text.contains(&format!("pwd={expected}")) || text.contains(&format!("pwd={canonical}")),

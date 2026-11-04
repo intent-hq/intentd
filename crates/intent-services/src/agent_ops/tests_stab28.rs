@@ -82,7 +82,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
     // Parent received the first wake message.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -134,7 +134,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
     // Parent received the SECOND wake message.
     let parent_session_after = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session after second completion");
     assert_eq!(

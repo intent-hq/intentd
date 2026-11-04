@@ -277,7 +277,11 @@ async fn retire_sets_mark_emits_event_and_preserves_the_row() {
     assert_eq!(batch[0].data["reason"].as_str(), Some("handing off"));
 
     // The row survives with the mark set and the conversation intact.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.retired_at.as_deref(), Some(retired_at.as_str()));
 
     // Idempotent: a second retire preserves the original timestamp.
@@ -802,7 +806,11 @@ async fn retire_and_restore_reject_cross_workspace_targets() {
         .await
         .expect_err("cross-workspace restore must fail");
     // The mark was never set.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.retired_at.is_none());
 }
 
@@ -817,7 +825,7 @@ async fn link_child(
 ) {
     let mut s = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     s.parent_agent_id = Some(parent.clone());
@@ -847,7 +855,11 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
     assert!(msg.contains("running a turn"), "got: {msg}");
     // Nothing mutated: neither the parent nor the child is retired.
     for id in [&parent, &child] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "no partial retire for {id}");
     }
 
@@ -880,7 +892,11 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
         "error names the grandchild: {msg}"
     );
     for id in [&parent, &child, &grandchild] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "no partial retire for {id}");
     }
 
@@ -945,7 +961,11 @@ async fn agent_self_retire_rejects_the_last_top_level_agent() {
     link_child(&svc, &ws, &child, &solo, AgentStatus::RuntimeIdle).await;
     // A background agent is not visible top-level either.
     let bg = create_agent(&svc, &ws, "Background").await;
-    let mut bg_session = svc.store().get_agent_session(&bg).await.expect("bg");
+    let mut bg_session = svc
+        .store()
+        .get_agent_session_with_transcript(&bg)
+        .await
+        .expect("bg");
     bg_session.is_background = true;
     svc.store()
         .update_agent_session(&ws, &bg_session)
@@ -962,7 +982,11 @@ async fn agent_self_retire_rejects_the_last_top_level_agent() {
         .expect_err("children/background/retired agents do not count");
     assert_last_top_level_refusal(&err);
     for id in [&solo, &child, &bg] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "{id} must not be retired");
     }
 
@@ -1034,7 +1058,11 @@ async fn user_retire_rejects_the_last_top_level_agent() {
         err.to_string().contains("Start another agent"),
         "user-facing guidance: {err}"
     );
-    let s = svc.store().get_agent_session(&solo).await.expect("session");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&solo)
+        .await
+        .expect("session");
     assert!(s.retired_at.is_none(), "nothing mutated on refusal");
 
     let peer = create_agent(&svc, &ws, "Peer").await;
@@ -1223,16 +1251,24 @@ async fn retire_cascades_to_settled_descendants() {
     // Rows: parent + cascaded descendants retired; terminal child and
     // bystander untouched; the veteran keeps its original timestamp.
     for id in [&parent, &child, &grandchild] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_some(), "{id} retired by the cascade");
     }
     for id in [&done, &bystander] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "{id} must not be cascade-retired");
     }
     let s = svc
         .store()
-        .get_agent_session(&veteran)
+        .get_agent_session_with_transcript(&veteran)
         .await
         .expect("veteran");
     assert_eq!(
@@ -1278,7 +1314,11 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
         .await
         .expect("retire parent");
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(s.retired_at.is_some(), "child cascade-retired");
 
     let r = svc
@@ -1288,11 +1328,15 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     assert_eq!(r["restored"], json!(true));
     let s = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent");
     assert!(s.retired_at.is_none(), "parent restored");
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(
         s.retired_at.is_some(),
         "cascaded child stays retired after the parent's restore"
@@ -1304,7 +1348,11 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
         .await
         .expect("restore child");
     assert_eq!(r["restored"], json!(true));
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(s.retired_at.is_none());
 }
 
@@ -1716,7 +1764,7 @@ async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     // The parent received exactly one wake message via agent_send_message_op.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -1753,7 +1801,7 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
     // No wake delivered and the group watch is left in place for AS-4.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert!(parent_session.messages.is_empty());
@@ -2636,7 +2684,7 @@ async fn completion_delivery_attaches_event_notification_metadata() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -2701,7 +2749,7 @@ async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
     // The chief parent received exactly one wake and the watch is consumed.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -2795,7 +2843,7 @@ async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
     assert!(svc.list_watches_for_parent(&parent).is_empty());
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws_b)
+        .list_agent_sessions_with_transcripts(&ws_b)
         .await
         .expect("list ws-b sessions");
     assert!(
@@ -2877,7 +2925,7 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("chief parent session");
     assert_eq!(
@@ -2923,7 +2971,7 @@ async fn group_fire_attaches_event_notification_metadata() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -3004,7 +3052,7 @@ async fn app_agents_wait_immediate_wakes_from_two_workspaces() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 2, "one wake per completed target");
@@ -3069,7 +3117,7 @@ async fn app_agents_wait_immediate_reconciles_already_settled_target() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3087,7 +3135,7 @@ async fn app_agents_wait_immediate_reconciles_already_settled_target() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "immediate synthetic wake");
@@ -3110,7 +3158,7 @@ async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
     for (target, report) in [(&t1, "one done"), (&t2, "two done")] {
         let mut s = svc
             .store()
-            .get_agent_session(target)
+            .get_agent_session_with_transcript(target)
             .await
             .expect("target session");
         s.status = intent_core::AgentStatus::Completed;
@@ -3144,7 +3192,7 @@ async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -3216,7 +3264,7 @@ async fn app_agents_wait_after_all_across_two_workspaces_single_aggregated_wake(
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -3284,7 +3332,10 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     let store = Store::open(&tmp.path).await.expect("reopen store");
     // The second target finished while the daemon was down: its session is
     // Completed with a report and no interrupted row (the STAB-108 predicate).
-    let mut s2 = store.get_agent_session(&t2).await.expect("t2 session");
+    let mut s2 = store
+        .get_agent_session_with_transcript(&t2)
+        .await
+        .expect("t2 session");
     s2.status = intent_core::AgentStatus::Completed;
     s2.completion_report = Some("two".into());
     store.update_agent_session(&ws, &s2).await.expect("mark t2");
@@ -3300,7 +3351,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     // wake to the caller covering both targets.
     let session = restarted
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(
@@ -3542,7 +3593,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
         .await;
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake post-restart");
@@ -3580,7 +3631,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
     // The child finished during the downtime (STAB-108 predicate: Completed
     // with a completion report).
     let mut s = store
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3599,7 +3650,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
 
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -3666,7 +3717,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let mut s = store
-        .get_agent_session(&gone_parent)
+        .get_agent_session_with_transcript(&gone_parent)
         .await
         .expect("gone parent session");
     s.status = intent_core::AgentStatus::Deleted;
@@ -3737,7 +3788,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     assert!(restarted.find_watches_for_child(&child).is_empty());
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "only the pre-restart wake");
@@ -3809,7 +3860,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     {
         let store = Store::open(&tmp.path).await.expect("reopen to mark");
         let mut s = store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -3878,7 +3929,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     // the registration-time reconcile must NOT fire the historical completion.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3904,7 +3955,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     // exactly once — the normal single-delivery path is unchanged.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("second".into());
@@ -3996,7 +4047,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
     // `completionReport: ""` — the marker must match and suppress it.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -4035,7 +4086,7 @@ async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
     // with the hook still active.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -4121,7 +4172,7 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     // report's idle event is finally processed.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -4474,7 +4525,7 @@ async fn group_adoption_mid_window_retracts_held_report_into_aggregate_wake() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("aggregate wake");
@@ -4587,7 +4638,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     {
         let store = Store::open(&tmp.path).await.expect("reopen to mark");
         let mut s = store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -4837,7 +4888,7 @@ async fn fresh_watch_on_failed_child_delivers_historical_failure_once() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("wake message");
@@ -5038,7 +5089,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
 
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     let delivered = target_session.messages.last().expect("delivered message");
@@ -5120,7 +5171,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     });
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     assert_eq!(
@@ -5231,7 +5282,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5310,7 +5361,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
     svc.set_test_busy(&target, false);
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5335,7 +5386,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
     assert!(svc.list_watches_for_parent(&chief).is_empty());
     let chief_session = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session");
     // The ask target is not the Chief's delegation child, so the wake
@@ -5501,7 +5552,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     assert!(watch.completion_only, "ask watch is completion-only");
     let chief_before = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
@@ -5517,7 +5568,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     .expect("attention request");
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after attention")
             .messages
@@ -5528,7 +5579,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5547,7 +5598,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     .await;
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after completion")
             .messages
@@ -5606,14 +5657,14 @@ async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
 
     let chief_before = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
         .len();
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5633,7 +5684,7 @@ async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
 
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after completion")
             .messages
@@ -5667,7 +5718,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
             .expect("persist source");
         let mut session = svc
             .store()
-            .get_agent_session(&target)
+            .get_agent_session_with_transcript(&target)
             .await
             .expect("target session");
         session.status = AgentStatus::Active;
@@ -5709,14 +5760,14 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     );
     let before = restarted
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
         .len();
     let mut target_session = restarted
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5741,7 +5792,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
 
     let after = restarted
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
@@ -5800,7 +5851,7 @@ async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
     );
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     assert!(
@@ -5881,7 +5932,7 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -7047,7 +7098,11 @@ async fn agent_lite_last_activity_overlays_live_stream_stamp() {
     let id = create_agent(&svc, &ws, "Streamer").await;
 
     // Freeze the persisted stamp in the past — a long turn's updated_at.
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.updated_at = "2000-01-01T00:00:00Z".to_string();
     svc.store()
         .update_agent_session(&ws, &s)
@@ -7089,7 +7144,11 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
     let id = create_agent(&svc, &ws, "LongTurn").await;
 
     // Responding status with a long-stale persisted stamp.
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.status = intent_core::AgentStatus::Active;
     s.updated_at = "2000-01-01T00:00:00Z".to_string();
     svc.store()
@@ -10405,7 +10464,11 @@ async fn worst_case_agent_list_row(
         .expect("append assistant");
 
     let ts = now_iso();
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.parent_agent_id = Some(parent.clone());
     s.backend_session_id = Some(AgentId::from("agent-11111111-2222-3333-4444-555555555555"));
     s.acp_session_id = Some("acp-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
@@ -10990,7 +11053,11 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
         .await
         .expect("delegate checkbox task");
     let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(session.task_note_id.as_ref(), Some(&note.id));
 
     let report = svc
@@ -11011,7 +11078,11 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
         .expect("legacy attention request");
     assert_eq!(attention["ok"], json!(true));
     assert!(attention.get("quarantined").is_none());
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(session.completion_report.as_deref(), Some("done"));
     assert_eq!(
         session.attention_request_kind.as_deref(),
@@ -11109,7 +11180,11 @@ async fn delegated_task_note_edits_do_not_suppress_report_to_parent() {
     assert_eq!(result["ok"], json!(true));
     assert!(result.get("quarantined").is_none());
 
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(
         session.completion_report.as_deref(),
         Some("incident regression covered")
@@ -11149,7 +11224,11 @@ async fn delegated_task_note_edits_do_not_suppress_attention_requests() {
         assert_eq!(result["ok"], json!(true));
         assert!(result.get("quarantined").is_none());
 
-        let session = svc.store().get_agent_session(&child).await.expect("child");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .expect("child");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         let note = svc
             .store()
@@ -11448,7 +11527,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
     assert_eq!(r["ok"], json!(true));
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert!(session.task_note_id.is_none());
@@ -11506,7 +11585,7 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     );
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws_a)
+        .list_agent_sessions_with_transcripts(&ws_a)
         .await
         .expect("list ws_a sessions");
     assert!(
@@ -11561,7 +11640,7 @@ async fn delegate_nonexistent_task_note_id_is_rejected_without_spawning() {
 
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(
@@ -11699,7 +11778,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
 
     let before = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("load child before");
     assert!(before.completion_report.is_none());
@@ -11723,7 +11802,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
     // No side effects: the persisted session is byte-identical to `before`.
     let after = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("load child after");
     assert!(
@@ -11889,7 +11968,7 @@ async fn terminal_wake_suppresses_already_delivered_report() {
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -11941,7 +12020,7 @@ async fn terminal_wake_renders_full_report_when_identity_stale() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12071,7 +12150,7 @@ async fn report_to_parent_debounce_settlement_retracts_and_combines() {
     // report event first (it happened first), then the terminal idle.
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12247,7 +12326,7 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12336,7 +12415,7 @@ async fn report_to_parent_flushed_wake_retracted_at_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12475,7 +12554,7 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12546,7 +12625,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
     // (the busy-parent fallback shape).
     let immediate = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session")
         .messages
@@ -12595,7 +12674,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12697,7 +12776,7 @@ async fn group_settlement_retracts_flushed_report_into_aggregate_wake() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("aggregate wake");
@@ -12736,7 +12815,7 @@ async fn durable_completion_wake_retry_reuses_transcript_message_id() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), baseline + 1);
@@ -12844,7 +12923,7 @@ async fn failed_terminal_wake_retries_without_another_event() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -12934,7 +13013,7 @@ async fn failed_aggregated_wake_retries_without_another_event() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -13043,7 +13122,7 @@ async fn multi_watch_wake_failure_coalesces_one_retry_per_child() {
     for (parent, watch_id) in [(&parent_a, &watch_a), (&parent_b, &watch_b)] {
         let session = svc
             .store()
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .expect("parent session");
         assert_eq!(session.messages.len(), 1);
@@ -13195,7 +13274,7 @@ async fn report_wake_says_reported_and_discloses_watch_is_still_armed() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("report wake delivered");
@@ -13244,7 +13323,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         .expect("report without watch");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("report wake delivered");
@@ -13284,7 +13363,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         .expect("second report");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("second report wake");
@@ -14575,7 +14654,7 @@ async fn queue_mutations_enforce_entry_ownership() {
     // Send-now — same visibility rule; the administrator force-sends anything.
     let rows_before = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session")
         .messages
@@ -14594,7 +14673,7 @@ async fn queue_mutations_enforce_entry_ownership() {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .expect("session")
             .messages
@@ -14801,7 +14880,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
         );
         assert_eq!(
             svc.store()
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .expect("session")
                 .messages
@@ -15644,7 +15723,11 @@ async fn send_message_op_persists_message_metadata() {
         .await
         .expect("send");
     assert_eq!(r["queued"], false);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.messages.len(), 1);
     metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
@@ -15683,7 +15766,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     assert_eq!(r["ok"], true);
     let session = svc
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 1);
@@ -15747,7 +15830,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         let id = id.to_string();
         async move {
             svc.store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -15762,7 +15845,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         let text = text.to_string();
         async move {
             svc.store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -16114,7 +16197,9 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     .expect("agent.create");
     let kickoff = svc
         .store()
-        .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().expect("id")))
+        .get_agent_session_with_transcript(&AgentId::from(
+            created["agent"]["id"].as_str().expect("id"),
+        ))
         .await
         .expect("kickoff session");
     assert_eq!(kickoff.initial_message.as_deref(), Some("first"));
@@ -16288,7 +16373,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -16305,7 +16390,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -16660,7 +16745,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&child)
+                .get_agent_session_with_transcript(&child)
                 .await
                 .expect("child session")
                 .messages
@@ -17164,7 +17249,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
     }
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert!(
@@ -17337,7 +17422,7 @@ async fn assert_self_send_rejected(
     }
     let session = svc
         .store()
-        .get_agent_session(agent_id)
+        .get_agent_session_with_transcript(agent_id)
         .await
         .expect("session");
     assert!(
@@ -17475,7 +17560,7 @@ async fn send_message_op_allows_other_sender_and_unattributed_sends() {
     .expect("unattributed send must succeed");
     let session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2);
@@ -17709,7 +17794,11 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("drain queued answer");
     assert_ne!(drained["messageId"], "dup-id");
-    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let answer = session.messages.last().unwrap();
     assert_eq!(json!(answer.id), drained["messageId"]);
     let answer_metadata = answer.metadata.as_ref().unwrap();
@@ -18341,7 +18430,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
     let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(session.name, "Planned");
@@ -18503,7 +18592,7 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(
@@ -18583,7 +18672,7 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let id = AgentId::from(initial["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(session.workspace_id, result.workspace.id);
@@ -20087,7 +20176,7 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
     loop {
         let session = svc
             .store()
-            .get_agent_session(&subscriber)
+            .get_agent_session_with_transcript(&subscriber)
             .await
             .expect("subscriber session");
         if !session.messages.is_empty() {
@@ -20157,7 +20246,7 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let session = svc
         .store()
-        .get_agent_session(&subscriber)
+        .get_agent_session_with_transcript(&subscriber)
         .await
         .expect("session");
     assert!(
@@ -20175,7 +20264,7 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let session = svc
         .store()
-        .get_agent_session(&subscriber)
+        .get_agent_session_with_transcript(&subscriber)
         .await
         .expect("session");
     assert!(
@@ -20239,7 +20328,11 @@ async fn discussion_rehydrated_agent_subscription_excludes_human_events() {
         intentd_test_support::test_timeout(Duration::from_secs(5)),
         async {
             loop {
-                let session = svc.store.get_agent_session(&subscriber).await.unwrap();
+                let session = svc
+                    .store
+                    .get_agent_session_with_transcript(&subscriber)
+                    .await
+                    .unwrap();
                 if !session.messages.is_empty() {
                     break session.messages;
                 }
@@ -20344,7 +20437,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     loop {
         let session = svc
             .store()
-            .get_agent_session(&subscriber)
+            .get_agent_session_with_transcript(&subscriber)
             .await
             .expect("session");
         if !session.messages.is_empty() {
@@ -21378,7 +21471,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // until the turn ends: no risk even with the old entry.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Active;
@@ -21403,7 +21496,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // A stale-responding agent is NOT actively draining — the risk returns.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Active;
@@ -21487,7 +21580,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // actively-responding skip.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Idle;
@@ -21738,7 +21831,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     // Report-time wake: reportToParent now delivers an immediate wake to the parent.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -21762,7 +21855,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(events[0]["data"]["report"], json!(report));
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.completion_report.as_deref(), Some(report));
@@ -22058,7 +22151,11 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let first = create_agent(&svc, &ws, "Participant").await;
-    let mut template = svc.store().get_agent_session_summary(&first).await.unwrap();
+    let mut template = svc
+        .store()
+        .get_agent_session_without_messages(&first)
+        .await
+        .unwrap();
     template.completion_report = Some("r".repeat(8192));
     template.initial_message = Some("initial".repeat(10000));
     template.system_prompt = Some("prompt".repeat(10000));
@@ -22689,7 +22786,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let child_id = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
     let child = svc
         .store()
-        .get_agent_session(&child_id)
+        .get_agent_session_with_transcript(&child_id)
         .await
         .expect("child session");
     assert_eq!(child.parent_agent_id, Some(caller));
@@ -22702,7 +22799,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let rpc_child_id = AgentId::from(rpc_resp["agentId"].as_str().expect("rpc agentId"));
     let rpc_child = svc
         .store()
-        .get_agent_session(&rpc_child_id)
+        .get_agent_session_with_transcript(&rpc_child_id)
         .await
         .expect("rpc child session");
     assert_eq!(rpc_child.parent_agent_id, None);
@@ -22759,7 +22856,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     // The child carries the parent linkage stamped from the caller identity.
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.parent_agent_id, Some(parent.clone()));
@@ -22800,7 +22897,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     // report. The report is persisted on the child session.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -22811,7 +22908,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     );
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.completion_report.as_deref(), Some(report));
@@ -23172,7 +23269,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let mut session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -23225,7 +23322,7 @@ async fn watch_completion_skips_when_parent_deleted() {
     let child = create_agent(&svc, &ws, "Child").await;
     let mut session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -23258,7 +23355,7 @@ async fn sender_watch_registers_ungrouped_for_foreground_caller() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.is_background = true;
@@ -23293,7 +23390,7 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.is_background = true;
@@ -23334,7 +23431,7 @@ async fn sender_watch_skips_delegated_background_caller() {
     let target = create_agent(&svc, &ws, "Sibling").await;
     let mut session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     session.is_background = true;
@@ -23399,7 +23496,7 @@ async fn sender_watch_skips_child_via_created_by_metadata() {
     let child = create_agent(&svc, &ws, "Child").await;
     let mut session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert!(session.parent_agent_id.is_none());
@@ -23511,7 +23608,7 @@ async fn sender_watch_skips_independent_top_level_foreground_target() {
     let peer = create_agent(&svc, &ws, "Peer").await;
     let session = svc
         .store()
-        .get_agent_session(&peer)
+        .get_agent_session_with_transcript(&peer)
         .await
         .expect("peer session");
     assert!(session.parent_agent_id.is_none());
@@ -23664,7 +23761,7 @@ async fn wake_or_create_scope_gate_rejection_create_branch_is_side_effect_free()
 
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws_b)
+        .list_agent_sessions_with_transcripts(&ws_b)
         .await
         .expect("list ws-b sessions");
     assert!(
@@ -23788,7 +23885,7 @@ async fn wake_or_create_unknown_caller_still_proceeds() {
 async fn flag_agent_deleted(svc: &Services, agent: &AgentId) {
     let mut session = svc
         .store()
-        .get_agent_session(agent)
+        .get_agent_session_with_transcript(agent)
         .await
         .expect("caller session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -23880,7 +23977,7 @@ async fn wake_or_create_created_new_sets_parent_to_live_caller() {
 
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert_eq!(
@@ -23898,7 +23995,7 @@ async fn wake_or_create_created_new_sets_parent_to_live_caller() {
     assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert_eq!(session.completion_report.as_deref(), Some("shipped it"));
@@ -23924,7 +24021,7 @@ async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(session.parent_agent_id.is_none());
@@ -23952,7 +24049,7 @@ async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(
@@ -23983,7 +24080,7 @@ async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(
@@ -24005,7 +24102,7 @@ async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
     let note_id = seed_task(&svc, &ws, "Depth cap fail-closed").await;
     let mut session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     session.delegation_depth = Some(MAX_DELEGATION_DEPTH);
@@ -24217,7 +24314,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
 /// when the caller's display name cannot be resolved
-/// (`store.get_agent_session` failed), the reuse path must still return
+/// (`store.get_agent_session_with_transcript` failed), the reuse path must still return
 /// the live subscription id — but must NOT overwrite the watch's stored
 /// `parent_agent_name` with an empty placeholder. Callers pass `None`
 /// through `find_and_refresh_ungrouped_watch` to signal the missing name.
@@ -24355,7 +24452,7 @@ async fn mcp_delegate_immediate_registers_ungrouped_watch() {
 async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     serde_json::to_string(&session.messages).expect("serialize child messages")
@@ -24367,7 +24464,7 @@ async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String 
 async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     let first = session.messages.first().expect("first message");
@@ -24715,7 +24812,7 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     );
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("session");
     assert!(
@@ -24747,7 +24844,11 @@ async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() 
     .await
     .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().expect("id"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         session.skip_auto_commit,
         "agent.create must opt the session out when auto-commit is off"
@@ -25058,7 +25159,7 @@ async fn delegate_after_all(svc: &Services, ws: &WorkspaceId, parent: &AgentId) 
 
 async fn parent_message_count(svc: &Services, parent: &AgentId) -> usize {
     svc.store()
-        .get_agent_session(parent)
+        .get_agent_session_with_transcript(parent)
         .await
         .expect("parent session")
         .messages
@@ -25068,7 +25169,7 @@ async fn parent_message_count(svc: &Services, parent: &AgentId) -> usize {
 async fn parent_messages_text(svc: &Services, parent: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(parent)
+        .get_agent_session_with_transcript(parent)
         .await
         .expect("parent session");
     let blocks: Vec<_> = session.messages.iter().map(|m| &m.content).collect();
@@ -25468,7 +25569,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -25514,7 +25615,7 @@ async fn monitoring_idle_advisory_metadata_flags() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -25945,7 +26046,7 @@ async fn failed_advisory_wake_retries_without_another_event() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -26476,7 +26577,7 @@ async fn grouped_monitoring_idle_delivers_one_advisory_and_group_settles_later()
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -27074,7 +27175,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
         // its active hook defers the refire.
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -27190,7 +27291,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
         // its active PR monitor defers the refire.
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -27647,7 +27748,7 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     for parent in [&a, &c] {
         let session = svc
             .store()
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .expect("parent session");
         assert_eq!(
@@ -28245,7 +28346,11 @@ async fn rearm_watch_on_agent_waiting_idle_child_stays_armed() {
         .expect("B watches C");
     // B looks genuinely complete by the STAB-108 predicate (RuntimeIdle +
     // report, no interrupted row) — only its outgoing watch on C defers.
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
     s.completion_report = Some("waiting on my reviewer".into());
     svc.store()
@@ -28292,7 +28397,11 @@ async fn rearm_watch_on_failed_child_with_outgoing_watch_fires_immediately() {
 
     svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
         .expect("B watches C");
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.status = intent_core::AgentStatus::Error;
     svc.store()
         .update_agent_session(&ws, &s)
@@ -28332,7 +28441,11 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
         svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
             .expect("B watches C");
         wait_for_persisted_watches(&svc, 2).await;
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("waiting on my reviewer".into());
         svc.store()
@@ -28409,7 +28522,11 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
             assert!(std::time::Instant::now() < deadline, "group row persisted");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("waiting on my reviewer".into());
         svc.store()
@@ -29057,7 +29174,7 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
     }
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -29140,7 +29257,7 @@ async fn busy_interim_parent_idle_does_not_seal_group_and_late_delegate_joins() 
     }
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -29743,7 +29860,11 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
     .expect("grouped watch");
     seed_active_pr_monitor(&svc, &ws, &b, 7).await;
     seed_active_hook(&svc, &ws, &b, "late-comment-watch").await;
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.completion_report = Some("done".into());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -29814,7 +29935,11 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         seed_active_pr_monitor(&svc, &ws, &b, 1009).await;
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("PR #1009 ready to merge".into());
         svc.store()
@@ -29873,7 +29998,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
         wait_for_persisted_watches(&svc, 1).await;
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29969,7 +30094,7 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
     // The child's next genuine completion fires the adopted watch.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("second cycle".into());
@@ -30010,7 +30135,7 @@ async fn registration_reconcile_defers_on_reported_idle_child_with_active_hook()
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30063,7 +30188,7 @@ async fn wait_for_reconcile_defers_on_reported_idle_child_with_active_monitor() 
     let monitor = seed_active_pr_monitor(&svc, &ws, &child, 88).await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30119,7 +30244,7 @@ async fn agent_watch_rejects_settled_idle_target_with_no_waiting_reasons() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30167,7 +30292,7 @@ async fn agent_watch_rejects_unreported_idle_target_with_no_waiting_reasons() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30201,7 +30326,7 @@ async fn app_agents_wait_rejects_idle_target_with_no_waiting_reasons() {
     let idle = create_agent(&svc, &ws, "Idle").await;
     let mut s = svc
         .store()
-        .get_agent_session(&idle)
+        .get_agent_session_with_transcript(&idle)
         .await
         .expect("idle session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30407,7 +30532,7 @@ async fn agent_watch_accepts_idle_target_with_queued_message() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30453,7 +30578,7 @@ async fn agent_watch_accepts_idle_target_with_pending_attention() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30488,7 +30613,7 @@ async fn agent_watch_accepts_idle_target_with_interrupted_row() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30524,7 +30649,7 @@ async fn agent_watch_accepts_idle_target_with_event_subscription() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30578,7 +30703,7 @@ async fn agent_watch_accepts_idle_target_with_pending_question() {
         .await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30613,7 +30738,7 @@ async fn watch_scope_gate_precedes_idle_target_guard() {
     let remote = create_agent(&svc, &ws_b, "Remote").await;
     let mut s = svc
         .store()
-        .get_agent_session(&remote)
+        .get_agent_session_with_transcript(&remote)
         .await
         .expect("remote session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30672,7 +30797,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
         wait_for_persisted_watches(&svc, 1).await;
         let mut s = svc
             .store()
-            .get_agent_session(&target)
+            .get_agent_session_with_transcript(&target)
             .await
             .expect("target session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -30807,7 +30932,7 @@ async fn registration_deferral_survives_non_last_hook_terminal_transition() {
     let hook_b = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -31044,7 +31169,11 @@ async fn report_to_parent_suppressed_for_after_all_group_child() {
 
     // The reports are still persisted on the child sessions.
     for (c, expected) in [(&c1, "report one"), (&c2, "report two")] {
-        let session = svc.store().get_agent_session(c).await.expect("child");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(c)
+            .await
+            .expect("child");
         assert_eq!(session.completion_report.as_deref(), Some(expected));
     }
 
@@ -31114,7 +31243,7 @@ async fn report_to_parent_immediate_after_group_delivery() {
     assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let child_session = svc
         .store()
-        .get_agent_session(&c1)
+        .get_agent_session_with_transcript(&c1)
         .await
         .expect("child session");
     assert_eq!(
@@ -31162,7 +31291,11 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     assert_eq!(v["metadata"]["attentionRequestTimestamp"], r["savedAt"]);
 
     // Transcript notice: system role + meta.kind = "discussion-request".
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     let notice = session
         .messages
         .iter()
@@ -31305,7 +31438,11 @@ async fn request_attention_transitions_linked_task_per_kind() {
             expected_status,
             "kind {kind} must set the matching task status"
         );
-        let session = svc.store().get_agent_session(&child).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .expect("sess");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         let notice = session
             .messages
@@ -31467,7 +31604,11 @@ async fn request_attention_validates_inputs() {
         .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert_eq!(session.attention_request_kind, None);
     assert!(session.messages.iter().all(|m| m.role != "system"));
 }
@@ -31713,7 +31854,11 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         assert_eq!(r["ok"], json!(true), "op reports success ({kind})");
 
         // Store persistence is immediate…
-        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("sess");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         // …but nothing user-facing surfaces mid-turn: no events, no notice.
         assert!(
@@ -31760,7 +31905,11 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
                     && e.data["attentionRequestKind"] == json!(kind)),
             "agent:updated attention fields emit at flush: {events:?}"
         );
-        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("sess");
         let notice = session
             .messages
             .iter()
@@ -31833,7 +31982,11 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
         .is_err(),
         "cleared-before-idle raise surfaces nothing"
     );
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert!(
         !session.messages.iter().any(|m| m.role == "system"),
         "no transcript notice for a dismissed raise"
@@ -31975,7 +32128,11 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     .expect("second raise");
 
     // The store keeps latest-wins pending fields…
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
 
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -32011,7 +32168,11 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     assert_eq!(attention[1].data["kind"], json!("blocker"));
     assert_eq!(attention[1].data["reason"], json!("second: sandbox broke"));
 
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     let notices: Vec<_> = session
         .messages
         .iter()
@@ -32134,7 +32295,7 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
     // exactly the child's session name from the store.
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(
@@ -32805,7 +32966,7 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
     .expect("grouped watch");
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Active;
@@ -32851,7 +33012,7 @@ async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
     .expect("grouped watch");
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Active;
@@ -32939,7 +33100,11 @@ fn parse_session_stats_output_maps_cli_shape() {
 async fn session_stats_emits_only_on_change() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Stats").await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     let mut sub = bus.subscribe(SubscriptionFilter {
         event_types: vec![AGENT_SESSION_STATS_CHANGED.to_string()],
@@ -33288,7 +33453,11 @@ async fn agent_update_notifications_muted_preserves_activity_timestamp() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Mute timestamp").await;
     let old = "2020-01-01T00:00:00.000Z";
-    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.updated_at = old.to_string();
     svc.store.update_agent_session(&ws, &session).await.unwrap();
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -33344,7 +33513,11 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
         json!({ "notificationsMuted": false, "isBackground": true }),
         json!({ "name": "Real edit" }),
     ] {
-        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        let mut session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.updated_at = old.to_string();
         svc.store.update_agent_session(&ws, &session).await.unwrap();
         let response = svc
@@ -33385,7 +33558,11 @@ async fn agent_update_pinned_preserves_activity_timestamp() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Pin timestamp").await;
     let old = "2020-01-01T00:00:00.000Z";
-    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.updated_at = old.to_string();
     svc.store.update_agent_session(&ws, &session).await.unwrap();
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -33445,7 +33622,11 @@ async fn agent_update_pinned_mixed_edit_and_validation() {
     let (_t, svc, ws, _bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Before").await;
     let old = "2020-01-01T00:00:00.000Z";
-    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.updated_at = old.to_string();
     svc.store.update_agent_session(&ws, &session).await.unwrap();
 
@@ -34296,7 +34477,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     // inheritance source can still read specialist/model from the row.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.status = intent_core::AgentStatus::Deleted;
@@ -34328,7 +34509,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(session.name, "Explicit Name");
@@ -34377,7 +34558,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
     // inheritance source.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.specialist = Some("retired-specialist".into());
@@ -34401,7 +34582,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(
@@ -34437,7 +34618,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
         .expect("assign prev");
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.specialist = Some("retired-specialist".into());
@@ -34463,7 +34644,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(
@@ -34505,7 +34686,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
     // the purge would remove.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.status = intent_core::AgentStatus::Deleted;
@@ -34516,7 +34697,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
         .expect("mark prev deleted");
     let sessions_before = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list before")
         .len();
@@ -34541,7 +34722,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
 
     let sessions_after = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list after")
         .len();
@@ -34619,7 +34800,7 @@ async fn wake_or_create_store_only_persists_row_level_metadata() {
     );
     let session = svc
         .store()
-        .get_agent_session(&new_id)
+        .get_agent_session_with_transcript(&new_id)
         .await
         .expect("session");
     assert_eq!(
@@ -35185,7 +35366,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
     let id = create_agent(&svc, &ws_a, "Owned").await;
     let mut session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("owner session");
     session.name = "Renamed".to_string();
@@ -35200,7 +35381,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
     assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
     let reread = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("still there");
     assert_ne!(reread.name, "Renamed");
@@ -35233,7 +35414,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
         .expect("delete returns bool");
     assert!(!removed, "cross-ws delete must remove zero rows");
     svc.store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("row still present after cross-ws delete");
 }
@@ -35301,7 +35482,11 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 
     // Store rows are gone — the cascade ran after the live-state sweep.
     for id in [&a, &b, &c] {
-        let err = svc.store().get_agent_session(id).await.expect_err("gone");
+        let err = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect_err("gone");
         assert!(matches!(err, Error::NotFound(_)), "{id}: {err:?}");
     }
 
@@ -35380,7 +35565,7 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     // Exactly one deleted-completion wake reached the chief parent.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session survives the delete");
     assert_eq!(parent_session.messages.len(), 1);
@@ -35410,7 +35595,7 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     svc.handle_completion_event(&event).await;
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1, "duplicate wake delivered");
@@ -36231,7 +36416,7 @@ async fn grouped_child_failure_wakes_parent_immediately() {
     // immediate wake's metadata (`watchStillArmed: true`).
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let failure_meta = parent_session
@@ -37046,7 +37231,9 @@ async fn migrate_queue_preserves_order_resets_flags_and_gcs_poisoned() {
     // was written through with the reset flags — nothing rehydrates for the
     // dead agent at the next startup.
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     assert_eq!(svc.record_terminal_failure(&poisoned, "boom"), 1);
@@ -37097,7 +37284,9 @@ async fn migrate_queue_empty_queue_still_gcs_poisoned_session() {
         .expect("migrate empty");
     assert_eq!(migrated, 0);
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     // No entries moved → no agent:queue:updated noise for the target.
@@ -37148,7 +37337,11 @@ async fn migrate_queue_rejects_unknown_target_without_draining() {
         .expect_err("unknown target must fail closed");
     assert!(matches!(err, Error::InvalidParams(_)));
     // Nothing was drained or deleted: the parked message and session survive.
-    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&poisoned)
+        .await
+        .is_ok());
     assert!(svc.dequeue_message(&poisoned).is_some());
 }
 
@@ -37187,7 +37380,11 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
 
     // GC skipped: the poisoned session survives with its durable rows, and
     // the in-memory drain was rolled back — nothing leaked onto the target.
-    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&poisoned)
+        .await
+        .is_ok());
     let rows = persisted_queue(&svc, &poisoned).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], "m-0");
@@ -37211,7 +37408,9 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
         .expect("retry succeeds");
     assert_eq!(migrated, 2);
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
@@ -38133,7 +38332,11 @@ fn context_size_error_classifier() {
 async fn deterministic_prompt_rejection_poisons_session_and_streak() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Rejected").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     // Error + the #940 rejection → poisoned without any streak.
     session.status = intent_core::AgentStatus::Error;
@@ -38219,7 +38422,11 @@ fn normalize_failure_text_strips_volatile_tokens() {
 async fn session_poisoned_requires_error_status_and_fatal_reason_or_streak() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Poisoned").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     // Fatal reason but non-Error status → not poisoned (status gate).
     session.status = intent_core::AgentStatus::Active;
@@ -38311,7 +38518,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
     // The fresh session inherits specialist from the poisoned source.
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(new_id.as_str()))
         .await
         .expect("new session");
     assert_eq!(session.specialist.as_deref(), Some("implementor"));
@@ -38429,7 +38636,7 @@ async fn wake_or_create_migrates_poisoned_queue_to_created_agent() {
 
     // GC: hard-deleted, nothing left to rehydrate at the next startup.
     assert!(matches!(
-        svc.store().get_agent_session(&prev).await,
+        svc.store().get_agent_session_with_transcript(&prev).await,
         Err(Error::NotFound(_))
     ));
     assert!(persisted_queue(&svc, &prev).await.is_empty());
@@ -38473,7 +38680,7 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     assert_eq!(moved.content, "parked");
     assert!(svc.dequeue_message(&live).is_none());
     assert!(matches!(
-        svc.store().get_agent_session(&bad).await,
+        svc.store().get_agent_session_with_transcript(&bad).await,
         Err(Error::NotFound(_))
     ));
 }
@@ -38530,7 +38737,7 @@ async fn wake_or_create_migrates_cross_workspace_poisoned_sibling_queue_to_woken
     assert_eq!(moved.id, "m-0");
     assert!(svc.dequeue_message(&live).is_none());
     assert!(matches!(
-        svc.store().get_agent_session(&bad).await,
+        svc.store().get_agent_session_with_transcript(&bad).await,
         Err(Error::NotFound(_))
     ));
     let task = svc
@@ -38561,7 +38768,11 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     }
     // Soft-delete: the row survives with status Deleted; park a queue on it
     // that must NOT be migrated.
-    let mut soft_session = svc.store().get_agent_session(&soft).await.expect("soft");
+    let mut soft_session = svc
+        .store()
+        .get_agent_session_with_transcript(&soft)
+        .await
+        .expect("soft");
     soft_session.status = intent_core::AgentStatus::Deleted;
     soft_session.updated_at = intent_core::now_iso();
     svc.store()
@@ -38595,7 +38806,7 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     assert!(svc.dequeue_message(&live).is_none());
     let soft_row = svc
         .store()
-        .get_agent_session(&soft)
+        .get_agent_session_with_transcript(&soft)
         .await
         .expect("soft row survives cleanup");
     assert_eq!(soft_row.status, intent_core::AgentStatus::Deleted);
@@ -38648,7 +38859,11 @@ async fn wake_or_create_survives_failed_queue_migration() {
     // in memory) on the poisoned queue; nothing leaked onto the new agent.
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     assert!(svc.dequeue_message(&new_id).is_none());
-    assert!(svc.store().get_agent_session(&prev).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&prev)
+        .await
+        .is_ok());
     assert_eq!(persisted_queue(&svc, &prev).await.len(), 1);
     {
         let guard = svc.agent_queues.lock().unwrap();
@@ -38680,7 +38895,7 @@ async fn wake_or_create_survives_failed_queue_migration() {
     assert_eq!(resp2["created"], false);
     assert_eq!(resp2["cleanedUpAgentIds"], json!([prev.clone()]));
     assert!(matches!(
-        svc.store().get_agent_session(&prev).await,
+        svc.store().get_agent_session_with_transcript(&prev).await,
         Err(Error::NotFound(_))
     ));
     let guard = svc.agent_queues.lock().unwrap();
@@ -38716,7 +38931,7 @@ async fn repeated_identical_failure_wake_is_deduped_per_parent() {
         let parent = parent.clone();
         async move {
             svc.store()
-                .get_agent_session(&parent)
+                .get_agent_session_with_transcript(&parent)
                 .await
                 .expect("parent session")
                 .messages
@@ -38964,7 +39179,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
     let aid = create_agent(&svc, &ws, "Provisioning").await;
     let (_directory, path) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
     if target == 1 {
-        let mut session = store.get_agent_session(&aid).await.unwrap();
+        let mut session = store.get_agent_session_with_transcript(&aid).await.unwrap();
         session.status = AgentStatus::Deleted;
         store.update_agent_session(&ws, &session).await.unwrap();
     } else if target == 2 {
@@ -39062,7 +39277,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
     if target == 0 {
         assert_eq!(
             reopened
-                .get_agent_session(&aid)
+                .get_agent_session_with_transcript(&aid)
                 .await
                 .unwrap()
                 .sandbox_path
@@ -39071,7 +39286,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
         );
     } else if target == 1 {
         assert!(reopened
-            .get_agent_session(&aid)
+            .get_agent_session_with_transcript(&aid)
             .await
             .unwrap()
             .sandbox_path
@@ -39211,7 +39426,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     let aid = create_agent(&svc, &ws, "Doomed").await;
     let mut session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -39242,7 +39457,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     );
     let session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     assert!(
@@ -39279,7 +39494,7 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
     );
     let session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     assert_eq!(
@@ -39330,7 +39545,11 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
     }
 
     // Old (full-transcript) projection, still used by the event-emit paths.
-    let full = svc.store().get_agent_session(&id).await.expect("session");
+    let full = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let old_lite = svc.project_lite_with_flags(full);
     let old = serde_json::to_value(&old_lite).unwrap();
     assert!(
@@ -39531,7 +39750,11 @@ async fn agent_lite_last_message_id_follows_newest_message() {
     )
     .await
     .expect("replace");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let newest = session.messages.last().expect("replaced rows");
     assert_eq!(newest.role, "assistant");
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
@@ -39617,7 +39840,7 @@ async fn agent_lite_last_message_role_live_turn_overlay_flip() {
 /// transcripts, and their per-session message work is bounded (the newest
 /// user/assistant rows only) regardless of per-agent message count — proven
 /// by corrupting the content JSON of every OTHER message row, which errors
-/// any path that fetches/decodes it (as `get_agent_session` demonstrates).
+/// any path that fetches/decodes it (as `get_agent_session_with_transcript` demonstrates).
 /// Query count stays fixed by construction: `agent_list_op` issues one
 /// summaries read plus one bounded projections read for the whole workspace,
 /// never a per-agent (or per-message) transcript query.
@@ -39662,7 +39885,10 @@ async fn agent_list_and_get_do_not_hydrate_transcripts_regression() {
     // fails on the corrupted rows — so the assertions below prove the new
     // paths never touch them.
     assert!(
-        svc.store().get_agent_session(&ids[0]).await.is_err(),
+        svc.store()
+            .get_agent_session_with_transcript(&ids[0])
+            .await
+            .is_err(),
         "full transcript hydration must fail on the corrupted rows"
     );
 
@@ -39826,7 +40052,7 @@ async fn link_task_note(
     .expect("mark as task");
     let mut s = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     s.task_note_id = Some(note.id.clone());
@@ -39870,7 +40096,7 @@ async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake");
@@ -39912,7 +40138,7 @@ async fn stall_annotation_skipped_when_completion_report_present() {
     link_task_note(&svc, &ws, &child, "Port frobnicator", "in_progress").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("all done".into());
@@ -39940,7 +40166,7 @@ async fn stall_annotation_skipped_when_completion_report_present() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -39971,7 +40197,7 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
     let dangling = create_agent(&svc, &ws, "Dangling").await;
     let mut s = svc
         .store()
-        .get_agent_session(&dangling)
+        .get_agent_session_with_transcript(&dangling)
         .await
         .expect("session");
     s.task_note_id = Some(intent_core::NoteId::from("note-gone"));
@@ -40001,7 +40227,7 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 3, "three clean wakes");
@@ -40045,7 +40271,7 @@ async fn stall_annotation_skipped_for_agent_failed() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -40098,7 +40324,7 @@ async fn stall_annotation_applies_to_grouped_after_all_child_line() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -40176,7 +40402,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     // The target settled while the daemon was down: Completed but with NO
     // completion report, and its task note is still in_progress.
     let mut s = store
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::Completed;
@@ -40191,7 +40417,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
 
     let session = restarted
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -40233,7 +40459,7 @@ async fn stall_annotation_skipped_when_task_review_required() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -40278,7 +40504,7 @@ async fn stall_tail_never_contradicts_rendered_report() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -40325,7 +40551,7 @@ async fn stall_tail_never_contradicts_rendered_report() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -40367,7 +40593,11 @@ async fn truncation_redrive_eligibility_gates() {
     // Fully eligible: parent + in_progress task + no report.
     let child = create_agent(&svc, &ws, "Child").await;
     link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -40388,7 +40618,11 @@ async fn truncation_redrive_eligibility_gates() {
 
     // Delegated but taskless → ineligible.
     let taskless = create_agent(&svc, &ws, "Taskless").await;
-    let mut s = svc.store().get_agent_session(&taskless).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&taskless)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -40402,7 +40636,11 @@ async fn truncation_redrive_eligibility_gates() {
     // Delegated + task, but the task is not in_progress → ineligible.
     let waiting = create_agent(&svc, &ws, "Waiting").await;
     link_task_note(&svc, &ws, &waiting, "Parked task", "waiting").await;
-    let mut s = svc.store().get_agent_session(&waiting).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&waiting)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -40417,7 +40655,11 @@ async fn truncation_redrive_eligibility_gates() {
     // wake, not a redrive).
     let reported = create_agent(&svc, &ws, "Reported").await;
     link_task_note(&svc, &ws, &reported, "Reported task", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&reported).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&reported)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     s.completion_report = Some("all done".into());
     svc.store()
@@ -40431,7 +40673,11 @@ async fn truncation_redrive_eligibility_gates() {
 
     // Dangling task_note_id (note gone) → fail closed.
     let dangling = create_agent(&svc, &ws, "Dangling").await;
-    let mut s = svc.store().get_agent_session(&dangling).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&dangling)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     s.task_note_id = Some(intent_core::NoteId::from("gone-note"));
     svc.store()
@@ -40525,7 +40771,11 @@ async fn empty_wake_recovery_raises_attention_for_root_agent() {
     let nudged = svc.recover_empty_harness_wake(&root, &ws).await;
     assert!(!nudged, "root agents are not redrive-eligible — no nudge");
 
-    let session = svc.store().get_agent_session(&root).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&root)
+        .await
+        .expect("session");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("blocker"),
@@ -40557,7 +40807,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -40585,7 +40839,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
         Some(json!({ "type": "empty_wake_redrive" })),
         "nudge row is attributable"
     );
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(
         session.attention_request_kind.is_none(),
         "redrive arm raises no attention"
@@ -40610,7 +40868,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
         !svc.has_ready_to_send(&child),
         "no nudge enqueued past the cap"
     );
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("blocker"),
@@ -40638,7 +40900,11 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
         MessageOrigin::Automatic,
     );
     assert!(!svc.recover_empty_harness_wake(&queued, &ws).await);
-    let session = svc.store().get_agent_session(&queued).await.expect("s");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&queued)
+        .await
+        .expect("s");
     assert!(
         session.attention_request_kind.is_none(),
         "imminent drain suppresses the recovery"
@@ -40651,7 +40917,11 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
         .await
         .expect("seed attention");
     assert!(!svc.recover_empty_harness_wake(&raised, &ws).await);
-    let session = svc.store().get_agent_session(&raised).await.expect("s");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&raised)
+        .await
+        .expect("s");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("discussion"),
@@ -40730,7 +41000,11 @@ async fn record_pending_proposals_persists_and_emits_agent_updated() {
     assert!(svc.record_pending_proposals(&ws, &id, &msg.id, &ids).await);
 
     // Persisted on the session row and lifted into the AgentLite projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].proposal_id, "tc-1");
@@ -40785,7 +41059,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_proposals(&ws, &id, &m2.id, &["tc-b".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -40806,7 +41084,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_proposals(&ws, &id, &m3.id, &["tc-a".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -40826,7 +41108,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_questions_marker(&ws, &id, &asked.id)
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str())
@@ -40850,7 +41136,11 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
 
     // Empty ids: no write, no marker key.
     assert!(!svc.record_pending_proposals(&ws, &id, &msg.id, &[]).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert!(session
         .metadata
@@ -40877,13 +41167,21 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
         )
         .await
         .expect("corrupt marker");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert!(
         svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_proposals().len(), 1);
     assert_eq!(session.pending_proposals()[0].proposal_id, "tc-1");
 }
@@ -40921,7 +41219,11 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
         .await
         .expect("replace");
     let new_carrier = r["messages"][1]["id"].as_str().expect("new id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(pending.len(), 1, "tc-2 was not pending and is not re-added");
     assert_eq!(pending[0].proposal_id, "tc-1");
@@ -40940,7 +41242,11 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
     )
     .await
     .expect("replace again");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
 }
 
@@ -41005,7 +41311,11 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
     assert_eq!(messages.len(), 2);
     let new_carrier = &messages[1].id;
     assert_eq!(new_carrier, &a1.id, "kept rows keep their ids");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -41307,7 +41617,11 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
     assert_eq!(r["outcome"], json!("applied"));
 
     // Pending list emptied, resolution persisted, both in the projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
@@ -41396,7 +41710,11 @@ async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
         .expect("resolve");
     assert_eq!(r["outcome"], json!("dismissed"));
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
@@ -41483,7 +41801,11 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         .expect("re-resolve");
     assert_eq!(again["success"], json!(true));
     assert_eq!(again["outcome"], json!("applied"), "persisted outcome wins");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("applied"))
@@ -41634,7 +41956,11 @@ async fn resolve_proposal_error_paths() {
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 
     // All failures left the pending entry intact.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_proposals().len(), 1);
     assert!(session.proposal_resolutions().is_empty());
 }
@@ -41723,7 +42049,11 @@ async fn resolve_proposal_removes_only_named_entry() {
     .await
     .expect("resolve");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -41760,7 +42090,11 @@ async fn resolve_proposal_ignores_seeded_invalid_outcome() {
         .await
         .expect("seed invalid resolution");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         session.proposal_resolutions().is_empty(),
         "reader must filter non-contract outcomes"
@@ -41811,7 +42145,11 @@ async fn resolve_proposal_matches_whitespace_id_verbatim() {
         .expect("whitespace-padded id must resolve");
     assert_eq!(r["proposalId"], json!(ws_id));
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get(ws_id),
@@ -41863,7 +42201,11 @@ async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
     .await
     .expect("resolve");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let resolutions = session.proposal_resolutions();
     assert_eq!(resolutions.len(), 100, "capped at the retention limit");
     assert!(
@@ -41888,7 +42230,11 @@ async fn pending_questions_tail_fallback_materializes_marker_and_survives_user_r
 
     // Empty transcript → no hold, and nothing materialized.
     assert!(!svc.questions_pending(&id).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(!session.pending_questions_marker_written());
 
     // Plain assistant message (no question blocks) → no hold.
@@ -41911,7 +42257,11 @@ async fn pending_questions_tail_fallback_materializes_marker_and_survives_user_r
         .await
         .expect("append question");
     assert!(svc.questions_pending(&id).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str()),
@@ -41952,7 +42302,11 @@ async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
     let id = create_agent(&svc, &ws, "Asker").await;
 
     svc.materialize_legacy_pending_questions_marker(&id).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         !session.pending_questions_marker_written(),
         "empty transcript: nothing to materialize"
@@ -41964,7 +42318,11 @@ async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
         .await
         .expect("append question");
     svc.materialize_legacy_pending_questions_marker(&id).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str()),
@@ -42036,7 +42394,7 @@ async fn pending_questions_survive_trailing_system_row() {
     // An explicit dismissal past the system row still releases it.
     let asked = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session")
         .pending_questions_message_id()
@@ -42131,7 +42489,11 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
 
     // Marker persisted on the session row (survives reload) and lifted into
     // the AgentLite metadata projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.dismissed_questions_message_id(),
         Some(asked.id.as_str())
@@ -42420,7 +42782,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
     // Force the session's metadata column into a non-object shape — not
     // reachable through the normal `agent.*` API, but defensively possible
     // if the column is ever written to by another code path.
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!("legacy-string-metadata"));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -42433,7 +42799,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
         .expect("dismiss");
     assert_eq!(r["success"], json!(true));
 
-    let after = svc.store().get_agent_session(&id).await.expect("session");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         after.dismissed_questions_message_id(),
         Some(asked.id.as_str()),
@@ -42453,7 +42823,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
 async fn dismiss_questions_preserves_existing_session_metadata() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!({ "source": "test-suite" }));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -42464,7 +42838,11 @@ async fn dismiss_questions_preserves_existing_session_metadata() {
         .await
         .expect("dismiss");
 
-    let session = svc.store().get_agent_session(&id).await.expect("reload");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     let metadata = session.metadata.as_ref().expect("metadata");
     assert_eq!(metadata["source"], json!("test-suite"));
     assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-1"));
@@ -42478,7 +42856,11 @@ async fn dismiss_questions_preserves_existing_session_metadata() {
 async fn dismiss_questions_preserves_system_prompt() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.system_prompt = Some("You are a careful reviewer.".to_string());
     svc.store()
         .update_agent_session(&ws, &session)
@@ -42489,7 +42871,11 @@ async fn dismiss_questions_preserves_system_prompt() {
         .await
         .expect("dismiss");
 
-    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.dismissed_questions_message_id(),
         Some("msg-1"),
@@ -42526,7 +42912,11 @@ async fn dismiss_questions_fails_closed() {
             .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.dismissed_questions_message_id(), None);
 
     // Blank messageId → InvalidParams.
@@ -42647,7 +43037,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str())
@@ -42677,7 +43071,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
     )
     .await
     .expect("append plain assistant");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str()),
@@ -42690,7 +43088,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         .await
         .expect("append re-ask");
     let reask_id = reask["message"]["id"].as_str().expect("id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(reask_id.as_str()),
@@ -42736,7 +43138,11 @@ async fn pending_marker_cleared_by_matching_answer_only() {
     )
     .await
     .expect("append answer");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(session.pending_questions_marker_written());
     assert!(!svc.questions_pending(&id).await);
@@ -42759,7 +43165,11 @@ async fn dismissal_neutralizes_pending_marker() {
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_id.clone())
         .await
         .expect("dismiss");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str()),
@@ -42815,7 +43225,11 @@ async fn edit_truncate_reconciles_pending_marker() {
         .await
         .expect("messages");
     let question_id = messages.last().expect("question row").id.clone();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(question_id.as_str()),
@@ -42829,7 +43243,11 @@ async fn edit_truncate_reconciles_pending_marker() {
     svc.agent_edit_truncate_op(&id, &first_id)
         .await
         .expect("truncate to empty");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(!svc.questions_pending(&id).await);
 }
@@ -42866,7 +43284,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata(&q0));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(q1.as_str()),
@@ -42878,7 +43300,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata("dropped-by-the-swap"));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(!svc.questions_pending(&id).await);
 
@@ -42886,7 +43312,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata(&q1));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
 }
 
@@ -42923,7 +43353,11 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
 
     // Marker persisted on the session row (survives reload) and lifted into
     // the AgentLite metadata projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
     let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
@@ -43004,7 +43438,11 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .expect("mark older");
     assert_eq!(r["success"], json!(true));
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(second.id.as_str()));
 
     // Same message again: idempotent success, still no event.
@@ -43076,7 +43514,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark unknown");
     assert_eq!(r["lastSeenMessageId"], json!("msg-unknown"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some("msg-unknown"));
 
     // Dangling current marker: a real message still advances it — the
@@ -43086,7 +43528,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark real");
     assert_eq!(r["lastSeenMessageId"], json!(real.id));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(real.id.as_str()));
 
     // Unknown NEW id over a resolvable current marker: the write-through is
@@ -43096,7 +43542,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark unknown over real");
     assert_eq!(r["lastSeenMessageId"], json!("msg-unknown-2"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some("msg-unknown-2"));
 }
 
@@ -43110,7 +43560,11 @@ async fn mark_seen_preserves_non_object_metadata() {
     // Force the session's metadata column into a non-object shape — not
     // reachable through the normal `agent.*` API, but defensively possible
     // if the column is ever written to by another code path.
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!("legacy-string-metadata"));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -43121,7 +43575,11 @@ async fn mark_seen_preserves_non_object_metadata() {
         .await
         .expect("mark seen");
 
-    let after = svc.store().get_agent_session(&id).await.expect("session");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(after.last_seen_message_id(), Some("msg-1"));
     assert_eq!(
         after
@@ -43140,7 +43598,11 @@ async fn mark_seen_preserves_non_object_metadata() {
 async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Reader").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!({ "source": "test-suite" }));
     session.system_prompt = Some("You are a careful reviewer.".to_string());
     svc.store()
@@ -43155,7 +43617,11 @@ async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
         .await
         .expect("mark seen");
 
-    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     let metadata = after.metadata.as_ref().expect("metadata");
     assert_eq!(metadata["source"], json!("test-suite"));
     assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-q1"));
@@ -43191,7 +43657,11 @@ async fn mark_seen_fails_closed() {
             .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), None);
 
     // Blank messageId → InvalidParams.
@@ -43541,7 +44011,11 @@ async fn pending_questions_do_not_gate_store_only_automatic_send() {
         .expect("automatic send succeeds");
     assert_eq!(r["queued"], json!(false), "{r}");
     assert!(r.get("heldForQuestions").is_none(), "{r}");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.messages.len(),
         2,
@@ -43598,7 +44072,7 @@ async fn pending_questions_do_not_gate_store_only_send_to_task() {
     assert!(r["result"].get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2, "user row appended");
@@ -43622,7 +44096,7 @@ async fn pending_questions_do_not_gate_store_only_parent_wake() {
     assert!(r.get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2, "wake row appended");
@@ -43958,7 +44432,7 @@ async fn agent_watch_delivers_once_and_is_retired() {
     // metadata (`watchStillArmed: false`), mirroring `hookStillActive`.
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -44023,7 +44497,7 @@ async fn agent_watch_removed_after_target_deleted() {
     // monorepo#2060: the deleted-kind retirement is machine-readable too.
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -44080,7 +44554,7 @@ async fn agent_watch_resolved_when_target_retires() {
     );
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -44507,7 +44981,11 @@ async fn retire_cascade_reaches_cross_workspace_descendants() {
 
     // Rows retired on both sides of the workspace boundary.
     for id in [&parent, &child] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_some(), "{id} retired by the cascade");
     }
     // The remote child's hook and PR monitor are cancelled by its cleanup.
@@ -44634,7 +45112,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
 
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -44721,7 +45199,7 @@ async fn group_rehydration_settles_retired_child() {
     // The retired member reconciled as settled and the sealed group fired.
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -44806,7 +45284,7 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     // fan-out wake metadata (`watchStillArmed: true`).
     let watcher_session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let attention_meta = watcher_session
@@ -45181,7 +45659,7 @@ async fn agent_watch_reconciles_already_settled_target() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.status = intent_core::AgentStatus::Completed;
@@ -45587,7 +46065,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     // Parent linkage: `child` is an actively executing delegate of `parent`.
     let mut child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
@@ -45759,7 +46237,7 @@ async fn agent_snapshot_excludes_settled_children() {
         let child = create_agent(&svc, &ws, &format!("Child {status:?}")).await;
         let mut child_session = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         child_session.parent_agent_id = Some(parent.clone());
@@ -45794,7 +46272,7 @@ async fn agent_snapshot_counts_idle_and_hook_waiting_children_as_unsettled_only(
         let child = create_agent(&svc, &ws, name).await;
         let mut child_session = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         child_session.parent_agent_id = Some(parent.clone());
@@ -45832,7 +46310,7 @@ async fn agent_snapshot_excludes_idle_children() {
     let created_idle = create_agent(&svc, &ws, "Created Idle").await;
     let mut created_session = svc
         .store()
-        .get_agent_session(&created_idle)
+        .get_agent_session_with_transcript(&created_idle)
         .await
         .expect("created-idle session");
     assert_eq!(created_session.status, intent_core::AgentStatus::Idle);
@@ -45845,7 +46323,7 @@ async fn agent_snapshot_excludes_idle_children() {
     let turn_idle = create_agent(&svc, &ws, "Turn Idle").await;
     let mut turn_session = svc
         .store()
-        .get_agent_session(&turn_idle)
+        .get_agent_session_with_transcript(&turn_idle)
         .await
         .expect("turn-idle session");
     turn_session.parent_agent_id = Some(parent.clone());
@@ -45896,7 +46374,7 @@ async fn agent_snapshot_counts_cross_workspace_children() {
     let child = create_agent(&svc, &other_ws, "Remote Child").await;
     let mut child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
@@ -46706,7 +47184,7 @@ async fn batch_delegate_rejects_unknown_specialist_default_fast() {
     }
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no child persisted: {agents:?}");
@@ -47200,7 +47678,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     // The bare entry inherited the top-level defaults…
     let plain_session = svc
         .store()
-        .get_agent_session(&AgentId::from(rp["agentId"].as_str().unwrap()))
+        .get_agent_session_with_transcript(&AgentId::from(rp["agentId"].as_str().unwrap()))
         .await
         .expect("plain session");
     assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
@@ -47212,7 +47690,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     // …and the object entry's overrides won, field by field.
     let custom_session = svc
         .store()
-        .get_agent_session(&AgentId::from(rc["agentId"].as_str().unwrap()))
+        .get_agent_session_with_transcript(&AgentId::from(rc["agentId"].as_str().unwrap()))
         .await
         .expect("custom session");
     assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
@@ -47305,7 +47783,7 @@ async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake");
@@ -47367,7 +47845,7 @@ async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let text = session.messages[0].content.to_string();
@@ -47418,7 +47896,7 @@ async fn taskless_and_no_delta_wakes_are_unannotated() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 2, "two wakes");
@@ -47560,7 +48038,7 @@ async fn group_wake_stamps_all_settled_member_trigger_tasks() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -47635,7 +48113,7 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -47692,7 +48170,7 @@ async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "one wake");
@@ -47734,7 +48212,7 @@ async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 2, "second wake");
@@ -47784,7 +48262,7 @@ async fn unlinked_child_completion_wake_stamps_flips_only() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -47840,7 +48318,7 @@ async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), baseline + 1, "one report wake");
@@ -47868,7 +48346,7 @@ async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session after terminal wake");
     let metadata = session.messages[baseline + 1]
@@ -47954,7 +48432,7 @@ async fn group_wake_includes_flipped_completion_triggers() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -48016,7 +48494,7 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "one persisted message");
@@ -49265,7 +49743,11 @@ async fn startup_resume_and_manual_resolution_have_one_winner() {
         automatic.is_ok() ^ manual_won,
         "exactly one resume must win"
     );
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.messages.iter().filter(|m| m.role == "user").count(),
         1
@@ -49300,7 +49782,11 @@ async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
         svc.abandon_interrupted_agent(&id)
     );
     assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let abandonment_notices = session
         .messages
         .iter()
@@ -49354,7 +49840,11 @@ async fn startup_resume_abandon_persist_failure_remains_retryable() {
         .await
         .unwrap()
         .is_none());
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session
             .messages
@@ -49422,7 +49912,11 @@ async fn completion_startup_checks_do_not_read_transcripts() {
         .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
     sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', '2026-09-30T00:00:00Z')")
         .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
-    assert!(svc.store().get_agent_session(&child).await.is_err());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .is_err());
     assert_eq!(
         svc.store()
             .get_agent_session_summary(&child)
@@ -49443,7 +49937,7 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages
@@ -49462,7 +49956,7 @@ async fn completion_startup_checks_do_not_read_transcripts() {
 }
 
 /// Make `agent_id`'s stored transcript undecodable so any full transcript
-/// read (`get_agent_messages(.., None)` / `get_agent_session`) fails, while
+/// read (`get_agent_messages(.., None)` / `get_agent_session_with_transcript`) fails, while
 /// the metadata lookups keep working.
 async fn poison_transcript(svc: &Services, agent_id: &AgentId) {
     svc.store()
@@ -49480,7 +49974,10 @@ async fn poison_transcript(svc: &Services, agent_id: &AgentId) {
         .await
         .unwrap();
     assert!(
-        svc.store().get_agent_session(agent_id).await.is_err(),
+        svc.store()
+            .get_agent_session_with_transcript(agent_id)
+            .await
+            .is_err(),
         "fixture: a full session read must fail on the undecodable row"
     );
 }
@@ -49647,7 +50144,11 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('history', ?, 0, 'assistant', ?, ?)")
             .bind(&parent.0).bind("x".repeat(1024 * 1024)).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
         for child in &children {
-            let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+            let mut session = svc
+                .store()
+                .get_agent_session_without_messages(child)
+                .await
+                .unwrap();
             session.status = intent_core::AgentStatus::Completed;
             session.completion_report = Some("done".into());
             svc.store()
@@ -49690,7 +50191,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         let recovery = restarted.prepare_startup_completion_recovery().await;
         assert!(restarted
             .store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages
@@ -49702,7 +50203,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         assert_eq!(
             restarted
                 .store()
-                .get_agent_session(&parent)
+                .get_agent_session_with_transcript(&parent)
                 .await
                 .unwrap()
                 .messages
@@ -49736,7 +50237,11 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
         wait_for_persisted_watches(&svc, 1).await;
         let hook_a = seed_active_hook(&svc, &ws, &child, "first hook").await;
         let hook_b = seed_active_hook(&svc, &ws, &child, "last hook").await;
-        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(&child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::RuntimeIdle;
         session.completion_report = Some("historical completion".into());
         session.completion_report_timestamp = Some(now_iso());
@@ -49862,7 +50367,11 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
             None,
         )
         .unwrap();
-        let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::Completed;
         session.completion_report = Some("done".into());
         svc.store()
@@ -49926,7 +50435,11 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         link_task_note(&svc, &ws, &child, "Unfinished task", "in_progress").await;
-        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(&child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::Completed;
         session.completion_report = report;
         svc.store()
@@ -49945,7 +50458,11 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
         wait_for_persisted_watches(&svc, 1).await;
         sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', ?)")
             .bind(&child.0).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
-        assert!(svc.store().get_agent_session(&child).await.is_err());
+        assert!(svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .is_err());
         assert_eq!(
             svc.store()
                 .get_agent_session_summary(&child)
@@ -49962,7 +50479,7 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
             .await;
         let messages = restarted
             .store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages;
@@ -50234,7 +50751,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     assert!(restarted.resume_interrupted_agent(&agent).await.is_err());
     let messages = restarted
         .store
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .unwrap()
         .messages;
@@ -50299,7 +50816,11 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         assert_eq!(result.is_ok(), outcome != "failure");
         if outcome == "collision" {
             assert_ne!(result.as_ref().unwrap()["messageId"], entry_id);
-            let session = svc.store.get_agent_session(&agent).await.unwrap();
+            let session = svc
+                .store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .unwrap();
             assert_eq!(session.messages.len(), 2);
             assert_eq!(
                 session.messages[1].metadata.as_ref().unwrap()["submissionIds"],

@@ -73,6 +73,7 @@ async fn provider_of(svc: &Services, id: &AgentId) -> String {
         .await
         .expect("child session")
         .provider
+        .clone()
         .expect("every new session pins a provider")
 }
 

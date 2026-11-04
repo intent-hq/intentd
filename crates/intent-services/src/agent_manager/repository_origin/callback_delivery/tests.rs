@@ -2405,7 +2405,11 @@ impl NativeHarness {
                 intent_core::CURRENT_HARNESS_VERSION
             );
             let id = intent_core::AgentId::from(created["agent"]["id"].as_str().unwrap());
-            let row = original.store.get_agent_session(&id).await.unwrap();
+            let row = original
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
             assert_eq!(
                 row.harness_features.as_ref(),
                 Some(&created["agent"]["harnessFeatures"])
@@ -8437,7 +8441,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 );
                 original
                     .store
-                    .get_agent_session(&intent_core::AgentId::from(
+                    .get_agent_session_with_transcript(&intent_core::AgentId::from(
                         result["agent"]["id"].as_str().unwrap(),
                     ))
                     .await
@@ -9607,7 +9611,7 @@ mod genuine_native_startup {
                 );
                 services
                     .store
-                    .get_agent_session(&intent_core::AgentId::from(
+                    .get_agent_session_with_transcript(&intent_core::AgentId::from(
                         created["agent"]["id"].as_str().unwrap(),
                     ))
                     .await
@@ -9658,7 +9662,7 @@ mod genuine_native_startup {
             let stored = self
                 .services
                 .store
-                .get_agent_session(&self.row.id)
+                .get_agent_session_with_transcript(&self.row.id)
                 .await
                 .unwrap();
             assert_eq!(
@@ -9868,7 +9872,7 @@ mod genuine_native_startup {
             assert_eq!(
                 self.services
                     .store
-                    .get_agent_session(&self.row.id)
+                    .get_agent_session_with_transcript(&self.row.id)
                     .await
                     .unwrap()
                     .acp_session_id,

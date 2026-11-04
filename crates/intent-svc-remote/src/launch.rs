@@ -458,7 +458,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     "node-agent-unplaced: agent {agent_id} runs under a lease this daemon no longer holds"
                 )));
             }
-            let session = svc.store().get_agent_session(agent_id).await?;
+            let session = svc.store().get_agent_session_summary(agent_id).await?;
             let view =
                 RemotePlacementView::from_metadata(session.metadata.as_ref()).ok_or_else(|| {
                     Error::InvalidParams(format!(
@@ -482,7 +482,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     agent_id: agent_id.clone(),
                     workspace_id: record.workspace_id,
                     provider: intent_providers::base_provider_id(&provider).to_owned(),
-                    model: session.model,
+                    model: session.model.clone(),
                     base_commit: view.base_commit,
                     repo_key,
                     profile_env,

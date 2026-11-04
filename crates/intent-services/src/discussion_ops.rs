@@ -302,7 +302,7 @@ impl Services {
                 EventActor {
                     actor_type: ActorType::Agent,
                     id: Some(agent.0),
-                    name: Some(session.name),
+                    name: Some(session.name.clone()),
                     ..EventActor::default()
                 },
             )

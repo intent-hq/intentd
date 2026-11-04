@@ -160,7 +160,7 @@ async fn check_retirement(action: &str, wss: bool) {
     workspace.id = intent_core::WorkspaceId::new();
     store.insert_workspace(&workspace).await.unwrap();
     let agent = AgentId::new();
-    let session = serde_json::from_value(json!({"id":agent,"workspaceId":workspace.id,"name":"monitor owner","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
+    let session: intent_core::AgentSession = serde_json::from_value(json!({"id":agent,"workspaceId":workspace.id,"name":"monitor owner","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
     store.insert_agent_session(&session).await.unwrap();
     let row = PrMonitor {
         monitor_id: PrMonitorId::new(),
@@ -362,7 +362,7 @@ async fn check_chat_retirement(action: &str, wss: bool, progressive: bool) {
     workspace.id = intent_core::WorkspaceId::new();
     store.insert_workspace(&workspace).await.unwrap();
     let agent = AgentId::new();
-    let session = serde_json::from_value(json!({"id":agent,"workspaceId":workspace.id,"name":"history owner","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
+    let session: intent_core::AgentSession = serde_json::from_value(json!({"id":agent,"workspaceId":workspace.id,"name":"history owner","status":"idle","createdAt":now_iso(),"updatedAt":now_iso()})).unwrap();
     store.insert_agent_session(&session).await.unwrap();
     let message = store
         .append_agent_message(

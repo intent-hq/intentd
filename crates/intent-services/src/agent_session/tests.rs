@@ -1316,7 +1316,7 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
     // last turn ends).
     let mut session = services
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("load session");
     let saved = now_iso();
@@ -3053,7 +3053,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         .clone();
     let session = bus
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(
@@ -3079,7 +3079,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
         .expect("turn 2 completes");
     let session = bus
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(
@@ -3143,7 +3143,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
         .clone();
     let session = bus
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     let pending = session.pending_proposals();
@@ -3167,7 +3167,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
         .expect("turn 2 completes");
     let session = bus
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(
@@ -3284,7 +3284,11 @@ async fn old_answer_cannot_clear_newer_pending_marker() {
         .unwrap()
         .expect("old answer append succeeds");
 
-    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let session = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         session.pending_questions_message_id(),
         Some(newer_id.as_str())
@@ -3333,7 +3337,11 @@ async fn older_question_completion_cannot_overwrite_newer_marker() {
         .unwrap()
         .expect("older question append succeeds");
 
-    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let session = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         session.pending_questions_message_id(),
         Some(newer_id.as_str())
@@ -3387,7 +3395,7 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
         .expect("answer persists while marker is absent");
     assert_eq!(
         bus.store()
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session before delayed set")
             .pending_questions_message_id(),
@@ -3402,7 +3410,7 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
     assert_eq!(asked["message"]["id"], question.id);
     assert_eq!(
         bus.store()
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session after delayed set")
             .pending_questions_message_id(),
@@ -3726,7 +3734,7 @@ async fn antigravity_candidate_commit_preserves_concurrent_session_and_metadata(
             .unwrap();
         assert_eq!(
             bus.store()
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -3743,12 +3751,20 @@ async fn antigravity_candidate_commit_preserves_concurrent_session_and_metadata(
             .set_agent_effort_levels(&ws, &agent_id, Some(&winner_levels), &now_iso())
             .await
             .unwrap();
-        let before = bus.store().get_agent_session(&agent_id).await.unwrap();
+        let before = bus
+            .store()
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         let result = services
             .commit_antigravity_acp_session(prepared, expected_old)
             .await;
         assert!(matches!(result, Err(intent_core::Error::Conflict { .. })));
-        let after = bus.store().get_agent_session(&agent_id).await.unwrap();
+        let after = bus
+            .store()
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         assert_eq!(after.acp_session_id.as_deref(), Some("winner-id"));
         assert_eq!(after.model, before.model);
         assert_eq!(after.effort_levels, Some(winner_levels));
@@ -3765,7 +3781,11 @@ async fn open_acp_session_persists_id() {
         .await
         .expect("open session");
     assert_eq!(opened.session_id, ACP_SID);
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 
     // `session-create` status hint fires ahead of the `session/new` wire call
@@ -3822,7 +3842,11 @@ async fn resume_requires_capability_and_stored_id() {
     assert_eq!(opened.session_id, ACP_SID);
 
     // A successful resume keeps the stored id canonical (no overwrite).
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
@@ -3875,7 +3899,11 @@ async fn resume_skips_foreign_session_after_cross_provider_switch() {
         "foreign session/load must be skipped after a committed cross-provider switch"
     );
     // The skip must not destroy the stored id: revert depends on it.
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 
     // Switch-and-revert before the next message: the identity matches the
@@ -4001,7 +4029,11 @@ async fn recreate_acp_session_replaces_stored_id() {
         .await
         .expect("recreate session");
     assert_eq!(opened.session_id, ACP_SID);
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 
     // No-clobber: recreating again with a stale expected-old reuses the stored
@@ -4021,7 +4053,11 @@ async fn recreate_acp_session_replaces_stored_id() {
         opened.modes.is_none(),
         "CAS loss must not surface modes captured from a session we didn't own"
     );
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
@@ -4398,7 +4434,11 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     )
     .await
     .expect("mark task in progress");
-    let mut session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let mut session = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     session.parent_agent_id = Some(AgentId::from("parent-agent"));
     session.task_note_id = Some(note.id);
     bus.store()
@@ -4772,7 +4812,11 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
             }
         }
     }
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -4861,7 +4905,11 @@ async fn provider_request_size_failure_surfaces_actionable_history_guidance() {
             assert!(message.contains("HTTP 400"));
             assert!(!message.contains("new agent conversation"));
         }
-        let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+        let stored = services
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         assert_eq!(stored.status, AgentStatus::Error);
         assert_eq!(stored.stop_reason.as_deref(), Some(message.as_str()));
         let mut events = Vec::new();
@@ -4923,7 +4971,11 @@ async fn streaming_benign_cancel_does_not_persist_error() {
         "the -32800 cancel classifies benign: {err}"
     );
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_ne!(
         stored.status,
         AgentStatus::Error,
@@ -5011,7 +5063,11 @@ async fn assert_explicit_cancellation_is_not_recovered(
             .is_empty(),
         "cancelled work must not enroll for wake recovery"
     );
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_ne!(stored.status, AgentStatus::Error);
     assert!(stored.stop_reason.is_none());
     assert!(
@@ -5210,7 +5266,11 @@ async fn assert_output_free_fetch_failure_retries(error_message: &str) {
         "two failed attempts + the succeeding retry"
     );
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_ne!(
         stored.status,
         AgentStatus::Error,
@@ -5268,7 +5328,11 @@ async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
         3,
         "1 initial attempt + 2 bounded retries, then terminal"
     );
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -5317,7 +5381,11 @@ async fn terminal_provider_error_fails_fast_without_retry() {
         1,
         "a terminal error is never retried"
     );
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error, "fails fast as today");
 }
 
@@ -5425,7 +5493,11 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
     );
 
     // Terminal classification is unchanged: Error persisted, context stashed.
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -5484,7 +5556,11 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
     // raise and `agent:failed` then delivers the ordinary completion wake
     // (a grouped parent later gets the aggregate) — that is the existing
     // attention contract, not exercised by this test.
-    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    let parent = services
+        .store
+        .get_agent_session_with_transcript(&parent_id)
+        .await
+        .unwrap();
     assert_eq!(
         parent.messages.len(),
         1,
@@ -5560,7 +5636,11 @@ async fn post_output_non_transient_error_raises_no_attention() {
         matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
         "terminal error keeps the wrapper: {err}"
     );
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error, "terminal as today");
     assert!(
         stored.attention_request_kind.is_none(),
@@ -5659,7 +5739,11 @@ async fn backoff_late_output_blocker_reason_reports_dispatched_attempt() {
         "exactly one session/prompt dispatched — the retry was abandoned"
     );
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error);
     assert_eq!(
         stored.attention_request_kind.as_deref(),
@@ -5799,7 +5883,11 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
     );
 
     // The side-effect-only path raises the blocker too, naming ITS cause.
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error);
     assert_eq!(
         stored.attention_request_kind.as_deref(),
@@ -7491,7 +7579,11 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
         "{msg}"
     );
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error);
     assert!(
         services.take_pending_terminal_error(&agent_id).is_some(),
@@ -7508,7 +7600,11 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
             && reason.contains("still open"),
         "reason names the stall and the hung tool call: {reason}"
     );
-    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    let parent = services
+        .store
+        .get_agent_session_with_transcript(&parent_id)
+        .await
+        .unwrap();
     assert_eq!(
         parent.messages.len(),
         1,
@@ -7618,7 +7714,11 @@ async fn open_tool_call_stall_with_cancelled_in_label_stays_terminal() {
         "a provider stall is never a benign cancel, whatever the tool label: {msg}"
     );
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.status,
         AgentStatus::Error,
@@ -7824,7 +7924,11 @@ async fn streaming_tool_call_past_open_tool_terminal_threshold_is_not_terminated
         "a streaming tool call is neither stalled nor terminated"
     );
     assert!(!events.iter().any(|e| e.event_type == "agent:failed"));
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(
         stored.attention_request_kind.is_none(),
         "no attention raise for a streaming tool call: {:?}",
@@ -7915,7 +8019,11 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
     );
 
     // Ordinary terminal classification: Error persisted, context stashed.
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.status, AgentStatus::Error);
     assert!(
         services.take_pending_terminal_error(&agent_id).is_some(),
@@ -7957,7 +8065,11 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
         json!("blocker-report")
     );
     // The parent received the direct blocker wake.
-    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    let parent = services
+        .store
+        .get_agent_session_with_transcript(&parent_id)
+        .await
+        .unwrap();
     assert_eq!(
         parent.messages.len(),
         1,
@@ -8043,7 +8155,11 @@ async fn raise_stall_blocker_via_failed_turn(
     .expect_err("the provider stall fails the turn");
     services.set_test_busy(agent_id, false);
     let _ = services.take_pending_terminal_error(agent_id);
-    let stored = services.store.get_agent_session(agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
     assert!(
         stored
@@ -8127,7 +8243,11 @@ async fn daemon_stall_blocker_clears_after_later_successful_turn() {
         .await
         .expect("the follow-up turn succeeds");
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(
         stored.attention_request_kind.is_none() && stored.attention_request_reason.is_none(),
         "the stall blocker is cleared after a successful turn: {:?}",
@@ -8164,7 +8284,11 @@ async fn daemon_stall_blocker_clears_after_later_successful_turn() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("second follow-up succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.attention_request_reason.as_deref(),
         Some("agent-owned blocker")
@@ -8183,7 +8307,7 @@ async fn daemon_stall_blocker_survives_later_failed_and_cancelled_turns() {
     raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
     let stall_reason = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .unwrap()
         .attention_request_reason;
@@ -8207,7 +8331,11 @@ async fn daemon_stall_blocker_survives_later_failed_and_cancelled_turns() {
     .await
     .expect("a cancelled turn resolves");
 
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(stored.attention_request_reason, stall_reason);
     let events = drain_events(&mut sub).await;
@@ -8221,7 +8349,11 @@ async fn daemon_stall_blocker_survives_later_failed_and_cancelled_turns() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("the later turn succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(stored.attention_request_kind.is_none());
 }
 
@@ -8250,7 +8382,11 @@ async fn successful_turn_leaves_agent_blockers_and_discussions_pending() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("turn succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(
         stored.attention_request_reason.as_deref(),
@@ -8271,7 +8407,11 @@ async fn successful_turn_leaves_agent_blockers_and_discussions_pending() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("turn succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("discussion"));
     assert_eq!(
         stored.attention_request_reason.as_deref(),
@@ -8292,7 +8432,11 @@ async fn successful_turn_leaves_agent_blockers_and_discussions_pending() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("turn succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(
         stored.attention_request_reason.as_deref(),
@@ -8326,7 +8470,11 @@ async fn daemon_stall_blocker_clears_after_restart_on_next_successful_turn() {
         .await
         .expect("the follow-up turn succeeds after restart");
 
-    let stored = restarted.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = restarted
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(
         stored.attention_request_kind.is_none(),
         "the persisted stall blocker clears after restart: {:?}",
@@ -8349,7 +8497,7 @@ async fn empty_harness_wake_keeps_stall_blocker_and_nonempty_wake_clears_it() {
     raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
     let stall_reason = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .unwrap()
         .attention_request_reason;
@@ -8365,7 +8513,11 @@ async fn empty_harness_wake_keeps_stall_blocker_and_nonempty_wake_clears_it() {
         )
         .await;
     assert!(outcome.empty_response, "whitespace-only wake is empty");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(
         stored.attention_request_reason, stall_reason,
@@ -8383,7 +8535,11 @@ async fn empty_harness_wake_keeps_stall_blocker_and_nonempty_wake_clears_it() {
         )
         .await;
     assert!(!outcome.empty_response);
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(
         stored.attention_request_kind.is_none(),
         "a successful wake clears the stall blocker"
@@ -8412,7 +8568,11 @@ async fn cancelled_stall_blocker_clear_retries_on_next_successful_turn() {
     .await;
     assert!(cancelled.is_err(), "the clear was cancelled on the gate");
     drop(held);
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.attention_request_kind.as_deref(),
         Some("blocker"),
@@ -8422,7 +8582,11 @@ async fn cancelled_stall_blocker_clear_retries_on_next_successful_turn() {
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("the follow-up turn succeeds");
-    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    let stored = services
+        .store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert!(
         stored.attention_request_kind.is_none(),
         "the next successful turn clears the blocker after a cancelled clear"
@@ -8462,7 +8626,11 @@ async fn agent_raised_attention_rejects_reserved_stall_prefixes() {
                 "{reason}: {err}"
             );
         }
-        let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+        let stored = services
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
         assert!(stored.attention_request_kind.is_none());
         services
             .agent_request_attention(
@@ -9019,7 +9187,11 @@ async fn open_session_resolves_and_persists_effective_model() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.model.as_deref(),
         Some("default"),
@@ -9057,7 +9229,11 @@ async fn open_session_never_overwrites_explicit_model() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.model.as_deref(),
         Some("sonnet"),
@@ -9095,7 +9271,11 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.model.as_deref(),
         Some("claude-fable-5[1m]"),
@@ -9168,7 +9348,11 @@ async fn open_session_resolves_effective_model_for_null_model() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     // The session-open fill never pins the adapter's floating `default`
     // alias (no concrete model is known), and never the D13 display name,
     // which stays a stats-only resolution (monorepo#1534).
@@ -9203,7 +9387,11 @@ async fn open_session_without_config_options_keeps_placeholder() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
@@ -9268,7 +9456,11 @@ async fn resume_session_resolves_and_persists_effective_model() {
         .await
         .expect("resume")
         .expect("resume yields opened session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
@@ -9433,7 +9625,11 @@ async fn session_open_persists_effort_levels_and_emits_on_change_only() {
         .expect("open session");
 
     let expected = ["low", "medium", "high", "max"].map(String::from).to_vec();
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(stored.effort_levels.as_deref(), Some(expected.as_slice()));
     // The wire projection carries the camelCase field.
     let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
@@ -9515,7 +9711,11 @@ async fn session_open_without_selector_clears_persisted_effort_levels() {
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&session.id)
+        .await
+        .unwrap();
     assert_eq!(stored.effort_levels, None, "cleared on none advertised");
     // The wire projection omits the field entirely.
     let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
@@ -9584,7 +9784,11 @@ async fn cas_losing_recreate_leaves_effort_levels_untouched() {
     );
 
     // The winner's persisted set survives.
-    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    let stored = bus
+        .store()
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .unwrap();
     assert_eq!(
         stored.effort_levels.as_deref(),
         Some(winner_levels.as_slice()),
@@ -10212,7 +10416,7 @@ async fn interrupt_flush_records_pending_proposals_from_the_partial_tail() {
 
     let session = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     let pending = session.pending_proposals();
@@ -11137,7 +11341,7 @@ async fn resolve_session_is_orchestrator_gated_on_provider() {
     let (_tmp, services, _bus, agent_id, _ws) = setup().await;
     let mut stored = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     // Historical orchestrator id with no snapshot: the name fallback decides.
@@ -11173,7 +11377,7 @@ async fn resolve_session_is_orchestrator_prefers_frozen_snapshot() {
     let (_tmp, services, _bus, agent_id, _ws) = setup().await;
     let mut stored = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     stored.specialist = Some("spec-writer".to_string());
@@ -11222,7 +11426,7 @@ async fn resolve_session_is_orchestrator_project_tier_via_repository_path() {
 
     let mut stored = services
         .store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     stored.workspace_id = ws2;
@@ -12038,7 +12242,7 @@ mod profile_native_session_tests {
             let stored = self
                 .services
                 .store
-                .get_agent_session(&self.agent_id)
+                .get_agent_session_with_transcript(&self.agent_id)
                 .await
                 .unwrap();
             match stored.acp_session_id {
@@ -12071,7 +12275,7 @@ mod profile_native_session_tests {
             let stored = self
                 .services
                 .store
-                .get_agent_session(&self.agent_id)
+                .get_agent_session_with_transcript(&self.agent_id)
                 .await
                 .unwrap();
             stored

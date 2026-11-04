@@ -369,7 +369,8 @@ impl Services {
             .store
             .get_agent_session_summary(agent_id)
             .await?
-            .workspace_id)
+            .workspace_id
+            .clone())
     }
 
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
@@ -854,7 +855,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) {
-        let sessions = match self.store.list_agent_sessions(workspace_id).await {
+        let sessions = match self
+            .store
+            .list_agent_sessions_with_transcripts(workspace_id)
+            .await
+        {
             Ok(sessions) => sessions,
             Err(e) => {
                 tracing::warn!(error = %e, workspace = %workspace_id, "members.remove: agent list failed; queued messages kept");

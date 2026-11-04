@@ -187,7 +187,7 @@ async fn restart_preserves_unresolved_imported_pending_bytes_without_legacy_emis
             .unwrap();
     assert_eq!(raw, pending);
     assert!(store
-        .get_agent_session(&owner)
+        .get_agent_session_with_transcript(&owner)
         .await
         .unwrap()
         .messages

@@ -24,6 +24,7 @@ use intent_core::{
     PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
+use intent_store::AgentSessionSummary;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -527,8 +528,8 @@ impl AgentSnapshot {
 /// branches prune/migrate.
 #[derive(Debug, Default)]
 pub(crate) struct AssignedAgentScan {
-    pub(crate) live_session: Option<AgentSession>,
-    pub(crate) inheritance_source: Option<AgentSession>,
+    pub(crate) live_session: Option<AgentSessionSummary>,
+    pub(crate) inheritance_source: Option<AgentSessionSummary>,
     pub(crate) cleaned_up: Vec<AgentId>,
     pub(crate) poisoned: Vec<AgentId>,
 }
@@ -1311,7 +1312,7 @@ impl Services {
         {
             return None;
         }
-        let provider = session.provider.filter(|p| !p.trim().is_empty())?;
+        let provider = session.provider.clone().filter(|p| !p.trim().is_empty())?;
         // A child never inherits its parent's named profile (PROTOCOL
         // §5.54 "Delegation"): no account is inferred for it.
         if crate::provider_profiles::is_qualified_ref(&provider) {
@@ -3742,6 +3743,15 @@ fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Optio
         .map_or((None, None), |m| (Some(m.role.clone()), Some(m.id.clone())))
 }
 
+/// Map a session read's `NotFound` to the generic `-32603` the TS peers of
+/// the `load_session_*internal` callers surface.
+fn map_internal_not_found(agent_id: &AgentId, read: Result<AgentSession>) -> Result<AgentSession> {
+    match read {
+        Err(Error::NotFound(_)) => Err(Error::Internal(format!("Agent \"{agent_id}\" not found"))),
+        other => other,
+    }
+}
+
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
 /// [`intent_store::SessionMessageProjection`] into [`AgentLite`] — the
 /// transcript-free equivalent of [`project_lite`] (monorepo#958). The derived
@@ -4358,7 +4368,7 @@ impl Services {
     /// subscription participants. Cap after the live runtime overlay.
     fn project_list_agent(
         &self,
-        session: AgentSession,
+        session: AgentSessionSummary,
         projection: &intent_store::SessionMessageProjection,
         waiting_on_hooks: Vec<Value>,
         waiting_on_pr_monitors: Vec<Value>,
@@ -4440,10 +4450,12 @@ impl Services {
     /// (monorepo#958) — same runtime-flag overlay, no transcript required.
     pub(crate) fn project_lite_with_flags_from_projection(
         &self,
-        session: AgentSession,
+        session: AgentSessionSummary,
         projection: &intent_store::SessionMessageProjection,
     ) -> AgentLite {
-        self.project_lite_with_flags_inner(session, |s| project_lite_from_projection(s, projection))
+        self.project_lite_with_flags_inner(session.into_read_only_session(), |s| {
+            project_lite_from_projection(s, projection)
+        })
     }
 
     /// The current effective `agentFeatures` values as the JSON snapshot
@@ -7100,7 +7112,10 @@ impl Services {
         // agent, and repository_pending_delete_tests pin the metadata-error
         // branch (legacy ack, claim never confirmed) to a failing full read
         // while scheduling validates with the summary.
-        let session_observation = self.store.get_agent_session(&agent_id).await;
+        let session_observation = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
         let session_meta = session_observation
             .ok()
@@ -7320,7 +7335,8 @@ impl Services {
             .store
             .get_agent_session_summary(&agent_id)
             .await?
-            .workspace_id;
+            .workspace_id
+            .clone();
         if let Some(ws) = workspace_id.as_ref() {
             if session_ws != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -7364,7 +7380,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<bool> {
         let session_ws = match self.store.get_agent_session_summary(&agent_id).await {
-            Ok(summary) => summary.workspace_id,
+            Ok(summary) => summary.workspace_id.clone(),
             // Row already gone: the deletion committed (or the session never
             // existed) — nothing pending, the race-safe non-error outcome.
             Err(Error::NotFound(_)) => return Ok(false),
@@ -7399,7 +7415,7 @@ impl Services {
     /// session (§5.5 cascade interaction).
     pub(crate) async fn take_pending_agent_deletes(
         &self,
-        sessions: &[AgentSession],
+        sessions: &[AgentSessionSummary],
     ) -> Result<Vec<crate::delete_grace::PendingDeleteClaim>> {
         let mut claims = Vec::new();
         for session in sessions {
@@ -7453,7 +7469,7 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        if let Some(existing) = session.retired_at {
+        if let Some(existing) = session.retired_at.clone() {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
         // Guard: neither an agent (`ws.agent.retire`, including from its
@@ -7489,6 +7505,7 @@ impl Services {
                     .get_agent_session_summary(&session.id)
                     .await?
                     .retired_at
+                    .clone()
                 {
                     return Ok(
                         json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
@@ -7587,7 +7604,7 @@ impl Services {
     /// still traversed, so grandchildren under a deleted intermediary are
     /// found. Cycle-safe via a visited set (parent links cannot cycle in
     /// practice, but a corrupt row must not hang the retire).
-    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSession>> {
+    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSessionSummary>> {
         let mut seen: HashSet<String> = HashSet::from([root.0.clone()]);
         let mut frontier = vec![root.clone()];
         let mut out = Vec::new();
@@ -7834,7 +7851,10 @@ impl Services {
         reason = "internal doc-hidden feature API, not a public library API"
     )]
     pub async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await?;
         self.project_session_for_wire(session).await
     }
 
@@ -7966,7 +7986,10 @@ impl Services {
                 "agent.update: remembering requires `specialist` in changes".into(),
             ));
         }
-        let mut session = self.store.get_agent_session(&agent_id).await?;
+        let mut session = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await?;
         let remember_specialist = remember_specialist && is_manual_foreground_agent(&session);
         let rename_placeholder = if remember_specialist
             && !session.name_explicitly_set
@@ -8339,7 +8362,10 @@ impl Services {
         if preference_only {
             // Return current activity and preference state, including any
             // genuine session update that raced the scoped preference write.
-            session = self.store.get_agent_session(&agent_id).await?;
+            session = self
+                .store
+                .get_agent_session_with_transcript(&agent_id)
+                .await?;
         }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
@@ -9131,7 +9157,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         let owning_ws = match self.store.get_agent_session_summary(&agent_id).await {
-            Ok(session) => Some(session.workspace_id),
+            Ok(session) => Some(session.workspace_id.clone()),
             Err(e) if workspace_id.is_some() => return Err(e),
             Err(_) => None,
         };
@@ -9489,7 +9515,7 @@ impl Services {
                         .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
                         .await;
                     manager
-                        .try_drain_queue(agent_id, session.workspace_id)
+                        .try_drain_queue(agent_id, session.workspace_id.clone())
                         .await;
                 }
             }
@@ -11499,7 +11525,7 @@ impl Services {
             source_workspace_id: session.workspace_id.clone(),
         });
         Ok(Some(CreateProposalOrigin::Resolve {
-            source_workspace: session.workspace_id,
+            source_workspace: session.workspace_id.clone(),
             agent: agent_id,
             proposal: proposal_id,
             key_bound: bound_key.is_some(),
@@ -11696,7 +11722,9 @@ impl Services {
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
     pub(crate) async fn agent_summary_op(&self, agent_id: AgentId) -> Result<Value> {
-        let session = self.load_session_internal(&agent_id).await?;
+        let session = self
+            .load_session_with_transcript_internal(&agent_id)
+            .await?;
         let last_response = last_assistant_text(&session.messages);
         let tool_counts = tool_call_counts(&session.messages);
         let mut out = json!({
@@ -11726,7 +11754,10 @@ impl Services {
         session_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&session_id).await?;
+        let session = self
+            .store
+            .get_agent_session_with_transcript(&session_id)
+            .await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
@@ -11955,7 +11986,7 @@ impl Services {
                     .store
                     .get_agent_session_summary(&parent)
                     .await
-                    .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                    .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
                 // Deliver the wake to the parent unconditionally (even if no
                 // watch exists).
                 if let Err(e) = self
@@ -12437,7 +12468,7 @@ impl Services {
                 .store
                 .get_agent_session_summary(parent)
                 .await
-                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
             let wake_text = crate::harness::latest().attention_parent_wake(
                 &session.name,
                 &caller.0,
@@ -13268,7 +13299,7 @@ impl Services {
                 let parent_home_ws = parent_session
                     .as_ref()
                     .map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
-                let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+                let parent_name = parent_session.map(|s| s.name.clone()).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
                 // The scope gate already ran up front (before child creation),
                 // so `register_completion_watch`'s re-check cannot reject here
@@ -13389,7 +13420,7 @@ impl Services {
                 self.scan_assigned_agents(&task.assigned_agent_ids)
                     .await?
                     .live_session
-                    .map(|s| (s.id.0, s.name))
+                    .map(|s| (s.id.0.clone(), s.name.clone()))
             };
             titles.insert(note.id.0.clone(), note.title.clone());
             snaps.insert(
@@ -13898,7 +13929,7 @@ impl Services {
                             .store
                             .get_agent_session_summary(parent)
                             .await
-                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
                         let advisory = format!(
                             "Advisory: your batch agent.delegate (waitMode: \"after_all\") started ZERO tasks — {breakdown}. No delegation group was formed, so NO settlement wake will ever arrive from that call. Re-call agent.delegate once the holds clear, or delegate a held task individually to force it."
                         );
@@ -14217,7 +14248,7 @@ impl Services {
             .await
             .ok();
         let skip = caller_session
-            .as_ref()
+            .as_deref()
             .is_some_and(is_delegated_background_task_session);
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
@@ -14948,7 +14979,7 @@ impl Services {
                     target.0
                 )));
             }
-            resolved.push((target, session.name, session.workspace_id));
+            resolved.push((target, session.name.clone(), session.workspace_id.clone()));
         }
         let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
             .iter()
@@ -15118,7 +15149,7 @@ impl Services {
 
         // Batched status projection (intent-hq/monorepo#3018): one `IN`-list
         // query for every present agent's status, instead of a per-agent
-        // `get_agent_session` loop that hydrated each agent's full message
+        // `get_agent_session_with_transcript` loop that hydrated each agent's full message
         // log just to read `status` — that made the dispatch duration scale
         // with the watched agents' transcript sizes (the monorepo#958
         // incident shape) and its statement count with the watch fan-out.
@@ -15621,7 +15652,7 @@ impl Services {
         }
 
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
-        let session_by_id: std::collections::HashMap<String, &AgentSession> =
+        let session_by_id: std::collections::HashMap<String, &AgentSessionSummary> =
             sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
 
         let mut matching: HashSet<String> = HashSet::new();
@@ -16706,7 +16737,7 @@ impl Services {
                 // so a chief caller's wake lands in `__chief__`. `resolved_home`
                 // is Some only when read from a real session row: the reuse
                 // path uses it to correct a fallback-registered anchor.
-                let resolved_home = caller_session.map(|s| s.workspace_id);
+                let resolved_home = caller_session.map(|s| s.workspace_id.clone());
                 let caller_home_ws = resolved_home
                     .clone()
                     .unwrap_or_else(|| workspace_id.clone());
@@ -17025,7 +17056,7 @@ impl Services {
             // back to the call's workspace when the session lookup fails)
             // so a chief caller's wake lands in `__chief__`.
             let caller_home_ws =
-                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id);
+                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
             let subscription_id = self.register_completion_watch(
                 &caller_home_ws,
                 &workspace_id,
@@ -17636,16 +17667,31 @@ impl Services {
         Ok(updated)
     }
 
-    /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS
-    /// peers surface a generic failure (rename/setModel/summary).
+    /// Load a session's full row WITHOUT its transcript (`messages` stays
+    /// empty), mapping `NotFound` to `-32603` for the methods whose TS peers
+    /// surface a generic failure (rename/setModel/reportToParent/attention).
+    /// These callers write the row back, so they need every column
+    /// (`system_prompt` included) but never the message log.
     async fn load_session_internal(&self, agent_id: &AgentId) -> Result<AgentSession> {
-        match self.store.get_agent_session(agent_id).await {
-            Ok(s) => Ok(s),
-            Err(Error::NotFound(_)) => {
-                Err(Error::Internal(format!("Agent \"{agent_id}\" not found")))
-            }
-            Err(e) => Err(e),
-        }
+        map_internal_not_found(
+            agent_id,
+            self.store
+                .get_agent_session_without_messages(agent_id)
+                .await,
+        )
+    }
+
+    /// [`Self::load_session_internal`] with the full message log, for
+    /// `agent.summary`, which derives its counts and last response from the
+    /// transcript.
+    async fn load_session_with_transcript_internal(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<AgentSession> {
+        map_internal_not_found(
+            agent_id,
+            self.store.get_agent_session_with_transcript(agent_id).await,
+        )
     }
 
     /// Push a message onto an agent's in-memory queue and return it together with
@@ -18468,7 +18514,7 @@ impl Services {
             return;
         };
         manager
-            .try_drain_queue(agent_id.clone(), session.workspace_id)
+            .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
             .await;
     }
 
@@ -19809,7 +19855,7 @@ impl Services {
     /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
         let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
-            Ok(s) => s.workspace_id,
+            Ok(s) => s.workspace_id.clone(),
             Err(_) => return,
         };
         self.publish_queue_updated_for(agent_id, &workspace_id)
@@ -19818,7 +19864,7 @@ impl Services {
 
     /// Like [`publish_queue_updated`] but takes the workspace id directly —
     /// used by call sites (the turn worker, `edit_and_regenerate`) that already
-    /// hold it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    /// hold it, avoiding a redundant `get_agent_session_with_transcript` round-trip per drain step.
     ///
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the
@@ -21110,8 +21156,9 @@ impl Services {
             );
         }
 
-        // Load the session to check for delegation metadata
-        let session = match self.store.get_agent_session(agent_id).await {
+        // Load the session with its transcript: delegation metadata, plus the
+        // tail that decides the duplicate-marker skip and the resume recap.
+        let session = match self.store.get_agent_session_with_transcript(agent_id).await {
             Ok(s) => s,
             Err(e) => {
                 reset_to_pending().await;
@@ -21139,7 +21186,7 @@ impl Services {
                     .as_ref()
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
-                let resolved_home = parent_session.map(|s| s.workspace_id);
+                let resolved_home = parent_session.map(|s| s.workspace_id.clone());
                 let parent_home_ws = resolved_home
                     .clone()
                     .unwrap_or_else(|| workspace_id.clone());

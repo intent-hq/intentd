@@ -219,7 +219,7 @@ async fn revive_with_notice_writes_pending_notices_atomically_with_the_flip() {
         let id = id.clone();
         async move {
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .metadata
