@@ -588,8 +588,6 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     // A fresh remote agent starts the saved service (any agent may start any
     // saved script), so the step does not depend on relaunching the agent
     // stopped above.
-    // Relaunching a remote agent right after `agent.stop` can leave its
-    // first prompt unanswered: intent-hq/intent#8457.
     let mut create_id = 290;
     let deadline = tokio::time::Instant::now() + wait();
     let second = loop {

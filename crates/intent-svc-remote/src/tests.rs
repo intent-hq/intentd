@@ -1524,6 +1524,8 @@ mod stop_acks {
             .await;
         assert_eq!(resent, stop_id);
         assert!(!launching.is_finished(), "the launch waits for the ack");
+        // As a machine does, the exit is journaled before the ack.
+        link.journal(exited(1, &agent)).await;
         link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
         link.expect(|frame| match frame {
             LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
@@ -1543,6 +1545,142 @@ mod stop_acks {
         })
         .await;
         assert!(late.is_err(), "the confirmed stop is not sent again");
+        node.shutdown();
+    }
+
+    /// Relaunch `agent` right after its stop, in the background.
+    fn relaunch(
+        node: &RemoteNode,
+        agent: &AgentId,
+    ) -> tokio::task::JoinHandle<intent_core::Result<Arc<crate::RemoteAgentRuntime>>> {
+        let node = node.clone();
+        let command = launch_of(agent);
+        tokio::spawn(async move { node.launch(command).await })
+    }
+
+    /// intent-hq/intent#8457: the stopped process's exit record, arriving
+    /// while its relaunch waits for the stop's ack, belongs to the old
+    /// process. The relaunched runtime must not take it as its own exit.
+    #[tokio::test]
+    async fn a_relaunch_ignores_the_stopped_processs_exit_sent_before_the_ack() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        let launching = relaunch(&node, &agent);
+        // The machine journals the old process's exit, then acks the stop.
+        link.journal(exited(1, &agent)).await;
+        link.acked(1).await;
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            _ => None,
+        })
+        .await;
+        let relaunched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            relaunched.is_running(),
+            "the old process's exit ended the relaunched runtime: {:?}",
+            relaunched.exit_error()
+        );
+        node.shutdown();
+    }
+
+    /// intent-hq/intent#8457: the machine acks a stop once the exit record
+    /// is journaled, which can be before that record is streamed. A
+    /// `stopped` ack means the record is coming: the relaunch waits for it
+    /// before it attaches, so the record never reaches the new runtime.
+    #[tokio::test]
+    async fn a_relaunch_waits_for_the_stopped_processs_exit_sent_after_the_ack() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        let launching = relaunch(&node, &agent);
+        // The ack overtakes the exit record.
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        let early = tokio::time::timeout(test_timeout(Duration::from_millis(500)), async {
+            link.expect(|frame| match frame {
+                LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+                _ => None,
+            })
+            .await;
+        })
+        .await;
+        assert!(early.is_err(), "launched before the old exit arrived");
+        link.journal(exited(1, &agent)).await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            _ => None,
+        })
+        .await;
+        let relaunched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            relaunched.is_running(),
+            "the old process's exit ended the relaunched runtime: {:?}",
+            relaunched.exit_error()
+        );
+        node.shutdown();
+    }
+
+    /// An exit record that never arrives (lost on the machine) holds the
+    /// relaunch back only for the stop wait, not for good.
+    #[tokio::test]
+    async fn a_relaunch_gives_up_on_an_exit_record_that_never_arrives() {
+        let (mut machine, backend, bare) = exposed().await;
+        bare.shutdown();
+        let mut quick = tuning();
+        quick.stop_wait = Duration::from_millis(300);
+        let node = backend.bare_with(&machine, quick).await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        let launching = relaunch(&node, &agent);
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            _ => None,
+        })
+        .await;
+        let relaunched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(relaunched.is_running());
+        node.shutdown();
+    }
+
+    /// A `not-running` ack promises no exit record: the relaunch goes out
+    /// at once.
+    #[tokio::test]
+    async fn a_relaunch_after_a_not_running_ack_does_not_wait_for_an_exit() {
+        let (mut machine, _backend, node) = exposed().await;
+        let (agent, runtime, mut link) = live(&mut machine, &node).await;
+        runtime.stop().await;
+        let stop_id = link.stop_for(&agent).await;
+        let launching = relaunch(&node, &agent);
+        link.ack_stop(stop_id, &agent, StopOutcome::NotRunning)
+            .await;
+        link.expect(|frame| match frame {
+            LinkFrame::Launch(command) if command.agent_id == agent => Some(()),
+            _ => None,
+        })
+        .await;
+        let relaunched = tokio::time::timeout(wait(), launching)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(relaunched.is_running());
         node.shutdown();
     }
 
