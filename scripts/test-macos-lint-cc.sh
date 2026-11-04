@@ -104,6 +104,14 @@ esac
   || fail "expand probe with -o exited non-zero"
 grep -q "lint_value 42 joined" "$tmp/probe.i" 2>/dev/null || fail "expand -o output missing joined flags"
 
+# sccache's lookup preprocess asks for the dep file too (gcc writes it on
+# -E); on a cache hit no compile follows, so the -E call must write it.
+"$stub" -x c -E -P -MMD -MF "$tmp/pre.d.tmp" -MT "$tmp/pre.o" "$tmp/real.c" -o "$tmp/pre.i" \
+  || fail "preprocess with -MF exited non-zero"
+grep -qx "$tmp/pre.o:" "$tmp/pre.d.tmp" 2>/dev/null || fail "-E with -MF did not write the dep file"
+"$stub" -E -MD -arch arm64 "$tmp/arm.c" -o "$tmp/arm_pre.i" >/dev/null || fail "fallback preprocess with -MD failed"
+grep -qx "$tmp/arm_pre.o:" "$tmp/arm_pre.d" 2>/dev/null || fail "-E fallback with -MD did not write <stem>.d"
+
 # sccache preprocesses a target-only source for its cache key: the host
 # rejects it, so the source comes back verbatim.
 verbatim=$("$stub" -E -arch arm64 "$tmp/arm.c") || fail "ARM-only preprocess failed"
