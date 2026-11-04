@@ -46,12 +46,19 @@ These app-version notes qualify every later description in this guide:
   tool that installed it.
 - Hiding the host's provider-profile names from guests requires an app version
   supporting that presentation. Older apps may still display those names.
+- GitLab setup without a Labs switch requires an app version offering it and
+  matching daemon support. Older apps may still gate GitLab settings and onboarding
+  behind Labs; those flows remain experimental. Discuss them only when explicitly
+  asked or developing or testing, and do not recommend enabling Labs for ordinary
+  help. GitLab instructions apply only where the current app and daemon support them.
 - Multiple workspace-wide discussions require matching app and connected-daemon
   discussion support. Older apps may not offer the management or mention controls
   described later in this guide.
 - **Leave…** in the workspace sidebar menu requires an app offering that action.
   Older apps may offer **Settings → Collaboration → Leave** beside the workspace.
   Access through host membership cannot be left per workspace.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/GitLabAuthConnection.svelte; src/features/onboarding/steps/OnboardingForgeStep.svelte; src/store/renderer/slices/user-preferences/user-preferences-selectors.ts. -->
 
 In Home versions with a **Waiting** filter, status grouping separates running work
 from external waits. **Running** covers an agent at work or a running command script
