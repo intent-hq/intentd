@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, StopId, FINAL_STOP_PROTOCOL,
+    MachineCapabilities, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -181,6 +181,19 @@ pub struct NodeStatus {
     pub intentd_version: Option<String>,
 }
 
+/// Where a stopped agent's exit record is, while it matters to a relaunch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopExit {
+    /// The stop is not acknowledged and no exit record was ingested yet;
+    /// `sent` once a stop frame for it went out (on any link).
+    Pending { sent: bool },
+    /// An exit record was ingested before the acknowledgement.
+    Seen,
+    /// Acknowledged as `stopped` with no exit record ingested yet: the
+    /// record is on its way, and a relaunch must not attach before it.
+    Owed,
+}
+
 /// One unacknowledged stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueuedStop {
@@ -238,6 +251,11 @@ pub(crate) struct Shared {
     /// The stops a task is resending, with the link generation it resends
     /// on, so one link has one resender per stop.
     resending: Mutex<HashMap<StopId, u64>>,
+    /// Where each stopped agent's exit record is, from its stop being
+    /// queued until head has ingested that record (or none is coming).
+    /// A relaunch waits out [`StopExit::Owed`], so the stopped process's
+    /// exit never reaches the new runtime (intent-hq/intent#8457).
+    stop_exits: Mutex<HashMap<AgentId, StopExit>>,
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
     final_settles: Mutex<Vec<AgentId>>,
@@ -397,6 +415,7 @@ impl Shared {
     /// The id of `agent_id`'s queued stop, queuing a new one if none is.
     /// A queued final stop stays final.
     fn queue_stop(&self, agent_id: &AgentId) -> StopId {
+        self.watch_stop_exit(agent_id);
         lock(&self.stops)
             .entry(agent_id.clone())
             .or_insert_with(|| QueuedStop::plain(StopId::new_v4()))
@@ -417,6 +436,7 @@ impl Shared {
             svc.feature_runtime()
                 .machine_runs_final_stop_begun(svc, agent_id);
         }
+        self.watch_stop_exit(agent_id);
         let replaced = lock(&self.stops).insert(
             agent_id.clone(),
             QueuedStop {
@@ -557,6 +577,8 @@ impl Shared {
                     continue;
                 }
                 self.confirm_stop(&record.agent_id, stop_id);
+                // No ack settles this stop, so nothing tracks its exit.
+                lock(&self.stop_exits).remove(&record.agent_id);
                 self.final_stop_over(&record.agent_id).await;
                 continue;
             }
@@ -616,6 +638,8 @@ impl Shared {
             let mut stops = lock(&self.stops);
             let before = stops.len();
             stops.retain(|_, queued| queued.durable);
+            // The machine journals no exit for a revoked binding's agents.
+            lock(&self.stop_exits).retain(|agent_id, _| stops.contains_key(agent_id));
             stops.len() != before
         };
         if dropped {
@@ -636,6 +660,7 @@ impl Shared {
     async fn send_queued(&self, link: &NodeLink) {
         let speaks_final = self.speaks_final_stops();
         for (agent_id, queued) in self.queued_stops() {
+            self.stop_exit_sending(&agent_id);
             if link
                 .send(&LinkFrame::Stop {
                     agent_id,
@@ -683,6 +708,7 @@ impl Shared {
             .filter(|_| !link.is_closed())
         {
             let final_stop = queued.final_stop && self.speaks_final_stops();
+            let resent = self.stop_exit_sending(&agent_id);
             match link
                 .stop_with(agent_id.clone(), stop_id, final_stop, delays.next_delay())
                 .await
@@ -696,6 +722,11 @@ impl Shared {
                         // The agent is ended for good, even when a link below
                         // nodeProtocol 9 got the stop as a plain one.
                         self.final_stop_over(&agent_id).await;
+                    }
+                    // Only this stop's own ack settles its exit: one
+                    // replaced meanwhile (by a final stop) leaves it alone.
+                    if self.queued(&agent_id, stop_id).is_some() {
+                        self.stop_exit_acked(&agent_id, acked.outcome, resent);
                     }
                     self.confirm_stop(&agent_id, stop_id);
                 }
@@ -778,21 +809,104 @@ impl Shared {
     ///
     /// `node-link-unavailable` when the stop is still unacknowledged.
     pub(crate) async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
-        if !self.stop_queued(agent_id) {
-            return Ok(());
-        }
         let deadline = Instant::now() + self.tuning.stop_wait;
-        if self
-            .wait_stops(std::slice::from_ref(agent_id), deadline)
-            .await
-            .is_empty()
+        if self.stop_queued(agent_id)
+            && !self
+                .wait_stops(std::slice::from_ref(agent_id), deadline)
+                .await
+                .is_empty()
         {
-            return Ok(());
+            return Err(Error::Internal(format!(
+                "{}: the machine has not acknowledged this agent's earlier stop",
+                link::codes::UNAVAILABLE
+            )));
         }
-        Err(Error::Internal(format!(
-            "{}: the machine has not acknowledged this agent's earlier stop",
-            link::codes::UNAVAILABLE
-        )))
+        self.wait_stop_exit(agent_id, deadline).await;
+        Ok(())
+    }
+
+    /// Track `agent_id`'s exit record from its stop being queued; an exit
+    /// already owed stays owed.
+    fn watch_stop_exit(&self, agent_id: &AgentId) {
+        lock(&self.stop_exits)
+            .entry(agent_id.clone())
+            .or_insert(StopExit::Pending { sent: false });
+    }
+
+    /// A stop frame for `agent_id` is going out. Whether one went out
+    /// before: if so, a `not-running` ack may answer an agent the earlier
+    /// frame already stopped, whose exit record is still on its way.
+    fn stop_exit_sending(&self, agent_id: &AgentId) -> bool {
+        match lock(&self.stop_exits).get_mut(agent_id) {
+            Some(StopExit::Pending { sent }) => std::mem::replace(sent, true),
+            _ => false,
+        }
+    }
+
+    /// The agent `record` reports exited, if it is an exit record.
+    fn exited_agent(record: &intent_core::node_link::JournalRecord) -> Option<AgentId> {
+        matches!(record.body, JournalBody::Exited { .. }).then(|| record.agent_id.clone())
+    }
+
+    /// An exit record for `exited` was delivered: it settles its agent's
+    /// stop, and one a relaunch waits for releases it. Called only after
+    /// delivery, so a released relaunch never attaches before the old
+    /// process's exit has reached the old runtime.
+    fn stop_exit_ingested(&self, exited: Option<AgentId>) {
+        let Some(agent_id) = exited else {
+            return;
+        };
+        let mut exits = lock(&self.stop_exits);
+        match exits.get(&agent_id) {
+            Some(StopExit::Pending { .. }) => {
+                exits.insert(agent_id, StopExit::Seen);
+            }
+            Some(StopExit::Owed) => {
+                exits.remove(&agent_id);
+                drop(exits);
+                self.stops_changed.send_modify(|n| *n += 1);
+            }
+            Some(StopExit::Seen) | None => {}
+        }
+    }
+
+    /// The machine acknowledged `agent_id`'s stop with `outcome`, answering
+    /// a resend when `resent`. A `stopped` agent's exit record was
+    /// journaled before the ack, but it may still be on its way: owed until
+    /// ingested. A resend answered `not-running` may find the agent the
+    /// earlier frame stopped still exiting (the machine answers
+    /// `not-running` until its exit is journaled), so its record is owed
+    /// too. A first stop answered `not-running` owes nothing.
+    fn stop_exit_acked(&self, agent_id: &AgentId, outcome: StopOutcome, resent: bool) {
+        let owed = outcome == StopOutcome::Stopped || resent;
+        let mut exits = lock(&self.stop_exits);
+        if owed && matches!(exits.get(agent_id), Some(StopExit::Pending { .. })) {
+            exits.insert(agent_id.clone(), StopExit::Owed);
+        } else if exits.get(agent_id) != Some(&StopExit::Owed) {
+            exits.remove(agent_id);
+        }
+    }
+
+    /// Wait until `agent_id` owes no exit record, or until `deadline`.
+    /// A record still owed then (lost on the machine, or its link is
+    /// down) is given up on, so it never holds back a later relaunch.
+    async fn wait_stop_exit(&self, agent_id: &AgentId, deadline: Instant) {
+        let mut changed = self.stops_changed.subscribe();
+        loop {
+            if lock(&self.stop_exits).get(agent_id) != Some(&StopExit::Owed) {
+                return;
+            }
+            match tokio::time::timeout_at(deadline, changed.changed()).await {
+                Ok(Ok(())) => {}
+                _ => break,
+            }
+        }
+        let mut exits = lock(&self.stop_exits);
+        if exits.get(agent_id) == Some(&StopExit::Owed) {
+            exits.remove(agent_id);
+            drop(exits);
+            tracing::warn!(agent = %agent_id, "remote machine: the stopped agent's exit record did not arrive in time; relaunching anyway");
+        }
     }
 
     #[cfg(test)]
@@ -988,6 +1102,7 @@ impl RemoteNode {
             protocol: std::sync::atomic::AtomicU32::new(0),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
+            stop_exits: Mutex::new(HashMap::new()),
             #[cfg(test)]
             final_settles: Mutex::default(),
             #[cfg(test)]
@@ -1219,13 +1334,18 @@ impl RemoteNode {
     /// `node-link-unavailable` when no link comes up within the grace.
     pub async fn launch(&self, command: LaunchCommand) -> Result<Arc<RemoteAgentRuntime>> {
         let parked = lock(&self.shared.parked).remove(&command.agent_id);
-        if let Some(runtime) = parked.filter(|runtime| runtime.is_running()) {
+        // A parked runtime is the stopping process's while a stop for it is
+        // queued: the relaunch waits for that stop below instead.
+        if let Some(runtime) = parked
+            .filter(|runtime| runtime.is_running() && !self.shared.stop_queued(&command.agent_id))
+        {
             return Ok(runtime);
         }
-        let runtime = self.attach(&command.agent_id, &command.workspace_id);
         // Never launch behind this agent's unacknowledged stop: a resend of
-        // it would stop the new process.
+        // it would stop the new process. Attach only after the stopped
+        // process's exit record is in, so it never ends the new runtime.
         self.shared.no_stop_pending(&command.agent_id).await?;
+        let runtime = self.attach(&command.agent_id, &command.workspace_id);
         let link = self
             .shared
             .link_within(self.shared.tuning.link_loss_grace)
@@ -1536,7 +1656,9 @@ async fn serve(
                         match ingest.accept(seq) {
                             Step::Ingest => {
                                 record_placement(shared, &record).await;
+                                let exited = Shared::exited_agent(&record);
                                 shared.agents.deliver(record);
+                                shared.stop_exit_ingested(exited);
                             }
                             Step::IngestAfterLoss { lost } => {
                                 tracing::warn!(
@@ -1545,7 +1667,9 @@ async fn serve(
                                     "remote machine: journal records were lost on the machine"
                                 );
                                 record_placement(shared, &record).await;
+                                let exited = Shared::exited_agent(&record);
                                 shared.agents.deliver(record);
+                                shared.stop_exit_ingested(exited);
                             }
                             Step::Skip => {}
                             Step::Resync => {
@@ -1688,7 +1812,7 @@ pub(crate) async fn has_live_records(store: &Store, lease_id: &str) -> Result<bo
 /// stop held in memory, with a new id; one whose session has ended
 /// (retired, deleted or completed) gets a recorded final stop; one with a
 /// recorded final stop already has it queued. Each is resent until
-/// acknowledged, and none is parked. One head knows but has not attached
+/// acknowledged, and none is parked; nor is one with a plain stop queued. One head knows but has not attached
 /// since it started gets a runtime, kept until the agent manager takes it,
 /// so its output is not dropped.
 ///
@@ -1769,7 +1893,10 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
             }
             continue;
         }
-        if !shared.agents.is_attached(agent_id) {
+        // An agent with a plain stop queued is being stopped: parking a
+        // runtime for it would hand a relaunch a runtime that the stopped
+        // process's exit then ends (intent-hq/intent#8457).
+        if !shared.agents.is_attached(agent_id) && !shared.stop_queued(agent_id) {
             let sink = shared.agents.attach(agent_id, record.workspace_id.clone());
             let runtime = Arc::new(RemoteAgentRuntime::new(
                 agent_id.clone(),
