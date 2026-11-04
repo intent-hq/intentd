@@ -15,7 +15,8 @@
 // session/update `update` objects echoed verbatim before the text response.
 import readline from 'node:readline';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import os from 'node:os';
 
 const SESSION_ID = 'mock-session-1';
 
@@ -93,6 +94,25 @@ function log(msg) {
 // to this fixture, excluding the Node executable and script path, so tests
 // can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
 // the daemon-owned policy JSON and selected CODEX_PATH, never other env values.
+// MOCK_AGENT_LOG_TMPDIR opts into `tmp`: the child's TMPDIR / TMP / TEMP,
+// Node's `os.tmpdir()` and a file `mktemp` created from a shell, so tests can
+// prove each agent gets its own temp folder that shells and tools honor.
+function tmpReport() {
+  let mktemp = null;
+  try {
+    mktemp = execFileSync('sh', ['-c', 'mktemp'], { encoding: 'utf8' }).trim();
+  } catch (err) {
+    log(`mktemp failed: ${err.message}`);
+  }
+  return {
+    TMPDIR: process.env.TMPDIR ?? null,
+    TMP: process.env.TMP ?? null,
+    TEMP: process.env.TEMP ?? null,
+    osTmpdir: os.tmpdir(),
+    mktemp,
+  };
+}
+
 function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
@@ -115,6 +135,7 @@ function logSessionCall(method, sessionId, meta, cwd) {
               codexPath: process.env.CODEX_PATH ?? null,
             } }
           : {}),
+        ...(process.env.MOCK_AGENT_LOG_TMPDIR === '1' ? { tmp: tmpReport() } : {}),
       }) + '\n'
     );
   } catch (err) {

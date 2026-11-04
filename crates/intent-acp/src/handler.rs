@@ -69,6 +69,11 @@ pub struct ClientRequestHandler {
     /// layer). `None` for read-only/test wiring, in which case `terminal/*`
     /// requests answer with [`terminal::unsupported_error`].
     terminal_host: Option<Arc<dyn TerminalHost>>,
+    /// Variables every `terminal/create` command starts with unless the
+    /// request sets them itself — the agent's private temp folder, so
+    /// commands the daemon runs for the agent see the same `TMPDIR` as the
+    /// agent process.
+    terminal_env_defaults: Vec<(String, String)>,
 }
 
 impl ClientRequestHandler {
@@ -91,6 +96,7 @@ impl ClientRequestHandler {
             policy,
             sink,
             terminal_host: None,
+            terminal_env_defaults: Vec::new(),
         }
     }
 
@@ -99,6 +105,14 @@ impl ClientRequestHandler {
     #[must_use]
     pub fn with_terminal_host(mut self, host: Arc<dyn TerminalHost>) -> Self {
         self.terminal_host = Some(host);
+        self
+    }
+
+    /// Variables applied to every `terminal/create` command whose request
+    /// does not set them (the request's own `env` entries win).
+    #[must_use]
+    pub fn with_terminal_env_defaults(mut self, env: Vec<(String, String)>) -> Self {
+        self.terminal_env_defaults = env;
         self
     }
 
@@ -273,7 +287,10 @@ impl ClientRequestHandler {
                     session_id: req.session_id.0.to_string(),
                     command: req.command,
                     args: req.args,
-                    env: req.env.into_iter().map(|v| (v.name, v.value)).collect(),
+                    env: merge_env_defaults(
+                        &self.terminal_env_defaults,
+                        req.env.into_iter().map(|v| (v.name, v.value)).collect(),
+                    ),
                     cwd: req.cwd,
                     output_byte_limit: req.output_byte_limit,
                 };
@@ -410,4 +427,52 @@ fn exit_status_value(exit: TerminalExitInfo) -> TerminalExitStatus {
     TerminalExitStatus::new()
         .exit_code(exit.exit_code)
         .signal(exit.signal)
+}
+
+/// A `terminal/create` environment: `requested`, preceded by every default
+/// whose name `requested` does not set.
+fn merge_env_defaults(
+    defaults: &[(String, String)],
+    requested: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = defaults
+        .iter()
+        .filter(|(key, _)| !requested.iter().any(|(k, _)| k == key))
+        .cloned()
+        .collect();
+    env.extend(requested);
+    env
+}
+
+#[cfg(test)]
+mod terminal_env_tests {
+    use super::merge_env_defaults;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn defaults_fill_unset_names_and_requests_win() {
+        let defaults = pairs(&[("TMPDIR", "/agent"), ("TMP", "/agent"), ("TEMP", "/agent")]);
+        let env = merge_env_defaults(&defaults, pairs(&[("TMP", "/mine"), ("FOO", "1")]));
+        assert_eq!(
+            env,
+            pairs(&[
+                ("TMPDIR", "/agent"),
+                ("TEMP", "/agent"),
+                ("TMP", "/mine"),
+                ("FOO", "1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn no_defaults_passes_the_request_through() {
+        let requested = pairs(&[("FOO", "1")]);
+        assert_eq!(merge_env_defaults(&[], requested.clone()), requested);
+    }
 }
