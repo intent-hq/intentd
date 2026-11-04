@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.120] - 2026-11-03
+
+### 🚀 Features
+
+- *(terminal)* Report the foreground program on terminal.list and terminal:process ([#3010](https://github.com/intent-hq/intentd/pull/3010))
+
+### ⚡ Performance
+
+- *(agents)* Read agent_ops session metadata without the transcript ([#3001](https://github.com/intent-hq/intentd/pull/3001))
+
+
 ## [0.11.119] - 2026-11-03
 
 ### 🐛 Bug Fixes
