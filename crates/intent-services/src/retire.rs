@@ -270,9 +270,19 @@ impl Services {
             let sessions = self.store.list_agent_session_summaries(&id).await?;
             let ids: Vec<AgentId> = sessions
                 .into_iter()
-                .map(|s| s.id)
+                .map(|s| s.id.clone())
                 .filter(|a| Some(a) != caller_agent_id.as_ref())
                 .collect();
+            // Remote agents get final stops, recorded before the checkout
+            // goes: their machines push to the workspace's repository, which
+            // retire keeps, then remove their checkouts.
+            self.feature_remote_launch_port()
+                .final_stop(
+                    self,
+                    &ids,
+                    intent_core::remote_launch::FinalStopReason::WorkspaceRetired,
+                )
+                .await;
             if !ids.is_empty() {
                 drop(manager.stop_many(&ids).await);
             }

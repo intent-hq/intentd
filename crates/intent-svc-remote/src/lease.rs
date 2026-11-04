@@ -12,7 +12,7 @@ use intent_core::nodes::{
     LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
     NodeRecord, NodeState,
 };
-use intent_core::{now_iso, Error, Result};
+use intent_core::{now_iso, AgentId, Error, Result};
 use intent_store::Store;
 
 use crate::machine::MachineTarget;
@@ -30,6 +30,7 @@ pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHe
             generation,
         },
         acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
     }
 }
 
@@ -154,6 +155,41 @@ impl HeadLease {
         Ok(self.store.get_node_lease(&self.owner).await?.ack_seq)
     }
 
+    /// The agents whose checkouts the machine keeps (nodeProtocol 9): those
+    /// with a pending final stop, and those recorded here whose session has
+    /// not ended. The machine sweeps every other checkout of this backend's
+    /// agents that is not running, so an ended agent's checkout left behind
+    /// (an ack below protocol 9, a final stop past its bound, or one from
+    /// before final stops) goes at the next bind. A session that cannot be
+    /// read for another reason than its absence is kept.
+    pub(crate) async fn lease_agents(&self) -> Result<Vec<AgentId>> {
+        let mut lease_agents: Vec<AgentId> = self
+            .store
+            .list_final_stops(&self.owner.lease_id)
+            .await?
+            .into_iter()
+            .map(|stop| stop.agent_id)
+            .collect();
+        for record in self.store.list_remote_agents(&self.owner.lease_id).await? {
+            if lease_agents.contains(&record.agent_id) {
+                continue;
+            }
+            let ended = match self
+                .store
+                .get_agent_session_with_transcript(&record.agent_id)
+                .await
+            {
+                Ok(session) => crate::final_stop::session_ended(&session),
+                Err(Error::NotFound(_)) => true,
+                Err(_) => false,
+            };
+            if !ended {
+                lease_agents.push(record.agent_id);
+            }
+        }
+        Ok(lease_agents)
+    }
+
     /// Durably advance the generation, then build the hello offering it.
     /// The hello acks only what is persisted: the node deletes the records
     /// it acks, so offering `ingested` before it is saved could lose records
@@ -169,6 +205,7 @@ impl HeadLease {
             }
         };
         let generation = self.store.next_node_link_generation(&self.owner).await?;
+        let lease_agents = self.lease_agents().await?;
         Ok(LinkHello {
             protocol: NODE_LINK_PROTOCOLS,
             intentd_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -179,6 +216,7 @@ impl HeadLease {
                 generation,
             },
             acked_seq: acked,
+            lease_agents,
         })
     }
 

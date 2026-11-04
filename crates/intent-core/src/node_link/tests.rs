@@ -85,12 +85,17 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocol_7_only() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_9() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
-    // confirmed by a machine that cannot confirm it.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 7 });
-    ensure_protocol(7).unwrap();
+    // confirmed by a machine that cannot confirm it. 8 adds the script
+    // frames, 9 final stops; a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 9 });
+    assert_eq!(SCRIPT_PROTOCOL, 8);
+    assert_eq!(FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    for version in 7..=9 {
+        ensure_protocol(version).unwrap();
+    }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
         assert!(matches!(
             ensure_protocol(peer),
@@ -223,8 +228,13 @@ fn later_additions_within_a_version_decode_on_an_older_peer() {
         intentd_version: "0.12.0".into(),
         binding: binding("head", 1),
         acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
     }))
     .unwrap();
+    assert!(
+        hello.get("leaseAgents").is_none(),
+        "an empty leaseAgents is left out"
+    );
     hello["futureOption"] = json!(true);
     assert!(matches!(
         serde_json::from_value::<LinkFrame>(hello).unwrap(),
@@ -300,6 +310,8 @@ fn executor_link_requests_golden() {
             "launch",
             "prompt",
             "response",
+            "scriptStart",
+            "scriptStop",
             "stop",
         ]
     );
@@ -342,6 +354,9 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "journal",
             "replayComplete",
             "request",
+            "scriptExited",
+            "scriptOutput",
+            "scriptStarted",
             "stopAck",
             "welcome"
         ]
@@ -368,6 +383,7 @@ fn every_frame() -> Vec<LinkFrame> {
             intentd_version: "0.12.0".into(),
             binding: binding("head", 3),
             acked_seq: NodeCounter(10),
+            lease_agents: Vec::new(),
         }),
         LinkFrame::Welcome(LinkWelcome {
             protocol: 7,
@@ -405,16 +421,19 @@ fn every_frame() -> Vec<LinkFrame> {
         LinkFrame::Stop {
             agent_id: agent_id.clone(),
             stop_id: request_id,
+            final_stop: false,
         },
         LinkFrame::StopAck {
             stop_id: request_id,
             agent_id: agent_id.clone(),
             outcome: StopOutcome::Stopped,
+            final_push: None,
         },
         LinkFrame::StopAck {
             stop_id: request_id,
             agent_id: agent_id.clone(),
             outcome: StopOutcome::NotRunning,
+            final_push: None,
         },
         LinkFrame::Journal(record(
             11,
@@ -467,7 +486,48 @@ fn every_frame() -> Vec<LinkFrame> {
         LinkFrame::CapabilitiesReply {
             capabilities: capabilities(),
         },
+        LinkFrame::ScriptStart(script_start()),
+        LinkFrame::ScriptStop(ScriptProcessRef {
+            agent_id: AgentId::from("a1"),
+            script_id: "s1".into(),
+            spawn_id: "r1".into(),
+        }),
+        LinkFrame::ScriptStarted(ScriptStarted {
+            agent_id: AgentId::from("a1"),
+            script_id: "s1".into(),
+            spawn_id: "r1".into(),
+            pid: 4242,
+        }),
+        LinkFrame::ScriptOutput(ScriptOutput {
+            agent_id: AgentId::from("a1"),
+            script_id: "s1".into(),
+            spawn_id: "r1".into(),
+            seq: 0,
+            data: "hello\n".into(),
+        }),
+        LinkFrame::ScriptExited(ScriptExited {
+            agent_id: AgentId::from("a1"),
+            script_id: "s1".into(),
+            spawn_id: "r1".into(),
+            exit_code: Some(0),
+            error: None,
+        }),
     ]
+}
+
+fn script_start() -> ScriptStartCommand {
+    ScriptStartCommand {
+        agent_id: AgentId::from("a1"),
+        script_id: "s1".into(),
+        spawn_id: "r1".into(),
+        command: "npm test".into(),
+        mode: crate::ScriptMode::Command,
+        cwd: Some("web".into()),
+        env: vec![ScriptEnvVar {
+            key: "API_TOKEN".into(),
+            value: "canary-script-secret".into(),
+        }],
+    }
 }
 
 #[test]
@@ -480,14 +540,14 @@ fn every_frame_round_trips_through_the_codec() {
 
 #[test]
 fn frames_are_routed_to_their_lane() {
-    use LinkChannel::{Control, Journal, Rpc};
+    use LinkChannel::{Control, Journal, Rpc, Script};
     let lanes: Vec<_> = every_frame().iter().map(LinkFrame::channel).collect();
     assert_eq!(
         lanes,
         [
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
-            Control
+            Control, Script, Script, Script, Script, Script
         ]
     );
 }
@@ -531,6 +591,7 @@ fn stop_and_stop_ack_wire_shapes() {
         serde_json::to_value(LinkFrame::Stop {
             agent_id: agent_id.clone(),
             stop_id,
+            final_stop: false,
         })
         .unwrap(),
         json!({ "type": "stop", "agentId": agent_id.0, "stopId": stop_id.to_string() })
@@ -544,6 +605,7 @@ fn stop_and_stop_ack_wire_shapes() {
                 stop_id,
                 agent_id: agent_id.clone(),
                 outcome,
+                final_push: None,
             })
             .unwrap(),
             json!({
@@ -554,6 +616,55 @@ fn stop_and_stop_ack_wire_shapes() {
             })
         );
     }
+    // nodeProtocol 9: a final stop and its acknowledgement's push report.
+    let final_stop = serde_json::to_value(LinkFrame::Stop {
+        agent_id: agent_id.clone(),
+        stop_id,
+        final_stop: true,
+    })
+    .unwrap();
+    assert_eq!(
+        final_stop,
+        json!({ "type": "stop", "agentId": agent_id.0, "stopId": stop_id.to_string(), "final": true })
+    );
+    assert!(matches!(
+        LinkFrame::decode(final_stop.to_string().as_bytes()).unwrap(),
+        LinkFrame::Stop {
+            final_stop: true,
+            ..
+        }
+    ));
+    for (push, wire) in [
+        (FinalPush::Pushed, "pushed"),
+        (FinalPush::Failed, "failed"),
+        (FinalPush::Skipped, "skipped"),
+    ] {
+        let ack = LinkFrame::StopAck {
+            stop_id,
+            agent_id: agent_id.clone(),
+            outcome: StopOutcome::Stopped,
+            final_push: Some(push),
+        };
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(value["finalPush"], wire);
+        assert_eq!(
+            LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+            ack
+        );
+    }
+    let hello = LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "0.12.0".into(),
+        binding: binding("head", 1),
+        acked_seq: NodeCounter(0),
+        lease_agents: vec![agent_id.clone()],
+    };
+    let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
+    assert_eq!(value["leaseAgents"], json!([agent_id.0]));
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        LinkFrame::Hello(hello)
+    );
     // Protocol 7 requires the stop id: a stop without one is malformed.
     assert!(LinkFrame::decode(
         json!({ "type": "stop", "agentId": agent_id.0 })
@@ -742,4 +853,109 @@ fn exited_carries_the_documented_capacity_failure() {
         serde_json::from_value::<JournalBody>(plain).unwrap(),
         JournalBody::Exited { failure: None, .. }
     ));
+}
+
+/// The script frames of `docs/protocol/node-link.md` "Saved scripts
+/// (nodeProtocol 8)": camelCase members, closed bodies.
+#[test]
+fn script_frames_match_the_documented_wire_shapes() {
+    assert_eq!(
+        serde_json::to_value(LinkFrame::ScriptStart(script_start())).unwrap(),
+        json!({
+            "type": "scriptStart",
+            "agentId": "a1",
+            "scriptId": "s1",
+            "spawnId": "r1",
+            "command": "npm test",
+            "mode": "command",
+            "cwd": "web",
+            "env": [{ "key": "API_TOKEN", "value": "canary-script-secret" }],
+        })
+    );
+    let bare = ScriptStartCommand {
+        cwd: None,
+        env: Vec::new(),
+        mode: crate::ScriptMode::Service,
+        ..script_start()
+    };
+    let wire = serde_json::to_value(LinkFrame::ScriptStart(bare)).unwrap();
+    assert!(
+        wire.get("cwd").is_none() && wire.get("env").is_none(),
+        "{wire}"
+    );
+    assert_eq!(wire["mode"], "service");
+    assert_eq!(
+        serde_json::to_value(LinkFrame::ScriptStop(ScriptProcessRef {
+            agent_id: AgentId::from("a1"),
+            script_id: "s1".into(),
+            spawn_id: "r1".into(),
+        }))
+        .unwrap(),
+        json!({ "type": "scriptStop", "agentId": "a1", "scriptId": "s1", "spawnId": "r1" })
+    );
+    assert_eq!(
+        serde_json::to_value(&every_frame()[23]).unwrap(),
+        json!({ "type": "scriptStarted", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "pid": 4242 })
+    );
+    assert_eq!(
+        serde_json::to_value(&every_frame()[24]).unwrap(),
+        json!({ "type": "scriptOutput", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "seq": 0, "data": "hello\n" })
+    );
+    assert_eq!(
+        serde_json::to_value(&every_frame()[25]).unwrap(),
+        json!({ "type": "scriptExited", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "exitCode": 0 })
+    );
+    let refused = LinkFrame::ScriptExited(ScriptExited {
+        agent_id: AgentId::from("a1"),
+        script_id: "s1".into(),
+        spawn_id: "r1".into(),
+        exit_code: None,
+        error: Some("node-script-invalid-cwd: /etc".into()),
+    });
+    assert_eq!(
+        serde_json::to_value(refused).unwrap(),
+        json!({ "type": "scriptExited", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "error": "node-script-invalid-cwd: /etc" })
+    );
+}
+
+#[test]
+fn script_frame_bodies_are_closed() {
+    for raw in [
+        json!({ "type": "scriptStop", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "extra": 1 }),
+        json!({ "type": "scriptStop", "agentId": "a1", "scriptId": "s1" }),
+        json!({ "type": "scriptStop", "scriptId": "s1", "spawnId": "r1" }),
+        json!({ "type": "scriptExited", "scriptId": "s1", "spawnId": "r1", "exitCode": 0 }),
+        json!({ "type": "scriptStarted", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "pid": "1" }),
+        json!({ "type": "scriptOutput", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "seq": 0, "data": "x", "more": true }),
+        json!({ "type": "scriptExited", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "exitCode": "0" }),
+        json!({ "type": "scriptStart", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "command": "x", "mode": "daemon" }),
+        json!({ "type": "scriptStart", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "command": "x", "mode": "command", "autoStart": true }),
+        json!({ "type": "scriptStart", "agentId": "a1", "scriptId": "s1", "spawnId": "r1", "command": "x", "mode": "command", "env": [{ "key": "A", "value": "b", "secret": true }] }),
+    ] {
+        assert!(
+            LinkFrame::decode(raw.to_string().as_bytes()).is_err(),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn script_env_never_debug_renders_its_values() {
+    let frame = LinkFrame::ScriptStart(script_start());
+    let rendered = format!("{frame:?}");
+    assert!(!rendered.contains("canary-script-secret"), "{rendered}");
+    assert!(rendered.contains("API_TOKEN"), "{rendered}");
+}
+
+#[test]
+fn script_frames_need_protocol_8() {
+    for frame in every_frame() {
+        let script = matches!(frame.channel(), LinkChannel::Script);
+        assert_eq!(
+            frame.min_protocol(),
+            if script { 8 } else { 7 },
+            "{}",
+            frame_tag(&frame)
+        );
+    }
 }

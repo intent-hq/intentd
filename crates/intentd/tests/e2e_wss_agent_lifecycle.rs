@@ -2319,7 +2319,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store
@@ -2610,7 +2610,7 @@ async fn agent_pinned_round_trip_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store
@@ -7849,6 +7849,137 @@ async fn terminal_create_env_over_wss() {
     )
     .await;
     assert_eq!(released["ok"], json!(true));
+}
+
+/// `terminal.list` rows carry `foregroundProcess` / `lastProcess`, and a
+/// `terminal:process` event fires when a job starts and when it ends.
+#[intent_test_macros::daemon_test]
+async fn terminal_process_fields_and_events_over_wss() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["terminal:process"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "{sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "terminal.create",
+        json!({ "workspaceId": ws_id, "cols": 80, "rows": 24, "command": "sh" }),
+    )
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], Value::Null, "{row}");
+
+    let _ = wss_rpc(
+        &mut rpc,
+        4,
+        "terminal.write",
+        // timing-guard: the shell job whose foreground state is observed, not a wait
+        json!({ "terminalId": terminal_id, "data": STANDARD.encode("sleep 30\n") }),
+    )
+    .await;
+
+    let mut events: Vec<Value> = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
+    let started =
+        json!({ "terminalId": terminal_id, "foregroundProcess": "sleep", "lastProcess": null });
+    let ended =
+        json!({ "terminalId": terminal_id, "foregroundProcess": null, "lastProcess": "sleep" });
+    let mut interrupted = false;
+    while !events.contains(&ended) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                let event = &frame["params"]["event"];
+                if frame["method"] != "events.event" || event["type"] != "terminal:process" {
+                    continue;
+                }
+                events.push(event["data"].clone());
+                if !interrupted && events.contains(&started) {
+                    interrupted = true;
+                    let listed = wss_rpc(
+                        &mut rpc,
+                        5,
+                        "terminal.list",
+                        json!({ "workspaceId": ws_id }),
+                    )
+                    .await;
+                    let row = listed["terminals"]
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+                        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+                    assert_eq!(row["foregroundProcess"], "sleep", "{row}");
+                    let _ = wss_rpc(
+                        &mut rpc,
+                        6,
+                        "terminal.write",
+                        json!({ "terminalId": terminal_id, "data": STANDARD.encode("\u{3}") }),
+                    )
+                    .await;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    assert_eq!(events, vec![started, ended], "terminal:process payloads");
+
+    let listed = wss_rpc(
+        &mut rpc,
+        7,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], "sleep", "{row}");
+    let _ = wss_rpc(
+        &mut rpc,
+        8,
+        "terminal.kill",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
 }
 
 /// Regression (paste/echo throughput): `terminal:data` is transient /

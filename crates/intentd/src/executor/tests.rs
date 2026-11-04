@@ -312,13 +312,26 @@ impl Running {
         admission: Arc<CountAdmission>,
         providers: BTreeMap<String, ProviderLaunch>,
     ) -> Self {
+        // Agents work in plain directories here: no backend serves git. The
+        // git checkout path is covered by the e2e tests.
+        Self::start_with_checkouts(data_dir, api, admission, providers, |storage, _cache| {
+            checkout::PlainCheckouts::new(storage)
+        })
+        .await
+    }
+
+    async fn start_with_checkouts(
+        data_dir: &std::path::Path,
+        api: Arc<MachineApi>,
+        admission: Arc<CountAdmission>,
+        providers: BTreeMap<String, ProviderLaunch>,
+        make_checkouts: MakeCheckouts,
+    ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
         });
-        // Agents work in plain directories here: no backend serves git. The
-        // git checkout path is covered by the e2e tests.
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
                 data_dir: data_dir.to_owned(),
@@ -337,7 +350,7 @@ impl Running {
                 },
             },
             api.subscribe_executor_revocations(),
-            |storage, _cache| checkout::PlainCheckouts::new(storage),
+            make_checkouts,
         )
         .unwrap();
         let bus_dir = tempfile::tempdir().unwrap();
@@ -409,6 +422,7 @@ fn hello_from(head: &str, generation: u64, lease: &str, acked: u64) -> LinkHello
             generation: NodeCounter(generation),
         },
         acked_seq: NodeCounter(acked),
+        lease_agents: Vec::new(),
     }
 }
 
@@ -1519,5 +1533,410 @@ async fn a_reconnecting_backend_counts_once() {
     .unwrap();
     replay_complete(&mut other).await;
     assert_eq!(node.service.linked_backends(), 2);
+    node.stop().await;
+}
+
+/// A revoked credential's storage (its checkouts included) goes: when the
+/// revocation arrives, at startup, and at the next bind of any backend.
+/// Another backend's active credential keeps its storage.
+#[tokio::test]
+async fn a_revoked_credentials_storage_is_removed_and_active_ones_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 4).await;
+    let mut first = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut first).await;
+    let mut other = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 1, "lease-1", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut other).await;
+    let roots: HashMap<String, std::path::PathBuf> = [token(), other_token()]
+        .into_iter()
+        .map(|t| {
+            let root = dir
+                .path()
+                .join("executor")
+                .join(&node.api.credential(&t).id.0);
+            (t, root)
+        })
+        .collect();
+    let root = |token: &str| roots[token].clone();
+    let gone = |path: std::path::PathBuf| async move {
+        let deadline = tokio::time::Instant::now() + wait();
+        while path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} remains",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+
+    // Revoked live: its storage goes, the other backend's stays.
+    let id = node.api.credential(&token()).id;
+    node.api.revoked.lock().unwrap().insert(id.clone());
+    node.api.revocations.send(id).unwrap();
+    gone(root(&token())).await;
+    assert!(root(&other_token()).join("journal").is_dir());
+
+    // A revoked credential's directory left behind (a crash before the
+    // removal) goes at the next bind.
+    let stale = dir.path().join("executor").join("stalecredential");
+    std::fs::create_dir_all(stale.join("agents").join("a1")).unwrap();
+    drop(other);
+    let mut again = dial_link(
+        &node.endpoint_for(&other_token()),
+        hello_from(OTHER_HEAD, 2, "lease-1", 0),
+    )
+    .await
+    .unwrap();
+    replay_complete(&mut again).await;
+    gone(stale.clone()).await;
+    assert!(root(&other_token()).join("journal").is_dir());
+    let api = node.stop().await;
+
+    // And at startup.
+    std::fs::create_dir_all(stale.join("agents")).unwrap();
+    let node = Running::start_with(dir.path(), api, CountAdmission::new(4), BTreeMap::new()).await;
+    gone(stale).await;
+    assert!(root(&other_token()).join("journal").is_dir());
+    node.stop().await;
+}
+
+/// A final stop ends the agent's script runs before its last push and the
+/// checkout's removal: when the stop is acknowledged the script's process
+/// is already gone, and so is the checkout.
+#[tokio::test]
+async fn a_final_stop_ends_the_agents_scripts_before_it_is_acknowledged() {
+    use intent_core::node_link::{FinalPush, ScriptStartCommand, StopId, StopOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let agent = AgentId::from("a-scripted");
+    let mut offer = hello(1, "lease-1", 0);
+    offer.lease_agents = vec![agent.clone()];
+    let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
+    assert_eq!(dialed.link.protocol(), 9);
+    replay_complete(&mut dialed).await;
+    let checkout = dir
+        .path()
+        .join("executor")
+        .join(&node.api.credential(&token()).id.0)
+        .join("agents")
+        .join(&agent.0)
+        .join("work");
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            // Ignores the polite signals, so only a kill that is waited for
+            // to the end (its escalation to SIGKILL) ends it.
+            command: "trap '' TERM HUP INT; while :; do sleep 1; done".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    let pid = loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => {
+                break i32::try_from(started.pid).unwrap();
+            }
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    };
+    assert!(!process_gone(pid), "the script runs");
+
+    let acked = dialed
+        .link
+        .stop_with(agent.clone(), StopId::new_v4(), true, wait())
+        .await
+        .unwrap();
+    assert!(process_gone(pid), "acknowledged while the script still ran");
+    assert_eq!(acked.outcome, StopOutcome::NotRunning);
+    assert_eq!(acked.final_push, Some(FinalPush::Skipped));
+    assert!(!checkout.exists());
+}
+
+/// The gate both backends' shutdown pushes meet at in
+/// [`shutdown_stops_backends_together`]: it opens only once both are under
+/// way at once.
+static BOTH_PUSHING: std::sync::LazyLock<Arc<tokio::sync::Barrier>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Barrier::new(2)));
+
+/// A daemon shutdown stops every backend's agents at once, each one's last
+/// push included, so it takes one drain however many backends there are
+/// (intent-hq/intent#8437): each push here is held until the other
+/// backend's is under way too, which a one-by-one stop never reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_backends_together() {
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node = Running::start_with_checkouts(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        providers,
+        |storage, _cache| checkout::PlainCheckouts::with_push_gate(storage, BOTH_PUSHING.clone()),
+    )
+    .await;
+    let mut links = Vec::new();
+    for (endpoint, hello) in [
+        (node.endpoint.clone(), hello(1, "lease-1", 0)),
+        (
+            node.endpoint_for(&other_token()),
+            hello_from(OTHER_HEAD, 1, "lease-o", 0),
+        ),
+    ] {
+        let mut dialed = dial_link(&endpoint, hello).await.unwrap();
+        replay_complete(&mut dialed).await;
+        dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+        assert!(matches!(
+            next_record(&mut dialed).await.body,
+            JournalBody::Started { .. }
+        ));
+        links.push(dialed);
+    }
+    assert_eq!(admission.running.lock().unwrap().len(), 2);
+
+    tokio::time::timeout(wait(), node.service.shutdown())
+        .await
+        .expect("both backends' pushes run together");
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with agents still running"
+    );
+    node.stop().await;
+}
+
+/// A final stop over a script whose reaper never finishes is not
+/// acknowledged (the backend resends it), and it answers within the reap
+/// bound instead of hanging, so a later stop or launch is not stuck behind
+/// it.
+#[tokio::test]
+async fn a_final_stop_over_a_stuck_script_answers_without_an_ack() {
+    use intent_core::node_link::ScriptStartCommand;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let agent = AgentId::from("a-stuck-final");
+    crate::executor::scripts::hold_reaps_for_test(&agent);
+    let mut offer = hello(1, "lease-1", 0);
+    offer.lease_agents = vec![agent.clone()];
+    let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
+    replay_complete(&mut dialed).await;
+    let checkout = dir
+        .path()
+        .join("executor")
+        .join(&node.api.credential(&token()).id.0)
+        .join("agents")
+        .join(&agent.0)
+        .join("work");
+    std::fs::create_dir_all(&checkout).unwrap();
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            command: "sleep 60".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => break,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+    let runner = node
+        .service
+        .runners_for_test()
+        .pop()
+        .expect("a linked backend");
+    let bound = crate::executor::scripts::reap_wait() + Duration::from_secs(3);
+    let answer = tokio::time::timeout(bound, runner.final_stop(&agent))
+        .await
+        .expect("the final stop hung on the stuck script");
+    assert_eq!(answer, None, "acknowledged with a script still unreaped");
+    assert!(
+        checkout.exists(),
+        "the checkout went with a script still unreaped"
+    );
+    node.stop().await;
+}
+
+/// A final stop over a script whose kill or reaper panicked is not
+/// acknowledged (the backend resends it); after a panicked kill, the resent
+/// stop kills the script again and is acknowledged.
+#[tokio::test]
+async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
+    use intent_core::node_link::{FinalPush, ScriptStartCommand, StopOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 2).await;
+    let killed = AgentId::from("a-panicked-kill");
+    let reaped = AgentId::from("a-panicked-reap");
+    crate::executor::scripts::panic_reaps_for_test(&reaped);
+    let mut offer = hello(1, "lease-1", 0);
+    offer.lease_agents = vec![killed.clone(), reaped.clone()];
+    let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
+    replay_complete(&mut dialed).await;
+    let root = dir
+        .path()
+        .join("executor")
+        .join(&node.api.credential(&token()).id.0)
+        .join("agents");
+    for agent in [&killed, &reaped] {
+        std::fs::create_dir_all(root.join(&agent.0).join("work")).unwrap();
+        dialed
+            .link
+            .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+                agent_id: agent.clone(),
+                script_id: "s1".into(),
+                spawn_id: format!("spawn-{}", agent.0),
+                command: "sleep 60".into(),
+                mode: intent_core::ScriptMode::Command,
+                cwd: None,
+                env: vec![],
+            }))
+            .await
+            .unwrap();
+    }
+    let mut started = 0;
+    while started < 2 {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(_)) => started += 1,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+    let runner = node
+        .service
+        .runners_for_test()
+        .pop()
+        .expect("a linked backend");
+    let bound = crate::executor::scripts::reap_wait() + Duration::from_secs(3);
+
+    crate::executor::scripts::panic_next_kill_for_test(&killed);
+    let answer = tokio::time::timeout(bound, runner.final_stop(&killed))
+        .await
+        .expect("the final stop hung on a panicked kill");
+    assert_eq!(answer, None, "acknowledged over a panicked kill");
+    assert!(root.join(&killed.0).join("work").exists());
+    let answer = tokio::time::timeout(bound, runner.final_stop(&killed))
+        .await
+        .expect("the resent final stop hung");
+    assert_eq!(answer, Some((StopOutcome::NotRunning, FinalPush::Skipped)));
+    assert!(!root.join(&killed.0).join("work").exists());
+
+    let answer = tokio::time::timeout(bound, runner.final_stop(&reaped))
+        .await
+        .expect("the final stop hung on a panicked reaper");
+    assert_eq!(answer, None, "acknowledged over a panicked reaper");
+    assert!(root.join(&reaped.0).join("work").exists());
+    node.stop().await;
+}
+
+/// The gate the agent's shutdown push meets the test at in
+/// [`shutdown_over_a_stuck_script_stays_within_one_reap_wait`].
+static SHUTDOWN_PUSH: std::sync::LazyLock<Arc<tokio::sync::Barrier>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Barrier::new(2)));
+
+/// A machine shutdown over a script whose reaper never finishes waits for
+/// it once, bounded by the reap wait: the agent's last push starts right
+/// after, and the whole executor shutdown, its links' close included,
+/// returns without a second reap wait at the link's end
+/// (intent-hq/intent#8437).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
+    use intent_core::node_link::ScriptStartCommand;
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node = Running::start_with_checkouts(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        providers,
+        |storage, _cache| checkout::PlainCheckouts::with_push_gate(storage, SHUTDOWN_PUSH.clone()),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let agent = AgentId::from("a-stuck-shutdown");
+    crate::executor::scripts::hold_reaps_for_test(&agent);
+    dialed
+        .link
+        .send(&launch_of(&agent.0, "mock"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            command: "sleep 60".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => break,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+
+    // One reap wait for the stuck script, plus room to stop the agent and
+    // close the links; a second reap wait at the links' close overruns it.
+    let margin = intentd_test_support::test_timeout(Duration::from_secs(4));
+    let bound = crate::executor::scripts::reap_wait() + margin;
+    let service = node.service.clone();
+    let shutdown = tokio::spawn(async move { service.shutdown().await });
+    tokio::time::timeout(bound, SHUTDOWN_PUSH.wait())
+        .await
+        .expect("the agent's push did not start within one reap wait");
+    tokio::time::timeout(margin, shutdown)
+        .await
+        .expect("the shutdown waited on the stuck script again after the push")
+        .unwrap();
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with the agent still running"
+    );
     node.stop().await;
 }

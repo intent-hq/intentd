@@ -9,7 +9,7 @@
 //! launch that failed or was refused for capacity). Records of one agent are
 //! journaled in order by a single per-agent pump.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,8 +26,8 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    ExitFailure, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
-    StopOutcome,
+    ExitFailure, FinalPush, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
+    MachineCapacity, StopOutcome,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -35,7 +35,8 @@ use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
 
-use super::checkout::Checkouts;
+use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT};
+use super::scripts::ScriptProcesses;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
@@ -72,9 +73,25 @@ const TRACK_INTERVAL: Duration = Duration::from_secs(1);
 /// its helpers (which inherit it) can be found after the provider exits,
 /// wherever they were reparented to.
 const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
-/// How long shutdown waits for stopped agents to be cleaned up and their
-/// queued records (each one fsync'd) to be journaled.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// The whole of a runner's shutdown: its script runs end (bounded by
+/// [`super::scripts::REAP_WAIT`]), then its agents are stopped, push their
+/// last work (each push bounded by [`FINAL_PUSH_TIMEOUT`]), are cleaned up
+/// and have their queued records (each one fsync'd) journaled, and every
+/// final stop's cleanup under way finishes.
+pub(super) const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
+
+// A shutdown push gets its whole bound after the scripts are reaped and the
+// agent is killed, all within the shutdown, and the shutdown ends well
+// before the sitter force-kills a stopping daemon, leaving the rest of the
+// daemon's stop room too, so a push is never killed midway
+// (intent-hq/intent#8437).
+const _: () = assert!(
+    super::scripts::REAP_WAIT.as_secs() + TERM_GRACE.as_secs() + FINAL_PUSH_TIMEOUT.as_secs()
+        < SHUTDOWN_WAIT.as_secs()
+);
+const _: () = assert!(
+    SHUTDOWN_WAIT.as_secs() + 10 <= intentd_sitter::supervisor::DEFAULT_KILL_TIMEOUT.as_secs()
+);
 
 /// How this machine launches a provider: its registry entry, the executable
 /// a local agent of it would spawn (or the npx package), and extra
@@ -155,6 +172,13 @@ struct Inner {
     /// adoption and every side effect, so a replaced session can act on
     /// nothing (see `session.rs`).
     link_gate: tokio::sync::Mutex<Option<LeaseBinding>>,
+    /// Machine runs of the agents' saved scripts (nodeProtocol 8).
+    scripts: ScriptProcesses,
+    /// Notified each time the bind sweep finishes removing one checkout.
+    swept: tokio::sync::Notify,
+    /// Set when shutdown begins: an ordinary push still under way is
+    /// cancelled, so the agent's last push starts within the budget.
+    closing_signal: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -170,6 +194,50 @@ struct State {
     /// free) whose exit record is not journaled yet, so a stop arriving in
     /// that window still waits for the record.
     exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
+    /// Agents a final stop is pushing and removing, each with the one
+    /// cleanup every repeat of that stop joins (`None` until it finishes).
+    /// The bind sweep leaves their checkouts to it, and a launch waits for
+    /// it.
+    finalizing: HashMap<AgentId, watch::Receiver<Option<FinalStopDone>>>,
+    /// Agents launched since the newest bind sweep took its list: the sweep
+    /// never removes their checkouts.
+    launched: HashSet<AgentId>,
+    /// Agents whose checkout the bind sweep is removing now; their launch
+    /// waits for it.
+    sweeping: HashSet<AgentId>,
+}
+
+/// A final stop's answer: the acknowledgement's outcome and push report, or
+/// `None` when it may not be acknowledged.
+type FinalStopDone = Option<(StopOutcome, FinalPush)>;
+
+/// Finishes a final stop's cleanup when its task ends, normally or not:
+/// drops its `finalizing` entry, publishes its answer (`None`, so the stop
+/// is not acknowledged and the backend resends it, unless the cleanup set
+/// one) and wakes launches waiting on it.
+struct FinalizingGuard {
+    runner: Runner,
+    agent_id: AgentId,
+    finished: watch::Sender<Option<FinalStopDone>>,
+    result: FinalStopDone,
+}
+
+impl Drop for FinalizingGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = lock(&self.runner.inner.state);
+            if state
+                .finalizing
+                .get(&self.agent_id)
+                .is_some_and(|done| done.same_channel(&self.finished.subscribe()))
+            {
+                state.finalizing.remove(&self.agent_id);
+            }
+        }
+        self.finished.send_replace(Some(self.result));
+        // A launch waiting for this cleanup goes ahead.
+        self.runner.inner.swept.notify_waiters();
+    }
 }
 
 /// Whether an agent's exit record reached the journal.
@@ -236,8 +304,14 @@ struct Agent {
     gates: workspace_api::Gates,
     /// The agent's working directory, once prepared.
     worktree: Mutex<Option<PathBuf>>,
+    /// Prepended to the agent's first turn (see [`Prepared::notice`]).
+    notice: Mutex<Option<String>>,
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
+    /// A final stop ends the agent: its exit push is bounded by
+    /// [`FINAL_PUSH_TIMEOUT`] and reported in `final_push`.
+    final_stop: std::sync::atomic::AtomicBool,
+    final_push: Mutex<Option<FinalPush>>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     /// Whether the agent's exit record reached the journal.
     journaled: watch::Receiver<ExitRecord>,
@@ -606,8 +680,41 @@ impl Runner {
                 state: Mutex::new(State::default()),
                 pumps: Mutex::new(Vec::new()),
                 link_gate: tokio::sync::Mutex::new(None),
+                scripts: ScriptProcesses::new(Arc::new(intent_pty::PtyHost::new())),
+                swept: tokio::sync::Notify::new(),
+                closing_signal: watch::channel(false).0,
             }),
         }
+    }
+
+    /// Start one process of a machine run for the link binding
+    /// `generation`, in the agent's checkout when it has one here.
+    pub(super) async fn script_start(
+        &self,
+        link: &intent_transport::node_link::NodeLink,
+        generation: NodeCounter,
+        command: intent_core::node_link::ScriptStartCommand,
+    ) {
+        let checkout = self.inner.checkouts.existing(&command.agent_id);
+        self.inner
+            .scripts
+            .start(link, generation, checkout.as_deref(), command)
+            .await;
+    }
+
+    /// Stop one script process; its `scriptExited` acknowledges the stop.
+    pub(super) fn script_stop(
+        &self,
+        link: &intent_transport::node_link::NodeLink,
+        process: &intent_core::node_link::ScriptProcessRef,
+    ) {
+        self.inner.scripts.stop(link, process);
+    }
+
+    /// Kill every script process the link binding `generation` started:
+    /// its link ended, so no script outlives it.
+    pub(super) async fn end_binding_scripts(&self, generation: NodeCounter) {
+        self.inner.scripts.stop_binding(generation).await;
     }
 
     /// The machine's shared limits and their use.
@@ -701,6 +808,7 @@ impl Runner {
     /// frames that caused them; a failed start is journaled as the agent's
     /// exit with an error code.
     pub(super) async fn launch(&self, command: LaunchCommand) {
+        self.claim_checkout(&command.agent_id).await;
         // Provider discovery reads the filesystem; keep it off the runtime.
         let launch = self.inner.launch.clone();
         let provider = command.provider.clone();
@@ -804,7 +912,10 @@ impl Runner {
                 is_sub_agent,
             },
             worktree: Mutex::new(None),
+            notice: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
+            final_stop: std::sync::atomic::AtomicBool::new(false),
+            final_push: Mutex::new(None),
             stop: Mutex::new(Some(stop_tx)),
             journaled: journaled_rx,
             ready: ready_rx,
@@ -974,8 +1085,12 @@ impl Runner {
         let started = match prepared {
             None => Err(None),
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
-            Some(Ok(cwd)) => {
+            Some(Ok(Prepared {
+                worktree: cwd,
+                notice,
+            })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
+                *lock(&agent.notice) = notice;
                 match workspace_api::serve(
                     &agent.id,
                     &agent.workspace_id,
@@ -1063,7 +1178,7 @@ impl Runner {
         // Turns still waiting for the session see it is gone.
         drop(ready);
         // Whatever the agent did is sent back before head hears it exited.
-        self.push_wip(&agent).await;
+        self.push_wip(&agent, Push::Exit).await;
         {
             let mut state = lock(&self.inner.state);
             if state
@@ -1108,10 +1223,14 @@ impl Runner {
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
-        let (child, connection, npx_launch_dir) = spawned.into_parts();
+        let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the
         // agent is gone.
         *lock(&agent.npx_launch_dir) = npx_launch_dir;
+        // Remote agents set no `agent_tmp_root`, so no private temp folder
+        // was created for this launch.
+        debug_assert!(agent_tmp_dir.is_none());
+        drop(agent_tmp_dir);
         let connection = Arc::new(connection);
         let handler = ClientRequestHandler::new(
             agent.workspace_id.clone(),
@@ -1264,26 +1383,263 @@ impl Runner {
             });
             *lock(&agent.busy) = false;
             // The agent is idle: send its work back.
-            runner.push_wip(&agent).await;
+            runner.push_wip(&agent, Push::TurnEnd).await;
         });
         None
     }
 
     /// Push the agent's work to head, if its checkout was prepared. Failures
     /// are logged: the next push sends the same refs again.
-    async fn push_wip(&self, agent: &Agent) {
+    async fn push_wip(&self, agent: &Agent, kind: Push) {
         let Some(worktree) = lock(&agent.worktree).clone() else {
             return;
         };
-        let _serial = agent.wip.lock().await;
-        if let Err(error) = self
-            .inner
-            .checkouts
-            .push_wip(&agent.id, &agent.workspace_id, &worktree)
-            .await
-        {
+        // Once the daemon is stopping, only the agent's exit push runs: a
+        // turn-end push, queued or under way, gives way to it, and the exit
+        // push sends everything it would have within the shutdown budget.
+        let mut shutting_down = self.inner.closing_signal.subscribe();
+        let _serial = match kind {
+            Push::Exit => agent.wip.lock().await,
+            Push::TurnEnd => tokio::select! {
+                serial = agent.wip.lock() => serial,
+                Ok(_) = shutting_down.wait_for(|closing| *closing) => return,
+            },
+        };
+        let final_stop = agent.final_stop.load(std::sync::atomic::Ordering::SeqCst);
+        let closing = lock(&self.inner.state).closing;
+        if closing && kind == Push::TurnEnd {
+            return;
+        }
+        let push = |timeout| {
+            self.inner
+                .checkouts
+                .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout)
+        };
+        let pushed = if kind == Push::Exit && (final_stop || closing) {
+            // The agent's last push here, bounded like a final stop's.
+            push(FINAL_PUSH_TIMEOUT).await
+        } else {
+            // Any other push gives way to shutdown: an ordinary one (up to
+            // `WIP_PUSH_TIMEOUT`), or a turn's end during a final stop's
+            // script stop, would hold the lock past the shutdown budget.
+            // Head's ref update is atomic: its refs are left old or whole.
+            let timeout = if final_stop {
+                FINAL_PUSH_TIMEOUT
+            } else {
+                WIP_PUSH_TIMEOUT
+            };
+            let raced = tokio::select! {
+                pushed = push(timeout) => Some(pushed),
+                Ok(_) = shutting_down.wait_for(|closing| *closing) => None,
+            };
+            match (raced, kind) {
+                (Some(pushed), _) => pushed,
+                // An exit push is the last one: send it again, bounded.
+                (None, Push::Exit) => push(FINAL_PUSH_TIMEOUT).await,
+                (None, Push::TurnEnd) => return,
+            }
+        };
+        if let Err(error) = &pushed {
             tracing::warn!(agent = %agent.id, error = %format!("{error:#}"), "node: WIP push failed");
         }
+        if final_stop {
+            *lock(&agent.final_push) = Some(if pushed.is_ok() {
+                FinalPush::Pushed
+            } else {
+                FinalPush::Failed
+            });
+        }
+    }
+
+    /// End `agent_id` for good (a final stop, nodeProtocol 9): end its
+    /// script runs, then stop it as [`Self::stop`] does, its exit push
+    /// bounded by [`FINAL_PUSH_TIMEOUT`] (an agent that is not running is
+    /// pushed then, when this machine knows its workspace), then remove its
+    /// checkout. Resolves with the acknowledgement's outcome and push report,
+    /// or `None` when the stop may not be acknowledged (its exit record was
+    /// not journaled, or the checkout could not be removed): the backend
+    /// resends it.
+    ///
+    /// The cleanup runs once per agent at a time: a repeat delivered while
+    /// it runs (the backend resends until acknowledged) joins it and gets
+    /// the same answer, and it runs to the end even if no caller waits.
+    pub(super) fn final_stop(
+        &self,
+        agent_id: &AgentId,
+    ) -> BoxFuture<'static, Option<(StopOutcome, FinalPush)>> {
+        let mut done = {
+            let mut state = lock(&self.inner.state);
+            if let Some(running) = state.finalizing.get(agent_id) {
+                running.clone()
+            } else {
+                let (finished, done) = watch::channel(None);
+                state.finalizing.insert(agent_id.clone(), done.clone());
+                let agent = state.agents.get(agent_id).cloned();
+                drop(state);
+                if let Some(agent) = &agent {
+                    agent
+                        .final_stop
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let runner = self.clone();
+                let agent_id = agent_id.clone();
+                // caller-binding: allow — node-local final-stop cleanup that every repeat joins
+                tokio::spawn(async move {
+                    // Ends the cleanup however the task ends (a panic or a
+                    // cancel included): no entry is left for launches to
+                    // wait on or later stops to join.
+                    let mut guard = FinalizingGuard {
+                        runner: runner.clone(),
+                        agent_id: agent_id.clone(),
+                        finished,
+                        result: None,
+                    };
+                    // The agent's script runs end first, so nothing still
+                    // writes to its checkout while it is pushed and removed.
+                    if !runner.inner.scripts.stop_agent(&agent_id).await {
+                        // A script that is still not reaped may still write
+                        // to the checkout: stop the provider, but neither
+                        // push nor remove, and do not acknowledge, so the
+                        // backend resends the stop.
+                        tracing::warn!(agent = %agent_id, "node: final stop not acknowledged: a script of the agent was not reaped");
+                        drop(runner.stop(&agent_id));
+                        return;
+                    }
+                    let wait = runner.stop(&agent_id);
+                    guard.result = runner.finish_final_stop(agent, &agent_id, wait).await;
+                });
+                done
+            }
+        };
+        Box::pin(async move {
+            match done.wait_for(Option::is_some).await {
+                Ok(result) => (*result).flatten(),
+                Err(_) => None,
+            }
+        })
+    }
+
+    async fn finish_final_stop(
+        &self,
+        agent: Option<Arc<Agent>>,
+        agent_id: &AgentId,
+        wait: StopWait,
+    ) -> Option<(StopOutcome, FinalPush)> {
+        let outcome = wait.wait().await?;
+        let exit_push = agent.and_then(|agent| *lock(&agent.final_push));
+        let push = match exit_push {
+            Some(push) => push,
+            None => self.push_final(agent_id).await,
+        };
+        if let Err(error) = self.inner.checkouts.remove(agent_id).await {
+            tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: could not remove a stopped agent's checkout; not acknowledging");
+            return None;
+        }
+        Some((outcome, push))
+    }
+
+    /// The final push of an agent that is not running: `skipped` without a
+    /// checkout here, or when this machine does not know its workspace
+    /// (it already pushed when it exited).
+    async fn push_final(&self, agent_id: &AgentId) -> FinalPush {
+        let Some(worktree) = self.inner.checkouts.existing(agent_id) else {
+            return FinalPush::Skipped;
+        };
+        let Some(workspace_id) = lock(&self.inner.state).workspaces.get(agent_id).cloned() else {
+            return FinalPush::Skipped;
+        };
+        match self
+            .inner
+            .checkouts
+            .push_wip(agent_id, &workspace_id, &worktree, FINAL_PUSH_TIMEOUT)
+            .await
+        {
+            Ok(()) => FinalPush::Pushed,
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: final WIP push failed");
+                FinalPush::Failed
+            }
+        }
+    }
+
+    /// Mark `agent_id` launched, so the bind sweep leaves its checkout, and
+    /// wait out a removal of that checkout already under way (by the sweep
+    /// or a final stop).
+    async fn claim_checkout(&self, agent_id: &AgentId) {
+        loop {
+            let swept = self.inner.swept.notified();
+            tokio::pin!(swept);
+            swept.as_mut().enable();
+            {
+                let mut state = lock(&self.inner.state);
+                state.launched.insert(agent_id.clone());
+                if !state.sweeping.contains(agent_id) && !state.finalizing.contains_key(agent_id) {
+                    return;
+                }
+            }
+            swept.await;
+        }
+    }
+
+    /// At a nodeProtocol 9 bind, before any frame of the new link is
+    /// handled: the checkouts of this backend's agents that are neither in
+    /// `lease_agents` nor running, exiting or being removed by a final stop.
+    /// Launches from here on are marked, and the sweep leaves them.
+    pub(super) fn sweep_candidates(&self, lease_agents: &[AgentId]) -> Vec<AgentId> {
+        let on_disk = self.inner.checkouts.agents();
+        let mut state = lock(&self.inner.state);
+        state.launched.clear();
+        on_disk
+            .into_iter()
+            .filter(|agent_id| {
+                !lease_agents.contains(agent_id)
+                    && !state.agents.contains_key(agent_id)
+                    && !state.exiting.contains_key(agent_id)
+                    && !state.finalizing.contains_key(agent_id)
+            })
+            .collect()
+    }
+
+    /// Remove the checkouts of `candidates` (from [`Self::sweep_candidates`])
+    /// except those launched, exiting or finalizing since. Returns the agents
+    /// swept.
+    pub(super) async fn sweep_checkouts(&self, candidates: Vec<AgentId>) -> Vec<AgentId> {
+        let mut swept = Vec::new();
+        for agent_id in candidates {
+            {
+                let mut state = lock(&self.inner.state);
+                if state.launched.contains(&agent_id)
+                    || state.agents.contains_key(&agent_id)
+                    || state.exiting.contains_key(&agent_id)
+                    || state.finalizing.contains_key(&agent_id)
+                {
+                    continue;
+                }
+                state.sweeping.insert(agent_id.clone());
+            }
+            #[cfg(test)]
+            self.inner.checkouts.before_sweep_removal(&agent_id).await;
+            let removed = self.inner.checkouts.remove(&agent_id).await;
+            lock(&self.inner.state).sweeping.remove(&agent_id);
+            self.inner.swept.notify_waiters();
+            match removed {
+                Ok(()) => {
+                    tracing::info!(agent = %agent_id, "node: removed the checkout of an agent its backend no longer records");
+                    swept.push(agent_id);
+                }
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: could not remove an orphaned checkout");
+                }
+            }
+        }
+        swept
+    }
+
+    /// [`Self::sweep_candidates`] then [`Self::sweep_checkouts`].
+    #[cfg(test)]
+    pub(super) async fn sweep(&self, lease_agents: &[AgentId]) -> Vec<AgentId> {
+        let candidates = self.sweep_candidates(lease_agents);
+        self.sweep_checkouts(candidates).await
     }
 
     /// Ask the agent's provider to cancel its running turn.
@@ -1319,6 +1675,11 @@ impl Runner {
     /// `not-running` when no such agent runs, once any exit record still
     /// being written for it is journaled. Repeating a stop is harmless.
     pub(super) fn stop(&self, agent_id: &AgentId) -> StopWait {
+        // The agent's scripts stop with it.
+        let scripts = self.inner.scripts.clone();
+        let agent = agent_id.clone();
+        // caller-binding: allow — node-local script teardown for a stopped agent
+        tokio::spawn(async move { scripts.stop_agent(&agent).await });
         let state = lock(&self.inner.state);
         if let Some(agent) = state.agents.get(agent_id).cloned() {
             drop(state);
@@ -1339,9 +1700,13 @@ impl Runner {
         }
     }
 
-    /// Stop every agent and wait (bounded) until each one's queued output
-    /// and exit are journaled.
+    /// End every script run, then stop every agent and wait until each
+    /// one's last push is done and its queued output and exit are
+    /// journaled, and until every final stop's cleanup already under way
+    /// has pushed and removed its checkout. All of it is bounded by
+    /// [`SHUTDOWN_WAIT`].
     pub(super) async fn shutdown(&self) {
+        let started = tokio::time::Instant::now();
         // Close admission first, under the same lock launches are admitted
         // under, so no agent can start after the stop below.
         let running: Vec<AgentId> = {
@@ -1349,15 +1714,24 @@ impl Runner {
             state.closing = true;
             state.agents.keys().cloned().collect()
         };
+        // An ordinary push under way gives way to each agent's last one.
+        self.inner.closing_signal.send_replace(true);
+        // Script runs end first (bounded by their reap wait), so nothing
+        // still writes to a checkout while its agent's last work is pushed.
+        self.inner.scripts.stop_all().await;
         for id in running {
             self.stop(&id);
         }
-        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let left = SHUTDOWN_WAIT.saturating_sub(started.elapsed());
+        let drained = tokio::time::timeout(left, async {
             // A launch admitted just before closing may register its pump
             // after a take, so keep draining until nothing is left.
             loop {
                 let pumps = std::mem::take(&mut *lock(&self.inner.pumps));
-                let idle = lock(&self.inner.state).agents.is_empty();
+                let idle = {
+                    let state = lock(&self.inner.state);
+                    state.agents.is_empty() && state.finalizing.is_empty()
+                };
                 if pumps.is_empty() {
                     if idle {
                         break;
@@ -1377,6 +1751,14 @@ impl Runner {
     }
 }
 
+/// Which of an agent's pushes runs: a turn's end, or its exit (its last
+/// push on this machine).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Push {
+    TurnEnd,
+    Exit,
+}
+
 enum Outcome {
     Exited(Option<i32>),
     Stopped,
@@ -1387,7 +1769,7 @@ enum Outcome {
 /// and any error.
 async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, Option<String>) {
     let failed = |detail: String| ("refusal".to_owned(), Some(detail));
-    let Ok(blocks) = prompt
+    let Ok(mut blocks) = prompt
         .into_iter()
         .map(serde_json::from_value)
         .collect::<Result<Vec<_>, _>>()
@@ -1402,6 +1784,16 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
     let Some(session) = session else {
         return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
     };
+    // Set before the agent is ready, so the first turn takes it.
+    let notice = lock(&agent.notice).take();
+    if let Some(notice) = notice {
+        match serde_json::from_value(serde_json::json!({ "type": "text", "text": notice })) {
+            Ok(block) => blocks.insert(0, block),
+            Err(error) => {
+                tracing::warn!(error = %error, "node: the checkout notice is not a prompt block");
+            }
+        }
+    }
     // Switch the pump to this turn before anything the prompt causes can
     // arrive.
     let (ack, switched) = oneshot::channel();

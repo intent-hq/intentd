@@ -175,6 +175,7 @@ async fn queued_frames_of_a_replaced_generation_have_no_effect() {
     let stop = LinkFrame::Stop {
         agent_id: AgentId::from("a1"),
         stop_id: intent_core::node_link::StopId::new_v4(),
+        final_stop: false,
     };
     assert_eq!(apply(&h.runner, &old, OPEN, stop).await, Applied::Stale);
 
@@ -310,6 +311,7 @@ async fn a_current_stop_yields_an_acknowledgement_for_its_own_id() {
     let frame = LinkFrame::Stop {
         agent_id: AgentId::from("ghost"),
         stop_id,
+        final_stop: false,
     };
     let Applied::Stopping(pending) = apply(&h.runner, &current, OPEN, frame).await else {
         panic!("a current stop is acknowledged");
@@ -320,6 +322,7 @@ async fn a_current_stop_yields_an_acknowledgement_for_its_own_id() {
             stop_id,
             agent_id: AgentId::from("ghost"),
             outcome: StopOutcome::NotRunning,
+            final_push: None,
         })
     );
 }

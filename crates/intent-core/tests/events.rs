@@ -259,6 +259,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "terminal:cwd",
     "terminal:data",
     "terminal:exit",
+    "terminal:process",
     "terminal:title",
     "test:completed",
     "test:started",

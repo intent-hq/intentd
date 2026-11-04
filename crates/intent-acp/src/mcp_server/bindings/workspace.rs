@@ -347,8 +347,13 @@ async fn propose_sibling(
     if !warnings.is_empty() {
         preview.insert("warnings".to_string(), json!(warnings));
     }
+    // A unique card id: the identity rule is `applyToolCallId ??
+    // preview.title`, and a title-keyed card shares its pending entry,
+    // resolution and created-workspace link with every same-titled follow-up
+    // card this agent proposes.
     let proposal = json!({
         "kind": "workspace-create",
+        "applyToolCallId": format!("workspace-create-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.create",
             "params": create_params,
@@ -545,6 +550,34 @@ async fn apply_proposal(
             }
         }
     }
+    // (c) the `preview.title` of exactly one pending proposal — follow-up
+    // cards were title-keyed before they carried a unique `applyToolCallId`,
+    // so an agent may still address a pending card by its title.
+    if matched.is_none() {
+        let mut by_title: Vec<(String, Value)> = Vec::new();
+        for entry in pending {
+            let found = proposals_in_message(api, ws, &caller, &entry.message_id)
+                .await?
+                .into_iter()
+                .find(|p| {
+                    proposal_identity(p) == Some(entry.proposal_id.as_str())
+                        && p.get("preview")
+                            .and_then(|preview| preview.get("title"))
+                            .and_then(Value::as_str)
+                            == Some(proposal_ref.as_str())
+                });
+            if let Some(proposal) = found {
+                by_title.push((entry.proposal_id.clone(), proposal));
+            }
+        }
+        if by_title.len() > 1 {
+            return Err(format!(
+                "{} pending proposals are titled `{proposal_ref}`; apply one by the `proposalId` from its proposeSibling result",
+                by_title.len()
+            ));
+        }
+        matched = by_title.pop();
+    }
     let Some((proposal_id, proposal)) = matched else {
         return match resolutions.get(&proposal_ref).and_then(Value::as_str) {
             Some(PROPOSAL_OUTCOME_APPLIED) => Ok(json!({
@@ -651,6 +684,7 @@ async fn apply_proposal(
             proposal_id.clone(),
             PROPOSAL_OUTCOME_APPLIED.to_string(),
             Some(detail),
+            Some(created.workspace.id.clone()),
         )
         .await
     {

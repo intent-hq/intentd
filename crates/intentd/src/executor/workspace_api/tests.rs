@@ -225,7 +225,6 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
     )
     .unwrap();
     for code in [
-        "return await ws.script.list();",
         "return await ws.terminal.list();",
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
@@ -350,6 +349,44 @@ async fn control_plane_calls_are_forwarded_to_head_for_the_agent() {
         .all(|request| request.agent_id == agent() && request.method == CALL_METHOD));
     assert_eq!(seen[0].params["method"], json!("note.read"));
     assert_eq!(seen[0].params["args"]["id"], json!("n-1"));
+}
+
+/// Saved scripts are forwarded to head only on a link that negotiated
+/// nodeProtocol 8; on 7 the machine refuses every `ws.script.*` itself.
+#[tokio::test]
+async fn script_calls_reach_head_only_on_a_protocol_8_link() {
+    for (max, forwarded) in [(8, true), (7, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (node_end, mut head_end, _served) = crate::executor::test_link::bound_link_offering(
+            dir.path(),
+            intent_core::node_link::ProtocolRange { min: 7, max },
+        )
+        .await;
+        assert_eq!(node_end.protocol(), max);
+        let head = HeadLink::default();
+        head.set(node_end);
+        let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+        let answering = tokio::spawn(async move {
+            while let Some(event) = head_end.events.recv().await {
+                if let LinkEvent::Request(request) = event {
+                    let method = request.request().params["method"].clone();
+                    request
+                        .respond(LinkOutcome::Ok(json!({ "answered": method })))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let (failed, text) = call(&server, "return JSON.stringify(await ws.script.list());").await;
+        if forwarded {
+            assert!(!failed, "{text}");
+            assert!(text.contains("script.list"), "{text}");
+        } else {
+            assert!(failed, "{text}");
+            assert!(text.contains("remote-agent-unsupported"), "{text}");
+        }
+        answering.abort();
+    }
 }
 
 /// Review of intentd#2786: an agent-initiated commit passes the same

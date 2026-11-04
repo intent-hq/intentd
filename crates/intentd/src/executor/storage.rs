@@ -184,6 +184,38 @@ impl Storage {
         Ok(parent.join("work"))
     }
 
+    /// The agents with a directory under `agents/`; names that are not safe
+    /// ids are left alone.
+    pub(super) fn agent_ids(&self) -> Vec<AgentId> {
+        let Ok(entries) = std::fs::read_dir(self.root.join(AGENTS)) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<AgentId> = entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| valid_id(name))
+            .map(AgentId::from)
+            .collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids
+    }
+
+    /// Remove `agent_id`'s directory (its worktree included); a missing one
+    /// is already removed.
+    pub(super) fn remove_agent(&self, agent_id: &AgentId) -> anyhow::Result<()> {
+        ensure!(
+            valid_id(&agent_id.0),
+            "agent id is not a safe path component"
+        );
+        let dir = self.root.join(AGENTS).join(&agent_id.0);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove {}", dir.display())),
+        }
+    }
+
     /// The per-repository bare caches holding agent worktrees.
     pub(super) fn cache_dir(&self) -> PathBuf {
         self.root.join(CACHE)
@@ -197,6 +229,13 @@ impl Storage {
     /// The local socket the helper reaches head's git sessions through.
     pub(super) fn git_socket(&self) -> PathBuf {
         self.git_socket.clone()
+    }
+
+    /// `agent_id`'s test working directory, if [`Self::agent_dir`] made it.
+    #[cfg(test)]
+    pub(super) fn existing_agent_dir(&self, agent_id: &AgentId) -> Option<PathBuf> {
+        let dir = self.root.join(AGENTS).join(&agent_id.0).join("work");
+        (valid_id(&agent_id.0) && dir.is_dir()).then_some(dir)
     }
 
     /// A fresh working directory for `agent_id`, created on demand.

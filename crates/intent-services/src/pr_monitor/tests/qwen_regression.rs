@@ -245,7 +245,7 @@ async fn post_push_recovery(conclusion: &str, expected: &str) {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages
@@ -452,7 +452,7 @@ async fn qwen_old_snapshot_rest_failure_and_recovery_each_deliver_once() {
     }
     assert_eq!(
         svc.store()
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages
@@ -536,7 +536,7 @@ async fn required_flip_after_rest_check(name: &str, was_known: bool) {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages
@@ -670,7 +670,7 @@ async fn silent_passing_discovery_required_flip(missing_emitted_evidence: bool) 
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages
@@ -839,7 +839,7 @@ async fn silent_discovery_with_pending_changes(outcome: &str) {
     }
     assert_eq!(
         svc.store()
-            .get_agent_session(&owner)
+            .get_agent_session_with_transcript(&owner)
             .await
             .unwrap()
             .messages

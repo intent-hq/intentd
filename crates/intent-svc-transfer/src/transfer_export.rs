@@ -1282,7 +1282,11 @@ mod tests {
         sqlx::query("INSERT INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('retained-private',?,0,'user',?,?,?)")
             .bind(&agent.0).bind(content.to_string()).bind(metadata.to_string()).bind(now_iso())
             .execute(svc.store().write_pool()).await.unwrap();
-        let before = svc.store().get_agent_session(&agent).await.unwrap();
+        let before = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         let result = svc.workspace_export_start_op(id).await;
         if let Ok(started) = &result {
             let export_id = started["exportId"].as_str().unwrap();
@@ -1318,7 +1322,13 @@ mod tests {
         );
         assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().exists());
-        assert_eq!(svc.store().get_agent_session(&agent).await.unwrap(), before);
+        assert_eq!(
+            svc.store()
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .unwrap(),
+            before
+        );
         let messages = svc.store().get_agent_messages(&agent, None).await.unwrap();
         assert_eq!(messages[0].content, content);
         assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
@@ -1706,13 +1716,17 @@ mod tests {
         // The source table is never written by the export.
         let src = svc
             .store()
-            .get_agent_session(&inherited)
+            .get_agent_session_with_transcript(&inherited)
             .await
             .expect("src");
         assert_eq!(src.provider, None);
         assert_eq!(src.model.as_deref(), Some("gpt6-astra"));
         assert_eq!(src.reasoning_effort.as_deref(), Some("high"));
-        let src = svc.store().get_agent_session(&auto).await.expect("src");
+        let src = svc
+            .store()
+            .get_agent_session_with_transcript(&auto)
+            .await
+            .expect("src");
         assert_eq!(src.provider, None);
         assert_eq!(src.model, None);
 

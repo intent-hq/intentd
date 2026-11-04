@@ -437,7 +437,10 @@ async fn agent_bindings_list_and_status() {
     );
 
     // Verify agent exists
-    let session = store.get_agent_session(&agent_id).await.expect("session");
+    let session = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("session");
     assert_eq!(session.id, agent_id);
 
     manager.shutdown().await;

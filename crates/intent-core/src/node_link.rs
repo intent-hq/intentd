@@ -36,17 +36,53 @@ pub enum StopOutcome {
     NotRunning,
 }
 
+/// How a final stop's WIP push went, reported on its acknowledgement
+/// (nodeProtocol 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalPush {
+    /// The agent's `head` and `wip` refs reached the backend.
+    Pushed,
+    /// The push failed or timed out; the checkout was removed anyway.
+    Failed,
+    /// Nothing to push: the agent has no checkout here, or it is not running
+    /// and its workspace is unknown to the machine.
+    Skipped,
+}
+
+/// The first protocol with final stops ([`LinkFrame::Stop`]'s `final`,
+/// [`LinkFrame::StopAck`]'s `finalPush`) and the bind-time checkout sweep
+/// (`leaseAgents` on [`LinkHello`]).
+pub const FINAL_STOP_PROTOCOL: u32 = 9;
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The private node-link protocol versions this build speaks. The
 /// daemon-to-daemon executor link started at 6; 7 adds the correlated stop
-/// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]).
-/// Neither 6 nor the single-node 5 ever shipped, and a protocol-6 peer
-/// cannot confirm a stop, so this build speaks 7 only: a backend never
-/// takes a stop as confirmed by a machine that cannot acknowledge it. The
+/// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
+/// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
+/// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]), and
+/// keeps everything 8 has. Neither 6 nor the single-node 5 ever shipped, and
+/// a protocol-6 peer cannot confirm a stop, so this build speaks 7 to 9: a
+/// backend never takes a stop as confirmed by a machine that cannot
+/// acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 7 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 9 };
+
+/// The first protocol with the saved-script frames (`scriptStart`,
+/// `scriptStop`, `scriptStarted`, `scriptOutput`, `scriptExited`). Neither
+/// side sends one on a link that negotiated less; every later protocol has
+/// them too, so gates compare with `>=`.
+pub const SCRIPT_PROTOCOL: u32 = 8;
 
 /// An inclusive range of node-link protocol versions a peer speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,11 +120,13 @@ impl std::fmt::Display for ProtocolRange {
 
 /// The link frame types a backend holding an executor credential may send
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
-/// liveness, agent control, journal acks, the capabilities request and
-/// responses to the machine's forwarded `workspace.call` requests. Nothing
-/// else is admitted from an executor credential; the machine-to-backend
-/// frames (`welcome`, `journal`, `replayComplete`, `request`,
-/// `capabilitiesReply`, `stopAck`) and `cancelRequest` are refused. Git sessions use the
+/// liveness, agent control, journal acks, the capabilities request,
+/// responses to the machine's forwarded `workspace.call` requests, and
+/// starting and stopping script runs (protocol 8). Nothing else is admitted
+/// from an executor credential; the machine-to-backend frames (`welcome`,
+/// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
+/// `scriptStarted`, `scriptOutput`, `scriptExited`) and `cancelRequest` are
+/// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
 /// [`LinkFrame::admitted_from_executor`] is the typed form.
 pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
@@ -101,6 +139,8 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "launch",
     "prompt",
     "response",
+    "scriptStart",
+    "scriptStop",
     "stop",
 ];
 
@@ -179,6 +219,11 @@ pub struct LinkHello {
     /// Highest journal sequence head has ingested; the node replays
     /// everything after it.
     pub acked_seq: NodeCounter,
+    /// nodeProtocol 9: the agents recorded on this lease, those with a
+    /// pending final stop included. The machine removes every checkout of
+    /// this backend's agents that is neither listed nor running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_agents: Vec<AgentId>,
 }
 
 /// The node's reply to an accepted [`LinkHello`]: the negotiated protocol
@@ -347,6 +392,110 @@ impl std::fmt::Debug for LaunchProfileEnv {
     }
 }
 
+/// Backend asks the machine to run one process of a remote agent's machine
+/// run of a saved script, in that agent's checkout. `spawn_id` is a UUID the
+/// backend picks for every process it starts, automatic restarts included,
+/// unique within the binding; it is not the run's §5.8a `runId`. A process is
+/// identified by (`agent_id`, `script_id`, `spawn_id`). The body is closed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptStartCommand {
+    /// The remote agent whose machine run this is: it runs in its checkout.
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub command: String,
+    pub mode: crate::ScriptMode,
+    /// Relative to the agent's checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The saved environment, in saved order. Values may be secrets:
+    /// `Debug` renders only the keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<ScriptEnvVar>,
+}
+
+impl std::fmt::Debug for ScriptStartCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptStartCommand")
+            .field("agent_id", &self.agent_id)
+            .field("script_id", &self.script_id)
+            .field("spawn_id", &self.spawn_id)
+            .field("mode", &self.mode)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One saved environment variable of a [`ScriptStartCommand`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptEnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for ScriptEnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}=<redacted>", self.key)
+    }
+}
+
+/// Names one script process: the body of `scriptStop`. The machine answers
+/// every stop with that process's `scriptExited`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptProcessRef {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+}
+
+/// Machine to backend: the run's process is spawned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptStarted {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub pid: u32,
+}
+
+/// Machine to backend: the next piece of the run's combined output, as
+/// UTF-8 text (invalid bytes replaced), `seq` counting from 0 per `spawn_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptOutput {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    pub seq: u64,
+    pub data: String,
+}
+
+/// Machine to backend: the run ended. `exit_code` is absent only together
+/// with `error` (`"<code>: <detail>"`), for a refused start or a stop of a
+/// process that is not running (`node-script-not-running`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptExited {
+    pub agent_id: AgentId,
+    pub script_id: String,
+    pub spawn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The largest `data` one [`ScriptOutput`] carries, in bytes.
+pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The most `scriptOutput` `data` one side keeps queued on a link, in bytes;
+/// past it the sender drops output and later reports how much it dropped.
+pub const SCRIPT_OUTPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
 /// A request over the link: node to head for forwarded workspace API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -384,6 +533,9 @@ pub enum LinkChannel {
     Control,
     Journal,
     Rpc,
+    /// Script runs (protocol 8): queued behind control frames, so output
+    /// never delays heartbeats, stops or launches.
+    Script,
 }
 
 /// One frame on the control/journal/RPC connection.
@@ -416,18 +568,28 @@ pub enum LinkFrame {
     /// Stop the agent's process. The machine answers with a
     /// [`LinkFrame::StopAck`] for `stop_id` once the stop is applied; a
     /// repeated `stop_id` is the same stop.
+    ///
+    /// `final_stop` (`final`, nodeProtocol 9): the agent ends for good, so
+    /// after the stop the machine pushes its work one last time, removes its
+    /// checkout and only then acknowledges.
     #[serde(rename_all = "camelCase")]
     Stop {
         agent_id: AgentId,
         stop_id: StopId,
+        #[serde(rename = "final", default, skip_serializing_if = "is_false")]
+        final_stop: bool,
     },
     /// Machine to backend: the stop `stop_id` for `agent_id` is applied.
     /// May arrive in any order relative to other frames and acks.
     #[serde(rename_all = "camelCase")]
+    ///
+    /// `final_push` is present only on a final stop's acknowledgement.
     StopAck {
         stop_id: StopId,
         agent_id: AgentId,
         outcome: StopOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_push: Option<FinalPush>,
     },
     Journal(JournalRecord),
     /// Head has ingested every record up to and including `seq`.
@@ -457,6 +619,11 @@ pub enum LinkFrame {
     CapabilitiesReply {
         capabilities: MachineCapabilities,
     },
+    ScriptStart(ScriptStartCommand),
+    ScriptStop(ScriptProcessRef),
+    ScriptStarted(ScriptStarted),
+    ScriptOutput(ScriptOutput),
+    ScriptExited(ScriptExited),
 }
 
 impl LinkFrame {
@@ -481,6 +648,21 @@ impl LinkFrame {
             Self::Request(_) | Self::Response { .. } | Self::CancelRequest { .. } => {
                 LinkChannel::Rpc
             }
+            Self::ScriptStart(_)
+            | Self::ScriptStop(_)
+            | Self::ScriptStarted(_)
+            | Self::ScriptOutput(_)
+            | Self::ScriptExited(_) => LinkChannel::Script,
+        }
+    }
+
+    /// The lowest negotiated protocol this frame may travel on.
+    #[must_use]
+    pub fn min_protocol(&self) -> u32 {
+        if self.channel() == LinkChannel::Script {
+            SCRIPT_PROTOCOL
+        } else {
+            NODE_LINK_PROTOCOLS.min
         }
     }
 
@@ -498,14 +680,19 @@ impl LinkFrame {
             | Self::Stop { .. }
             | Self::Ack { .. }
             | Self::Response { .. }
-            | Self::Capabilities => true,
+            | Self::Capabilities
+            | Self::ScriptStart(_)
+            | Self::ScriptStop(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
             | Self::Request(_)
             | Self::CancelRequest { .. }
             | Self::CapabilitiesReply { .. }
-            | Self::StopAck { .. } => false,
+            | Self::StopAck { .. }
+            | Self::ScriptStarted(_)
+            | Self::ScriptOutput(_)
+            | Self::ScriptExited(_) => false,
         }
     }
 

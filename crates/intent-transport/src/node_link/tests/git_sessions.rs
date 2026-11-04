@@ -21,11 +21,20 @@ impl NodeGitAccess for AllowAgent {
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        _service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
             binding.ensure_current(&super::binding(1))?;
             if remote.agent_id() == "agent-1" {
                 Ok(self.repository.clone())
+            } else if remote.agent_id() == "agent-gone" {
+                // A final stop whose workspace repository was removed.
+                Err(Error::Internal(format!(
+                    "{}: the workspace's repository is gone",
+                    git_codes::UNAVAILABLE
+                )))
+            } else if remote.agent_id() == "agent-stale" {
+                Err(Error::InvalidParams("node-link-stale".into()))
             } else {
                 Err(Error::Forbidden("not on this lease".into()))
             }
@@ -157,6 +166,38 @@ async fn sessions_for_agents_off_the_lease_are_denied() {
     let error = tokio::time::timeout(
         wait(),
         sessions.open(GitService::ReceivePack, &remote("agent-2")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(session_code(&error).contains(git_codes::DENIED), "{error}");
+}
+
+/// A refusal that carries its own session code keeps it: a final stop's
+/// push whose repository is gone is `node-git-unavailable`, not denied.
+#[tokio::test]
+async fn a_missing_repository_is_unavailable_not_denied() {
+    let (_node, _link, sessions, _serving) = connected().await;
+    let error = tokio::time::timeout(
+        wait(),
+        sessions.open(GitService::ReceivePack, &remote("agent-gone")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        session_code(&error).contains(git_codes::UNAVAILABLE),
+        "{error}"
+    );
+}
+
+/// A binding that is no longer current is refused as `node-git-denied`.
+#[tokio::test]
+async fn a_stale_binding_is_denied() {
+    let (_node, _link, sessions, _serving) = connected().await;
+    let error = tokio::time::timeout(
+        wait(),
+        sessions.open(GitService::ReceivePack, &remote("agent-stale")),
     )
     .await
     .unwrap()

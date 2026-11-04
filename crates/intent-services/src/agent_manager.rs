@@ -2964,6 +2964,13 @@ pub struct AgentManager {
     /// and sweeps leftovers at startup; `None` (tests / bare wiring) falls
     /// back to the OS temp dir.
     agent_config_root: Option<PathBuf>,
+    /// Per-daemon root of each launch's private temp folder
+    /// (`intent_core::agent_tmp`), exported to the child as `TMPDIR` /
+    /// `TMP` / `TEMP` so agents never share fixed temp file names. The
+    /// composition root wires `intent_core::agent_tmp_root(data_dir)` and
+    /// sweeps it at startup; `None` (tests / bare wiring) leaves the child's
+    /// temp variables as inherited.
+    agent_tmp_root: Option<PathBuf>,
     /// Persistent Antigravity conversation profiles, never startup-swept.
     antigravity_state_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
@@ -3210,7 +3217,7 @@ impl AgentManager {
                 // deleted) swallow the lookup error and skip the publish rather than
                 // blocking the registry path. The tracing log still fires above.
                 let workspace_id = match services.store.get_agent_session_summary(&agent_id).await {
-                    Ok(session) => session.workspace_id,
+                    Ok(session) => session.workspace_id.clone(),
                     Err(_) => return,
                 };
                 services
@@ -3257,6 +3264,7 @@ impl AgentManager {
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
             agent_config_root: None,
+            agent_tmp_root: None,
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
@@ -3363,6 +3371,33 @@ impl AgentManager {
     pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_config_root = Some(root.into());
         self
+    }
+
+    /// Set the per-daemon root under which every provider launch gets its own
+    /// temp folder (`TMPDIR` / `TMP` / `TEMP`). The composition root passes
+    /// `intent_core::agent_tmp_root(&config.data_dir)` after sweeping it; the
+    /// root is (re)validated right before each spawn.
+    #[must_use]
+    pub fn with_agent_tmp_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_tmp_root = Some(root.into());
+        self
+    }
+
+    /// The validated agent temp root for the next spawn, created on demand
+    /// (the OS may clean the temp dir while the daemon runs). `None` when no
+    /// root is wired or it cannot be used — the launch then inherits the
+    /// daemon's temp dir rather than failing.
+    fn agent_tmp_root(&self) -> Option<PathBuf> {
+        let root = self.agent_tmp_root.as_ref()?;
+        if let Err(e) = intent_core::prepare_agent_tmp_root(root) {
+            tracing::warn!(
+                error = %e,
+                path = %root.display(),
+                "agent temp root unusable; agents inherit the daemon's temp dir"
+            );
+            return None;
+        }
+        Some(root.clone())
     }
 
     /// Set the private persistent root for Antigravity conversation state.
@@ -3736,6 +3771,7 @@ impl AgentManager {
         // `<data_dir>/agent-configs` when wired (swept at startup so a killed
         // daemon's leftovers don't accumulate, monorepo#1302), else temp dir.
         let config_dir = self.agent_config_dir();
+        let agent_tmp_root = self.agent_tmp_root();
 
         // Generated MCP config (auggie format) pointing at the bridge
         // subcommand, written only for providers that consume an MCP-config flag.
@@ -3893,6 +3929,13 @@ impl AgentManager {
         if spawn_opts.npx_launch_root.is_none() {
             spawn_opts.npx_launch_root = Some(config_dir.as_path());
         }
+        // Each launch gets a private temp folder under the per-daemon root
+        // (`TMPDIR` / `TMP` / `TEMP`), so two agents writing the same fixed
+        // temp file name never overwrite each other. A caller-supplied root
+        // (tests / embedders) wins.
+        if spawn_opts.agent_tmp_root.is_none() {
+            spawn_opts.agent_tmp_root = agent_tmp_root.as_deref();
+        }
         // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
         // boot), so a settings change applies to the next spawned/respawned
         // provider process without a daemon restart (intent-hq/intent#4330).
@@ -3996,7 +4039,7 @@ impl AgentManager {
             spawn_provider(&spawn_opts, hooks)
         }
         .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
-        let (child, connection, npx_launch_dir) = spawned.into_parts();
+        let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
         // (a respawn installed a newer child with its own watcher).
@@ -4020,7 +4063,10 @@ impl AgentManager {
                 self.policy,
                 self.sink.clone(),
             )
-            .with_terminal_host(terminal_host),
+            .with_terminal_host(terminal_host)
+            // Commands the daemon runs for the agent (ACP `terminal/create`)
+            // share the agent process's private temp folder.
+            .with_terminal_env_defaults(agent_tmp_env(agent_tmp_dir.as_ref())),
         );
         let serve_conn = connection.clone();
         let serve_task = intent_core::spawn_daemon(async move {
@@ -4067,6 +4113,7 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                agent_tmp_dir,
                 preparation_guard,
                 cleanup_lease: Some(cleanup_lease),
                 #[cfg(test)]
@@ -5739,7 +5786,7 @@ impl AgentManager {
         {
             return None;
         }
-        // Metadata-only lookup: `get_agent_session` also loads and hydrates
+        // Metadata-only lookup: `get_agent_session_with_transcript` also loads and hydrates
         // the whole transcript, which this per-turn check never reads.
         let session = self
             .services
@@ -8327,7 +8374,7 @@ impl AgentManager {
         if session.parent_agent_id.is_none() {
             return false;
         }
-        let Some(report_ts) = session.completion_report_timestamp else {
+        let Some(report_ts) = session.completion_report_timestamp.clone() else {
             return false;
         };
         let (Some(queued), Some(reported)) = (parse_iso(&msg.queued_at), parse_iso(&report_ts))
@@ -10123,7 +10170,7 @@ impl AgentManager {
                 .get_agent_session_summary(agent_id)
                 .await
                 .ok()
-                .and_then(|s| s.acp_session_id)
+                .and_then(|s| s.acp_session_id.clone())
                 .is_some();
         if !cancellable {
             return;
@@ -12983,7 +13030,7 @@ impl AgentManager {
                         return;
                     }
                     if let Ok(session) = services.store.get_agent_session_summary(&id).await {
-                        mgr.try_drain_queue(id, session.workspace_id).await;
+                        mgr.try_drain_queue(id, session.workspace_id.clone()).await;
                     }
                 });
             }
@@ -13002,7 +13049,7 @@ impl AgentManager {
             }
             if let Ok(session) = self.services.store.get_agent_session_summary(&id).await {
                 Arc::clone(self)
-                    .try_drain_queue(id, session.workspace_id)
+                    .try_drain_queue(id, session.workspace_id.clone())
                     .await;
             }
         }
@@ -14848,7 +14895,19 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts.profile_env = opts.profile_env;
+    spawn_opts.agent_tmp_root = opts.agent_tmp_root;
     spawn_opts
+}
+
+/// The `(name, value)` temp variables pointing at `dir`, for commands the
+/// daemon runs on the agent's behalf; empty without a folder.
+fn agent_tmp_env(dir: Option<&intent_core::AgentTempDir>) -> Vec<(String, String)> {
+    dir.map(|dir| {
+        dir.env()
+            .map(|(key, value)| (key.to_owned(), value.to_string_lossy().into_owned()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Append the github.com-scoped daemon-backed credential-helper env pair
@@ -19852,7 +19911,7 @@ mod role_reminder_tests {
         let mut session = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session");
         session.name = name.to_string();
@@ -19917,7 +19976,7 @@ mod role_reminder_tests {
             let mut session = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .expect("session");
             session.provider = Some(provider.to_string());
@@ -19974,7 +20033,7 @@ mod role_reminder_tests {
                     let mut session = mgr
                         .services
                         .store
-                        .get_agent_session(&agent_id)
+                        .get_agent_session_with_transcript(&agent_id)
                         .await
                         .unwrap();
                     session.provider = Some(provider.to_string());
@@ -20038,7 +20097,7 @@ mod role_reminder_tests {
         let mut session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         session.metadata = Some(serde_json::json!({"specialistName": "Custom Builder"}));
@@ -20164,7 +20223,7 @@ mod role_reminder_tests {
     }
 
     /// The specialist role reminder is resolved on every turn too, so it must
-    /// use the metadata-only session lookup: `get_agent_session` loads and
+    /// use the metadata-only session lookup: `get_agent_session_with_transcript` loads and
     /// hydrates the whole transcript, and fails on an undecodable row.
     #[tokio::test]
     async fn role_reminder_does_not_read_the_transcript() {
@@ -20191,7 +20250,7 @@ mod role_reminder_tests {
         assert!(
             mgr.services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .is_err(),
             "fixture: a full session read must fail on the undecodable row"
@@ -20811,7 +20870,7 @@ mod role_reminder_tests {
         let mut s = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session");
         let ws = s.workspace_id.clone();
@@ -21748,6 +21807,7 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                agent_tmp_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
@@ -22040,7 +22100,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(
@@ -22193,7 +22253,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22348,7 +22408,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22374,7 +22434,7 @@ mod disabled_provider_rehome_tests {
         let stale = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         // ...and the user's newer pick landing before the re-home write.
@@ -22437,7 +22497,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("codex"));
@@ -22512,7 +22572,7 @@ mod disabled_provider_rehome_tests {
         let row = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert_eq!(row.provider.as_deref(), Some("mock"));
@@ -22806,7 +22866,7 @@ mod legacy_feature_freeze_tests {
     async fn stored_features(mgr: &AgentManager, agent_id: &AgentId) -> Option<serde_json::Value> {
         mgr.services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session exists")
             .harness_features
@@ -22842,7 +22902,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(
@@ -22900,7 +22960,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(session.harness_features.is_none(), "row stays NULL");
@@ -22910,7 +22970,7 @@ mod legacy_feature_freeze_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .unwrap();
         assert!(session.harness_features.is_none(), "row still NULL");
@@ -22987,7 +23047,7 @@ mod transcript_free_turn_start_tests {
     use super::*;
 
     /// Append one user message for `agent_id`, then make its stored content
-    /// undecodable so `get_agent_messages(.., None)` and `get_agent_session`
+    /// undecodable so `get_agent_messages(.., None)` and `get_agent_session_with_transcript`
     /// fail.
     async fn corrupt_transcript(mgr: &AgentManager, agent_id: &AgentId) {
         mgr.services
@@ -23008,7 +23068,7 @@ mod transcript_free_turn_start_tests {
         assert!(
             mgr.services
                 .store
-                .get_agent_session(agent_id)
+                .get_agent_session_with_transcript(agent_id)
                 .await
                 .is_err(),
             "fixture: a full session read must fail on the undecodable row"
@@ -23437,7 +23497,7 @@ mod thought_level_tests {
             let record = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             let opened = AcpSessionOpened {
@@ -23467,7 +23527,7 @@ mod thought_level_tests {
             let stored = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             assert_eq!(stored.effort_levels, Some(option("medium").values));
@@ -23487,7 +23547,7 @@ mod thought_level_tests {
             let record = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             let opened = AcpSessionOpened {
@@ -23523,7 +23583,7 @@ mod thought_level_tests {
             let stored = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .unwrap();
             assert!(
@@ -25069,7 +25129,7 @@ mod agent_retry_tests {
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .status,
@@ -25115,7 +25175,7 @@ mod agent_retry_tests {
         assert_eq!(
             mgr.services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .status,
@@ -25159,7 +25219,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::RuntimeIdle);
@@ -25243,7 +25303,7 @@ mod agent_retry_tests {
             let session = mgr
                 .services
                 .store
-                .get_agent_session(&agent_id)
+                .get_agent_session_with_transcript(&agent_id)
                 .await
                 .expect("session");
             assert!(
@@ -25511,7 +25571,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_with_transcript(agent_id)
             .await
             .expect("session row");
         (session.status, session.is_active, session.stop_reason)
@@ -26212,7 +26272,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::Pending);
@@ -26234,7 +26294,7 @@ mod agent_retry_tests {
         let session = mgr
             .services
             .store
-            .get_agent_session(&agent_id)
+            .get_agent_session_with_transcript(&agent_id)
             .await
             .expect("session");
         assert_eq!(session.status, AgentStatus::Active);

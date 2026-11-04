@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.123] - 2026-11-04
+
+### 📚 Documentation
+
+- *(assistant-guide)* Mention the web build's experimental notice ([#3019](https://github.com/intent-hq/intentd/pull/3019))
+
+
+## [0.11.122] - 2026-11-04
+
+### 🚀 Features
+
+- *(acp)* Give each agent launch its own TMPDIR ([#3011](https://github.com/intent-hq/intentd/pull/3011))
+- Run remote agents' saved scripts on their machine from the backend (remoteScripts, part 2) ([#3005](https://github.com/intent-hq/intentd/pull/3005))
+
+### 🐛 Bug Fixes
+
+- *(skills)* Warn about each skill name collision once per daemon run ([#3014](https://github.com/intent-hq/intentd/pull/3014))
+- *(agents)* Leave signed-out or disabled providers pending on unattended resume ([#3013](https://github.com/intent-hq/intentd/pull/3013))
+- *(agents)* Delegated agents inherit their creator's provider ([#3016](https://github.com/intent-hq/intentd/pull/3016))
+
+
+## [0.11.121] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Bound git.diffs and git.branchDiff reads under the 500 KiB budget ([#3015](https://github.com/intent-hq/intentd/pull/3015))
+- Push remote agents' work before the machine's links close on shutdown ([#3002](https://github.com/intent-hq/intentd/pull/3002))
+
+
+## [0.11.120] - 2026-11-03
+
+### 🚀 Features
+
+- *(terminal)* Report the foreground program on terminal.list and terminal:process ([#3010](https://github.com/intent-hq/intentd/pull/3010))
+
+### ⚡ Performance
+
+- *(agents)* Read agent_ops session metadata without the transcript ([#3001](https://github.com/intent-hq/intentd/pull/3001))
+
+
+## [0.11.119] - 2026-11-03
+
+### 🐛 Bug Fixes
+
+- *(acp)* Give workspace-create cards unique ids and link them to the created workspace ([#3007](https://github.com/intent-hq/intentd/pull/3007))
+- Durable final stop for remote agents: push, then remove the checkout ([#2998](https://github.com/intent-hq/intentd/pull/2998))
+
+
+## [0.11.118] - 2026-11-03
+
+### 🚀 Features
+
+- Saved-script frames and machine runs for remote agents (nodeProtocol 8, part 1) ([#3004](https://github.com/intent-hq/intentd/pull/3004))
+
+### 🐛 Bug Fixes
+
+- Agent.delete stops the agent's runtime before removing its rows ([#3000](https://github.com/intent-hq/intentd/pull/3000))
+
+
 ## [0.11.117] - 2026-11-03
 
 ### 🚀 Features

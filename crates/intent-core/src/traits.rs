@@ -34,6 +34,17 @@ use crate::repo_ref::RepoRef;
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Paging request of one `git.diffs` / `git.branchDiff` read (PROTOCOL §5.6
+/// "Response budget").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitDiffPage {
+    /// Result budget; clamped into [64 KiB, 480,000], 480,000 when `None`.
+    pub max_bytes: Option<usize>,
+    /// Resumes after the file list a previous page cut (that page's trailing
+    /// `{ "nextToken" }` entry).
+    pub next_token: Option<String>,
+}
+
 /// The single shared service surface (§6.8, "one impl, two front doors"): the
 /// transport JSON-RPC router and the agent→BE MCP callback both dispatch to the
 /// same `WorkspaceApi`, so an agent calling `note.*`/`task.*`/`comment.*`/
@@ -2636,7 +2647,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// a system-origin notice to the agent naming the proposal and outcome
     /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
     /// succeeds without a duplicate notice. Unknown `proposalId` (never
-    /// pending, never resolved) → `NotFound`.
+    /// pending, never resolved) → `NotFound`. `created_workspace_id` (an
+    /// in-process caller that just created the workspace for an applied
+    /// `workspace-create` card; never taken from the wire) is recorded under
+    /// `metadata.proposalCreatedWorkspaces` so clients can open it.
     fn agent_resolve_proposal(
         &self,
         workspace_id: WorkspaceId,
@@ -2644,8 +2658,16 @@ pub trait WorkspaceApi: Send + Sync {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        let _ = (
+            workspace_id,
+            agent_id,
+            proposal_id,
+            outcome,
+            detail,
+            created_workspace_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),
@@ -4269,6 +4291,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.diffs` with a byte budget (PROTOCOL §5.6 "Response budget"):
+    /// see [`GitDiffPage`] ([`Self::git_diffs`] uses the default page). The
+    /// default implementation ignores the page.
+    fn git_diffs_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Option<Vec<String>>,
+        staged: bool,
+        commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
+        page: GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = page;
+        self.git_diffs(workspace_id, paths, staged, commit_hash, git_root_id)
+    }
+
     /// `git.commitDetails`: metadata + per-file `(additions, deletions)` for a
     /// single commit, addressed by `commit_hash` (full SHA or short ref).
     /// Returns the wire shape `{ commitHash, author, authorEmail, date, message,
@@ -4415,6 +4453,21 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::git_branch_diff not implemented".to_string(),
             ))
         })
+    }
+
+    /// `git.branchDiff` with a byte budget (see [`Self::git_diffs_budgeted`]).
+    /// The default implementation ignores the budget.
+    fn git_branch_diff_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+        page: GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = page;
+        self.git_branch_diff(workspace_id, base_ref, base_sha, target_ref, paths)
     }
 
     /// `git.getRemoteUrl`: the configured URL of the named remote for the git
@@ -8194,6 +8247,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
     /// Workspace-scoped.
+    /// `script.<method>` with `remoteAgentId` (`remoteScripts: 1`): that
+    /// remote agent's machine run of the script (`params` are the request's).
+    fn script_machine_run(
+        &self,
+        workspace_id: WorkspaceId,
+        method: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async move {
+            Err(Error::InvalidParams(format!(
+                "script.{method}: remoteAgentId is not supported"
+            )))
+        })
+    }
+
     fn script_start(
         &self,
         workspace_id: WorkspaceId,

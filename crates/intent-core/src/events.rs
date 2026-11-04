@@ -261,10 +261,12 @@ pub(crate) const TERMINAL_COMMAND: &str = "terminal:command";
 // Interactive PTY streaming family (new in intentd; PROTOCOL §5.13/§6.5). The
 // daemon fans live PTY output to subscribers as `terminal:data` (base64 `chunk`)
 // and signals process exit with `terminal:exit`; `terminal:title`/`terminal:cwd`
-// carry detected title / working-directory changes. All payloads are
-// self-sufficient and carry the `terminalId`.
+// carry detected title / working-directory changes, and `terminal:process`
+// carries foreground program changes (`{ terminalId, foregroundProcess,
+// lastProcess }`). All payloads are self-sufficient and carry the `terminalId`.
 pub const TERMINAL_DATA: &str = "terminal:data";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
+pub const TERMINAL_PROCESS: &str = "terminal:process";
 pub(crate) const TERMINAL_TITLE: &str = "terminal:title";
 pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 
@@ -699,6 +701,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TERMINAL_COMMAND,
     TERMINAL_DATA,
     TERMINAL_EXIT,
+    TERMINAL_PROCESS,
     TERMINAL_TITLE,
     TERMINAL_CWD,
     SCRIPT_OUTPUT,
@@ -1089,6 +1092,7 @@ pub const MEMBER_EVENT_TYPES: &[&str] = &[
     TERMINAL_CWD,
     TERMINAL_DATA,
     TERMINAL_EXIT,
+    TERMINAL_PROCESS,
     TERMINAL_TITLE,
     TEST_COMPLETED,
     TEST_STARTED,

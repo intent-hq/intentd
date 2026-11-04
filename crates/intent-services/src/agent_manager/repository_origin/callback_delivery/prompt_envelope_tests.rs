@@ -150,7 +150,9 @@ impl Harness {
             );
             services
                 .store
-                .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
+                .get_agent_session_with_transcript(&AgentId::from(
+                    created["agent"]["id"].as_str().unwrap(),
+                ))
                 .await
                 .unwrap()
         };
@@ -552,7 +554,7 @@ async fn prompt_envelope_failed_load_recreates_with_a_distinct_original_owner() 
     let old_id = h
         .services
         .store
-        .get_agent_session(&h.row.id)
+        .get_agent_session_with_transcript(&h.row.id)
         .await
         .unwrap()
         .acp_session_id;
@@ -561,7 +563,7 @@ async fn prompt_envelope_failed_load_recreates_with_a_distinct_original_owner() 
     let new_id = h
         .services
         .store
-        .get_agent_session(&h.row.id)
+        .get_agent_session_with_transcript(&h.row.id)
         .await
         .unwrap()
         .acp_session_id;
@@ -619,7 +621,12 @@ async fn prompt_envelope_old_outbound_turn_resume_recovery_and_tools_keep_pinned
     for stamp in ["<missing>", "2.9", "2.10", "3.0", "3.1", "unknown-future"] {
         let h = Harness::new(Some(stamp), true).await;
         h.turn("historical ordinary turn").await;
-        let before = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let before = h
+            .services
+            .store
+            .get_agent_session_with_transcript(&h.row.id)
+            .await
+            .unwrap();
         assert!(!before
             .system_prompt
             .as_deref()
@@ -648,7 +655,12 @@ async fn prompt_envelope_old_outbound_turn_resume_recovery_and_tools_keep_pinned
             assert!(!record.to_string().contains(FACTS), "{stamp}: {record}");
             assert!(!record.to_string().contains("qualified review read"));
         }
-        let after = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let after = h
+            .services
+            .store
+            .get_agent_session_with_transcript(&h.row.id)
+            .await
+            .unwrap();
         assert_eq!(after.harness_version, before.harness_version);
         assert_eq!(after.harness_features, before.harness_features);
         assert_eq!(after.system_prompt, before.system_prompt);
@@ -811,7 +823,9 @@ let SESSION_ID = `config-session-${process.pid}`;
             );
             services
                 .store
-                .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
+                .get_agent_session_with_transcript(&AgentId::from(
+                    created["agent"]["id"].as_str().unwrap(),
+                ))
                 .await
                 .unwrap()
         };
@@ -838,7 +852,12 @@ let SESSION_ID = `config-session-${process.pid}`;
         let manager = h.manager.clone();
         let id = h.row.id.clone();
         h.daemon(async move {
-            let row = manager.services.store.get_agent_session(&id).await.unwrap();
+            let row = manager
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
             let workspace = manager
                 .services
                 .store
@@ -893,7 +912,12 @@ let SESSION_ID = `config-session-${process.pid}`;
         assert_eq!(records.len(), expected);
         let record = records.last().unwrap();
         assert_eq!(record["childAllowed"], false);
-        let stored = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let stored = h
+            .services
+            .store
+            .get_agent_session_with_transcript(&h.row.id)
+            .await
+            .unwrap();
         assert_eq!(record["rules"].as_str(), stored.system_prompt.as_deref());
         assert!(!record["rules"].as_str().unwrap().contains(FACTS));
         let address = h.manager.handles.lock().unwrap()[&h.row.id]
@@ -974,7 +998,12 @@ let SESSION_ID = `config-session-${process.pid}`;
             .await
             .unwrap();
         let first_files = assert_consumed(&h, 1).await;
-        let before = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let before = h
+            .services
+            .store
+            .get_agent_session_with_transcript(&h.row.id)
+            .await
+            .unwrap();
         let origin = h.origin();
         let connection = h.manager.handles.lock().unwrap()[&h.row.id]
             .execution
@@ -1072,7 +1101,12 @@ let SESSION_ID = `config-session-${process.pid}`;
             .records("rpc.jsonl")
             .iter()
             .all(|r| r["method"] != "_intent/session/register_mcp_callback"));
-        let after = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let after = h
+            .services
+            .store
+            .get_agent_session_with_transcript(&h.row.id)
+            .await
+            .unwrap();
         assert_eq!(after.harness_version, before.harness_version);
         assert_eq!(after.harness_features, before.harness_features);
         assert_eq!(after.system_prompt, before.system_prompt);

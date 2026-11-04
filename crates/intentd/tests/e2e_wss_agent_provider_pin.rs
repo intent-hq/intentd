@@ -480,7 +480,10 @@ async fn default_provider_change_never_moves_an_existing_conversation() {
             .expect("open daemon store");
         let ws = intent_core::WorkspaceId::from(ws_id.as_str());
         let id = intent_core::AgentId::from(legacy.as_str());
-        let session = store.get_agent_session(&id).await.expect("legacy session");
+        let session = store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .expect("legacy session");
         store
             .set_agent_session_model(
                 &ws,

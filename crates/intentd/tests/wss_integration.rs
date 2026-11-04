@@ -1435,7 +1435,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         assert_eq!(response["error"]["code"], -32602, "{response}");
         assert!(srv
             .store
-            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .get_agent_session_with_transcript(&intent_core::AgentId::from(agent_id.as_str()))
             .await
             .unwrap()
             .retired_at
@@ -1676,7 +1676,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&beta_child, &top_b),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(parent.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1695,7 +1699,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let retired_child = create_agent("retired-under-b", false, 9).await;
     {
         let child_id = intent_core::AgentId::from(retired_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(top_b.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1712,7 +1720,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let gamma_child = create_agent("under-gamma", false, 31).await;
     {
         let child_id = intent_core::AgentId::from(gamma_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1737,7 +1749,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&gamma_child, intent_core::AgentStatus::Active),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.status = status;
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -2400,7 +2416,11 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let watcher = intent_core::AgentId::from(watcher_id.as_str());
 
     // Link the child under the parent and mark it mid-turn (Active).
-    let mut child_session = srv.store.get_agent_session(&child).await.expect("child");
+    let mut child_session = srv
+        .store
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     child_session.parent_agent_id = Some(parent.clone());
     srv.store
         .update_agent_session(&workspace_id, &child_session)
@@ -2713,7 +2733,7 @@ async fn wss_get_subscriptions_bundles_slim_agents() {
     let child = &ids[1];
     let mut session = srv
         .store
-        .get_agent_session_summary(&intent_core::AgentId::from(child.as_str()))
+        .get_agent_session_without_messages(&intent_core::AgentId::from(child.as_str()))
         .await
         .unwrap();
     session.context_references = Some(json!([{"text": "context".repeat(5000)}]));
@@ -23824,7 +23844,7 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
         .unwrap());
     assert_eq!(
         srv.store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .attention_request_reason
@@ -23874,7 +23894,11 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             )
             .await
             .unwrap();
-        let mut session = srv.store.get_agent_session(&agent).await.unwrap();
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
         srv.store
@@ -23999,7 +24023,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         .await
         .unwrap();
     // Capture exactly the task/link observations held by an admitted resolver.
-    let before_session = srv.store.get_agent_session(&agent).await.unwrap();
+    let before_session = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(before_session.task_note_id.as_ref(), Some(old));
     let before_note = srv.store.get_note(&ws, old).await.unwrap();
     let mut prepared = before_note.clone();
@@ -24028,7 +24056,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     )
     .await;
     assert!(relink.get("error").is_none(), "{relink}");
-    let after_relink = srv.store.get_agent_session(&agent).await.unwrap();
+    let after_relink = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(after_relink.task_note_id.as_ref(), Some(new));
     assert_eq!(
         srv.store.get_note(&ws, old).await.unwrap().rev,

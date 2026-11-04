@@ -3,7 +3,7 @@
 //! task that closes a silent link.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,11 +18,15 @@ use tokio_tungstenite::WebSocketStream;
 
 use intent_core::link_traffic::{LinkTap, TrafficDirection};
 use intent_core::node_link::{
-    LeaseBinding, LinkFrame, LinkId, LinkOutcome, LinkRequest, LinkRpcError, StopId, StopOutcome,
+    FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkId, LinkOutcome, LinkRequest,
+    LinkRpcError, ScriptOutput, StopId, StopOutcome, SCRIPT_OUTPUT_QUEUE_BYTES,
 };
 use intent_core::{AgentId, Error, Result};
 
 use super::codes;
+
+#[cfg(test)]
+const NODE_LINK_PROTOCOLS_MAX: u32 = intent_core::node_link::NODE_LINK_PROTOCOLS.max;
 
 /// Heartbeat cadence, the silence after which a link is declared dead, and
 /// queue sizes.
@@ -64,13 +68,27 @@ struct Outbound {
     message: Message,
     request: Option<Arc<AtomicU8>>,
 }
+/// A queued script-lane message and the `scriptOutput` bytes it holds
+/// against [`SCRIPT_OUTPUT_QUEUE_BYTES`] (0 for the other script frames).
+struct ScriptOutbound {
+    message: Message,
+    output_bytes: usize,
+}
+
 /// JSON-RPC internal error, used when a request handler is dropped.
 const DROPPED_CODE: i32 = -32603;
 
 struct Inner {
     binding: LeaseBinding,
+    /// The protocol version the handshake negotiated: script frames need 8.
+    protocol: u32,
     out: mpsc::Sender<Outbound>,
     urgent: mpsc::Sender<Message>,
+    /// The lowest-priority lane. Unbounded in frames: `scriptStart`,
+    /// `scriptStop`, `scriptStarted` and `scriptExited` are never dropped,
+    /// and `scriptOutput` is bounded by `script_output_bytes`.
+    script: mpsc::UnboundedSender<ScriptOutbound>,
+    script_output_bytes: AtomicUsize,
     pending: Mutex<HashMap<LinkId, oneshot::Sender<LinkOutcome>>>,
     /// Stops waiting for their acknowledgement, by stop id: the agent the
     /// stop is for and every caller waiting on that id.
@@ -157,7 +175,16 @@ fn closed_error() -> Error {
 /// The callers waiting for one stop's acknowledgement.
 struct PendingStop {
     agent_id: AgentId,
-    waiters: Vec<oneshot::Sender<StopOutcome>>,
+    waiters: Vec<oneshot::Sender<StopAcked>>,
+}
+
+/// What a machine's `stopAck` reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopAcked {
+    pub outcome: StopOutcome,
+    /// How a final stop's WIP push went; `None` on a plain stop's ack (and
+    /// from a machine below nodeProtocol 9).
+    pub final_push: Option<FinalPush>,
 }
 
 /// Withdraws a [`NodeLink::stop`] caller's waiter when it gives up (timeout,
@@ -335,31 +362,57 @@ impl NodeLink {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::start_with(socket, binding, tuning, false, None)
+        Self::start_with(
+            socket,
+            binding,
+            tuning,
+            false,
+            None,
+            NODE_LINK_PROTOCOLS_MAX,
+        )
+    }
+
+    /// [`Self::start`] on a link that negotiated `protocol`.
+    #[cfg(test)]
+    pub(super) fn start_at<S>(
+        socket: WebSocketStream<S>,
+        binding: LeaseBinding,
+        tuning: Tuning,
+        protocol: u32,
+    ) -> (Self, LinkEvents)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with(socket, binding, tuning, false, None, protocol)
     }
 
     /// [`Self::start`] for a link whose peer is an executor credential: any
     /// frame outside [`intent_core::node_link::EXECUTOR_LINK_REQUESTS`]
     /// closes the link. `tap`, when given, records the link's frames
-    /// while capture is on.
+    /// while capture is on. `protocol` is the version the handshake chose.
     pub(super) fn start_with<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
         tuning: Tuning,
         executor_peer: bool,
         tap: Option<LinkTap>,
+        protocol: u32,
     ) -> (Self, LinkEvents)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (out, out_rx) = mpsc::channel(tuning.outbound_queue);
         let (urgent, urgent_rx) = mpsc::channel(URGENT_QUEUE);
+        let (script, script_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::channel(tuning.event_queue);
         let (close, _) = watch::channel(false);
         let inner = Arc::new(Inner {
             binding,
+            protocol,
             out,
             urgent,
+            script,
+            script_output_bytes: AtomicUsize::new(0),
             pending: Mutex::new(HashMap::new()),
             stops: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
@@ -370,7 +423,13 @@ impl NodeLink {
         });
         let (sink, stream) = socket.split();
         let last_seen = Arc::new(Mutex::new(Instant::now()));
-        tokio::spawn(write_loop(sink, out_rx, urgent_rx, inner.clone()));
+        tokio::spawn(write_loop(
+            sink,
+            out_rx,
+            urgent_rx,
+            script_rx,
+            inner.clone(),
+        ));
         tokio::spawn(read_loop(
             stream,
             events_tx,
@@ -389,6 +448,87 @@ impl NodeLink {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// The protocol version this link negotiated.
+    #[must_use]
+    pub fn protocol(&self) -> u32 {
+        self.inner.protocol
+    }
+
+    /// Queue one `scriptOutput` on the script lane unless the link already
+    /// holds [`SCRIPT_OUTPUT_QUEUE_BYTES`] of unsent output: `Ok(false)`
+    /// then, and the caller drops the output and reports it later.
+    ///
+    /// # Errors
+    ///
+    /// `node-link-protocol` on a link below protocol 8; `node-link-closed`
+    /// when the link is gone.
+    pub fn try_send_script_output(&self, output: ScriptOutput) -> Result<bool> {
+        let frame = LinkFrame::ScriptOutput(output);
+        self.check_protocol(&frame)?;
+        if self.is_closed() {
+            return Err(closed_error());
+        }
+        let len = match &frame {
+            LinkFrame::ScriptOutput(output) => output.data.len(),
+            _ => 0,
+        };
+        let queued = &self.inner.script_output_bytes;
+        let mut current = queued.load(Ordering::Acquire);
+        loop {
+            if current > 0 && current + len > SCRIPT_OUTPUT_QUEUE_BYTES {
+                return Ok(false);
+            }
+            match queued.compare_exchange(
+                current,
+                current + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => current = now,
+            }
+        }
+        self.queue_script(&frame, len)?;
+        Ok(true)
+    }
+
+    fn check_protocol(&self, frame: &LinkFrame) -> Result<()> {
+        if frame.min_protocol() > self.inner.protocol {
+            return Err(super::protocol("frame needs a newer link protocol"));
+        }
+        Ok(())
+    }
+
+    fn queue_script(&self, frame: &LinkFrame, output_bytes: usize) -> Result<()> {
+        let release = || {
+            self.inner
+                .script_output_bytes
+                .fetch_sub(output_bytes, Ordering::AcqRel);
+        };
+        let bytes = match frame.encode() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                release();
+                return Err(error);
+            }
+        };
+        self.inner
+            .observe(TrafficDirection::Out, frame, bytes.len());
+        if self
+            .inner
+            .script
+            .send(ScriptOutbound {
+                message: Message::Binary(bytes.into()),
+                output_bytes,
+            })
+            .is_err()
+        {
+            release();
+            return Err(closed_error());
+        }
+        Ok(())
     }
 
     /// Close the link. Pending calls fail with `node-link-closed` and
@@ -433,8 +573,16 @@ impl NodeLink {
                 | LinkFrame::Request(_)
                 | LinkFrame::Response { .. }
                 | LinkFrame::CancelRequest { .. }
+                | LinkFrame::ScriptOutput(_)
         ) {
             return Err(super::protocol("frame is not sent directly"));
+        }
+        self.check_protocol(frame)?;
+        if frame.channel() == LinkChannel::Script {
+            if self.is_closed() {
+                return Err(closed_error());
+            }
+            return self.queue_script(frame, 0);
         }
         self.send_any(frame, None).await
     }
@@ -476,6 +624,24 @@ impl NodeLink {
         stop_id: StopId,
         timeout: Duration,
     ) -> Result<StopOutcome> {
+        self.stop_with(agent_id, stop_id, false, timeout)
+            .await
+            .map(|acked| acked.outcome)
+    }
+
+    /// [`Self::stop`], sending a final stop (nodeProtocol 9) when
+    /// `final_stop`; the acknowledgement reports how its push went.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stop`].
+    pub async fn stop_with(
+        &self,
+        agent_id: AgentId,
+        stop_id: StopId,
+        final_stop: bool,
+        timeout: Duration,
+    ) -> Result<StopAcked> {
         if self.is_closed() {
             return Err(closed_error());
         }
@@ -498,7 +664,11 @@ impl NodeLink {
         if self.is_closed() {
             return Err(closed_error());
         }
-        let frame = LinkFrame::Stop { agent_id, stop_id };
+        let frame = LinkFrame::Stop {
+            agent_id,
+            stop_id,
+            final_stop,
+        };
         let exchange = async {
             self.send_any(&frame, None).await?;
             rx.await.map_err(|_| closed_error())
@@ -571,6 +741,7 @@ async fn write_loop<S>(
     mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     mut out: mpsc::Receiver<Outbound>,
     mut urgent: mpsc::Receiver<Message>,
+    mut script: mpsc::UnboundedReceiver<ScriptOutbound>,
     inner: Arc<Inner>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -608,6 +779,17 @@ async fn write_loop<S>(
                         }
                     }
                     () = super::wait_true(&mut close) => break,
+                }
+            }
+            queued = script.recv() => {
+                let Some(ScriptOutbound { message, output_bytes }) = queued else { break };
+                let sent = tokio::select! {
+                    sent = sink.send(message) => sent.is_ok(),
+                    () = super::wait_true(&mut close) => false,
+                };
+                inner.script_output_bytes.fetch_sub(output_bytes, Ordering::AcqRel);
+                if !sent {
+                    break;
                 }
             }
         }
@@ -668,6 +850,13 @@ async fn read_loop<S>(
 
 /// Handle one received frame; `false` closes the link.
 async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<Inner>) -> bool {
+    if frame.min_protocol() > inner.protocol {
+        tracing::warn!(
+            code = codes::PROTOCOL,
+            "node link: frame needs a newer link protocol; closing"
+        );
+        return false;
+    }
     if inner.executor_peer && !frame.admitted_from_executor() {
         tracing::warn!(
             code = codes::PROTOCOL,
@@ -701,13 +890,17 @@ async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<I
             stop_id,
             agent_id,
             outcome,
+            final_push,
         } => {
             let mut stops = lock(&inner.stops);
             match stops.get(&stop_id) {
                 Some(pending) if pending.agent_id == agent_id => {
                     if let Some(pending) = stops.remove(&stop_id) {
                         for waiter in pending.waiters {
-                            let _ = waiter.send(outcome);
+                            let _ = waiter.send(StopAcked {
+                                outcome,
+                                final_push,
+                            });
                         }
                     }
                 }

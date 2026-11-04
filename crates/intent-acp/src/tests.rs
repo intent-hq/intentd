@@ -7232,11 +7232,17 @@ mod workspace_api_tool_tests {
 
         assert_eq!(proposal["kind"], "workspace-create");
         assert_eq!(proposal["payload"]["operation"], "workspace.create");
-        assert_eq!(
-            first["proposalId"], "Create workspace: Follow up",
-            "top-level proposalId is the applyProposal handle (preview.title, no applyToolCallId)"
+        assert_eq!(proposal["preview"]["title"], "Create workspace: Follow up");
+        let first_id = first["proposalId"].as_str().expect("proposalId");
+        assert!(
+            first_id.starts_with("workspace-create-"),
+            "top-level proposalId is the card's unique applyToolCallId: {first_id}"
         );
-        assert_eq!(first["proposalId"], proposal["preview"]["title"]);
+        assert_eq!(first["proposalId"], proposal["applyToolCallId"]);
+        assert_ne!(
+            second["proposalId"], first["proposalId"],
+            "same-titled follow-up cards never share an identity"
+        );
         assert_eq!(create["mode"], "sibling");
         assert_eq!(create["title"], "Follow up");
         assert_eq!(
@@ -11112,6 +11118,7 @@ mod wsapi4_bindings_tests {
                 pending_questions_message_id: None,
                 pending_proposals: Vec::new(),
                 proposal_resolutions: serde_json::Map::new(),
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -14491,6 +14498,8 @@ mod workspace_apply_proposal_tests {
         /// Outcome the fake resolver echoes back instead of the requested one
         /// (models the real resolver's "already resolved" idempotent path).
         resolve_persisted_outcome: Mutex<Option<String>>,
+        /// `created_workspace_id` of each resolve call, in call order.
+        resolve_created: Mutex<Vec<Option<String>>>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -14589,6 +14598,7 @@ mod workspace_apply_proposal_tests {
                 pending_questions_message_id: None,
                 pending_proposals: pending,
                 proposal_resolutions: resolutions,
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -14707,7 +14717,12 @@ mod workspace_apply_proposal_tests {
             proposal_id: String,
             outcome: String,
             detail: Option<String>,
+            created_workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.resolve_created
+                .lock()
+                .unwrap()
+                .push(created_workspace_id.map(|id| id.as_str().to_string()));
             self.resolve_calls.lock().unwrap().push((
                 workspace_id.as_str().to_string(),
                 agent_id.as_str().to_string(),
@@ -14945,6 +14960,12 @@ mod workspace_apply_proposal_tests {
             detail.as_deref(),
             Some("Created workspace ws-new (Follow up) via ws.workspace.applyProposal")
         );
+        drop(resolves);
+        assert_eq!(
+            *api.resolve_created.lock().unwrap(),
+            vec![Some("ws-new".to_string())],
+            "the applied card records the workspace it created"
+        );
     }
 
     #[tokio::test]
@@ -15041,6 +15062,57 @@ mod workspace_apply_proposal_tests {
             &resp,
             "has no initialAgent; initialPrompt cannot be overridden",
         );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    /// A unique-id follow-up card whose pending entry is its `applyToolCallId`.
+    fn api_with_pending_ids(ids: &[&str]) -> Arc<FakeApi> {
+        let api = Arc::new(FakeApi::default());
+        for (index, id) in ids.iter().enumerate() {
+            let message_id = format!("m-{index}");
+            let mut proposal = sibling_proposal();
+            proposal["applyToolCallId"] = json!(id);
+            proposal["payload"]["params"]["idempotencyKey"] = json!(format!("{KEY}-{index}"));
+            api.pending.lock().unwrap().push(PendingProposal {
+                proposal_id: id.to_string(),
+                message_id: message_id.clone(),
+            });
+            api.messages
+                .lock()
+                .unwrap()
+                .insert(message_id, vec![proposal_block(&proposal)]);
+        }
+        api
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_applies_the_one_pending_unique_id_card() {
+        let api = api_with_pending_ids(&["workspace-create-a"]);
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["proposalId"], "workspace-create-a");
+        assert_eq!(api.resolve_calls.lock().unwrap()[0].2, "workspace-create-a");
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_refuses_an_ambiguous_title() {
+        let api = api_with_pending_ids(&["workspace-create-a", "workspace-create-b"]);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "2 pending proposals are titled");
         assert!(api.create_calls.lock().unwrap().is_empty());
     }
 

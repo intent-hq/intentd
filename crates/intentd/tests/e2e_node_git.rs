@@ -21,7 +21,9 @@ use intent_core::{
     BoxFuture, Error, ExecutorCredentialId, HostRole, PrincipalId, Result, WorkspaceApi,
 };
 use intent_git::hub::AgentRef;
-use intent_git::node_git::{AgentRemote, CheckoutCache, NodeGit, HELPER_NAME, SOCKET_ENV};
+use intent_git::node_git::{
+    AgentRemote, CheckoutCache, GitService, NodeGit, HELPER_NAME, SOCKET_ENV,
+};
 use intent_transport::generate_certificate;
 use intent_transport::node_link::{
     dial_git, dial_link, serve_git, serve_helpers, CertificatePin, ExecutorHost, ExecutorLinks,
@@ -78,15 +80,34 @@ struct Lease {
     repository: PathBuf,
     binding: LeaseBinding,
     agents: BTreeSet<String>,
+    hold: Arc<ReceiveHold>,
 }
+
+/// Holds the next push's session on head, after it opened and before
+/// `git receive-pack` runs: signals the first sender, waits for the
+/// receiver.
+type ReceiveHold = std::sync::Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+>;
 
 impl NodeGitAccess for Lease {
     fn repository<'a>(
         &'a self,
         binding: &'a LeaseBinding,
         remote: &'a AgentRemote,
+        service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
+            if service == GitService::ReceivePack {
+                let hold = self.hold.lock().unwrap().take();
+                if let Some((entered, release)) = hold {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
             binding.ensure_current(&self.binding)?;
             if remote.workspace_id() != WS || !self.agents.contains(remote.agent_id()) {
                 return Err(Error::Forbidden("agent not on this lease".into()));
@@ -191,6 +212,7 @@ struct Fixture {
     helper_dir: PathBuf,
     socket: PathBuf,
     base: String,
+    receive_hold: Arc<ReceiveHold>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
     _link: intent_transport::node_link::DialedLink,
     _node_link: Box<dyn std::any::Any + Send>,
@@ -282,6 +304,7 @@ impl Fixture {
                 intentd_version: "test".into(),
                 binding: binding.clone(),
                 acked_seq: NodeCounter(0),
+                lease_agents: Vec::new(),
             },
         )
         .await
@@ -297,11 +320,14 @@ impl Fixture {
             panic!("expected the git connection");
         };
 
+        let receive_hold = Arc::new(ReceiveHold::default());
         let lease = Lease {
             repository: head.path().to_path_buf(),
             binding,
             agents: BTreeSet::from([AGENT.to_owned()]),
+            hold: receive_hold.clone(),
         };
+        intent_git::node_git::configure_receive_hooks(&node.path().join("head-data")).unwrap();
         let serving = tokio::spawn(serve_git(head_git, Arc::new(lease)));
 
         // The node side: sessions on the git connection, the helper socket,
@@ -326,6 +352,7 @@ impl Fixture {
             helper_dir,
             socket,
             base,
+            receive_hold,
             _tasks: vec![serving, helpers],
             _link: link,
             _node_link: Box::new((server, node_link, accepted)),
@@ -367,7 +394,7 @@ async fn node_fetches_base_and_pushes_wip_over_the_link() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(commit, fixture.base);
+    assert_eq!(commit.base, fixture.base);
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), fixture.base);
     assert_eq!(
         std::fs::read_to_string(worktree.join("README.md")).unwrap(),
@@ -412,6 +439,34 @@ async fn node_fetches_base_and_pushes_wip_over_the_link() {
     assert_eq!(
         git(head, &["rev-parse", &format!("{}^", pushed.wip)]),
         pushed.head
+    );
+
+    // The checkout is removed (final stop or sweep); relaunching the agent
+    // fetches its head and wip refs over the link and restores both.
+    tokio::time::timeout(wait(), fixture.cache.remove(REPO, &worktree))
+        .await
+        .unwrap()
+        .unwrap();
+    let restored = fixture.worktree("a-restored");
+    let checkout = tokio::time::timeout(
+        wait(),
+        fixture.cache.checkout(REPO, &remote(AGENT), &restored),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(checkout.base, fixture.base);
+    assert_eq!(checkout.at, pushed.head);
+    assert_eq!(checkout.unrestored_wip, None);
+    assert_eq!(git(&restored, &["rev-parse", "HEAD"]), pushed.head);
+    assert_eq!(
+        std::fs::read_to_string(restored.join("notes.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(git(&restored, &["status", "--porcelain"]), "?? notes.txt");
+    assert_eq!(
+        try_ref(head, &remote(AGENT).ref_name(AgentRef::Wip)),
+        Some(pushed.wip)
     );
 }
 
@@ -479,4 +534,145 @@ async fn sessions_for_another_leases_agent_are_refused() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(try_ref(fixture.head.path(), &target), None);
+}
+
+/// Every `*.lock` file under `dir`.
+fn lock_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "lock") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The processes left of a push: `git receive-pack` against `repository`
+/// and helpers reaching the node through `socket`.
+#[cfg(target_os = "linux")]
+fn push_processes(repository: &Path, socket: &Path) -> Vec<String> {
+    let repository = repository.to_string_lossy().into_owned();
+    let socket = format!("{SOCKET_ENV}={}", socket.display());
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            let environ = std::fs::read(entry.path().join("environ")).unwrap_or_default();
+            let helper = String::from_utf8_lossy(&environ)
+                .split('\0')
+                .any(|var| var == socket)
+                && !cmdline.is_empty();
+            let receive = cmdline.contains("receive-pack") && cmdline.contains(&repository);
+            (helper || receive).then_some(cmdline)
+        })
+        .collect()
+}
+
+/// Wait until no process of a push is left.
+#[cfg_attr(not(target_os = "linux"), expect(clippy::unused_async))] // only the linux arm awaits
+async fn no_push_processes(repository: &Path, socket: &Path) {
+    #[cfg(target_os = "linux")]
+    tokio::time::timeout(wait(), async {
+        loop {
+            if push_processes(repository, socket).is_empty() {
+                return;
+            }
+            // timing-guard: poll interval for exited processes to leave /proc (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "push processes left: {:?}",
+            push_processes(repository, socket)
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let _ = (repository, socket);
+}
+
+/// A WIP push dropped part way (the machine cancelling an ordinary push at
+/// shutdown) leaves head's refs at their old value, ends its helper and head's
+/// session, and leaves no ref lock or process
+/// behind; the next push then carries all the work (intent-hq/intent#8437).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_push_leaves_heads_refs_whole_and_the_next_push_lands() {
+    let fixture = Fixture::start().await;
+    let worktree = fixture.worktree("a");
+    tokio::time::timeout(
+        wait(),
+        fixture.cache.checkout(REPO, &remote(AGENT), &worktree),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let head = fixture.head.path();
+    let wip_ref = remote(AGENT).ref_name(AgentRef::Wip);
+    let head_ref = remote(AGENT).ref_name(AgentRef::Head);
+    std::fs::write(worktree.join("first.txt"), "first\n").unwrap();
+    let first = tokio::time::timeout(
+        wait(),
+        fixture.cache.git().push_wip(&worktree, &remote(AGENT)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // The next push is held on head after its session opened, then
+    // dropped, as the machine's shutdown drops an ordinary push. Head then
+    // answers the open (its access check returns).
+    std::fs::write(worktree.join("second.txt"), "second\n").unwrap();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *fixture.receive_hold.lock().unwrap() = Some((entered_tx, release_rx));
+    {
+        let agent = remote(AGENT);
+        let push = fixture.cache.git().push_wip(&worktree, &agent);
+        tokio::pin!(push);
+        tokio::select! {
+            result = &mut push => panic!("the held push finished: {result:?}"),
+            entered = tokio::time::timeout(wait(), entered) => entered.unwrap().unwrap(),
+        }
+    }
+    let _ = release.send(());
+    // The orphaned helper and head's session end, and nothing was written.
+    no_push_processes(head, &fixture.socket).await;
+    assert_eq!(try_ref(head, &wip_ref), Some(first.wip.clone()));
+    assert_eq!(try_ref(head, &head_ref), Some(first.head.clone()));
+    assert_eq!(lock_files(&head.join(".git")), Vec::<PathBuf>::new());
+
+    // The next push carries everything the dropped one would have, and more.
+    std::fs::write(worktree.join("third.txt"), "third\n").unwrap();
+    let last = tokio::time::timeout(
+        wait(),
+        fixture.cache.git().push_wip(&worktree, &remote(AGENT)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(try_ref(head, &wip_ref), Some(last.wip.clone()));
+    for (file, content) in [
+        ("first.txt", "first"),
+        ("second.txt", "second"),
+        ("third.txt", "third"),
+    ] {
+        assert_eq!(
+            git(head, &["show", &format!("{}:{file}", last.wip)]),
+            content
+        );
+    }
+    assert_eq!(lock_files(&head.join(".git")), Vec::<PathBuf>::new());
+    no_push_processes(head, &fixture.socket).await;
 }

@@ -753,3 +753,164 @@ async fn light_captures_bound_what_they_copy() {
         "welcome protocol 6, 100000 running agents"
     );
 }
+
+fn script_start_frame() -> LinkFrame {
+    LinkFrame::ScriptStart(crate::node_link::ScriptStartCommand {
+        agent_id: AgentId::from_string("agent-1"),
+        script_id: "script-1".into(),
+        spawn_id: "run-1".into(),
+        command: "npm run dev".into(),
+        mode: crate::ScriptMode::Service,
+        cwd: None,
+        env: vec![crate::node_link::ScriptEnvVar {
+            key: "DATABASE_URL".into(),
+            value: "postgres://u:canary-db@h/db".into(),
+        }],
+    })
+}
+
+#[tokio::test]
+async fn script_env_is_masked_in_script_start_and_forwarded_calls() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(true);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    tap.observe(TrafficDirection::Out, &script_start_frame(), 100);
+    let request_id = uuid::Uuid::new_v4();
+    tap.observe(
+        TrafficDirection::In,
+        &LinkFrame::Request(LinkRequest {
+            request_id,
+            agent_id: AgentId::from_string("agent-1"),
+            method: crate::remote_launch::workspace_api::CALL_METHOD.into(),
+            params: json!({
+                "method": "script.create",
+                "args": { "name": "dev", "command": "x", "env": { "PLAIN": "canary-obj" } },
+                // Variables that happen to share a profile overlay's member
+                // names are still an ordinary env map: every value masked.
+                "more": [
+                    { "env": { "env": "x", "DATABASE_URL": "postgres://user:canary-pw1@h/db" } },
+                    { "env": { "providerRef": "y", "API_URL": "https://canary-pw2.example" } },
+                ],
+            }),
+            timeout_ms: 1000,
+        }),
+        100,
+    );
+    tap.observe(
+        TrafficDirection::Out,
+        &LinkFrame::Response {
+            request_id,
+            outcome: LinkOutcome::Ok(json!({
+                "scripts": [{ "id": "s", "env": { "SECRETLESS": "canary-row" } }],
+                "nested": { "env": [
+                    { "key": "K", "value": "canary-arr" },
+                    { "key": "N", "value": null },
+                    // Entries that are not `{ key, value }` pairs still get
+                    // the generic redaction.
+                    "-----BEGIN PRIVATE KEY----- canary-pem",
+                    { "token": "canary-token" },
+                ] },
+            })),
+        },
+        100,
+    );
+    settle(&traffic, 3).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    let text = records.to_string();
+    for canary in [
+        "canary-db",
+        "canary-obj",
+        "canary-row",
+        "canary-arr",
+        "canary-pw1",
+        "canary-pw2",
+        "canary-pem",
+        "canary-token",
+    ] {
+        assert!(!text.contains(canary), "{canary} in {text}");
+    }
+    assert_eq!(records[0]["payload"]["env"][0]["key"], "DATABASE_URL");
+    assert_eq!(records[0]["payload"]["env"][0]["value"], "***");
+    assert_eq!(records[0]["payload"]["command"], "npm run dev");
+    assert_eq!(
+        records[1]["payload"]["params"]["args"]["env"]["PLAIN"],
+        "***"
+    );
+    let more = &records[1]["payload"]["params"]["more"];
+    assert_eq!(more[0]["env"]["env"], "***", "{more}");
+    assert_eq!(more[0]["env"]["DATABASE_URL"], "***", "{more}");
+    assert_eq!(more[1]["env"]["providerRef"], "***", "{more}");
+    assert_eq!(more[1]["env"]["API_URL"], "***", "{more}");
+    assert_eq!(
+        records[2]["payload"]["outcome"]["ok"]["nested"]["env"][0]["key"],
+        "K"
+    );
+    assert_eq!(
+        records[2]["payload"]["outcome"]["ok"]["nested"]["env"][1]["value"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn script_frames_are_summarized() {
+    let (traffic, _) = traffic(limits(10, 1 << 16, 16));
+    traffic.start(false);
+    let tap = LinkTap::new(traffic.clone(), machine());
+    let run = |id: &str| (id.to_owned(), "run-1".to_owned());
+    let (script_id, spawn_id) = run("script-1");
+    let frames = [
+        (
+            script_start_frame(),
+            "scriptStart script-1 spawn run-1 for agent-1 (service)",
+        ),
+        (
+            LinkFrame::ScriptStop(crate::node_link::ScriptProcessRef {
+                agent_id: crate::AgentId::from("agent-1"),
+                script_id: script_id.clone(),
+                spawn_id: spawn_id.clone(),
+            }),
+            "scriptStop script-1 spawn run-1 for agent-1",
+        ),
+        (
+            LinkFrame::ScriptStarted(crate::node_link::ScriptStarted {
+                agent_id: crate::AgentId::from("agent-1"),
+                script_id: script_id.clone(),
+                spawn_id: spawn_id.clone(),
+                pid: 77,
+            }),
+            "scriptStarted script-1 spawn run-1 for agent-1 pid 77",
+        ),
+        (
+            LinkFrame::ScriptOutput(crate::node_link::ScriptOutput {
+                agent_id: crate::AgentId::from("agent-1"),
+                script_id: script_id.clone(),
+                spawn_id: spawn_id.clone(),
+                seq: 3,
+                data: "canary-output".into(),
+            }),
+            "scriptOutput script-1 spawn run-1 for agent-1 #3",
+        ),
+        (
+            LinkFrame::ScriptExited(crate::node_link::ScriptExited {
+                agent_id: crate::AgentId::from("agent-1"),
+                script_id,
+                spawn_id,
+                exit_code: Some(2),
+                error: None,
+            }),
+            "scriptExited script-1 spawn run-1 for agent-1 code 2",
+        ),
+    ];
+    for (frame, _) in &frames {
+        tap.observe(TrafficDirection::In, frame, 100);
+    }
+    settle(&traffic, frames.len()).await;
+    let records = traffic.snapshot(None, None)["records"].clone();
+    for (record, (_, summary)) in records.as_array().unwrap().iter().zip(&frames) {
+        assert_eq!(record["summary"], *summary, "{record}");
+    }
+    for record in records.as_array().unwrap() {
+        assert_eq!(record["agentId"], "agent-1", "{record}");
+    }
+    assert!(!records.to_string().contains("canary-output"));
+}

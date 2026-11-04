@@ -4320,6 +4320,18 @@ pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
 /// [`AgentSession::proposal_resolutions`].
 pub const PROPOSAL_RESOLUTIONS_KEY: &str = "proposalResolutions";
 
+/// Metadata key under which the workspaces created by applied
+/// `workspace-create` proposals are persisted on the `agent_session.metadata`
+/// JSON (PROTOCOL §5.5): a `proposalId -> workspaceId` map written when the
+/// daemon resolves a card `applied` for a create it ran (`workspace.create
+/// { origin }`, `ws.workspace.applyProposal`). Lets every client open the
+/// created workspace from an applied card, including cards applied by the
+/// agent, another client, or before a restart. Bounded to the ids still in
+/// [`PROPOSAL_RESOLUTIONS_KEY`]. No schema migration — the map rides the
+/// existing free-form `metadata` column. Read back by
+/// [`AgentSession::proposal_created_workspaces`].
+pub const PROPOSAL_CREATED_WORKSPACES_KEY: &str = "proposalCreatedWorkspaces";
+
 /// The only two `outcome` values `agent.resolveProposal` accepts and the
 /// [`PROPOSAL_RESOLUTIONS_KEY`] map may carry. The reader
 /// ([`AgentSession::proposal_resolutions`]) filters entries against this set
@@ -4747,6 +4759,26 @@ impl AgentSession {
             .unwrap_or_default()
     }
 
+    /// The created-workspace ids persisted under
+    /// [`PROPOSAL_CREATED_WORKSPACES_KEY`] in the session's free-form
+    /// `metadata`: a `proposalId -> workspaceId` map. Entries with an empty
+    /// id or a non-string / empty workspace id are skipped defensively.
+    /// Absent key or a non-object value reads as an empty map.
+    pub fn proposal_created_workspaces(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PROPOSAL_CREATED_WORKSPACES_KEY))
+            .and_then(serde_json::Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(id, ws)| !id.is_empty() && ws.as_str().is_some_and(|w| !w.is_empty()))
+                    .map(|(id, ws)| (id.clone(), ws.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The per-conversation seen marker persisted under
     /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
     /// `Some` only when the metadata is an object carrying a non-empty string
@@ -4886,6 +4918,12 @@ pub struct AgentMetadata {
     /// transcript proposal cards from it. Omitted when empty.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub proposal_resolutions: serde_json::Map<String, serde_json::Value>,
+    /// Workspaces created by applied `workspace-create` proposals
+    /// (PROTOCOL §5.5): a `proposalId -> workspaceId` map, mirroring
+    /// [`AgentSession::proposal_created_workspaces`]. Clients open the
+    /// created workspace from an applied card with it. Omitted when empty.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub proposal_created_workspaces: serde_json::Map<String, serde_json::Value>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -5204,6 +5242,7 @@ impl AgentLite {
         });
         let pending_proposals = session.pending_proposals();
         let proposal_resolutions = session.proposal_resolutions();
+        let proposal_created_workspaces = session.proposal_created_workspaces();
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
@@ -5230,6 +5269,7 @@ impl AgentLite {
             pending_questions_message_id,
             pending_proposals,
             proposal_resolutions,
+            proposal_created_workspaces,
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
@@ -5304,7 +5344,7 @@ impl AgentLite {
     /// that only the open-agent (detail) UI reads — `harnessFeatures`,
     /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`, the
     /// placed agent's `leaseId`, `metadata.pendingProposals`,
-    /// `metadata.proposalResolutions` — so an
+    /// `metadata.proposalResolutions`, `metadata.proposalCreatedWorkspaces` — so an
     /// `agent.list` row carries only what list contexts render. Every one of
     /// these is presence-detected on the wire (`skip_serializing_if`), so a
     /// stripped row simply omits the key (absent, never `null`). `agent.list`
@@ -5328,6 +5368,7 @@ impl AgentLite {
         self.stats = None;
         self.metadata.pending_proposals.clear();
         self.metadata.proposal_resolutions.clear();
+        self.metadata.proposal_created_workspaces.clear();
     }
 
     /// List-path preview capping (list-payload cost contract, extending
@@ -6025,6 +6066,20 @@ pub struct Script {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The remote agent that created this script (`remoteScripts: 1`).
+    /// Daemon-owned: no `script.create` param sets it and an upsert keeps the
+    /// stored value. A remote agent changes only definitions it authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_author: Option<ScriptRemoteAuthor>,
+}
+
+/// `Script.remoteAuthor`: the remote agent that created the script and its
+/// machine (the `remoteMachines` row id, the agent's placement `nodeId`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptRemoteAuthor {
+    pub agent_id: AgentId,
+    pub node_id: String,
 }
 
 /// Wire input for `script.create` (PROTOCOL §5.8); built by the router from

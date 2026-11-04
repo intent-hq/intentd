@@ -506,7 +506,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             .is_none());
         assert!(services
             .store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .acp_session_id
@@ -1313,7 +1313,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         assert_eq!(
             services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1453,7 +1453,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             .unwrap();
             let before_commit = while_retirement_held(
                 mutation.as_mut(),
-                services.store.get_agent_session(&agent),
+                services.store.get_agent_session_with_transcript(&agent),
                 "held precommit row",
             )
             .await
@@ -1468,7 +1468,11 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                 mutation.as_mut(),
                 async {
                     loop {
-                        let row = services.store.get_agent_session(&agent).await.unwrap();
+                        let row = services
+                            .store
+                            .get_agent_session_with_transcript(&agent)
+                            .await
+                            .unwrap();
                         let committed = if mutation_case == HeldMutation::Retired {
                             row.retired_at.as_deref() == Some("2026-10-10T12:19:00Z")
                         } else {
@@ -1502,7 +1506,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         assert_eq!(
             while_retirement_held(
                 mutation.as_mut(),
-                services.store.get_agent_session(&agent),
+                services.store.get_agent_session_with_transcript(&agent),
                 "intermediate session ID",
             )
             .await
@@ -1602,7 +1606,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         assert_eq!(
             services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1797,7 +1801,7 @@ async fn retired_new_waits_for_remote_join(
                     loop {
                         if services
                             .store
-                            .get_agent_session(&agent)
+                            .get_agent_session_with_transcript(&agent)
                             .await
                             .unwrap()
                             .acp_session_id
@@ -1827,7 +1831,7 @@ async fn retired_new_waits_for_remote_join(
         assert_eq!(
             services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1886,7 +1890,7 @@ async fn retired_new_waits_for_remote_join(
         assert_eq!(
             services
                 .store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .unwrap()
                 .acp_session_id
@@ -1922,7 +1926,7 @@ async fn retired_new_waits_for_remote_join(
     .is_err());
     assert!(services
         .store
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .unwrap()
         .acp_session_id
@@ -1961,7 +1965,7 @@ async fn retired_new_waits_for_remote_join(
         );
         assert!(services
             .store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .acp_session_id

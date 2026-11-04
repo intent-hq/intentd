@@ -256,6 +256,7 @@ fn machine(id: &str, credential: &str, added_at: &str) -> ExposedMachine {
         state: RemoteMachineState::Disconnected,
         added_at: added_at.into(),
         last_connected_at: None,
+        node_protocol: None,
     }
 }
 
@@ -423,6 +424,34 @@ async fn exposed_machine_state_routes_and_capabilities_are_cached() {
         saved.credential_id,
         id("cred-1"),
         "routes never move the credential"
+    );
+    assert_eq!(saved.node_protocol, None, "absent before the first bind");
+
+    // Each bind records the version it negotiated; it is kept while the
+    // machine is disconnected and survives a save of the row.
+    assert!(store
+        .record_exposed_machine_protocol("mac", 8)
+        .await
+        .unwrap());
+    assert!(!store
+        .record_exposed_machine_protocol("absent", 8)
+        .await
+        .unwrap());
+    assert!(store
+        .record_exposed_machine_protocol("mac", 7)
+        .await
+        .unwrap());
+    let saved = store.get_exposed_machine("mac").await.unwrap().unwrap();
+    assert_eq!(saved.node_protocol, Some(7));
+    store.save_exposed_machine(&saved).await.unwrap();
+    assert_eq!(
+        store
+            .get_exposed_machine("mac")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_protocol,
+        Some(7)
     );
 }
 

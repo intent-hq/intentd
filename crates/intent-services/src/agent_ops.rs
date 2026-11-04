@@ -24,6 +24,7 @@ use intent_core::{
     PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, SLIM_PAGE_BUDGET_BYTES,
 };
 use intent_sourcecontrol::RepoRef;
+use intent_store::AgentSessionSummary;
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
@@ -224,6 +225,10 @@ pub(crate) struct AgentRetirementGates {
     /// retiring at once (each would otherwise see the other still active).
     workspaces: Arc<Mutex<HashMap<WorkspaceId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
+
+/// How long deleting a remote agent waits for its machine to acknowledge
+/// the stops of its script runs before deleting it anyway.
+const REMOTE_SCRIPT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AgentRetirementGates {
     pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
@@ -523,8 +528,8 @@ impl AgentSnapshot {
 /// branches prune/migrate.
 #[derive(Debug, Default)]
 pub(crate) struct AssignedAgentScan {
-    pub(crate) live_session: Option<AgentSession>,
-    pub(crate) inheritance_source: Option<AgentSession>,
+    pub(crate) live_session: Option<AgentSessionSummary>,
+    pub(crate) inheritance_source: Option<AgentSessionSummary>,
     pub(crate) cleaned_up: Vec<AgentId>,
     pub(crate) poisoned: Vec<AgentId>,
 }
@@ -602,6 +607,12 @@ mod tests_suggested_prompts_contract;
 
 #[cfg(test)]
 mod tests_proposal_origin;
+
+#[cfg(test)]
+mod tests_parent_provider;
+
+#[cfg(test)]
+mod tests_unattended_resume;
 
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
@@ -1202,10 +1213,13 @@ fn resolve_delegate_reasoning_effort(
 /// 1. The specialist's frontmatter `codingAgent` (3-tier resolution). It
 ///    must be a known, available provider or the delegate fails with a
 ///    clear error (never silently substituted).
-/// 2. The settings-derived default (`model.defaultProvider` —
+/// 2. The delegating agent's own provider (`inherited`), when it is still
+///    selectable, enabled, installed and not known to be signed out
+///    ([`Services::inheritable_parent_provider`], intent-hq/intent#8479).
+/// 3. The settings-derived default (`model.defaultProvider` —
 ///    [`crate::agent_session::derived_default_provider`]), with the same
-///    known/available requirement.
-/// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
+///    known/available requirement as the specialist pin.
+/// 4. None of these is set: a clear `-32602` (monorepo#3044) — the former residual
 ///    `Ok(None)` left the session's `provider` unset, and spawn-time
 ///    resolution bottomed out at the first registered provider (auggie),
 ///    silently spawning a binary that may not be installed. Resolution that
@@ -1214,6 +1228,7 @@ fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
+    inherited: Option<&str>,
 ) -> Result<Option<String>> {
     let settings = services.effective_settings();
 
@@ -1221,6 +1236,12 @@ fn resolve_delegate_provider(
         resolve_specialist_provider(services, "agent.delegate", specialist, workspace_path)?
     {
         return Ok(Some(provider));
+    }
+
+    // The delegating agent's own provider, already vetted by
+    // [`Services::inheritable_parent_provider`] (intent-hq/intent#8479).
+    if let Some(inherited) = inherited {
+        return Ok(Some(inherited.to_string()));
     }
 
     match crate::agent_session::derived_default_provider(&settings) {
@@ -1263,6 +1284,79 @@ fn resolve_specialist_provider(
         )?;
     }
     Ok(provider)
+}
+
+impl Services {
+    /// The provider a child inherits from the agent creating it when the
+    /// caller names none (intent-hq/intent#8479): the parent session's bare
+    /// provider, provided it would pass this backend's create front door —
+    /// enabled, installed and not cached as signed out — and, when the
+    /// caller passed a bare `model`, not provably another provider's model.
+    /// A parent on a named profile passes nothing on: a child never
+    /// inherits its parent's profile (PROTOCOL §5.54). `None` falls back to the
+    /// existing resolution (`model.defaultProvider`), never to an error: an
+    /// unusable parent provider must not block delegation.
+    ///
+    /// A remote parent is skipped: its provider runs on another machine,
+    /// so this backend's installation says nothing about it. Callers also
+    /// skip a child placed on another machine, for the same reason.
+    pub(crate) async fn inheritable_parent_provider(
+        &self,
+        method: &'static str,
+        parent: &AgentId,
+        model: Option<&str>,
+    ) -> Option<String> {
+        let session = self.store.get_agent_session_summary(parent).await.ok()?;
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        let provider = session.provider.clone().filter(|p| !p.trim().is_empty())?;
+        // A child never inherits its parent's named profile (PROTOCOL
+        // §5.54 "Delegation"): no account is inferred for it.
+        if crate::provider_profiles::is_qualified_ref(&provider) {
+            return None;
+        }
+        let services = self.clone();
+        let candidate = provider.clone();
+        let usable = tokio::task::spawn_blocking(move || {
+            services.ensure_selectable_provider(method, &candidate)?;
+            services.ensure_provider_available_for(
+                method,
+                &candidate,
+                &services.effective_settings().providers,
+            )
+        })
+        .await
+        .ok()?;
+        if let Err(error) = usable {
+            tracing::debug!(
+                parent = %parent,
+                provider,
+                %error,
+                "parent provider not usable for a child; using the settings default"
+            );
+            return None;
+        }
+        // The create front door gates on the verdict of the selection's own
+        // saved settings (an overridden Default's overlay, not the bare
+        // install); a cached signed-out or unresolvable verdict there would
+        // reject the child, so fall back instead.
+        match Box::pin(self.selection_auth_verdict(&provider)).await {
+            Ok(Some(false)) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        // A caller-supplied model must be one the inherited provider both
+        // may own and can resolve, the same two checks the create front door
+        // applies; otherwise the default provider keeps it, as before.
+        if let Some(model) = model {
+            let catalog = self.cached_models();
+            ensure_bare_model_matches_provider(method, &catalog, &provider, model).ok()?;
+            ensure_model_offered_by_provider(method, &catalog, &provider, model).ok()?;
+        }
+        Some(provider)
+    }
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
@@ -3649,6 +3743,15 @@ fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Optio
         .map_or((None, None), |m| (Some(m.role.clone()), Some(m.id.clone())))
 }
 
+/// Map a session read's `NotFound` to the generic `-32603` the TS peers of
+/// the `load_session_*internal` callers surface.
+fn map_internal_not_found(agent_id: &AgentId, read: Result<AgentSession>) -> Result<AgentSession> {
+    match read {
+        Err(Error::NotFound(_)) => Err(Error::Internal(format!("Agent \"{agent_id}\" not found"))),
+        other => other,
+    }
+}
+
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
 /// [`intent_store::SessionMessageProjection`] into [`AgentLite`] — the
 /// transcript-free equivalent of [`project_lite`] (monorepo#958). The derived
@@ -4265,7 +4368,7 @@ impl Services {
     /// subscription participants. Cap after the live runtime overlay.
     fn project_list_agent(
         &self,
-        session: AgentSession,
+        session: AgentSessionSummary,
         projection: &intent_store::SessionMessageProjection,
         waiting_on_hooks: Vec<Value>,
         waiting_on_pr_monitors: Vec<Value>,
@@ -4347,10 +4450,12 @@ impl Services {
     /// (monorepo#958) — same runtime-flag overlay, no transcript required.
     pub(crate) fn project_lite_with_flags_from_projection(
         &self,
-        session: AgentSession,
+        session: AgentSessionSummary,
         projection: &intent_store::SessionMessageProjection,
     ) -> AgentLite {
-        self.project_lite_with_flags_inner(session, |s| project_lite_from_projection(s, projection))
+        self.project_lite_with_flags_inner(session.into_read_only_session(), |s| {
+            project_lite_from_projection(s, projection)
+        })
     }
 
     /// The current effective `agentFeatures` values as the JSON snapshot
@@ -6142,7 +6247,7 @@ impl Services {
         if let Some(parent) = &parent_agent_id {
             let parent_depth = self
                 .store
-                .get_agent_session(parent)
+                .get_agent_session_summary(parent)
                 .await
                 .ok()
                 .and_then(|s| s.delegation_depth)
@@ -6284,8 +6389,9 @@ impl Services {
 
         // With neither caller choice supplied, honor the specialist's
         // provider before resolving its model/effort. Explicit model-only
-        // creates deliberately resolve on the settings default provider, as
-        // they do in delegate — which the plan then pins on the row, like
+        // creates deliberately resolve on the settings default provider (a
+        // sub-agent's on its creator's, below), as they do in delegate —
+        // which the plan then pins on the row, like
         // every other effective provider. Persist the effective pin so
         // spawn and previews use the same pair; reject unusable pins here,
         // before even workspace.create's workspace row can be written.
@@ -6307,6 +6413,21 @@ impl Services {
             })??
         } else {
             provider
+        };
+        // A sub-agent created without a provider (and without a specialist
+        // pin) inherits its creator's provider ahead of the settings default
+        // (intent-hq/intent#8479).
+        // A child placed on another machine keeps the existing resolution:
+        // this backend's install and sign-in say nothing about that machine.
+        let placed_remotely = placement
+            .as_ref()
+            .is_some_and(|p| !p.runs_on_backend().unwrap_or(true));
+        let provider = match (provider, &parent_agent_id) {
+            (None, Some(parent)) if !placed_remotely => {
+                self.inheritable_parent_provider(method, parent, model.as_deref())
+                    .await
+            }
+            (provider, _) => provider,
         };
 
         // Resolve the default model when none is explicitly supplied, via the
@@ -6994,7 +7115,15 @@ impl Services {
         // failing the idempotent delete. When the caller declares a
         // workspace, reject a cross-workspace bare-id probe by mapping to
         // `NotFound` before touching the store.
-        let session_observation = self.store.get_agent_session(&agent_id).await;
+        //
+        // Deliberately the full read, not the summary: delete runs once per
+        // agent, and repository_pending_delete_tests pin the metadata-error
+        // branch (legacy ack, claim never confirmed) to a failing full read
+        // while scheduling validates with the summary.
+        let session_observation = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await;
         let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
         let session_meta = session_observation
             .ok()
@@ -7044,6 +7173,49 @@ impl Services {
             .pause("agent-sql", &agent_id.0)
             .await;
         self.desktop_terminate_agent(&agent_id).await;
+        // A remote agent's script runs on its machine stop first: wait at
+        // most 10 s for the machine's acknowledgements, then go on anyway.
+        // Before the runtime stop below, which would end the scripts on the
+        // machine without a requested stop (a service would look crashed).
+        // Only a remote agent has machine runs; for any other agent this is
+        // an in-memory lookup that finds none and returns at once.
+        let deadline = tokio::time::Instant::now() + REMOTE_SCRIPT_STOP_WAIT;
+        let acked = self
+            .feature_runtime()
+            .end_agent_machine_runs(
+                self,
+                &agent_id,
+                deadline,
+                "remote-script-lost: the agent was deleted",
+            )
+            .await;
+        if !acked {
+            tracing::warn!(agent = %agent_id, "agent delete: the machine did not acknowledge every script stop");
+        }
+        // Then the remote agent's final stop is recorded, after its script
+        // stops and before the runtime stop below and before its session
+        // (and placement) rows go: the
+        // plain stop `stop_many` sends then joins the queued final stop
+        // instead of replacing it, and the machine's last push is still
+        // accepted after the rows are deleted.
+        self.feature_remote_launch_port()
+            .final_stop(
+                self,
+                std::slice::from_ref(&agent_id),
+                intent_core::remote_launch::FinalStopReason::AgentDeleted,
+            )
+            .await;
+        // Stop the agent's runtime before its rows go (intent-hq/intent#8426):
+        // a local provider tree is killed, a remote agent is stopped on its
+        // machine (freeing its capacity slot). The fence keeps a racing
+        // `agent.sendMessage` from respawning it until the row is deleted —
+        // the same pattern as the `workspace.delete` sweep.
+        let _teardown_fence = match (session_workspace_id.as_ref(), self.agent_manager()) {
+            (Some(_), Some(manager)) => {
+                Some(manager.stop_many(std::slice::from_ref(&agent_id)).await)
+            }
+            _ => None,
+        };
         #[cfg(all(test, unix))]
         self.pending_delete_test_gate
             .pause("agent-secret-window", &agent_id.0)
@@ -7171,7 +7343,8 @@ impl Services {
             .store
             .get_agent_session_summary(&agent_id)
             .await?
-            .workspace_id;
+            .workspace_id
+            .clone();
         if let Some(ws) = workspace_id.as_ref() {
             if session_ws != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -7215,7 +7388,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<bool> {
         let session_ws = match self.store.get_agent_session_summary(&agent_id).await {
-            Ok(summary) => summary.workspace_id,
+            Ok(summary) => summary.workspace_id.clone(),
             // Row already gone: the deletion committed (or the session never
             // existed) — nothing pending, the race-safe non-error outcome.
             Err(Error::NotFound(_)) => return Ok(false),
@@ -7250,7 +7423,7 @@ impl Services {
     /// session (§5.5 cascade interaction).
     pub(crate) async fn take_pending_agent_deletes(
         &self,
-        sessions: &[AgentSession],
+        sessions: &[AgentSessionSummary],
     ) -> Result<Vec<crate::delete_grace::PendingDeleteClaim>> {
         let mut claims = Vec::new();
         for session in sessions {
@@ -7304,7 +7477,7 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        if let Some(existing) = session.retired_at {
+        if let Some(existing) = session.retired_at.clone() {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
         // Guard: neither an agent (`ws.agent.retire`, including from its
@@ -7340,6 +7513,7 @@ impl Services {
                     .get_agent_session_summary(&session.id)
                     .await?
                     .retired_at
+                    .clone()
                 {
                     return Ok(
                         json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
@@ -7438,7 +7612,7 @@ impl Services {
     /// still traversed, so grandchildren under a deleted intermediary are
     /// found. Cycle-safe via a visited set (parent links cannot cycle in
     /// practice, but a corrupt row must not hang the retire).
-    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSession>> {
+    async fn collect_retire_descendants(&self, root: &AgentId) -> Result<Vec<AgentSessionSummary>> {
         let mut seen: HashSet<String> = HashSet::from([root.0.clone()]);
         let mut frontier = vec![root.clone()];
         let mut out = Vec::new();
@@ -7494,6 +7668,15 @@ impl Services {
             return Ok(None);
         }
         self.desktop_terminate_agent(&session.id).await;
+        // A remote agent stops on its machine, which pushes its work one
+        // last time and removes its checkout.
+        self.feature_remote_launch_port()
+            .final_stop(
+                self,
+                std::slice::from_ref(&session.id),
+                intent_core::remote_launch::FinalStopReason::AgentRetired,
+            )
+            .await;
         // A retired agent is inert: drop its secrets and pending requests (§5.56).
         self.secret_vault.clear_agent(&session.id);
         // The persisted mark closes new requests before teardown. A wire
@@ -7676,7 +7859,10 @@ impl Services {
         reason = "internal doc-hidden feature API, not a public library API"
     )]
     pub async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await?;
         self.project_session_for_wire(session).await
     }
 
@@ -7808,7 +7994,10 @@ impl Services {
                 "agent.update: remembering requires `specialist` in changes".into(),
             ));
         }
-        let mut session = self.store.get_agent_session(&agent_id).await?;
+        let mut session = self
+            .store
+            .get_agent_session_with_transcript(&agent_id)
+            .await?;
         let remember_specialist = remember_specialist && is_manual_foreground_agent(&session);
         let rename_placeholder = if remember_specialist
             && !session.name_explicitly_set
@@ -8180,7 +8369,10 @@ impl Services {
         if preference_only {
             // Return current activity and preference state, including any
             // genuine session update that raced the scoped preference write.
-            session = self.store.get_agent_session(&agent_id).await?;
+            session = self
+                .store
+                .get_agent_session_with_transcript(&agent_id)
+                .await?;
         }
         // The stored model changed, so any persisted display resolution now
         // names the wrong model — clear it, same anti-staleness contract as
@@ -8301,7 +8493,7 @@ impl Services {
         content: Value,
         metadata: Option<Value>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         // Own admission through transcript persistence, events and derived state.
         // Nested drain helpers reuse this permit even if deletion is queued.
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
@@ -8410,7 +8602,7 @@ impl Services {
             metadata: Option<Value>,
             created_at: String,
         }
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
@@ -8569,7 +8761,7 @@ impl Services {
         agent_id: &AgentId,
         message_id: &str,
     ) -> Result<usize> {
-        let session = self.store.get_agent_session(agent_id).await?;
+        let session = self.store.get_agent_session_summary(agent_id).await?;
         let messages = self.store.get_agent_messages(agent_id, None).await?;
         let idx = Self::find_edit_target(&messages, message_id)?;
         let keep = &messages[..idx];
@@ -8972,7 +9164,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         let owning_ws = match self.store.get_agent_session_summary(&agent_id).await {
-            Ok(session) => Some(session.workspace_id),
+            Ok(session) => Some(session.workspace_id.clone()),
             Err(e) if workspace_id.is_some() => return Err(e),
             Err(_) => None,
         };
@@ -9325,12 +9517,12 @@ impl Services {
         // editing: true → false ⇒ the message is now ready-to-send. Self-drain.
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
-                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                if let Ok(session) = self.store.get_agent_session_summary(&agent_id).await {
                     manager
                         .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
                         .await;
                     manager
-                        .try_drain_queue(agent_id, session.workspace_id)
+                        .try_drain_queue(agent_id, session.workspace_id.clone())
                         .await;
                 }
             }
@@ -9776,7 +9968,12 @@ impl Services {
                 // vanished between the up-front validation and the append
                 // (concurrent delete), fail closed like the guard rather than
                 // auto-queueing a phantom message for a gone agent.
-                if self.store.get_agent_session(&agent_id).await.is_err() {
+                if self
+                    .store
+                    .get_agent_session_summary(&agent_id)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
                     return Err(Error::InvalidParams(format!(
                         "unknown agent id: {}",
@@ -11031,6 +11228,7 @@ impl Services {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
         // The id is matched VERBATIM against the recorded pending entries —
         // recording preserves `applyToolCallId` / `preview.title` exactly as
@@ -11117,6 +11315,23 @@ impl Services {
         }
         let resolutions_json = serde_json::to_string(&resolutions)
             .map_err(|e| Error::Internal(format!("serialize proposal resolutions: {e}")))?;
+        // The created-workspace map follows the resolutions map: an applied
+        // create records (or replaces) its workspace, an applied resolution
+        // WITHOUT an id keeps any existing link — a client
+        // `agent.resolveProposal` retry after a partially failed
+        // origin-resolve wrote the link must not drop it — a dismissal drops
+        // the link, and entries whose resolution was evicted go with it.
+        let previous_created = session.proposal_created_workspaces();
+        let mut created_workspaces = previous_created.clone();
+        if outcome == PROPOSAL_OUTCOME_APPLIED {
+            if let Some(created) = created_workspace_id.as_ref() {
+                created_workspaces.insert(proposal_id.clone(), json!(created.as_str()));
+            }
+        } else {
+            created_workspaces.shift_remove(&proposal_id);
+        }
+        created_workspaces.retain(|id, _| resolutions.contains_key(id));
+        let created_changed = created_workspaces != previous_created;
         // Persist the resolution FIRST (it doubles as the durable idempotency
         // marker), then shrink the pending list. A failure between the two
         // writes leaves the entry pending WITH its outcome recorded: the RPC
@@ -11125,6 +11340,20 @@ impl Services {
         // both writes), so none can duplicate. The reverse order could
         // permanently lose the resolution: pending entry gone, no recorded
         // outcome, every retry NotFound.
+        if created_changed {
+            let created_json = serde_json::to_string(&created_workspaces).map_err(|e| {
+                Error::Internal(format!("serialize proposal created workspaces: {e}"))
+            })?;
+            self.store
+                .set_agent_session_metadata_key_json(
+                    &workspace_id,
+                    &agent_id,
+                    intent_core::PROPOSAL_CREATED_WORKSPACES_KEY,
+                    &created_json,
+                    &now_iso(),
+                )
+                .await?;
+        }
         self.store
             .set_agent_session_metadata_key_json(
                 &workspace_id,
@@ -11143,6 +11372,12 @@ impl Services {
                 &now_iso(),
             )
             .await?;
+        // Always carry the CURRENT created-workspace map (empty when
+        // cleared), not only when this invocation wrote it: a retry after a
+        // partial failure reads the already-persisted map, so the first
+        // successful event would otherwise omit the link and hydrated
+        // clients that consume these fields directly (skipping `agent.get`)
+        // would show the card applied without its workspace link.
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -11151,6 +11386,7 @@ impl Services {
                 "agentId": agent_id.0,
                 "pendingProposals": remaining,
                 "proposalResolutions": resolutions,
+                "proposalCreatedWorkspaces": Value::Object(created_workspaces),
             }),
         )
         .await;
@@ -11296,7 +11532,7 @@ impl Services {
             source_workspace_id: session.workspace_id.clone(),
         });
         Ok(Some(CreateProposalOrigin::Resolve {
-            source_workspace: session.workspace_id,
+            source_workspace: session.workspace_id.clone(),
             agent: agent_id,
             proposal: proposal_id,
             key_bound: bound_key.is_some(),
@@ -11360,6 +11596,7 @@ impl Services {
                 proposal_id.clone(),
                 PROPOSAL_OUTCOME_APPLIED.to_string(),
                 Some(detail),
+                Some(created.clone()),
             )
             .await
         {
@@ -11492,7 +11729,9 @@ impl Services {
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
     pub(crate) async fn agent_summary_op(&self, agent_id: AgentId) -> Result<Value> {
-        let session = self.load_session_internal(&agent_id).await?;
+        let session = self
+            .load_session_with_transcript_internal(&agent_id)
+            .await?;
         let last_response = last_assistant_text(&session.messages);
         let tool_counts = tool_call_counts(&session.messages);
         let mut out = json!({
@@ -11522,7 +11761,10 @@ impl Services {
         session_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&session_id).await?;
+        let session = self
+            .store
+            .get_agent_session_with_transcript(&session_id)
+            .await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
@@ -11749,9 +11991,9 @@ impl Services {
                 // cannot be resolved (matches the pre-lift behavior).
                 let parent_home_ws = self
                     .store
-                    .get_agent_session(&parent)
+                    .get_agent_session_summary(&parent)
                     .await
-                    .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                    .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
                 // Deliver the wake to the parent unconditionally (even if no
                 // watch exists).
                 if let Err(e) = self
@@ -12231,9 +12473,9 @@ impl Services {
         if let Some(parent) = &parent {
             let parent_home_ws = self
                 .store
-                .get_agent_session(parent)
+                .get_agent_session_summary(parent)
                 .await
-                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
             let wake_text = crate::harness::latest().attention_parent_wake(
                 &session.name,
                 &caller.0,
@@ -12697,7 +12939,7 @@ impl Services {
         // `delegationDepth` (parent depth + 1; P3-1.2b), the depth-limit guard
         // below, and the completion-watch registration.
         let parent_session = match &parent_agent_id {
-            Some(parent) => self.store.get_agent_session(parent).await.ok(),
+            Some(parent) => self.store.get_agent_session_summary(parent).await.ok(),
             None => None,
         };
         let _parent_mutation = parent_session
@@ -12796,6 +13038,19 @@ impl Services {
         // provider guard, default-model and effort resolution — re-reads the
         // specialist tier directories, so it runs on the blocking pool
         // (monorepo#4148).
+        // A child the caller did not pin inherits the delegating agent's own
+        // provider (intent-hq/intent#8479), ahead of `model.defaultProvider`:
+        // a coordinator the user put on one provider must not hand its work
+        // to another one the user may not even be signed in to.
+        // A placed child's provider runs on its machine, so this backend's
+        // install and sign-in say nothing about it: keep the old resolution.
+        let inherited_provider = match (&parent_agent_id, input.provider.as_deref()) {
+            (Some(parent), None) if !placed => {
+                self.inheritable_parent_provider("agent.delegate", parent, input.model.as_deref())
+                    .await
+            }
+            _ => None,
+        };
         let services = self.clone();
         let specialist_param = input.specialist.clone();
         let provider_param_in = input.provider.clone();
@@ -12827,9 +13082,12 @@ impl Services {
                         &services,
                         specialist_param.as_deref(),
                         ws_path.as_deref(),
+                        inherited_provider.as_deref(),
                     )?
                 } else {
-                    None
+                    // An explicit model keeps the parent's provider only when
+                    // that provider can run it (checked by the inheritance).
+                    inherited_provider
                 };
                 // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
                 // effort > specialist frontmatter > unset, validated against the
@@ -13048,7 +13306,7 @@ impl Services {
                 let parent_home_ws = parent_session
                     .as_ref()
                     .map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
-                let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
+                let parent_name = parent_session.map(|s| s.name.clone()).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
                 // The scope gate already ran up front (before child creation),
                 // so `register_completion_watch`'s re-check cannot reject here
@@ -13169,7 +13427,7 @@ impl Services {
                 self.scan_assigned_agents(&task.assigned_agent_ids)
                     .await?
                     .live_session
-                    .map(|s| (s.id.0, s.name))
+                    .map(|s| (s.id.0.clone(), s.name.clone()))
             };
             titles.insert(note.id.0.clone(), note.title.clone());
             snaps.insert(
@@ -13395,7 +13653,7 @@ impl Services {
         // rejection is one clear error before any child is created, not N
         // identical per-task failures.
         if let Some(parent) = &parent_agent_id {
-            let parent_session = self.store.get_agent_session(parent).await.ok();
+            let parent_session = self.store.get_agent_session_summary(parent).await.ok();
             let parent_depth = parent_session
                 .as_ref()
                 .and_then(|s| s.delegation_depth)
@@ -13676,9 +13934,9 @@ impl Services {
                     if !self.has_open_delegation_group(parent) {
                         let parent_home_ws = self
                             .store
-                            .get_agent_session(parent)
+                            .get_agent_session_summary(parent)
                             .await
-                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id.clone());
                         let advisory = format!(
                             "Advisory: your batch agent.delegate (waitMode: \"after_all\") started ZERO tasks — {breakdown}. No delegation group was formed, so NO settlement wake will ever arrive from that call. Re-call agent.delegate once the holds clear, or delegate a held task individually to force it."
                         );
@@ -13808,7 +14066,11 @@ impl Services {
         base_commit_sha: String,
         snapshot_commit_sha: Option<String>,
     ) {
-        let session = match self.store.get_agent_session(agent_id).await {
+        let session = match self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!(
@@ -13918,7 +14180,11 @@ impl Services {
         // never fires, leaving the parent in a phantom "waiting" state
         // (mirrors the SUB-1 sender-watch guard below).
         let child_session = self.require_agent_session(&child_agent_id).await?;
-        let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
+        let parent_session = self
+            .store
+            .get_agent_session_summary(&parent_agent_id)
+            .await
+            .ok();
         let parent_deleted = parent_session
             .as_ref()
             .is_some_and(|s| s.status == AgentStatus::Deleted);
@@ -13983,9 +14249,13 @@ impl Services {
         // registration — a caller→target watch on an id that does not exist
         // never fires, leaving the sender in a phantom "waiting" state.
         let target_session = self.require_agent_session(&target_agent_id).await?;
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         let skip = caller_session
-            .as_ref()
+            .as_deref()
             .is_some_and(is_delegated_background_task_session);
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
@@ -14279,7 +14549,11 @@ impl Services {
                 target_agent_id.0
             )));
         }
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the caller's HOME workspace (falls back to the
         // call's workspace when the session lookup failed), mirroring
@@ -14643,7 +14917,11 @@ impl Services {
         // mirroring `agent_watch_completion_op`: fall back to the call's
         // workspace when the session lookup fails; a deleted caller can never
         // receive a wake, so registering for it is refused.
-        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_session = self
+            .store
+            .get_agent_session_summary(&caller_agent_id)
+            .await
+            .ok();
         if caller_session
             .as_ref()
             .is_some_and(|s| s.status == AgentStatus::Deleted)
@@ -14668,7 +14946,7 @@ impl Services {
             // store failures propagate unchanged.
             let session = self
                 .store
-                .get_agent_session(&target)
+                .get_agent_session_summary(&target)
                 .await
                 .map_err(|e| match e {
                     Error::NotFound(_) => {
@@ -14708,7 +14986,7 @@ impl Services {
                     target.0
                 )));
             }
-            resolved.push((target, session.name, session.workspace_id));
+            resolved.push((target, session.name.clone(), session.workspace_id.clone()));
         }
         let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
             .iter()
@@ -14878,7 +15156,7 @@ impl Services {
 
         // Batched status projection (intent-hq/monorepo#3018): one `IN`-list
         // query for every present agent's status, instead of a per-agent
-        // `get_agent_session` loop that hydrated each agent's full message
+        // `get_agent_session_with_transcript` loop that hydrated each agent's full message
         // log just to read `status` — that made the dispatch duration scale
         // with the watched agents' transcript sizes (the monorepo#958
         // incident shape) and its statement count with the watch fan-out.
@@ -15381,7 +15659,7 @@ impl Services {
         }
 
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
-        let session_by_id: std::collections::HashMap<String, &AgentSession> =
+        let session_by_id: std::collections::HashMap<String, &AgentSessionSummary> =
             sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
 
         let mut matching: HashSet<String> = HashSet::new();
@@ -16202,7 +16480,7 @@ impl Services {
         let mut scan = AssignedAgentScan::default();
         for candidate in assigned.iter().rev().cloned() {
             if scan.live_session.is_some() {
-                match self.store.get_agent_session(&candidate).await {
+                match self.store.get_agent_session_summary(&candidate).await {
                     // Retired sessions are never GC'd (the poisoned path
                     // hard-deletes) — leave them untouched here.
                     Ok(session)
@@ -16218,7 +16496,7 @@ impl Services {
                 }
                 continue;
             }
-            match self.store.get_agent_session(&candidate).await {
+            match self.store.get_agent_session_summary(&candidate).await {
                 // Soft-retired: inert — never resumable and never GC'd (the
                 // poisoned path below hard-deletes, which must not touch a
                 // retired session). Treated like a stale assignment (cleaned
@@ -16304,7 +16582,7 @@ impl Services {
         // decision cannot drift between two lookups and a pass here
         // guarantees the later shared gate cannot reject.
         let caller_session = match input.caller_agent_id.as_ref() {
-            Some(caller) => self.store.get_agent_session(caller).await.ok(),
+            Some(caller) => self.store.get_agent_session_summary(caller).await.ok(),
             None => None,
         };
         // monorepo#994: a Deleted caller can never receive the wake (the
@@ -16466,7 +16744,7 @@ impl Services {
                 // so a chief caller's wake lands in `__chief__`. `resolved_home`
                 // is Some only when read from a real session row: the reuse
                 // path uses it to correct a fallback-registered anchor.
-                let resolved_home = caller_session.map(|s| s.workspace_id);
+                let resolved_home = caller_session.map(|s| s.workspace_id.clone());
                 let caller_home_ws = resolved_home
                     .clone()
                     .unwrap_or_else(|| workspace_id.clone());
@@ -16785,7 +17063,7 @@ impl Services {
             // back to the call's workspace when the session lookup fails)
             // so a chief caller's wake lands in `__chief__`.
             let caller_home_ws =
-                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id);
+                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
             let subscription_id = self.register_completion_watch(
                 &caller_home_ws,
                 &workspace_id,
@@ -16822,7 +17100,7 @@ impl Services {
         let Some(caller) = input.caller_agent_id.as_ref() else {
             return Ok(None);
         };
-        match self.store.get_agent_session(caller).await {
+        match self.store.get_agent_session_summary(caller).await {
             Ok(session) => Ok(Some(
                 session
                     .metadata
@@ -17396,16 +17674,31 @@ impl Services {
         Ok(updated)
     }
 
-    /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS
-    /// peers surface a generic failure (rename/setModel/summary).
+    /// Load a session's full row WITHOUT its transcript (`messages` stays
+    /// empty), mapping `NotFound` to `-32603` for the methods whose TS peers
+    /// surface a generic failure (rename/setModel/reportToParent/attention).
+    /// These callers write the row back, so they need every column
+    /// (`system_prompt` included) but never the message log.
     async fn load_session_internal(&self, agent_id: &AgentId) -> Result<AgentSession> {
-        match self.store.get_agent_session(agent_id).await {
-            Ok(s) => Ok(s),
-            Err(Error::NotFound(_)) => {
-                Err(Error::Internal(format!("Agent \"{agent_id}\" not found")))
-            }
-            Err(e) => Err(e),
-        }
+        map_internal_not_found(
+            agent_id,
+            self.store
+                .get_agent_session_without_messages(agent_id)
+                .await,
+        )
+    }
+
+    /// [`Self::load_session_internal`] with the full message log, for
+    /// `agent.summary`, which derives its counts and last response from the
+    /// transcript.
+    async fn load_session_with_transcript_internal(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<AgentSession> {
+        map_internal_not_found(
+            agent_id,
+            self.store.get_agent_session_with_transcript(agent_id).await,
+        )
     }
 
     /// Push a message onto an agent's in-memory queue and return it together with
@@ -18224,11 +18517,11 @@ impl Services {
         let Some(manager) = self.agent_manager() else {
             return;
         };
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         manager
-            .try_drain_queue(agent_id.clone(), session.workspace_id)
+            .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
             .await;
     }
 
@@ -19568,8 +19861,8 @@ impl Services {
     /// lookup / write-through awaits would let this publisher emit a queue
     /// older than a mutation that completed while it was suspended.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
-        let workspace_id = match self.store.get_agent_session(agent_id).await {
-            Ok(s) => s.workspace_id,
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(s) => s.workspace_id.clone(),
             Err(_) => return,
         };
         self.publish_queue_updated_for(agent_id, &workspace_id)
@@ -19578,7 +19871,7 @@ impl Services {
 
     /// Like [`publish_queue_updated`] but takes the workspace id directly —
     /// used by call sites (the turn worker, `edit_and_regenerate`) that already
-    /// hold it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    /// hold it, avoiding a redundant `get_agent_session_with_transcript` round-trip per drain step.
     ///
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the
@@ -19828,7 +20121,7 @@ impl Services {
         if &target.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {target_id}")));
         }
-        match self.store.get_agent_session(poisoned_id).await {
+        match self.store.get_agent_session_summary(poisoned_id).await {
             Ok(poisoned) => {
                 if &poisoned.workspace_id != workspace_id {
                     return Err(Error::NotFound(format!("agent session {poisoned_id}")));
@@ -20528,6 +20821,76 @@ impl Drop for StartupResumeCandidates {
 }
 
 impl Services {
+    /// Why an unattended resume (the startup sweep, including the forced
+    /// sweep after an update restart, and the wake sweep) must leave
+    /// `agent_id` pending instead of re-running it: its provider is disabled
+    /// in `providers.enabled`, or its sign-in probe reports signed out.
+    /// Re-running such an agent can only fail again, and the failure wakes
+    /// its parent with a stale alert about work it may already have replaced
+    /// (intent-hq/intent#8478). The probe runs when no fresh verdict is
+    /// cached, because the cache is empty right after a restart.
+    ///
+    /// `None` lets the resume proceed: an unknown sign-in, a remote agent
+    /// (its provider runs on another machine), an unresolvable provider and
+    /// a failed session read all stay permissive. A manual resume never
+    /// consults this; it runs and surfaces the provider error to the user.
+    pub(crate) async fn unattended_resume_hold(&self, agent_id: &AgentId) -> Option<String> {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        let settings = self.effective_settings();
+        let saved = session
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let provider = match saved {
+            Some(saved) => crate::agent_session::resolve_provider_id(
+                Some(saved),
+                crate::agent_session::derived_default_provider(&settings).as_deref(),
+            )?,
+            // A legacy row (NULL provider) resumes on the provider
+            // `pin_legacy_session_provider` repairs it onto at spawn: its
+            // last committed turn's, else today's default. Check that one,
+            // not today's default alone; a failed read stays permissive.
+            None => {
+                crate::agent_session::legacy_session_provider(self, &session.workspace_id, agent_id)
+                    .await
+                    .ok()
+                    .flatten()?
+            }
+        };
+        if provider_is_disabled(&provider, settings.providers.enabled.as_ref()) {
+            let display = intent_providers::provider_config(&provider).display_name;
+            return Some(format!(
+                "provider \"{provider}\" ({display}) is not enabled"
+            ));
+        }
+        if self.unattended_resume_sign_in(&provider).await == Some(false) {
+            return Some(crate::provider_auth::not_authenticated_message(&provider));
+        }
+        None
+    }
+
+    /// The sign-in verdict [`Self::unattended_resume_hold`] acts on: a live
+    /// probe in the daemon (the cache is empty right after a restart).
+    /// Unit tests read only the cache, which they seed, so a resume test
+    /// never depends on which provider CLIs the host has installed or
+    /// signed in, and never waits on a probe timeout.
+    async fn unattended_resume_sign_in(&self, provider: &str) -> Option<bool> {
+        #[cfg(test)]
+        {
+            self.selection_auth_verdict(provider).await.ok().flatten()
+        }
+        #[cfg(not(test))]
+        {
+            self.probe_selection_sign_in(provider).await
+        }
+    }
+
     /// Resume one reserved startup candidate, then expose and notify failures.
     /// The notification invalidates the recovery list; it does not declare a
     /// terminal agent failure or drive completion watches.
@@ -20539,7 +20902,16 @@ impl Services {
         candidates: &StartupResumeCandidates,
         agent_id: &AgentId,
     ) -> Result<()> {
-        let result = self.resume_interrupted_agent(agent_id).await;
+        // A held agent goes through the same release + notify path as a failed
+        // resume: the reservation hid its row from `agent.listInterrupted`, and
+        // the `startupRecoveryFailed` update is what makes a window that listed
+        // during the sweep show it again for manual resume.
+        let result = match self.unattended_resume_hold(agent_id).await {
+            Some(reason) => Err(Error::InvalidParams(format!(
+                "left pending for manual resume: {reason}"
+            ))),
+            None => self.resume_interrupted_agent(agent_id).await,
+        };
         candidates.finished(agent_id);
         if result.is_err() {
             // Use the durable pending row's workspace, never a caller-supplied
@@ -20647,7 +21019,7 @@ impl Services {
             // Guard: `session/load` needs a persisted acpSessionId; without one
             // the provider cannot reload, so leave the row pending for manual
             // retry rather than re-running the whole turn unattended.
-            match self.store.get_agent_session(&agent_id).await {
+            match self.store.get_agent_session_summary(&agent_id).await {
                 Ok(session) if session.acp_session_id.is_none() => {
                     tracing::info!(
                         agent_id = %agent_id,
@@ -20664,6 +21036,14 @@ impl Services {
                     );
                     continue;
                 }
+            }
+            if let Some(reason) = self.unattended_resume_hold(&agent_id).await {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    reason,
+                    "wake-resume: provider cannot run; leaving pending for manual retry"
+                );
+                continue;
             }
             match self.resume_interrupted_agent(&agent_id).await {
                 Ok(()) => {
@@ -20783,8 +21163,9 @@ impl Services {
             );
         }
 
-        // Load the session to check for delegation metadata
-        let session = match self.store.get_agent_session(agent_id).await {
+        // Load the session with its transcript: delegation metadata, plus the
+        // tail that decides the duplicate-marker skip and the resume recap.
+        let session = match self.store.get_agent_session_with_transcript(agent_id).await {
             Ok(s) => s,
             Err(e) => {
                 reset_to_pending().await;
@@ -20807,12 +21188,12 @@ impl Services {
                 // (and any group) is anchored in the parent's HOME workspace;
                 // fall back to the child's workspace when the parent session
                 // cannot be loaded (matches the pre-lift behavior).
-                let parent_session = self.store.get_agent_session(&parent).await.ok();
+                let parent_session = self.store.get_agent_session_summary(&parent).await.ok();
                 let parent_name = parent_session
                     .as_ref()
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
-                let resolved_home = parent_session.map(|s| s.workspace_id);
+                let resolved_home = parent_session.map(|s| s.workspace_id.clone());
                 let parent_home_ws = resolved_home
                     .clone()
                     .unwrap_or_else(|| workspace_id.clone());
@@ -21101,13 +21482,13 @@ impl Services {
         let _ = self.rehydrate_delegation_groups(&workspace_id).await;
 
         // Load the session to check for delegation group membership
-        let session = self.store.get_agent_session(agent_id).await.ok();
+        let session = self.store.get_agent_session_summary(agent_id).await.ok();
         if let Some(session) = &session {
             if let Some(parent_id) = &session.parent_agent_id {
                 // A cross-workspace (chief) parent's group is persisted under
                 // the parent's home workspace — rehydrate it too so this
                 // abandoned child is recorded there (idempotent, best-effort).
-                if let Ok(parent_session) = self.store.get_agent_session(parent_id).await {
+                if let Ok(parent_session) = self.store.get_agent_session_summary(parent_id).await {
                     if parent_session.workspace_id != workspace_id {
                         let _ = self
                             .rehydrate_delegation_groups(&parent_session.workspace_id)

@@ -850,13 +850,16 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
     let propose_marker = "PROPOSE_THEN_APPLY_E2E_T1";
     let apply_marker = "APPLY_PROPOSAL_E2E_T2";
-    let proposal_id = "Create workspace: Applied follow-up";
+    // The agent applies by the card title: follow-up cards carry a unique
+    // `applyToolCallId`, and applyProposal still resolves one pending card by
+    // its `preview.title`.
+    let proposal_title = "Create workspace: Applied follow-up";
     let proposal_code = r#"return await ws.workspace.proposeSibling({
         title: "Applied follow-up",
         initialPrompt: "Implement the applied follow-up end to end."
     });"#;
     let apply_code = format!(
-        "return await ws.workspace.applyProposal({proposal_id:?}, {{ userRequested: true }});"
+        "return await ws.workspace.applyProposal({proposal_title:?}, {{ userRequested: true }});"
     );
     let behavior = json!({
         "rules": [{
@@ -955,6 +958,14 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     let end_data = await_stream_end(&mut sub, &agent_id).await;
     let propose_message_id = end_data["messageId"].as_str().expect("turn messageId");
     let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    let proposal_id = lite["agent"]["metadata"]["pendingProposals"][0]["proposalId"]
+        .as_str()
+        .expect("pending proposal id")
+        .to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "follow-up cards carry a unique id: {proposal_id}"
+    );
     assert_eq!(
         lite["agent"]["metadata"]["pendingProposals"],
         json!([{ "proposalId": proposal_id, "messageId": propose_message_id }]),
@@ -1083,7 +1094,7 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     assert_eq!(update["pendingProposals"], json!([]), "{update}");
     assert_eq!(
         update["proposalResolutions"],
-        json!({ proposal_id: "applied" }),
+        json!({ proposal_id.as_str(): "applied" }),
         "{update}"
     );
     let lite = wss_rpc(&mut rpc, 17, "agent.get", json!({ "agentId": agent_id })).await;
@@ -1094,8 +1105,13 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     );
     assert_eq!(
         lite["agent"]["metadata"]["proposalResolutions"],
-        json!({ proposal_id: "applied" }),
+        json!({ proposal_id.as_str(): "applied" }),
         "resolution served on agent.get: {lite}"
+    );
+    assert_eq!(
+        lite["agent"]["metadata"]["proposalCreatedWorkspaces"],
+        json!({ proposal_id.as_str(): created_ws_id }),
+        "the applied card links its created workspace: {lite}"
     );
 }
 
@@ -1239,13 +1255,21 @@ async fn pending_proposals_projection_over_wss() {
     let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
 
     // 1. The live event carried the list: one entry, identity from the
-    //    proposal's `preview.title` (no applyToolCallId on workspace-create
-    //    proposals), messageId naming this turn's persisted assistant row.
+    //    proposal's unique `applyToolCallId`, messageId naming this turn's
+    //    persisted assistant row.
     let update = pending_update.expect("agent:updated with pendingProposals was emitted");
+    let proposal_id = update["pendingProposals"][0]["proposalId"]
+        .as_str()
+        .expect("pending proposal id")
+        .to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "follow-up cards carry a unique id: {proposal_id}"
+    );
     assert_eq!(
         update["pendingProposals"],
         json!([{
-            "proposalId": "Create workspace: Pending projection",
+            "proposalId": proposal_id,
             "messageId": turn_message_id,
         }]),
         "live event payload: {update}"
@@ -1281,8 +1305,12 @@ async fn pending_proposals_projection_over_wss() {
     let proposal: Value =
         serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
     assert_eq!(
-        proposal["preview"]["title"], "Create workspace: Pending projection",
+        proposal["applyToolCallId"], proposal_id,
         "recovered proposal identity matches the pending entry"
+    );
+    assert_eq!(
+        proposal["preview"]["title"],
+        "Create workspace: Pending projection"
     );
 
     // 4. `agent.resolveProposal` (dismissed): the response envelope carries
@@ -1290,7 +1318,6 @@ async fn pending_proposals_projection_over_wss() {
     //    the resolution persists (event + `agent.get` projection), and the
     //    dismissal notice reaches the model as a system-origin user row
     //    carrying the `proposal_resolved` messageMetadata.
-    let proposal_id = "Create workspace: Pending projection";
     let resolved = wss_rpc(
         &mut rpc,
         14,
@@ -1322,7 +1349,7 @@ async fn pending_proposals_projection_over_wss() {
     assert_eq!(resolve_update["pendingProposals"], json!([]));
     assert_eq!(
         resolve_update["proposalResolutions"],
-        json!({ proposal_id: "dismissed" })
+        json!({ proposal_id.as_str(): "dismissed" })
     );
 
     // Idempotent re-resolution over the wire: success echoing the persisted
@@ -1361,7 +1388,7 @@ async fn pending_proposals_projection_over_wss() {
     );
     assert_eq!(
         lite["agent"]["metadata"]["proposalResolutions"],
-        json!({ proposal_id: "dismissed" }),
+        json!({ proposal_id.as_str(): "dismissed" }),
         "resolution served on agent.get: {lite}"
     );
     let conversation = wss_rpc(
@@ -1379,7 +1406,7 @@ async fn pending_proposals_projection_over_wss() {
             m["role"] == "user"
                 && m["metadata"]["type"] == "proposal_resolved"
                 && m["metadata"]["outcome"] == "dismissed"
-                && m["metadata"]["proposalId"] == proposal_id
+                && m["metadata"]["proposalId"] == proposal_id.as_str()
         })
         .unwrap_or_else(|| panic!("dismissal notice persisted: {conversation:#}"))
         .clone();
@@ -1546,8 +1573,15 @@ async fn workspace_create_with_proposal_origin_resolves_over_wss() {
         .unwrap_or_else(|| panic!("proposal resource on the carrier: {carrier:#}"));
     let proposal: Value =
         serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
-    let proposal_id = proposal["preview"]["title"].as_str().unwrap().to_string();
-    assert_eq!(proposal_id, "Create workspace: Origin follow-up");
+    let proposal_id = proposal["applyToolCallId"].as_str().unwrap().to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "{proposal_id}"
+    );
+    assert_eq!(
+        proposal["preview"]["title"],
+        "Create workspace: Origin follow-up"
+    );
 
     // Card Apply: the proposal's create params plus `origin`.
     let mut params = proposal["payload"]["params"].clone();
@@ -1634,7 +1668,7 @@ async fn workspace_create_with_proposal_origin_resolves_over_wss() {
     assert_eq!(
         notices,
         vec![format!(
-            "User applied the proposal '{proposal_id}'. Created workspace {created_ws_id}."
+            "User applied the proposal 'Create workspace: Origin follow-up'. Created workspace {created_ws_id}."
         )],
         "exactly one applied notice: {conversation:#}"
     );

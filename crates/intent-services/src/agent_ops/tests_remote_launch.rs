@@ -25,6 +25,9 @@ struct FakeRemote {
     launched: Mutex<Vec<RemoteLaunchRequest>>,
     needs: Mutex<Vec<RemoteLaunchNeeds>>,
     fail_launch: bool,
+    /// Each final stop recorded, and whether the agent's script-stop wait
+    /// (`end_agent_machine_runs`) had already run then.
+    final_stops: Mutex<Vec<(AgentId, bool)>>,
 }
 
 fn view(placement: &AgentPlacement) -> RemotePlacementView {
@@ -42,6 +45,24 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
 }
 
 impl RemoteLaunchPort for FakeRemote {
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        _reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        let scripts_stopped = crate::test_support::fake_runtime::FakeRuntime::of(svc)
+            .calls()
+            .contains(&"end_agent_machine_runs");
+        for agent in agent_ids {
+            self.final_stops
+                .lock()
+                .unwrap()
+                .push((agent.clone(), scripts_stopped));
+        }
+        Box::pin(async {})
+    }
+
     fn placements<'a>(
         &'a self,
         _svc: &'a Services,
@@ -246,7 +267,11 @@ async fn a_local_create_carries_no_placement_even_if_the_caller_forges_one() {
     assert!(created.get("notice").is_none());
     assert!(remote.launched.lock().unwrap().is_empty());
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_none());
 }
 
@@ -488,7 +513,11 @@ async fn a_placed_create_keeps_its_placement_with_non_object_metadata() {
             "{metadata}: {created}"
         );
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-        let session = svc.store.get_agent_session(&id).await.unwrap();
+        let session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_some());
         assert_eq!(
             session.metadata.unwrap()["priorNonObjectMetadata"],
@@ -532,6 +561,7 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
             state: intent_core::machines::RemoteMachineState::Disconnected,
             added_at: intent_core::now_iso(),
             last_connected_at: None,
+            node_protocol: None,
         })
         .await
         .unwrap();
@@ -677,7 +707,11 @@ async fn a_remote_agent_switches_to_a_model_its_machine_offers() {
     svc.agent_set_model_op(id.clone(), "opus4.5".into(), None)
         .await
         .expect("a model the machine lists is accepted");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("opus4.5"));
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
@@ -713,7 +747,11 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
         assert_eq!(machines.len(), 1, "{data}");
         assert_eq!(machines[0]["nodeId"], "node-1");
     }
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
@@ -746,7 +784,11 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
         .agent_set_model_op(id.clone(), "gpt-5".into(), Some(folder.clone()))
         .await;
     assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 
     let api_key = daemon_profile(
@@ -759,7 +801,11 @@ async fn a_remote_agent_switches_only_to_a_remote_compatible_profile() {
     svc.agent_set_model_op(id.clone(), "gpt-5".into(), Some(api_key.clone()))
         .await
         .expect("an API-key profile the machine's provider can run is accepted");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.provider.as_deref(), Some(api_key.as_str()));
     assert_eq!(session.model.as_deref(), Some("gpt-5"));
 }
@@ -778,7 +824,11 @@ async fn a_remote_agent_on_a_removed_machine_cannot_switch() {
         panic!("expected placement-unavailable, got {result:?}");
     };
     assert_eq!(failure.data()["reason"], "machine-unknown");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
 }
 
@@ -906,4 +956,28 @@ async fn a_failed_parent_read_fails_the_sub_agent_instead_of_running_it_locally(
 
     assert_eq!(remote.launched.lock().unwrap().len(), launched);
     assert_eq!(count().await, before, "nothing was created");
+}
+
+/// Docs K (lease end): `agent.delete` records a remote agent's final stop
+/// only after the bounded wait for its machine runs' script stops, so the
+/// machine never ends a script without a requested stop first.
+#[tokio::test]
+async fn deleting_a_remote_agent_records_its_final_stop_after_the_script_stop_wait() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = crate::test_support::fake_runtime::FakeRuntime::install(svc)
+        .with_remote_launch_port(remote.clone());
+    create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = remote.launched.lock().unwrap()[0].agent_id.clone();
+    svc.agent_delete_op(id.clone(), Some(ws)).await.unwrap();
+    assert_eq!(*remote.final_stops.lock().unwrap(), vec![(id, true)]);
 }

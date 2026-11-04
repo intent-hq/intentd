@@ -526,7 +526,7 @@ pub(crate) struct DeferredAttention {
 struct WorkspaceAggregateSnapshot {
     max_note_updated_at: HashMap<WorkspaceId, String>,
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
-    sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
+    sessions: Option<HashMap<WorkspaceId, Vec<intent_store::AgentSessionSummary>>>,
     unread: Option<HashSet<WorkspaceId>>,
     /// Workspaces owning an active hook or script monitor (one UNION read).
     active_hooks_or_script_monitors: HashSet<WorkspaceId>,
@@ -2641,7 +2641,7 @@ impl Services {
     /// is added to the outbound provider prompt only and never persisted.
     pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
         // Runs on every turn: the metadata-only lookup skips the transcript
-        // load and payload hydration `get_agent_session` performs.
+        // load and payload hydration `get_agent_session_with_transcript` performs.
         let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let specialist_id = session.specialist.as_deref()?;
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
@@ -3775,7 +3775,7 @@ impl Services {
             ),
         }
 
-        let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
+        let sessions_by_agent: HashMap<&AgentId, &intent_store::AgentSessionSummary> = sessions
             .iter()
             .flat_map(|by_workspace| by_workspace.values().flatten())
             .map(|session| (&session.id, session))
@@ -7478,7 +7478,7 @@ impl Services {
         // suppress completion propagation and bounce the agent. On blocked or
         // retry-exhausted, propagate with merge-pending status.
         if event.event_type == AGENT_IDLE {
-            if let Ok(session) = self.store.get_agent_session(&child).await {
+            if let Ok(session) = self.store.get_agent_session_without_messages(&child).await {
                 if session.sandbox_path.is_some() {
                     let should_propagate = self
                         .handle_sandbox_merge_on_completion(&event.workspace_id, &child, &session)
@@ -8336,10 +8336,10 @@ impl Services {
             let completion_reported = !self.has_stale_report_interim_skip(child_id)
                 && self
                     .store
-                    .get_agent_session(child_id)
+                    .get_agent_session_summary(child_id)
                     .await
                     .ok()
-                    .and_then(|s| s.completion_report)
+                    .and_then(|s| s.completion_report.clone())
                     .is_some_and(|r| !r.is_empty());
             if !completion_reported {
                 if let Some(gid) = self.seal_group_for_parent(child_id).await {
@@ -8356,7 +8356,7 @@ impl Services {
         if !self.take_interim_skipped_idle(child_id) {
             return;
         }
-        let session = match self.store.get_agent_session(child_id).await {
+        let session = match self.store.get_agent_session_summary(child_id).await {
             Ok(session) => session,
             Err(e) => {
                 tracing::warn!(
@@ -8396,7 +8396,7 @@ impl Services {
         // WHICH terminal transition settled it (a dispatch/expiry wake runs
         // an owner turn that clears the report; an external cancel does not).
         if !had_stale_report {
-            if let Some(report) = session.completion_report {
+            if let Some(report) = session.completion_report.clone() {
                 data["completionReport"] = serde_json::Value::String(report.clone());
                 data["report"] = serde_json::Value::String(report);
             }
@@ -8422,7 +8422,7 @@ impl Services {
             .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
-            workspace_id: session.workspace_id,
+            workspace_id: session.workspace_id.clone(),
             timestamp: now_iso(),
             event_type: AGENT_IDLE.to_string(),
             actor: intent_core::EventActor {
@@ -9203,7 +9203,7 @@ impl Services {
                 .get_agent_session_summary(child_id)
                 .await
                 .ok()
-                .and_then(|s| s.parent_agent_id)
+                .and_then(|s| s.parent_agent_id.clone())
         };
         // monorepo#1016: best-effort stall detection — an agent:idle with no
         // completion report while the child's assigned task note is still
@@ -9289,11 +9289,11 @@ impl Services {
                     } else {
                         None
                     };
-                    let trigger = match s.task_note_id {
-                        Some(n) => vec![(s.workspace_id.0, n.0)],
+                    let trigger = match s.task_note_id.clone() {
+                        Some(n) => vec![(s.workspace_id.0.clone(), n.0)],
                         None => Vec::new(),
                     };
-                    (trigger, identity, s.completion_report_timestamp)
+                    (trigger, identity, s.completion_report_timestamp.clone())
                 }
                 Err(_) => (Vec::new(), None, None),
             }
@@ -9336,7 +9336,9 @@ impl Services {
                                 .to_string();
                                 let persisted = s.stop_reason.as_deref();
                                 if persisted == Some(err) || persisted == Some(wrapped.as_str()) {
-                                    s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                                    s.stop_reason_timestamp
+                                        .clone()
+                                        .map(|ts| format!("failed:{ts}"))
                                 } else {
                                     None
                                 }
@@ -9483,7 +9485,7 @@ impl Services {
                         }
                     }
                 }
-                let report = child_session.and_then(|s| s.completion_report);
+                let report = child_session.and_then(|s| s.completion_report.clone());
                 let group_annotated;
                 let event = if attention.is_some() || !triggers.is_empty() {
                     let mut e = event.clone();
@@ -10225,8 +10227,8 @@ impl Services {
                 .get_agent_session_summary(&AgentId::from(child))
                 .await
             {
-                if let Some(n) = s.task_note_id {
-                    trigger_tasks.push((s.workspace_id.0, n.0));
+                if let Some(n) = s.task_note_id.clone() {
+                    trigger_tasks.push((s.workspace_id.0.clone(), n.0));
                 }
             }
         }
@@ -12191,7 +12193,7 @@ impl Services {
         task.assigned_agent_ids.contains(agent_id)
             || self
                 .store
-                .get_agent_session(agent_id)
+                .get_agent_session_summary(agent_id)
                 .await
                 .ok()
                 .is_some_and(|s| s.task_note_id.as_ref() == Some(note_id))
@@ -12345,7 +12347,11 @@ impl Services {
             let agent = match &caller_agent_id {
                 Some(agent_id) => Some((
                     agent_id.0.clone(),
-                    store.get_agent_session(agent_id).await.ok().map(|s| s.name),
+                    store
+                        .get_agent_session_summary(agent_id)
+                        .await
+                        .ok()
+                        .map(|s| s.name.clone()),
                 )),
                 None => None,
             };
@@ -13138,8 +13144,8 @@ fn note_to_workspace_task(
 /// (`AgentStatus::Deleted`) and soft-retired sessions (`retired_at` set) are
 /// excluded from `count`/`agents`/`agentIds` so clients never render deleted
 /// or retired rows (mirrors the `workspace_attention_signals` filter).
-fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
-    let live: Vec<&AgentSession> = sessions
+fn build_agent_summary(sessions: &[intent_store::AgentSessionSummary]) -> WorkspaceAgentSummary {
+    let live: Vec<&intent_store::AgentSessionSummary> = sessions
         .iter()
         .filter(|s| s.status != intent_core::AgentStatus::Deleted && s.retired_at.is_none())
         .collect();
@@ -13265,7 +13271,7 @@ async fn track_flipped_completion_boundary(
         let Some(agent_id) = caller_agent_id else {
             return;
         };
-        match store.get_agent_session(agent_id).await {
+        match store.get_agent_session_summary(agent_id).await {
             // The agent's own linked task note is excluded.
             Ok(session) if session.task_note_id.as_ref() == Some(note_id) => {}
             Ok(_) => {
@@ -14825,7 +14831,11 @@ async fn resolve_event_agent(
     caller_agent_id: Option<&AgentId>,
 ) -> Option<(String, Option<String>)> {
     let agent_id = caller_agent_id?;
-    let name = store.get_agent_session(agent_id).await.ok().map(|s| s.name);
+    let name = store
+        .get_agent_session_summary(agent_id)
+        .await
+        .ok()
+        .map(|s| s.name.clone());
     Some((agent_id.0.clone(), name))
 }
 
@@ -16355,7 +16365,7 @@ impl Services {
                 Error::Forbidden(_) => not_found(),
                 other => other,
             })?;
-        Ok(session.provider.unwrap_or_default())
+        Ok(session.provider.clone().unwrap_or_default())
     }
 
     /// The §5.5b worker projections.
@@ -18731,7 +18741,7 @@ impl Services {
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
             // Summaries only (intent-hq/monorepo#4130): the sweep reads just
-            // `id` + `name`, and the full `list_agent_sessions` hydrated
+            // `id` + `name`, and the full `list_agent_sessions_with_transcripts` hydrated
             // every session's transcript (2 statements per agent) for rows
             // the cascade below is about to drop.
             let sessions = store.list_agent_session_summaries(&id).await?;
@@ -18755,6 +18765,16 @@ impl Services {
             // its store check before the sweep would otherwise respawn a
             // replacement child during the shared grace wait and leave it
             // running as a ghost process after the rows are gone.
+            // Remote agents get final stops, recorded before their sessions
+            // go, so their machines' last pushes are still accepted.
+            services
+                .feature_remote_launch_port()
+                .final_stop(
+                    &services,
+                    &session_ids,
+                    intent_core::remote_launch::FinalStopReason::WorkspaceDeleted,
+                )
+                .await;
             let _teardown_fence = match manager.as_ref() {
                 Some(manager) => Some(manager.stop_many(&session_ids).await),
                 None => None,
@@ -21711,6 +21731,12 @@ impl WorkspaceApi for Services {
             ) -> BoxFuture<'_, Result<serde_json::Value>> => script_output;
             fn script_status(&self, workspace_id: WorkspaceId, script_id: String)
                 -> BoxFuture<'_, Result<serde_json::Value>> => script_status;
+            fn script_machine_run(
+                &self,
+                workspace_id: WorkspaceId,
+                method: String,
+                params: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => machine_run_call;
             fn script_run(
                 &self,
                 workspace_id: WorkspaceId,
@@ -31139,6 +31165,37 @@ impl WorkspaceApi for Services {
         commit_hash: Option<String>,
         git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.git_diffs_budgeted(
+            workspace_id,
+            paths,
+            staged,
+            commit_hash,
+            git_root_id,
+            intent_core::GitDiffPage::default(),
+        )
+    }
+
+    fn git_diffs_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Option<Vec<String>>,
+        staged: bool,
+        commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
+        page: intent_core::GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let intent_core::GitDiffPage {
+            max_bytes,
+            next_token,
+        } = page;
+        let budget = git_ops::DiffBudget::for_max_bytes(max_bytes);
+        let after = match next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => match git_ops::decode_page_token("git.diffs", t) {
+                Ok(a) => Some(a),
+                Err(e) => return Box::pin(async move { Err(e) }),
+            },
+            None => None,
+        };
         let svc = self.clone();
         let store = self.store.clone();
         let inflight = Arc::clone(&self.git_diffs_inflight);
@@ -31189,6 +31246,7 @@ impl WorkspaceApi for Services {
                 staged,
                 commit_hash.clone(),
                 git_root_id.clone(),
+                (budget, after.clone()),
             );
             loop {
                 match inflight.join(&key) {
@@ -31203,6 +31261,7 @@ impl WorkspaceApi for Services {
                         let walk_worktree = worktree.clone();
                         let walk_paths = paths.clone();
                         let walk_commit = commit_hash.clone();
+                        let walk_after = after.clone();
                         let probe = walk_probe.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             if let Some(probe) = &probe {
@@ -31213,6 +31272,8 @@ impl WorkspaceApi for Services {
                                 walk_paths.as_deref(),
                                 staged,
                                 walk_commit.as_deref(),
+                                budget,
+                                walk_after.as_deref(),
                             )
                         })
                         .await
@@ -31513,6 +31574,37 @@ impl WorkspaceApi for Services {
         target_ref: Option<String>,
         paths: Option<Vec<String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.git_branch_diff_budgeted(
+            workspace_id,
+            base_ref,
+            base_sha,
+            target_ref,
+            paths,
+            intent_core::GitDiffPage::default(),
+        )
+    }
+
+    fn git_branch_diff_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+        page: intent_core::GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let intent_core::GitDiffPage {
+            max_bytes,
+            next_token,
+        } = page;
+        let budget = git_ops::DiffBudget::for_max_bytes(max_bytes);
+        let after = match next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => match git_ops::decode_page_token("git.branchDiff", t) {
+                Ok(a) => Some(a),
+                Err(e) => return Box::pin(async move { Err(e) }),
+            },
+            None => None,
+        };
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -31551,6 +31643,8 @@ impl WorkspaceApi for Services {
                 base_sha.as_deref(),
                 target,
                 paths.as_deref(),
+                budget,
+                after.as_deref(),
             )
         })
     }
@@ -32250,12 +32344,20 @@ impl WorkspaceApi for Services {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member_in(&agent_id, &workspace_id)
                 .await?;
-            self.agent_resolve_proposal_op(workspace_id, agent_id, proposal_id, outcome, detail)
-                .await
+            self.agent_resolve_proposal_op(
+                workspace_id,
+                agent_id,
+                proposal_id,
+                outcome,
+                detail,
+                created_workspace_id,
+            )
+            .await
         })
     }
 
@@ -37014,7 +37116,7 @@ impl Services {
                         if self.has_ready_to_send(&session.id) {
                             manager
                                 .clone()
-                                .try_drain_queue(session.id, id.clone())
+                                .try_drain_queue(session.id.clone(), id.clone())
                                 .await;
                         }
                     }

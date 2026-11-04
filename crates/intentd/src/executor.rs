@@ -32,6 +32,7 @@ use intent_transport::node_link::{
 
 mod checkout;
 mod runner;
+mod scripts;
 mod session;
 mod storage;
 #[cfg(test)]
@@ -107,6 +108,17 @@ struct Backend {
     _storage: Arc<Storage>,
 }
 
+impl ExecutorService {
+    /// The runners of the backends linked now (test seam).
+    #[cfg(test)]
+    fn runners_for_test(&self) -> Vec<Runner> {
+        lock(&self.backends)
+            .values()
+            .map(|backend| backend.runner.clone())
+            .collect()
+    }
+}
+
 /// The running executor service. Cloning the `Arc` shares it.
 pub(crate) struct ExecutorService {
     deps: ExecutorDeps,
@@ -172,10 +184,21 @@ impl ExecutorService {
         // caller-binding: allow — the executor service's own connection worker
         let worker = tokio::spawn(serve_connections(Arc::downgrade(&service), rx, revocations));
         *lock(&service.worker) = Some(worker);
+        // caller-binding: allow — one-time startup cleanup of revoked credentials' storage
+        tokio::spawn({
+            let service = Arc::downgrade(&service);
+            async move {
+                if let Some(service) = service.upgrade() {
+                    service.remove_inactive_storage().await;
+                }
+            }
+        });
         Ok(service)
     }
 
-    /// Stop every backend's agents (the daemon is stopping).
+    /// Stop every backend's agents (the daemon is stopping), each one's last
+    /// work pushed before its backend's links close. Run it before the WSS
+    /// listener stops, which closes those links.
     pub(crate) async fn shutdown(&self) {
         let tasks: Vec<_> = [lock(&self.worker).take(), lock(&self.refresher).take()]
             .into_iter()
@@ -191,9 +214,16 @@ impl ExecutorService {
         for task in tasks {
             let _ = task.await;
         }
-        let backends: Vec<Backend> = lock(&self.backends).drain().map(|(_, b)| b).collect();
+        // Together, so the whole stop takes one drain, not one per backend.
+        let backends: Vec<_> = lock(&self.backends)
+            .drain()
+            .map(|(_, backend)| {
+                // caller-binding: allow — stops one backend's agents; shutdown joins it
+                tokio::spawn(stop_backend_for_shutdown(backend))
+            })
+            .collect();
         for backend in backends {
-            stop_backend(backend).await;
+            let _ = backend.await;
         }
         let stopping = std::mem::take(&mut *lock(&self.stopping));
         for task in stopping {
@@ -347,6 +377,16 @@ impl ExecutorService {
                     hello,
                     report,
                 )));
+                // At every bind, the storage of credentials no longer active
+                // (revoked, or unknown to this machine) goes; another
+                // backend's active credential is never touched.
+                let service = Arc::downgrade(self);
+                // caller-binding: allow — node-local cleanup of revoked credentials' storage
+                tokio::spawn(async move {
+                    if let Some(service) = service.upgrade() {
+                        service.remove_inactive_storage().await;
+                    }
+                });
             }
             NodeConnection::Git(git) => {
                 tracing::info!("executor: backend's git connection bound");
@@ -372,10 +412,14 @@ impl ExecutorService {
             .count()
     }
 
-    /// Stop a revoked backend's agents and close its links. The stop runs
-    /// as a tracked task, so a shutdown racing it still waits for it.
-    fn revoked(&self, credential: &ExecutorCredentialId) {
+    /// Stop a revoked backend's agents and close its links, then (when
+    /// `forget`: the credential is known to be revoked, not merely
+    /// unreadable) remove its storage, checkouts included. The stop runs as
+    /// a tracked task, so a shutdown racing it still waits for it.
+    fn revoked(&self, credential: &ExecutorCredentialId, forget: bool) {
         let backend = lock(&self.backends).remove(credential);
+        let root = (forget && storage::valid_id(&credential.0))
+            .then(|| self.deps.data_dir.join(EXECUTOR_DIR).join(&credential.0));
         #[cfg(test)]
         if backend.is_some() {
             let pause = lock(&self.revoke_pause).take();
@@ -384,15 +428,70 @@ impl ExecutorService {
                 let _ = resume.recv();
             }
         }
-        if let Some(backend) = backend {
-            tracing::info!("executor: credential revoked; stopping its agents");
-            let mut stopping = lock(&self.stopping);
-            stopping.retain(|task| !task.is_finished());
-            // caller-binding: allow — stops one revoked backend's agents; shutdown joins it
-            stopping.push(tokio::spawn(stop_backend(backend)));
+        if backend.is_none() && root.is_none() {
+            return;
         }
+        tracing::info!("executor: credential revoked; stopping its agents");
+        let mut stopping = lock(&self.stopping);
+        stopping.retain(|task| !task.is_finished());
+        // caller-binding: allow — stops one revoked backend's agents; shutdown joins it
+        stopping.push(tokio::spawn(async move {
+            if let Some(backend) = backend {
+                stop_backend(backend).await;
+            }
+            if let Some(root) = root {
+                remove_storage(root).await;
+            }
+        }));
     }
 
+    /// At start: remove the storage of every credential that is no longer
+    /// active (revoked, or unknown to the store), unless its backend is
+    /// open. The directories are listed before the active credentials are
+    /// read, so a credential minted and bound meanwhile is never touched.
+    pub(crate) async fn remove_inactive_storage(&self) {
+        let base = self.deps.data_dir.join(EXECUTOR_DIR);
+        let listed: Vec<String> = match std::fs::read_dir(&base) {
+            Ok(entries) => entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| storage::valid_id(name))
+                .collect(),
+            Err(_) => return,
+        };
+        let active = match (self.deps.active_credentials)().await {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(%error, "executor: cannot read executor credentials; keeping their storage");
+                return;
+            }
+        };
+        for name in listed {
+            let id = ExecutorCredentialId::from(name.clone());
+            if active.contains(&id) || lock(&self.backends).contains_key(&id) {
+                continue;
+            }
+            tracing::info!("executor: removing a revoked credential's storage");
+            remove_storage(base.join(name)).await;
+        }
+    }
+}
+
+/// Remove a revoked credential's storage root.
+async fn remove_storage(root: PathBuf) {
+    let removed = tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    })
+    .await;
+    if !matches!(removed, Ok(Ok(()))) {
+        tracing::warn!("executor: could not remove a revoked credential's storage");
+    }
+}
+
+impl ExecutorService {
     /// The revocation feed lagged: stop every backend whose credential is
     /// no longer active. If the store cannot say, stop them all (a
     /// still-valid backend simply binds again).
@@ -400,19 +499,18 @@ impl ExecutorService {
         let active = (self.deps.active_credentials)().await;
         let open: Vec<ExecutorCredentialId> = lock(&self.backends).keys().cloned().collect();
         for id in open {
-            let keep = match &active {
-                Ok(active) => active.contains(&id),
-                Err(_) => false,
-            };
-            if !keep {
-                self.revoked(&id);
+            match &active {
+                Ok(active) if active.contains(&id) => {}
+                Ok(_) => self.revoked(&id, true),
+                // Unknown, not revoked: stop, but keep its storage.
+                Err(_) => self.revoked(&id, false),
             }
         }
     }
 }
 
-/// Close a backend's links, settle its sessions, then stop its agents, so
-/// none can be launched behind the stop.
+/// A revoked backend: close its links, settle its sessions, then stop its
+/// agents, so none can be launched behind the stop.
 async fn stop_backend(backend: Backend) {
     for link in &backend.links {
         link.close();
@@ -421,6 +519,21 @@ async fn stop_backend(backend: Backend) {
         let _ = session.await;
     }
     backend.runner.shutdown().await;
+    backend.helpers.abort();
+}
+
+/// The daemon is stopping: stop a backend's agents while its links are still
+/// up, so each one's last work is pushed to the backend, then close the
+/// links and settle their sessions. The runner closes its own admission
+/// first, so nothing is launched behind the stop (intent-hq/intent#8437).
+async fn stop_backend_for_shutdown(backend: Backend) {
+    backend.runner.shutdown().await;
+    for link in &backend.links {
+        link.close();
+    }
+    for session in backend.sessions {
+        let _ = session.await;
+    }
     backend.helpers.abort();
 }
 
@@ -452,7 +565,7 @@ async fn serve_connections(
             } => match revoked {
                 Ok(id) => {
                     let Some(service) = service.upgrade() else { return };
-                    service.revoked(&id);
+                    service.revoked(&id, true);
                 }
                 // Revocations were dropped; re-read which credentials are
                 // still active.

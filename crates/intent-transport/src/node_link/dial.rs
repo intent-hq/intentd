@@ -147,7 +147,14 @@ pub(super) async fn dial_link_with(
     })
     .await
     .map_err(|_| super::unavailable())??;
-    let (link, events) = NodeLink::start_with(socket, binding, tuning, false, endpoint.tap.clone());
+    let (link, events) = NodeLink::start_with(
+        socket,
+        binding,
+        tuning,
+        false,
+        endpoint.tap.clone(),
+        welcome.protocol,
+    );
     Ok(DialedLink {
         link,
         events,

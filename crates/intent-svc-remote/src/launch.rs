@@ -357,6 +357,81 @@ impl RemoteLaunchPort for RemoteLaunch {
         })
     }
 
+    fn final_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_ids: &'a [AgentId],
+        reason: intent_core::remote_launch::FinalStopReason,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(feature) = svc.remote_feature() else {
+                return;
+            };
+            // One read for the whole list, so deleting a workspace of local
+            // agents costs one statement, not one per agent.
+            let records = match svc.store().get_remote_agents(agent_ids).await {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!(%error, "remote agents: could not read their placements; no final stops");
+                    return;
+                }
+            };
+            for record in records {
+                let agent_id = &record.agent_id;
+                let node = match feature.node(svc, &record.node_id).await {
+                    Ok(node) => node,
+                    Err(error) => {
+                        tracing::warn!(agent = %agent_id, machine = %record.node_id, %error, "remote agent: its machine is unavailable; no final stop");
+                        continue;
+                    }
+                };
+                if node.status().lease_id != record.lease_id {
+                    tracing::info!(agent = %agent_id, "remote agent: placed under an ended lease; no final stop");
+                    continue;
+                }
+                node.final_stop(agent_id, reason).await;
+            }
+        })
+    }
+
+    fn machine_script_link<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<intent_services::feature_api::feature_ports::MachineScriptLink>> {
+        Box::pin(async move {
+            let record = svc
+                .store()
+                .get_remote_agent(agent_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "node-agent-unplaced: agent {agent_id} was not placed on a machine"
+                    ))
+                })?;
+            let feature = svc.remote_feature().ok_or_else(no_node)?;
+            let node = feature.node(svc, &record.node_id).await?;
+            node.connect().await?;
+            let link = node.shared().current_link().ok_or_else(|| {
+                Error::Internal("machine-unreachable: the machine's link closed".into())
+            })?;
+            let status = node.status();
+            let sender = link.clone();
+            Ok(
+                intent_services::feature_api::feature_ports::MachineScriptLink {
+                    node_id: record.node_id.clone(),
+                    protocol: link.protocol(),
+                    machine_name: status.node_name.clone(),
+                    machine_version: status.intentd_version.clone().unwrap_or_default(),
+                    send: Arc::new(move |frame| {
+                        let link = sender.clone();
+                        Box::pin(async move { link.send(&frame).await })
+                    }),
+                },
+            )
+        })
+    }
+
     fn runtime<'a>(
         &'a self,
         svc: &'a Services,
@@ -383,7 +458,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     "node-agent-unplaced: agent {agent_id} runs under a lease this daemon no longer holds"
                 )));
             }
-            let session = svc.store().get_agent_session(agent_id).await?;
+            let session = svc.store().get_agent_session_summary(agent_id).await?;
             let view =
                 RemotePlacementView::from_metadata(session.metadata.as_ref()).ok_or_else(|| {
                     Error::InvalidParams(format!(
@@ -407,7 +482,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     agent_id: agent_id.clone(),
                     workspace_id: record.workspace_id,
                     provider: intent_providers::base_provider_id(&provider).to_owned(),
-                    model: session.model,
+                    model: session.model.clone(),
                     base_commit: view.base_commit,
                     repo_key,
                     profile_env,

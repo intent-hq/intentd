@@ -838,6 +838,7 @@ pub async fn build_large_state(scale: &LargeStateScale) -> LargeState {
                 auto_start: Some(false),
                 created_at: ts(i),
                 updated_at: Some(ts(i)),
+                remote_author: None,
             })
             .await
             .expect("upsert script");
@@ -862,6 +863,7 @@ pub async fn build_large_state(scale: &LargeStateScale) -> LargeState {
             auto_start: Some(false),
             created_at: ts(390 * 86_400),
             updated_at: Some(ts(390 * 86_400)),
+            remote_author: None,
         })
         .await
         .expect("upsert huge script");

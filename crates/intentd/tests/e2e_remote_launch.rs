@@ -201,7 +201,7 @@ fn try_rev(dir: &Path, name: &str) -> Option<String> {
 /// `mock`, with remote agents on and an executor credential minted for the
 /// backend `backend_id`.
 struct Machine {
-    _daemon: common::DaemonGuard,
+    daemon: common::DaemonGuard,
     port: u16,
     fingerprint: String,
     daemon_id: String,
@@ -243,7 +243,7 @@ async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
     )
     .await;
     Machine {
-        _daemon: daemon,
+        daemon,
         port,
         fingerprint,
         daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
@@ -528,19 +528,15 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         notes.to_string().contains("From the node"),
         "the forwarded note is on head: {notes}"
     );
-    let refused = turn(
+    // Saved scripts (`remoteScripts: 1`): the agent's runs are machine runs.
+    let service_id = machine_runs(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &agent_id),
-        "wsapi return await ws.script.list();",
-        98,
+        &node_id,
+        &repo,
     )
     .await;
-    assert!(
-        refused.starts_with("wsapi-error: ")
-            && refused.contains("is not supported on remote agents yet"),
-        "{refused}"
-    );
 
     // Stop: the node pushes the agent's work before it exits.
     ok(
@@ -586,6 +582,317 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         std::fs::read_to_string(repo.join("README.md")).unwrap(),
         "dirty on head\n"
     );
+
+    // Lost on disconnect: a live machine run of a machine that goes away
+    // ends `exited`, `-1`, `remote-script-lost: …`, and is not reattached.
+    // A fresh remote agent starts the saved service (any agent may start any
+    // saved script), so the step does not depend on relaunching the agent
+    // stopped above.
+    // Relaunching a remote agent right after `agent.stop` can leave its
+    // first prompt unanswered: intent-hq/intent#8457.
+    let mut create_id = 290;
+    let deadline = tokio::time::Instant::now() + wait();
+    let second = loop {
+        create_id += 1;
+        let response = rpc(
+            &mut rpc_ws,
+            create_id,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "name": "Remote 2",
+                "model": "default",
+                "provider": "mock",
+                "placement": { "target": "remote" },
+            }),
+        )
+        .await;
+        if response.get("error").is_none() {
+            break response["result"]["agent"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+        assert_eq!(
+            response["error"]["data"]["code"], "placement-unavailable",
+            "{response}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the backend redials the machine (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &second),
+        &format!(
+            "wsapi const st = await ws.script.start({service_id:?}); return JSON.stringify({{ marker: \"turn-300\", st }});"
+        ),
+        "turn-300",
+        300,
+    )
+    .await;
+    assert!(started.starts_with("wsapi: "), "{started}");
+    machine_run_until(&mut rpc_ws, (&ws_id, &service_id, &second), 310, |run| {
+        run["runtime"]["status"] == "running"
+    })
+    .await;
+    drop(machine);
+    let lost = machine_run_until(&mut rpc_ws, (&ws_id, &service_id, &second), 400, |run| {
+        run["runtime"]["status"] == "exited"
+    })
+    .await;
+    assert_eq!(lost["runtime"]["exitCode"], -1, "{lost}");
+    assert!(
+        lost["runtime"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("remote-script-lost:"),
+        "{lost}"
+    );
+}
+
+/// [`turn`] for a `wsapi` prompt whose reply carries `marker`. Monitor
+/// wakes, a stop or a relaunch also end turns, so the first
+/// `agent:stream:end` after sending may belong to another turn, and the
+/// agent's `lastAgentResponse` may still be the previous `wsapi:` reply:
+/// only a reply carrying this prompt's own `marker` is accepted.
+async fn wsapi_turn(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    marker: &str,
+    id: i64,
+) -> String {
+    let mut reply = turn(rpc_ws, events, (ws_id, agent_id), content, id).await;
+    let mut next = id + 2;
+    let found = timeout(wait(), async {
+        while !reply.contains(marker) {
+            // timing-guard: poll interval for this turn's reply to be recorded (the stream-end event may have belonged to another turn)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let got = ok(
+                rpc_ws,
+                next,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            next += 1;
+            got["agent"]["lastAgentResponse"]
+                .as_str()
+                .unwrap_or_default()
+                .clone_into(&mut reply);
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "no reply carrying {marker:?}; last reply: {reply}"
+    );
+    reply
+}
+
+/// A `wsapi:` reply's returned value: the agent returns `JSON.stringify(…)`,
+/// which the reply carries as a JSON string.
+fn wsapi_value(reply: &str) -> Value {
+    let raw: Value = serde_json::from_str(
+        reply
+            .strip_prefix("wsapi: ")
+            .unwrap_or_else(|| panic!("{reply}")),
+    )
+    .unwrap();
+    match raw {
+        Value::String(text) => serde_json::from_str(&text).unwrap(),
+        other => other,
+    }
+}
+
+/// The script row of `script_id`, from `script.get`.
+async fn script_row(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, script_id): (&str, &str),
+    id: i64,
+) -> Value {
+    let got = ok(
+        rpc_ws,
+        id,
+        "script.get",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    got.get("script").cloned().unwrap_or(got)
+}
+
+/// Poll the script's first machine run until `done` holds; returns it.
+async fn machine_run_until(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, script_id, agent_id): (&str, &str, &str),
+    first_id: i64,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut id = first_id;
+    let mut last = Value::Null;
+    let reached = timeout(wait(), async {
+        loop {
+            id += 1;
+            let row = script_row(rpc_ws, (ws_id, script_id), id).await;
+            let run = row["machineRuns"]
+                .as_array()
+                .and_then(|runs| runs.iter().find(|run| run["remoteAgentId"] == agent_id))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if done(&run) {
+                return run;
+            }
+            last = row;
+            // timing-guard: poll interval for the machine's script frames to settle the run
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    reached.unwrap_or_else(|_| {
+        panic!("the machine run never reached the expected state; last row: {last}")
+    })
+}
+
+/// A remote agent's saved scripts run on its machine: the run, its output,
+/// its monitor and its stop all reach the backend. Returns the id of a
+/// saved service, stopped, for the caller's disconnect check.
+async fn machine_runs(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    node_id: &str,
+    repo: &Path,
+) -> String {
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
+    let wsapi = r#"wsapi const c = await ws.script.create("mrun", "sleep 1; pwd; echo machine-run", "command", { purpose: "saved" }); const id = c.id ?? c.script.id; const st = await ws.script.start(id); const m = await ws.script.monitor(id, { ttlMs: 600000 }); return JSON.stringify({ id, st, m });"#;
+    let reply = turn(rpc_ws, events, (ws_id, agent_id), wsapi, 200).await;
+    let body = wsapi_value(&reply);
+    let script_id = body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_owned();
+    assert_eq!(body["st"]["status"], "starting", "{body}");
+    assert_eq!(body["m"]["monitor"]["remoteAgentId"], agent_id, "{body}");
+    assert_eq!(body["m"]["monitor"]["nodeId"], node_id, "{body}");
+
+    // The monitor wakes the agent when the run ends on the machine.
+    let end = event(events, "agent:stream:end").await;
+    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    let woken = ok(
+        rpc_ws,
+        202,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let woken = woken["agent"]["lastAgentResponse"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(woken.contains("exited with code 0"), "{woken}");
+
+    let row = script_row(rpc_ws, (ws_id, &script_id), 203).await;
+    assert_eq!(row["remoteAuthor"]["agentId"], agent_id, "{row}");
+    assert_eq!(row["remoteAuthor"]["nodeId"], node_id, "{row}");
+    assert_ne!(
+        row["runtime"]["status"], "running",
+        "the home run never started: {row}"
+    );
+    let run = &row["machineRuns"][0];
+    assert_eq!(run["remoteAgentId"], agent_id, "{row}");
+    assert_eq!(run["nodeId"], node_id, "{row}");
+    assert_eq!(run["runtime"]["status"], "exited", "{row}");
+    assert_eq!(run["runtime"]["exitCode"], 0, "{row}");
+    assert_eq!(run["lastRun"]["outcome"], "succeeded", "{row}");
+
+    // Its output came from the agent's checkout on the machine.
+    let output = ok(
+        rpc_ws,
+        204,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": script_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    let text = output.to_string();
+    assert!(text.contains("machine-run"), "{output}");
+    assert!(
+        !text.contains(&repo.to_string_lossy().into_owned()),
+        "ran on head: {output}"
+    );
+
+    // Only the remote agent starts a run on its machine.
+    let refused = rpc(
+        rpc_ws,
+        205,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": script_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("remote-script-start-remote-only"),
+        "{refused}"
+    );
+
+    // Definition authority: a remote agent changes only scripts it created,
+    // never sets autoStart, and never supplies remoteAuthor.
+    let users = ok(
+        rpc_ws,
+        260,
+        "script.create",
+        json!({ "workspaceId": ws_id, "name": "user-saved", "command": "true", "mode": "command", "purpose": "saved" }),
+    )
+    .await;
+    let users = users.get("script").cloned().unwrap_or(users);
+    let user_script = users["id"].as_str().unwrap().to_owned();
+    for (code, expected) in [
+        (
+            format!("wsapi return await ws.script.remove({user_script:?});"),
+            "remote-script-not-owned",
+        ),
+        (
+            r#"wsapi return await ws.script.create("auto", "true", "service", { autoStart: true });"#.to_owned(),
+            "remote-script-autostart-unsupported",
+        ),
+        (
+            r#"wsapi return await ws.script.create("forged", "true", "command", { remoteAuthor: { agentId: "a", nodeId: "n" } });"#.to_owned(),
+            "remote-script-author-readonly",
+        ),
+    ] {
+        let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &code, expected, 262).await;
+        assert!(
+            reply.starts_with("wsapi-error: ") && reply.contains(expected),
+            "{code}: {reply}"
+        );
+    }
+
+    // A service started by the agent, stopped from the app.
+    // timing-guard: the saved script's own runtime on the machine, not a wait in the test
+    let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); return JSON.stringify({ marker: "turn-206", id });"#;
+    let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), wsapi, "turn-206", 206).await;
+    let body = wsapi_value(&reply);
+    let service_id = body["id"].as_str().unwrap().to_owned();
+    machine_run_until(rpc_ws, (ws_id, &service_id, agent_id), 210, |run| {
+        run["runtime"]["status"] == "running"
+    })
+    .await;
+    let stopped = ok(
+        rpc_ws,
+        250,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": service_id, "remoteAgentId": agent_id }),
+    )
+    .await;
+    assert_eq!(stopped["status"], "idle", "{stopped}");
+    service_id
 }
 
 /// A backend `intentd serve` on `data_dir` with a seeded workspace on
@@ -593,6 +900,15 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
 async fn start_backend(
     data_dir: &Path,
     repo: &Path,
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
+    start_backend_with(data_dir, repo, &[]).await
+}
+
+/// [`start_backend`] with extra environment for the backend process.
+async fn start_backend_with(
+    data_dir: &Path,
+    repo: &Path,
+    env: &[(&str, &str)],
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace(data_dir, repo).await;
@@ -603,6 +919,7 @@ async fn start_backend(
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("head.log")).unwrap(),
@@ -664,6 +981,8 @@ async fn placement_chooses_among_exposed_machines() {
         "{on}"
     );
     assert_eq!(on["server"]["capabilities"]["remoteLinkTraffic"], 1, "{on}");
+    // Saved scripts for remote agents come only with exposed machines.
+    assert_eq!(on["server"]["capabilities"]["remoteScripts"], 1, "{on}");
 
     let backend = ok(&mut rpc_ws, 3, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
@@ -841,5 +1160,506 @@ async fn placement_chooses_among_exposed_machines() {
             .as_str()
             .is_some_and(|notice| notice.contains("Machine B")),
         "{placed}"
+    );
+}
+
+/// The `agent.pid` file the fixture provider wrote in `agent_id`'s worktree
+/// under the machine's data dir `root`.
+fn find_agent_pid_file(root: &Path, agent_id: &str) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && !kind.is_symlink() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|n| n == "agent.pid")
+                && path.to_string_lossy().contains(agent_id)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn pid_alive(pid: i64) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// intent-hq/intent#8426: `agent.delete` on a running remote agent stops
+/// its runtime on the machine — the provider process exits and the agent
+/// no longer counts against the machine's capacity, on head
+/// (`remoteMachines.list`) and on the machine (`executor.list`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_remote_agent_stops_it_on_the_machine() {
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping remote delete e2e: node not on PATH");
+        return;
+    }
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping remote delete e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-rdel-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    ok(
+        &mut rpc_ws,
+        1,
+        "client.hello",
+        json!({ "clientId": "remote-delete-e2e", "name": "Remote delete E2E" }),
+    )
+    .await;
+    let backend = ok(&mut rpc_ws, 2, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        3,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut machine_ws = connect(machine.port, client_config(&machine.fingerprint)).await;
+
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id,
+        "name": "Remote",
+        "model": "default",
+        "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert_eq!(
+            response["error"]["data"]["code"], "placement-unavailable",
+            "{response}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+
+    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 100).await;
+    assert!(reply.contains("echo:"), "{reply}");
+
+    let head_running = |listed: &Value| listed["machines"][0]["runningAgents"].clone();
+    let machine_running = |listed: &Value| listed["backends"][0]["runningAgents"].clone();
+    let listed = ok(&mut rpc_ws, 110, "remoteMachines.list", json!({})).await;
+    assert_eq!(head_running(&listed), 1, "{listed}");
+    let listed = ok(&mut machine_ws, 111, "executor.list", json!({})).await;
+    assert_eq!(machine_running(&listed), 1, "{listed}");
+    let pid_file = find_agent_pid_file(&node_dir, &agent_id)
+        .unwrap_or_else(|| panic!("the fixture's agent.pid for {agent_id} on the machine"));
+    let pids: Value = serde_json::from_str(&std::fs::read_to_string(&pid_file).unwrap()).unwrap();
+    let (provider_pid, child_pid) = (
+        pids["agent"].as_i64().unwrap(),
+        pids["child"].as_i64().unwrap(),
+    );
+    assert!(
+        pid_alive(provider_pid),
+        "the provider runs before the delete"
+    );
+
+    ok(
+        &mut rpc_ws,
+        120,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+
+    let mut id = 200;
+    timeout(wait(), async {
+        loop {
+            id += 2;
+            let head = ok(&mut rpc_ws, id, "remoteMachines.list", json!({})).await;
+            let node = ok(&mut machine_ws, id + 1, "executor.list", json!({})).await;
+            if head_running(&head) == 0
+                && machine_running(&node) == 0
+                && !pid_alive(provider_pid)
+                && !pid_alive(child_pid)
+            {
+                return;
+            }
+            // timing-guard: poll interval for the machine to tear the agent down (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("agent.delete stops the remote agent and frees its slot on the machine");
+}
+
+/// intent-hq/intent#8426, local half: `agent.delete` on a running local
+/// agent stops its provider process tree before the rows go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_local_agent_stops_its_provider() {
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping local delete e2e: node not on PATH");
+        return;
+    }
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping local delete e2e: git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-ldel-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &scratch.path().join("head"),
+        &repo,
+        &[("MOCK_AGENT_SCRIPT_PATH", fixture.as_str())],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let created = ok(
+        &mut rpc_ws,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Local", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 10).await;
+
+    let pid_file = repo.join("agent.pid");
+    let pids: Value = serde_json::from_str(
+        &std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|e| panic!("the fixture's agent.pid at {}: {e}", pid_file.display())),
+    )
+    .unwrap();
+    let (provider_pid, child_pid) = (
+        pids["agent"].as_i64().unwrap(),
+        pids["child"].as_i64().unwrap(),
+    );
+    assert!(
+        pid_alive(provider_pid),
+        "the provider runs before the delete"
+    );
+
+    ok(
+        &mut rpc_ws,
+        20,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    timeout(wait(), async {
+        while pid_alive(provider_pid) || pid_alive(child_pid) {
+            // timing-guard: poll interval for the provider tree to exit (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("agent.delete stops the local agent's provider process tree");
+}
+
+/// Deleting a remote agent ends it for good: without a prior stop, its
+/// machine pushes its work one last time (landing as its `wip` ref) and
+/// then removes its checkout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_remote_agent_pushes_its_work_then_removes_its_checkout() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote final stop e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-final-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi await ws.file.write("turn.txt", "turn work"); return "ok";"#,
+        50,
+    )
+    .await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    // The turn's end pushes `wip` on its own; wait for it, so only the
+    // final stop can carry what is written next.
+    let turn_wip = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
+                if git(&repo, &["ls-tree", "--name-only", &wip])
+                    .lines()
+                    .any(|f| f == "turn.txt")
+                {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the turn-end push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the turn-end wip lands on head");
+    let checkout = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id);
+    // Unsaved work after the last turn, written straight into the checkout.
+    std::fs::write(checkout.join("work").join("final.txt"), "unsaved work").unwrap();
+
+    ok(
+        &mut rpc_ws,
+        60,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let wip = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
+                if wip != turn_wip {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the machine's final push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the final push lands a new wip on head");
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:final.txt")]),
+        "unsaved work"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:turn.txt")]),
+        "turn work"
+    );
+    timeout(wait(), async {
+        while checkout.exists() {
+            // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the machine removes the checkout after the push");
+}
+
+/// The machine's own graceful shutdown (a restart or an update) stops its
+/// agents and pushes each one's work a last time, and the backend accepts
+/// that push: a live agent's changes since its last turn-end push land in
+/// its `wip` ref (intent-hq/intent#8437).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_shutdown_pushes_live_agents_work() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote shutdown push e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-shutdown-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let mut machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let wip_ref = format!("refs/intent/ws/{ws_id}/agents/{agent_id}/wip");
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi await ws.file.write("turn.txt", "pushed at turn end"); return "ok";"#,
+        50,
+    )
+    .await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    // The turn-end push lands first.
+    let pushed = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &wip_ref) {
+                if git(&repo, &["ls-tree", "--name-only", &wip]).contains("turn.txt") {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the turn-end push to land the ref (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the turn-end push lands on head");
+
+    // Work since that push, still only in the machine's checkout.
+    let checkout = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id)
+        .join("work");
+    assert!(
+        checkout.join("turn.txt").is_file(),
+        "{}",
+        checkout.display()
+    );
+    std::fs::write(checkout.join("unpushed.txt"), "since the last push").unwrap();
+
+    // The machine's daemon shuts down gracefully, the agent still live.
+    let daemon = machine.daemon.child_mut();
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    daemon
+        .wait_with_timeout(common::test_timeout(Duration::from_secs(120)))
+        .unwrap()
+        .expect("the machine's daemon exits gracefully");
+
+    let wip = try_rev(&repo, &wip_ref).expect("the wip ref exists");
+    let log = std::fs::read_to_string(node_dir.join("machine.log")).unwrap_or_default();
+    assert_ne!(
+        wip, pushed,
+        "the shutdown push did not land on head; machine log:\n{log}"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:unpushed.txt")]),
+        "since the last push"
     );
 }

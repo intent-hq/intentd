@@ -357,7 +357,8 @@ the original configuration is **Codex · Default**. In a shared workspace, guest
 an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
-explicit, specialist, or default selection, never the parent's profile.
+explicit or specialist selection, else their parent agent's provider when it is
+enabled, installed and not signed out, else the default; never the parent's profile.
 Once a provider has profiles, its original configuration is listed first as the
 Default profile, where backups start from; it cannot be moved, and shows its name
 with a **Default** badge once renamed. To rename it or give it its own environment
@@ -437,7 +438,7 @@ the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 
 ## Use Intent from a browser on another device (experimental)
 
@@ -457,9 +458,10 @@ Tailscale address in the browser. Never suggest Tailscale Funnel or another publ
 The browser asks once for the **Access key** shown in that section; **Reset key** signs
 out every browser. In the browser, opening a saved connection opens that backend in a
 new tab; adding or forgetting connections stays on the desktop. Desktop-only features
-such as native file dialogs and window controls are unavailable in the browser. If the
-section shows the port is in use, change **Port**. If it says the build does not
-include the browser version, the installed app predates the feature.
+such as native file dialogs and window controls are unavailable in the browser; a notice
+listing them appears each time the browser loads Intent. If the section shows the port
+is in use, change **Port**. If it says the build does not include the browser version,
+the installed app predates the feature.
 
 <!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
@@ -504,7 +506,8 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 - Its data directory (default `~/.local/state/intent-web`) holds machine tokens in
   plain text; treat it like an SSH key. The **Settings → Mobile** tab, iCloud sync of
   saved machines and desktop-only features such as native file dialogs are not
-  available there.
+  available there; a notice listing them appears each time the browser loads Intent,
+  and **Got it** closes it.
 
 <!-- Sources: packages/cloudlands-fe/docs/intent-web.md; packages/cloudlands-fe/src/features/intent-web/; packages/cloudlands-fe/src/features/intent-web/package/README.md. -->
 
@@ -593,14 +596,16 @@ uses the most recent setup. Changes you make in the form are kept when you switc
 repositories.
 
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/InlineProposal.svelte; src/lib/components/chat/proposals/open-created-workspace.ts; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
 workspace for that repository, and uses that agent's last model and reasoning
 effort while it stays selected. The new workspace opens as a tab at the end of
-the top tab strip, and the current workspace stays selected.
+the top tab strip, and the current workspace stays selected. Once created, the
+card shows **Open workspace**, whoever applied it; if that workspace was deleted,
+a message says it no longer exists.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
@@ -650,6 +655,9 @@ responds. Such a row has no Stop and clears the next time the agent starts.
 Restarting Intent stops running background tasks. The agent is then listed with
 interrupted agents, and when resumed it is told its tasks were stopped and will
 not report back, so it can restart any it still needs.
+After an Intent update, interrupted agents resume on their own, except agents
+whose provider is turned off or not signed in: those stay listed with interrupted
+agents until the user signs in and resumes them.
 Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->

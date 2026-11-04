@@ -64,6 +64,7 @@ impl Fixture {
         write_base_ref(head.path(), &remote(AGENT), oid).unwrap();
         write_base_ref(head.path(), &remote(OTHER), oid).unwrap();
         let node = tempfile::tempdir().unwrap();
+        configure_receive_hooks(&node.path().join("data")).unwrap();
         let mut node_git = NodeGit::new(node.path().join("bin"), node.path().join("git.sock"));
         node_git.test_head = Some(head.path().to_path_buf());
         let cache = CheckoutCache::new(node.path().join("cache"), node_git);
@@ -81,12 +82,12 @@ impl Fixture {
 
     async fn checkout(&self, name: &str) -> std::path::PathBuf {
         let worktree = self.worktree(name);
-        let commit = self
+        let checkout = self
             .cache
             .checkout("repo-1", &remote(AGENT), &worktree)
             .await
             .unwrap();
-        assert_eq!(commit, self.base);
+        assert_eq!(checkout.base, self.base);
         worktree
     }
 }
@@ -139,7 +140,8 @@ async fn upload_pack_advertises_only_the_agents_refs() {
         fixture.head.path(),
         &["update-ref", "refs/heads/secret", "HEAD"],
     );
-    let mut command = service_command(GitService::UploadPack, fixture.head.path(), &remote(AGENT));
+    let mut command =
+        service_command(GitService::UploadPack, fixture.head.path(), &remote(AGENT)).unwrap();
     command.stdin(Stdio::piped());
     let mut child = command.spawn().unwrap();
     {
@@ -281,10 +283,8 @@ async fn pushes_outside_the_agents_prefix_are_rejected() {
         let mut push = fixture.cache.git().command(&worktree);
         push.args(["push", "--force", &url, &format!("HEAD:{target}")]);
         let error = run(push).await.unwrap_err().to_string();
-        assert!(
-            error.contains("deny updating a hidden ref"),
-            "{target}: {error}"
-        );
+        // The kept stderr tail can cut the start of git's message.
+        assert!(error.contains("a hidden ref"), "{target}: {error}");
         assert_eq!(try_ref(head, &target), before, "{target} changed");
     }
 }
@@ -323,4 +323,433 @@ fn head_commit_fails_without_a_commit() {
     let empty = tempfile::tempdir().unwrap();
     git(empty.path(), &["init", "--quiet"]);
     assert!(head_commit(empty.path()).is_err());
+}
+
+fn commit_all(worktree: &Path, message: &str) {
+    git(worktree, &["add", "--all"]);
+    git(
+        worktree,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+}
+
+#[tokio::test]
+async fn relaunch_without_a_checkout_restores_head_and_wip() {
+    let fixture = Fixture::new();
+    let worktree = fixture.checkout("a").await;
+    write_file(&worktree, "committed.txt", "agent commit\n");
+    commit_all(&worktree, "agent work");
+    write_file(&worktree, "README.md", "dirty\n");
+    write_file(&worktree, "new.txt", "untracked\n");
+    let pushed = fixture
+        .cache
+        .git()
+        .push_wip(&worktree, &remote(AGENT))
+        .await
+        .unwrap();
+    assert_ne!(pushed.wip, pushed.head);
+    // The final stop (or the bind sweep) removes the checkout.
+    fixture.cache.remove("repo-1", &worktree).await.unwrap();
+
+    let restored = fixture.worktree("a-restored");
+    let checkout = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &restored)
+        .await
+        .unwrap();
+    assert_eq!(checkout.base, fixture.base);
+    assert_eq!(checkout.at, pushed.head);
+    assert_eq!(checkout.unrestored_wip, None);
+    assert_eq!(git(&restored, &["rev-parse", "HEAD"]), pushed.head);
+    assert_eq!(
+        std::fs::read_to_string(restored.join("committed.txt")).unwrap(),
+        "agent commit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(restored.join("README.md")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(restored.join("new.txt")).unwrap(),
+        "untracked\n"
+    );
+    // The wip changes are uncommitted, as they were when pushed.
+    assert_eq!(
+        git(&restored, &["status", "--porcelain"]),
+        "M README.md\n?? new.txt".to_owned()
+    );
+    // Head's refs are untouched.
+    let head = fixture.head.path();
+    assert_eq!(
+        try_ref(head, &remote(AGENT).ref_name(AgentRef::Head)),
+        Some(pushed.head)
+    );
+    assert_eq!(
+        try_ref(head, &remote(AGENT).ref_name(AgentRef::Wip)),
+        Some(pushed.wip)
+    );
+}
+
+#[tokio::test]
+async fn relaunch_with_a_clean_wip_checks_out_head_only() {
+    let fixture = Fixture::new();
+    let worktree = fixture.checkout("a").await;
+    write_file(&worktree, "committed.txt", "agent commit\n");
+    commit_all(&worktree, "agent work");
+    let pushed = fixture
+        .cache
+        .git()
+        .push_wip(&worktree, &remote(AGENT))
+        .await
+        .unwrap();
+    assert_eq!(pushed.wip, pushed.head);
+    fixture.cache.remove("repo-1", &worktree).await.unwrap();
+
+    let restored = fixture.worktree("a-restored");
+    let checkout = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &restored)
+        .await
+        .unwrap();
+    assert_eq!(checkout.at, pushed.head);
+    assert_eq!(checkout.unrestored_wip, None);
+    assert_eq!(git(&restored, &["status", "--porcelain"]), "");
+}
+
+/// Point the agent's refs on head at a `wip` that changes README on top of
+/// `on` and a saved head that changes it differently, so the wip does not
+/// apply. Returns `(wip, saved_head)`; head's own `HEAD` ends at `on`.
+fn conflicting_refs(head: &Path, on: &str, wip_text: &str, head_text: &str) -> (String, String) {
+    git(head, &["reset", "--quiet", "--hard", on]);
+    commit_file(head, "README.md", wip_text);
+    let wip = git(head, &["rev-parse", "HEAD"]);
+    git(head, &["reset", "--quiet", "--hard", on]);
+    commit_file(head, "README.md", head_text);
+    let saved_head = git(head, &["rev-parse", "HEAD"]);
+    git(head, &["reset", "--quiet", "--hard", on]);
+    git(
+        head,
+        &["update-ref", &remote(AGENT).ref_name(AgentRef::Wip), &wip],
+    );
+    git(
+        head,
+        &[
+            "update-ref",
+            &remote(AGENT).ref_name(AgentRef::Head),
+            &saved_head,
+        ],
+    );
+    (wip, saved_head)
+}
+
+/// Push `refspec` from `dir` to the agent's refs on head; whether head
+/// accepted it.
+async fn push_raw(cache: &CheckoutCache, dir: &Path, refspec: &str) -> bool {
+    let url = cache.git.remote_url(&remote(AGENT));
+    cache
+        .git
+        .git(dir, &["push", "--quiet", &url, refspec])
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn a_wip_that_does_not_apply_is_pinned_under_unapplied_and_reported() {
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    let (wip, saved_head) = conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    let wip_ref = remote(AGENT).ref_name(AgentRef::Wip);
+    let head_ref = remote(AGENT).ref_name(AgentRef::Head);
+    let pinned = remote(AGENT).unapplied_ref(&wip);
+    assert_eq!(
+        pinned,
+        format!("refs/intent/ws/ws-1/agents/agent-1/unapplied/{wip}")
+    );
+
+    let restored = fixture.worktree("a");
+    let checkout = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &restored)
+        .await
+        .unwrap();
+    assert_eq!(checkout.at, saved_head);
+    assert_eq!(checkout.unrestored_wip, Some(wip.clone()));
+    assert_eq!(git(&restored, &["rev-parse", "HEAD"]), saved_head);
+    assert_eq!(
+        std::fs::read_to_string(restored.join("README.md")).unwrap(),
+        "head\n"
+    );
+    assert_eq!(git(&restored, &["status", "--porcelain"]), "");
+    // The wip is pinned on head before the agent runs, and readable here.
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    assert_eq!(git(&restored, &["rev-parse", &pinned]), wip);
+    assert_eq!(try_ref(head, &head_ref), Some(saved_head.clone()));
+
+    // The agent's first push replaces wip; the pinned ref keeps the work.
+    write_file(&restored, "README.md", "second\n");
+    let pushed = fixture
+        .cache
+        .git()
+        .push_wip(&restored, &remote(AGENT))
+        .await
+        .unwrap();
+    assert_ne!(pushed.wip, wip);
+    assert_eq!(try_ref(head, &wip_ref), Some(pushed.wip.clone()));
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+
+    // A second failure pins its own wip without touching the first.
+    commit_file(head, "README.md", "head2\n");
+    let head2 = git(head, &["rev-parse", "HEAD"]);
+    git(head, &["update-ref", &head_ref, &head2]);
+    fixture.cache.remove("repo-1", &restored).await.unwrap();
+    let again = fixture.worktree("a-again");
+    let checkout = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &again)
+        .await
+        .unwrap();
+    assert_eq!(checkout.at, head2);
+    assert_eq!(checkout.unrestored_wip, Some(pushed.wip.clone()));
+    let second = remote(AGENT).unapplied_ref(&pushed.wip);
+    assert_eq!(try_ref(head, &second), Some(pushed.wip.clone()));
+    assert_eq!(try_ref(head, &pinned), Some(wip));
+}
+
+#[tokio::test]
+async fn unapplied_refs_are_create_only_and_named_by_their_commit() {
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    let (wip, _) = conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    let worktree = fixture.worktree("a");
+    fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &worktree)
+        .await
+        .unwrap();
+    let pinned = remote(AGENT).unapplied_ref(&wip);
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    let at = git(&worktree, &["rev-parse", "HEAD"]);
+
+    // No update, forced or not, and no delete.
+    assert!(!push_raw(&fixture.cache, &worktree, &format!("+HEAD:{pinned}")).await);
+    assert!(!push_raw(&fixture.cache, &worktree, &format!(":{pinned}")).await);
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    // A new ref must be named by the commit it holds.
+    let misnamed = remote(AGENT).unapplied_ref(&fixture.base);
+    assert!(!push_raw(&fixture.cache, &worktree, &format!("HEAD:{misnamed}")).await);
+    assert_eq!(try_ref(head, &misnamed), None);
+    let other = format!("{}unapplied/other", remote(AGENT).ref_prefix());
+    assert!(!push_raw(&fixture.cache, &worktree, &format!("HEAD:{other}")).await);
+    assert_eq!(try_ref(head, &other), None);
+    // Creating one named by its commit is allowed; head and wip still
+    // update as before.
+    let own = remote(AGENT).unapplied_ref(&at);
+    assert!(push_raw(&fixture.cache, &worktree, &format!("HEAD:{own}")).await);
+    assert_eq!(try_ref(head, &own), Some(at));
+    let wip_ref = remote(AGENT).ref_name(AgentRef::Wip);
+    assert!(push_raw(&fixture.cache, &worktree, &format!("+HEAD:{wip_ref}")).await);
+}
+
+/// A saved wip head will not pin fails the checkout, so the agent never
+/// starts over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_wip_head_will_not_pin_fails_the_checkout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    // Head cannot create refs under the agent's prefix.
+    let refs = head.join(".git/refs/intent/ws/ws-1/agents/agent-1");
+    assert!(refs.is_dir(), "the agent's refs are loose");
+    std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(refs.join("probe"), "").is_ok() {
+        // Permissions do not bind this user (root): nothing to test.
+        std::fs::remove_file(refs.join("probe")).unwrap();
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: the refs directory stays writable");
+        return;
+    }
+    let result = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &fixture.worktree("a"))
+        .await;
+    std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("pin the unapplied wip"), "{error}");
+    assert!(!fixture.worktree("a").exists());
+}
+
+/// A pin that landed but whose answer was lost: the relaunch pins the same
+/// commit again, which succeeds, and the checkout proceeds.
+#[tokio::test]
+async fn repinning_the_same_commit_succeeds() {
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    let (wip, saved_head) = conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    let pinned = remote(AGENT).unapplied_ref(&wip);
+    git(head, &["update-ref", &pinned, &wip]);
+    let checkout = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &fixture.worktree("a"))
+        .await
+        .unwrap();
+    assert_eq!(checkout.at, saved_head);
+    assert_eq!(checkout.unrestored_wip, Some(wip.clone()));
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    // An explicit same-value push is accepted too.
+    let worktree = fixture.worktree("a");
+    assert!(push_raw(&fixture.cache, &worktree, &format!("{wip}:{pinned}")).await);
+    assert_eq!(try_ref(head, &pinned), Some(wip));
+}
+
+/// An existing unapplied ref holding another commit is never moved: the
+/// pin is refused and the checkout fails.
+#[tokio::test]
+async fn a_pin_over_a_different_commit_is_refused() {
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    let (wip, _) = conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    let pinned = remote(AGENT).unapplied_ref(&wip);
+    // Hand-made: the ref holds wip's parent (base), so the pin would be a
+    // fast-forward.
+    git(head, &["update-ref", &pinned, &fixture.base]);
+    let error = fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &fixture.worktree("a"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pin the unapplied wip"), "{error}");
+    assert_eq!(try_ref(head, &pinned), Some(fixture.base.clone()));
+    // No checkout is left for a later launch to reuse unpinned.
+    assert!(!fixture.worktree("a").exists());
+}
+
+#[test]
+fn only_receive_pack_runs_heads_update_hook() {
+    let data = tempfile::tempdir().unwrap();
+    configure_receive_hooks(data.path()).unwrap();
+    let hooks_path = |service| {
+        let command = service_command(service, Path::new("/repo"), &remote(AGENT)).unwrap();
+        command
+            .as_std()
+            .get_args()
+            .filter_map(|arg| {
+                arg.to_str()?
+                    .strip_prefix("core.hooksPath=")
+                    .map(str::to_owned)
+            })
+            .last()
+    };
+    let receive = hooks_path(GitService::ReceivePack).unwrap();
+    assert!(Path::new(&receive).join("update").is_file(), "{receive}");
+    assert_eq!(
+        hooks_path(GitService::UploadPack).as_deref(),
+        Some("/dev/null")
+    );
+}
+
+/// Inside the agent's prefix only `head`, `wip` and
+/// `unapplied/<full lowercase sha>` may be pushed.
+#[tokio::test]
+async fn the_hook_allows_only_head_wip_and_well_formed_unapplied_refs() {
+    let fixture = Fixture::new();
+    let worktree = fixture.checkout("a").await;
+    let head = fixture.head.path();
+    // A commit no agent ref holds yet, so every push below moves a ref.
+    write_file(&worktree, "work.txt", "work\n");
+    commit_all(&worktree, "work");
+    let at = git(&worktree, &["rev-parse", "HEAD"]);
+    let prefix = remote(AGENT).ref_prefix();
+    for name in [
+        format!("UNAPPLIED/{at}"),
+        format!("unapplied/{}", at.to_uppercase()),
+        format!("unapplied/x/{at}"),
+        format!("unapplied/{}", &at[..12]),
+        "unknown".to_owned(),
+        "base".to_owned(),
+        "head/extra".to_owned(),
+    ] {
+        let target = format!("{prefix}{name}");
+        let before = try_ref(head, &target);
+        assert!(
+            !push_raw(&fixture.cache, &worktree, &format!("+HEAD:{target}")).await,
+            "{name} accepted"
+        );
+        assert_eq!(try_ref(head, &target), before, "{name} changed");
+    }
+    assert!(push_raw(&fixture.cache, &worktree, &format!("+HEAD:{prefix}head")).await);
+    assert!(push_raw(&fixture.cache, &worktree, &format!("+HEAD:{prefix}wip")).await);
+    assert!(
+        push_raw(
+            &fixture.cache,
+            &worktree,
+            &format!("HEAD:{prefix}unapplied/{at}")
+        )
+        .await
+    );
+}
+
+/// A hook removed or altered between pushes is reinstalled before the next
+/// one, which is still checked; one that cannot be reinstalled refuses the
+/// push.
+#[tokio::test]
+async fn a_removed_or_altered_hook_is_reinstalled_or_the_push_refused() {
+    let fixture = Fixture::new();
+    let head = fixture.head.path();
+    let (wip, _) = conflicting_refs(head, &fixture.base, "wip\n", "head\n");
+    let worktree = fixture.worktree("a");
+    fixture
+        .cache
+        .checkout("repo-1", &remote(AGENT), &worktree)
+        .await
+        .unwrap();
+    let pinned = remote(AGENT).unapplied_ref(&wip);
+    let hooks = fixture.node.path().join("data").join("node-git-hooks");
+
+    std::fs::remove_dir_all(&hooks).unwrap();
+    assert!(!push_raw(&fixture.cache, &worktree, &format!("+HEAD:{pinned}")).await);
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    assert!(hooks.join("update").is_file(), "reinstalled");
+
+    std::fs::write(hooks.join("update"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert!(!push_raw(&fixture.cache, &worktree, &format!("+HEAD:{pinned}")).await);
+    assert_eq!(try_ref(head, &pinned), Some(wip.clone()));
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("update")).unwrap(),
+        UPDATE_HOOK
+    );
+
+    // The hooks directory cannot be made: no command, so no push.
+    std::fs::remove_dir_all(&hooks).unwrap();
+    std::fs::remove_dir_all(fixture.node.path().join("data")).unwrap();
+    std::fs::write(fixture.node.path().join("data"), "not a directory").unwrap();
+    assert!(service_command(GitService::ReceivePack, head, &remote(AGENT)).is_err());
+    assert!(service_command(GitService::UploadPack, head, &remote(AGENT)).is_ok());
+}
+
+/// Startup clears whatever an earlier run left in the hooks directory.
+#[test]
+fn configuring_the_hooks_removes_stale_files() {
+    let data = tempfile::tempdir().unwrap();
+    let hooks = data.path().join("node-git-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("stale"), "x").unwrap();
+    std::fs::write(hooks.join("update"), "#!/bin/sh\nexit 0\n").unwrap();
+    configure_receive_hooks(data.path()).unwrap();
+    assert!(!hooks.join("stale").exists());
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("update")).unwrap(),
+        UPDATE_HOOK
+    );
 }

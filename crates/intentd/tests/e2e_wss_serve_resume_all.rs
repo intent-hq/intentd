@@ -901,7 +901,11 @@ async fn startup_recovery_manual_resolution_wins_before_automatic_claim() {
     release.write_u8(1).await.unwrap();
     wait_for_sweep(fixture.root.path()).await;
     for (i, id) in fixture.agents.iter().enumerate() {
-        let session = fixture.store.get_agent_session(id).await.unwrap();
+        let session = fixture
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         assert_eq!(
             session.messages.iter().filter(|m| m.role == "user").count(),
             usize::from(i == 0),
@@ -951,7 +955,7 @@ async fn startup_recovery_shutdown_releases_unclaimed_candidates() {
     for agent in &fixture.agents {
         assert!(fixture
             .store
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .unwrap()
             .messages
@@ -1027,7 +1031,7 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     );
     let workspace = fixture
         .store
-        .get_agent_session(id)
+        .get_agent_session_with_transcript(id)
         .await
         .unwrap()
         .workspace_id;
@@ -1089,7 +1093,7 @@ async fn startup_completion_recovery_serves_wss_before_waking_parents() {
         let child = &fixture.agents[1];
         let mut session = fixture
             .store
-            .get_agent_session_summary(child)
+            .get_agent_session_without_messages(child)
             .await
             .unwrap();
         let workspace = session.workspace_id.clone();
@@ -1283,7 +1287,7 @@ async fn startup_completion_recovery_serves_wss_before_waking_parents() {
         .expect("completion delivered after release");
         let messages = fixture
             .store
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .unwrap()
             .messages;

@@ -145,6 +145,19 @@ fn parse_message_block_page(
     Ok(intent_core::MessageBlockPage { offset, max_bytes })
 }
 
+/// `maxBytes` on `git.diffs` / `git.branchDiff` (§5.6 "Response budget"):
+/// a positive integer sets the packed result's budget (the daemon clamps it into
+/// [64 KiB, 480,000]); absent / `null` → `None` (the 480,000-byte default);
+/// anything else → `-32602`.
+fn git_diff_max_bytes(params: &Map<String, Value>) -> Result<Option<usize>, RpcErr> {
+    match params.get("maxBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or_else(|| invalid_params("maxBytes must be a positive integer".to_string())),
+    }
+}
+
 fn parse_max_content_bytes(
     params: &Map<String, Value>,
 ) -> std::result::Result<Option<usize>, RpcErr> {
@@ -3083,7 +3096,7 @@ async fn dispatch(
             let detail = opt_str(params, "detail");
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail)
+                .agent_resolve_proposal(ws, agent_id, proposal_id, outcome, detail, None)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -3966,8 +3979,22 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // walk to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let max_bytes = git_diff_max_bytes(params)?;
+            // §5.6 "Response budget": resumes the file list a previous
+            // page cut (its trailing `{ nextToken }` entry).
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_diffs(ws, paths, staged, commit_hash, git_root_id)
+                .git_diffs_budgeted(
+                    ws,
+                    paths,
+                    staged,
+                    commit_hash,
+                    git_root_id,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -4069,8 +4096,20 @@ async fn dispatch(
             }
             let target_ref = opt_nonempty_str(params, "targetRef");
             let paths = opt_str_array(params, "paths");
+            let max_bytes = git_diff_max_bytes(params)?;
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .git_branch_diff(ws, base_ref, base_sha, target_ref, paths)
+                .git_branch_diff_budgeted(
+                    ws,
+                    base_ref,
+                    base_sha,
+                    target_ref,
+                    paths,
+                    intent_core::GitDiffPage {
+                        max_bytes,
+                        next_token,
+                    },
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -5581,6 +5620,36 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "script.start" | "script.stop" | "script.restart" | "script.output" | "script.status"
+        | "script.run"
+            if params.contains_key("remoteAgentId") =>
+        {
+            // A remote agent's machine run (`remoteScripts: 1`): status,
+            // output, stop and restart of an existing run; start and run
+            // are the remote agent's own. Guests keep the home run's narrow
+            // parameter set, plus the run's `remoteAgentId`.
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params.keys().any(|k| {
+                !(["workspaceId", "scriptId", "remoteAgentId"].contains(&k.as_str())
+                    || (method == "script.output" && k == "maxLines"))
+            }) {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId, scriptId and remoteAgentId",
+                ));
+            }
+            let ws = require_ws_note(params)?;
+            require_str_param(params, "scriptId")?;
+            require_str_param(params, "remoteAgentId")?;
+            let method = method.trim_start_matches("script.").to_owned();
+            api.script_machine_run(ws, method, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "script.start" => {
             if matches!(
                 intent_core::current_caller(),
@@ -6374,6 +6443,12 @@ fn strict_opt_str_array(
 /// Build [`ScriptCreateParams`] from `script.create` params: `name`, `command`,
 /// and `mode` (`service`|`command`) are required; the rest are optional.
 fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams, RpcErr> {
+    // `remoteAuthor` is daemon-owned (`remoteScripts: 1`), never a param.
+    if params.contains_key("remoteAuthor") {
+        return Err(invalid_params(
+            "remote-script-author-readonly: remoteAuthor is set by the backend",
+        ));
+    }
     let name = require_str_param(params, "name")?;
     let command = require_str_param(params, "command")?;
     let mode = match require_str_param(params, "mode")?.as_str() {

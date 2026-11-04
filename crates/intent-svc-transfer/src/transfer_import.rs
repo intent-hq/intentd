@@ -1564,6 +1564,9 @@ fn transform_rows(
                     rewrite_path(map, "cwd", &ws_dir);
                     // Source process ownership cannot cross daemon hosts.
                     map.insert("was_running".into(), serde_json::json!(0));
+                    // The remote agent and machine that authored the script
+                    // belong to the source daemon.
+                    map.insert("remote_author".into(), serde_json::Value::Null);
                 }
             }
             _ => {}
@@ -1669,6 +1672,18 @@ mod tests {
             .find(|(t, _)| t == table)
             .unwrap_or_else(|| panic!("table {table} missing from outcome"))
             .1
+    }
+
+    #[test]
+    fn imported_scripts_drop_the_source_daemons_remote_author() {
+        let outcome = transform_one(
+            "script",
+            serde_json::json!({"id":"s", "workspace_id":ws(), "cwd":null, "was_running":1,
+                "remote_author":"{\"agentId\":\"a\",\"nodeId\":\"mac\"}"}),
+        );
+        let script = &find(&outcome, "script")[0];
+        assert_eq!(script["remote_author"], serde_json::Value::Null);
+        assert_eq!(script["was_running"], serde_json::json!(0));
     }
 
     #[test]
@@ -2803,7 +2818,11 @@ mod tests {
             .unwrap();
         svc.workspace_import_commit_op(id).await.unwrap();
         let agent = intent_core::AgentId::from("agent-live");
-        let session = svc.store().get_agent_session(&agent).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         assert!(!session.is_active);
         assert!(session.acp_session_id.is_none());
         assert!(session.backend_session_id.is_none());
@@ -3545,7 +3564,7 @@ mod tests {
 
         let session = svc
             .store()
-            .get_agent_session(&intent_core::AgentId("agent-live".to_string()))
+            .get_agent_session_with_transcript(&intent_core::AgentId("agent-live".to_string()))
             .await
             .expect("session");
         assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
@@ -3789,7 +3808,7 @@ mod tests {
         assert!(svc.store().get_workspace(&ws).await.is_err());
         assert!(svc
             .store()
-            .get_agent_session(&AgentId::from("agent-live"))
+            .get_agent_session_with_transcript(&AgentId::from("agent-live"))
             .await
             .is_err());
     }

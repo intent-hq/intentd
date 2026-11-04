@@ -11,7 +11,8 @@
 //! acknowledge nothing, and cannot move the journal back to its lease.
 
 use intent_core::node_link::{
-    LeaseBinding, LinkFrame, LinkHello, LinkOutcome, LinkRpcError, MachineCapabilities, StopId,
+    FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
+    MachineCapabilities, StopId, StopOutcome, FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -96,18 +97,33 @@ enum Applied {
 pub(super) struct PendingAck {
     stop_id: StopId,
     agent_id: AgentId,
-    wait: StopWait,
+    wait: AckWait,
+}
+
+/// What a stop's acknowledgement waits for.
+enum AckWait {
+    Plain(StopWait),
+    /// A final stop: the stop, the final push and the checkout's removal.
+    Final(BoxFuture<'static, Option<(StopOutcome, FinalPush)>>),
 }
 
 impl PendingAck {
     /// Wait until the stop is applied, then build its `stopAck`; `None`
-    /// when it may not be acknowledged (the exit record was not journaled).
+    /// when it may not be acknowledged (the exit record was not journaled,
+    /// or a final stop's checkout could not be removed).
     pub(super) async fn ack(self) -> Option<LinkFrame> {
-        let outcome = self.wait.wait().await?;
+        let (outcome, final_push) = match self.wait {
+            AckWait::Plain(wait) => (wait.wait().await?, None),
+            AckWait::Final(wait) => {
+                let (outcome, push) = wait.await?;
+                (outcome, Some(push))
+            }
+        };
         Some(LinkFrame::StopAck {
             stop_id: self.stop_id,
             agent_id: self.agent_id,
             outcome,
+            final_push,
         })
     }
 }
@@ -149,11 +165,19 @@ async fn apply(
             prompt,
         } => runner.prompt(&agent_id, turn_id, prompt).await,
         LinkFrame::Cancel { agent_id } => runner.cancel(&agent_id).await,
-        LinkFrame::Stop { agent_id, stop_id } => {
+        LinkFrame::Stop {
+            agent_id,
+            stop_id,
+            final_stop,
+        } => {
             // Under the gate, so a replaced session stops nothing; the
-            // acknowledgement waits outside it, so a slow teardown holds up
-            // no other frame.
-            let wait = runner.stop(&agent_id);
+            // acknowledgement waits outside it, so a slow teardown (or a
+            // final stop's push and removal) holds up no other frame.
+            let wait = if final_stop {
+                AckWait::Final(runner.final_stop(&agent_id))
+            } else {
+                AckWait::Plain(runner.stop(&agent_id))
+            };
             return Applied::Stopping(PendingAck {
                 stop_id,
                 agent_id,
@@ -177,6 +201,25 @@ async fn apply(
     Applied::Done
 }
 
+/// Apply one script-lane frame (nodeProtocol 8) for `binding`'s session, on
+/// `link`. A replaced session starts and stops nothing.
+async fn apply_script(runner: &Runner, binding: &LeaseBinding, link: &NodeLink, frame: LinkFrame) {
+    let gate = runner.link_gate().lock().await;
+    if admit(gate.as_ref(), binding, link.is_closed()) == Admission::Replaced {
+        tracing::debug!("node: dropping a script frame from a replaced link");
+        return;
+    }
+    match frame {
+        LinkFrame::ScriptStart(command) => {
+            runner.script_start(link, binding.generation, command).await;
+        }
+        LinkFrame::ScriptStop(process) => runner.script_stop(link, &process),
+        other => {
+            tracing::debug!(frame = ?other.channel(), "node: ignoring unexpected script frame");
+        }
+    }
+}
+
 /// A fresh capabilities report, for [`LinkFrame::Capabilities`].
 pub(super) type Report =
     std::sync::Arc<dyn Fn() -> BoxFuture<'static, MachineCapabilities> + Send + Sync>;
@@ -191,8 +234,27 @@ pub(super) async fn serve_link(
 ) {
     let binding = hello.binding;
     let acked = hello.acked_seq;
+    let protocol = NODE_LINK_PROTOCOLS
+        .highest_common(hello.protocol)
+        .unwrap_or_default();
     match adopt(&runner, &binding, acked, || link.is_closed()).await {
-        Adopted::Ready => runner.head_link().set(link.clone()),
+        Adopted::Ready => {
+            runner.head_link().set(link.clone());
+            // The backend listed the agents it still records: the
+            // checkouts of any others are orphans.
+            // The list is taken now, before any frame of this link (a
+            // launch included) is handled.
+            if protocol >= FINAL_STOP_PROTOCOL {
+                let candidates = runner.sweep_candidates(&hello.lease_agents);
+                if !candidates.is_empty() {
+                    let runner = runner.clone();
+                    // caller-binding: allow — node-local checkout sweep for one bound backend
+                    tokio::spawn(async move {
+                        runner.sweep_checkouts(candidates).await;
+                    });
+                }
+            }
+        }
         Adopted::Replaced => {
             tracing::info!("node: link replaced before it was adopted");
             link.close();
@@ -227,6 +289,9 @@ pub(super) async fn serve_link(
                         .await;
                 });
             }
+            LinkEvent::Frame(frame) if frame.channel() == LinkChannel::Script => {
+                apply_script(&runner, &binding, &link, frame).await;
+            }
             LinkEvent::Frame(frame) => {
                 match apply(&runner, &binding, || link.is_closed(), frame).await {
                     Applied::Close => link.close(),
@@ -256,6 +321,8 @@ pub(super) async fn serve_link(
         }
     }
     streamer.abort();
+    // No script outlives the link that started it.
+    runner.end_binding_scripts(binding.generation).await;
 }
 
 /// Send every record after `acked`, then `ReplayComplete`, then each new

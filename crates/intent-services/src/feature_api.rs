@@ -99,10 +99,10 @@ pub mod delivery_tasks {
 /// The feature ports core calls features through.
 pub mod feature_ports {
     pub use crate::feature_ports::{
-        monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity, MergeOutcome,
-        ProvisionOutcome, RemoteLaunchPort, RemoteRuntime, RuntimePort, ScriptsClosing,
-        SetupScriptRun, TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch,
-        IMPORT_MAX_CHUNK_BYTES,
+        monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity,
+        MachineScriptLink, MergeOutcome, ProvisionOutcome, RemoteLaunchPort, RemoteRuntime,
+        RemoteScriptCaller, RuntimePort, ScriptFrameSender, ScriptsClosing, SetupScriptRun,
+        TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch, IMPORT_MAX_CHUNK_BYTES,
     };
 }
 
@@ -219,7 +219,8 @@ pub mod retire {
 /// Shell selection and environment scrubbing.
 pub mod shell {
     pub use crate::shell::{
-        default_shell, scrubbed_env_vars_except, shell_args, shell_true_invocation,
+        default_shell, enhanced_shell_path, saved_script_env_overlay, scrubbed_env_vars_except,
+        shell_args, shell_true_invocation,
     };
 }
 

@@ -26,7 +26,11 @@ pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usiz
     let deadline = std::time::Instant::now()
         + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
-        let session = svc.store().get_agent_session(id).await.expect("session");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         let texts: Vec<String> = session
             .messages
             .iter()

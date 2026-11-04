@@ -327,7 +327,7 @@ async fn workspace_delete_survives_write_pool_acquire_timeout() {
     );
     assert!(
         matches!(
-            store.get_agent_session(&agent_id).await,
+            store.get_agent_session_with_transcript(&agent_id).await,
             Err(Error::NotFound(_))
         ),
         "agent session removed"

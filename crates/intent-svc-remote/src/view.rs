@@ -14,7 +14,7 @@ pub(crate) async fn update(
     agent_id: &AgentId,
     change: impl FnOnce(&mut RemotePlacementView),
 ) -> Result<bool> {
-    let session = match store.get_agent_session(agent_id).await {
+    let session = match store.get_agent_session_summary(agent_id).await {
         Ok(session) => session,
         Err(Error::NotFound(_)) => return Ok(false),
         Err(error) => return Err(error),

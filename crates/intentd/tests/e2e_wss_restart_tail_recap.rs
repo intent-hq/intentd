@@ -260,7 +260,7 @@ where
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let session = store
-            .get_agent_session(&AgentId(agent_id.to_string()))
+            .get_agent_session_with_transcript(&AgentId(agent_id.to_string()))
             .await
             .expect("get agent session");
         if pred(&session.messages) {
@@ -507,7 +507,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         .await
         .expect("open store");
     let session = store
-        .get_agent_session(&intent_core::AgentId(agent_id.clone()))
+        .get_agent_session_with_transcript(&intent_core::AgentId(agent_id.clone()))
         .await
         .expect("get agent session");
     assert!(

@@ -12,7 +12,7 @@ use intent_core::{
         NodeState,
     },
     now_iso,
-    remote_launch::RemoteAgentRecord,
+    remote_launch::{FinalStopReason, RemoteAgentRecord, RemoteFinalStopRecord},
     AgentId, Error, Result, WorkspaceId,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -907,6 +907,36 @@ impl Store {
         }))
     }
 
+    /// The remote placements among `agent_ids`, in one statement (agents
+    /// placed locally have none).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_remote_agents(&self, agent_ids: &[AgentId]) -> Result<Vec<RemoteAgentRecord>> {
+        if agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = agent_ids.iter().map(AgentId::as_str).collect();
+        let ids = serde_json::to_string(&ids).map_err(|e| Error::Internal(e.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT agent_id, workspace_id, node_id, lease_id, created_at FROM remote_agent \
+             WHERE agent_id IN (SELECT value FROM json_each(?)) ORDER BY created_at, agent_id",
+        )
+        .bind(ids)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| RemoteAgentRecord {
+                agent_id: AgentId::from(row.get::<String, _>("agent_id")),
+                workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+                node_id: row.get("node_id"),
+                lease_id: row.get("lease_id"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
     /// Forget that `agent_id` runs remotely. Returns whether it was recorded.
     /// # Errors
     /// Returns database errors.
@@ -918,6 +948,119 @@ impl Store {
             .map_err(db)?;
         Ok(done.rows_affected() > 0)
     }
+
+    /// Record a final stop for `stop.agent_id`, unless one is already
+    /// recorded; returns the recorded one (whose `stop_id` every resend
+    /// reuses).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn record_final_stop(
+        &self,
+        stop: &RemoteFinalStopRecord,
+    ) -> Result<RemoteFinalStopRecord> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        sqlx::query(
+            "INSERT INTO remote_final_stop (agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id) DO NOTHING",
+        )
+        .bind(stop.agent_id.as_str())
+        .bind(stop.workspace_id.as_str())
+        .bind(&stop.machine_id)
+        .bind(&stop.lease_id)
+        .bind(&stop.stop_id)
+        .bind(stop.reason.as_str())
+        .bind(&stop.repo_path)
+        .bind(&stop.requested_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        let row = sqlx::query(&format!("{FINAL_STOP_SELECT} WHERE agent_id = ?"))
+            .bind(stop.agent_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+        let recorded = final_stop_row(&row)?;
+        tx.commit().await.map_err(db)?;
+        Ok(recorded)
+    }
+
+    /// The final stops recorded on `lease_id`, oldest first.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn list_final_stops(&self, lease_id: &str) -> Result<Vec<RemoteFinalStopRecord>> {
+        let rows = sqlx::query(&format!(
+            "{FINAL_STOP_SELECT} WHERE lease_id = ? ORDER BY requested_at, agent_id"
+        ))
+        .bind(lease_id)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(db)?;
+        rows.iter().map(final_stop_row).collect()
+    }
+
+    /// `agent_id`'s recorded final stop, if any.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn get_final_stop(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<RemoteFinalStopRecord>> {
+        let row = sqlx::query(&format!("{FINAL_STOP_SELECT} WHERE agent_id = ?"))
+            .bind(agent_id.as_str())
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(db)?;
+        row.as_ref().map(final_stop_row).transpose()
+    }
+
+    /// The final stop `stop_id` of `agent_id` is done (acknowledged, or past
+    /// its bound): drop its record and, unless its session can come back
+    /// ([`FinalStopReason::keeps_placement`]), the agent's placement record,
+    /// in one transaction. Returns whether that final stop was recorded.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: &str) -> Result<bool> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let reason = sqlx::query(
+            "DELETE FROM remote_final_stop WHERE agent_id = ? AND stop_id = ? RETURNING reason",
+        )
+        .bind(agent_id.as_str())
+        .bind(stop_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        .map(|row| row.get::<String, _>("reason"));
+        let Some(reason) = reason else {
+            return Ok(false);
+        };
+        let keeps = FinalStopReason::parse(&reason).is_some_and(FinalStopReason::keeps_placement);
+        if !keeps {
+            sqlx::query("DELETE FROM remote_agent WHERE agent_id = ?")
+                .bind(agent_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+}
+
+const FINAL_STOP_SELECT: &str = "SELECT agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at FROM remote_final_stop";
+
+fn final_stop_row(row: &sqlx::sqlite::SqliteRow) -> Result<RemoteFinalStopRecord> {
+    let reason: String = row.get("reason");
+    Ok(RemoteFinalStopRecord {
+        agent_id: AgentId::from(row.get::<String, _>("agent_id")),
+        workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+        machine_id: row.get("machine_id"),
+        lease_id: row.get("lease_id"),
+        stop_id: row.get("stop_id"),
+        reason: FinalStopReason::parse(&reason)
+            .ok_or_else(|| db(format!("unknown final stop reason {reason}")))?,
+        repo_path: row.get("repo_path"),
+        requested_at: row.get("requested_at"),
+    })
 }
 
 fn check_assignment(current: &NodeAssignment, expected: &NodeAssignment) -> Result<()> {

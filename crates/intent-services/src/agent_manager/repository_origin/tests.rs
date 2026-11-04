@@ -102,6 +102,7 @@ pub(super) fn handle(
                     _rules_config: None,
                     _pi_extension: None,
                     npx_launch_dir: None,
+                    agent_tmp_dir: None,
                     preparation_guard: None,
                     cleanup_lease: None,
                     cleanup_services: None,
@@ -342,7 +343,7 @@ impl Fixture {
         self.manager
             .services
             .store
-            .get_agent_session(&self.row.id)
+            .get_agent_session_with_transcript(&self.row.id)
             .await
             .unwrap()
     }
@@ -449,7 +450,7 @@ async fn actual_start_session_retains_original_owner_through_metadata_and_idle()
         .manager
         .services
         .store
-        .get_agent_session(&f.row.id)
+        .get_agent_session_with_transcript(&f.row.id)
         .await
         .unwrap();
     assert_eq!(stored.system_prompt.as_deref(), Some("assembled prompt"));
@@ -603,7 +604,7 @@ async fn pending_initialization_cancellation_keeps_the_original_callback_unavail
         .manager
         .services
         .store
-        .get_agent_session(&f.row.id)
+        .get_agent_session_with_transcript(&f.row.id)
         .await
         .unwrap()
         .acp_session_id
@@ -1836,6 +1837,7 @@ for line in sys.stdin:
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            agent_tmp_dir: None,
             preparation_guard: None,
             cleanup_lease: None,
             cleanup_services: None,
@@ -2051,7 +2053,7 @@ async fn manager_shutdown_retains_pending_native_startup_until_original_response
         .manager
         .services
         .store
-        .get_agent_session(&f.row.id)
+        .get_agent_session_with_transcript(&f.row.id)
         .await
         .unwrap()
         .acp_session_id

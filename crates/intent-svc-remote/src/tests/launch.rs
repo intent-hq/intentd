@@ -137,7 +137,7 @@ impl Fixture {
         let session = self
             .services
             .store()
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .unwrap();
         RemotePlacementView::from_metadata(session.metadata.as_ref()).unwrap()
@@ -297,7 +297,12 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
     // The node gates the agent's workspace API with its session's
     // captured features (review of intentd#2786).
-    let session = f.services.store().get_agent_session(&agent).await.unwrap();
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(
         launch.agent_features,
         serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
@@ -578,21 +583,138 @@ async fn git_sessions_are_confined_to_the_leases_agents() {
     let binding = link.hello.binding.clone();
     let remote = |agent: &AgentId| AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
 
-    let path = access.repository(&binding, &remote(&agent)).await.unwrap();
+    let path = access
+        .repository(&binding, &remote(&agent), GitService::UploadPack)
+        .await
+        .unwrap();
     assert_eq!(path, f.repo.path());
     assert!(matches!(
-        access.repository(&binding, &remote(&unplaced)).await,
+        access
+            .repository(&binding, &remote(&unplaced), GitService::UploadPack)
+            .await,
         Err(Error::Forbidden(_))
     ));
     let other_workspace = AgentRemote::new("ws-other", agent.as_str()).unwrap();
     assert!(matches!(
-        access.repository(&binding, &other_workspace).await,
+        access
+            .repository(&binding, &other_workspace, GitService::UploadPack)
+            .await,
         Err(Error::Forbidden(_))
     ));
     let mut stale = binding.clone();
     stale.generation = NodeCounter(binding.generation.0 - 1);
-    assert!(access.repository(&stale, &remote(&agent)).await.is_err());
+    assert!(access
+        .repository(&stale, &remote(&agent), GitService::UploadPack)
+        .await
+        .is_err());
     let _ = GitService::UploadPack;
+    f.node.shutdown();
+}
+
+/// A final stop admits the agent's last push. Below nodeProtocol 9 the
+/// machine may acknowledge before pushing, so the push stays admitted for
+/// the grace after the ack, then is refused.
+#[tokio::test]
+async fn a_final_push_is_admitted_through_the_grace_after_a_below_9_ack() {
+    let (f, mut link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let access = crate::git::HeadGitAccess::new(f.node.shared());
+    let binding = link.hello.binding.clone();
+    let remote = AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+    let stop_id = f
+        .node
+        .final_stop(
+            &agent,
+            intent_core::remote_launch::FinalStopReason::AgentDeleted,
+        )
+        .await;
+    assert_eq!(link.stop_for(&agent).await, stop_id);
+    link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        access
+            .repository(&binding, &remote, GitService::ReceivePack)
+            .await
+            .unwrap(),
+        f.repo.path(),
+        "a push inside the grace is admitted"
+    );
+    tokio::time::timeout(wait(), async {
+        while f
+            .backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the grace ends");
+    assert!(
+        matches!(
+            access
+                .repository(&binding, &remote, GitService::ReceivePack)
+                .await,
+            Err(Error::Forbidden(_))
+        ),
+        "a push after the grace is refused"
+    );
+    f.node.shutdown();
+}
+
+/// A final-stop record admits receive-pack only, never upload-pack; when
+/// the workspace's repository is gone the push is unavailable, not denied.
+#[tokio::test]
+async fn a_final_stop_admits_only_the_push_and_reports_a_missing_repository() {
+    let (f, mut link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let access = crate::git::HeadGitAccess::new(f.node.shared());
+    let binding = link.hello.binding.clone();
+    let remote = AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
+    let stop_id = f
+        .node
+        .final_stop(
+            &agent,
+            intent_core::remote_launch::FinalStopReason::AgentDeleted,
+        )
+        .await;
+    assert_eq!(link.stop_for(&agent).await, stop_id);
+    assert_eq!(
+        access
+            .repository(&binding, &remote, GitService::ReceivePack)
+            .await
+            .unwrap(),
+        f.repo.path()
+    );
+    assert!(matches!(
+        access
+            .repository(&binding, &remote, GitService::UploadPack)
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    sqlx::query(
+        "UPDATE remote_final_stop SET repo_path = '/nonexistent/intent-repo' WHERE agent_id = ?",
+    )
+    .bind(agent.as_str())
+    .execute(f.backend.store().write_pool())
+    .await
+    .unwrap();
+    match access
+        .repository(&binding, &remote, GitService::ReceivePack)
+        .await
+    {
+        Err(Error::Internal(message)) => assert!(
+            message.starts_with(intent_transport::node_link::git_codes::UNAVAILABLE),
+            "{message}"
+        ),
+        other => panic!("expected node-git-unavailable, got {other:?}"),
+    }
     f.node.shutdown();
 }
 
@@ -660,7 +782,15 @@ async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
         "{unknown:?}"
     );
 
-    for method in ["script.list", "file.read", "hook.list", "workspace.info"] {
+    // `script.*` is forwarded by a protocol-8 machine, but this backend
+    // does not run machine runs yet, so it refuses them too.
+    for method in [
+        "script.list",
+        "script.start",
+        "file.read",
+        "hook.list",
+        "workspace.info",
+    ] {
         let error = refused(forward(&link, &agent, method, json!({})).await);
         assert!(
             error.message.starts_with("remote-agent-unsupported"),
@@ -862,7 +992,7 @@ async fn connected_machines_count_live_links() {
 async fn sessions(f: &Fixture) -> Vec<intent_core::AgentSession> {
     f.services
         .store()
-        .list_agent_sessions(&workspace())
+        .list_agent_sessions_with_transcripts(&workspace())
         .await
         .unwrap()
 }
@@ -894,7 +1024,7 @@ async fn placement_of(f: &Fixture, agent: &str) -> Option<RemotePlacementView> {
     let session = f
         .services
         .store()
-        .get_agent_session(&AgentId::from(agent))
+        .get_agent_session_with_transcript(&AgentId::from(agent))
         .await
         .unwrap();
     RemotePlacementView::from_metadata(session.metadata.as_ref())
@@ -921,7 +1051,7 @@ async fn a_remote_agents_sub_agent_defaults_to_its_machine() {
     let session = f
         .services
         .store()
-        .get_agent_session(&AgentId::from(id))
+        .get_agent_session_with_transcript(&AgentId::from(id))
         .await
         .unwrap();
     assert_eq!(session.parent_agent_id, Some(parent.clone()));
@@ -1071,7 +1201,12 @@ async fn user_and_local_agent_creates_stay_on_the_backend() {
         .execute(f.services.store().write_pool())
         .await
         .unwrap();
-    let session = f.services.store().get_agent_session(&local).await.unwrap();
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&local)
+        .await
+        .unwrap();
     let host = intent_acp::make_workspace_host_for_bridge(
         std::sync::Arc::new(f.services.clone()),
         workspace(),

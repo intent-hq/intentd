@@ -20,9 +20,11 @@ use base64::Engine as _;
 use intent_acp::{
     AcpError, AcpResult, TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo,
 };
-use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT};
+use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT, TERMINAL_PROCESS};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
-use intent_pty::{LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+use intent_pty::{
+    LineSnapshot, OutputChunk, PtyExit, PtyHost, PtyId, PtyProcess, PtySize, SpawnSpec,
+};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -46,6 +48,16 @@ use intent_services::feature_api::{
 /// — without a `terminal.kill` — never closes the live channel; polling the
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
+
+/// Delay after output before re-reading the foreground program. A program
+/// start or exit almost always prints (the echoed Enter, a new prompt), so
+/// output drives the check; the delay lets the new program take the
+/// foreground first and folds a burst of output into one check.
+const PROCESS_SETTLE: Duration = Duration::from_millis(250);
+
+/// Fallback check for a change with no output (e.g. a job resumed by a
+/// signal from another terminal).
+const PROCESS_IDLE_CHECK: Duration = Duration::from_secs(5);
 
 /// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
 const DEFAULT_TERM: &str = "xterm-256color";
@@ -213,8 +225,8 @@ async fn default_cwd(
     caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Option<PathBuf> {
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return Some(sandbox_path.into());
             }
         }
@@ -383,13 +395,16 @@ pub(crate) fn get_buffer(
 }
 
 /// The workspace's live terminals wrapped in the per-boot envelope
-/// `{ terminals: [{ id, name, cwd, isExecutingCommand }], daemonBootId }`
+/// `{ terminals: [{ id, name, cwd, isExecutingCommand, foregroundProcess,
+/// lastProcess }], daemonBootId }`
 /// (§5.13; monorepo#1334). Exited PTYs are omitted while their sessions remain
 /// retained for post-exit output and release. `name` is the display name given
 /// at spawn (`SpawnSpec::name`, e.g. "Setup Script"), else the constant
 /// `"Terminal"`; `cwd` is the working directory resolved at spawn;
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
-/// running command). `daemon_boot_id` is the daemon's per-process boot id, so
+/// running command). `foregroundProcess` / `lastProcess` are the cached
+/// foreground program and the previous one (`null` when none), refreshed by
+/// the output streamer off the read path. `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
 #[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
@@ -409,11 +424,14 @@ pub(crate) fn list(
                 .and_then(|i| i.name.as_deref())
                 .unwrap_or("Terminal");
             let is_executing = info.as_ref().is_some_and(|i| i.alive);
+            let process = info.as_ref().map(|i| i.process.clone()).unwrap_or_default();
             let value = json!({
                 "id": id_str,
                 "name": name,
                 "cwd": cwd,
                 "isExecutingCommand": is_executing,
+                "foregroundProcess": process.foreground,
+                "lastProcess": process.last,
             });
             (id_str, value)
         })
@@ -587,6 +605,8 @@ fn utf8_len(b: u8) -> usize {
 
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
+/// While it runs, it re-reads the foreground program shortly after output
+/// (and on a slow idle fallback) and emits `terminal:process` on each change.
 pub(crate) fn spawn_output_stream(
     tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
@@ -603,6 +623,9 @@ pub(crate) fn spawn_output_stream(
             return;
         };
         let mut live = attachment.live;
+        let process_check = tokio::time::sleep(PROCESS_IDLE_CHECK);
+        tokio::pin!(process_check);
+        let mut process_check_soon = false;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
@@ -617,12 +640,25 @@ pub(crate) fn spawn_output_stream(
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk),
+                    Ok(chunk) => {
+                        emit_data(bus.as_ref(), &workspace_id, &terminal_id, pty.daemon_boot_id(), &chunk);
+                        if !process_check_soon {
+                            process_check_soon = true;
+                            process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_SETTLE);
+                        }
+                    }
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
+                () = &mut process_check => {
+                    if let Ok(Some(process)) = pty.refresh_process(pty_id) {
+                        emit_process(bus.as_ref(), &workspace_id, &terminal_id, &process);
+                    }
+                    process_check_soon = false;
+                    process_check.as_mut().reset(tokio::time::Instant::now() + PROCESS_IDLE_CHECK);
+                }
                 () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
@@ -680,6 +716,24 @@ fn emit_data(
             ws,
             TERMINAL_DATA,
             json!({ "terminalId": terminal_id, "chunk": chunk, "daemonBootId": daemon_boot_id, "startOffset": output.start_offset.to_string(), "endOffset": output.end_offset.to_string() }),
+        ),
+    );
+}
+
+/// Broadcast a `terminal:process` event with the terminal's foreground program
+/// and the previous one. Transient like `terminal:data`: `terminal.list`
+/// carries the same fields for clients that reconnect.
+fn emit_process(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, process: &PtyProcess) {
+    publish_event_transient(
+        bus,
+        &terminal_event(
+            ws,
+            TERMINAL_PROCESS,
+            json!({
+                "terminalId": terminal_id,
+                "foregroundProcess": process.foreground,
+                "lastProcess": process.last,
+            }),
         ),
     );
 }

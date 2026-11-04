@@ -308,6 +308,20 @@ fn fixed(method: &'static str, why: &'static str, variants: Vec<Variant>) -> Row
 /// hand their params to.
 const SCRIPT_LIST_PARSE: (&str, &str, &str) = ("intent-core/src/script_lists.rs", "parse", "value");
 
+/// `remote_scripts::machine_run_call`, which `script.*` hands its params to
+/// when they carry `remoteAgentId` (a remote agent's machine run).
+const MACHINE_RUN_PARSE: (&str, &str, &str) = (
+    "intent-svc-runtime/src/remote_scripts.rs",
+    "machine_run_call",
+    "params",
+);
+
+/// The seeded daemon has no remote machines, so no machine run to address.
+const MACHINE_RUN_UNEXERCISED: &[(&str, &str)] = &[(
+    "remoteAgentId",
+    "Addresses a remote agent's machine run (remoteScripts: 1); the seeded daemon has no remote machine. Its replies use the home run's bounded-output helpers, covered above 480,000 escaped bytes by machine_runs::tests::machine_run_output_replies_are_bounded.",
+)];
+
 impl Row {
     fn parsed_by(
         mut self,
@@ -912,6 +926,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "baseRef": s.base_branch, "paths": ["src/history/module_1.rs"] }),
                     Bytes(1024),
                 ),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "baseRef": s.base_branch, "maxBytes": 1_000_000 }),
+                    Bytes(256 * 1024),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "baseRef": s.base_branch, "maxBytes": 65_536 }),
+                    "/-/nextToken",
+                    "nextToken",
+                    Bytes(16 * 1024),
+                ),
             ],
         ),
         fixed(
@@ -1003,6 +1029,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "git.diffs",
             vec![
                 v("default", w.clone(), Items("", 1_000)),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "maxBytes": 1_000_000 }),
+                    Items("", 1_000),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "maxBytes": 65_536 }),
+                    "/-/nextToken",
+                    "nextToken",
+                    Items("", 100),
+                ),
                 v(
                     "staged",
                     json!({ "workspaceId": ws, "staged": true }),
@@ -1607,7 +1645,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     Bytes(8 * 1024),
                 ),
             ],
-        ),
+        )
+        .parsed_by(MACHINE_RUN_PARSE, &[])
+        .skip(MACHINE_RUN_UNEXERCISED),
         fixed(
             "script.status",
             "Runtime state of one script.",
@@ -1616,7 +1656,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 json!({ "workspaceId": ws, "scriptId": s.loud_script }),
                 Fixed("/status"),
             )],
-        ),
+        )
+        .parsed_by(MACHINE_RUN_PARSE, &[])
+        .skip(MACHINE_RUN_UNEXERCISED),
         fixed(
             "scriptMonitor.get",
             "One script monitor.",

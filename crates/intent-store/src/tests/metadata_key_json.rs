@@ -108,7 +108,10 @@ async fn recovers_after_real_pool_timeout_preserving_newer_sibling_metadata() {
         observed.load(Ordering::SeqCst) >= 1,
         "no actual timeout observed"
     );
-    let session = store.get_agent_session(&id).await.expect("read agent");
+    let session = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read agent");
     assert_eq!(
         session.metadata,
         Some(json!({
@@ -122,7 +125,10 @@ async fn recovers_after_real_pool_timeout_preserving_newer_sibling_metadata() {
 #[tokio::test]
 async fn permanent_pool_contention_returns_last_error_after_existing_deadline() {
     let (tmp, mut store, ws, id) = setup().await;
-    let before = store.get_agent_session(&id).await.expect("read before");
+    let before = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read before");
     shorten_acquire_timeout(&mut store, &tmp).await;
     let held = store
         .write_pool()
@@ -165,7 +171,10 @@ async fn permanent_pool_contention_returns_last_error_after_existing_deadline() 
         elapsed >= crate::BUSY_RETRY_DEADLINE,
         "returned before the retry deadline: {elapsed:?}"
     );
-    let after = store.get_agent_session(&id).await.expect("read after");
+    let after = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read after");
     assert_eq!(after.metadata, before.metadata);
     assert_eq!(after.updated_at, before.updated_at);
 }
@@ -193,7 +202,10 @@ async fn preserves_json_value_types_and_siblings_on_repeated_writes() {
                 )
                 .await
                 .expect("set JSON value");
-            let session = store.get_agent_session(&id).await.expect("read agent");
+            let session = store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .expect("read agent");
             assert_eq!(
                 session.metadata,
                 Some(json!({
@@ -235,7 +247,7 @@ async fn preserves_null_and_nonobject_metadata_defenses() {
         };
         assert_eq!(
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .expect("read agent")
                 .metadata,
@@ -253,7 +265,10 @@ async fn missing_agent_and_wrong_workspace_remain_not_found_without_mutation() {
         .await
         .expect("insert other workspace");
     let other_id = AgentId::new();
-    let before = store.get_agent_session(&id).await.expect("read before");
+    let before = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read before");
     for (workspace, agent) in [(&other_ws, &id), (&ws, &other_id)] {
         let error = timeout(
             watchdog(),
@@ -270,7 +285,10 @@ async fn missing_agent_and_wrong_workspace_remain_not_found_without_mutation() {
         .expect_err("missing scoped agent");
         assert!(matches!(error, Error::NotFound(_)), "{error:?}");
     }
-    let after = store.get_agent_session(&id).await.expect("read after");
+    let after = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read after");
     assert_eq!(after.metadata, before.metadata);
     assert_eq!(after.updated_at, before.updated_at);
 }
@@ -278,7 +296,10 @@ async fn missing_agent_and_wrong_workspace_remain_not_found_without_mutation() {
 #[tokio::test]
 async fn malformed_json_and_closed_pool_fail_without_retry_or_mutation() {
     let (_tmp, store, ws, id) = setup().await;
-    let before = store.get_agent_session(&id).await.expect("read before");
+    let before = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("read before");
     let error = timeout(
         watchdog(),
         store.set_agent_session_metadata_key_json(
@@ -297,7 +318,7 @@ async fn malformed_json_and_closed_pool_fail_without_retry_or_mutation() {
         "{error:?}"
     );
     let after = store
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("read after bad value");
     assert_eq!(after.metadata, before.metadata);

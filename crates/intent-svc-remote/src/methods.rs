@@ -61,6 +61,11 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
     if let Some(last) = &row.last_connected_at {
         machine.insert("lastConnectedAt".into(), json!(last));
     }
+    // Served with `remoteScripts: 1`: a machine below 8 needs an update
+    // before its agents can use saved scripts.
+    if let Some(protocol) = row.node_protocol {
+        machine.insert("nodeProtocol".into(), json!(protocol));
+    }
     Value::Object(machine)
 }
 
@@ -354,6 +359,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
             .as_ref()
             .map_or_else(|| now.clone(), |row| row.added_at.clone()),
         last_connected_at: Some(now),
+        node_protocol: Some(welcome.protocol),
     };
 
     // Save. A new credential replaces the lease: the old connector stops
@@ -432,11 +438,24 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         if running > 0 && !stop_agents {
             return Err(in_use(&row.name, running));
         }
-        let stopped = node.stop_all();
+        let stopped = node.stop_all().await;
         deliver_stops(feature, &node, &stopped, &row.name).await?;
     }
     if let Some(node) = feature.take_node(&machine_id) {
         node.shutdown();
+    }
+    // The machine is forgotten: no connector will resend a final stop it
+    // did not acknowledge (it was revoked), so their records go too.
+    let head_id = store.daemon_id().await?;
+    for lease in store.list_owned_node_leases(&head_id).await? {
+        if lease.owner.node_id != machine_id {
+            continue;
+        }
+        for stop in store.list_final_stops(&lease.owner.lease_id).await? {
+            store
+                .finish_final_stop(&stop.agent_id, &stop.stop_id)
+                .await?;
+        }
     }
     let credential = store.remove_exposed_machine(&machine_id).await?;
     svc.delete_remote_machine_token(&machine_id).await?;
@@ -524,7 +543,8 @@ fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
 /// forgotten: the machine keeps its agents running across a lost link, and
 /// once its credential and lease are gone nothing could reach them. Waits at
 /// most [`crate::connector::Tuning::remove_timeout`] (30 s), the connect
-/// included. When any stop is unacknowledged the removal fails
+/// included, or [`crate::connector::Tuning::final_remove_timeout`] (90 s, to
+/// fit the machine's 60 s final push) once the link speaks nodeProtocol 9. When any stop is unacknowledged the removal fails
 /// `machine-unreachable` with `unconfirmedStops` and everything stays, the
 /// stops still queued and resent. A revoked credential needs no stops.
 async fn deliver_stops(
@@ -536,7 +556,8 @@ async fn deliver_stops(
     if agents.is_empty() {
         return Ok(());
     }
-    let deadline = tokio::time::Instant::now() + feature.tuning().remove_timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + feature.tuning().remove_timeout;
     let mut attempts = json!([]);
     // A connect that does not finish in time leaves the stops unconfirmed.
     if let Ok(Err(error)) = tokio::time::timeout_at(deadline, node.connect()).await {
@@ -551,11 +572,29 @@ async fn deliver_stops(
         }
     }
     // An unreachable machine cannot ack now; the stops stay queued.
-    let unconfirmed = if attempts.as_array().is_some_and(|a| !a.is_empty()) {
-        node.wait_stops(agents, tokio::time::Instant::now()).await
+    let unreachable = attempts.as_array().is_some_and(|a| !a.is_empty());
+    let wait_until = if unreachable {
+        tokio::time::Instant::now()
     } else {
-        node.wait_stops(agents, deadline).await
+        started + node.shared_ref().remove_budget()
     };
+    // The agents' stops and their script runs' stops are awaited together,
+    // within the same budget: every script stop is sent before any wait, and
+    // an unacknowledged script stop leaves its agent unconfirmed.
+    let shared = node.shared();
+    let (mut unconfirmed, scripts_unacked) = tokio::join!(
+        node.wait_stops(agents, wait_until),
+        shared.end_agents_machine_runs(
+            agents,
+            wait_until,
+            "remote-script-lost: the machine was removed",
+        ),
+    );
+    for agent in scripts_unacked {
+        if !unconfirmed.contains(&agent) {
+            unconfirmed.push(agent);
+        }
+    }
     if unconfirmed.is_empty() {
         return Ok(());
     }

@@ -75,10 +75,19 @@ async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
     assert_eq!(machine_json["capabilities"]["capacity"]["agentCap"], 2);
     assert!(machine_json["addedAt"].is_string());
     assert!(machine_json["lastConnectedAt"].is_string());
+    // The version the probe's bind negotiated (`remoteScripts: 1`).
+    assert_eq!(
+        machine_json["nodeProtocol"],
+        json!(intent_core::node_link::NODE_LINK_PROTOCOLS.max)
+    );
     assert!(added.get("replacedCredentialId").is_none());
 
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed["machines"][0]["nodeProtocol"],
+        json!(intent_core::node_link::NODE_LINK_PROTOCOLS.max)
+    );
     for text in [added.to_string(), listed.to_string()] {
         assert!(!text.contains(&machine.token), "never the token");
     }
@@ -89,6 +98,17 @@ async fn add_probes_then_saves_the_machine_and_keeps_the_token_secret() {
             .await
             .unwrap(),
         Some(machine.token.clone())
+    );
+    assert_eq!(
+        backend
+            .store()
+            .get_exposed_machine(&machine.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .node_protocol,
+        Some(intent_core::node_link::NODE_LINK_PROTOCOLS.max),
+        "the bind's version is stored"
     );
     let row = backend
         .store()
@@ -732,6 +752,7 @@ async fn a_host_that_stalls_the_bind_does_not_hide_a_valid_one() {
 async fn remove_fails_and_keeps_everything_when_stops_go_unacknowledged() {
     let mut quick = tuning();
     quick.remove_timeout = std::time::Duration::from_millis(800);
+    quick.final_remove_timeout = std::time::Duration::from_millis(800);
     let backend = Backend::with_tuning(quick).await;
     let mut machine = backend.machine().await;
     let node = backend.expose(&mut machine).await;

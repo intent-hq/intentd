@@ -1,0 +1,7 @@
+error[E0594]: cannot assign to data in dereference of `AgentSessionSummary`
+ --> tests/ui/agent_session_summary_mutate.rs:3:5
+  |
+3 |     summary.status = intent_core::AgentStatus::Idle;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot assign
+  |
+  = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `AgentSessionSummary`

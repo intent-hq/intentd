@@ -320,7 +320,10 @@ pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
         let mut should_remove = false;
 
         // Check if the agent session still exists
-        let agent_exists = store.get_agent_session(&sandbox.agent_id).await.is_ok();
+        let agent_exists = store
+            .get_agent_session_with_transcript(&sandbox.agent_id)
+            .await
+            .is_ok();
         if !agent_exists {
             should_remove = true;
         }

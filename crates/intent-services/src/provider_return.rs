@@ -439,7 +439,7 @@ impl Services {
     ) {
         let away = self
             .store
-            .get_agent_session(agent_id)
+            .get_agent_session_summary(agent_id)
             .await
             .ok()
             .and_then(|s| read_state(&s))
@@ -476,7 +476,11 @@ impl Services {
     /// the session read can predate a manual choice, even one of the same
     /// selection, and that choice's first turn tries it.
     pub(crate) async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
             return;
         };
         self.return_home_if_due_from(workspace_id, agent_id, session)
@@ -627,7 +631,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
             return;
         };
         self.avoid_exhausted_provider_from(workspace_id, agent_id, &session)
@@ -699,7 +707,7 @@ impl Services {
     /// the in-memory mark does not survive a daemon restart, the persisted
     /// state does. A no-op otherwise.
     pub(crate) async fn rearm_provider_return_if_home(&self, agent_id: &AgentId) {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         let Some(state) = read_state(&session) else {
@@ -744,7 +752,7 @@ impl Services {
         {
             return;
         }
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return;
         };
         let Some(state) = read_state(&session) else {
@@ -837,7 +845,7 @@ impl Services {
         from: &str,
         to: &str,
     ) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         read_state(&session).is_some_and(|s| {
