@@ -2334,3 +2334,146 @@ async fn chat_full_mode_text_past_budget_sends_cut_marker() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Single-row bound on progressive history (§7.1, the app's default
+/// `historyDelivery: "progressive"`): with an over-budget 600 KB text row as
+/// the newest row (it lands in seq-0) and a ~300-block tool row before it,
+/// the seq-0 snapshot and every `history` frame stay within the read budget,
+/// the cut rows carry their markers, and every row is delivered.
+#[intent_test_macros::daemon_test]
+async fn chat_progressive_history_over_budget_rows_fit_read_payload_budget() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+    let store = bus.store();
+
+    let small = Uuid::now_v7().to_string();
+    let tools = Uuid::now_v7().to_string();
+    let huge = Uuid::now_v7().to_string();
+    let output = "o".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let tool_blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            json!({ "type": "tool_result", "id": format!("{tools}:{i}"),
+                "tool_use_id": format!("tc-{i}"), "output": output, "is_error": false })
+        })
+        .collect();
+    for (id, role, blocks) in [
+        (
+            &small,
+            "user",
+            json!([{ "type": "text", "id": format!("{small}:0"), "text": "hi" }]),
+        ),
+        (&tools, "assistant", json!(tool_blocks)),
+        (
+            &huge,
+            "assistant",
+            json!([{ "type": "text", "id": format!("{huge}:0"), "text": "z".repeat(600_000) }]),
+        ),
+    ] {
+        store
+            .append_agent_message_with_id(&agent, id, role, &blocks, None, &now_iso())
+            .await
+            .expect("append row");
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id, "limit": 20, "historyDelivery": "progressive" }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let mut rows: Vec<Value> = Vec::new();
+    let mut saw_snapshot = false;
+    let mut complete = false;
+    for _ in 0..16 {
+        let mut line = String::new();
+        let n = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub_reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("read failed");
+        assert!(n > 0, "connection closed unexpectedly");
+        let frame = line.trim_end();
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "frame {} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}",
+            frame.len()
+        );
+        let v: Value = serde_json::from_str(frame).expect("json frame");
+        if v["id"] == 1 {
+            continue;
+        }
+        match v["params"]["kind"].as_str() {
+            Some("snapshot") => {
+                saw_snapshot = true;
+                rows.extend(
+                    v["params"]["snapshot"]["messages"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            Some("history") => {
+                let h = &v["params"]["history"];
+                if let Some(m) = h.get("message") {
+                    rows.push(m.clone());
+                }
+                if h["complete"] == true {
+                    complete = true;
+                    break;
+                }
+            }
+            other => panic!("unexpected frame kind {other:?}"),
+        }
+    }
+    assert!(saw_snapshot && complete, "progressive delivery completed");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("row {id} delivered"))
+    };
+    assert_eq!(rows.len(), 3, "every row delivered once");
+    assert_eq!(
+        rows[0]["id"],
+        huge.as_str(),
+        "the over-budget row is the seq-0 row"
+    );
+    assert_eq!(row(&huge)["contentBlocks"][0]["textTruncated"], true);
+    assert_eq!(row(&huge)["contentBlocks"][0]["textBytes"], 600_000);
+    let tool_out = row(&tools)["contentBlocks"].as_array().unwrap();
+    assert_eq!(tool_out.len(), 300);
+    assert!(tool_out.iter().any(|b| b["bodyOmitted"] == true));
+    assert_eq!(row(&small)["contentBlocks"][0]["text"], "hi");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

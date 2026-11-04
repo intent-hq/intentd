@@ -5175,11 +5175,16 @@ impl Services {
             .store
             .get_agent_message_thumbnails(&agent_id, &ids)
             .await?;
+        // Single-row bound (§5.5): progressive history frames each carry one
+        // row (and the seq-0 snapshot its newest rows), so a row that alone
+        // is over the page budget is cut to fit here, like the page read.
         let page: Vec<_> = page
             .into_iter()
             .map(|m| {
                 let thumbs = thumbnails.get(&m.id);
-                apply_slim_projection(m, thumbs)
+                let mut m = apply_slim_projection(m, thumbs);
+                fit_slim_row(&mut m, SLIM_PAGE_BUDGET_BYTES);
+                m
             })
             .collect();
         Ok(json!({"agentId":agent_id,"messages":page,"totalMessages":total}))
