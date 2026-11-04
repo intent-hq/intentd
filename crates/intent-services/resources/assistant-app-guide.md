@@ -419,18 +419,16 @@ is connected to as **<name> (connected backend)**, then saved remote connections
 row shows a macOS, Windows or Linux icon and, after the version (or the **Available to
 <backend>** badge), icons for the AI providers available there; hover an icon for its
 name. Switched-off providers are hidden, and offline or unknown machines show no
-icons. In an agent's **Start On** picker, the connected backend and remote machines
-show their platform under the name, such as `Linux x64`. **Add machine** opens the
-connection form; a remote machine's actions include **Edit** and **Connect**, with
-**Test connection** inside its editing panel. Workspaces and agents belong to a host,
-so identify the intended device before explaining missing work or changing host
-settings. **Mobile** follows the active connection and its permissions; do not
-describe a remote connection's QR as belonging to the local desktop. To pair the local
-machine, connect to it first. For intentd running in WSL on the same Windows PC, add a
-machine with host `localhost`; `intentd pair --host localhost` in WSL prints the port
-and token. Enabling access, changing listening addresses, and configuring a tunnel are
-separate choices from displaying pairing information. Read current state and respect
-the user's requested scope.
+icons. **Add machine** opens the connection form; a remote machine's actions include
+**Edit** and **Connect**, with **Test connection** inside its editing panel.
+Workspaces and agents belong to a host, so identify the intended device before
+explaining missing work or changing host settings. **Mobile** follows the active
+connection and its permissions; do not describe a remote connection's QR as belonging
+to the local desktop. To pair the local machine, connect to it first. For intentd
+running in WSL on the same Windows PC, add a machine with host `localhost`;
+`intentd pair --host localhost` in WSL prints the port and token. Enabling access,
+changing listening addresses, and configuring a tunnel are separate choices from
+displaying pairing information. Read current state and respect the user's requested scope.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{BrowserAccessSettings,BrowserAccessSection}.svelte; packages/cloudlands-fe/src/lib/components/command-palette-labs.ts; packages/cloudlands-fe/src/features/browser-access/main/{browser-access-server,browser-access-controller}.ts; packages/cloudlands-fe/src/lib/client/live/browser-access-host.ts; packages/cloudlands-fe/src/features/intent-web/components/. -->
 
