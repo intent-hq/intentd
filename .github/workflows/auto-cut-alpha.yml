@@ -512,6 +512,9 @@ jobs:
             # 0, but the substitution's exit status is gh's), so a flaked
             # read retries instead of being mistaken for "no unresolved
             # threads".
+            # The single quotes keep $owner/$repo/$pr/$endCursor as GraphQL
+            # variables for gh, not shell expansions.
+            # shellcheck disable=SC2016
             if ! unresolved=$(gh api graphql --paginate \
               -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
                 repository(owner: $owner, name: $repo) {
@@ -620,6 +623,8 @@ jobs:
             # cancelled (e.g. superseded), timed out — blocks the cut until a
             # fix or re-run turns it green. A human merging the Release PR by
             # hand is the deliberate override.
+            # The single-quoted --jq program binds its own $r.
+            # shellcheck disable=SC2016
             if ! main_ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$main_sha&event=push&per_page=100" \
               --jq '([.workflow_runs[]?] | max_by(.id)) as $r
                 | if $r == null then "missing"

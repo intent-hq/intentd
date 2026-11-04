@@ -426,6 +426,28 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
+      # Workflow YAML and its run: scripts have no other check: actionlint
+      # (pinned in scripts/lint-workflows.sh) plus shellcheck, with policy in
+      # .github/actionlint.yaml. Main is clean, so any finding is new.
+      # REQUIRE_ACTIONLINT=1 forbids the self-test's skip of its real cases.
+      - name: Install ShellCheck when absent
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            for attempt in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$attempt" -eq 3 ]; then exit 1; fi
+              sleep $((attempt * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq shellcheck
+          fi
+      - name: Install the pinned actionlint
+        run: |
+          bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      - name: Self-test make lint-workflows
+        run: REQUIRE_ACTIONLINT=1 bash scripts/test-lint-workflows.sh
+      - name: Lint GitHub workflows
+        run: make lint-workflows
       # Copies of monorepo protocol fixtures (docs/protocol/README.md "Copied
       # fixtures") carry a lock naming the intent-hq/intent commit they were
       # exported from; an edited copy fails here. Every tracked *.lock.json for
@@ -441,6 +463,8 @@ jobs:
           set -euo pipefail
           # A command substitution in an assignment fails the step (set -e,
           # pipefail) when discovery throws; `mapfile < <(...)` would not.
+          # The single-quoted node program uses JS template literals.
+          # shellcheck disable=SC2016
           discovered=$(git ls-files -z -- '*.lock.json' | node -e '
             const fs = require("node:fs");
             for (const file of fs.readFileSync(0, "utf8").split("\0").filter(Boolean)) {
@@ -1658,19 +1682,21 @@ jobs:
       - name: Generate coverage summary
         if: always()
         run: |
-          cd ${{ github.workspace }}
-          echo "## E2E Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # The script tees its summary to coverage-summary.txt; re-running
-          # the report (~30s) is only a fallback for a run that died before
-          # reporting (intent-hq/monorepo#4260).
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cd "${{ github.workspace }}"
+          {
+            echo "## E2E Coverage Report"
+            echo ""
+            echo '```'
+            # The script tees its summary to coverage-summary.txt; re-running
+            # the report (~30s) is only a fallback for a run that died before
+            # reporting (intent-hq/monorepo#4260).
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention: the lcov artifact is a debugging aid
       # only, and an org artifact-quota outage must not fail the required
       # check when all tests passed (monorepo#1163).
@@ -1808,17 +1834,19 @@ jobs:
       - name: Generate coverage summary
         if: always()
         run: |
-          cd ${{ github.workspace }}
-          echo "## Combined Coverage Report (all tests)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # Same reuse-or-fallback as coverage-e2e's summary step.
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cd "${{ github.workspace }}"
+          {
+            echo "## Combined Coverage Report (all tests)"
+            echo ""
+            echo '```'
+            # Same reuse-or-fallback as coverage-e2e's summary step.
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention — same rationale as coverage-e2e's
       # upload step (monorepo#1163).
       - name: Upload coverage artifact
