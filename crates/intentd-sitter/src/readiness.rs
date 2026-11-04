@@ -19,11 +19,16 @@ use std::time::{Duration, Instant};
 /// which answers within seconds when healthy.
 ///
 /// The budget covers the whole restart, so it must stay above the
-/// supervisor's [`crate::supervisor::SupervisorConfig::kill_timeout`] (30s
+/// supervisor's [`crate::supervisor::DEFAULT_KILL_TIMEOUT`] (90s
 /// — how long a graceful stop waits before force-killing the old daemon)
 /// plus new-daemon startup: a SIGTERM-slow old daemon eats that much of it
-/// first. Revisit this constant if `kill_timeout` grows.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// first.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(150);
+
+// The restart budget leaves at least a minute for startup after the slowest
+// graceful stop.
+const _: () =
+    assert!(DEFAULT_TIMEOUT.as_secs() >= crate::supervisor::DEFAULT_KILL_TIMEOUT.as_secs() + 60);
 
 /// Test-only env override (integer milliseconds) for [`DEFAULT_TIMEOUT`],
 /// matching the `INTENTD_SITTER_*_MS` convention of

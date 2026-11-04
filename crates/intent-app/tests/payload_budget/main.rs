@@ -461,9 +461,17 @@ async fn send_variant(
             if let Some(e) = page.error() {
                 return Err(format!("first page errored: {e}"));
             }
-            let token = page
-                .result()
-                .pointer(token_at)
+            // `/-/<pointer>` reads the cursor from the reply array's last
+            // element (git diff reads end a cut page with `{ nextToken }`).
+            let root = page.result();
+            let found = match token_at.strip_prefix("/-") {
+                Some(rest) => root
+                    .as_array()
+                    .and_then(|items| items.last())
+                    .and_then(|last| last.pointer(rest)),
+                None => root.pointer(token_at),
+            };
+            let token = found
                 .filter(|t| !t.is_null())
                 .cloned()
                 .ok_or_else(|| format!("first page has no cursor at `{token_at}`"))?;

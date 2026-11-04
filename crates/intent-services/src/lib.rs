@@ -31149,6 +31149,37 @@ impl WorkspaceApi for Services {
         commit_hash: Option<String>,
         git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.git_diffs_budgeted(
+            workspace_id,
+            paths,
+            staged,
+            commit_hash,
+            git_root_id,
+            intent_core::GitDiffPage::default(),
+        )
+    }
+
+    fn git_diffs_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Option<Vec<String>>,
+        staged: bool,
+        commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
+        page: intent_core::GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let intent_core::GitDiffPage {
+            max_bytes,
+            next_token,
+        } = page;
+        let budget = git_ops::DiffBudget::for_max_bytes(max_bytes);
+        let after = match next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => match git_ops::decode_page_token("git.diffs", t) {
+                Ok(a) => Some(a),
+                Err(e) => return Box::pin(async move { Err(e) }),
+            },
+            None => None,
+        };
         let svc = self.clone();
         let store = self.store.clone();
         let inflight = Arc::clone(&self.git_diffs_inflight);
@@ -31199,6 +31230,7 @@ impl WorkspaceApi for Services {
                 staged,
                 commit_hash.clone(),
                 git_root_id.clone(),
+                (budget, after.clone()),
             );
             loop {
                 match inflight.join(&key) {
@@ -31213,6 +31245,7 @@ impl WorkspaceApi for Services {
                         let walk_worktree = worktree.clone();
                         let walk_paths = paths.clone();
                         let walk_commit = commit_hash.clone();
+                        let walk_after = after.clone();
                         let probe = walk_probe.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             if let Some(probe) = &probe {
@@ -31223,6 +31256,8 @@ impl WorkspaceApi for Services {
                                 walk_paths.as_deref(),
                                 staged,
                                 walk_commit.as_deref(),
+                                budget,
+                                walk_after.as_deref(),
                             )
                         })
                         .await
@@ -31523,6 +31558,37 @@ impl WorkspaceApi for Services {
         target_ref: Option<String>,
         paths: Option<Vec<String>>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.git_branch_diff_budgeted(
+            workspace_id,
+            base_ref,
+            base_sha,
+            target_ref,
+            paths,
+            intent_core::GitDiffPage::default(),
+        )
+    }
+
+    fn git_branch_diff_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+        page: intent_core::GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let intent_core::GitDiffPage {
+            max_bytes,
+            next_token,
+        } = page;
+        let budget = git_ops::DiffBudget::for_max_bytes(max_bytes);
+        let after = match next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => match git_ops::decode_page_token("git.branchDiff", t) {
+                Ok(a) => Some(a),
+                Err(e) => return Box::pin(async move { Err(e) }),
+            },
+            None => None,
+        };
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -31561,6 +31627,8 @@ impl WorkspaceApi for Services {
                 base_sha.as_deref(),
                 target,
                 paths.as_deref(),
+                budget,
+                after.as_deref(),
             )
         })
     }

@@ -641,6 +641,9 @@ responds. Such a row has no Stop and clears the next time the agent starts.
 Restarting Intent stops running background tasks. The agent is then listed with
 interrupted agents, and when resumed it is told its tasks were stopped and will
 not report back, so it can restart any it still needs.
+After an Intent update, interrupted agents resume on their own, except agents
+whose provider is turned off or not signed in: those stay listed with interrupted
+agents until the user signs in and resumes them.
 Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->

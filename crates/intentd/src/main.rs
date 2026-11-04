@@ -2305,6 +2305,18 @@ async fn cmd_serve_owned(
             }
             root
         })
+        // Every provider launch gets a private temp folder (`TMPDIR` /
+        // `TMP` / `TEMP`) under a per-daemon root in the OS temp dir, so
+        // agents never share fixed temp file names. The data-dir lock makes
+        // this daemon the root's only user, so the startup sweep (no agent
+        // child is live yet) safely reclaims folders a killed daemon left.
+        .with_agent_tmp_root({
+            let root = intent_core::agent_tmp_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_agent_tmp_root(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "agent temp sweep failed");
+            }
+            root
+        })
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider
@@ -3361,6 +3373,16 @@ async fn cmd_serve_owned(
     // teardown). Idle reaping during the run is the M5 `reap_idle` hook. Stop
     // via ServerControl so we stop the runtime listener
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
+    // Stop the remote agents this machine runs while its links to their
+    // backends are still up: each one's last work is pushed over them, and
+    // stopping the tunnel or the WSS listener closes them
+    // (intent-hq/intent#8437).
+    #[cfg(unix)]
+    if let Some(service) = &executor_service {
+        let phase = shutdown::Phase::start("executor_shutdown");
+        service.shutdown().await;
+        phase.complete();
+    }
     let phase = shutdown::Phase::start("tunnel_stop");
     intent_core::ServerControl::stop_tunnel(control.as_ref()).await;
     phase.complete();
@@ -3415,10 +3437,6 @@ async fn cmd_serve_owned(
     let phase = shutdown::Phase::start("mcp_shutdown");
     mcp_hub.shutdown().await;
     phase.complete();
-    #[cfg(unix)]
-    if let Some(service) = &executor_service {
-        service.shutdown().await;
-    }
     let phase = shutdown::Phase::start("agent_shutdown");
     let native_shutdown = manager.shutdown_with_native_outcome().await;
     match &native_shutdown {

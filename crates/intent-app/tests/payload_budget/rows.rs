@@ -912,6 +912,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "baseRef": s.base_branch, "paths": ["src/history/module_1.rs"] }),
                     Bytes(1024),
                 ),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "baseRef": s.base_branch, "maxBytes": 1_000_000 }),
+                    Bytes(256 * 1024),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "baseRef": s.base_branch, "maxBytes": 65_536 }),
+                    "/-/nextToken",
+                    "nextToken",
+                    Bytes(16 * 1024),
+                ),
             ],
         ),
         fixed(
@@ -1003,6 +1015,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             "git.diffs",
             vec![
                 v("default", w.clone(), Items("", 1_000)),
+                v(
+                    "maxBytes",
+                    json!({ "workspaceId": ws, "maxBytes": 1_000_000 }),
+                    Items("", 1_000),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "maxBytes": 65_536 }),
+                    "/-/nextToken",
+                    "nextToken",
+                    Items("", 100),
+                ),
                 v(
                     "staged",
                     json!({ "workspaceId": ws, "staged": true }),

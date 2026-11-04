@@ -312,13 +312,26 @@ impl Running {
         admission: Arc<CountAdmission>,
         providers: BTreeMap<String, ProviderLaunch>,
     ) -> Self {
+        // Agents work in plain directories here: no backend serves git. The
+        // git checkout path is covered by the e2e tests.
+        Self::start_with_checkouts(data_dir, api, admission, providers, |storage, _cache| {
+            checkout::PlainCheckouts::new(storage)
+        })
+        .await
+    }
+
+    async fn start_with_checkouts(
+        data_dir: &std::path::Path,
+        api: Arc<MachineApi>,
+        admission: Arc<CountAdmission>,
+        providers: BTreeMap<String, ProviderLaunch>,
+        make_checkouts: MakeCheckouts,
+    ) -> Self {
         let report = Arc::new(FixedReport {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
         });
-        // Agents work in plain directories here: no backend serves git. The
-        // git checkout path is covered by the e2e tests.
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
                 data_dir: data_dir.to_owned(),
@@ -337,7 +350,7 @@ impl Running {
                 },
             },
             api.subscribe_executor_revocations(),
-            |storage, _cache| checkout::PlainCheckouts::new(storage),
+            make_checkouts,
         )
         .unwrap();
         let bus_dir = tempfile::tempdir().unwrap();
@@ -1654,6 +1667,60 @@ async fn a_final_stop_ends_the_agents_scripts_before_it_is_acknowledged() {
     assert_eq!(acked.outcome, StopOutcome::NotRunning);
     assert_eq!(acked.final_push, Some(FinalPush::Skipped));
     assert!(!checkout.exists());
+}
+
+/// The gate both backends' shutdown pushes meet at in
+/// [`shutdown_stops_backends_together`]: it opens only once both are under
+/// way at once.
+static BOTH_PUSHING: std::sync::LazyLock<Arc<tokio::sync::Barrier>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Barrier::new(2)));
+
+/// A daemon shutdown stops every backend's agents at once, each one's last
+/// push included, so it takes one drain however many backends there are
+/// (intent-hq/intent#8437): each push here is held until the other
+/// backend's is under way too, which a one-by-one stop never reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_stops_backends_together() {
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node = Running::start_with_checkouts(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        providers,
+        |storage, _cache| checkout::PlainCheckouts::with_push_gate(storage, BOTH_PUSHING.clone()),
+    )
+    .await;
+    let mut links = Vec::new();
+    for (endpoint, hello) in [
+        (node.endpoint.clone(), hello(1, "lease-1", 0)),
+        (
+            node.endpoint_for(&other_token()),
+            hello_from(OTHER_HEAD, 1, "lease-o", 0),
+        ),
+    ] {
+        let mut dialed = dial_link(&endpoint, hello).await.unwrap();
+        replay_complete(&mut dialed).await;
+        dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+        assert!(matches!(
+            next_record(&mut dialed).await.body,
+            JournalBody::Started { .. }
+        ));
+        links.push(dialed);
+    }
+    assert_eq!(admission.running.lock().unwrap().len(), 2);
+
+    tokio::time::timeout(wait(), node.service.shutdown())
+        .await
+        .expect("both backends' pushes run together");
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with agents still running"
+    );
     node.stop().await;
 }
 
@@ -1787,5 +1854,89 @@ async fn a_final_stop_over_a_panicked_script_teardown_gives_no_ack() {
         .expect("the final stop hung on a panicked reaper");
     assert_eq!(answer, None, "acknowledged over a panicked reaper");
     assert!(root.join(&reaped.0).join("work").exists());
+    node.stop().await;
+}
+
+/// The gate the agent's shutdown push meets the test at in
+/// [`shutdown_over_a_stuck_script_stays_within_one_reap_wait`].
+static SHUTDOWN_PUSH: std::sync::LazyLock<Arc<tokio::sync::Barrier>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Barrier::new(2)));
+
+/// A machine shutdown over a script whose reaper never finishes waits for
+/// it once, bounded by the reap wait: the agent's last push starts right
+/// after, and the whole executor shutdown, its links' close included,
+/// returns without a second reap wait at the link's end
+/// (intent-hq/intent#8437).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
+    use intent_core::node_link::ScriptStartCommand;
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let admission = CountAdmission::new(4);
+    let node = Running::start_with_checkouts(
+        dir.path(),
+        MachineApi::new(),
+        admission.clone(),
+        providers,
+        |storage, _cache| checkout::PlainCheckouts::with_push_gate(storage, SHUTDOWN_PUSH.clone()),
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let agent = AgentId::from("a-stuck-shutdown");
+    crate::executor::scripts::hold_reaps_for_test(&agent);
+    dialed
+        .link
+        .send(&launch_of(&agent.0, "mock"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+    dialed
+        .link
+        .send(&LinkFrame::ScriptStart(ScriptStartCommand {
+            agent_id: agent.clone(),
+            script_id: "s1".into(),
+            spawn_id: "spawn-1".into(),
+            command: "sleep 60".into(),
+            mode: intent_core::ScriptMode::Command,
+            cwd: None,
+            env: vec![],
+        }))
+        .await
+        .unwrap();
+    loop {
+        match next_frame(&mut dialed).await {
+            Some(LinkFrame::ScriptStarted(started)) if started.spawn_id == "spawn-1" => break,
+            Some(LinkFrame::ScriptExited(exited)) => panic!("script did not start: {exited:?}"),
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+
+    // One reap wait for the stuck script, plus room to stop the agent and
+    // close the links; a second reap wait at the links' close overruns it.
+    let margin = intentd_test_support::test_timeout(Duration::from_secs(4));
+    let bound = crate::executor::scripts::reap_wait() + margin;
+    let service = node.service.clone();
+    let shutdown = tokio::spawn(async move { service.shutdown().await });
+    tokio::time::timeout(bound, SHUTDOWN_PUSH.wait())
+        .await
+        .expect("the agent's push did not start within one reap wait");
+    tokio::time::timeout(margin, shutdown)
+        .await
+        .expect("the shutdown waited on the stuck script again after the push")
+        .unwrap();
+    assert!(
+        admission.running.lock().unwrap().is_empty(),
+        "shutdown returned with the agent still running"
+    );
     node.stop().await;
 }
