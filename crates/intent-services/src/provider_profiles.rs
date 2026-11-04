@@ -2085,6 +2085,10 @@ impl Services {
     /// `None` when the provider has no probe, is not installed, the probe is
     /// inconclusive, or the overlay cannot be resolved. A probe-less
     /// provider is never reported signed out.
+    #[cfg_attr(
+        test,
+        expect(dead_code, reason = "unit tests read the auth cache only")
+    )]
     pub(crate) async fn probe_selection_sign_in(&self, selection: &str) -> Option<bool> {
         let base = intent_providers::find_provider_or_legacy_alias(
             intent_providers::base_provider_id(selection),

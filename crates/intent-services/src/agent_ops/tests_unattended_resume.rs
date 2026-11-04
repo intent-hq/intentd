@@ -188,3 +188,66 @@ async fn wake_resume_skips_signed_out_provider() {
     );
     assert_eq!(user_messages(&svc, &id).await, 0);
 }
+
+/// A legacy row (NULL provider) is checked on the provider its resume will
+/// actually spawn: `pin_legacy_session_provider` repairs it onto its last
+/// committed turn's provider, not today's default.
+async fn legacy_interrupted_agent(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &str,
+    last_turn: &str,
+) -> AgentId {
+    let id = AgentId::from(id);
+    let mut session = crate::test_support::fixtures::session(&id, ws);
+    session.provider = None;
+    svc.store.insert_agent_session(&session).await.unwrap();
+    svc.store
+        .set_agent_session_last_turn_model(ws, &id, None, last_turn)
+        .await
+        .unwrap();
+    svc.store
+        .insert_interrupted_agent(&id, ws, "active", &now_iso())
+        .await
+        .unwrap();
+    id
+}
+
+#[intent_test_macros::daemon_test]
+async fn legacy_row_is_held_on_its_last_turn_provider_not_the_default() {
+    let _env = EnvGuard::apply(&[]);
+    let _reset = (AuthSeedReset("auggie"), AuthSeedReset("codex"));
+    let (_t, svc, ws) = setup().await;
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("model.defaultProvider".into(), json!("codex"))])
+        .expect("default to codex");
+    let id = legacy_interrupted_agent(&svc, &ws, "agent-legacy-auggie", "auggie").await;
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(false));
+    crate::provider_auth::seed_auth_verdict_for_tests("codex", Some(true));
+
+    let reason = svc
+        .unattended_resume_hold(&id)
+        .await
+        .expect("the last-turn provider (auggie) is signed out");
+    assert!(
+        reason.contains("auggie"),
+        "names the last-turn provider: {reason}"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn legacy_row_is_not_held_by_an_unrelated_signed_out_default() {
+    let _env = EnvGuard::apply(&[]);
+    let _reset = (AuthSeedReset("auggie"), AuthSeedReset("codex"));
+    let (_t, svc, ws) = setup().await;
+    let id = legacy_interrupted_agent(&svc, &ws, "agent-legacy-codex", "codex").await;
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(false));
+    crate::provider_auth::seed_auth_verdict_for_tests("codex", Some(true));
+
+    assert_eq!(
+        svc.unattended_resume_hold(&id).await,
+        None,
+        "the signed-out default (auggie) is not the provider this row resumes on"
+    );
+}

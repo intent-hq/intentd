@@ -20647,20 +20647,53 @@ impl Services {
             return None;
         }
         let settings = self.effective_settings();
-        let provider = crate::agent_session::resolve_provider_id(
-            session.provider.as_deref(),
-            crate::agent_session::derived_default_provider(&settings).as_deref(),
-        )?;
+        let saved = session
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let provider = match saved {
+            Some(saved) => crate::agent_session::resolve_provider_id(
+                Some(saved),
+                crate::agent_session::derived_default_provider(&settings).as_deref(),
+            )?,
+            // A legacy row (NULL provider) resumes on the provider
+            // `pin_legacy_session_provider` repairs it onto at spawn: its
+            // last committed turn's, else today's default. Check that one,
+            // not today's default alone; a failed read stays permissive.
+            None => {
+                crate::agent_session::legacy_session_provider(self, &session.workspace_id, agent_id)
+                    .await
+                    .ok()
+                    .flatten()?
+            }
+        };
         if provider_is_disabled(&provider, settings.providers.enabled.as_ref()) {
             let display = intent_providers::provider_config(&provider).display_name;
             return Some(format!(
                 "provider \"{provider}\" ({display}) is not enabled"
             ));
         }
-        if self.probe_selection_sign_in(&provider).await == Some(false) {
+        if self.unattended_resume_sign_in(&provider).await == Some(false) {
             return Some(crate::provider_auth::not_authenticated_message(&provider));
         }
         None
+    }
+
+    /// The sign-in verdict [`Self::unattended_resume_hold`] acts on: a live
+    /// probe in the daemon (the cache is empty right after a restart).
+    /// Unit tests read only the cache, which they seed, so a resume test
+    /// never depends on which provider CLIs the host has installed or
+    /// signed in, and never waits on a probe timeout.
+    async fn unattended_resume_sign_in(&self, provider: &str) -> Option<bool> {
+        #[cfg(test)]
+        {
+            self.selection_auth_verdict(provider).await.ok().flatten()
+        }
+        #[cfg(not(test))]
+        {
+            self.probe_selection_sign_in(provider).await
+        }
     }
 
     /// Resume one reserved startup candidate, then expose and notify failures.
