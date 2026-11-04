@@ -110,6 +110,30 @@ static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> 
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static SKILL_IO_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// Upper bound on remembered collisions, so a pathological skill tree cannot
+/// grow the set without limit. Past it, new collisions log at debug.
+const MAX_REPORTED_COLLISIONS: usize = 1024;
+
+/// Collisions already reported at warn level, keyed by (name, kept path,
+/// shadowed path). Every skills scan re-detects the same collisions, so
+/// warning on each one flooded the daemon log (intent-hq/intent#8480).
+static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<HashSet<(String, String, String)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether this collision is new to this daemon run: `true` the first time a
+/// (name, kept, shadowed) triple is seen, `false` on every later scan and
+/// once [`MAX_REPORTED_COLLISIONS`] distinct triples have been reported.
+fn first_collision_report(name: &str, kept: &str, shadowed: &str) -> bool {
+    let mut reported = REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (name.to_owned(), kept.to_owned(), shadowed.to_owned());
+    if reported.contains(&key) || reported.len() >= MAX_REPORTED_COLLISIONS {
+        return false;
+    }
+    reported.insert(key)
+}
+
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
     let payload = load_skills_payload(workspace_path).await;
@@ -404,12 +428,21 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                     } else {
                         (&existing.metadata.location, &parsed.metadata.location)
                     };
-                    tracing::warn!(
-                        name = %name,
-                        kept = %kept,
-                        shadowed = %shadowed,
-                        "Skill name collision detected, keeping higher-precedence skill"
-                    );
+                    if first_collision_report(&name, kept, shadowed) {
+                        tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision detected, keeping higher-precedence skill"
+                        );
+                    } else {
+                        tracing::debug!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision (already reported)"
+                        );
+                    }
                 }
 
                 if !discovered_by_name.contains_key(&name)
@@ -1270,6 +1303,63 @@ mod tests {
         assert_eq!(
             PathBuf::from(&skills[0].location),
             std::fs::canonicalize(&intent_skill_path).unwrap()
+        );
+    }
+
+    /// intent-hq/intent#8480: every scan re-detects the same collision, so
+    /// the warning is emitted once per daemon run and later scans log at
+    /// debug instead of flooding the daemon log.
+    #[tokio::test]
+    async fn skill_collision_warns_once_across_scans() {
+        clear_cache();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().join("home");
+        let workspace_path = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+        for root in [".augment", ".intent"] {
+            write_skill(
+                &workspace_path.join(root).join("skills"),
+                "noisy-skill",
+                &build_skill_content(
+                    &format!("name: noisy-skill\ndescription: from {root}"),
+                    "Use this skill when needed.",
+                ),
+            )
+            .await;
+        }
+
+        let warnings = crate::test_tracing::Warnings::default();
+        let _guard = warnings.install();
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        for _ in 0..3 {
+            let payload = scan_skills_sync(Some(&workspace), Some(home_dir.clone()));
+            assert_eq!(payload.skills.len(), 1, "the collision still resolves");
+        }
+        let reported = warnings.containing("noisy-skill");
+        assert_eq!(
+            reported.len(),
+            1,
+            "one warning across three scans: {:?}",
+            warnings.all()
+        );
+        assert!(reported[0].contains("Skill name collision detected"));
+    }
+
+    #[test]
+    fn first_collision_report_dedupes_and_is_bounded() {
+        let name = format!("bounded-{}", std::process::id());
+        assert!(first_collision_report(&name, "/kept", "/shadowed"));
+        assert!(!first_collision_report(&name, "/kept", "/shadowed"));
+        assert!(
+            first_collision_report(&name, "/kept", "/other-shadowed"),
+            "a different shadowed path is a new collision"
+        );
+        for i in 0..MAX_REPORTED_COLLISIONS {
+            first_collision_report(&format!("{name}-fill-{i}"), "/k", "/s");
+        }
+        assert!(
+            !first_collision_report(&format!("{name}-past-cap"), "/k", "/s"),
+            "past the cap new collisions stay at debug"
         );
     }
 
