@@ -2656,6 +2656,18 @@ pub struct TaskListResult {
     pub stats: WorkspaceTaskStats,
 }
 
+/// A paged `task.list` reply (`limit` / `nextToken`): one bounded page of
+/// `WorkspaceTask` rows in `(createdAt, id)` order, the unchanged
+/// workspace-wide `stats`, and the token for the rest (`None` on the last
+/// page).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskListPage {
+    pub tasks: Vec<serde_json::Value>,
+    pub stats: WorkspaceTaskStats,
+    pub next_token: Option<String>,
+}
+
 /// Result of `task.markAsTask`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

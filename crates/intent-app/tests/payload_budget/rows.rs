@@ -1902,6 +1902,18 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                     json!({ "workspaceId": ws, "status": "in_progress" }),
                     Items("/tasks", 50),
                 ),
+                v(
+                    "limit",
+                    json!({ "workspaceId": ws, "limit": 100_000 }),
+                    Items("/tasks", 50),
+                ),
+                next(
+                    "nextToken",
+                    json!({ "workspaceId": ws, "limit": 50 }),
+                    "/nextToken",
+                    "nextToken",
+                    Items("/tasks", 50),
+                ),
             ],
         ),
         row(

@@ -452,6 +452,130 @@ async fn comment_channel_snapshot_is_paged_with_next_token() {
     let _ = server.await;
 }
 
+/// Bounded reads: the `task.subscribe` seq-0 snapshot is the first bounded
+/// page of task notes (frame under the 512,000-byte budget) and carries
+/// `nextToken`; following it through the paged `task.list` serves every
+/// remaining task exactly once. A plain `task.list` keeps its whole-list
+/// reply.
+#[intent_test_macros::daemon_test]
+async fn task_channel_snapshot_is_paged_with_next_token() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let body = "t".repeat(60_000);
+    let mut task_ids = Vec::new();
+    for i in 0..12_i64 {
+        let n = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            100 + i,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": format!("T{i}"), "content": body }),
+        )
+        .await;
+        let note_id = n["note"]["id"].as_str().unwrap().to_string();
+        rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            200 + i,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
+        )
+        .await;
+        task_ids.push(note_id);
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "task.subscribe",
+        "params": { "workspaceId": ws_id }
+    });
+    send(&mut sub_write, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].is_string(), "{resp}");
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let frame_bytes = serde_json::to_string(&snap).unwrap().len();
+    assert!(
+        frame_bytes <= 512_000,
+        "snapshot frame is {frame_bytes} bytes"
+    );
+    let first = snap["params"]["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .clone();
+    assert!(
+        !first.is_empty() && first.len() < task_ids.len(),
+        "the snapshot is one bounded page of {} rows",
+        first.len()
+    );
+    assert_eq!(first[0]["content"], body.as_str(), "rows are whole notes");
+    assert_eq!(first[0]["specLinked"], false);
+    let mut seen: Vec<String> = first
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut token = snap["params"]["nextToken"]
+        .as_str()
+        .expect("a paged snapshot carries nextToken")
+        .to_string();
+    for id in 300.. {
+        let page = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            id,
+            "task.list",
+            json!({ "workspaceId": ws_id, "limit": 5, "nextToken": token }),
+        )
+        .await;
+        assert!(page["stats"].is_object(), "paged task.list keeps stats");
+        let rows = page["tasks"].as_array().expect("tasks");
+        assert!(rows.len() <= 5);
+        for row in rows {
+            assert_eq!(row["status"], "not_started", "WorkspaceTask rows: {row}");
+            assert_eq!(row["workspaceId"], ws_id.as_str(), "paged rows are scoped");
+            seen.push(row["id"].as_str().unwrap().to_string());
+        }
+        match page["nextToken"].as_str() {
+            Some(next) => token = next.to_string(),
+            None => break,
+        }
+    }
+    seen.sort();
+    let mut expected = task_ids.clone();
+    expected.sort();
+    assert_eq!(seen, expected, "every task served exactly once");
+
+    let whole = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        400,
+        "task.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(whole["tasks"].as_array().unwrap().len(), task_ids.len());
+    assert!(whole.get("nextToken").is_none(), "unpaged reply unchanged");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
 #[intent_test_macros::daemon_test]
 async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();

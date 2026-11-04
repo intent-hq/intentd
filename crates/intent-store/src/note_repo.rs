@@ -82,6 +82,24 @@ impl Store {
         workspace_id: &WorkspaceId,
         filter: Option<TaskStatus>,
     ) -> Result<TaskListResult> {
+        Ok(self
+            .list_workspace_tasks_keyed(workspace_id, filter)
+            .await?
+            .0)
+    }
+
+    /// [`Self::list_workspace_tasks`] plus each returned task's `created_at`
+    /// (same index as `tasks`), the sort key of the paged `task.list` and the
+    /// `task.subscribe` snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query or projected metadata decoding fails.
+    pub async fn list_workspace_tasks_keyed(
+        &self,
+        workspace_id: &WorkspaceId,
+        filter: Option<TaskStatus>,
+    ) -> Result<(TaskListResult, Vec<String>)> {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Summary {
@@ -93,7 +111,7 @@ impl Store {
 
         let filter = filter.map(|s| enum_to_db(&s)).transpose()?;
         let rows = sqlx::query(
-            "SELECT id, parent_id, json_extract(task_json, '$.status') AS status, \
+            "SELECT id, parent_id, created_at, json_extract(task_json, '$.status') AS status, \
              CASE WHEN id = 'spec' THEN content END AS spec_content, \
              CASE WHEN id != 'spec' AND (?2 IS NULL OR json_extract(task_json, '$.status') = ?2) \
              THEN json_object('title', title, 'updatedAt', updated_at, \
@@ -113,6 +131,7 @@ impl Store {
         let mut status_by_id = HashMap::new();
         let mut children = Vec::new();
         let mut tasks = Vec::new();
+        let mut keys = Vec::new();
         for row in &rows {
             let id: String = col(row, "id")?;
             let status: Option<String> = col(row, "status")?;
@@ -138,6 +157,7 @@ impl Store {
             if let Some(summary) = summary {
                 let summary: Summary = serde_json::from_str(&summary)
                     .map_err(|e| Error::Internal(format!("decode task summary failed: {e}")))?;
+                keys.push(col::<String>(row, "created_at")?);
                 tasks.push(WorkspaceTask {
                     id: NoteId::from(id),
                     title: if summary.title.is_empty() {
@@ -182,7 +202,7 @@ impl Store {
                 _ => stats.total += 1,
             }
         }
-        Ok(TaskListResult { tasks, stats })
+        Ok((TaskListResult { tasks, stats }, keys))
     }
 
     /// Test whether a workspace owns a note without hydrating its row.
