@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.121] - 2026-11-04
+
+### 🐛 Bug Fixes
+
+- Bound git.diffs and git.branchDiff reads under the 500 KiB budget ([#3015](https://github.com/intent-hq/intentd/pull/3015))
+- Push remote agents' work before the machine's links close on shutdown ([#3002](https://github.com/intent-hq/intentd/pull/3002))
+
+
 ## [0.11.120] - 2026-11-03
 
 ### 🚀 Features
