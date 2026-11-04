@@ -105,9 +105,27 @@ def sccache_rule(root):
     return f'sccache >= {pinned}', check
 
 
+def actionlint_rule(root):
+    """CI installs the pinned actionlint and shellcheck before this suite and
+    sets REQUIRE_ACTIONLINT=1, which makes it fail rather than skip without them."""
+    text = (root / 'scripts/lint-workflows.sh').read_text()
+    match = re.search(r'^ACTIONLINT_VERSION="([^"]+)"', text, re.M)
+    if not match:
+        raise SetupError('scripts/lint-workflows.sh has no ACTIONLINT_VERSION="..." line')
+    tools = [exact_tool('actionlint', match.group(1)), exact_tool('shellcheck', '')]
+
+    def check():
+        for name, tool in tools:
+            if found := tool():
+                return f'{name.split()[0]} {found}'
+        return None
+    return ' and '.join(name for name, _ in tools), check
+
+
 # Suites that depend on the host itself rather than on a tool CI installs.
 HOST_RULES = {
     'test-release-cache-smoke.py': sccache_rule,
+    'test-lint-workflows.sh': actionlint_rule,
 }
 
 

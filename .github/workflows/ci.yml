@@ -426,28 +426,6 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
-      # Workflow YAML and its run: scripts have no other check: actionlint
-      # (pinned in scripts/lint-workflows.sh) plus shellcheck, with policy in
-      # .github/actionlint.yaml. Main is clean, so any finding is new.
-      # REQUIRE_ACTIONLINT=1 forbids the self-test's skip of its real cases.
-      - name: Install ShellCheck when absent
-        run: |
-          if ! command -v shellcheck >/dev/null; then
-            for attempt in 1 2 3; do
-              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
-              if [ "$attempt" -eq 3 ]; then exit 1; fi
-              sleep $((attempt * 15))
-            done
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq shellcheck
-          fi
-      - name: Install the pinned actionlint
-        run: |
-          bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
-          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
-      - name: Self-test make lint-workflows
-        run: REQUIRE_ACTIONLINT=1 bash scripts/test-lint-workflows.sh
-      - name: Lint GitHub workflows
-        run: make lint-workflows
       # Copies of monorepo protocol fixtures (docs/protocol/README.md "Copied
       # fixtures") carry a lock naming the intent-hq/intent commit they were
       # exported from; an edited copy fails here. Every tracked *.lock.json for
@@ -2356,6 +2334,34 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # actionlint (pinned in scripts/lint-workflows.sh) plus shellcheck over
+      # .github/workflows, with policy in .github/actionlint.yaml; workflow
+      # YAML and its run: scripts have no other check. It runs here, not in
+      # the PR-only pr-static, so the queue lints the merged tree: a PR whose
+      # CI predated a workflow edit, or two queued PRs that each edit
+      # workflows, would otherwise land an unlinted tree on main (intentd#3036
+      # merged ahead of #3039, which added this lint, that way). Main is
+      # clean, so any finding is new. The ShellCheck fallback needs sudo,
+      # which this job's free standard runner has.
+      - name: Install ShellCheck when absent
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            for attempt in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$attempt" -eq 3 ]; then exit 1; fi
+              sleep $((attempt * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq shellcheck
+          fi
+      - name: Install the pinned actionlint
+        run: |
+          bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      # REQUIRE_ACTIONLINT=1 forbids the self-test's skip of its real cases.
+      - name: Self-test make lint-workflows
+        run: REQUIRE_ACTIONLINT=1 ./scripts/test-lint-workflows.sh
+      - name: Lint GitHub workflows
+        run: make lint-workflows
       # .gitignore covers new caches, but `git add -f` bypasses it; this job
       # also runs in the merge queue and on main, unlike pr-static.
       - name: Reject tracked Python bytecode
