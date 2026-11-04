@@ -345,7 +345,8 @@ the original configuration is **Codex · Default**. In a shared workspace, guest
 an agent's provider and model without the host's profile name, including in chat notices. Each profile has its own **Fast
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
-explicit, specialist, or default selection, never the parent's profile.
+explicit or specialist selection, else their parent agent's provider when it is
+enabled, installed and not signed out, else the default; never the parent's profile.
 Once a provider has profiles, its original configuration is listed first as the
 Default profile, where backups start from; it cannot be moved, and shows its name
 with a **Default** badge once renamed. To rename it or give it its own environment
