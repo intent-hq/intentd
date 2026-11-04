@@ -377,8 +377,23 @@ class ProvisionerTests(unittest.TestCase):
     def test_node_mismatch_finds_a_matching_node_later_on_path(self):
         required = self.fixture.descriptor["tools"]["node"]
         wrong = self.fake_node(self.root / "wrong bin", "v22.0.0")
-        right = self.fake_node(self.root / "right bin", required)
+        right = self.fake_node(self.root / f"node-{required}-linux-x64/bin", required)
         self.assertEqual(self.mismatch(os.pathsep.join([str(wrong), str(right)])).matching, right)
+
+    def test_node_mismatch_never_runs_path_nodes_that_do_not_name_the_pin(self):
+        # A version-manager shim may install on demand when executed.
+        shim = self.fake_node(self.root / "shims", self.fixture.descriptor["tools"]["node"])
+        marker = self.root / "shim-ran"
+        (shim / "node").write_text(f"#!/bin/sh\ntouch {PREP.shlex.quote(str(marker))}\n")
+        self.assertIsNone(self.mismatch(str(shim)).matching)
+        self.assertFalse(marker.exists())
+
+    def test_node_mismatch_without_home_or_nvm_dir_still_reports_versions(self):
+        with patch.dict(os.environ, {}, clear=True):
+            error = self.mismatch()
+        self.assertIsNone(error.matching)
+        self.assertIn("no installed Node", str(error))
+        self.assertIn("was found on PATH.", str(error))
 
     def test_node_mismatch_without_an_installed_match_refuses_without_guessing(self):
         required = self.fixture.descriptor["tools"]["node"]

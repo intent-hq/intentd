@@ -300,8 +300,10 @@ class NodeVersionMismatch(InvalidFixture):
         self.found, self.required, self.matching = found, required, matching
         message = f"Node version mismatch: found {found}, descriptor requires {required}"
         if matching is None:
-            message += (f"; no installed Node {required} was found on PATH or under"
-                        f" {nvm_versions_dir()}. Install it, then re-run (nothing was downloaded)")
+            nvm = nvm_versions_dir()
+            where = "on PATH" + (f" or under {nvm}" if nvm is not None else "")
+            message += (f"; no installed Node {required} was found {where}."
+                        " Install it, then re-run (nothing was downloaded)")
         else:
             message += (f"; Node {required} is installed in {matching}. Put it first on PATH,"
                         f" then re-run: {path_export(matching)}")
@@ -309,7 +311,8 @@ class NodeVersionMismatch(InvalidFixture):
 
 
 def nvm_versions_dir():
-    return Path(os.environ.get("NVM_DIR") or Path.home() / ".nvm") / "versions/node"
+    root = os.environ.get("NVM_DIR") or (os.environ.get("HOME") and Path(os.environ["HOME"]) / ".nvm")
+    return Path(root) / "versions/node" if root else None
 
 
 def path_export(directory):
@@ -331,9 +334,10 @@ def matching_node_dir(required, env):
 
     Only names a candidate for the error message: the pin is never chosen
     automatically, and nothing is downloaded or repaired. nvm's directory for
-    the version comes first, then later PATH entries.
+    the version comes first, then PATH entries whose resolved path names it.
     """
-    candidates = [nvm_versions_dir() / required / "bin"]
+    nvm = nvm_versions_dir()
+    candidates = [nvm / required / "bin"] if nvm is not None else []
     candidates += [Path(entry) for entry in env["PATH"].split(os.pathsep) if entry]
     seen = set()
     for directory in candidates:
@@ -341,6 +345,10 @@ def matching_node_dir(required, env):
         if not os.access(node, os.X_OK) or not node.is_file():
             continue
         resolved = node.resolve()
+        # Only execute installs whose path names the pin: version-manager shims
+        # (asdf, mise, Volta) may install on demand when run.
+        if not any(required.removeprefix("v") in part for part in resolved.parts):
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
