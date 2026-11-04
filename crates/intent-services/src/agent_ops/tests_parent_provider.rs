@@ -4,10 +4,16 @@
 //! the settings default (Auggie) the user was not signed in to, and failed.
 //! The harness's settings default is `auggie`; the parent runs `claude-code`.
 
-use intent_core::{AgentCreateExtra, AgentDelegateInput, AgentId, WorkspaceId};
+use std::sync::Arc;
+
+use intent_core::{
+    AgentCreateExtra, AgentDelegateInput, AgentId, BatchTaskEntry, NoteCreate, NoteId,
+    WorkspaceApi as _, WorkspaceId,
+};
+use intent_store::Store;
 use serde_json::json;
 
-use super::tests::setup;
+use super::tests::{setup, test_registry_with_default_provider, workspace, TempDb};
 use crate::Services;
 
 /// Restores the seeded verdict to cached-unknown on drop.
@@ -176,23 +182,200 @@ async fn explicit_model_inherits_only_a_provider_that_owns_it() {
 }
 
 /// A child never inherits its parent's named profile (PROTOCOL §5.54
-/// "Delegation"): a parent on `claude-code@work` passes nothing on, and the
-/// child resolves the settings default exactly as before.
+/// "Delegation"): a parent on a saved, enabled `claude-code` profile passes
+/// nothing on, and the child resolves the settings default exactly as
+/// before. The profile is real, so without the rule it would be inherited.
 #[intent_test_macros::daemon_test]
 async fn parent_profile_is_never_inherited() {
     let _reset = AuthSeedReset("claude-code");
-    let (_t, svc, ws) = setup().await;
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let data = tempfile::tempdir().expect("data dir");
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(test_registry_with_default_provider(&tmp))
+        .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()))
+        .with_provider_profiles_dir(data.path());
+    let created = svc
+        .provider_profiles_create_impl(
+            json!({ "baseProviderId": "claude-code", "name": "Work", "env": [] }),
+        )
+        .await
+        .expect("save a claude-code profile");
+    let profile_ref = created["profile"]["providerRef"]
+        .as_str()
+        .expect("providerRef")
+        .to_string();
     let parent = parent_on_claude_code(&svc, &ws).await;
     svc.store()
         .set_agent_session_model(
             &ws,
             &parent,
             "sonnet",
-            Some("claude-code@work"),
+            Some(&profile_ref),
             &intent_core::now_iso(),
         )
         .await
-        .expect("park the parent on a profile");
+        .expect("park the parent on the saved profile");
+
+    assert_eq!(delegate(&svc, &ws, Some(&parent), None).await, "auggie");
+}
+
+/// An explicit model the parent's provider cannot resolve keeps the old
+/// resolution (the settings default) instead of inheriting a provider the
+/// create front door would then reject.
+#[intent_test_macros::daemon_test]
+async fn explicit_model_the_parent_provider_cannot_offer_keeps_the_default() {
+    let _reset = AuthSeedReset("claude-code");
+    let (_t, svc, ws) = setup().await;
+    let parent = parent_on_claude_code(&svc, &ws).await;
+    svc.models_catalog.store_for_test(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "sonnet", "name": "Sonnet", "provider": "claude-code" })],
+    );
+
+    assert_eq!(
+        delegate(&svc, &ws, Some(&parent), Some("not-a-claude-model")).await,
+        "auggie"
+    );
+}
+
+/// The specialist's `codingAgent` still beats the parent's provider.
+#[intent_test_macros::daemon_test]
+async fn specialist_provider_beats_the_parent_provider() {
+    let _reset = AuthSeedReset("claude-code");
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let specialists = tempfile::tempdir().expect("specialists dir");
+    std::fs::write(
+        specialists.path().join("codex-specialist.md"),
+        "---\nname: \"codex-specialist\"\ndescription: \"Test\"\ncodingAgent: \"codex\"\n---\n\nTest prompt",
+    )
+    .expect("write specialist");
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(test_registry_with_default_provider(&tmp))
+        .with_specialist_dirs(
+            Some(specialists.path().to_path_buf()),
+            Some(specialists.path().to_path_buf()),
+        );
+    let parent = parent_on_claude_code(&svc, &ws).await;
+    crate::test_support::provider_installed::mark_on(&svc, &["claude-code", "codex"]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("codex-specialist".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(provider_of(&svc, &child).await, "codex");
+}
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    note.id
+}
+
+/// Batch delegation from an agent inherits the same way as a single one.
+#[intent_test_macros::daemon_test]
+async fn batch_delegated_children_inherit_the_parent_provider() {
+    let _reset = AuthSeedReset("claude-code");
+    let (_t, svc, ws) = setup().await;
+    let parent = parent_on_claude_code(&svc, &ws).await;
+    let tasks = [
+        seed_task(&svc, &ws, "First").await,
+        seed_task(&svc, &ws, "Second").await,
+    ];
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(tasks.iter().cloned().map(BatchTaskEntry::Id).collect()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect("batch delegate");
+    let rows = resp["tasks"].as_array().expect("tasks array");
+    assert_eq!(rows.len(), 2, "{resp}");
+    for row in rows {
+        assert_eq!(row["disposition"], "started", "{resp}");
+        let child = AgentId::from(row["agentId"].as_str().expect("agentId"));
+        assert_eq!(provider_of(&svc, &child).await, "claude-code");
+    }
+}
+
+/// The create front door gates a Default with saved overrides on its
+/// overlay's verdict, not the bare install's: a parent on bare `claude-code`
+/// whose overridden Default is cached signed out is not inherited, so the
+/// child falls back to the settings default instead of failing the call.
+#[intent_test_macros::daemon_test]
+async fn signed_out_overridden_default_is_not_inherited() {
+    let _reset = AuthSeedReset("claude-code");
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let data = tempfile::tempdir().expect("data dir");
+    let svc = Services::new_isolated(store)
+        .with_settings_registry(test_registry_with_default_provider(&tmp))
+        .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()))
+        .with_provider_profiles_dir(data.path());
+    svc.provider_profiles_update_default_impl(json!({
+        "baseProviderId": "claude-code",
+        "env": [{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "sk-test-work" }],
+    }))
+    .await
+    .expect("save Default overrides");
+    assert!(svc.default_has_overrides("claude-code"));
+    let parent = parent_on_claude_code(&svc, &ws).await;
+    crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(true));
+    let overlay = svc
+        .resolve_profile_env("claude-code")
+        .await
+        .expect("resolve overlay")
+        .expect("saved overlay");
+    crate::provider_auth::demote_profile_auth_verdict(&overlay);
 
     assert_eq!(delegate(&svc, &ws, Some(&parent), None).await, "auggie");
 }

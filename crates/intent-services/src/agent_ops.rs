@@ -1290,7 +1290,8 @@ impl Services {
     /// unusable parent provider must not block delegation.
     ///
     /// A remote parent is skipped: its provider runs on another machine,
-    /// so this backend's installation says nothing about it.
+    /// so this backend's installation says nothing about it. Callers also
+    /// skip a child placed on another machine, for the same reason.
     pub(crate) async fn inheritable_parent_provider(
         &self,
         method: &'static str,
@@ -1330,9 +1331,21 @@ impl Services {
             );
             return None;
         }
+        // The create front door gates on the verdict of the selection's own
+        // saved settings (an overridden Default's overlay, not the bare
+        // install); a cached signed-out or unresolvable verdict there would
+        // reject the child, so fall back instead.
+        match Box::pin(self.selection_auth_verdict(&provider)).await {
+            Ok(Some(false)) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        // A caller-supplied model must be one the inherited provider both
+        // may own and can resolve, the same two checks the create front door
+        // applies; otherwise the default provider keeps it, as before.
         if let Some(model) = model {
-            ensure_bare_model_matches_provider(method, &self.cached_models(), &provider, model)
-                .ok()?;
+            let catalog = self.cached_models();
+            ensure_bare_model_matches_provider(method, &catalog, &provider, model).ok()?;
+            ensure_model_offered_by_provider(method, &catalog, &provider, model).ok()?;
         }
         Some(provider)
     }
@@ -6385,8 +6398,13 @@ impl Services {
         // A sub-agent created without a provider (and without a specialist
         // pin) inherits its creator's provider ahead of the settings default
         // (intent-hq/intent#8479).
+        // A child placed on another machine keeps the existing resolution:
+        // this backend's install and sign-in say nothing about that machine.
+        let placed_remotely = placement
+            .as_ref()
+            .is_some_and(|p| !p.runs_on_backend().unwrap_or(true));
         let provider = match (provider, &parent_agent_id) {
-            (None, Some(parent)) => {
+            (None, Some(parent)) if !placed_remotely => {
                 self.inheritable_parent_provider(method, parent, model.as_deref())
                     .await
             }
@@ -12959,8 +12977,10 @@ impl Services {
         // provider (intent-hq/intent#8479), ahead of `model.defaultProvider`:
         // a coordinator the user put on one provider must not hand its work
         // to another one the user may not even be signed in to.
+        // A placed child's provider runs on its machine, so this backend's
+        // install and sign-in say nothing about it: keep the old resolution.
         let inherited_provider = match (&parent_agent_id, input.provider.as_deref()) {
-            (Some(parent), None) => {
+            (Some(parent), None) if !placed => {
                 self.inheritable_parent_provider("agent.delegate", parent, input.model.as_deref())
                     .await
             }
