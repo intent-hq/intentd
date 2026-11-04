@@ -299,6 +299,9 @@ impl MachineRuns {
             let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
             if is_live(&run.state) {
                 run.stopping = true;
+                // The run being stopped takes its monitor with it: a watch
+                // never outlives its run into the next one.
+                run.monitor = None;
                 (true, run.link.clone(), run.spawn_id.clone())
             } else {
                 runs.remove(place);
@@ -555,7 +558,11 @@ impl MachineRuns {
             // keeps one line up to its bound, and an oversized line counts
             // but cannot match, so a wake never carries a huge line.
             let mut matched = None;
-            if let Some(monitor) = &mut run.monitor {
+            if let Some(monitor) = run
+                .monitor
+                .as_mut()
+                .filter(|m| m.run_id.is_none() || m.run_id == run.state.run_id)
+            {
                 for byte in data.bytes() {
                     if let Some(line) = monitor.decoder.push(byte) {
                         if let Some(text) = line.text.filter(|text| {
@@ -635,6 +642,7 @@ impl MachineRuns {
                 && run.fast_restarts < MAX_FAST_RESTARTS;
             if run.stopping {
                 run.stopping = false;
+                run.monitor = None;
                 if run.def.mode == ScriptMode::Command {
                     run.last_run = Some(last_run(
                         &run.state,
@@ -734,7 +742,7 @@ impl MachineRuns {
     }
 
     async fn respawn_now(&self, place: &RunPlace) {
-        let (link, def, spawn_id) = {
+        let respawn = {
             let mut runs = lock(&self.inner.runs);
             let Some(run) = runs.get_mut(place) else {
                 return;
@@ -742,12 +750,26 @@ impl MachineRuns {
             if run.state.status != ScriptStatus::Restarting || run.spawn_id.is_some() {
                 return;
             }
-            let Some(link) = run.link.clone() else { return };
-            let spawn_id = new_id();
-            run.spawn_id = Some(spawn_id.clone());
-            run.spawned_at = Some(tokio::time::Instant::now());
-            run.state.status = ScriptStatus::Starting;
-            (link, run.def.clone(), spawn_id)
+            if run.stopping {
+                // A stop (or a final stop) came during the backoff: the
+                // service stays stopped instead of starting a new process.
+                run.stopping = false;
+                run.monitor = None;
+                run.state = idle_after(&run.state);
+                None
+            } else {
+                let Some(link) = run.link.clone() else { return };
+                let spawn_id = new_id();
+                run.spawn_id = Some(spawn_id.clone());
+                run.spawned_at = Some(tokio::time::Instant::now());
+                run.state.status = ScriptStatus::Starting;
+                Some((link, run.def.clone(), spawn_id))
+            }
+        };
+        let Some((link, def, spawn_id)) = respawn else {
+            self.bump();
+            self.changed(place).await;
+            return;
         };
         if (link.send)(start_frame(place, &def, &spawn_id))
             .await
@@ -989,6 +1011,17 @@ impl MachineRuns {
         let options = Options::parse(options)?;
         let mut runs = lock(&self.inner.runs);
         let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
+        // As for the home run: a run that already finished cannot be
+        // watched, its only exit having passed.
+        if !is_live(&run.state) {
+            return Ok(json!({
+                "ok": false,
+                "refused": true,
+                "reason": "run-finished",
+                "scriptId": place.script_id,
+                "runId": run.state.run_id,
+            }));
+        }
         if let Some(run_id) = &options.run {
             if run.state.run_id.as_ref() != Some(run_id) {
                 return Err(Error::InvalidParams(format!(
@@ -1016,7 +1049,7 @@ impl MachineRuns {
         };
         let row = monitor_row(place, run, &monitor);
         run.monitor = Some(monitor);
-        Ok(row)
+        Ok(json!({ "ok": true, "monitor": row }))
     }
 
     /// `agent_id`'s active machine-run monitors.

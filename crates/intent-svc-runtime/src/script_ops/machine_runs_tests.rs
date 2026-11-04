@@ -294,8 +294,8 @@ async fn a_lost_link_settles_live_runs_and_monitors_wake_their_agent() {
     let monitor = runs
         .monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
         .unwrap();
-    assert_eq!(monitor["remoteAgentId"], agent.as_str());
-    assert_eq!(monitor["nodeId"], "mac");
+    assert_eq!(monitor["monitor"]["remoteAgentId"], agent.as_str());
+    assert_eq!(monitor["monitor"]["nodeId"], "mac");
     assert!(runs.live_on("mac"));
     runs.link_lost("mac", "remote-script-lost: the machine disconnected")
         .await;
@@ -774,4 +774,114 @@ async fn a_final_stop_ack_settles_the_runs_never_seen_ending() {
     let wakes = rec.wakes.lock().unwrap();
     assert_eq!(wakes.len(), 1, "{wakes:?}");
     assert!(wakes[0].1.contains("remote-script-lost"), "{}", wakes[0].1);
+}
+
+/// Review of intentd#3005: a final stop that begins while a service waits
+/// out its restart backoff fences that respawn: no new process starts after
+/// the machine's cleanup began.
+#[tokio::test]
+async fn a_final_stop_fences_a_pending_service_respawn() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Service, "serve"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, started(&start)).await;
+    // The service exits on its own: a respawn is scheduled after the backoff.
+    frame(&runs, exited(&start, Some(1), None)).await;
+    assert_eq!(
+        runs.state(&place(&agent)).map(|s| s.status),
+        Some(ScriptStatus::Restarting)
+    );
+    runs.final_stop_begun(&agent);
+    // timing-guard: longer than the 20 ms restart backoff, so the respawn has had its chance
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        script_starts(&rec),
+        1,
+        "no respawn after a final stop began"
+    );
+    assert_ne!(
+        runs.state(&place(&agent)).map(|s| s.status),
+        Some(ScriptStatus::Restarting)
+    );
+}
+
+/// Review of intentd#3005: like the home run's, a monitor registered after
+/// the run already finished is refused `run-finished` instead of returning
+/// an active watch that could never wake.
+#[tokio::test]
+async fn a_monitor_on_a_finished_run_is_refused() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    runs.start(&place(&agent), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let start = last_start(&rec);
+    frame(&runs, exited(&start, Some(0), None)).await;
+    let reply = runs
+        .monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["refused"], true, "{reply}");
+    assert_eq!(reply["reason"], "run-finished", "{reply}");
+    assert!(runs.monitors_of(&agent).is_empty());
+}
+
+/// Review of intentd#3005: stopping a run retires its monitor, and a
+/// monitor only ever matches its own run's output, so a watch on run A
+/// never wakes on run B after a restart.
+#[tokio::test]
+async fn a_stopped_runs_monitor_never_wakes_on_the_next_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let def = script(ScriptMode::Service, "serve");
+    runs.start(&place(&agent), &def).await.unwrap();
+    let a = last_start(&rec);
+    frame(&runs, started(&a)).await;
+    let reply = runs
+        .monitor(
+            &place(&agent),
+            &serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready" }),
+        )
+        .unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    // An acknowledged stop of run A.
+    let acker = {
+        let runs = runs.clone();
+        let rec = rec.clone();
+        let a = a.clone();
+        tokio::spawn(async move {
+            while !rec
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| matches!(f, LinkFrame::ScriptStop(_)))
+            {
+                tokio::task::yield_now().await;
+            }
+            runs.on_frame("mac", exited(&a, Some(143), None)).await;
+        })
+    };
+    runs.stop(&place(&agent)).await.unwrap();
+    acker.await.unwrap();
+    assert!(
+        runs.monitors_of(&agent).is_empty(),
+        "run A's monitor is retired"
+    );
+    // Run B prints what run A's monitor waited for.
+    runs.start(&place(&agent), &def).await.unwrap();
+    let b = last_start(&rec);
+    assert_ne!(a.spawn_id, b.spawn_id);
+    frame(&runs, started(&b)).await;
+    frame(&runs, output(&b, 0, "ready\n")).await;
+    assert!(
+        rec.wakes.lock().unwrap().is_empty(),
+        "run A's watch woke on run B"
+    );
 }

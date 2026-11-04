@@ -778,8 +778,8 @@ async fn machine_runs(
         .unwrap_or_else(|| panic!("{body}"))
         .to_owned();
     assert_eq!(body["st"]["status"], "starting", "{body}");
-    assert_eq!(body["m"]["remoteAgentId"], agent_id, "{body}");
-    assert_eq!(body["m"]["nodeId"], node_id, "{body}");
+    assert_eq!(body["m"]["monitor"]["remoteAgentId"], agent_id, "{body}");
+    assert_eq!(body["m"]["monitor"]["nodeId"], node_id, "{body}");
 
     // The monitor wakes the agent when the run ends on the machine.
     let end = event(events, "agent:stream:end").await;
