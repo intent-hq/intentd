@@ -218,10 +218,17 @@ struct FixedReport {
     refreshes: std::sync::atomic::AtomicUsize,
     primes: std::sync::atomic::AtomicUsize,
     auth_failures: Mutex<Vec<String>>,
+    /// Reconciles with the enabled set, after which `mock` is reported as
+    /// enabled or not per `mock_enabled`.
+    reconciles: std::sync::atomic::AtomicUsize,
+    mock_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl MachineReport for FixedReport {
     fn providers(&self) -> Vec<ProviderCapability> {
+        if !self.mock_enabled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
         let failed = lock(&self.auth_failures).iter().any(|p| p == "mock");
         vec![ProviderCapability {
             id: "mock".into(),
@@ -249,6 +256,10 @@ impl MachineReport for FixedReport {
     }
     fn launch_auth_failed(&self, provider: &str) {
         lock(&self.auth_failures).push(provider.to_owned());
+    }
+    fn reconcile(&self) {
+        self.reconciles
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -331,6 +342,8 @@ impl Running {
             refreshes: std::sync::atomic::AtomicUsize::new(0),
             primes: std::sync::atomic::AtomicUsize::new(0),
             auth_failures: Mutex::new(Vec::new()),
+            reconciles: std::sync::atomic::AtomicUsize::new(0),
+            mock_enabled: std::sync::atomic::AtomicBool::new(true),
         });
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
@@ -1938,5 +1951,175 @@ async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
         admission.running.lock().unwrap().is_empty(),
         "shutdown returned with the agent still running"
     );
+    node.stop().await;
+}
+
+/// When the machine's enabled providers change, every live backend link
+/// gets the cheap reconciled report at once and then the fully refreshed
+/// one, without asking: a provider the owner disabled drops out of the
+/// backend's placement right away, and one enabled again comes back.
+#[tokio::test]
+async fn an_enabled_providers_change_pushes_the_report_unasked() {
+    use std::sync::atomic::Ordering;
+    async fn pushed(dialed: &mut DialedLink) -> Vec<String> {
+        loop {
+            match next_frame(dialed).await {
+                Some(LinkFrame::CapabilitiesReply { capabilities }) => {
+                    return capabilities.providers.into_iter().map(|p| p.id).collect();
+                }
+                Some(LinkFrame::Journal(_)) => {}
+                other => panic!("expected a pushed capabilities report, got {other:?}"),
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 3).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+
+    node.report.mock_enabled.store(false, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    assert!(
+        pushed(&mut dialed).await.is_empty(),
+        "the reconciled report"
+    );
+    assert!(pushed(&mut dialed).await.is_empty(), "the refreshed report");
+    assert_eq!(node.report.reconciles.load(Ordering::SeqCst), 1);
+    assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 1);
+
+    node.report.mock_enabled.store(true, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    assert_eq!(pushed(&mut dialed).await, ["mock"]);
+    assert_eq!(pushed(&mut dialed).await, ["mock"]);
+    node.stop().await;
+}
+
+/// The report follows the enabled set by value: a change is reported once,
+/// however many settings notices it arrived in (or none, when a newer
+/// notice replaced it), and changing back before the loop acts reports
+/// nothing.
+#[test]
+fn an_enabled_set_change_is_taken_once_by_value() {
+    let set = |pairs: &[(&str, bool)]| {
+        Some(
+            pairs
+                .iter()
+                .map(|(id, on)| ((*id).to_owned(), *on))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+    };
+    let mut watch = EnabledWatch::new(None);
+    assert!(!watch.take_change(None), "unchanged");
+    assert!(
+        watch.take_change(set(&[("codex", false)])),
+        "disabled codex"
+    );
+    assert!(
+        !watch.take_change(set(&[("codex", false)])),
+        "already taken"
+    );
+    assert!(watch.take_change(set(&[("codex", true)])), "enabled again");
+    assert!(watch.take_change(None), "back to the default");
+}
+
+fn observed(id: &str, status: ProviderStatus, models: &[&str]) -> ProviderCapability {
+    ProviderCapability {
+        id: id.into(),
+        visible: true,
+        status,
+        models: models.iter().map(|m| (*m).to_owned()).collect(),
+        models_stale: models.is_empty(),
+    }
+}
+
+/// Reconciling drops a provider disabled since the cached report, adds one
+/// enabled since with its launch status only, and keeps what was observed
+/// of the others.
+#[test]
+fn reconciling_follows_the_enabled_set_and_keeps_observations() {
+    let cached = vec![
+        observed("claude-code", ProviderStatus::SignedIn, &["opus"]),
+        observed("codex", ProviderStatus::SignedOut, &["gpt"]),
+    ];
+    let enabled_now = vec![
+        observed("claude-code", ProviderStatus::Unknown, &[]),
+        observed("opencode", ProviderStatus::Unknown, &[]),
+    ];
+    assert_eq!(
+        reconcile_providers(&cached, enabled_now.clone()),
+        vec![
+            observed("claude-code", ProviderStatus::SignedIn, &["opus"]),
+            observed("opencode", ProviderStatus::Unknown, &[]),
+        ]
+    );
+    assert_eq!(reconcile_providers(&[], enabled_now.clone()), enabled_now);
+}
+
+/// A launch, model switch or failover reaches the machine as a launch of
+/// the provider, which resolves from the machine's own settings: a provider
+/// disabled there is refused before any process starts (journaled as
+/// `node-provider-unavailable`).
+#[test]
+fn the_machine_refuses_a_provider_disabled_in_its_own_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings =
+        Arc::new(intent_services::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
+    settings
+        .apply(&[(
+            "providers.enabled".into(),
+            serde_json::json!({ "codex": false }),
+        )])
+        .unwrap();
+    let launch = SettingsLaunch(settings);
+    assert_eq!(
+        launch.resolve("codex").err().as_deref(),
+        Some("unknown or disabled")
+    );
+    assert_ne!(
+        launch.resolve("claude-code").err().as_deref(),
+        Some("unknown or disabled"),
+        "an enabled provider is not refused as disabled"
+    );
+}
+
+/// Disabling a provider changes only the report: an agent already running
+/// on it keeps its process; only its next start is refused.
+#[tokio::test]
+async fn disabling_a_provider_keeps_its_running_agent() {
+    use std::sync::atomic::Ordering;
+    let Some(providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        CountAdmission::new(3),
+        providers,
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Started { .. }
+    ));
+
+    node.report.mock_enabled.store(false, Ordering::SeqCst);
+    node.service.enabled_providers_changed().await;
+    let running: Vec<_> = node
+        .service
+        .runners_for_test()
+        .iter()
+        .flat_map(Runner::running)
+        .collect();
+    assert_eq!(running, [AgentId::from("a1")]);
     node.stop().await;
 }
