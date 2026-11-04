@@ -21662,9 +21662,8 @@ impl WorkspaceApi for Services {
             let proposal_origin = boxed_await(|| {
                 services.prepare_create_proposal_origin(&mut input, requested_key.as_deref())
             })
-            .await?;
-            // The original key is needed only through proposal validation.
-            drop(requested_key);
+            .await?
+            .map(Box::new);
             // Clone fields for logging (input moves into the closure below).
             let execution_origin = input.github_url.clone();
             let log_repo_path = input.repository_path.clone();
@@ -23893,7 +23892,7 @@ impl WorkspaceApi for Services {
             if let Some(origin) = proposal_origin {
                 let replayed = !executed.load(std::sync::atomic::Ordering::Relaxed);
                 result.proposal_origin = boxed_await(|| {
-                    self.resolve_create_proposal_origin(origin, &result.workspace.id, replayed)
+                    self.resolve_create_proposal_origin(*origin, &result.workspace.id, replayed)
                 })
                 .await;
             }
