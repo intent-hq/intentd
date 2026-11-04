@@ -8,9 +8,6 @@ agent.listUserMessages default 803157
 chat.subscribe incremental 527220
 chat.subscribe limit=200 527190
 chat.subscribe sinceMessageId 527206
-git.branchDiff baseCommitSha 819758
-git.branchDiff baseRef 1639071
-git.diffs default 3368715
 search.notes default 1369857
 search.notes max 682175
 task.subscribe default 2227998
