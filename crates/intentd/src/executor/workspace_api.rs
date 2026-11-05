@@ -5,9 +5,11 @@
 //! evaluated here, and each `ws.*` frame is routed by the shared table in
 //! `intent_core::remote_launch::workspace_api`: file, `git.commit` and
 //! `host.exec` calls run against the agent's own worktree on this node, the
-//! control-plane namespaces are forwarded to head over the current link
-//! (head checks the agent is on the link's lease), and every other
-//! namespace fails with an explicit "not supported on remote agents yet".
+//! control-plane and backend-data calls are forwarded to head over the
+//! current link (head checks the agent is on the link's lease), and every
+//! other namespace fails with an explicit `remote-agent-unsupported:` error.
+//! Head also supplies the machine-placement text of the agent's
+//! `workspace_api` description and `ws.help("agent")`.
 //! Tool outputs too large for the reply are written next to the worktree,
 //! on this node.
 
@@ -21,7 +23,7 @@ use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
 use intent_core::node_link::LinkOutcome;
 use intent_core::remote_launch::workspace_api::{
-    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
+    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -76,7 +78,7 @@ pub(super) async fn serve(
     head: HeadLink,
     bridge_exe: &Path,
 ) -> std::io::Result<(McpBridge, McpServer)> {
-    let server = Arc::new(server(agent_id, workspace_id, worktree, gates, head)?);
+    let server = Arc::new(described_server(agent_id, workspace_id, worktree, gates, head).await?);
     let bridge = intent_acp::serve_workspace_mcp_tcp(server).await?;
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
         bridge_exe,
@@ -144,8 +146,33 @@ fn server(
     Ok(server.with_frame_router(Arc::new(router)))
 }
 
+/// [`server`] with head's machine-placement text in its `workspace_api`
+/// description, as a local agent's has, so the agent can place sub-agents
+/// on other machines. Without an answer (no link, an older backend) the
+/// text is left out.
+async fn described_server(
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    worktree: &Path,
+    gates: &Gates,
+    head: HeadLink,
+) -> std::io::Result<WorkspaceMcpServer> {
+    let help = Router {
+        agent_id: agent_id.clone(),
+        head: head.clone(),
+        timeout: DEFAULT_TIMEOUT,
+    }
+    .placement_help()
+    .await;
+    Ok(server(agent_id, workspace_id, worktree, gates, head)?.with_remote_placement_help(help))
+}
+
 /// How long the node waits for head to answer its own policy read.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the agent's start and `ws.help("agent")` wait for head's
+/// placement text.
+const PLACEMENT_HELP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Routes one agent's frames: local ones to [`NodeApi`], forwarded ones to
 /// head, the rest refused.
@@ -235,6 +262,26 @@ impl Router {
         }
     }
 
+    /// Head's machine-placement text for the agent, or `None` when head
+    /// has none or does not answer within [`PLACEMENT_HELP_TIMEOUT`] (an
+    /// older backend refuses the frame).
+    async fn placement_help(&self) -> Option<String> {
+        let quick = Self {
+            timeout: self.timeout.min(PLACEMENT_HELP_TIMEOUT),
+            ..self.clone()
+        };
+        match quick.forward(PLACEMENT_HELP_METHOD, &Value::Null).await {
+            Ok(answer) => answer
+                .get("help")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            Err(error) => {
+                tracing::debug!(%error, "head did not answer the placement help");
+                None
+            }
+        }
+    }
+
     /// Whether the workspace lets agents commit on their own, as head
     /// resolves it. Fails closed: no answer is no.
     async fn auto_commit(&self) -> Result<bool> {
@@ -293,6 +340,13 @@ impl NodeApi {
 }
 
 impl WorkspaceApi for NodeApi {
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            self.check(&workspace_id).ok()?;
+            self.head.placement_help().await
+        })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             self.check(&id)?;
@@ -412,10 +466,7 @@ impl WorkspaceApi for NodeApi {
 }
 
 fn no_git_roots() -> Error {
-    Error::InvalidParams(format!(
-        "{}: secondary git roots are not supported on remote agents yet",
-        workspace_api::UNSUPPORTED_CODE
-    ))
+    Error::InvalidParams(workspace_api::GIT_ROOTS_MESSAGE.to_owned())
 }
 
 /// Commit in the agent's worktree: the named `files`, or every change. Its

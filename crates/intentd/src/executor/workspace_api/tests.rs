@@ -226,18 +226,27 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
     )
     .unwrap();
     for code in [
-        "return await ws.terminal.list();",
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
         "return await ws.browser.listTabs();",
-        "return await ws.workspace.archive();",
         r#"return await ws.file.getAttachment("att-1");"#,
-        r#"return await ws.git.registerRoot("sub");"#,
     ] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(
             text.contains("is not supported on remote agents yet"),
+            "{code}: {text}"
+        );
+    }
+    for code in [
+        r#"return await ws.git.registerRoot("sub");"#,
+        r#"return await ws.git.unregisterRoot("sub");"#,
+        r#"return await ws.git.commit("x", { gitRootId: "root-1", userRequested: true });"#,
+    ] {
+        let (failed, text) = call(&server, code).await;
+        assert!(failed, "{code}: {text}");
+        assert!(
+            text.contains(workspace_api::GIT_ROOTS_MESSAGE),
             "{code}: {text}"
         );
     }
@@ -448,12 +457,130 @@ async fn workspace_setters_are_forwarded_to_head() {
             "{method}"
         );
     }
-    let (failed, text) = call(&server, "return await ws.workspace.archive();").await;
+    answering.abort();
+}
+
+/// Remote parity S2: the backend-data calls go to head for the agent, as
+/// one `workspace.call` each.
+#[tokio::test]
+async fn backend_data_calls_are_forwarded_to_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            if let LinkEvent::Request(request) = event {
+                let frame = request.request().clone();
+                assert_eq!(frame.agent_id, agent());
+                request
+                    .respond(LinkOutcome::Ok(
+                        json!({ "answered": frame.params["method"] }),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    for (code, method) in [
+        (
+            r#"ws.primitive.addCli("n-1", "make check", "Gate")"#,
+            "primitive.addCli",
+        ),
+        ("ws.discussion.conversations()", "discussion.conversations"),
+        (
+            "ws.crossWorkspace.listSiblings()",
+            "crossWorkspace.listSiblings",
+        ),
+        ("ws.git.listRoots()", "git.listRoots"),
+        ("ws.terminal.list()", "terminal.list"),
+        (r#"ws.terminal.readOutput("t-1")"#, "terminal.readOutput"),
+        ("ws.workspace.archive()", "workspace.archive"),
+        ("ws.workspace.unarchive()", "workspace.unarchive"),
+        (
+            r#"ws.workspace.applyProposal("p-1", { userRequested: true })"#,
+            "workspace.applyProposal",
+        ),
+        (
+            r#"host({ method: "workspace.timeline", args: {} })"#,
+            "workspace.timeline",
+        ),
+    ] {
+        let answer = ok_json(call(&server, &format!("return JSON.stringify(await {code});")).await);
+        assert_eq!(answer, json!({ "answered": method }), "{method}");
+    }
+    let (failed, text) = call(
+        &server,
+        r#"return await host({ method: "app.agents.list", args: {} });"#,
+    )
+    .await;
     assert!(
-        failed && text.contains("remote-agent-unsupported"),
+        failed && text.contains("is for the Assistant workspace"),
         "{text}"
     );
     answering.abort();
+}
+
+/// Remote parity G1: the machine asks head for the placement text when it
+/// builds the agent's server and for `ws.help("agent")`, and adds it to the
+/// `workspace_api` description and the help; a backend that refuses the
+/// frame (older) or no link leaves it out.
+#[tokio::test]
+async fn placement_help_comes_from_head() {
+    use intent_core::remote_launch::workspace_api::PLACEMENT_HELP_METHOD;
+    const HELP: &str = "Remote placement (test): machine `node-2`.";
+    for answers in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+        let head = HeadLink::default();
+        head.set(node_end);
+        let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let answering = tokio::spawn(async move {
+            while let Some(event) = head_end.events.recv().await {
+                if let LinkEvent::Request(request) = event {
+                    let frame = request.request().clone();
+                    assert_eq!(frame.agent_id, agent());
+                    asked_tx.send(frame.params["method"].clone()).unwrap();
+                    let outcome = if answers {
+                        LinkOutcome::Ok(json!({ "help": HELP }))
+                    } else {
+                        LinkOutcome::Err(LinkRpcError {
+                            code: -32003,
+                            message: format!("remote-agent-unsupported: `{PLACEMENT_HELP_METHOD}`"),
+                            data: None,
+                        })
+                    };
+                    request.respond(outcome).await.unwrap();
+                }
+            }
+        });
+        let server = described_server(&agent(), &workspace(), dir.path(), &gates(), head)
+            .await
+            .unwrap();
+        assert_eq!(asked.try_recv().unwrap(), json!(PLACEMENT_HELP_METHOD));
+        let description = server.full_workspace_api_description();
+        assert_eq!(description.contains(HELP), answers, "{description}");
+        let help = ok_json(call(&server, r#"return ws.help("agent");"#).await);
+        let help = help.as_str().unwrap_or_default();
+        assert_eq!(help.contains(HELP), answers, "{help}");
+        assert!(help.contains("ws.agent.create"), "{help}");
+        answering.abort();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let unlinked = described_server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates(),
+        HeadLink::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!unlinked
+        .full_workspace_api_description()
+        .contains("Remote placement"));
 }
 
 /// intent-hq/intent#8593: a call's cards (two proposals here) go to head as

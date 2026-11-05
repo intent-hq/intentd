@@ -1149,11 +1149,7 @@ async fn workspace_setters_are_refused_off_the_lease() {
         proposed.message.starts_with("node-agent-denied"),
         "{proposed:?}"
     );
-    for method in [
-        "workspace.archive",
-        "workspace.unarchive",
-        "workspace.applyProposal",
-    ] {
+    for method in ["app.agents.list", "git.registerRoot", "workspace.bogus"] {
         let error = refused(forward(&link, &agent, method, json!({})).await);
         assert!(
             error.message.starts_with("remote-agent-unsupported"),
@@ -1177,6 +1173,113 @@ async fn workspace_setters_are_refused_off_the_lease() {
         .unwrap()
         .name;
     assert_eq!(name, "remote");
+    f.node.shutdown();
+}
+
+/// Remote parity S2: the backend-data calls run on head as the lease agent,
+/// with a local agent's checks and results; none is refused by the routing
+/// table, and an agent off the lease still gets nothing.
+#[tokio::test]
+async fn a_lease_agents_backend_data_calls_run_on_head() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let note = answered(
+        forward(
+            &link,
+            &agent,
+            "note.create",
+            json!({ "title": "Primitives", "content": "body" }),
+        )
+        .await,
+    );
+    let note_id = note["id"].as_str().unwrap().to_owned();
+    let cli = answered(
+        forward(
+            &link,
+            &agent,
+            "primitive.addCli",
+            json!({ "noteId": note_id, "command": "make check", "description": "Gate" }),
+        )
+        .await,
+    );
+    assert_eq!(cli["ok"], json!(true), "{cli}");
+    let siblings = answered(forward(&link, &agent, "crossWorkspace.listSiblings", json!({})).await);
+    assert!(siblings.is_array(), "{siblings}");
+    let roots = answered(forward(&link, &agent, "git.listRoots", json!({})).await);
+    assert!(roots.is_array(), "{roots}");
+
+    // These reach head's own bindings: whatever they answer is a local
+    // agent's answer, never the routing table's refusal.
+    for (method, args) in [
+        ("terminal.list", json!({})),
+        ("terminal.readOutput", json!({ "terminalId": "t-none" })),
+        ("discussion.conversations", json!({})),
+        ("workspace.context", json!({})),
+        ("workspace.referenceDocs", json!({})),
+        ("workspace.timeline", json!({})),
+        ("workspace.emitNotification", json!({})),
+        ("workspace.applyProposal", json!({ "proposalId": "p-none" })),
+    ] {
+        if let LinkOutcome::Err(error) = forward(&link, &agent, method, args).await {
+            assert!(
+                !error.message.starts_with("remote-agent-unsupported")
+                    && !error.message.starts_with("node-agent-denied"),
+                "{method}: {error:?}"
+            );
+        }
+    }
+    let applied = refused(
+        forward(
+            &link,
+            &agent,
+            "workspace.applyProposal",
+            json!({ "proposalId": "p-none" }),
+        )
+        .await,
+    );
+    assert!(applied.message.contains("userRequested"), "{applied:?}");
+
+    let archived = answered(forward(&link, &agent, "workspace.archive", json!({})).await);
+    assert_eq!(archived["ok"], json!(true), "{archived}");
+    let unarchived = answered(forward(&link, &agent, "workspace.unarchive", json!({})).await);
+    assert_eq!(unarchived["ok"], json!(true), "{unarchived}");
+
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    for method in ["primitive.addCli", "git.listRoots", "workspace.archive"] {
+        let denied = refused(forward(&link, &unplaced, method, json!({})).await);
+        assert!(
+            denied.message.starts_with("node-agent-denied"),
+            "{method}: {denied:?}"
+        );
+    }
+    f.node.shutdown();
+}
+
+/// Remote parity G1: the machine asks head for the machine-placement text a
+/// local agent sees; head answers it only for a lease agent.
+#[tokio::test]
+async fn head_answers_placement_help_for_lease_agents() {
+    use intent_core::remote_launch::workspace_api::PLACEMENT_HELP_METHOD;
+    let (f, link, machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let expected = f.port().placement_help(&f.services).await.unwrap();
+    let answer = answered(forward(&link, &agent, PLACEMENT_HELP_METHOD, Value::Null).await);
+    assert_eq!(answer, json!({ "help": expected }));
+    assert!(
+        answer["help"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("nodeId `{}`", machine.id())),
+        "{answer}"
+    );
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    let denied = refused(forward(&link, &unplaced, PLACEMENT_HELP_METHOD, Value::Null).await);
+    assert!(
+        denied.message.starts_with("node-agent-denied"),
+        "{denied:?}"
+    );
     f.node.shutdown();
 }
 
@@ -1542,24 +1645,21 @@ async fn user_and_local_agent_creates_stay_on_the_backend() {
 }
 
 /// A remote agent reads its workspace's details through head;
-/// `archive`, and `workspace.info` (answered on the machine), are refused.
+/// `workspace.info` (answered on the machine) is refused on head.
 #[tokio::test]
-async fn a_remote_agent_reads_workspace_details_but_cannot_archive() {
+async fn a_remote_agent_reads_workspace_details_but_not_heads_workspace_info() {
     let (f, link, _machine) = fixture().await;
     let (agent, _) = f.placed().await;
     let details = answered(forward(&link, &agent, "workspace.details", json!({})).await);
     assert_eq!(details["id"], json!(workspace().as_str()), "{details}");
     assert_eq!(details["title"], json!("Remote"), "{details}");
-    for (method, args) in [
-        ("workspace.archive", json!({})),
-        ("workspace.info", json!({})),
-    ] {
-        let error = refused(forward(&link, &agent, method, args).await);
-        assert!(
-            error.message.starts_with("remote-agent-unsupported"),
-            "{method}: {error:?}"
-        );
-    }
+    // `workspace.info` names the agent's checkout, so it runs on the machine
+    // and head never answers it.
+    let error = refused(forward(&link, &agent, "workspace.info", json!({})).await);
+    assert!(
+        error.message.starts_with("remote-agent-unsupported"),
+        "{error:?}"
+    );
     let workspace = f
         .services
         .store()
