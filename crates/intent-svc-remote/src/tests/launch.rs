@@ -924,22 +924,11 @@ async fn a_lease_agent_sets_the_workspace_title_and_status() {
     assert_eq!(row.title, "Remote naming");
     assert_eq!(row.status_message.as_deref(), Some("Working remotely."));
 
-    const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    let image = answered(
-        forward(
-            &link,
-            &agent,
-            "workspace.setStatusImage",
-            json!({ "image": { "data": PIXEL_PNG, "mimeType": "image/png" } }),
-        )
-        .await,
-    );
-    let asset = image["statusImageAssetId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("an asset id: {image}"))
-        .to_owned();
-    let row = store.get_workspace(&workspace()).await.unwrap();
-    assert_eq!(row.status_image_asset_id.as_deref(), Some(asset.as_str()));
+    sqlx::query("UPDATE workspace SET status_image_asset_id = 'asset-1' WHERE id = ?")
+        .bind(workspace().as_str())
+        .execute(f.backend.store().write_pool())
+        .await
+        .unwrap();
     let cleared = answered(
         forward(
             &link,
@@ -950,6 +939,8 @@ async fn a_lease_agent_sets_the_workspace_title_and_status() {
         .await,
     );
     assert_eq!(cleared["statusImageAssetId"], Value::Null, "{cleared}");
+    let row = store.get_workspace(&workspace()).await.unwrap();
+    assert_eq!(row.status_image_asset_id, None);
 
     let skipped = answered(
         forward(
@@ -997,6 +988,63 @@ async fn a_lease_agent_renames_itself_and_no_other_agent() {
     f.node.shutdown();
 }
 
+/// intent-hq/intent#8593: a lease agent proposes a sibling workspace on
+/// head; the answer carries the proposal card the agent's transcript
+/// records. A remote sub-agent may not propose, as locally.
+#[tokio::test]
+async fn a_lease_agent_proposes_a_sibling_workspace() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let params = json!({ "title": "Follow-up", "initialPrompt": "Do the follow-up." });
+
+    let proposed =
+        answered(forward(&link, &agent, "workspace.proposeSibling", params.clone()).await);
+    assert!(
+        proposed["proposalId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("workspace-create-")),
+        "{proposed}"
+    );
+    let card = proposed["__mcpContentItems"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item["type"] == "resource")
+                    .then(|| item["resource"]["text"].as_str())
+                    .flatten()
+            })
+        })
+        .map(|text| serde_json::from_str::<Value>(text).unwrap())
+        .unwrap_or_else(|| panic!("a proposal resource: {proposed}"));
+    assert_eq!(card["kind"], json!("workspace-create"), "{card}");
+    let nonce = card[intent_core::turn_attachments::ATTACHMENT_ID_KEY]
+        .as_str()
+        .unwrap_or_else(|| panic!("the card is stamped for the transcript: {card}"));
+    assert!(nonce.starts_with("tar-"), "{card}");
+    let registry = f.services.turn_attachments();
+    assert_eq!(
+        registry.pending_count_by_mime(&agent, "application/vnd.intent.proposal+json"),
+        1,
+        "head holds the card for the agent's turn"
+    );
+    assert_eq!(card["applyToolCallId"], proposed["proposalId"], "{card}");
+    assert_eq!(
+        card["payload"]["params"]["title"],
+        json!("Follow-up"),
+        "{card}"
+    );
+
+    sqlx::query("UPDATE agent_session SET parent_agent_id = ? WHERE id = ?")
+        .bind(AgentId::new().as_str())
+        .bind(agent.as_str())
+        .execute(f.backend.store().write_pool())
+        .await
+        .unwrap();
+    let error = refused(forward(&link, &agent, "workspace.proposeSibling", params).await);
+    assert!(error.message.contains("proposeSibling"), "{error:?}");
+    f.node.shutdown();
+}
+
 /// intent-hq/intent#8593: the setters stay confined to the lease's agents
 /// and to the four setters; a refused one changes nothing.
 #[tokio::test]
@@ -1025,10 +1073,22 @@ async fn workspace_setters_are_refused_off_the_lease() {
         renamed.message.starts_with("node-agent-denied"),
         "{renamed:?}"
     );
+    let proposed = refused(
+        forward(
+            &link,
+            &unplaced,
+            "workspace.proposeSibling",
+            json!({ "title": "Nope", "initialPrompt": "Nope" }),
+        )
+        .await,
+    );
+    assert!(
+        proposed.message.starts_with("node-agent-denied"),
+        "{proposed:?}"
+    );
     for method in [
         "workspace.archive",
         "workspace.unarchive",
-        "workspace.proposeSibling",
         "workspace.applyProposal",
     ] {
         let error = refused(forward(&link, &agent, method, json!({})).await);

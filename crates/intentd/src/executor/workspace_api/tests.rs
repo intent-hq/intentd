@@ -389,8 +389,9 @@ async fn script_calls_reach_head_only_on_a_protocol_8_link() {
     }
 }
 
-/// intent-hq/intent#8593: the machine forwards the workspace setters to
-/// head for the agent; the other workspace calls it still refuses itself.
+/// intent-hq/intent#8593: the machine forwards the workspace setters and
+/// `proposeSibling` to head for the agent; the other workspace calls it
+/// still refuses itself.
 #[tokio::test]
 async fn workspace_setters_are_forwarded_to_head() {
     let dir = tempfile::tempdir().unwrap();
@@ -433,6 +434,11 @@ async fn workspace_setters_are_forwarded_to_head() {
             "ws.workspace.setStatusImage(null)",
             "workspace.setStatusImage",
             json!({ "image": null }),
+        ),
+        (
+            r#"ws.workspace.proposeSibling({ title: "Next", initialPrompt: "Go" })"#,
+            "workspace.proposeSibling",
+            json!({ "title": "Next", "initialPrompt": "Go" }),
         ),
     ] {
         let answer = ok_json(call(&server, &format!("return JSON.stringify(await {code});")).await);
