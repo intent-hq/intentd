@@ -791,7 +791,7 @@ async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
         "script.list",
         "script.start",
         "file.read",
-        "hook.list",
+        "mcp.listServers",
         "workspace.info",
     ] {
         let error = refused(forward(&link, &agent, method, json!({})).await);
