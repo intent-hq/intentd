@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.130] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- *(remote)* Report switched-off providers as disabled in model-unavailable ([#3050](https://github.com/intent-hq/intentd/pull/3050))
+
+
 ## [0.11.129] - 2026-11-05
 
 ### 🚀 Features
