@@ -1861,6 +1861,9 @@ impl Runner {
             Some(push) => push,
             None => self.push_final(agent_id).await,
         };
+        // No requested push (`pushWip`) reads the checkout while it goes.
+        let serial = self.push_lock(agent_id);
+        let _serial = serial.lock().await;
         if let Err(error) = self.inner.checkouts.remove(agent_id).await {
             tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: could not remove a stopped agent's checkout; not acknowledging");
             return None;
@@ -1872,18 +1875,20 @@ impl Runner {
     /// checkout here, or when this machine does not know its workspace
     /// (it already pushed when it exited).
     async fn push_final(&self, agent_id: &AgentId) -> FinalPush {
-        let Some(worktree) = self.inner.checkouts.existing(agent_id) else {
+        // An agent sharing a checkout pushes it to its owner's refs.
+        let owner = lock(&self.inner.state).checkout_owner(agent_id);
+        let Some(worktree) = self.inner.checkouts.existing(&owner) else {
             return FinalPush::Skipped;
         };
-        let Some(workspace_id) = lock(&self.inner.state).workspaces.get(agent_id).cloned() else {
+        let Some(workspace_id) = lock(&self.inner.state).workspaces.get(&owner).cloned() else {
             return FinalPush::Skipped;
         };
-        let serial = self.push_lock(agent_id);
+        let serial = self.push_lock(&owner);
         let _serial = serial.lock().await;
         match self
             .inner
             .checkouts
-            .push_wip(agent_id, &workspace_id, &worktree, FINAL_PUSH_TIMEOUT)
+            .push_wip(&owner, &workspace_id, &worktree, FINAL_PUSH_TIMEOUT)
             .await
         {
             Ok(()) => FinalPush::Pushed,
@@ -1957,6 +1962,15 @@ impl Runner {
         };
         let serial = self.push_lock(&owner);
         let _serial = serial.lock().await;
+        // A final stop or the sweep is removing the checkout: its final
+        // push, not this one, is the last word.
+        let removing = {
+            let state = lock(&self.inner.state);
+            state.finalizing.contains_key(&owner) || state.sweeping.contains(&owner)
+        };
+        if removing || self.inner.checkouts.existing(&owner).is_none() {
+            return (FinalPush::Skipped, None);
+        }
         match self
             .inner
             .checkouts
@@ -2043,7 +2057,11 @@ impl Runner {
             }
             #[cfg(test)]
             self.inner.checkouts.before_sweep_removal(&agent_id).await;
-            let removed = self.inner.checkouts.remove(&agent_id).await;
+            let serial = self.push_lock(&agent_id);
+            let removed = {
+                let _serial = serial.lock().await;
+                self.inner.checkouts.remove(&agent_id).await
+            };
             lock(&self.inner.state).sweeping.remove(&agent_id);
             self.inner.swept.notify_waiters();
             match removed {

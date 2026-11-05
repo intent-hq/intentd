@@ -157,3 +157,50 @@ async fn a_push_request_pushes_the_owners_checkout_now() {
         "{error:?}"
     );
 }
+
+/// A stopped sharing agent's final stop pushes the shared checkout to the
+/// owner's refs, not "skipped" for want of a checkout of its own.
+#[tokio::test]
+async fn a_stopped_sharers_final_stop_pushes_the_owners_checkout() {
+    let Some(h) = harness(2, &[]) else { return };
+    owner_and_child(&h, "o1", "c1").await;
+    let child = AgentId::from("c1");
+    h.runner.stop(&child).wait().await.unwrap();
+    let pushes = h.checkouts.pushes.lock().unwrap().len();
+    assert_eq!(
+        h.runner.final_stop(&child).await,
+        Some((StopOutcome::NotRunning, FinalPush::Pushed))
+    );
+    let all = h.checkouts.pushes.lock().unwrap().clone();
+    assert_eq!(all.len(), pushes + 1);
+    assert_eq!(all.last(), Some(&AgentId::from("o1")));
+    assert!(h.storage.existing_agent_dir(&AgentId::from("o1")).is_some());
+}
+
+/// A push request that arrives while the owner's final stop pushes waits,
+/// then is skipped: it never pushes a checkout being removed over the
+/// final push.
+#[tokio::test]
+async fn a_push_request_during_the_owners_final_stop_is_skipped() {
+    let Some(h) = harness(1, &[]) else { return };
+    let owner = AgentId::from("o1");
+    h.runner.launch(launch("o1")).await;
+    wait_for(&h.runner, "started", started("o1")).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *h.checkouts.hold_push.lock().unwrap() = Some((entered_tx, release_rx));
+    let stopping = tokio::spawn(h.runner.final_stop(&owner));
+    entered_rx.await.unwrap();
+    let request = {
+        let runner = h.runner.clone();
+        let owner = owner.clone();
+        tokio::spawn(async move { runner.push_now(&owner).await })
+    };
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        stopping.await.unwrap(),
+        Some((StopOutcome::Stopped, FinalPush::Pushed))
+    );
+    assert_eq!(request.await.unwrap(), (FinalPush::Skipped, None));
+    assert_eq!(h.checkouts.pushes.lock().unwrap().as_slice(), [owner]);
+}
