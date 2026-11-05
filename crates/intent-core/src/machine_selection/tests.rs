@@ -52,6 +52,7 @@ fn report(
             memory_budget_bytes: None,
         },
         providers,
+        disabled_providers: vec![],
         observed_at: observed_at.into(),
     }
 }
@@ -409,6 +410,105 @@ async fn model_unavailable_without_a_model_names_the_provider_status() {
         "Provider \"claude-code\" can't start on out-name (macos/aarch64, status: signed-out)."
     );
     assert_eq!(failure.data()["model"], "");
+}
+
+/// A report listing `providers` and naming `disabled` as switched off on
+/// the machine.
+fn report_disabling(providers: Vec<ProviderCapability>, disabled: &[&str]) -> MachineCapabilities {
+    MachineCapabilities {
+        disabled_providers: disabled.iter().map(|id| (*id).to_owned()).collect(),
+        ..report(MAC, FRESH, providers)
+    }
+}
+
+/// A provider switched off in the machine's own settings reads `disabled`,
+/// not `cli-missing`, so the user knows to switch it on there rather than
+/// install it; a provider merely absent stays `cli-missing`, and neither is
+/// a placement candidate.
+#[tokio::test]
+async fn model_unavailable_reports_a_provider_switched_off_on_the_machine_as_disabled() {
+    let fake = Fake::new(vec![
+        machine(
+            "off",
+            Some(report_disabling(
+                vec![provider("codex", ProviderStatus::SignedIn, &["gpt-5"])],
+                &["claude-code"],
+            )),
+        ),
+        machine(
+            "absent",
+            Some(report_disabling(
+                vec![provider("codex", ProviderStatus::SignedIn, &["gpt-5"])],
+                &["droid"],
+            )),
+        ),
+    ]);
+    let placement = remote();
+    let failure = model_failure(select(&fake, request(&placement, Some("opus"))).await);
+    assert_eq!(
+        failure.data()["machines"],
+        json!([
+            { "nodeId": "off", "name": "off-name",
+              "platform": { "os": "macos", "arch": "aarch64" },
+              "status": "disabled", "models": [], "observedAt": FRESH },
+            { "nodeId": "absent", "name": "absent-name",
+              "platform": { "os": "macos", "arch": "aarch64" },
+              "status": "cli-missing", "models": [], "observedAt": FRESH },
+        ])
+    );
+    let message = failure.message();
+    assert!(
+        message.contains("claude-code is disabled on off-name (macos/aarch64)"),
+        "{message}"
+    );
+    assert!(
+        message
+            .contains("isn't available on absent-name (macos/aarch64, claude-code: cli-missing)"),
+        "{message}"
+    );
+
+    let failure = model_failure(select(&fake, request(&placement, None)).await);
+    assert!(
+        failure.message().starts_with(
+            "Provider \"claude-code\" can't start: it is disabled on off-name (macos/aarch64)"
+        ),
+        "{}",
+        failure.message()
+    );
+}
+
+/// A machine that switched every provider off sends a report with no
+/// providers, which is not the "no report yet" case: the provider reads
+/// `disabled`, not `unknown`, and the report is not refreshed for it.
+#[tokio::test]
+async fn a_report_with_every_provider_disabled_reads_disabled_not_unknown() {
+    let fake = Fake::new(vec![machine(
+        "off",
+        Some(report_disabling(vec![], &["claude-code", "codex"])),
+    )]);
+    let placement = remote();
+    let failure = model_failure(select(&fake, request(&placement, Some("opus"))).await);
+    assert_eq!(failure.machines[0].status, ProviderStatus::Disabled);
+    assert!(!failure.retryable);
+    assert!(fake.refreshed().is_empty(), "{:?}", fake.refreshed());
+}
+
+/// A report from a machine that does not send `disabledProviders` decodes
+/// with none disabled: every absent provider stays `cli-missing`.
+#[tokio::test]
+async fn an_older_machines_report_keeps_absent_providers_cli_missing() {
+    let mut value = serde_json::to_value(report(
+        MAC,
+        FRESH,
+        vec![provider("codex", ProviderStatus::SignedIn, &["gpt-5"])],
+    ))
+    .unwrap();
+    value.as_object_mut().unwrap().remove("disabledProviders");
+    let caps: MachineCapabilities = serde_json::from_value(value).unwrap();
+    let fake = Fake::new(vec![machine("old", Some(caps))]);
+    let placement = remote();
+    let failure = model_failure(select(&fake, request(&placement, Some("opus"))).await);
+    assert_eq!(failure.machines[0].status, ProviderStatus::CliMissing);
 }
 
 #[tokio::test]
@@ -948,6 +1048,25 @@ fn a_switch_is_judged_on_the_agents_machine_report() {
         panic!("expected model-unavailable for a signed-out provider");
     };
     assert_eq!(failure.machines[0].status, ProviderStatus::SignedOut);
+}
+
+/// A switch on a machine with no stored report says `unknown` (nothing is
+/// known of its providers), never `cli-missing`; one whose report names
+/// the provider as switched off there says `disabled`.
+#[test]
+fn a_switch_without_a_report_reads_unknown_and_a_disabled_provider_disabled() {
+    let mut unreported = machine("bare", None);
+    unreported.platform = Some(MAC);
+    let rows = vec![
+        unreported,
+        machine("off", Some(report_disabling(vec![], &["codex"]))),
+    ];
+    let status = |node_id: &str| match switch_check(&rows, node_id, "codex", Some("gpt-5"), false) {
+        Err(Error::ModelUnavailable(failure)) => failure.machines[0].status,
+        other => panic!("expected model-unavailable, got {other:?}"),
+    };
+    assert_eq!(status("bare"), ProviderStatus::Unknown);
+    assert_eq!(status("off"), ProviderStatus::Disabled);
 }
 
 #[test]

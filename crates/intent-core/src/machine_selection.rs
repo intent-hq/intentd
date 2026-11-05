@@ -151,11 +151,9 @@ pub async fn select_machines(
             .platform
             .is_none_or(|platform| placement.matches_platform(platform));
         // A report without providers was sent before the machine observed
-        // them (its welcome right after remote agents were turned on).
-        let must_refresh = row
-            .capabilities
-            .as_ref()
-            .is_none_or(|caps| caps.providers.is_empty())
+        // them (its welcome right after remote agents were turned on),
+        // unless it names them all as switched off there.
+        let must_refresh = row.capabilities.as_ref().is_none_or(not_observed)
             || row.state == RemoteMachineState::UpdateRequired
             || report_is_stale(row.observed_at.as_deref(), now)
             || models_pending(&row, &request);
@@ -416,7 +414,9 @@ fn provider_of<'a>(row: &'a ExposedMachine, provider: &str) -> Option<&'a Provid
 /// a launch without a profile.
 fn provider_usable(status: ProviderStatus, with_profile: bool) -> bool {
     match status {
-        ProviderStatus::CliMissing | ProviderStatus::PrerequisiteMissing => false,
+        ProviderStatus::CliMissing
+        | ProviderStatus::PrerequisiteMissing
+        | ProviderStatus::Disabled => false,
         ProviderStatus::SignedOut | ProviderStatus::AuthFailed => with_profile,
         ProviderStatus::SignedIn | ProviderStatus::Unknown => true,
     }
@@ -455,26 +455,34 @@ pub fn model_listed(listed: &str, requested: &str) -> bool {
             .any(|window| window == requested.as_slice())
 }
 
+/// A report that says nothing of the machine's providers yet: sent before
+/// the machine first looked at them.
+fn not_observed(caps: &MachineCapabilities) -> bool {
+    caps.providers.is_empty() && caps.disabled_providers.is_empty()
+}
+
+/// The status of a provider the machine's report does not list: `disabled`
+/// when the report names it as switched off there, `unknown` without a
+/// report or with one that predates the machine's first look at its
+/// providers, else `cli-missing`.
+fn unlisted_status(caps: Option<&MachineCapabilities>, provider: &str) -> ProviderStatus {
+    match caps {
+        Some(caps) if caps.disabled_providers.iter().any(|id| id == provider) => {
+            ProviderStatus::Disabled
+        }
+        Some(caps) if !not_observed(caps) => ProviderStatus::CliMissing,
+        _ => ProviderStatus::Unknown,
+    }
+}
+
 fn machine_models(row: &ExposedMachine, provider: &str) -> Option<MachineModels> {
     let offered = provider_of(row, provider);
     Some(MachineModels {
         node_id: row.id.clone(),
         name: row.name.clone(),
         platform: row.platform?,
-        // A report listing no providers at all predates the machine's
-        // first look at them.
         status: offered.map_or_else(
-            || {
-                if row
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|caps| caps.providers.is_empty())
-                {
-                    ProviderStatus::Unknown
-                } else {
-                    ProviderStatus::CliMissing
-                }
-            },
+            || unlisted_status(row.capabilities.as_ref(), provider),
             |provider| provider.status,
         ),
         models: offered

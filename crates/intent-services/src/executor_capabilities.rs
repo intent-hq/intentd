@@ -103,6 +103,24 @@ impl Services {
             .collect()
     }
 
+    /// The providers this build knows that this machine's own
+    /// `providers.enabled` switches off, in registry order: the
+    /// `disabledProviders` of its capabilities report.
+    #[must_use]
+    pub fn executor_disabled_providers(&self) -> Vec<String> {
+        let settings = self.effective_settings();
+        intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|provider| {
+                crate::agent_ops::provider_is_disabled(
+                    provider.id,
+                    settings.providers.enabled.as_ref(),
+                )
+            })
+            .map(|provider| provider.id.to_owned())
+            .collect()
+    }
+
     /// Every enabled provider this build knows, with its status and (for a
     /// launchable one) its models from `models.list`. A launchable
     /// provider's status is its default account's cached sign-in probe, or
@@ -327,6 +345,41 @@ mod tests {
             .collect();
         assert!(!ids.iter().any(|id| id == "codex"), "{ids:?}");
         assert!(ids.iter().any(|id| id == "claude-code"), "{ids:?}");
+    }
+
+    /// The providers switched off in this machine's own `providers.enabled`
+    /// are named, in registry order, so a backend can report them as
+    /// `disabled` rather than not installed; switching one back on drops it.
+    #[tokio::test]
+    async fn disabled_providers_name_those_switched_off_and_follow_the_setting() {
+        let dir = crate::test_support::test_tempdir("disabled-providers");
+        let store = intent_store::Store::open(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+        let settings = std::sync::Arc::new(
+            crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap(),
+        );
+        let svc = Services::new(store).with_settings_registry(settings.clone());
+        assert!(
+            svc.executor_disabled_providers().is_empty(),
+            "every provider is enabled by default"
+        );
+
+        settings
+            .apply(&[("providers.enabled".into(), json!({ "codex": false }))])
+            .unwrap();
+        assert_eq!(svc.executor_disabled_providers(), ["codex"]);
+        let listed: Vec<_> = svc
+            .executor_provider_launch_statuses()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(!listed.iter().any(|id| id == "codex"), "{listed:?}");
+
+        settings
+            .apply(&[("providers.enabled".into(), json!({ "codex": true }))])
+            .unwrap();
+        assert!(svc.executor_disabled_providers().is_empty());
     }
 
     /// What the installation says applies to every launch, signed in or not.
