@@ -14,7 +14,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
-use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
+use intent_core::remote_launch::workspace_api::{
+    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, MAX_FORWARDED_ATTACHMENTS,
+};
 use intent_core::{Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
@@ -89,7 +91,8 @@ impl HeadCalls {
         let Some(method) = request.params.get("method").and_then(Value::as_str) else {
             return refusal(INVALID_PARAMS, "workspace.call needs a string `method`");
         };
-        if method != COMMIT_POLICY_METHOD && workspace_api::route(method) != Route::Forward {
+        let internal = method == COMMIT_POLICY_METHOD || method == ATTACHMENTS_METHOD;
+        if !internal && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
         let record = match shared.store.get_remote_agent(&request.agent_id).await {
@@ -120,6 +123,17 @@ impl HeadCalls {
                 .effective_auto_commit(&record.workspace_id)
                 .await;
             return LinkOutcome::Ok(serde_json::json!({ "autoCommit": enabled }));
+        }
+        if method == ATTACHMENTS_METHOD {
+            return match forwarded_attachments(request.params.get("args")) {
+                Ok(batch) => {
+                    self.services
+                        .turn_attachments()
+                        .register_all(&record.agent_id, batch);
+                    LinkOutcome::Ok(serde_json::json!({}))
+                }
+                Err(message) => refusal(INVALID_PARAMS, message),
+            };
         }
         let features = self.services.session_agent_features(&session);
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
@@ -165,4 +179,47 @@ impl HeadCalls {
             Err(message) => refusal(CALL_FAILED, message),
         }
     }
+}
+
+/// The cards of one [`ATTACHMENTS_METHOD`] frame, for the tool result they
+/// came from: claimed together by nonce or by the `workspace_api` fallback.
+fn forwarded_attachments(
+    args: Option<&Value>,
+) -> std::result::Result<Vec<intent_core::TurnAttachment>, String> {
+    let items = args
+        .and_then(|args| args.get("attachments"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{ATTACHMENTS_METHOD} needs an `attachments` array"))?;
+    if items.len() > MAX_FORWARDED_ATTACHMENTS {
+        return Err(format!(
+            "{ATTACHMENTS_METHOD} carries at most {MAX_FORWARDED_ATTACHMENTS} attachments"
+        ));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let field = |key: &str| {
+                item.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        format!("{ATTACHMENTS_METHOD}: each attachment needs a string `{key}`")
+                    })
+            };
+            let id = field("id")?;
+            if !intent_core::turn_attachments::is_attachment_id(&id) {
+                return Err(format!(
+                    "{ATTACHMENTS_METHOD}: `{id}` is not an attachment id"
+                ));
+            }
+            Ok(intent_core::TurnAttachment {
+                id,
+                policy: intent_core::AttachmentPolicy::AtToolResult,
+                mime_type: field("mimeType")?,
+                uri: field("uri")?,
+                name: field("name")?,
+                text: field("text")?,
+            })
+        })
+        .collect()
 }

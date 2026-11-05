@@ -412,6 +412,12 @@ async fn a_revoked_credential_marks_the_machine_revoked() {
         .unwrap_err();
     assert_eq!(error.code(), -32603);
     assert_eq!(data(&error)["code"], "machine-revoked");
+    let message = error.to_string();
+    assert!(
+        message.contains("let this backend run agents on it again"),
+        "{message}"
+    );
+    assert!(!message.contains("available"), "{message}");
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"][0]["state"], "revoked");
 }

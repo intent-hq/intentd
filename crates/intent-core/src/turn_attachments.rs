@@ -54,6 +54,15 @@ pub fn new_attachment_id() -> String {
     format!("{NONCE_PREFIX}{}", &hex[..12])
 }
 
+/// Whether `id` has the shape [`new_attachment_id`] mints. A claim matches
+/// a nonce by substring, so a shorter or empty id from another process (a
+/// remote agent's node) would claim unrelated tool results.
+#[must_use]
+pub fn is_attachment_id(id: &str) -> bool {
+    id.strip_prefix(NONCE_PREFIX)
+        .is_some_and(|hex| hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The `workspace_api` MCP tool's input schema: a string `code` (the JS to
 /// run) plus a string `summary` (the model-authored one-line description),
 /// and nothing else. Both keys are required by the schema and no daemon tool
