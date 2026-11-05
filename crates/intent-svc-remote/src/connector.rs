@@ -1331,30 +1331,30 @@ impl RemoteNode {
     /// without, only whether it is reachable. Bounded by the capabilities
     /// timeout.
     pub async fn machine_skills(&self, query: bool) -> MachineSkills {
-        let bound = self.shared.tuning.capabilities_timeout;
-        if !matches!(
-            tokio::time::timeout(bound, self.connect()).await,
-            Ok(Ok(()))
-        ) {
-            return MachineSkills::Offline;
-        }
-        if self.shared.protocol() < SKILLS_PROTOCOL {
-            return MachineSkills::UpdateRequired;
-        }
-        if !query {
-            return MachineSkills::Reachable;
-        }
         let query_id = LinkId::new_v4();
-        let (tx, rx) = oneshot::channel();
-        lock(&self.shared.skills_waiters).insert(query_id, tx);
-        let frame = LinkFrame::Skills(SkillsQuery { query_id });
-        let answer = match self.shared.send(&frame).await {
-            Ok(()) => match tokio::time::timeout(bound, rx).await {
-                Ok(Ok(skills)) => MachineSkills::Listed(skills),
-                _ => MachineSkills::Offline,
-            },
-            Err(_) => MachineSkills::Offline,
+        let ask = async {
+            if self.connect().await.is_err() {
+                return MachineSkills::Offline;
+            }
+            if self.shared.protocol() < SKILLS_PROTOCOL {
+                return MachineSkills::UpdateRequired;
+            }
+            if !query {
+                return MachineSkills::Reachable;
+            }
+            let (tx, rx) = oneshot::channel();
+            lock(&self.shared.skills_waiters).insert(query_id, tx);
+            let frame = LinkFrame::Skills(SkillsQuery { query_id });
+            if self.shared.send(&frame).await.is_err() {
+                return MachineSkills::Offline;
+            }
+            rx.await
+                .map_or(MachineSkills::Offline, MachineSkills::Listed)
         };
+        // One deadline for connecting and answering (agent-aux.md: 10 s).
+        let answer = tokio::time::timeout(self.shared.tuning.capabilities_timeout, ask)
+            .await
+            .unwrap_or(MachineSkills::Offline);
         lock(&self.shared.skills_waiters).remove(&query_id);
         answer
     }

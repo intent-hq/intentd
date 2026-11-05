@@ -47,6 +47,13 @@ impl HeadLink {
     pub(super) fn get(&self) -> Option<NodeLink> {
         lock(&self.current).clone().filter(|link| !link.is_closed())
     }
+
+    /// The protocol the last link to head negotiated, closed or not; 0
+    /// before any link. Records gated on it are written even while the
+    /// link is briefly down, and replay to the same backend.
+    pub(super) fn last_protocol(&self) -> u32 {
+        lock(&self.current).as_ref().map_or(0, NodeLink::protocol)
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

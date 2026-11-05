@@ -32374,7 +32374,12 @@ impl WorkspaceApi for Services {
                 )
                 .await
             };
-            if let (Ok(_), Some(asked)) = (&sent, asked_skill) {
+            // After a sent message only: a queued one is stored later, and
+            // the notice must follow it.
+            let queued = sent
+                .as_ref()
+                .is_ok_and(|v| v.get("queued").and_then(serde_json::Value::as_bool) == Some(true));
+            if let (Ok(_), Some(asked), false) = (&sent, asked_skill, queued) {
                 self.note_unavailable_skill(&notice_workspace, &notice_agent, &asked)
                     .await;
             }

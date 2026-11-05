@@ -1622,15 +1622,12 @@ impl Runner {
     }
 
     /// Discover the agent's skills on this machine for its first prompt and,
-    /// on a protocol 12 link, journal them before it starts.
+    /// when the backend's last link negotiated protocol 12, journal them
+    /// before it starts.
     async fn find_skills(&self, agent: &Agent, cwd: &std::path::Path) {
         let found = skills::discover(Some(cwd.to_path_buf()), self.inner.home.clone()).await;
         *lock(&agent.skills_catalog) = skills::catalog_block(&found);
-        let reports = self
-            .inner
-            .head
-            .get()
-            .is_some_and(|link| link.protocol() >= SKILLS_PROTOCOL);
+        let reports = self.inner.head.last_protocol() >= SKILLS_PROTOCOL;
         if reports {
             self.append(agent_entry(agent, JournalBody::Skills { skills: found }))
                 .await;
