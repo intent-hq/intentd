@@ -4,10 +4,11 @@
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
-//! agent's machine), plus `workspace.details`, is forwarded to head over the node link (head checks the agent
-//! is on the link's lease and routes the frame again, never trusting the
-//! node), and everything else is refused with an explicit error instead of
-//! running on the wrong host.
+//! agent's machine), plus `workspace.details` and the workspace setters
+//! ([`FORWARDED_METHODS`]), is forwarded to head over the node link (head
+//! checks the agent is on the link's lease and routes the frame again, never
+//! trusting the node), and everything else is refused with an explicit error
+//! instead of running on the wrong host.
 
 /// The link request method that carries one forwarded frame. Its params are
 /// `{ "method": <frame method>, "args": <frame args> }`.
@@ -37,8 +38,18 @@ pub const LOCAL_METHODS: &[&str] = &[
 ];
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
-/// read-only workspace details. The other `workspace.*` stay refused.
-pub const FORWARDED_METHODS: &[&str] = &["workspace.details"];
+/// workspace details and the setters an agent names its workspace and
+/// itself with. Head runs them as the agent, so `setAgentName` renames only
+/// the caller. They ride `workspace.call` on every protocol: an older
+/// machine refuses them itself, an older backend refuses them by its own
+/// table. The other `workspace.*` stay refused.
+pub const FORWARDED_METHODS: &[&str] = &[
+    "workspace.details",
+    "workspace.setTitle",
+    "workspace.setStatusMessage",
+    "workspace.setStatusImage",
+    "workspace.setAgentName",
+];
 
 /// Error code at the start of a refused frame's message.
 pub const UNSUPPORTED_CODE: &str = "remote-agent-unsupported";
@@ -97,7 +108,7 @@ pub fn unsupported_message(method: &str) -> String {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details, setTitle, setStatusMessage, setStatusImage and setAgentName through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
