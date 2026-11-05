@@ -4,11 +4,12 @@
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
-//! agent's machine), plus `workspace.details`, the workspace setters and
-//! `workspace.proposeSibling` ([`FORWARDED_METHODS`]), is forwarded to head over the node link (head
-//! checks the agent is on the link's lease and routes the frame again, never
-//! trusting the node), and everything else is refused with an explicit error
-//! instead of running on the wrong host.
+//! agent's machine), plus single methods such as `workspace.details`,
+//! `git.listRoots` and the terminal reads ([`FORWARDED_METHODS`]), is
+//! forwarded to head over the node link (head checks the agent is on the
+//! link's lease and routes the frame again, never trusting the node), and
+//! everything else is refused with an explicit error instead of running on
+//! the wrong host.
 
 /// The link request method that carries one forwarded frame. Its params are
 /// `{ "method": <frame method>, "args": <frame args> }`.
@@ -27,12 +28,36 @@ pub const COMMIT_POLICY_METHOD: &str = "git.commitPolicy";
 /// for the agent's turn, as a local agent's call does, and answers `{}`.
 pub const ATTACHMENTS_METHOD: &str = "turn.attachments";
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) for the machine-placement text a local agent sees in
+/// its `workspace_api` description and `ws.help("agent")`. Args `null`;
+/// head answers `{ "help": string | null }`.
+pub const PLACEMENT_HELP_METHOD: &str = "agent.placementHelp";
+
+/// The node's own frames to head. They ride [`CALL_METHOD`] but agent code
+/// cannot send them, even when their namespace is forwarded.
+pub const INTERNAL_METHODS: &[&str] = &[
+    COMMIT_POLICY_METHOD,
+    ATTACHMENTS_METHOD,
+    PLACEMENT_HELP_METHOD,
+];
+
 /// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
 pub const MAX_FORWARDED_ATTACHMENTS: usize = 32;
 
 /// Namespaces forwarded to head.
 pub const FORWARDED_NAMESPACES: &[&str] = &[
-    "note", "task", "agent", "pr", "mr", "comment", "event", "script",
+    "note",
+    "task",
+    "agent",
+    "pr",
+    "mr",
+    "comment",
+    "event",
+    "script",
+    "primitive",
+    "discussion",
+    "crossWorkspace",
 ];
 
 /// Methods that run on the node, against the agent's checkout.
@@ -49,13 +74,14 @@ pub const LOCAL_METHODS: &[&str] = &[
 ];
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
-/// workspace details, the setters an agent names its workspace and itself
-/// with, and the sibling-workspace proposal. Head runs them as the agent
-/// with a local agent's checks, so `setAgentName` renames only the caller
-/// and a sub-agent cannot propose; the node publishes a proposal's card
-/// with [`ATTACHMENTS_METHOD`]. They ride `workspace.call` on every protocol: an older
-/// machine refuses them itself, an older backend refuses them by its own
-/// table. The other `workspace.*` stay refused.
+/// `workspace.*` calls other than `info`, the secondary-root list and the
+/// read-only terminal calls. Head runs them as the agent with a local
+/// agent's checks, so `setAgentName` renames only the caller, a sub-agent
+/// cannot propose, and `archive` / `unarchive` act on the workspace on head
+/// (not the agent's checkout); the node publishes a proposal's card with
+/// [`ATTACHMENTS_METHOD`]. They ride `workspace.call` on every protocol: an
+/// older machine refuses them itself, an older backend refuses them by its
+/// own table.
 pub const FORWARDED_METHODS: &[&str] = &[
     "workspace.details",
     "workspace.setTitle",
@@ -63,7 +89,24 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "workspace.setStatusImage",
     "workspace.setAgentName",
     "workspace.proposeSibling",
+    "workspace.applyProposal",
+    "workspace.archive",
+    "workspace.unarchive",
+    "workspace.context",
+    "workspace.referenceDocs",
+    "workspace.timeline",
+    "workspace.emitNotification",
+    "git.listRoots",
+    "terminal.list",
+    "terminal.readOutput",
 ];
+
+/// Why secondary git roots (`git.registerRoot`, `git.unregisterRoot`, a
+/// `gitRootId`) are refused on a remote agent.
+pub const GIT_ROOTS_MESSAGE: &str = "remote-agent-unsupported: secondary git roots are on the backend only; this agent's machine has the main checkout and its submodules.";
+
+/// Why `ws.app.*` is refused on a remote agent.
+const APP_MESSAGE: &str = "remote-agent-unsupported: ws.app.* is for the Assistant workspace, whose agents run on the backend.";
 
 /// Error code at the start of a refused frame's message.
 pub const UNSUPPORTED_CODE: &str = "remote-agent-unsupported";
@@ -82,6 +125,9 @@ pub enum Route {
 /// Route the frame `method` (such as `note.read`).
 #[must_use]
 pub fn route(method: &str) -> Route {
+    if INTERNAL_METHODS.contains(&method) {
+        return Route::Unsupported;
+    }
     if method.starts_with("help.") || LOCAL_METHODS.contains(&method) {
         return Route::Local;
     }
@@ -116,13 +162,19 @@ pub fn unsupported_message(method: &str) -> String {
     let namespace = method
         .split_once('.')
         .map_or(method, |(namespace, _)| namespace);
+    if namespace == "app" {
+        return APP_MESSAGE.to_owned();
+    }
+    if matches!(method, "git.registerRoot" | "git.unregisterRoot") {
+        return GIT_ROOTS_MESSAGE.to_owned();
+    }
     let what = if method == "file.getAttachment" {
         "attachments are".to_owned()
     } else {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -155,9 +207,9 @@ mod tests {
     }
 
     /// Remote agents read their workspace's details and set its title,
-    /// status and their own name through head (intent-hq/intent#8593); the
-    /// other workspace calls stay refused (route is per method, not
-    /// namespace). They ride `workspace.call` with no protocol gate: an
+    /// status and their own name through head (intent-hq/intent#8593);
+    /// routing is per method, so an unknown workspace call stays refused.
+    /// They ride `workspace.call` with no protocol gate: an
     /// older machine refuses them itself, an older backend refuses them.
     #[test]
     fn workspace_details_and_setters_are_forwarded_and_the_rest_refused() {
@@ -176,19 +228,82 @@ mod tests {
                 "{method}"
             );
         }
-        for method in [
-            "workspace.archive",
-            "workspace.unarchive",
-            "workspace.applyProposal",
-            "workspace.timeline",
-        ] {
+        for method in ["workspace.bogus", "workspace.", "workspace"] {
             assert_eq!(route(method), Route::Unsupported, "{method}");
         }
-        let message = unsupported_message("workspace.archive");
-        assert!(
-            message.contains("ws.workspace.info on their own checkout")
-                && message.contains("ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head"),
-            "{message}"
+    }
+
+    /// S2 of the remote-agent parity design: the backend-data namespaces and
+    /// the remaining workspace calls are forwarded with no protocol gate (an
+    /// older machine refuses them itself, an older backend by its table).
+    #[test]
+    fn backend_data_calls_are_forwarded_to_head() {
+        for method in [
+            "primitive.addReference",
+            "primitive.addCli",
+            "primitive.addPatch",
+            "primitive.addAgentAction",
+            "discussion.conversations",
+            "discussion.send",
+            "crossWorkspace.listSiblings",
+            "crossWorkspace.readNote",
+            "crossWorkspace.search",
+            "git.listRoots",
+            "terminal.list",
+            "terminal.readOutput",
+            "workspace.context",
+            "workspace.referenceDocs",
+            "workspace.timeline",
+            "workspace.emitNotification",
+            "workspace.applyProposal",
+            "workspace.archive",
+            "workspace.unarchive",
+        ] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::NODE_LINK_PROTOCOLS.min,
+                "{method}"
+            );
+        }
+        // Terminals are read-only for remote agents: only the two reads.
+        for method in ["terminal.write", "terminal.create", "terminal.kill"] {
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+        }
+    }
+
+    /// The machine's internal frames ride `workspace.call` but agent code
+    /// cannot send them, even when their namespace is forwarded.
+    #[test]
+    fn internal_frames_are_refused_from_agent_code() {
+        for method in [
+            COMMIT_POLICY_METHOD,
+            ATTACHMENTS_METHOD,
+            PLACEMENT_HELP_METHOD,
+        ] {
+            assert!(INTERNAL_METHODS.contains(&method), "{method}");
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+        }
+        assert_eq!(PLACEMENT_HELP_METHOD, "agent.placementHelp");
+    }
+
+    /// `app.*` and secondary git roots say why they are refused.
+    #[test]
+    fn app_and_git_root_refusals_explain_why() {
+        for method in ["app.agents.list", "app.question.ask"] {
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+            assert_eq!(
+                unsupported_message(method),
+                "remote-agent-unsupported: ws.app.* is for the Assistant workspace, whose agents run on the backend."
+            );
+        }
+        for method in ["git.registerRoot", "git.unregisterRoot"] {
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+            assert_eq!(unsupported_message(method), GIT_ROOTS_MESSAGE);
+        }
+        assert_eq!(
+            GIT_ROOTS_MESSAGE,
+            "remote-agent-unsupported: secondary git roots are on the backend only; this agent's machine has the main checkout and its submodules."
         );
     }
 
@@ -213,13 +328,12 @@ mod tests {
     #[test]
     fn everything_else_is_refused_by_name() {
         for method in [
-            "terminal.list",
             "browser.exec",
             "hook.schedule",
             "desktop.screenshot",
             "mcp.listTools",
+            "search.query",
             "file.getAttachment",
-            "git.registerRoot",
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
             "note",
@@ -228,15 +342,26 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
-        let message = unsupported_message("terminal.list");
+        let message = unsupported_message("hook.list");
         assert!(
             message.starts_with(
-                "remote-agent-unsupported: `terminal.list` is not supported on remote agents yet"
+                "remote-agent-unsupported: `hook.list` is not supported on remote agents yet"
             ),
             "{message}"
         );
-        assert!(message.contains("ws.terminal.*"), "{message}");
-        assert!(message.contains("ws.script and"), "{message}");
+        assert!(message.contains("ws.hook.* is"), "{message}");
+        for forwarded in [
+            "ws.script",
+            "ws.primitive",
+            "ws.discussion",
+            "ws.crossWorkspace",
+            "ws.git.listRoots",
+            "ws.terminal.list",
+            "ws.workspace calls (details",
+            "archive",
+        ] {
+            assert!(message.contains(forwarded), "{forwarded}: {message}");
+        }
         assert!(unsupported_message("file.getAttachment").contains("attachments are"));
     }
 }

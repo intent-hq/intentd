@@ -958,6 +958,7 @@ impl Runner {
             gates: workspace_api::Gates {
                 agent_features,
                 is_sub_agent,
+                compact_tool_descriptions: launch.config.truncates_tool_descriptions,
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),

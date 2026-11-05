@@ -771,3 +771,103 @@ async fn a_remote_agent_refuses_a_message_with_attachments() {
 
 #[path = "remote_quota_failover_tests.rs"]
 mod remote_quota_failover_tests;
+
+/// Remote parity S1: a remote agent's instructions match what its machine
+/// can serve. A truncating provider gets the condensed `ws.*` reference
+/// (its machine serves the compact tool description that points at it);
+/// the backend's skills catalog stays out (its paths are on the backend);
+/// and the prompt does not promise a private `$TMPDIR` the machine does
+/// not create.
+#[tokio::test]
+async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
+    let ws = WorkspaceId::from("ws-remote-prompt");
+    let id = AgentId::from("agent-remote-prompt");
+    let port = Arc::new(RemoteRuntimes {
+        runtime: None,
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    let worktree = tempfile::TempDir::new().unwrap();
+    let skill = worktree.path().join(".agents/skills/backend-only-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: backend-only-skill\ndescription: Lives on the backend\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let mut workspace = store.get_workspace(&ws).await.unwrap();
+    workspace.worktree_path = Some(worktree.path().to_string_lossy().into_owned());
+    store.update_workspace(&workspace).await.unwrap();
+
+    let prompt_for = |provider: &'static str| {
+        let mgr = mgr.clone();
+        let (ws, id) = (ws.clone(), id.clone());
+        async move {
+            let mut session = mgr
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
+            session.provider = Some(provider.to_owned());
+            mgr.prepare_remote_system_prompt(&id, &ws, &session)
+                .await
+                .unwrap();
+            mgr.services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap()
+                .system_prompt
+                .unwrap_or_default()
+        }
+    };
+
+    let truncating = prompt_for("claude-code").await;
+    assert!(
+        truncating.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+        "{truncating}"
+    );
+    assert!(truncating.contains("ws.note.read("), "{truncating}");
+    assert!(!truncating.contains("<available_skills>"), "{truncating}");
+    assert!(!truncating.contains("backend-only-skill"), "{truncating}");
+    assert!(
+        !truncating.contains("is a private temp folder"),
+        "{truncating}"
+    );
+    assert!(truncating.contains("mktemp"), "{truncating}");
+
+    let full = prompt_for("codex").await;
+    assert!(
+        !full.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+        "a provider that reads the full tool description gets no copy: {full}"
+    );
+    assert!(!full.contains("<available_skills>"), "{full}");
+}
+
+/// The remote prompt swaps out the bundled private-`$TMPDIR` sentence by
+/// exact text, so every bundled doctrine that mentions `$TMPDIR` must carry
+/// it verbatim: a rewording would otherwise leave the promise in place
+/// without any test failing.
+#[test]
+fn every_bundled_tmpdir_promise_is_the_one_remote_prompts_replace() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/agent-instructions");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let common = entry.unwrap().path().join("common.md");
+        let Ok(text) = std::fs::read_to_string(&common) else {
+            continue;
+        };
+        if text.contains("$TMPDIR") {
+            assert!(
+                text.contains(super::super::LOCAL_TMPDIR_PROMISE),
+                "{} words the $TMPDIR promise differently; update LOCAL_TMPDIR_PROMISE",
+                common.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no bundled doctrine mentions $TMPDIR");
+}

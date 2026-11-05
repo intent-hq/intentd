@@ -2,7 +2,8 @@
 //!
 //! A remote agent evaluates its `workspace_api` code on its node and
 //! forwards the control-plane frames (notes, tasks, agents, PRs, comments,
-//! events) to head as [`CALL_METHOD`] link requests. Head serves one only on
+//! events, primitives, discussions, sibling workspaces and the backend's
+//! workspace data) to head as [`CALL_METHOD`] link requests. Head serves one only on
 //! the node's current binding, only for an agent recorded on that binding's
 //! lease, and only for a frame its own routing table forwards (the node is
 //! not trusted to route). The frame then runs through the same host
@@ -15,7 +16,8 @@ use serde_json::Value;
 
 use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
 use intent_core::remote_launch::workspace_api::{
-    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, MAX_FORWARDED_ATTACHMENTS,
+    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, INTERNAL_METHODS,
+    MAX_FORWARDED_ATTACHMENTS, PLACEMENT_HELP_METHOD,
 };
 use intent_core::{Error, WorkspaceApi};
 use intent_services::feature_api::Services;
@@ -91,7 +93,7 @@ impl HeadCalls {
         let Some(method) = request.params.get("method").and_then(Value::as_str) else {
             return refusal(INVALID_PARAMS, "workspace.call needs a string `method`");
         };
-        let internal = method == COMMIT_POLICY_METHOD || method == ATTACHMENTS_METHOD;
+        let internal = INTERNAL_METHODS.contains(&method);
         if !internal && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
@@ -123,6 +125,14 @@ impl HeadCalls {
                 .effective_auto_commit(&record.workspace_id)
                 .await;
             return LinkOutcome::Ok(serde_json::json!({ "autoCommit": enabled }));
+        }
+        if method == PLACEMENT_HELP_METHOD {
+            let help = self
+                .services
+                .feature_remote_launch_port()
+                .placement_help(&self.services)
+                .await;
+            return LinkOutcome::Ok(serde_json::json!({ "help": help }));
         }
         if method == ATTACHMENTS_METHOD {
             return match forwarded_attachments(request.params.get("args")) {
