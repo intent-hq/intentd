@@ -85,15 +85,17 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_9() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_10() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
-    // frames, 9 final stops; a protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 9 });
+    // frames, 9 final stops, 10 the prepared checkout; a protocol-7 peer
+    // still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 10 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
-    assert_eq!(FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS.max);
-    for version in 7..=9 {
+    assert_eq!(FINAL_STOP_PROTOCOL, 9);
+    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    for version in 7..=10 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -775,6 +777,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
             "fingerprint": "f1",
             "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": "canary-secret-7f3a" }],
         }))),
+        checkout: None,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -798,9 +801,48 @@ fn launch_without_a_profile_omits_profile_env() {
         agent_features: json!({}),
         is_sub_agent: false,
         profile_env: None,
+        checkout: None,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
+    assert!(wire.get("checkout").is_none(), "{wire}");
+}
+
+/// nodeProtocol 10's `checkout` member: closed objects, the pins in
+/// order, `setup` absent when there is no script; a launch without it
+/// (protocol 7 to 9) still decodes.
+#[test]
+fn a_prepared_checkout_matches_the_documented_wire_shape() {
+    let wire = json!({
+        "submodules": [
+            { "path": "a", "name": "a", "commit": "c1", "moduleKey": "repo-1" },
+            { "path": "a/b", "name": "b", "commit": "c2", "moduleKey": "repo-2" },
+        ],
+    });
+    let checkout: PreparedCheckout = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(checkout.submodules[1].path, "a/b");
+    assert_eq!(checkout.submodules[1].module_key, "repo-2");
+    assert_eq!(checkout.setup, None);
+    assert_eq!(serde_json::to_value(&checkout).unwrap(), wire);
+    let setup = json!({
+        "submodules": [],
+        "setup": { "script": "make", "branchName": "feat/x", "sourceBranch": "main", "timeoutSecs": 60 },
+    });
+    let checkout: PreparedCheckout = serde_json::from_value(setup.clone()).unwrap();
+    assert_eq!(checkout.setup.as_ref().unwrap().timeout_secs, Some(60));
+    assert_eq!(serde_json::to_value(&checkout).unwrap(), setup);
+    for open in [
+        json!({ "submodules": [], "extra": 1 }),
+        json!({ "submodules": [{ "path": "a", "name": "a", "commit": "c", "moduleKey": "k", "url": "x" }] }),
+        json!({ "submodules": [], "setup": { "script": "s", "branchName": "b", "sourceBranch": "m", "env": {} } }),
+    ] {
+        assert!(serde_json::from_value::<PreparedCheckout>(open.clone()).is_err(), "{open}");
+    }
+    let old = json!({
+        "agentId": "a1", "workspaceId": "ws-1", "provider": "codex", "baseCommit": "base",
+        "repoKey": "repo", "agentFeatures": {}, "isSubAgent": false,
+    });
+    assert_eq!(serde_json::from_value::<LaunchCommand>(old).unwrap().checkout, None);
 }
 
 /// The executor frames of `docs/protocol/node-link.md`: an empty

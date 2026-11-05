@@ -18,6 +18,9 @@ use intent_transport::node_link::NodeGitAccess;
 
 use super::*;
 
+#[cfg(unix)]
+mod submodules;
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
