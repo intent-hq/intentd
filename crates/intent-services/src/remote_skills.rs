@@ -27,6 +27,30 @@ pub(crate) fn leading_skill_name(text: &str) -> Option<&str> {
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
+/// The text of `message` when a person wrote it and it starts with a
+/// `/name`: a user row that no agent sent. Cheap, so every stored row can
+/// be checked before the session is read.
+pub(crate) fn person_skill_text(message: &intent_core::AgentMessage) -> Option<&str> {
+    if message.role != "user" {
+        return None;
+    }
+    let metadata = message.metadata.as_ref();
+    let by_agent = metadata
+        .and_then(|m| m.get("fromAgentId"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    let by_system = metadata.and_then(|m| m.get("source")).and_then(Value::as_str) == Some("system");
+    if by_agent || by_system {
+        return None;
+    }
+    let text = message
+        .content
+        .as_array()?
+        .iter()
+        .find_map(|block| (block.get("type")? == "text").then(|| block.get("text")?.as_str())?)?;
+    leading_skill_name(text).map(|_| text)
+}
+
 impl Services {
     /// `skill.list` with `agentId`: `{ skills, stale?, unavailable? }`,
     /// name-sorted, before paging. A backend agent gets the workspace's list.

@@ -13,7 +13,7 @@ use intent_acp::PermissionPolicy;
 use intent_core::machines::ExecutorCredential;
 use intent_core::node_link::{
     BindDecision, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, LinkFrame, LinkHello,
-    MachineCapacity, ProviderStatus, NODE_LINK_PROTOCOLS,
+    MachineCapacity, ProviderStatus, NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -480,10 +480,67 @@ async fn next_frame(dialed: &mut DialedLink) -> Option<LinkFrame> {
     }
 }
 
+/// The next journal record other than a `skills` report (nodeProtocol 12),
+/// which [`skills_are_journaled_before_started_only_on_protocol_12`] covers.
 async fn next_record(dialed: &mut DialedLink) -> JournalRecord {
+    loop {
+        let record = next_raw_record(dialed).await;
+        if !matches!(record.body, JournalBody::Skills { .. }) {
+            return record;
+        }
+    }
+}
+
+async fn next_raw_record(dialed: &mut DialedLink) -> JournalRecord {
     match next_frame(dialed).await {
         Some(LinkFrame::Journal(record)) => record,
         other => panic!("expected a journal record, got {other:?}"),
+    }
+}
+
+/// The machine reports the agent's skills right before `started` when the
+/// link negotiated protocol 12, and journals no `skills` record below it
+/// (an older backend could not decode one).
+#[tokio::test]
+async fn skills_are_journaled_before_started_only_on_protocol_12() {
+    let Some(providers) = fixture_providers() else {
+        return;
+    };
+    for (max, reports) in [
+        (NODE_LINK_PROTOCOLS.max, true),
+        (SKILLS_PROTOCOL - 1, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Running::start_with(
+            dir.path(),
+            MachineApi::new(),
+            CountAdmission::new(4),
+            providers.clone(),
+        )
+        .await;
+        let mut hello = hello(1, "lease-1", 0);
+        hello.protocol = intent_core::node_link::ProtocolRange { min: 7, max };
+        let mut dialed = dial_link(&node.endpoint, hello).await.unwrap();
+        replay_complete(&mut dialed).await;
+        dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+        let first = next_raw_record(&mut dialed).await;
+        if reports {
+            assert!(
+                matches!(first.body, JournalBody::Skills { .. }),
+                "protocol {max}: {first:?}"
+            );
+            let started = next_raw_record(&mut dialed).await;
+            assert!(
+                matches!(started.body, JournalBody::Started { .. }),
+                "{started:?}"
+            );
+        } else {
+            assert!(
+                matches!(first.body, JournalBody::Started { .. }),
+                "protocol {max}: {first:?}"
+            );
+        }
+        node.stop().await;
     }
 }
 

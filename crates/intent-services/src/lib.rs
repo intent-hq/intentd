@@ -32301,13 +32301,6 @@ impl WorkspaceApi for Services {
             // path and the store-only fallback persist what the model sees.
             // Same gate as the stamp — only a user-origin send is a person
             // speaking; the owner's content stays byte-identical.
-            // A `/name` a remote agent's machine lacks still sends; it gets
-            // a notice once the send is accepted.
-            let asked_skill = origin
-                .is_user()
-                .then(|| crate::remote_skills::leading_skill_name(&content))
-                .flatten()
-                .map(|name| format!("/{name}"));
             if origin.is_user() {
                 self.annotate_collaborator_sender(&workspace_id, &mut content)
                     .await?;
@@ -32329,8 +32322,7 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            let (notice_workspace, notice_agent) = (workspace_id.clone(), agent_id.clone());
-            let sent = if let Some(manager) = self.agent_manager() {
+            if let Some(manager) = self.agent_manager() {
                 // Construct TurnOptions only when the manager is attached
                 // to avoid cloning large payloads on the fallback path.
                 let options = crate::agent_manager::TurnOptions {
@@ -32373,17 +32365,7 @@ impl WorkspaceApi for Services {
                     message_metadata,
                 )
                 .await
-            };
-            // After a sent message only: a queued one is stored later, and
-            // the notice must follow it.
-            let queued = sent
-                .as_ref()
-                .is_ok_and(|v| v.get("queued").and_then(serde_json::Value::as_bool) == Some(true));
-            if let (Ok(_), Some(asked), false) = (&sent, asked_skill, queued) {
-                self.note_unavailable_skill(&notice_workspace, &notice_agent, &asked)
-                    .await;
             }
-            sent
         }))
     }
 

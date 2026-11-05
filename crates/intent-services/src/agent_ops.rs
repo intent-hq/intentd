@@ -5625,6 +5625,12 @@ impl Services {
             last_payload,
         )
         .await;
+        // Every stored user row passes here (sent, queued or batched): a
+        // remote agent's `/name` its machine lacks gets its notice after it.
+        if let Some(text) = crate::remote_skills::person_skill_text(message) {
+            self.note_unavailable_skill(workspace_id, agent_id, text)
+                .await;
+        }
     }
 
     /// Publish `agent:subscriptions-changed` for `parent_agent_id`, carrying the
