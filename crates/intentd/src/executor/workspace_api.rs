@@ -154,7 +154,7 @@ async fn described_server(
     let help = Router {
         agent_id: agent_id.clone(),
         head: head.clone(),
-        timeout: PLACEMENT_HELP_TIMEOUT,
+        timeout: DEFAULT_TIMEOUT,
     }
     .placement_help()
     .await;
@@ -164,7 +164,8 @@ async fn described_server(
 /// How long the node waits for head to answer its own policy read.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the agent's start waits for head's placement text.
+/// How long the agent's start and `ws.help("agent")` wait for head's
+/// placement text.
 const PLACEMENT_HELP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Routes one agent's frames: local ones to [`NodeApi`], forwarded ones to
@@ -256,9 +257,14 @@ impl Router {
     }
 
     /// Head's machine-placement text for the agent, or `None` when head
-    /// has none or does not answer (an older backend refuses the frame).
+    /// has none or does not answer within [`PLACEMENT_HELP_TIMEOUT`] (an
+    /// older backend refuses the frame).
     async fn placement_help(&self) -> Option<String> {
-        match self.forward(PLACEMENT_HELP_METHOD, &Value::Null).await {
+        let quick = Self {
+            timeout: self.timeout.min(PLACEMENT_HELP_TIMEOUT),
+            ..self.clone()
+        };
+        match quick.forward(PLACEMENT_HELP_METHOD, &Value::Null).await {
             Ok(answer) => answer
                 .get("help")
                 .and_then(Value::as_str)
