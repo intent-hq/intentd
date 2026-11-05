@@ -2640,31 +2640,6 @@ fn find_agent_file(root: &Path, agent_id: &str, name: &str) -> Option<std::path:
         .filter(|path| path.exists())
 }
 
-/// Poll `mcp.servers.getStatus` until `server_id` runs in head's hub, and
-/// return its status.
-async fn running_mcp_server(rpc_ws: &mut common::TlsWs, server_id: &str, id: i64) -> Value {
-    let mut next = id;
-    let found = timeout(wait(), async {
-        loop {
-            next += 1;
-            let status = ok(
-                rpc_ws,
-                next,
-                "mcp.servers.getStatus",
-                json!({ "serverId": server_id }),
-            )
-            .await;
-            if status["status"]["state"] == "running" {
-                return status["status"].clone();
-            }
-            // timing-guard: poll interval while head's hub starts the stdio server (no event in this harness's subscription)
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-    found.unwrap_or_else(|_| panic!("mcp server {server_id} never ran on head"))
-}
-
 /// Remote parity S4 (nodeProtocol 11): a remote agent's provider sees the
 /// user's MCP servers as servers in its own session, and their tool calls
 /// run in head's MCP hub, as the agent (head runs with the bound-caller
@@ -2703,7 +2678,7 @@ async fn a_remote_agents_provider_calls_user_mcp_tools_in_heads_hub() {
             "command": "node",
             "args": [mcp_script],
             "env": { "MOCK_MCP_SECRET": SECRET },
-            "enabled": true,
+            "enabled": false,
         } }),
     )
     .await;
@@ -2721,8 +2696,15 @@ async fn a_remote_agents_provider_calls_user_mcp_tools_in_heads_hub() {
         } }),
     )
     .await;
-    let hub = running_mcp_server(&mut rpc_ws, &server_id, 3).await;
-    let hub_pid = hub["pid"].as_u64().expect("stdio pid");
+    let toggled = ok(
+        &mut rpc_ws,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(toggled["status"]["state"], "running", "{toggled}");
+    let hub_pid = toggled["status"]["pid"].as_u64().expect("stdio pid");
     let backend = ok(&mut rpc_ws, 100, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();
     let node_dir = scratch.path().join("node");

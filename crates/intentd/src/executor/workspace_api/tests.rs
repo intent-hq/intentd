@@ -226,7 +226,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         HeadLink::default(),
     )
     .unwrap();
-    for code in ["return await ws.mcp.listServers();"] {
+    for code in [r#"return await host({ method: "secret.list", args: {} });"#] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(
@@ -234,9 +234,10 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
             "{code}: {text}"
         );
     }
-    // Hooks, questions, the browser and the desktop go to head, so with no
-    // link they fail for the link, not by name.
+    // Hooks, questions, the browser, the desktop and ws.mcp go to head, so
+    // with no link they fail for the link, not by name.
     for code in [
+        "return await ws.mcp.listServers();",
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
         "return await ws.browser.listTabs();",
