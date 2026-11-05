@@ -27,6 +27,7 @@ pub mod antigravity;
 pub mod args;
 pub mod checkpoint;
 pub mod config;
+pub mod cursor;
 pub mod discover;
 pub mod installed_cli;
 pub mod models;
