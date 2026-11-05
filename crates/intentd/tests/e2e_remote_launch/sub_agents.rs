@@ -133,7 +133,10 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
     let seen = reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
     let seen: Value = serde_json::from_str(&seen).unwrap();
     let text = seen.to_string();
-    assert!(text.contains("from parent"), "the child sees the parent's edit: {text}");
+    assert!(
+        text.contains("from parent"),
+        "the child sees the parent's edit: {text}"
+    );
     assert!(
         text.contains(&parent_path),
         "the child works in the parent's checkout {parent_path}: {text}"
@@ -145,7 +148,11 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
         json!({ "workspaceId": ws_id, "agentId": child_id }),
     )
     .await;
-    assert_eq!(child["agent"]["nodeId"], machine.daemon_id.as_str(), "{child}");
+    assert_eq!(
+        child["agent"]["nodeId"],
+        machine.daemon_id.as_str(),
+        "{child}"
+    );
 
     // The child's edit is in the parent's checkout on the machine.
     assert_eq!(
@@ -271,5 +278,10 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
         try_rev(&repo, &format!("{parent_refs}/head")),
         "the child's base is the parent's head"
     );
-    shows(&repo, &format!("{child_refs}/wip:parent.txt"), "from parent").await;
+    shows(
+        &repo,
+        &format!("{child_refs}/wip:parent.txt"),
+        "from parent",
+    )
+    .await;
 }

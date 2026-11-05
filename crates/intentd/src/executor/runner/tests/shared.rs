@@ -87,7 +87,10 @@ async fn final_stops_keep_a_shared_checkout_until_its_owner_ends() {
         h.runner.final_stop(&AgentId::from("c1")).await,
         Some((StopOutcome::Stopped, FinalPush::Pushed))
     );
-    assert_eq!(h.checkouts.pushes.lock().unwrap().as_slice(), [owner.clone()]);
+    assert_eq!(
+        h.checkouts.pushes.lock().unwrap().as_slice(),
+        [owner.clone()]
+    );
     assert!(checkout.is_dir(), "the owner's checkout stays");
 
     h.runner.launch(sharing("c2", "o1")).await;
@@ -153,7 +156,10 @@ async fn a_push_request_pushes_the_owners_checkout_now() {
     let (outcome, error) = h.runner.push_now(&owner).await;
     assert_eq!(outcome, FinalPush::Failed);
     assert!(
-        error.as_deref().unwrap_or_default().contains("head refused the push"),
+        error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("head refused the push"),
         "{error:?}"
     );
 }

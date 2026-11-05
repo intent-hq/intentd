@@ -216,8 +216,8 @@ async fn copy_parent_work(
         let Some(head) = node_git::read_agent_ref(&checkout, &parent, AgentRef::Head)? else {
             return Ok(None);
         };
-        if let Some(wip) = node_git::read_agent_ref(&checkout, &parent, AgentRef::Wip)?
-            .filter(|wip| *wip != head)
+        if let Some(wip) =
+            node_git::read_agent_ref(&checkout, &parent, AgentRef::Wip)?.filter(|wip| *wip != head)
         {
             node_git::write_agent_ref(&checkout, &child, AgentRef::Wip, wip)?;
         }
@@ -678,14 +678,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .filter(|work| work.copied.is_none())
                 .map(|work| work.agent_id.clone())
             {
-                copy_parent_work(
-                    svc,
-                    &workspace_id,
-                    (&checkout, &agent_id),
-                    owner,
-                    &mut view,
-                )
-                .await?;
+                copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view)
+                    .await?;
             }
             let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
             let commit = git2::Oid::from_str(&view.base_commit)
@@ -870,25 +864,25 @@ impl RemoteLaunchPort for RemoteLaunch {
             let checkout = if checkout_of.is_some() {
                 None
             } else if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
-                    let protocol = link_protocol(&node).await?;
-                    let setup = svc
-                        .remote_setup_command(&record.workspace_id, &view)
-                        .await?;
-                    if needs_prepared_checkout(view.pins(), setup.as_ref()) {
-                        if let Err(error) = require_prepared_checkout(&node, protocol) {
-                            record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
-                            return Err(error);
-                        }
+                let protocol = link_protocol(&node).await?;
+                let setup = svc
+                    .remote_setup_command(&record.workspace_id, &view)
+                    .await?;
+                if needs_prepared_checkout(view.pins(), setup.as_ref()) {
+                    if let Err(error) = require_prepared_checkout(&node, protocol) {
+                        record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
+                        return Err(error);
                     }
-                    (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| {
-                        Box::new(PreparedCheckout {
-                            submodules: view.pins().to_vec(),
-                            setup,
-                        })
+                }
+                (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| {
+                    Box::new(PreparedCheckout {
+                        submodules: view.pins().to_vec(),
+                        setup,
                     })
-                } else {
-                    None
-                };
+                })
+            } else {
+                None
+            };
             if checkout.is_some() && view.setup.is_none() {
                 record_setup_pending(svc, &record.workspace_id, agent_id).await;
             }

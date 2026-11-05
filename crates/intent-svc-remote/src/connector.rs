@@ -1400,7 +1400,11 @@ impl RemoteNode {
     ///
     /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
     /// does not answer in time.
-    pub(crate) async fn push_wip(&self, agent_id: &AgentId, wait: Duration) -> Result<PushWipResult> {
+    pub(crate) async fn push_wip(
+        &self,
+        agent_id: &AgentId,
+        wait: Duration,
+    ) -> Result<PushWipResult> {
         let request_id = intent_core::node_link::LinkId::new_v4();
         let (tx, rx) = oneshot::channel();
         lock(&self.shared.push_waiters).insert(request_id, tx);
