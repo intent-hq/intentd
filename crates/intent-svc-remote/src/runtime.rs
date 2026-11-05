@@ -131,6 +131,22 @@ impl RemoteAgentRuntime {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| AcpError::Serde(e.to_string()))?;
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let frame = LinkFrame::Prompt {
+            agent_id: self.agent_id.clone(),
+            turn_id: turn_id.clone(),
+            prompt,
+        };
+        // Large image attachments can outgrow one frame: fail the turn
+        // before anything reaches the machine.
+        if let Err(error) = frame.encode() {
+            return Err(AcpError::Rpc(JsonRpcError {
+                code: TURN_FAILED_CODE,
+                message: format!(
+                    "node-prompt-too-large: this turn's prompt does not fit the link to the remote machine ({error}); send fewer or smaller images"
+                ),
+                data: None,
+            }));
+        }
         let Some(mut ended) = self.sink.expect_turn(&turn_id) else {
             return Err(self
                 .not_running()
@@ -165,13 +181,7 @@ impl RemoteAgentRuntime {
             .no_stop_pending(&self.agent_id)
             .await
             .map_err(|_| undelivered())?;
-        link.send(&LinkFrame::Prompt {
-            agent_id: self.agent_id.clone(),
-            turn_id: turn_id.clone(),
-            prompt,
-        })
-        .await
-        .map_err(|_| undelivered())?;
+        link.send(&frame).await.map_err(|_| undelivered())?;
         activity.touch();
         let idle_window = prompt_idle_timeout();
         let mut down_since: Option<Instant> = None;

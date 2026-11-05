@@ -550,24 +550,9 @@ pub(crate) fn get_attachment(
     // a tampered registry row must never read outside it.
     let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
     if !src.is_file() {
-        return Err(Error::Internal(format!(
-            "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
-             longer exists on disk. Continue without this file — do not retry the download.",
-            record.file_name, record.uploaded_at
-        )));
+        return Err(deleted_attachment(record));
     }
-    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
-    let dest_dir_full = resolve_within(dest_root, dir)?;
-    std::fs::create_dir_all(&dest_dir_full).map_err(|e: std::io::Error| io_err(&e))?;
-    // Keep retrieved copies out of git tracking (same ignore-all marker
-    // `place_attachment` drops), whatever directory the caller picked.
-    let marker = dest_dir_full.join(".gitignore");
-    if !marker.exists() {
-        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
-    }
-    // resolve_within on the joined relative path guards a crafted fileName.
-    let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
-    let dest = resolve_within(dest_root, &rel)?;
+    let (rel, dest) = attachment_destination(dest_root, dest_dir, &record.file_name)?;
     let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
         (Ok(s), Ok(d)) if s.len() == d.len() => {
             // Same size — confirm contents before skipping the copy.
@@ -590,11 +575,146 @@ pub(crate) fn get_attachment(
     let size = std::fs::metadata(&dest)
         .map(|m| m.len())
         .unwrap_or_default();
+    Ok(attachment_copy_result(
+        &rel,
+        &record.file_name,
+        size,
+        &record.uploaded_at,
+        record.mime_type.as_deref(),
+    ))
+}
+
+/// The error for a registry row whose stored file is gone from disk.
+fn deleted_attachment(record: &intent_store::AttachmentRecord) -> Error {
+    Error::Internal(format!(
+        "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
+         longer exists on disk. Continue without this file — do not retry the download.",
+        record.file_name, record.uploaded_at
+    ))
+}
+
+/// Where a copy of `file_name` goes under `dest_root`: `dest_dir` (default
+/// [`ATTACHMENTS_DIR`]) is created and kept out of git tracking (same
+/// ignore-all marker `place_attachment` drops), whatever directory the
+/// caller picked. Returns the copy's relative and full paths.
+fn attachment_destination(
+    dest_root: &str,
+    dest_dir: Option<&str>,
+    file_name: &str,
+) -> Result<(String, PathBuf)> {
+    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
+    let dest_dir_full = resolve_within(dest_root, dir)?;
+    std::fs::create_dir_all(&dest_dir_full).map_err(|e: std::io::Error| io_err(&e))?;
+    let marker = dest_dir_full.join(".gitignore");
+    if !marker.exists() {
+        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
+    }
+    // resolve_within on the joined relative path guards a crafted fileName.
+    let rel = format!("{}/{}", dir.trim_end_matches('/'), file_name);
+    let dest = resolve_within(dest_root, &rel)?;
+    Ok((rel, dest))
+}
+
+/// Refuse a `ws.file.getAttachment` `dest_dir` outside `dest_root` before
+/// anything is fetched; [`write_attachment_copy`] checks again.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn check_attachment_dest(dest_root: &str, dest_dir: Option<&str>) -> Result<()> {
+    resolve_within(dest_root, dest_dir.unwrap_or(ATTACHMENTS_DIR)).map(drop)
+}
+
+/// `{ path, fileName, mimeType?, size, uploadedAt }`, the
+/// `ws.file.getAttachment` result.
+fn attachment_copy_result(
+    rel: &str,
+    file_name: &str,
+    size: u64,
+    uploaded_at: &str,
+    mime_type: Option<&str>,
+) -> Value {
     let mut result = json!({
         "path": rel,
-        "fileName": record.file_name,
+        "fileName": file_name,
         "size": size,
+        "uploadedAt": uploaded_at,
+    });
+    if let Some(mime) = mime_type {
+        result["mimeType"] = json!(mime);
+    }
+    result
+}
+
+/// `ws.file.getAttachment` on a remote agent's machine: write `bytes` (the
+/// attachment head sent) into the agent's checkout `dest_root`, as
+/// [`get_attachment`] copies a local one: under `dest_dir` (default
+/// [`ATTACHMENTS_DIR`]), git-ignored, skipped when an identical file is
+/// already there, with the same result.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn write_attachment_copy(
+    dest_root: &str,
+    dest_dir: Option<&str>,
+    file_name: &str,
+    mime_type: Option<&str>,
+    uploaded_at: &str,
+    bytes: &[u8],
+) -> Result<Value> {
+    if dest_root.is_empty() {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
+    }
+    let (rel, dest) = attachment_destination(dest_root, dest_dir, file_name)?;
+    let identical = std::fs::read(&dest).is_ok_and(|existing| existing == bytes);
+    if !identical {
+        std::fs::write(&dest, bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&dest);
+            Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+        })?;
+    }
+    Ok(attachment_copy_result(
+        &rel,
+        file_name,
+        bytes.len() as u64,
+        uploaded_at,
+        mime_type,
+    ))
+}
+
+/// The bytes of a registered attachment for a remote agent's machine:
+/// `{ fileName, mimeType?, size, uploadedAt, data }` with `data` base64,
+/// read from the canonical store like [`get_attachment`]'s source. A file
+/// larger than `max_bytes` is `-32602` `attachment-too-large-for-link`.
+pub(crate) fn attachment_data(
+    canonical_root: &str,
+    record: &intent_store::AttachmentRecord,
+    max_bytes: u64,
+) -> Result<Value> {
+    use base64::Engine as _;
+    if canonical_root.is_empty() {
+        return Err(Error::Internal(
+            "workspace has no resolved filesystem root".to_string(),
+        ));
+    }
+    let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
+    let size = match std::fs::metadata(&src) {
+        Ok(md) if md.is_file() => md.len(),
+        _ => return Err(deleted_attachment(record)),
+    };
+    if size > max_bytes {
+        return Err(Error::InvalidParams(format!(
+            "attachment-too-large-for-link: \"{}\" is {size} bytes; a remote agent can copy attachments of at most {max_bytes} bytes. Continue without this file, or ask the user to share it another way.",
+            record.file_name
+        )));
+    }
+    let bytes = std::fs::read(&src).map_err(|_| deleted_attachment(record))?;
+    let mut result = json!({
+        "fileName": record.file_name,
+        "size": bytes.len(),
         "uploadedAt": record.uploaded_at,
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
     });
     if let Some(mime) = &record.mime_type {
         result["mimeType"] = json!(mime);

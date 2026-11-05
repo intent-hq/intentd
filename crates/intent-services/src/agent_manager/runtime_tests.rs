@@ -734,10 +734,13 @@ async fn a_remote_run_never_starts_without_its_instructions() {
     assert!(mgr.prepend_pending.lock().unwrap().contains(&id));
 }
 
-/// A message with attachments to a remote agent is refused by the runtime
-/// front door before it is stored, queued or prompted.
+/// Remote parity S6: a message with an image and a file reaches the remote
+/// agent's runtime: the image inline in the prompt, the file as the notice
+/// that points at `ws.file.getAttachment` (which runs on the machine).
 #[tokio::test]
-async fn a_remote_agent_refuses_a_message_with_attachments() {
+async fn a_remote_agent_receives_a_message_with_attachments() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
     let ws = WorkspaceId::from("ws-remote-attachments");
     let id = AgentId::from("agent-remote-attachments");
     let fake = FakeRuntime::new();
@@ -746,33 +749,40 @@ async fn a_remote_agent_refuses_a_message_with_attachments() {
         asked: AtomicUsize::new(0),
     });
     let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
-    let result = mgr
-        .send_message(
-            id.clone(),
-            ws.clone(),
-            "look".into(),
-            None,
-            super::super::TurnOptions {
-                file_blocks: Some(serde_json::json!([
-                    { "attachmentId": "att-1", "fileName": "notes.txt" }
-                ])),
-                ..Default::default()
-            },
-        )
-        .await;
+    fake.finish.add_permits(1);
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "look".into(),
+        None,
+        super::super::TurnOptions {
+            image_blocks: Some(serde_json::json!([
+                { "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "mimeType": "image/png" }
+            ])),
+            file_blocks: Some(serde_json::json!([
+                { "attachmentId": "att-1", "fileName": "notes.txt" }
+            ])),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    let prompt = serde_json::to_value(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    let blocks = prompt.as_array().unwrap();
     assert!(
-        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-agent-unsupported: attachments")),
-        "{result:?}"
+        blocks
+            .iter()
+            .any(|b| b["type"] == "image" && b["data"].as_str().is_some_and(|d| !d.is_empty())),
+        "{prompt}"
     );
-    assert!(fake.prompts.lock().unwrap().is_empty());
-    assert_eq!(port.asked.load(Ordering::SeqCst), 0);
-    assert!(mgr
-        .services
-        .store
-        .get_agent_messages(&id, None)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        blocks.iter().any(|b| b["type"] == "text"
+            && b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("ws.file.getAttachment(\"att-1\")"))),
+        "{prompt}"
+    );
 }
 
 #[path = "remote_quota_failover_tests.rs"]
@@ -782,8 +792,8 @@ mod remote_quota_failover_tests;
 /// can serve. A truncating provider gets the condensed `ws.*` reference
 /// (its machine serves the compact tool description that points at it);
 /// the backend's skills catalog stays out (its paths are on the backend);
-/// and the prompt does not promise a private `$TMPDIR` the machine does
-/// not create.
+/// and the prompt keeps the private `$TMPDIR` promise, which the machine
+/// keeps (remote parity S6).
 #[tokio::test]
 async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
     let ws = WorkspaceId::from("ws-remote-prompt");
@@ -839,10 +849,9 @@ async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
     assert!(!truncating.contains("<available_skills>"), "{truncating}");
     assert!(!truncating.contains("backend-only-skill"), "{truncating}");
     assert!(
-        !truncating.contains("is a private temp folder"),
+        truncating.contains("is a private temp folder for this agent"),
         "{truncating}"
     );
-    assert!(truncating.contains("mktemp"), "{truncating}");
 
     let full = prompt_for("codex").await;
     assert!(
@@ -850,30 +859,4 @@ async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
         "a provider that reads the full tool description gets no copy: {full}"
     );
     assert!(!full.contains("<available_skills>"), "{full}");
-}
-
-/// The remote prompt swaps out the bundled private-`$TMPDIR` sentence by
-/// exact text, so every bundled doctrine that mentions `$TMPDIR` must carry
-/// it verbatim: a rewording would otherwise leave the promise in place
-/// without any test failing.
-#[test]
-fn every_bundled_tmpdir_promise_is_the_one_remote_prompts_replace() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/agent-instructions");
-    let mut checked = 0;
-    for entry in std::fs::read_dir(&root).unwrap() {
-        let common = entry.unwrap().path().join("common.md");
-        let Ok(text) = std::fs::read_to_string(&common) else {
-            continue;
-        };
-        if text.contains("$TMPDIR") {
-            assert!(
-                text.contains(super::super::LOCAL_TMPDIR_PROMISE),
-                "{} words the $TMPDIR promise differently; update LOCAL_TMPDIR_PROMISE",
-                common.display()
-            );
-            checked += 1;
-        }
-    }
-    assert!(checked > 0, "no bundled doctrine mentions $TMPDIR");
 }

@@ -225,10 +225,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         HeadLink::default(),
     )
     .unwrap();
-    for code in [
-        "return await ws.mcp.listServers();",
-        r#"return await ws.file.getAttachment("att-1");"#,
-    ] {
+    for code in ["return await ws.mcp.listServers();"] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(
@@ -300,6 +297,108 @@ async fn a_forwarded_call_without_a_link_fails_clearly() {
     let (failed, text) = call(&server, r#"return await ws.note.read("n-1");"#).await;
     assert!(failed, "{text}");
     assert!(text.contains("node-link-unavailable"), "{text}");
+}
+
+/// Remote parity S6: `ws.file.getAttachment` runs on the machine. The bytes
+/// come from head with the internal `file.attachmentData` frame, and the copy
+/// lands in the agent's checkout, git-ignored, with the local result shape.
+/// Head's refusal (an unknown id, or an older backend) is the call's error.
+#[tokio::test]
+async fn file_get_attachment_copies_heads_bytes_into_the_checkout() {
+    use base64::Engine as _;
+    use intent_core::remote_launch::workspace_api::ATTACHMENT_DATA_METHOD;
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            let LinkEvent::Request(request) = event else {
+                continue;
+            };
+            let frame = request.request().clone();
+            asked_tx.send(frame.params.clone()).unwrap();
+            let outcome = match frame.params["args"]["attachmentId"].as_str() {
+                Some("att-1") => LinkOutcome::Ok(json!({
+                    "fileName": "notes.txt",
+                    "mimeType": "text/plain",
+                    "size": 5,
+                    "uploadedAt": "2026-11-05T00:00:00Z",
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+                })),
+                _ => LinkOutcome::Err(LinkRpcError {
+                    code: -32000,
+                    message: "unknown attachment id: att-missing".into(),
+                    data: None,
+                }),
+            };
+            request.respond(outcome).await.unwrap();
+        }
+    });
+
+    let copied = ok_json(
+        call(
+            &server,
+            r#"return JSON.stringify(await ws.file.getAttachment("att-1"));"#,
+        )
+        .await,
+    );
+    assert_eq!(
+        copied,
+        json!({
+            "path": ".intent/attachments/notes.txt",
+            "fileName": "notes.txt",
+            "mimeType": "text/plain",
+            "size": 5,
+            "uploadedAt": "2026-11-05T00:00:00Z",
+        })
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".intent/attachments/notes.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".intent/attachments/.gitignore")).unwrap(),
+        "*\n"
+    );
+    let params = asked.try_recv().unwrap();
+    assert_eq!(params["method"], json!(ATTACHMENT_DATA_METHOD));
+    assert_eq!(params["args"], json!({ "attachmentId": "att-1" }));
+
+    let into = ok_json(
+        call(
+            &server,
+            r#"return JSON.stringify(await ws.file.getAttachment("att-1", "inbox"));"#,
+        )
+        .await,
+    );
+    assert_eq!(into["path"], json!("inbox/notes.txt"), "{into}");
+    assert!(dir.path().join("inbox/notes.txt").is_file());
+
+    let unknown = call(
+        &server,
+        r#"return await ws.file.getAttachment("att-missing");"#,
+    )
+    .await;
+    assert!(
+        unknown.0 && unknown.1.contains("unknown attachment id"),
+        "{unknown:?}"
+    );
+    while asked.try_recv().is_ok() {}
+    let escape = call(
+        &server,
+        r#"return await ws.file.getAttachment("att-1", "../outside");"#,
+    )
+    .await;
+    assert!(escape.0, "{escape:?}");
+    assert!(!dir.path().parent().unwrap().join("outside").exists());
+    assert!(
+        asked.try_recv().is_err(),
+        "a destDir outside the checkout is refused before head is asked"
+    );
+    answering.abort();
 }
 
 /// A bound link: the machine's end and the backend's (the test's) end.

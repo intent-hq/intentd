@@ -318,13 +318,23 @@ async fn module_work_comes_back_leaves_first() {
         try_ref(fixture.head.path(), &remote(AGENT).ref_name(AgentRef::Wip)),
         Some(pushed.wip)
     );
-    // The next push lands everything.
+    // The next push lands everything. It makes the `wip` commits again
+    // (stamped with the push's time, so their ids may differ from the
+    // refused run's): the superproject names the modules' current `wip`s,
+    // which carry the same work.
     fixture
         .head_state
         .refuse_superproject_push
         .store(false, Ordering::SeqCst);
     let last = push(&fixture, &worktree, &layout.pins).await.unwrap();
-    assert_eq!(gitlink(fixture.head.path(), &last.wip, "a"), a_wip2);
+    let a_wip3 = agent_ref(&layout.a, AgentRef::Wip).unwrap();
+    let b_wip3 = agent_ref(&layout.b, AgentRef::Wip).unwrap();
+    assert_eq!(gitlink(fixture.head.path(), &last.wip, "a"), a_wip3);
+    assert_eq!(gitlink(&layout.a, &a_wip3, "b"), b_wip3);
+    assert_eq!(
+        git(&layout.b, &["show", &format!("{b_wip3}:more.txt")]),
+        "more"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

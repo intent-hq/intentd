@@ -2389,6 +2389,36 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// The bytes of attachment `attachment_id` for a remote agent of
+    /// `workspace_id` whose `ws.file.getAttachment` runs on its machine (the
+    /// node link's `file.attachmentData`): the same lookup and store read as
+    /// a local copy, at most `max_bytes`. An attachment of another workspace
+    /// reads as an unknown id.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown id, `InvalidParams` for a file over
+    /// `max_bytes`, `Internal` for a file gone from the store.
+    pub async fn remote_attachment_data(
+        &self,
+        workspace_id: &WorkspaceId,
+        attachment_id: &str,
+        max_bytes: u64,
+    ) -> Result<serde_json::Value> {
+        // The same membership gate as a local copy, as the bound agent.
+        self.require_member(workspace_id).await?;
+        let unknown = || Error::NotFound(format!("unknown attachment id: {attachment_id}"));
+        let record = match self.store.get_attachment(attachment_id).await {
+            Ok(record) if record.workspace_id == *workspace_id => record,
+            Ok(_) | Err(Error::NotFound(_)) => return Err(unknown()),
+            Err(error) => return Err(error),
+        };
+        let root = file_ops::resolve_root(&self.store, workspace_id, None).await;
+        tokio::task::spawn_blocking(move || file_ops::attachment_data(&root, &record, max_bytes))
+            .await
+            .map_err(|e| Error::Internal(format!("attachment read failed: {e}")))?
+    }
+
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
     /// §3b): the persisted per-workspace override when set (mirrored from the
     /// global `git.autoCommit` at create time, toggled via

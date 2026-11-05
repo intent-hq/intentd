@@ -3272,49 +3272,12 @@ pub(crate) fn reject_self_targeted_send(
     Ok(())
 }
 
-/// Refuse a message carrying attachments to a remote agent: attachments are
-/// stored on head and its provider runs on the execution node, which cannot
-/// read them yet. Checked before any state change. An empty list is no
-/// attachment.
-pub(crate) fn reject_remote_attachments(
-    session: &AgentSession,
-    image_blocks: Option<&Value>,
-    file_blocks: Option<&Value>,
-) -> Result<()> {
-    if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
-        .is_some()
-    {
-        return reject_attachments_on_remote(image_blocks, file_blocks);
-    }
-    Ok(())
-}
-
 /// The sentence a sub-agent's inherited-placement failure ends with: why
 /// it went to `node_name` and how to run it on the backend instead.
 fn inherited_placement_hint(node_name: &str) -> String {
     format!(
         "The sub-agent defaults to \"{node_name}\" because its parent runs there; pass placement {{ target: \"local\" }} to run it on the backend."
     )
-}
-
-/// The attachment refusal for an agent that runs on another machine: any
-/// non-empty image or file blocks are `-32602`.
-pub(crate) fn reject_attachments_on_remote(
-    image_blocks: Option<&Value>,
-    file_blocks: Option<&Value>,
-) -> Result<()> {
-    let carries = |blocks: Option<&Value>| match blocks {
-        None | Some(Value::Null) => false,
-        Some(Value::Array(items)) => !items.is_empty(),
-        Some(_) => true,
-    };
-    if carries(image_blocks) || carries(file_blocks) {
-        return Err(Error::InvalidParams(format!(
-            "{}: attachments are not supported on remote agents yet; send the message without them (put the content in the message text or a note)",
-            intent_core::remote_launch::workspace_api::UNSUPPORTED_CODE
-        )));
-    }
-    Ok(())
 }
 
 /// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5, v10.0): every
@@ -6133,9 +6096,6 @@ impl Services {
         if placement.runs_on_backend()? {
             return Ok(());
         }
-        // The first message would be refused on the machine after the
-        // workspace exists, so its attachments are refused here instead.
-        reject_attachments_on_remote(plan.image_blocks.as_ref(), plan.file_blocks.as_ref())?;
         let needs = self
             .remote_launch_needs(&plan.provider, plan.model.as_deref(), &placement)
             .await?;
@@ -10003,7 +9963,6 @@ impl Services {
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
-        reject_remote_attachments(&session, image_blocks.as_ref(), file_blocks.as_ref())?;
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         // Image references must name registered attachments
         // (monorepo#3338) — rejected before any state change.
