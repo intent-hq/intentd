@@ -261,6 +261,13 @@ impl MachineReport for FixedReport {
         self.reconciles
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    fn disabled_providers(&self) -> Vec<String> {
+        if self.mock_enabled.load(std::sync::atomic::Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            vec!["mock".into()]
+        }
+    }
 }
 
 /// The fixture agent as the `mock` provider, when `node` is on PATH.
@@ -1961,11 +1968,12 @@ async fn shutdown_over_a_stuck_script_stays_within_one_reap_wait() {
 #[tokio::test]
 async fn an_enabled_providers_change_pushes_the_report_unasked() {
     use std::sync::atomic::Ordering;
-    async fn pushed(dialed: &mut DialedLink) -> Vec<String> {
+    async fn pushed(dialed: &mut DialedLink) -> (Vec<String>, Vec<String>) {
         loop {
             match next_frame(dialed).await {
                 Some(LinkFrame::CapabilitiesReply { capabilities }) => {
-                    return capabilities.providers.into_iter().map(|p| p.id).collect();
+                    let listed = capabilities.providers.into_iter().map(|p| p.id).collect();
+                    return (listed, capabilities.disabled_providers);
                 }
                 Some(LinkFrame::Journal(_)) => {}
                 other => panic!("expected a pushed capabilities report, got {other:?}"),
@@ -1982,18 +1990,17 @@ async fn an_enabled_providers_change_pushes_the_report_unasked() {
 
     node.report.mock_enabled.store(false, Ordering::SeqCst);
     node.service.enabled_providers_changed().await;
-    assert!(
-        pushed(&mut dialed).await.is_empty(),
-        "the reconciled report"
-    );
-    assert!(pushed(&mut dialed).await.is_empty(), "the refreshed report");
+    let off = (Vec::<String>::new(), vec!["mock".to_owned()]);
+    assert_eq!(pushed(&mut dialed).await, off, "the reconciled report");
+    assert_eq!(pushed(&mut dialed).await, off, "the refreshed report");
     assert_eq!(node.report.reconciles.load(Ordering::SeqCst), 1);
     assert_eq!(node.report.refreshes.load(Ordering::SeqCst), 1);
 
     node.report.mock_enabled.store(true, Ordering::SeqCst);
     node.service.enabled_providers_changed().await;
-    assert_eq!(pushed(&mut dialed).await, ["mock"]);
-    assert_eq!(pushed(&mut dialed).await, ["mock"]);
+    let on = (vec!["mock".to_owned()], Vec::<String>::new());
+    assert_eq!(pushed(&mut dialed).await, on);
+    assert_eq!(pushed(&mut dialed).await, on);
     node.stop().await;
 }
 

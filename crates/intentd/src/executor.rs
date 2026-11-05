@@ -70,6 +70,9 @@ pub(crate) trait MachineReport: Send + Sync {
     /// is cheap to know, keeping what was observed of the others. Never
     /// blocks for long.
     fn reconcile(&self);
+    /// The providers switched off in the machine's own `providers.enabled`,
+    /// read from the current settings. Never blocks for long.
+    fn disabled_providers(&self) -> Vec<String>;
 }
 
 /// The machine's `providers.enabled` as the capabilities report last
@@ -283,7 +286,8 @@ impl ExecutorService {
     }
 
     /// The capabilities report: platform, version, the shared limits and
-    /// their use, and the cached provider list. Until the first full report
+    /// their use, the cached provider list and the providers switched off
+    /// in this machine's settings. Until the first full report
     /// lands, the list is primed with what is cheap to know, so a backend
     /// binding right after its first mint sees the providers.
     fn capabilities(&self) -> MachineCapabilities {
@@ -296,6 +300,15 @@ impl ExecutorService {
         );
         capabilities.capacity = self.deps.admission.capacity();
         capabilities.providers = self.deps.report.providers();
+        // An id is never in both lists, even while the cached list has not
+        // caught up with a settings change yet.
+        capabilities.disabled_providers = self
+            .deps
+            .report
+            .disabled_providers()
+            .into_iter()
+            .filter(|id| !capabilities.providers.iter().any(|p| p.id == *id))
+            .collect();
         capabilities
     }
 
@@ -1004,6 +1017,10 @@ impl MachineReport for DaemonReport {
         let enabled_now = self.services.executor_provider_launch_statuses();
         let mut cache = lock(&self.cache);
         cache.0 = reconcile_providers(&cache.0, enabled_now);
+    }
+
+    fn disabled_providers(&self) -> Vec<String> {
+        self.services.executor_disabled_providers()
     }
 }
 

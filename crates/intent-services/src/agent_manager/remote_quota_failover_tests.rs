@@ -660,6 +660,7 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
                     models: models.iter().map(|m| (*m).to_owned()).collect(),
                     models_stale: false,
                 }],
+                disabled_providers: vec![],
                 observed_at: observed_at.clone(),
             }),
             observed_at: Some(observed_at),
