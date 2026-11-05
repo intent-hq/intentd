@@ -12448,7 +12448,9 @@ impl AgentManager {
     /// tool descriptions gets the condensed `workspace_api` reference (the
     /// machine serves the compact description that points at it); the
     /// skills catalog is left out (its paths are on this host). The private
-    /// `$TMPDIR` promise stays: the machine gives each agent its own.
+    /// `$TMPDIR` promise stays: the machine gives each agent its own. A
+    /// machine from before that (no nodeProtocol marks it) shares its temp
+    /// folder; the instructions' `mktemp` advice still applies there.
     ///
     /// # Errors
     ///
