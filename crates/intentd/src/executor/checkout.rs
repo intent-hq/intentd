@@ -146,7 +146,11 @@ impl Checkouts for GitCheckouts {
             let modules = match self
                 .cache
                 .checkout_modules_reporting(repo_key, &remote, &worktree, submodules, &|path| {
-                    progress(&format!("Fetching {path}…"));
+                    // A kept checkout's output is its setup's: only a fresh
+                    // one reports progress, which starts the output over.
+                    if fresh {
+                        progress(&format!("Fetching {path}…"));
+                    }
                 })
                 .await
             {

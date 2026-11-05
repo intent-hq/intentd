@@ -888,7 +888,7 @@ impl NodeGit {
         excludes: Option<&Path>,
     ) -> Result<WipRefs> {
         validate_pins(pins)?;
-        let excluded = |pin: Option<usize>| {
+        let excludes_of = |pin: Option<usize>| {
             excludes
                 .map(|dir| exclude_file(dir, pin))
                 .filter(|file| file.is_file())
@@ -902,13 +902,18 @@ impl NodeGit {
             let children = child_links(pins, &wips, Some(index));
             let module = remote.with_module(&pin.module_key)?;
             let pushed = self
-                .push_repository(&dir, &module, &children, excluded(Some(index)).as_deref())
+                .push_repository(
+                    &dir,
+                    &module,
+                    &children,
+                    excludes_of(Some(index)).as_deref(),
+                )
                 .await
                 .map_err(|error| Error::Internal(format!("submodule {}: {error}", pin.path)))?;
             wips[index] = Some(pushed.wip);
         }
         let children = child_links(pins, &wips, None);
-        self.push_repository(worktree, remote, &children, excluded(None).as_deref())
+        self.push_repository(worktree, remote, &children, excludes_of(None).as_deref())
             .await
     }
 

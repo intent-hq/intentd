@@ -79,7 +79,14 @@ pub(super) async fn serve(
     bridge_exe: &Path,
 ) -> std::io::Result<(McpBridge, McpServer)> {
     let server = Arc::new(
-        described_server(agent_id, workspace_id, worktree, (gates, setup_status), head).await?,
+        described_server(
+            agent_id,
+            workspace_id,
+            worktree,
+            (gates, setup_status),
+            head,
+        )
+        .await?,
     );
     let bridge = intent_acp::serve_workspace_mcp_tcp(server).await?;
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
@@ -180,8 +187,10 @@ async fn described_server(
     }
     .placement_help()
     .await;
-    Ok(server_with_setup(agent_id, workspace_id, worktree, gates, head)?
-        .with_remote_placement_help(help))
+    Ok(
+        server_with_setup(agent_id, workspace_id, worktree, gates, head)?
+            .with_remote_placement_help(help),
+    )
 }
 
 /// The forwarded call whose `setupStatus` the machine replaces.

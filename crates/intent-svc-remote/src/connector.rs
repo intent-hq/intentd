@@ -611,6 +611,8 @@ impl Shared {
     async fn final_stop_over(&self, agent_id: &AgentId) {
         #[cfg(test)]
         lock(&self.final_settles).push(agent_id.clone());
+        // The agent is gone for good: so is its kept setup output.
+        lock(&self.setup_outputs).remove(agent_id);
         if let Some(svc) = &self.services {
             svc.feature_runtime()
                 .machine_runs_final_stop_acked(

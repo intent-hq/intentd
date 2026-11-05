@@ -55,6 +55,9 @@ const SCROLLBACK_BYTES: usize = 64 * 1024;
 
 const STATUS_FILE: &str = "setup.json";
 const LOG_FILE: &str = "setup.log";
+/// The untracked paths before the script ran, so an interrupted run's
+/// files can still be excluded at the next launch.
+const BEFORE_FILE: &str = "setup-before.json";
 const EXCLUDES_DIR: &str = "setup-exclude";
 
 /// The agent's storage directory: its checkout's parent.
@@ -127,6 +130,17 @@ impl SetupStatus {
         )
     }
 
+    /// A kept checkout with no recorded setup (a launch stopped before its
+    /// checkout was ready, or one from a machine without setup): the script
+    /// never ran there and does not run now.
+    pub(super) fn never_ran() -> Self {
+        Self::failed(
+            None,
+            codes::INTERRUPTED,
+            "this checkout was kept from a launch that did not run the setup script; it does not run again",
+        )
+    }
+
     /// The `setupFinished` state; `None` while running.
     pub(super) fn finished_state(&self) -> Option<SetupState> {
         match self.state {
@@ -190,6 +204,9 @@ pub(super) struct SetupOutput {
     agent_id: AgentId,
     head: HeadLink,
     state: Mutex<OutputState>,
+    /// The log in the agent's storage directory, appended as output
+    /// arrives so a crash keeps what ran.
+    log: Mutex<Option<std::fs::File>>,
 }
 
 #[derive(Default)]
@@ -207,7 +224,31 @@ impl SetupOutput {
             agent_id,
             head,
             state: Mutex::new(OutputState::default()),
+            log: Mutex::new(None),
         })
+    }
+
+    /// Start the log at `path` with the output so far.
+    fn start_log(&self, path: &Path) {
+        let (tail, _) = self.tail();
+        let file = std::fs::File::create(path).and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(tail.as_bytes())?;
+            Ok(file)
+        });
+        match file {
+            Ok(file) => *lock(&self.log) = Some(file),
+            Err(error) => tracing::warn!(%error, "node: could not start the setup log"),
+        }
+    }
+
+    /// Replace the log with the kept tail and stop appending.
+    fn close_log(&self, path: &Path) {
+        lock(&self.log).take();
+        let (tail, _) = self.tail();
+        if let Err(error) = std::fs::write(path, tail) {
+            tracing::warn!(%error, "node: could not keep the setup output");
+        }
     }
 
     /// One progress line of the checkout.
@@ -258,6 +299,10 @@ impl SetupOutput {
     fn send_text(&self, state: &mut OutputState, text: &str) {
         if text.is_empty() {
             return;
+        }
+        if let Some(file) = lock(&self.log).as_mut() {
+            use std::io::Write as _;
+            let _ = file.write_all(text.as_bytes());
         }
         state.tail.push_str(text);
         if state.tail.len() > OUTPUT_TAIL_BYTES {
@@ -339,18 +384,42 @@ pub(super) async fn run(
     stop: &mut oneshot::Receiver<()>,
 ) -> Ran {
     let dir = agent_dir(run.worktree);
+    let excludes = excludes_dir(run.worktree);
+    // A fresh run's excludes replace any earlier run's.
+    let _ = std::fs::remove_dir_all(&excludes);
     let before = untracked(run.worktree, run.pins).await;
-    let script = dir.join(format!("setup-{}.sh", intent_core::node_link::LinkId::new_v4()));
+    match serde_json::to_vec(&before) {
+        Ok(body) => {
+            if let Err(error) = std::fs::write(dir.join(BEFORE_FILE), body) {
+                tracing::warn!(%error, "node: could not record the untracked paths before setup");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "node: could not encode the untracked paths"),
+    }
+    output.start_log(&dir.join(LOG_FILE));
+    let script = dir.join(format!(
+        "setup-{}.sh",
+        intent_core::node_link::LinkId::new_v4()
+    ));
     let ran = spawn_and_wait(pty, &run, &script, output, started_at, stop).await;
     let _ = std::fs::remove_file(&script);
     output.finish();
     let after = untracked(run.worktree, run.pins).await;
-    write_excludes(&excludes_dir(run.worktree), &before, after);
-    let (tail, _) = output.tail();
-    if let Err(error) = std::fs::write(dir.join(LOG_FILE), tail) {
-        tracing::warn!(%error, "node: could not keep the setup output");
-    }
+    write_excludes(run.worktree, &excludes, &before, after);
+    output.close_log(&dir.join(LOG_FILE));
     ran
+}
+
+/// After a setup a stop or restart interrupted: exclude what it created
+/// from `wip` pushes, as a finished run does.
+pub(super) async fn exclude_interrupted(worktree: &Path, pins: &[SubmodulePin]) {
+    let before: Vec<(Option<usize>, Vec<String>)> =
+        std::fs::read(agent_dir(worktree).join(BEFORE_FILE))
+            .ok()
+            .and_then(|body| serde_json::from_slice(&body).ok())
+            .unwrap_or_default();
+    let after = untracked(worktree, pins).await;
+    write_excludes(worktree, &excludes_dir(worktree), &before, after);
 }
 
 async fn spawn_and_wait(
@@ -547,11 +616,12 @@ async fn untracked(worktree: &Path, pins: &[SubmodulePin]) -> Vec<(Option<usize>
 /// did not, after the machine user's global excludes (the file replaces
 /// git's global excludes file for the push).
 fn write_excludes(
+    worktree: &Path,
     dir: &Path,
     before: &[(Option<usize>, Vec<String>)],
     after: Vec<(Option<usize>, Vec<String>)>,
 ) {
-    let global = global_excludes();
+    let global = global_excludes(worktree);
     for (repo, paths) in after {
         let old = before
             .iter()
@@ -583,14 +653,32 @@ fn write_excludes(
     }
 }
 
-/// The machine user's default global excludes file's patterns, if any.
-fn global_excludes() -> String {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    config
-        .and_then(|dir| std::fs::read_to_string(dir.join("git").join("ignore")).ok())
+/// The patterns of the machine user's global excludes file: the one
+/// `core.excludesFile` names, else git's default `git/ignore` under
+/// `$XDG_CONFIG_HOME` (or `~/.config`).
+fn global_excludes(worktree: &Path) -> String {
+    let configured = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--path", "--get", "core.excludesFile"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let file = configured.or_else(|| {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .map(|dir| dir.join("git").join("ignore"))
+    });
+    file.and_then(|file| std::fs::read_to_string(file).ok())
         .unwrap_or_default()
 }
 
@@ -617,4 +705,96 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A repository at `<root>/work` (the agent dir is `<root>`).
+    fn repo(root: &Path) -> PathBuf {
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "--quiet"]);
+        std::fs::write(work.join("tracked.txt"), "t\n").unwrap();
+        git(&work, &["add", "tracked.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--quiet",
+                "-m",
+                "t",
+            ],
+        );
+        work
+    }
+
+    /// The excludes file replaces git's global one for a push, so it
+    /// carries the patterns of the file `core.excludesFile` names.
+    #[test]
+    fn excludes_carry_the_configured_global_excludes_file() {
+        let root = tempfile::tempdir().unwrap();
+        let work = repo(root.path());
+        let global = root.path().join("global-ignore");
+        std::fs::write(&global, "secret\n").unwrap();
+        git(
+            &work,
+            &["config", "core.excludesFile", global.to_str().unwrap()],
+        );
+        std::fs::write(work.join("made by setup"), "x").unwrap();
+        let after = vec![(None, vec!["made by setup".to_owned()])];
+        let dir = excludes_dir(&work);
+        write_excludes(&work, &dir, &[], after);
+        let body = std::fs::read_to_string(intent_git::node_git::exclude_file(&dir, None)).unwrap();
+        assert!(body.lines().any(|line| line == "secret"), "{body}");
+        assert!(body.lines().any(|line| line == "/made by setup"), "{body}");
+    }
+
+    /// An interrupted setup's files are excluded at the next launch from
+    /// the untracked paths recorded before it ran.
+    #[tokio::test]
+    async fn an_interrupted_setups_files_are_excluded() {
+        let root = tempfile::tempdir().unwrap();
+        let work = repo(root.path());
+        std::fs::write(work.join("before.txt"), "b").unwrap();
+        let before = untracked(&work, &[]).await;
+        std::fs::write(
+            agent_dir(&work).join(BEFORE_FILE),
+            serde_json::to_vec(&before).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(work.join("node_modules/x")).unwrap();
+        std::fs::write(work.join("node_modules/x/i.js"), "x").unwrap();
+        exclude_interrupted(&work, &[]).await;
+        let body = std::fs::read_to_string(intent_git::node_git::exclude_file(
+            &excludes_dir(&work),
+            None,
+        ))
+        .unwrap();
+        assert!(body.lines().any(|line| line == "/node_modules/"), "{body}");
+        assert!(!body.contains("before.txt"), "{body}");
+    }
+
+    #[test]
+    fn patterns_are_literal() {
+        assert_eq!(escape_pattern("a*b?[c]"), "a\\*b\\?\\[c]");
+        assert_eq!(escape_pattern("#x!"), "\\#x\\!");
+        assert_eq!(escape_pattern("trail  "), "trail\\ \\ ");
+    }
 }

@@ -326,9 +326,10 @@ struct Agent {
     repo_key: String,
     /// The submodules its checkout has at their pins (nodeProtocol 10).
     submodules: Vec<intent_core::node_link::SubmodulePin>,
-    /// The launch's setup script (`Some(None)`: none), when it carried a
-    /// prepared checkout (nodeProtocol 10).
-    setup: Option<Option<intent_core::node_link::SetupCommand>>,
+    /// Whether the launch carried a prepared checkout (nodeProtocol 10).
+    prepared: bool,
+    /// Its setup script, if any.
+    setup: Option<intent_core::node_link::SetupCommand>,
     /// The checkout's progress and setup output while they run, resent
     /// after a reconnect.
     setup_output: Mutex<Option<Arc<SetupOutput>>>,
@@ -873,7 +874,10 @@ impl Runner {
             is_sub_agent,
             checkout,
         } = command;
-        let setup = checkout.as_ref().map(|checkout| checkout.setup.clone());
+        let prepared = checkout.is_some();
+        let setup = checkout
+            .as_ref()
+            .and_then(|checkout| checkout.setup.clone());
         let submodules = checkout
             .map(|checkout| checkout.submodules)
             .unwrap_or_default();
@@ -948,6 +952,7 @@ impl Runner {
             base_commit,
             repo_key,
             submodules,
+            prepared,
             setup,
             setup_output: Mutex::new(None),
             gates: workspace_api::Gates {
@@ -1117,7 +1122,7 @@ impl Runner {
         ready: watch::Sender<Option<Arc<Ready>>>,
         mut stop: oneshot::Receiver<()>,
     ) {
-        let output = agent.setup.is_some().then(|| {
+        let output = agent.prepared.then(|| {
             let output = SetupOutput::new(agent.id.clone(), self.inner.head.clone());
             *lock(&agent.setup_output) = Some(output.clone());
             output
@@ -1146,12 +1151,19 @@ impl Runner {
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                let settled = match (&agent.setup, &output) {
-                    (Some(command), Some(output)) => {
-                        self.settle_setup(&agent, &cwd, fresh, command.as_ref(), output, &mut stop)
-                            .await
+                let settled = match &output {
+                    Some(output) => {
+                        self.settle_setup(
+                            &agent,
+                            &cwd,
+                            fresh,
+                            agent.setup.as_ref(),
+                            output,
+                            &mut stop,
+                        )
+                        .await
                     }
-                    _ => Settled::default(),
+                    None => Settled::default(),
                 };
                 *lock(&agent.setup_output) = None;
                 if settled.stopped {
@@ -1282,13 +1294,21 @@ impl Runner {
     ) -> Settled {
         let status = match (fresh, command) {
             (false, _) => match setup::read_status(cwd) {
-                Some(status) if status.state == setup::Recorded::Running => status.interrupted(),
-                kept => {
+                Some(status) if status.state == setup::Recorded::Running => {
+                    setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    status.interrupted()
+                }
+                Some(kept) => {
                     return Settled {
-                        overlay: kept.map(|status| status.overlay()),
+                        overlay: Some(kept.overlay()),
                         ..Settled::default()
                     }
                 }
+                // Kept from a launch that never got as far as setup (or
+                // from a machine without it): record a result once, so the
+                // backend does not wait for one.
+                None if command.is_some() => SetupStatus::never_ran(),
+                None => SetupStatus::skipped(),
             },
             (true, None) => SetupStatus::skipped(),
             (true, Some(command)) => {

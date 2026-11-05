@@ -287,12 +287,18 @@ pub struct RemoteSetupStatus {
 }
 
 /// The longest `setup.error` a placement keeps, in bytes.
-pub const SETUP_ERROR_CAP_BYTES: usize = 512;
+pub const SETUP_ERROR_CAP_BYTES: usize = 160;
 
 impl RemoteSetupStatus {
     /// `error` cut to [`SETUP_ERROR_CAP_BYTES`] on a character boundary.
     #[must_use]
+    /// Control characters become spaces, so the cap holds after JSON
+    /// escaping too.
     pub fn capped_error(error: &str) -> String {
+        let error: String = error
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         let mut end = error.len().min(SETUP_ERROR_CAP_BYTES);
         while !error.is_char_boundary(end) {
             end -= 1;
@@ -375,7 +381,9 @@ pub fn launch_notice_with_setup(
         notice.push_str(" Its submodules start from the commits checked out in the workspace; uncommitted changes inside them are not carried either.");
     }
     if setup {
-        notice.push_str(" The workspace's setup script runs on that machine before the agent starts.");
+        notice.push_str(
+            " The workspace's setup script runs on that machine before the agent starts.",
+        );
     }
     notice
 }

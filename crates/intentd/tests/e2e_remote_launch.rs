@@ -2424,7 +2424,13 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     assert!(fetched < ready, "the checkout comes before setup: {output}");
     assert_eq!(setup["outputTruncated"], false);
 
-    let listed = ok(&mut rpc_ws, 200, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = ok(
+        &mut rpc_ws,
+        200,
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
     let row = listed["agents"]
         .as_array()
         .unwrap()
@@ -2460,7 +2466,12 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     let main_checkout = Path::new(fields[3]);
     assert!(main_checkout.is_dir(), "{env}");
     assert!(
-        main_checkout.starts_with(node_dir.join("executor").join(&machine.credential_id).join("repos")),
+        main_checkout.starts_with(
+            node_dir
+                .join("executor")
+                .join(&machine.credential_id)
+                .join("repos")
+        ),
         "{env}"
     );
     assert_eq!(fields[4], "unset", "no agent launch wiring: {env}");
@@ -2474,13 +2485,27 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     set_script("echo boom-from-setup\nexit 3\n");
     let failing = create_remote(&mut rpc_ws, &ws_id, "Failing", 400).await;
     let failing_id = failing["agent"]["id"].as_str().unwrap().to_owned();
-    turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "hello", 450).await;
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &failing_id),
+        "hello",
+        450,
+    )
+    .await;
     let setup = setup_until(&mut rpc_ws, (&ws_id, &failing_id), 500, |setup| {
         setup["state"] == "failed"
     })
     .await;
     assert_eq!(setup["exitCode"], 3, "{setup}");
-    turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "again", 600).await;
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &failing_id),
+        "again",
+        600,
+    )
+    .await;
     // The fixture echoes each prompt; the notice rides the first one only.
     let replies = timeout(wait(), async {
         let mut id = 650;
@@ -2512,7 +2537,10 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     assert!(replies[0].contains("workspace setup failed"), "{replies:?}");
     assert!(replies[0].contains("exited with code 3"), "{replies:?}");
     assert!(replies[0].contains("boom-from-setup"), "{replies:?}");
-    assert!(!replies[1].contains("workspace setup failed"), "notice once: {replies:?}");
+    assert!(
+        !replies[1].contains("workspace setup failed"),
+        "notice once: {replies:?}"
+    );
 
     // The first agent's work comes back without the setup's files.
     std::fs::write(work.join("agent.txt"), "agent edit\n").unwrap();
@@ -2545,15 +2573,24 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
         assert!(!files.lines().any(|f| f == setup_file), "{files}");
     }
     let module_wip = git(&repo, &["rev-parse", &format!("{wip}:a")]);
-    let module_files = git(&repo.join("a"), &["ls-tree", "-r", "--name-only", &module_wip]);
-    assert!(module_files.lines().any(|f| f == "agent.txt"), "{module_files}");
-    assert!(!module_files.lines().any(|f| f == "built/out.txt"), "{module_files}");
+    let module_files = git(
+        &repo.join("a"),
+        &["ls-tree", "-r", "--name-only", &module_wip],
+    );
+    assert!(
+        module_files.lines().any(|f| f == "agent.txt"),
+        "{module_files}"
+    );
+    assert!(
+        !module_files.lines().any(|f| f == "built/out.txt"),
+        "{module_files}"
+    );
 }
 
 /// Whether `work` holds a setup script file (`setup-<uuid>.sh`).
 fn entry_is_script(work: &Path) -> bool {
     std::fs::read_dir(work).unwrap().any(|entry| {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-        name.starts_with("setup-") && name.ends_with(".sh")
+        name.starts_with("setup-") && Path::new(&name).extension().is_some_and(|ext| ext == "sh")
     })
 }

@@ -2280,8 +2280,17 @@ fn setup_finished(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
 /// Wait until `id` has journaled `count` exits.
 async fn wait_exits(runner: &Runner, id: &str, count: usize) {
     let deadline = tokio::time::Instant::now() + wait();
-    while records(runner).await.iter().filter(|r| exited(id)(r)).count() < count {
-        assert!(tokio::time::Instant::now() < deadline, "{id} never exited {count} times");
+    while records(runner)
+        .await
+        .iter()
+        .filter(|r| exited(id)(r))
+        .count()
+        < count
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id} never exited {count} times"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -2350,7 +2359,8 @@ fn told_setup_failed(all: &[JournalRecord], id: &str, turn: &str, needle: &str) 
 async fn node_runner_runs_setup_before_the_agent_starts() {
     use intent_core::node_link::SetupState;
     let Some(h) = harness(5, &[]) else { return };
-    let env_script = "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"$(pwd -P)\" \"$WORKTREE_PATH\" \"$MAIN_CHECKOUT\" \
+    let env_script =
+        "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"$(pwd -P)\" \"$WORKTREE_PATH\" \"$MAIN_CHECKOUT\" \
          \"$BRANCH_NAME\" \"$SOURCE_BRANCH\" \"$INTENT_REMOTE_MACHINE\" \
          \"${CODEX_ACCESS_TOKEN-none}${INTENT_NODE_GIT_SOCKET-}\" > setup-env.txt\n\
          echo ran >> setup-runs.txt\n";
@@ -2362,7 +2372,11 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
     .profile_env;
     h.runner.launch(with_profile).await;
     h.runner
-        .launch(launch_with_setup("a2", Some("echo boom-from-setup\nexit 3\n"), None))
+        .launch(launch_with_setup(
+            "a2",
+            Some("echo boom-from-setup\nexit 3\n"),
+            None,
+        ))
         .await;
     h.runner
         .launch(launch_with_setup("a3", Some("sleep 30\n"), Some(1)))
@@ -2404,9 +2418,9 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
             .chain(std::fs::read_dir(&worktree).unwrap())
             .any(|entry| entry
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".sh")),
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "sh")),
         "the script file is written outside the checkout and removed"
     );
 
@@ -2515,6 +2529,45 @@ async fn node_runner_stop_during_setup_kills_it_and_records_it_interrupted() {
         "ran\n",
         "no re-run"
     );
-    assert!(told_setup_failed(&all, "a1", "t1", "stopped before it finished"));
+    assert!(told_setup_failed(
+        &all,
+        "a1",
+        "t1",
+        "stopped before it finished"
+    ));
     h.runner.stop(&AgentId::from("a1"));
+}
+
+/// A kept checkout with no recorded setup (its first launch was stopped
+/// before setup, or ran on a machine without it) records one result, so
+/// the backend never waits on a setup that will not come: `failed` without
+/// running a script it carries, `skipped` without one.
+#[tokio::test]
+async fn node_runner_records_setup_for_a_kept_checkout_without_one() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(2, &[]) else { return };
+    for id in ["a1", "a2"] {
+        h.storage.agent_dir(&AgentId::from(id)).unwrap();
+    }
+    h.runner
+        .launch(launch_with_setup("a1", Some("echo ran > ran.txt\n"), None))
+        .await;
+    h.runner.launch(launch_with_setup("a2", None, None)).await;
+    for id in ["a1", "a2"] {
+        wait_for(&h.runner, "started", started(id)).await;
+    }
+    let all = records(&h.runner).await;
+    let (state, code, error) = finished(&all, "a1");
+    assert_eq!((state, code), (SetupState::Failed, None));
+    assert!(error.unwrap().starts_with("node-setup-interrupted: "));
+    assert!(!all.iter().any(setup_started("a1")), "{all:#?}");
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    assert!(
+        !worktree.join("ran.txt").exists(),
+        "no run on a kept checkout"
+    );
+    assert_eq!(finished(&all, "a2"), (SetupState::Skipped, None, None));
+    for id in ["a1", "a2"] {
+        h.runner.stop(&AgentId::from(id));
+    }
 }
