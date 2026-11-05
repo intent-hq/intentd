@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.131] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- Use "run agents" wording in the app guide and machine-revoked error ([#3051](https://github.com/intent-hq/intentd/pull/3051))
+- Let remote agents set the workspace title, their name and status, and propose siblings ([#3054](https://github.com/intent-hq/intentd/pull/3054))
+
+
 ## [0.11.130] - 2026-11-05
 
 ### 🐛 Bug Fixes
