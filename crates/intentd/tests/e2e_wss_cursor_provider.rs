@@ -42,7 +42,7 @@ impl Drop for Daemon {
 
 /// Kills every mock `cursor-agent acp` process group (and its worker) the
 /// test's daemons started. Declared before the daemon so it drops after it:
-/// a SIGKILLed test daemon cannot reap agents spawned in their own process
+/// a test daemon killed with `SIGKILL` cannot reap agents spawned in their own process
 /// groups, and the mock (like the real CLI) ignores stdin EOF.
 struct MockCleanup(std::path::PathBuf);
 

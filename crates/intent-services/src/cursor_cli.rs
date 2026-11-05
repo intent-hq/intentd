@@ -111,11 +111,42 @@ pub(crate) async fn run_cursor_cli(
     .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd.spawn().ok()?;
+    let mut child = cmd.spawn().ok()?;
     let pgid = child.id();
-    let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // Read the pipes concurrently and wait for the CLI itself, not for pipe
+    // EOF: a child the CLI leaves behind would keep the pipes open.
+    let read = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+            }
+            buf
+        })
+    };
+    let stdout = read(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let status = tokio::time::timeout(timeout, child.wait()).await;
     kill_cursor_group(pgid);
-    output.ok()?.ok()
+    let status = match status {
+        Ok(Ok(status)) => status,
+        _ => {
+            let _ = child.kill().await;
+            return None;
+        }
+    };
+    let collect = |task: tokio::task::JoinHandle<Vec<u8>>| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    };
+    Some(std::process::Output {
+        status,
+        stdout: collect(stdout).await,
+        stderr: collect(stderr).await,
+    })
 }
 
 /// `cursor-agent --version` with a 3s budget, in its own process group that
@@ -146,6 +177,9 @@ fn run_cursor_version_probe(path: &std::path::Path) -> Option<String> {
     let line = loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
+                // Kill the group first: a child left behind would hold the
+                // stdout pipe open and block the read.
+                kill_cursor_group(pgid);
                 let mut out = Vec::new();
                 child.stdout.take()?.read_to_end(&mut out).ok()?;
                 break String::from_utf8_lossy(&out)
