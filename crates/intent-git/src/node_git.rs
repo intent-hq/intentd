@@ -664,7 +664,10 @@ pub fn validate_pins(pins: &[SubmodulePin]) -> Result<()> {
         if pin.name.is_empty() || pin.name.contains(['\n', '\0']) {
             return Err(invalid_pin(path, "not a submodule name"));
         }
-        let hex = pin.commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let hex = pin
+            .commit
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         if !hex || !matches!(pin.commit.len(), 40 | 64) {
             return Err(invalid_pin(path, "not a full commit id"));
         }
@@ -911,7 +914,13 @@ impl NodeGit {
         run(with_index(&["add", "--all"])).await?;
         for (path, commit) in links {
             let entry = format!("160000,{commit},{path}");
-            run(with_index(&["update-index", "--add", "--cacheinfo", &entry])).await?;
+            run(with_index(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &entry,
+            ]))
+            .await?;
         }
         let tree = run(with_index(&["write-tree"])).await?;
         let wip = if tree == head_tree {
@@ -1040,7 +1049,8 @@ impl CheckoutCache {
         let _serial = self.lock.lock().await;
         let mut added = Vec::new();
         for (index, pin) in pins.iter().enumerate() {
-            let context = |error: Error| Error::Internal(format!("submodule {}: {error}", pin.path));
+            let context =
+                |error: Error| Error::Internal(format!("submodule {}: {error}", pin.path));
             ensure_no_symlink(worktree, &pin.path)?;
             let dir = worktree.join(&pin.path);
             if populated_here(&dir) {
@@ -1104,13 +1114,22 @@ impl CheckoutCache {
                     .git(parent, &["config", "--file", &own, "core.bare", "true"])
                     .await?;
                 self.git
-                    .git(parent, &["config", "--file", &config_arg, "--unset", "core.bare"])
+                    .git(
+                        parent,
+                        &["config", "--file", &config_arg, "--unset", "core.bare"],
+                    )
                     .await?;
             }
             self.git
                 .git(
                     parent,
-                    &["config", "--file", &config_arg, "extensions.worktreeConfig", "true"],
+                    &[
+                        "config",
+                        "--file",
+                        &config_arg,
+                        "extensions.worktreeConfig",
+                        "true",
+                    ],
                 )
                 .await?;
         }
@@ -1252,9 +1271,9 @@ impl CheckoutCache {
             "--no-color",
             "--ignore-submodules=all",
         ])
-            .arg(format!("--output={}", patch.display()))
-            .arg(format!("{wip}^"))
-            .arg(wip);
+        .arg(format!("--output={}", patch.display()))
+        .arg(format!("{wip}^"))
+        .arg(wip);
         run(diff).await?;
         if std::fs::metadata(&patch).map_err(io)?.len() == 0 {
             return Ok(());

@@ -162,9 +162,7 @@ async fn checkout(fixture: &Fixture, worktree: &Path, pins: &[SubmodulePin]) {
         .unwrap();
     let modules = tokio::time::timeout(
         wait(),
-        fixture
-            .cache
-            .checkout_modules(REPO, &agent, worktree, pins),
+        fixture.cache.checkout_modules(REPO, &agent, worktree, pins),
     )
     .await
     .unwrap()
@@ -172,10 +170,17 @@ async fn checkout(fixture: &Fixture, worktree: &Path, pins: &[SubmodulePin]) {
     assert_eq!(modules.len(), pins.len());
 }
 
-async fn push(fixture: &Fixture, worktree: &Path, pins: &[SubmodulePin]) -> intent_core::Result<node_git::WipRefs> {
+async fn push(
+    fixture: &Fixture,
+    worktree: &Path,
+    pins: &[SubmodulePin],
+) -> intent_core::Result<node_git::WipRefs> {
     tokio::time::timeout(
         wait(),
-        fixture.cache.git().push_work(worktree, &remote(AGENT), pins),
+        fixture
+            .cache
+            .git()
+            .push_work(worktree, &remote(AGENT), pins),
     )
     .await
     .unwrap()
@@ -218,13 +223,10 @@ async fn the_machine_checks_out_every_populated_submodule_at_heads_commits() {
     // No submodule URL is configured on the machine, and the superproject
     // cache's other worktrees do not see the activation.
     let other = fixture.worktree("plain");
-    tokio::time::timeout(
-        wait(),
-        fixture.cache.checkout(REPO, &remote(AGENT), &other),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(wait(), fixture.cache.checkout(REPO, &remote(AGENT), &other))
+        .await
+        .unwrap()
+        .unwrap();
     let other_config = std::process::Command::new("git")
         .arg("-C")
         .arg(&other)
@@ -313,10 +315,7 @@ async fn module_work_comes_back_leaves_first() {
     let a_wip2 = agent_ref(&layout.a, AgentRef::Wip).unwrap();
     assert_eq!(gitlink(&layout.a, &a_wip2, "b"), b_wip);
     assert_eq!(
-        try_ref(
-            fixture.head.path(),
-            &remote(AGENT).ref_name(AgentRef::Wip)
-        ),
+        try_ref(fixture.head.path(), &remote(AGENT).ref_name(AgentRef::Wip)),
         Some(pushed.wip)
     );
     // The next push lands everything.
@@ -347,10 +346,7 @@ async fn an_ordinary_merge_on_head_leaves_the_submodules_clean() {
         git(dir, &["merge", "--quiet", "--ff-only", &head_ref]);
     }
     let after = status(fixture.head.path());
-    assert!(
-        after.iter().all(|line| !line.starts_with('+')),
-        "{after:?}"
-    );
+    assert!(after.iter().all(|line| !line.starts_with('+')), "{after:?}");
     assert_eq!(
         std::fs::read_to_string(layout.b.join("work.txt")).unwrap(),
         "b work\n"
@@ -404,7 +400,10 @@ async fn a_relaunch_restores_every_module_and_pins_a_conflicting_module_wip() {
     let saved_head = commit_file(c, "README.md", "head\n");
     git(c, &["checkout", "--quiet", "--detach", &pin]);
     git(c, &["update-ref", &agent.ref_name(AgentRef::Wip), &wip]);
-    git(c, &["update-ref", &agent.ref_name(AgentRef::Head), &saved_head]);
+    git(
+        c,
+        &["update-ref", &agent.ref_name(AgentRef::Head), &saved_head],
+    );
     tokio::time::timeout(wait(), fixture.cache.remove(REPO, &restored))
         .await
         .unwrap()

@@ -1817,14 +1817,18 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     std::fs::write(repo.join("a/ahead.txt"), "backend only\n").unwrap();
     git(&repo.join("a"), &["add", "ahead.txt"]);
     git(&repo.join("a"), &["commit", "--quiet", "-m", "ahead"]);
-    let heads = |root: &Path| {
-        ["a", "a/b", "c"].map(|path| git(&root.join(path), &["rev-parse", "HEAD"]))
-    };
+    let heads =
+        |root: &Path| ["a", "a/b", "c"].map(|path| git(&root.join(path), &["rev-parse", "HEAD"]));
     let backend_heads = heads(&repo);
     let status = |root: &Path| -> Vec<String> {
         git(root, &["submodule", "status", "--recursive"])
             .lines()
-            .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+            .map(|line| {
+                line.split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .collect()
     };
 
@@ -1896,7 +1900,10 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     // The agent commits in the nested `a/b` and leaves an edit in `c`.
     std::fs::write(work.join("a/b/agent.txt"), "agent commit\n").unwrap();
     git(&work.join("a/b"), &["add", "agent.txt"]);
-    git(&work.join("a/b"), &["commit", "--quiet", "-m", "agent work"]);
+    git(
+        &work.join("a/b"),
+        &["commit", "--quiet", "-m", "agent work"],
+    );
     let b_commit = git(&work.join("a/b"), &["rev-parse", "HEAD"]);
     std::fs::write(work.join("c/edit.txt"), "agent edit\n").unwrap();
 

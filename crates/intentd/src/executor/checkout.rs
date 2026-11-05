@@ -354,10 +354,7 @@ impl Checkouts for PlainCheckouts {
                 !self.fail.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the fetch"
             );
-            self.prepared_pins
-                .lock()
-                .unwrap()
-                .push(submodules.to_vec());
+            self.prepared_pins.lock().unwrap().push(submodules.to_vec());
             if self.fail_pin.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(anyhow::anyhow!("pin the unapplied wip on head: refused")
                     .context("fetch the agent's refs from head"));

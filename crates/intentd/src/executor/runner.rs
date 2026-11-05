@@ -880,7 +880,9 @@ impl Runner {
             checkout,
         } = command;
         let setup = checkout.as_ref().map(|checkout| checkout.setup.is_some());
-        let submodules = checkout.map(|checkout| checkout.submodules).unwrap_or_default();
+        let submodules = checkout
+            .map(|checkout| checkout.submodules)
+            .unwrap_or_default();
         let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
             agent_id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
