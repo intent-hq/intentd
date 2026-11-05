@@ -324,6 +324,11 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "mcp.testConnection",
             json!({ "url": "http://127.0.0.1:9/" }),
         ),
+        ("plugin.install", json!({ "source": "/tmp/plugin" })),
+        ("plugin.list", json!({})),
+        ("plugin.toggle", json!({ "name": "p", "enabled": false })),
+        ("plugin.uninstall", json!({ "name": "p" })),
+        ("plugin.update", json!({ "name": "p" })),
         (
             "prMonitor.cancel",
             json!({ "workspaceId": ws, "monitorId": "m1" }),

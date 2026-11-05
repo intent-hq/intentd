@@ -645,10 +645,14 @@ impl PluginPaths {
         if cfg!(test) {
             return None;
         }
+        Self::home().map(|home| Self::new(home.join(".intent")))
+    }
+
+    pub(crate) fn home() -> Option<PathBuf> {
         std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .filter(|h| !h.is_empty())
-            .map(|h| Self::new(PathBuf::from(h).join(".intent")))
+            .map(PathBuf::from)
     }
 
     pub(crate) fn plugins_dir(&self) -> PathBuf {
@@ -856,6 +860,8 @@ pub(crate) fn ensure_data_dirs(plugins: &[LoadedPlugin]) {
 pub(crate) fn skill_name(plugin: &str, skill: &str) -> String {
     format!("{plugin}:{skill}")
 }
+
+pub(crate) mod ops;
 
 #[cfg(test)]
 mod tests;

@@ -278,6 +278,11 @@ note.subscribe
 note.unsubscribe
 note.update
 note.updateMetadata
+plugin.install
+plugin.list
+plugin.toggle
+plugin.uninstall
+plugin.update
 pr.refresh
 prMonitor.cancel
 prMonitor.flush

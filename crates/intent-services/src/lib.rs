@@ -20575,6 +20575,49 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn plugin_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.list")?;
+            plugins::ops::list().await
+        })
+    }
+
+    fn plugin_install(&self, source: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.install")?;
+            plugins::ops::install(source).await
+        })
+    }
+
+    fn plugin_update(&self, name: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.update")?;
+            plugins::ops::update(name).await
+        })
+    }
+
+    fn plugin_uninstall(
+        &self,
+        name: String,
+        keep_data: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.uninstall")?;
+            plugins::ops::uninstall(name, keep_data).await
+        })
+    }
+
+    fn plugin_toggle(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.toggle")?;
+            plugins::ops::toggle(name, enabled).await
+        })
+    }
+
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversRestart")?;

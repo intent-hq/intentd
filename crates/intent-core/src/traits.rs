@@ -7580,6 +7580,65 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `plugin.list` → `{ plugins: PluginInfo[] }`: installed user-scope Agent
+    /// Plugins, valid or not, sorted by name.
+    fn plugin_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.install { source }` → `{ plugin }`: copy a local folder or clone a
+    /// git URL into the user plugins folder after validation.
+    fn plugin_install(&self, source: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = source;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_install not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.update { name }` → `{ plugin }`: re-fetch from the recorded source.
+    fn plugin_update(&self, name: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = name;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.uninstall { name, keepData? }` → `{ name, removed }`.
+    fn plugin_uninstall(
+        &self,
+        name: String,
+        keep_data: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (name, keep_data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_uninstall not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.toggle { name, enabled }` → `{ plugin }`.
+    fn plugin_toggle(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (name, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_toggle not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `mcp.servers.restart` → stop-then-start a server; returns
     /// `{ status: McpServerStatus }` (PROTOCOL §5.22).
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {

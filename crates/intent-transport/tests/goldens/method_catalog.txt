@@ -302,6 +302,11 @@ router note.saveAsset
 router note.setContent
 router note.update
 router note.updateMetadata
+router plugin.install
+router plugin.list
+router plugin.toggle
+router plugin.uninstall
+router plugin.update
 router pr.refresh
 router prMonitor.cancel
 router prMonitor.flush
