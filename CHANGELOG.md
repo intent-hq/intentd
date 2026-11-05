@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.134] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- *(remote)* Run the workspace setup script on the machine ([#3064](https://github.com/intent-hq/intentd/pull/3064))
+- Run a remote agent's forwarded script frames as the agent ([#3066](https://github.com/intent-hq/intentd/pull/3066))
+- *(remote)* Private temp folder and attachments for remote agents ([#3065](https://github.com/intent-hq/intentd/pull/3065))
+
+
 ## [0.11.133] - 2026-11-05
 
 ### 🐛 Bug Fixes
