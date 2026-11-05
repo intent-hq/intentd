@@ -45,6 +45,8 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         setup: None,
         setup_script: None,
         skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
     }
 }
 

@@ -436,6 +436,8 @@ async fn remote_manager(
         setup: None,
         setup_script: None,
         skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
     };
     mgr.services
         .store
@@ -465,6 +467,8 @@ fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
         setup: None,
         setup_script: None,
         skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
     }
 }
 

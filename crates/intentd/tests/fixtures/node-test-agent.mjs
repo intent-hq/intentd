@@ -157,7 +157,10 @@ function promptText(params) {
     .map((block) => block?.text ?? '')
     .join('')
     .replace(/<system>[\s\S]*?<\/system>/g, '')
-    .trim();
+    .trim()
+    // A message from another agent (a sub-agent's first prompt) carries a
+    // header naming the sender; the behavior is the text after it.
+    .replace(/^\[MESSAGE FROM AGENT [^\]]*\]\s*/, '');
 }
 
 readline.createInterface({ input: process.stdin }).on('line', async (line) => {

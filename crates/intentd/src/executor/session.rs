@@ -12,7 +12,7 @@
 
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
-    MachineCapabilities, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
     NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
@@ -304,6 +304,25 @@ pub(super) async fn serve_link(
                         .send(&LinkFrame::SkillsReply(SkillsReply {
                             query_id: query.query_id,
                             skills,
+                        }))
+                        .await;
+                });
+            }
+            // Pushes the agent's checkout now (nodeProtocol 13); the push
+            // waits in line with the checkout's other pushes, not with
+            // control frames.
+            LinkEvent::Frame(LinkFrame::PushWip(request)) => {
+                let link = link.clone();
+                let runner = runner.clone();
+                // caller-binding: allow — answers one push request on its link
+                tokio::spawn(async move {
+                    let (outcome, error) = runner.push_now(&request.agent_id).await;
+                    let _ = link
+                        .send(&LinkFrame::PushWipReply(PushWipResult {
+                            request_id: request.request_id,
+                            agent_id: request.agent_id,
+                            outcome,
+                            error,
                         }))
                         .await;
                 });

@@ -50,6 +50,7 @@ fn launch_frame() -> LinkFrame {
         checkout: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
+        checkout_of: None,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",

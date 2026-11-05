@@ -103,7 +103,7 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
 
     let child_prompt = r#"wsapi const p = await ws.file.read("parent.txt"); await ws.file.write("child.txt", "from child"); const i = await ws.workspace.info(); return JSON.stringify({ marker: "child-1", p, path: i.path });"#;
     let code = format!(
-        r#"wsapi await ws.file.write("parent.txt", "from parent"); const i = await ws.workspace.info(); const c = await ws.agent.create("Child", {child_prompt:?}); return JSON.stringify({{ marker: "parent-1", path: i.path, c }});"#
+        r#"wsapi await ws.file.write("parent.txt", "from parent"); const i = await ws.workspace.info(); const c = await ws.agent.create("Child", {child_prompt:?}, {{ provider: "mock", model: "default" }}); return JSON.stringify({{ marker: "parent-1", path: i.path, c }});"#
     );
     let reply = wsapi_turn(
         &mut rpc_ws,
@@ -122,6 +122,14 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
     );
     let child_id = agent_named(&mut rpc_ws, &ws_id, "Child", 60).await;
 
+    // The child's turn end comes first, so the parent's next turn waits
+    // for its own.
+    loop {
+        let end = event(&mut events, "agent:stream:end").await;
+        if end["data"]["agentId"] == child_id.as_str() {
+            break;
+        }
+    }
     let seen = reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
     let seen: Value = serde_json::from_str(&seen).unwrap();
     let text = seen.to_string();
@@ -139,18 +147,11 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
     .await;
     assert_eq!(child["agent"]["nodeId"], machine.daemon_id.as_str(), "{child}");
 
-    let reply = wsapi_turn(
-        &mut rpc_ws,
-        &mut events,
-        (&ws_id, &parent_id),
-        r#"wsapi const c = await ws.file.read("child.txt"); return JSON.stringify({ marker: "parent-2", c });"#,
-        "parent-2",
-        210,
-    )
-    .await;
-    assert!(
-        reply.contains("from child"),
-        "the parent sees the child's edit: {reply}"
+    // The child's edit is in the parent's checkout on the machine.
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&parent_path).join("child.txt")).unwrap(),
+        "from child",
+        "the parent sees the child's edit"
     );
 
     let parent_refs = format!("refs/intent/ws/{ws_id}/agents/{parent_id}");
@@ -223,7 +224,7 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
 
     let far_prompt = r#"wsapi const p = await ws.file.read("parent.txt"); const i = await ws.workspace.info(); return JSON.stringify({ marker: "far-1", p, path: i.path });"#;
     let code = format!(
-        r#"wsapi await ws.file.write("parent.txt", "from parent"); const i = await ws.workspace.info(); const c = await ws.agent.create("Far", {far_prompt:?}, {{ placement: {{ target: "remote", nodeId: {far_id:?} }} }}); return JSON.stringify({{ marker: "parent-1", path: i.path, c }});"#,
+        r#"wsapi await ws.file.write("parent.txt", "from parent"); const i = await ws.workspace.info(); const c = await ws.agent.create("Far", {far_prompt:?}, {{ provider: "mock", model: "default", placement: {{ target: "remote", nodeId: {far_id:?} }} }}); return JSON.stringify({{ marker: "parent-1", path: i.path, c }});"#,
         far_id = far.daemon_id,
     );
     let reply = wsapi_turn(

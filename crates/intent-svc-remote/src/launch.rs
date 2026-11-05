@@ -20,18 +20,19 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand, SubmodulePin,
-    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
+    FinalPush, LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand, SubmodulePin,
+    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
     PlacementUnavailableReason, PlatformAvailability,
 };
 use intent_core::remote_launch::{
-    EffectiveIsolation, RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds,
-    RemoteLaunchRequest, RemotePlacementView, RemoteSetupStatus,
+    EffectiveIsolation, ParentWork, ParentWorkCopy, RemoteAgentRecord, RemoteCheckoutBase,
+    RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView, RemoteSetupStatus,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
+use intent_git::hub::AgentRef;
 use intent_git::node_git::{self, AgentRemote};
 use intent_services::feature_api::feature_ports::{RemoteLaunchPort, RemoteRuntime};
 use intent_services::feature_api::Services;
@@ -151,6 +152,123 @@ async fn check_machine_prepares(
         return Ok(());
     }
     require_prepared_checkout(&node, link_protocol(&node).await?)
+}
+
+/// How long the backend waits for a parent's machine to push before a
+/// sub-agent on another machine starts from the parent's last push.
+const PARENT_PUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Ask `owner`'s machine to push its checkout now (`pushWip`, nodeProtocol
+/// 13); whether it did.
+async fn push_parent_now(svc: &Services, owner: &AgentId) -> bool {
+    let Some(feature) = svc.remote_feature() else {
+        return false;
+    };
+    let record = match svc.store().get_remote_agent(owner).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(agent = %owner, %error, "remote launch: could not read the parent's placement");
+            return false;
+        }
+    };
+    let Ok(node) = feature.node(svc, &record.node_id).await else {
+        return false;
+    };
+    if node.status().lease_id != record.lease_id {
+        return false;
+    }
+    match link_protocol(&node).await {
+        Ok(protocol) if protocol >= SHARED_CHECKOUT_PROTOCOL => {}
+        _ => return false,
+    }
+    match node.push_wip(owner, PARENT_PUSH_WAIT).await {
+        Ok(reply) if reply.outcome == FinalPush::Pushed => true,
+        Ok(reply) => {
+            tracing::info!(agent = %owner, outcome = ?reply.outcome, error = ?reply.error, "remote launch: the parent's machine did not push its work now");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(agent = %owner, %error, "remote launch: the parent's machine did not answer the push request");
+            false
+        }
+    }
+}
+
+/// Start sub-agent `agent_id` from its parent `owner`'s pushed work: its
+/// `base` is the parent's `head`, its `wip` the parent's `wip`, in the
+/// superproject and each pinned submodule (nodeProtocol 13). The parent's
+/// machine is asked to push first. Without a parent `head` the view is left
+/// as admitted (the workspace's last commit).
+async fn copy_parent_work(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    (checkout, agent_id): (&Path, &AgentId),
+    owner: AgentId,
+    view: &mut RemotePlacementView,
+) -> Result<()> {
+    let pushed = push_parent_now(svc, &owner).await;
+    let parent = AgentRemote::new(workspace_id.as_str(), owner.as_str())?;
+    let child = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
+    let pins = view.pins().to_vec();
+    let checkout = checkout.to_path_buf();
+    let copied = blocking(move || {
+        let Some(head) = node_git::read_agent_ref(&checkout, &parent, AgentRef::Head)? else {
+            return Ok(None);
+        };
+        if let Some(wip) = node_git::read_agent_ref(&checkout, &parent, AgentRef::Wip)?
+            .filter(|wip| *wip != head)
+        {
+            node_git::write_agent_ref(&checkout, &child, AgentRef::Wip, wip)?;
+        }
+        let mut copied_pins = Vec::with_capacity(pins.len());
+        for mut pin in pins {
+            let module = node_git::module_repository(&checkout, &pin.path, &pin.module_key)
+                .map_err(|refusal| {
+                    Error::Internal(format!(
+                        "remote launch: submodule {} is not the pinned repository: {refusal:?}",
+                        pin.path
+                    ))
+                })?;
+            let parent_module = parent.with_module(&pin.module_key)?;
+            if let Some(module_head) =
+                node_git::read_agent_ref(&module.worktree, &parent_module, AgentRef::Head)?
+            {
+                pin.commit = module_head.to_string();
+                if let Some(wip) =
+                    node_git::read_agent_ref(&module.worktree, &parent_module, AgentRef::Wip)?
+                        .filter(|wip| *wip != module_head)
+                {
+                    let child_module = child.with_module(&pin.module_key)?;
+                    node_git::write_agent_ref(&module.worktree, &child_module, AgentRef::Wip, wip)?;
+                }
+            }
+            copied_pins.push(pin);
+        }
+        Ok(Some((head.to_string(), copied_pins)))
+    })
+    .await?;
+    let Some((head, pins)) = copied else {
+        return Ok(());
+    };
+    view.base_commit = head;
+    if view.submodules.is_some() {
+        view.submodules = Some(pins);
+    }
+    view.parent_work = Some(ParentWork {
+        agent_id: owner,
+        copied: Some(if pushed {
+            ParentWorkCopy::Pushed
+        } else {
+            ParentWorkCopy::LastPush
+        }),
+    });
+    let stored = view.clone();
+    crate::view::update(svc.store(), workspace_id, agent_id, move |current| {
+        *current = stored;
+    })
+    .await?;
+    Ok(())
 }
 
 /// An agent's first prepared launch: its machine is preparing the checkout.
@@ -474,6 +592,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                 setup: None,
                 setup_script: None,
                 skills: None,
+                shared_checkout_of: None,
+                parent_work: None,
             })
         })
     }
@@ -499,6 +619,34 @@ impl RemoteLaunchPort for RemoteLaunch {
         true
     }
 
+    fn place_sub_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        (parent, parent_view): (&'a AgentId, &'a RemotePlacementView),
+        child: &'a mut RemotePlacementView,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // A parent that shares a checkout passes on that checkout's owner.
+            let owner = parent_view
+                .shared_checkout_of
+                .clone()
+                .unwrap_or_else(|| parent.clone());
+            if child.node_id != parent_view.node_id {
+                child.parent_work = Some(ParentWork {
+                    agent_id: owner,
+                    copied: None,
+                });
+                return Ok(());
+            }
+            let feature = svc.remote_feature().ok_or_else(no_node)?;
+            let node = feature.node(svc, &child.node_id).await?;
+            if link_protocol(&node).await? >= SHARED_CHECKOUT_PROTOCOL {
+                child.shared_checkout_of = Some(owner);
+            }
+            Ok(())
+        })
+    }
+
     fn setup_output(
         &self,
         svc: &Services,
@@ -520,10 +668,25 @@ impl RemoteLaunchPort for RemoteLaunch {
             let RemoteLaunchRequest {
                 workspace_id,
                 agent_id,
-                view,
+                mut view,
             } = request;
             check_machine_prepares(svc, &workspace_id, &view).await?;
             let checkout = workspace_checkout(svc, &workspace_id).await?;
+            if let Some(owner) = view
+                .parent_work
+                .as_ref()
+                .filter(|work| work.copied.is_none())
+                .map(|work| work.agent_id.clone())
+            {
+                copy_parent_work(
+                    svc,
+                    &workspace_id,
+                    (&checkout, &agent_id),
+                    owner,
+                    &mut view,
+                )
+                .await?;
+            }
             let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
             let commit = git2::Oid::from_str(&view.base_commit)
                 .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
@@ -692,8 +855,21 @@ impl RemoteLaunchPort for RemoteLaunch {
             // 10 when its workspace needs a prepared checkout. An agent
             // placed before pins were captured, or any agent while this
             // build does not offer the prepared checkout, starts as before.
-            let checkout =
-                if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
+            // A sub-agent sharing its parent's checkout (nodeProtocol 13)
+            // gets no checkout of its own.
+            let checkout_of = view.shared_checkout_of.clone();
+            if checkout_of.is_some() {
+                let protocol = link_protocol(&node).await?;
+                if protocol < SHARED_CHECKOUT_PROTOCOL {
+                    return Err(Error::InvalidParams(format!(
+                        "node-link-protocol: \"{}\" speaks nodeProtocol {protocol}; this sub-agent works in its parent's checkout there, which needs {SHARED_CHECKOUT_PROTOCOL}",
+                        view.node_name
+                    )));
+                }
+            }
+            let checkout = if checkout_of.is_some() {
+                None
+            } else if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
                     let protocol = link_protocol(&node).await?;
                     let setup = svc
                         .remote_setup_command(&record.workspace_id, &view)
@@ -746,6 +922,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     checkout,
                     mcp_proxies,
                     compact_tool_descriptions,
+                    checkout_of,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

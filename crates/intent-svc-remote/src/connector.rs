@@ -25,8 +25,8 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, MachineSkill, SetupState, SkillsQuery, StopId, StopOutcome,
-    FINAL_STOP_PROTOCOL, SKILLS_PROTOCOL,
+    MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SetupState, SkillsQuery,
+    StopId, StopOutcome, FINAL_STOP_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -288,6 +288,9 @@ pub(crate) struct Shared {
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     /// Waiting for a `skillsReply` (nodeProtocol 12), by query id.
     skills_waiters: Mutex<HashMap<LinkId, oneshot::Sender<Vec<MachineSkill>>>>,
+    /// Waiting for the machine's `pushWipReply`, by request id
+    /// (nodeProtocol 13).
+    push_waiters: Mutex<HashMap<intent_core::node_link::LinkId, oneshot::Sender<PushWipResult>>>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -383,6 +386,7 @@ impl Shared {
             || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
+            || !lock(&self.push_waiters).is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1206,6 +1210,7 @@ impl RemoteNode {
             survivors_unclaimed: std::sync::atomic::AtomicBool::new(false),
             capability_waiters: Mutex::new(Vec::new()),
             skills_waiters: Mutex::new(HashMap::new()),
+            push_waiters: Mutex::new(HashMap::new()),
             ingested: Mutex::new(acked),
             demand,
             shutdown: watch::channel(false).0,
@@ -1385,6 +1390,40 @@ impl RemoteNode {
         .await;
         // On failure, drop this request so it no longer holds the link.
         lock(&self.shared.capability_waiters).retain(|waiter| !waiter.is_closed());
+        reply
+    }
+
+    /// Ask the machine to push `agent_id`'s checkout now (`pushWip`,
+    /// nodeProtocol 13) and wait up to `wait` for its answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
+    /// does not answer in time.
+    pub(crate) async fn push_wip(&self, agent_id: &AgentId, wait: Duration) -> Result<PushWipResult> {
+        let request_id = intent_core::node_link::LinkId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.push_waiters).insert(request_id, tx);
+        let reply = async {
+            self.connect().await?;
+            self.shared
+                .send(&LinkFrame::PushWip(PushWipRequest {
+                    request_id,
+                    agent_id: agent_id.clone(),
+                }))
+                .await?;
+            tokio::time::timeout(wait, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not answer the push request",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        lock(&self.shared.push_waiters).remove(&request_id);
         reply
     }
 
@@ -1608,6 +1647,7 @@ async fn run(
                 // Fail the capability requests; they no longer hold a link.
                 lock(&shared.capability_waiters).clear();
                 lock(&shared.skills_waiters).clear();
+                lock(&shared.push_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
                     let delay = match failure {
@@ -1664,6 +1704,7 @@ async fn run(
             }
             lock(&shared.capability_waiters).clear();
             lock(&shared.skills_waiters).clear();
+            lock(&shared.push_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
             if retry {
@@ -1734,6 +1775,7 @@ async fn run(
         shared.disconnected();
         lock(&shared.capability_waiters).clear();
         lock(&shared.skills_waiters).clear();
+        lock(&shared.push_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
             .machine_runs_lost("remote-script-lost: the machine disconnected")
@@ -1842,6 +1884,11 @@ async fn serve(
                     LinkEvent::Frame(LinkFrame::SkillsReply(reply)) => {
                         if let Some(waiter) = lock(&shared.skills_waiters).remove(&reply.query_id) {
                             let _ = waiter.send(reply.skills);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::PushWipReply(reply)) => {
+                        if let Some(waiter) = lock(&shared.push_waiters).remove(&reply.request_id) {
+                            let _ = waiter.send(reply);
                         }
                     }
                     LinkEvent::Frame(frame)

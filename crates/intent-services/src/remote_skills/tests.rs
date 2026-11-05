@@ -88,6 +88,8 @@ fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
         setup: None,
         setup_script: None,
         skills,
+        shared_checkout_of: None,
+        parent_work: None,
     }
 }
 

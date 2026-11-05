@@ -464,16 +464,53 @@ fn key_of(repo: &git2::Repository) -> Result<String> {
 ///
 /// When the repository can't be opened or the commit doesn't exist.
 pub fn write_base_ref(repository: &Path, remote: &AgentRemote, commit: git2::Oid) -> Result<()> {
+    write_agent_ref(repository, remote, AgentRef::Base, commit)
+}
+
+/// Point head's `kind` ref for `remote` at `commit` in `repository`: a
+/// sub-agent that starts from its parent's work gets the parent's `head`
+/// as its `base` and the parent's `wip` as its own (nodeProtocol 13).
+///
+/// # Errors
+///
+/// When the repository can't be opened or the commit doesn't exist.
+pub fn write_agent_ref(
+    repository: &Path,
+    remote: &AgentRemote,
+    kind: AgentRef,
+    commit: git2::Oid,
+) -> Result<()> {
     let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
     repo.find_commit(commit).map_err(crate::map_git_err)?;
     repo.reference(
-        &remote.ref_name(AgentRef::Base),
+        &remote.ref_name(kind),
         commit,
         true,
-        "intent: remote agent base",
+        "intent: remote agent ref",
     )
     .map_err(crate::map_git_err)?;
     Ok(())
+}
+
+/// The commit head's `kind` ref for `remote` names in `repository`, if it
+/// has one.
+///
+/// # Errors
+///
+/// When the repository can't be opened or the ref does not name a commit.
+pub fn read_agent_ref(
+    repository: &Path,
+    remote: &AgentRemote,
+    kind: AgentRef,
+) -> Result<Option<git2::Oid>> {
+    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
+    let reference = match repo.find_reference(&remote.ref_name(kind)) {
+        Ok(reference) => reference,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(crate::map_git_err(error)),
+    };
+    let commit = reference.peel_to_commit().map_err(crate::map_git_err)?;
+    Ok(Some(commit.id()))
 }
 
 const GITLINK_MODE: u32 = 0o160_000;

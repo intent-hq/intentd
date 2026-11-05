@@ -180,6 +180,9 @@ struct Inner {
     pty: Arc<intent_pty::PtyHost>,
     /// Notified each time the bind sweep finishes removing one checkout.
     swept: tokio::sync::Notify,
+    /// One push at a time per checkout, keyed by its owner: the owner and
+    /// every agent sharing its checkout (nodeProtocol 13) push through it.
+    push_locks: Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Set when shutdown begins: an ordinary push still under way is
     /// cancelled, so the agent's last push starts within the budget.
     closing_signal: watch::Sender<bool>,
@@ -209,6 +212,33 @@ struct State {
     /// Agents whose checkout the bind sweep is removing now; their launch
     /// waits for it.
     sweeping: HashSet<AgentId>,
+    /// Every agent launched since start into another agent's checkout
+    /// (nodeProtocol 13), with that checkout's owner.
+    shares: HashMap<AgentId, AgentId>,
+}
+
+impl State {
+    /// The owner of the checkout `agent_id` works in: its own, unless it
+    /// shares one.
+    fn checkout_owner(&self, agent_id: &AgentId) -> AgentId {
+        self.shares
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.clone())
+    }
+
+    /// The agents that work in `owner`'s checkout and are running or
+    /// exiting.
+    fn live_sharers(&self, owner: &AgentId) -> Vec<AgentId> {
+        self.shares
+            .iter()
+            .filter(|(agent_id, of)| {
+                *of == owner
+                    && (self.agents.contains_key(*agent_id) || self.exiting.contains_key(*agent_id))
+            })
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect()
+    }
 }
 
 /// A final stop's answer: the acknowledgement's outcome and push report, or
@@ -343,8 +373,12 @@ struct Agent {
     notice: Mutex<Option<String>>,
     /// The machine's skills catalog block, added to the agent's first turn.
     skills_catalog: Mutex<Option<String>>,
-    /// Serializes the agent's WIP pushes.
-    wip: tokio::sync::Mutex<()>,
+    /// The owner of the checkout the agent works in, when it is not its own
+    /// (nodeProtocol 13): its pushes go to the owner's refs.
+    checkout_of: Option<AgentId>,
+    /// Serializes the pushes of the agent's checkout, shared with its owner
+    /// and every agent sharing it.
+    wip: Arc<tokio::sync::Mutex<()>>,
     /// A final stop ends the agent: its exit push is bounded by
     /// [`FINAL_PUSH_TIMEOUT`] and reported in `final_push`.
     final_stop: std::sync::atomic::AtomicBool,
@@ -372,6 +406,11 @@ struct Agent {
 }
 
 impl Agent {
+    /// The agent whose refs this agent's pushes update.
+    fn checkout_owner(&self) -> &AgentId {
+        self.checkout_of.as_ref().unwrap_or(&self.id)
+    }
+
     /// Report a setup or turn failure that is the provider refusing the
     /// default account as not signed in.
     fn note_auth_failure(&self, error: &intent_acp::AcpError) {
@@ -721,6 +760,7 @@ impl Runner {
                 scripts: ScriptProcesses::new(pty.clone()),
                 pty,
                 swept: tokio::sync::Notify::new(),
+                push_locks: Mutex::new(HashMap::new()),
                 closing_signal: watch::channel(false).0,
             }),
         }
@@ -734,7 +774,8 @@ impl Runner {
         generation: NodeCounter,
         command: intent_core::node_link::ScriptStartCommand,
     ) {
-        let checkout = self.inner.checkouts.existing(&command.agent_id);
+        let owner = lock(&self.inner.state).checkout_owner(&command.agent_id);
+        let checkout = self.inner.checkouts.existing(&owner);
         self.inner
             .scripts
             .start(link, generation, checkout.as_deref(), command)
@@ -883,8 +924,10 @@ impl Runner {
             checkout,
             mcp_proxies,
             compact_tool_descriptions,
+            checkout_of,
         } = command;
         let prepared = checkout.is_some();
+        let both = prepared && checkout_of.is_some();
         let setup = checkout
             .as_ref()
             .and_then(|checkout| checkout.setup.clone());
@@ -909,6 +952,13 @@ impl Runner {
             return Some(exited(format!(
                 "{}: the node is shutting down",
                 codes::SHUTTING_DOWN
+            )));
+        }
+        if both {
+            drop(state);
+            return Some(exited(format!(
+                "{}: a launch into another agent's checkout carries no checkout of its own",
+                codes::CHECKOUT
             )));
         }
         if state.agents.contains_key(&agent_id) {
@@ -976,7 +1026,8 @@ impl Runner {
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
             skills_catalog: Mutex::new(None),
-            wip: tokio::sync::Mutex::new(()),
+            wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
+            checkout_of: checkout_of.clone(),
             final_stop: std::sync::atomic::AtomicBool::new(false),
             final_push: Mutex::new(None),
             stop: Mutex::new(Some(stop_tx)),
@@ -997,6 +1048,10 @@ impl Runner {
             }),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
+        match checkout_of {
+            Some(owner) => state.shares.insert(agent_id.clone(), owner),
+            None => state.shares.remove(&agent_id),
+        };
         state.workspaces.insert(agent_id, workspace_id);
         drop(state);
         // caller-binding: allow — node-local journal pump; the node has no service layer
@@ -1146,15 +1201,18 @@ impl Runner {
                 output.line(line);
             }
         };
-        let prepared = tokio::select! {
-            prepared = self.inner.checkouts.prepare(
-                &agent.id,
-                &agent.workspace_id,
-                (&agent.base_commit, &agent.repo_key),
-                &agent.submodules,
-                &progress,
-            ) => Some(prepared),
-            _ = &mut stop => None,
+        let prepared = match &agent.checkout_of {
+            Some(owner) => Some(self.shared_checkout(owner)),
+            None => tokio::select! {
+                prepared = self.inner.checkouts.prepare(
+                    &agent.id,
+                    &agent.workspace_id,
+                    (&agent.base_commit, &agent.repo_key),
+                    &agent.submodules,
+                    &progress,
+                ) => Some(prepared),
+                _ = &mut stop => None,
+            },
         };
         let started = match prepared {
             None => Err(None),
@@ -1674,10 +1732,11 @@ impl Runner {
         if closing && kind == Push::TurnEnd {
             return;
         }
+        let owner = agent.checkout_owner();
         let push = |timeout| {
             self.inner
                 .checkouts
-                .push_wip(&agent.id, &agent.workspace_id, &worktree, timeout)
+                .push_wip(owner, &agent.workspace_id, &worktree, timeout)
         };
         let pushed = if kind == Push::Exit && (final_stop || closing) {
             // The agent's last push here, bounded like a final stop's.
@@ -1769,6 +1828,13 @@ impl Runner {
                         drop(runner.stop(&agent_id));
                         return;
                     }
+                    // The agents working in this checkout stop before it
+                    // is pushed and removed (nodeProtocol 13).
+                    if !runner.stop_sharers(&agent_id).await {
+                        tracing::warn!(agent = %agent_id, "node: final stop not acknowledged: an agent sharing the checkout did not stop");
+                        drop(runner.stop(&agent_id));
+                        return;
+                    }
                     let wait = runner.stop(&agent_id);
                     guard.result = runner.finish_final_stop(agent, &agent_id, wait).await;
                 });
@@ -1812,6 +1878,8 @@ impl Runner {
         let Some(workspace_id) = lock(&self.inner.state).workspaces.get(agent_id).cloned() else {
             return FinalPush::Skipped;
         };
+        let serial = self.push_lock(agent_id);
+        let _serial = serial.lock().await;
         match self
             .inner
             .checkouts
@@ -1822,6 +1890,84 @@ impl Runner {
             Err(error) => {
                 tracing::warn!(agent = %agent_id, error = %format!("{error:#}"), "node: final WIP push failed");
                 FinalPush::Failed
+            }
+        }
+    }
+
+    /// The one push lock of `owner`'s checkout.
+    fn push_lock(&self, owner: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = lock(&self.inner.push_locks);
+        locks.retain(|_, held| held.strong_count() > 0);
+        if let Some(held) = locks.get(owner).and_then(std::sync::Weak::upgrade) {
+            return held;
+        }
+        let held = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(owner.clone(), Arc::downgrade(&held));
+        held
+    }
+
+    /// The checkout of `owner` a launch with `checkoutOf` works in
+    /// (nodeProtocol 13); nothing is fetched or set up.
+    fn shared_checkout(&self, owner: &AgentId) -> anyhow::Result<Prepared> {
+        let removing = {
+            let state = lock(&self.inner.state);
+            state.sweeping.contains(owner) || state.finalizing.contains_key(owner)
+        };
+        match self.inner.checkouts.existing(owner) {
+            Some(worktree) if !removing => Ok(Prepared {
+                worktree,
+                notice: None,
+                fresh: false,
+            }),
+            _ => Err(anyhow::anyhow!(
+                "the checkout of agent {owner} is not on this machine"
+            )),
+        }
+    }
+
+    /// Stop every agent working in `owner`'s checkout, their script runs
+    /// first, and wait until each one's exit is journaled. `false` when one
+    /// could not be confirmed stopped.
+    async fn stop_sharers(&self, owner: &AgentId) -> bool {
+        let sharers = lock(&self.inner.state).live_sharers(owner);
+        let mut stopped = true;
+        for sharer in sharers {
+            if !self.inner.scripts.stop_agent(&sharer).await {
+                stopped = false;
+            }
+            stopped &= self.stop(&sharer).wait().await.is_some();
+        }
+        stopped
+    }
+
+    /// Push `agent_id`'s checkout now (`pushWip`, nodeProtocol 13), to its
+    /// owner's refs, one push of that checkout at a time: `skipped` when
+    /// it has no checkout here or the machine does not know its workspace.
+    pub(super) async fn push_now(&self, agent_id: &AgentId) -> (FinalPush, Option<String>) {
+        let (owner, workspace_id) = {
+            let state = lock(&self.inner.state);
+            let owner = state.checkout_owner(agent_id);
+            let workspace_id = state.workspaces.get(&owner).cloned();
+            (owner, workspace_id)
+        };
+        let (Some(worktree), Some(workspace_id)) =
+            (self.inner.checkouts.existing(&owner), workspace_id)
+        else {
+            return (FinalPush::Skipped, None);
+        };
+        let serial = self.push_lock(&owner);
+        let _serial = serial.lock().await;
+        match self
+            .inner
+            .checkouts
+            .push_wip(&owner, &workspace_id, &worktree, FINAL_PUSH_TIMEOUT)
+            .await
+        {
+            Ok(()) => (FinalPush::Pushed, None),
+            Err(error) => {
+                let error = format!("{error:#}");
+                tracing::warn!(agent = %owner, %error, "node: requested WIP push failed");
+                (FinalPush::Failed, Some(error))
             }
         }
     }
@@ -1853,10 +1999,23 @@ impl Runner {
         let on_disk = self.inner.checkouts.agents();
         let mut state = lock(&self.inner.state);
         state.launched.clear();
+        // A checkout stays while an agent sharing it runs or is on the
+        // lease (nodeProtocol 13).
+        let in_use: HashSet<AgentId> = state
+            .shares
+            .iter()
+            .filter(|(agent_id, _)| {
+                lease_agents.contains(agent_id)
+                    || state.agents.contains_key(*agent_id)
+                    || state.exiting.contains_key(*agent_id)
+            })
+            .map(|(_, owner)| owner.clone())
+            .collect();
         on_disk
             .into_iter()
             .filter(|agent_id| {
                 !lease_agents.contains(agent_id)
+                    && !in_use.contains(agent_id)
                     && !state.agents.contains_key(agent_id)
                     && !state.exiting.contains_key(agent_id)
                     && !state.finalizing.contains_key(agent_id)
@@ -1876,6 +2035,7 @@ impl Runner {
                     || state.agents.contains_key(&agent_id)
                     || state.exiting.contains_key(&agent_id)
                     || state.finalizing.contains_key(&agent_id)
+                    || !state.live_sharers(&agent_id).is_empty()
                 {
                     continue;
                 }

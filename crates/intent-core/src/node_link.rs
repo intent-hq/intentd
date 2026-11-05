@@ -70,16 +70,17 @@ fn is_false(value: &bool) -> bool {
 /// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]); 10 adds
 /// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); 11 adds the
 /// user MCP server proxies ([`MCP_PROXY_PROTOCOL`]); 12 adds the machine's
-/// skills ([`SKILLS_PROTOCOL`]); each keeps
-/// everything the one before has. Neither 6 nor the single-node 5 ever
+/// skills ([`SKILLS_PROTOCOL`]); 13 adds sub-agent checkouts
+/// ([`SHARED_CHECKOUT_PROTOCOL`]); each keeps everything the one before
+/// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 12: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 13: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 12 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 13 };
 
 /// The first protocol with the user MCP server proxies:
 /// [`LaunchCommand::mcp_proxies`] and the internal `mcp.proxy.*` frames.
@@ -98,6 +99,12 @@ pub const SKILLS_PROTOCOL: u32 = 12;
 /// session there. The machine runs [`PreparedCheckout::setup`] in a fresh
 /// checkout before the agent starts.
 pub const PREPARED_CHECKOUT_PROTOCOL: u32 = 10;
+
+/// The first protocol with sub-agent checkouts: [`LaunchCommand::checkout_of`]
+/// (a sub-agent works in its parent's checkout on the same machine) and the
+/// [`LinkFrame::PushWip`] / [`LinkFrame::PushWipReply`] frames (the parent's
+/// machine pushes its work now, for a sub-agent on another machine).
+pub const SHARED_CHECKOUT_PROTOCOL: u32 = 13;
 
 /// Whether this build offers the prepared checkout: only then does a
 /// workspace that needs one refuse older machines, and do placed agents
@@ -169,6 +176,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "hello",
     "launch",
     "prompt",
+    "pushWip",
     "response",
     "scriptStart",
     "scriptStop",
@@ -429,6 +437,34 @@ pub struct LaunchCommand {
     /// at it. Absent (an older head): the full description.
     #[serde(default, skip_serializing_if = "is_false")]
     pub compact_tool_descriptions: bool,
+    /// The agent whose checkout on the machine this agent works in (its
+    /// owner); the launch then carries no `checkout`. Sent only on a link
+    /// of [`SHARED_CHECKOUT_PROTOCOL`] or later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_of: Option<AgentId>,
+}
+
+/// Backend to machine (nodeProtocol 13): push `agent_id`'s checkout now,
+/// as after a turn. The machine answers with one [`PushWipResult`] for
+/// `request_id`. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PushWipRequest {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+}
+
+/// Machine to backend (nodeProtocol 13): how a [`PushWipRequest`] ended:
+/// `pushed`, `skipped` (the agent has no checkout here) or `failed` with
+/// `error`. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PushWipResult {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub outcome: FinalPush,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One user MCP server a remote agent's provider sees: only its name and
@@ -771,6 +807,10 @@ pub enum LinkFrame {
     Skills(SkillsQuery),
     /// Machine to backend (nodeProtocol 12): the skills it found.
     SkillsReply(SkillsReply),
+    /// Backend to machine (nodeProtocol 13): push an agent's work now.
+    PushWip(PushWipRequest),
+    /// Machine to backend (nodeProtocol 13): the answer to a `pushWip`.
+    PushWipReply(PushWipResult),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -814,7 +854,9 @@ impl LinkFrame {
             | Self::Capabilities
             | Self::CapabilitiesReply { .. }
             | Self::Skills(_)
-            | Self::SkillsReply(_) => LinkChannel::Control,
+            | Self::SkillsReply(_)
+            | Self::PushWip(_)
+            | Self::PushWipReply(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -834,6 +876,8 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::Launch(command) if command.checkout_of.is_some() => SHARED_CHECKOUT_PROTOCOL,
+            Self::PushWip(_) | Self::PushWipReply(_) => SHARED_CHECKOUT_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
@@ -871,7 +915,8 @@ impl LinkFrame {
             | Self::Capabilities
             | Self::ScriptStart(_)
             | Self::ScriptStop(_)
-            | Self::Skills(_) => true,
+            | Self::Skills(_)
+            | Self::PushWip(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -883,7 +928,8 @@ impl LinkFrame {
             | Self::ScriptOutput(_)
             | Self::ScriptExited(_)
             | Self::SetupOutput(_)
-            | Self::SkillsReply(_) => false,
+            | Self::SkillsReply(_)
+            | Self::PushWipReply(_) => false,
         }
     }
 

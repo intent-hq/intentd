@@ -1759,7 +1759,7 @@ async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
     );
     assert!(
         isolated.message.contains(
-            "agent.delegate: a remote agent's sub-agents run on its machine in their own checkout, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend"
+            "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend"
         ),
         "{isolated:?}"
     );
