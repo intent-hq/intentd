@@ -473,6 +473,72 @@ pub(crate) async fn assemble_system_prompt(
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
 ) -> Option<String> {
+    assemble_system_prompt_layers(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        true,
+    )
+    .await
+}
+
+/// [`assemble_system_prompt`] for an agent that runs on another machine:
+/// the same layers without the skills catalog, whose paths are on this
+/// host and cannot be read there.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn assemble_remote_system_prompt(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+) -> Option<String> {
+    assemble_system_prompt_layers(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        false,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+async fn assemble_system_prompt_layers(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+    skills_catalog: bool,
+) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
     // (previews, background one-shots) resolve to the latest.
@@ -544,7 +610,7 @@ pub(crate) async fn assemble_system_prompt(
     // workspace path is available, discover and inject the skills catalog. Empty
     // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
     // warn, omit layer) — never fail prompt assembly.
-    if let Some(ws) = workspace {
+    if let Some(ws) = workspace.filter(|_| skills_catalog) {
         if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
             match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
                 .await

@@ -58,6 +58,11 @@ pub(super) struct Gates {
     /// The session's `agentFeatures` snapshot (`AgentFeaturesSettings`).
     pub agent_features: Value,
     pub is_sub_agent: bool,
+    /// Serve the compact `workspace_api` description, as a local bridge
+    /// does for a provider that truncates long tool descriptions (this
+    /// machine's provider entry decides). Head then carries the condensed
+    /// reference in the agent's instructions.
+    pub compact_tool_descriptions: bool,
 }
 
 /// Start `agent_id`'s workspace MCP server and return it with the
@@ -130,7 +135,8 @@ fn server(
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
         .with_caller_agent_id(Some(agent_id.clone()))
         .with_agent_features(features)
-        .with_sub_agent(gates.is_sub_agent);
+        .with_sub_agent(gates.is_sub_agent)
+        .with_compact_tool_descriptions(gates.compact_tool_descriptions);
     let router = Router {
         timeout: server.workspace_api_timeout(),
         ..router
