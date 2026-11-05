@@ -829,11 +829,12 @@ async fn remote_hooks_questions_and_client_calls(
         marked["agent"]["metadata"]["pendingQuestionsMessageId"].is_string(),
         "the question is pending on the agent's message on head: {marked}"
     );
-    let answered = turn(
+    let answered = wsapi_turn(
         rpc_ws,
         events,
         (ws_id, agent_id),
         "Q: Which one?\nA: Left",
+        "A: Left",
         820,
     )
     .await;
@@ -923,7 +924,7 @@ async fn remote_hooks_questions_and_client_calls(
         rpc_ws,
         events,
         (ws_id, agent_id),
-        r#"wsapi const d = await ws.desktop.startControl(); return JSON.stringify({ marker: "turn-desktop", d });"#,
+        r#"wsapi const d = await ws.desktop.startControl(); const e = await ws.desktop.endControl(); return JSON.stringify({ marker: "turn-desktop", d, e });"#,
         "turn-desktop",
         950,
     )
@@ -936,14 +937,35 @@ async fn remote_hooks_questions_and_client_calls(
     let request = timeout(wait(), seen.recv()).await.unwrap().unwrap();
     assert_eq!(request["method"], "desktop.control", "{request}");
     assert_eq!(request["params"]["operation"], "prepare", "{request}");
-    let state = ok(
-        rpc_ws,
-        960,
-        "desktop.getState",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(state["state"]["status"], "pending_permission", "{state}");
+    assert_eq!(controlled["e"]["withdrawn"], true, "{controlled}");
+    // The withdrawn request wakes the agent once, as it would a local agent;
+    // take that turn here so later steps see only their own turns.
+    event(events, "agent:stream:end").await;
+    let woke = timeout(wait(), async {
+        let mut id = 960;
+        loop {
+            let got = ok(
+                rpc_ws,
+                id,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            id += 1;
+            let reply = got["agent"]["lastAgentResponse"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if reply.contains("Desktop permission") {
+                return reply;
+            }
+            // timing-guard: poll interval for the desktop wake turn's reply to be recorded
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the desktop outcome wakes the remote agent");
+    assert!(woke.starts_with("echo: "), "{woke}");
     served.abort();
 }
 
