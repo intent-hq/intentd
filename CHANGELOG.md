@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.129] - 2026-11-05
+
+### 🚀 Features
+
+- Streamline Developer and default delegation to general agents ([#2840](https://github.com/intent-hq/intentd/pull/2840))
+
+### 📚 Documentation
+
+- Describe workspace picker refinements ([#3048](https://github.com/intent-hq/intentd/pull/3048))
+
+
 ## [0.11.128] - 2026-11-04
 
 ### 🐛 Bug Fixes
