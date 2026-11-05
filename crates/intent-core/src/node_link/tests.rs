@@ -85,19 +85,18 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_9() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_10() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
-    // frames, 9 final stops; a protocol-7 peer still binds and runs agents.
-    // 10 (the prepared checkout) is defined but not offered until the
-    // machine prepares submodules.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 9 });
+    // frames, 9 final stops, 10 the prepared checkout; a protocol-7 peer
+    // still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 10 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
-    assert_eq!(FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS.max);
-    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max + 1);
-    assert!(!offers_prepared_checkout());
-    for version in 7..=9 {
+    assert_eq!(FINAL_STOP_PROTOCOL, 9);
+    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert!(offers_prepared_checkout());
+    for version in 7..=10 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -1036,4 +1035,30 @@ fn script_frames_need_protocol_8() {
             frame_tag(&frame)
         );
     }
+}
+
+/// A machine below nodeProtocol 10 rejects a launch that carries `checkout`
+/// (`node-link-protocol`): `LaunchCommand` takes unknown members, so the
+/// gate is explicit. Without `checkout` a launch travels on any link.
+#[test]
+fn a_launch_with_a_checkout_needs_protocol_10() {
+    let launch = |checkout: Option<Box<PreparedCheckout>>| {
+        LinkFrame::Launch(LaunchCommand {
+            agent_id: AgentId::from("a1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            provider: "codex".into(),
+            model: None,
+            base_commit: "base".into(),
+            repo_key: "repo".into(),
+            agent_features: json!({}),
+            is_sub_agent: false,
+            profile_env: None,
+            checkout,
+        })
+    };
+    assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
+    assert_eq!(
+        launch(Some(Box::default())).min_protocol(),
+        PREPARED_CHECKOUT_PROTOCOL
+    );
 }

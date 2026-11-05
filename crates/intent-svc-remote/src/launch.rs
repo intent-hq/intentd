@@ -94,25 +94,11 @@ async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Resul
     })
 }
 
-/// Whether `workspace`'s agents start from a checkout a machine must
-/// prepare: populated submodules, or a setup script (resolved as a local
-/// create resolves it, without the create's execute-only parameter).
-async fn needs_prepared_checkout(workspace: &Workspace, submodules: &[SubmodulePin]) -> bool {
-    if !submodules.is_empty() {
-        return true;
-    }
-    if workspace.skip_worktree || workspace.plain_folder {
-        return false;
-    }
-    let Some(checkout) = checkout_path(workspace) else {
-        return false;
-    };
-    let config = intent_services::feature_api::repo_config::read_repo_config(&checkout).await;
-    config.setup_script.is_some_and(|script| !script.is_empty())
-        || workspace
-            .setup_script
-            .as_ref()
-            .is_some_and(|setup| !setup.script.is_empty())
+/// Whether an agent with `submodules` starts from a checkout a machine must
+/// prepare. A setup script alone does not count yet: no machine runs one,
+/// so refusing older machines for it would gain nothing.
+fn needs_prepared_checkout(submodules: &[SubmodulePin]) -> bool {
+    !submodules.is_empty()
 }
 
 /// The protocol of `node`'s link, connecting first when none is up.
@@ -142,20 +128,15 @@ fn require_prepared_checkout(node: &RemoteNode, protocol: u32) -> Result<()> {
     )))
 }
 
-/// [`require_prepared_checkout`] for an agent of `workspace_id` placed with
-/// `view`, when its checkout needs preparing.
-async fn check_machine_prepares(
-    svc: &Services,
-    workspace_id: &WorkspaceId,
-    view: &RemotePlacementView,
-) -> Result<()> {
+/// [`require_prepared_checkout`] for an agent placed with `view`, when its
+/// checkout needs preparing.
+async fn check_machine_prepares(svc: &Services, view: &RemotePlacementView) -> Result<()> {
     let feature = svc.remote_feature().ok_or_else(no_node)?;
     let node = feature.node(svc, &view.node_id).await?;
     if !node.shared_ref().offers_prepared_checkout() {
         return Ok(());
     }
-    let workspace = svc.store().get_workspace(workspace_id).await?;
-    if !needs_prepared_checkout(&workspace, view.pins()).await {
+    if !needs_prepared_checkout(view.pins()) {
         return Ok(());
     }
     require_prepared_checkout(&node, link_protocol(&node).await?)
@@ -371,7 +352,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let base = self.checkout_base(svc, workspace_id).await?;
             view.base_commit = base.commit;
             view.submodules = Some(base.submodules);
-            check_machine_prepares(svc, workspace_id, &view).await?;
+            check_machine_prepares(svc, &view).await?;
             Ok(view)
         })
     }
@@ -470,7 +451,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 agent_id,
                 view,
             } = request;
-            check_machine_prepares(svc, &workspace_id, &view).await?;
+            check_machine_prepares(svc, &view).await?;
             let checkout = workspace_checkout(svc, &workspace_id).await?;
             let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
             let commit = git2::Oid::from_str(&view.base_commit)
@@ -622,8 +603,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let checkout =
                 if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
                     let protocol = link_protocol(&node).await?;
-                    let workspace = svc.store().get_workspace(&record.workspace_id).await?;
-                    if needs_prepared_checkout(&workspace, view.pins()).await {
+                    if needs_prepared_checkout(view.pins()) {
                         if let Err(error) = require_prepared_checkout(&node, protocol) {
                             record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
                             return Err(error);

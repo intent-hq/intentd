@@ -121,8 +121,12 @@ impl AgentSink {
 
     fn deliver(&self, record: JournalRecord) {
         match record.body {
-            // The connector records it on the agent's placement.
-            JournalBody::Started { .. } => {}
+            // The connector records `started` on the agent's placement.
+            // Setup status is not stored before the setup script runs on
+            // the machine; until then the setup records are dropped.
+            JournalBody::Started { .. }
+            | JournalBody::SetupStarted { .. }
+            | JournalBody::SetupFinished { .. } => {}
             JournalBody::Notification { notification } => {
                 self.requests.fetch_add(1, Ordering::SeqCst);
                 // The manager may have dropped the stream; nothing to do then.

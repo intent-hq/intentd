@@ -1642,7 +1642,7 @@ async fn a_final_stop_ends_the_agents_scripts_before_it_is_acknowledged() {
     let mut offer = hello(1, "lease-1", 0);
     offer.lease_agents = vec![agent.clone()];
     let mut dialed = dial_link(&node.endpoint, offer).await.unwrap();
-    assert_eq!(dialed.link.protocol(), 9);
+    assert_eq!(dialed.link.protocol(), NODE_LINK_PROTOCOLS.max);
     replay_complete(&mut dialed).await;
     let checkout = dir
         .path()

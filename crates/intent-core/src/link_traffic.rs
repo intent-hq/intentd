@@ -717,6 +717,11 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "exitCode": exited.exit_code,
             "error": exited.error.as_deref().map(field),
         }),
+        LinkFrame::SetupOutput(output) => json!({
+            "type": "setupOutput",
+            "agentId": agent(&output.agent_id),
+            "seq": output.seq,
+        }),
     }
 }
 
@@ -739,6 +744,8 @@ fn journal_kind(body: &JournalBody) -> &'static str {
         JournalBody::Notification { .. } => "notification",
         JournalBody::TurnEnded { .. } => "turnEnded",
         JournalBody::Exited { .. } => "exited",
+        JournalBody::SetupStarted { .. } => "setupStarted",
+        JournalBody::SetupFinished { .. } => "setupFinished",
     }
 }
 
