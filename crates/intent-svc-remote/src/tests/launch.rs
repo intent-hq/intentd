@@ -915,7 +915,11 @@ async fn a_lease_agent_sets_the_workspace_title_and_status() {
         )
         .await,
     );
-    assert_eq!(status["statusMessage"], json!("Working remotely."), "{status}");
+    assert_eq!(
+        status["statusMessage"],
+        json!("Working remotely."),
+        "{status}"
+    );
     let row = store.get_workspace(&workspace()).await.unwrap();
     assert_eq!(row.title, "Remote naming");
     assert_eq!(row.status_message.as_deref(), Some("Working remotely."));
@@ -937,7 +941,13 @@ async fn a_lease_agent_sets_the_workspace_title_and_status() {
     let row = store.get_workspace(&workspace()).await.unwrap();
     assert_eq!(row.status_image_asset_id.as_deref(), Some(asset.as_str()));
     let cleared = answered(
-        forward(&link, &agent, "workspace.setStatusImage", json!({ "image": null })).await,
+        forward(
+            &link,
+            &agent,
+            "workspace.setStatusImage",
+            json!({ "image": null }),
+        )
+        .await,
     );
     assert_eq!(cleared["statusImageAssetId"], Value::Null, "{cleared}");
 
@@ -1028,7 +1038,12 @@ async fn workspace_setters_are_refused_off_the_lease() {
         );
     }
 
-    let row = f.services.store().get_workspace(&workspace()).await.unwrap();
+    let row = f
+        .services
+        .store()
+        .get_workspace(&workspace())
+        .await
+        .unwrap();
     assert_eq!(row.title, "Remote");
     assert_eq!(row.status_message, None);
     let name = f

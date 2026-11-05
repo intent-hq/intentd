@@ -436,10 +436,17 @@ async fn workspace_setters_are_forwarded_to_head() {
         ),
     ] {
         let answer = ok_json(call(&server, &format!("return JSON.stringify(await {code});")).await);
-        assert_eq!(answer, json!({ "answered": method, "args": args }), "{method}");
+        assert_eq!(
+            answer,
+            json!({ "answered": method, "args": args }),
+            "{method}"
+        );
     }
     let (failed, text) = call(&server, "return await ws.workspace.archive();").await;
-    assert!(failed && text.contains("remote-agent-unsupported"), "{text}");
+    assert!(
+        failed && text.contains("remote-agent-unsupported"),
+        "{text}"
+    );
     answering.abort();
 }
 
