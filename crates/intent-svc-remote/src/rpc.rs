@@ -20,7 +20,8 @@ use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, INTERNAL_METHODS,
     MAX_FORWARDED_ATTACHMENTS, PLACEMENT_HELP_METHOD,
 };
-use intent_core::{Error, WorkspaceApi};
+use intent_core::remote_launch::RemoteAgentRecord;
+use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
 
@@ -120,6 +121,22 @@ impl HeadCalls {
             }
             Err(error) => return refusal(CALL_FAILED, error.to_string()),
         };
+        // Every frame past the lease check runs as the leased agent, so no
+        // branch can reach a capability gate unbound (intent#8630).
+        let caller = Caller::Agent {
+            agent_id: record.agent_id.clone(),
+        };
+        with_caller(caller, self.serve(&record, &session, method, request)).await
+    }
+
+    /// Serve one admitted frame for `record`'s agent; the caller is bound.
+    async fn serve(
+        &self,
+        record: &RemoteAgentRecord,
+        session: &AgentSession,
+        method: &str,
+        request: &LinkRequest,
+    ) -> LinkOutcome {
         if method == COMMIT_POLICY_METHOD {
             let enabled = self
                 .services
@@ -146,7 +163,7 @@ impl HeadCalls {
                 Err(message) => refusal(INVALID_PARAMS, message),
             };
         }
-        let features = self.services.session_agent_features(&session);
+        let features = self.services.session_agent_features(session);
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
         let budget = Duration::from_millis(u64::from(request.timeout_ms)).min(MAX_BUDGET);
         // Saved scripts (`remoteScripts: 1`): definitions and reads on the
@@ -169,8 +186,8 @@ impl HeadCalls {
             };
         }
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
-        // The host binds `Caller::Agent { record.agent_id }` around the frame
-        // itself: a node's agent acts with exactly its own identity, never
+        // The host also binds `Caller::Agent { record.agent_id }` around the
+        // frame: a node's agent acts with exactly its own identity, never
         // the head daemon's.
         let host = intent_acp::make_workspace_host_for_bridge(
             api,

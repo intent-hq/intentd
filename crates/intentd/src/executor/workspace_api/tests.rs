@@ -565,7 +565,7 @@ async fn placement_help_comes_from_head() {
                 }
             }
         });
-        let server = described_server(&agent(), &workspace(), dir.path(), &gates(), head)
+        let server = described_server(&agent(), &workspace(), dir.path(), (&gates(), None), head)
             .await
             .unwrap();
         assert_eq!(asked.try_recv().unwrap(), json!(PLACEMENT_HELP_METHOD));
@@ -583,7 +583,7 @@ async fn placement_help_comes_from_head() {
         &agent(),
         &workspace(),
         dir.path(),
-        &gates(),
+        (&gates(), None),
         HeadLink::default(),
     )
     .await

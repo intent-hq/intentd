@@ -121,9 +121,7 @@ impl AgentSink {
 
     fn deliver(&self, record: JournalRecord) {
         match record.body {
-            // The connector records `started` on the agent's placement.
-            // Setup status is not stored before the setup script runs on
-            // the machine; until then the setup records are dropped.
+            // The connector records these on the agent's placement.
             JournalBody::Started { .. }
             | JournalBody::SetupStarted { .. }
             | JournalBody::SetupFinished { .. } => {}
@@ -169,6 +167,13 @@ impl Agents {
         let sink = Arc::new(AgentSink::new(workspace_id));
         lock(&self.sinks).insert(agent_id.clone(), sink.clone());
         sink
+    }
+
+    /// The workspace of attached agent `agent_id`.
+    pub(crate) fn workspace_of(&self, agent_id: &AgentId) -> Option<WorkspaceId> {
+        lock(&self.sinks)
+            .get(agent_id)
+            .map(|sink| sink.workspace_id.clone())
     }
 
     /// Whether `agent_id` has a sink.

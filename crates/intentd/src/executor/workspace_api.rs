@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
-use intent_core::node_link::LinkOutcome;
+use intent_core::node_link::{LinkOutcome, PREPARED_CHECKOUT_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, PLACEMENT_HELP_METHOD,
 };
@@ -44,7 +44,7 @@ impl HeadLink {
         *lock(&self.current) = Some(link);
     }
 
-    fn get(&self) -> Option<NodeLink> {
+    pub(super) fn get(&self) -> Option<NodeLink> {
         lock(&self.current).clone().filter(|link| !link.is_closed())
     }
 }
@@ -74,11 +74,20 @@ pub(super) async fn serve(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
-    gates: &Gates,
+    (gates, setup_status): (&Gates, Option<Value>),
     head: HeadLink,
     bridge_exe: &Path,
 ) -> std::io::Result<(McpBridge, McpServer)> {
-    let server = Arc::new(described_server(agent_id, workspace_id, worktree, gates, head).await?);
+    let server = Arc::new(
+        described_server(
+            agent_id,
+            workspace_id,
+            worktree,
+            (gates, setup_status),
+            head,
+        )
+        .await?,
+    );
     let bridge = intent_acp::serve_workspace_mcp_tcp(server).await?;
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
         bridge_exe,
@@ -113,11 +122,23 @@ pub(super) async fn serve(
 /// `agent_id`'s workspace MCP server over its worktree and the head link,
 /// gated like a local agent's bridge. A feature snapshot the node cannot
 /// read starts nothing.
+#[cfg(test)]
 fn server(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
     gates: &Gates,
+    head: HeadLink,
+) -> std::io::Result<WorkspaceMcpServer> {
+    server_with_setup(agent_id, workspace_id, worktree, (gates, None), head)
+}
+
+/// [`server`] whose `workspace.details` shows `setup_status`.
+fn server_with_setup(
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    worktree: &Path,
+    (gates, setup_status): (&Gates, Option<Value>),
     head: HeadLink,
 ) -> std::io::Result<WorkspaceMcpServer> {
     let features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
@@ -128,6 +149,7 @@ fn server(
         agent_id: agent_id.clone(),
         head,
         timeout: DEFAULT_TIMEOUT,
+        setup_status: setup_status.map(Arc::new),
     };
     let api = Arc::new(NodeApi {
         workspace_id: workspace_id.clone(),
@@ -154,18 +176,25 @@ async fn described_server(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     worktree: &Path,
-    gates: &Gates,
+    gates: (&Gates, Option<Value>),
     head: HeadLink,
 ) -> std::io::Result<WorkspaceMcpServer> {
     let help = Router {
         agent_id: agent_id.clone(),
         head: head.clone(),
         timeout: DEFAULT_TIMEOUT,
+        setup_status: None,
     }
     .placement_help()
     .await;
-    Ok(server(agent_id, workspace_id, worktree, gates, head)?.with_remote_placement_help(help))
+    Ok(
+        server_with_setup(agent_id, workspace_id, worktree, gates, head)?
+            .with_remote_placement_help(help),
+    )
 }
+
+/// The forwarded call whose `setupStatus` the machine replaces.
+const DETAILS_METHOD: &str = "workspace.details";
 
 /// How long the node waits for head to answer its own policy read.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,6 +210,9 @@ struct Router {
     agent_id: AgentId,
     head: HeadLink,
     timeout: Duration,
+    /// The agent's checkout's setup status, shown as `setupStatus` in
+    /// `workspace.details` (nodeProtocol 10) instead of head's worktree's.
+    setup_status: Option<Arc<Value>>,
 }
 
 impl HostFrameRouter for Router {
@@ -246,6 +278,10 @@ impl Router {
         );
         let params = json!({ "method": method, "args": args });
         let timeout = self.timeout;
+        let overlay = self
+            .setup_status
+            .clone()
+            .filter(|_| method == DETAILS_METHOD);
         async move {
             let link = link.ok_or_else(|| {
                 "node-link-unavailable: head is not connected to this node; try again shortly"
@@ -255,7 +291,15 @@ impl Router {
                 return Err(refused);
             }
             match link.call(agent_id, CALL_METHOD, params, timeout).await {
-                Ok(LinkOutcome::Ok(value)) => Ok(value),
+                Ok(LinkOutcome::Ok(mut value)) => {
+                    if let (Some(status), Some(details)) = (
+                        overlay.filter(|_| link.protocol() >= PREPARED_CHECKOUT_PROTOCOL),
+                        value.as_object_mut(),
+                    ) {
+                        details.insert("setupStatus".to_owned(), (*status).clone());
+                    }
+                    Ok(value)
+                }
                 Ok(LinkOutcome::Err(error)) => Err(error.message),
                 Err(error) => Err(format!("the call did not reach head: {error}")),
             }

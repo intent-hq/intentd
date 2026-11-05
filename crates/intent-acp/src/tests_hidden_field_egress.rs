@@ -147,6 +147,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         effective_isolation: None,
         placement_error: None,
         submodules: None,
+        setup: None,
         id: AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,

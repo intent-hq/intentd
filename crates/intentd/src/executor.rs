@@ -36,6 +36,7 @@ mod checkout;
 mod runner;
 mod scripts;
 mod session;
+mod setup;
 mod storage;
 #[cfg(test)]
 mod test_link;

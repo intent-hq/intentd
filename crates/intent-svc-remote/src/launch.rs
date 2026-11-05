@@ -20,7 +20,8 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    LaunchCommand, LaunchProfileEnv, PreparedCheckout, SubmodulePin, PREPARED_CHECKOUT_PROTOCOL,
+    LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand, SubmodulePin,
+    PREPARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -28,7 +29,7 @@ use intent_core::placement::{
 };
 use intent_core::remote_launch::{
     EffectiveIsolation, RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds,
-    RemoteLaunchRequest, RemotePlacementView,
+    RemoteLaunchRequest, RemotePlacementView, RemoteSetupStatus,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote};
@@ -94,11 +95,10 @@ async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Resul
     })
 }
 
-/// Whether an agent with `submodules` starts from a checkout a machine must
-/// prepare. A setup script alone does not count yet: no machine runs one,
-/// so refusing older machines for it would gain nothing.
-fn needs_prepared_checkout(submodules: &[SubmodulePin]) -> bool {
-    !submodules.is_empty()
+/// Whether an agent with `submodules` and `setup` starts from a checkout a
+/// machine must prepare.
+fn needs_prepared_checkout(submodules: &[SubmodulePin], setup: Option<&SetupCommand>) -> bool {
+    !submodules.is_empty() || setup.is_some()
 }
 
 /// The protocol of `node`'s link, connecting first when none is up.
@@ -130,16 +130,41 @@ fn require_prepared_checkout(node: &RemoteNode, protocol: u32) -> Result<()> {
 
 /// [`require_prepared_checkout`] for an agent placed with `view`, when its
 /// checkout needs preparing.
-async fn check_machine_prepares(svc: &Services, view: &RemotePlacementView) -> Result<()> {
+async fn check_machine_prepares(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    view: &RemotePlacementView,
+) -> Result<()> {
     let feature = svc.remote_feature().ok_or_else(no_node)?;
     let node = feature.node(svc, &view.node_id).await?;
     if !node.shared_ref().offers_prepared_checkout() {
         return Ok(());
     }
-    if !needs_prepared_checkout(view.pins()) {
+    let setup = svc.remote_setup_command(workspace_id, view).await?;
+    if !needs_prepared_checkout(view.pins(), setup.as_ref()) {
         return Ok(());
     }
     require_prepared_checkout(&node, link_protocol(&node).await?)
+}
+
+/// An agent's first prepared launch: its machine is preparing the checkout.
+/// Later launches keep the last result until the machine reports a new one
+/// (a kept checkout reports none).
+async fn record_setup_pending(svc: &Services, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+    match crate::view::update(svc.store(), workspace_id, agent_id, |view| {
+        view.setup.get_or_insert_with(RemoteSetupStatus::pending);
+    })
+    .await
+    {
+        Ok(true) => {
+            svc.publish_agent_placement_changed(workspace_id, agent_id)
+                .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(agent = %agent_id, %error, "remote launch: could not record the pending setup");
+        }
+    }
 }
 
 /// Record a start refused for `error` as the agent's `placementError`.
@@ -352,7 +377,7 @@ impl RemoteLaunchPort for RemoteLaunch {
             let base = self.checkout_base(svc, workspace_id).await?;
             view.base_commit = base.commit;
             view.submodules = Some(base.submodules);
-            check_machine_prepares(svc, &view).await?;
+            check_machine_prepares(svc, workspace_id, &view).await?;
             Ok(view)
         })
     }
@@ -415,6 +440,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                 placement_error: None,
                 base_commit: String::new(),
                 submodules: None,
+                setup: None,
+                setup_script: None,
             })
         })
     }
@@ -440,6 +467,18 @@ impl RemoteLaunchPort for RemoteLaunch {
         true
     }
 
+    fn setup_output(
+        &self,
+        svc: &Services,
+        node_id: &str,
+        agent_id: &AgentId,
+    ) -> Option<(String, bool)> {
+        svc.remote_feature()?
+            .running_node(node_id)?
+            .shared_ref()
+            .setup_output_tail(agent_id)
+    }
+
     fn launch<'a>(
         &'a self,
         svc: &'a Services,
@@ -451,7 +490,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 agent_id,
                 view,
             } = request;
-            check_machine_prepares(svc, &view).await?;
+            check_machine_prepares(svc, &workspace_id, &view).await?;
             let checkout = workspace_checkout(svc, &workspace_id).await?;
             let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
             let commit = git2::Oid::from_str(&view.base_commit)
@@ -603,7 +642,10 @@ impl RemoteLaunchPort for RemoteLaunch {
             let checkout =
                 if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
                     let protocol = link_protocol(&node).await?;
-                    if needs_prepared_checkout(view.pins()) {
+                    let setup = svc
+                        .remote_setup_command(&record.workspace_id, &view)
+                        .await?;
+                    if needs_prepared_checkout(view.pins(), setup.as_ref()) {
                         if let Err(error) = require_prepared_checkout(&node, protocol) {
                             record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
                             return Err(error);
@@ -612,12 +654,15 @@ impl RemoteLaunchPort for RemoteLaunch {
                     (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| {
                         Box::new(PreparedCheckout {
                             submodules: view.pins().to_vec(),
-                            setup: None,
+                            setup,
                         })
                     })
                 } else {
                     None
                 };
+            if checkout.is_some() && view.setup.is_none() {
+                record_setup_pending(svc, &record.workspace_id, agent_id).await;
+            }
             let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             let runtime = node

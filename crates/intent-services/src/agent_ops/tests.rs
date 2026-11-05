@@ -10590,6 +10590,18 @@ async fn worst_case_agent_list_row(
         )),
         base_commit: "0".repeat(40),
         submodules: None,
+        // The longest setup status a row carries: every member, the error
+        // at its cap.
+        setup: Some(intent_core::remote_launch::RemoteSetupStatus {
+            state: intent_core::remote_launch::RemoteSetupState::Failed,
+            exit_code: Some(i32::MIN),
+            error: Some("e".repeat(intent_core::remote_launch::SETUP_ERROR_CAP_BYTES)),
+            started_at: Some("2026-11-05T12:00:00.000000000Z".into()),
+            finished_at: Some("2026-11-05T12:00:00.000000000Z".into()),
+            output: None,
+            output_truncated: None,
+        }),
+        setup_script: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(

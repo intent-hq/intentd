@@ -75,6 +75,8 @@ impl RemoteLaunchPort for FakeRemote {
                 placement_error: None,
                 base_commit: String::new(),
                 submodules: None,
+                setup: None,
+                setup_script: None,
             })
         })
     }

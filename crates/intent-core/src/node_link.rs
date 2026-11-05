@@ -82,9 +82,8 @@ pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 10 }
 /// The first protocol with the prepared checkout: [`LaunchCommand::checkout`]
 /// and module git remotes (`intent://ws/<ws>/agents/<agent>/modules/<key>`).
 /// Head sends neither on a link that negotiated less, and refuses a module
-/// session there. This build prepares submodules but runs no setup script
-/// yet: head never sends [`PreparedCheckout::setup`], and a machine given
-/// one records it `failed` without running it.
+/// session there. The machine runs [`PreparedCheckout::setup`] in a fresh
+/// checkout before the agent starts.
 pub const PREPARED_CHECKOUT_PROTOCOL: u32 = 10;
 
 /// Whether this build offers the prepared checkout: only then does a
@@ -719,8 +718,8 @@ pub enum SetupState {
     Skipped,
 }
 
-/// `setupFinished.error` when a launch carries a setup script this machine
-/// cannot run yet.
+/// `setupFinished.error` when the setup script could not be written or
+/// started (an older machine also uses it for a script it cannot run).
 pub const SETUP_FAILED_CODE: &str = "node-setup-failed";
 
 impl LinkFrame {

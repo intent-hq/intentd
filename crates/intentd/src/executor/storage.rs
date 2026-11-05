@@ -19,6 +19,7 @@ const JOURNAL: &str = "journal";
 const AGENTS: &str = "agents";
 const CACHE: &str = "cache";
 const BIN: &str = "bin";
+const REPOS: &str = "repos";
 const GIT_SOCKET: &str = "git.sock";
 
 /// Longest Unix socket path in bytes, without the trailing NUL
@@ -214,6 +215,20 @@ impl Storage {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("remove {}", dir.display())),
         }
+    }
+
+    /// The machine-local stand-in for head's main checkout of the
+    /// repository `repo_key`, created empty: a setup script's
+    /// `MAIN_CHECKOUT`, where the machine's owner can put untracked files.
+    pub(super) fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf> {
+        ensure!(valid_id(repo_key), "repo key is not a safe path component");
+        let dir = self.root.join(REPOS).join(repo_key).join("main");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .context("create the main checkout directory")?;
+        Ok(dir)
     }
 
     /// The per-repository bare caches holding agent worktrees.
