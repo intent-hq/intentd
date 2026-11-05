@@ -32,6 +32,8 @@ use intent_transport::node_link::{
 
 use crate::common::test_tempdir_in;
 
+mod submodules;
+
 const WS: &str = "ws-1";
 const AGENT: &str = "agent-1";
 /// An agent that runs on another lease.
@@ -81,6 +83,16 @@ struct Lease {
     binding: LeaseBinding,
     agents: BTreeSet<String>,
     hold: Arc<ReceiveHold>,
+    head: Arc<HeadState>,
+}
+
+/// What head serves beyond the workspace's repository: the agents'
+/// submodule pins, resolved like head's own access check, and an injected
+/// refusal of superproject pushes.
+#[derive(Default)]
+struct HeadState {
+    pins: std::sync::Mutex<Vec<intent_core::node_link::SubmodulePin>>,
+    refuse_superproject_push: std::sync::atomic::AtomicBool,
 }
 
 /// Holds the next push's session on head, after it opened and before
@@ -112,7 +124,29 @@ impl NodeGitAccess for Lease {
             if remote.workspace_id() != WS || !self.agents.contains(remote.agent_id()) {
                 return Err(Error::Forbidden("agent not on this lease".into()));
             }
-            Ok(self.repository.clone())
+            let Some(key) = remote.module_key() else {
+                if service == GitService::ReceivePack
+                    && self
+                        .head
+                        .refuse_superproject_push
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(Error::Forbidden("test: superproject push refused".into()));
+                }
+                return Ok(self.repository.clone());
+            };
+            let pin = self
+                .head
+                .pins
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|pin| pin.module_key == key)
+                .cloned()
+                .ok_or_else(|| Error::Forbidden("not a pin".into()))?;
+            intent_git::node_git::module_repository(&self.repository, &pin.path, key)
+                .map(|module| module.worktree)
+                .map_err(|refusal| Error::Forbidden(format!("{refusal:?}")))
         })
     }
 }
@@ -213,6 +247,7 @@ struct Fixture {
     socket: PathBuf,
     base: String,
     receive_hold: Arc<ReceiveHold>,
+    head_state: Arc<HeadState>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
     _link: intent_transport::node_link::DialedLink,
     _node_link: Box<dyn std::any::Any + Send>,
@@ -321,11 +356,13 @@ impl Fixture {
         };
 
         let receive_hold = Arc::new(ReceiveHold::default());
+        let head_state = Arc::new(HeadState::default());
         let lease = Lease {
             repository: head.path().to_path_buf(),
             binding,
             agents: BTreeSet::from([AGENT.to_owned()]),
             hold: receive_hold.clone(),
+            head: head_state.clone(),
         };
         intent_git::node_git::configure_receive_hooks(&node.path().join("head-data")).unwrap();
         let serving = tokio::spawn(serve_git(head_git, Arc::new(lease)));
@@ -353,6 +390,7 @@ impl Fixture {
             socket,
             base,
             receive_hold,
+            head_state,
             _tasks: vec![serving, helpers],
             _link: link,
             _node_link: Box::new((server, node_link, accepted)),

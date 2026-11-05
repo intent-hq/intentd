@@ -1751,3 +1751,197 @@ async fn machine_shutdown_pushes_live_agents_work() {
         "since the last push"
     );
 }
+
+/// The prepared checkout end to end (nodeProtocol 10, intent-hq/intent#8594):
+/// a remote agent's checkout on the machine has every submodule populated on
+/// the backend, nested ones included, at the commits the backend has checked
+/// out (here `a` is at a backend-only commit ahead of its gitlink); and a
+/// commit inside one submodule plus an uncommitted edit inside another come
+/// back to the backend's submodule repositories with the agent's final
+/// push, the superproject's `wip` naming the module `wip`s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote submodules e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-subm-");
+    let upstream = |name: &str| {
+        let dir = scratch.path().join("upstream").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "--quiet", "-m", name]);
+        dir
+    };
+    let add = |dir: &Path, url: &Path, path: &str| {
+        git(
+            dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                url.to_str().unwrap(),
+                path,
+            ],
+        );
+    };
+    let b_url = upstream("b");
+    let a_url = upstream("a");
+    add(&a_url, &b_url, "b");
+    git(&a_url, &["commit", "--quiet", "-m", "add b"]);
+    let c_url = upstream("c");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    add(&repo, &a_url, "a");
+    add(&repo, &c_url, "c");
+    git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--quiet",
+            "--init",
+            "--recursive",
+        ],
+    );
+    git(&repo, &["commit", "--quiet", "-m", "submodules"]);
+    std::fs::write(repo.join("a/ahead.txt"), "backend only\n").unwrap();
+    git(&repo.join("a"), &["add", "ahead.txt"]);
+    git(&repo.join("a"), &["commit", "--quiet", "-m", "ahead"]);
+    let heads = |root: &Path| {
+        ["a", "a/b", "c"].map(|path| git(&root.join(path), &["rev-parse", "HEAD"]))
+    };
+    let backend_heads = heads(&repo);
+    let status = |root: &Path| -> Vec<String> {
+        git(root, &["submodule", "status", "--recursive"])
+            .lines()
+            .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+            .collect()
+    };
+
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    assert!(
+        created["notice"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("submodules"),
+        "{created}"
+    );
+    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
+    assert!(reply.contains("echo:"), "{reply}");
+
+    let work = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id)
+        .join("work");
+    assert_eq!(heads(&work), backend_heads);
+    assert_eq!(status(&work), status(&repo));
+    assert_eq!(
+        std::fs::read_to_string(work.join("a/ahead.txt")).unwrap(),
+        "backend only\n"
+    );
+
+    // The agent commits in the nested `a/b` and leaves an edit in `c`.
+    std::fs::write(work.join("a/b/agent.txt"), "agent commit\n").unwrap();
+    git(&work.join("a/b"), &["add", "agent.txt"]);
+    git(&work.join("a/b"), &["commit", "--quiet", "-m", "agent work"]);
+    let b_commit = git(&work.join("a/b"), &["rev-parse", "HEAD"]);
+    std::fs::write(work.join("c/edit.txt"), "agent edit\n").unwrap();
+
+    ok(
+        &mut rpc_ws,
+        60,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let wip = timeout(wait(), async {
+        loop {
+            let c_wip = try_rev(&repo.join("c"), &format!("{refs}/wip"));
+            let super_wip = try_rev(&repo, &format!("{refs}/wip"));
+            if let (Some(c_wip), Some(super_wip)) = (c_wip, super_wip) {
+                let edited = git(&repo.join("c"), &["ls-tree", "--name-only", &c_wip])
+                    .lines()
+                    .any(|file| file == "edit.txt");
+                if edited && git(&repo, &["rev-parse", &format!("{super_wip}:c")]) == c_wip {
+                    return super_wip;
+                }
+            }
+            // timing-guard: poll interval for the machine's final push to land the refs (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the final push lands the modules and the superproject");
+    assert_eq!(
+        try_rev(&repo.join("a/b"), &format!("{refs}/head")),
+        Some(b_commit.clone())
+    );
+    let c_wip = try_rev(&repo.join("c"), &format!("{refs}/wip")).unwrap();
+    assert_eq!(
+        git(&repo.join("c"), &["show", &format!("{c_wip}:edit.txt")]),
+        "agent edit"
+    );
+    let a_wip = try_rev(&repo.join("a"), &format!("{refs}/wip")).unwrap();
+    assert_eq!(
+        git(&repo.join("a"), &["rev-parse", &format!("{a_wip}:b")]),
+        b_commit
+    );
+    assert_eq!(git(&repo, &["rev-parse", &format!("{wip}:a")]), a_wip);
+    // The backend's own checkouts are untouched.
+    assert_eq!(heads(&repo), backend_heads);
+    assert!(!repo.join("c/edit.txt").exists());
+}
