@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.132] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- *(remote)* Pin a remote agent's submodules and serve module git sessions ([#3057](https://github.com/intent-hq/intentd/pull/3057))
+
+
 ## [0.11.131] - 2026-11-05
 
 ### 🐛 Bug Fixes
