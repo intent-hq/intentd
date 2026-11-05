@@ -4,8 +4,8 @@
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
-//! agent's machine), plus `workspace.details` and the workspace setters
-//! ([`FORWARDED_METHODS`]), is forwarded to head over the node link (head
+//! agent's machine), plus `workspace.details`, the workspace setters and
+//! `workspace.proposeSibling` ([`FORWARDED_METHODS`]), is forwarded to head over the node link (head
 //! checks the agent is on the link's lease and routes the frame again, never
 //! trusting the node), and everything else is refused with an explicit error
 //! instead of running on the wrong host.
@@ -38,9 +38,11 @@ pub const LOCAL_METHODS: &[&str] = &[
 ];
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
-/// workspace details and the setters an agent names its workspace and
-/// itself with. Head runs them as the agent, so `setAgentName` renames only
-/// the caller. They ride `workspace.call` on every protocol: an older
+/// workspace details, the setters an agent names its workspace and itself
+/// with, and the sibling-workspace proposal. Head runs them as the agent
+/// with a local agent's checks, so `setAgentName` renames only the caller
+/// and a sub-agent cannot propose; head registers a proposal's card for the
+/// agent's message. They ride `workspace.call` on every protocol: an older
 /// machine refuses them itself, an older backend refuses them by its own
 /// table. The other `workspace.*` stay refused.
 pub const FORWARDED_METHODS: &[&str] = &[
@@ -49,6 +51,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "workspace.setStatusMessage",
     "workspace.setStatusImage",
     "workspace.setAgentName",
+    "workspace.proposeSibling",
 ];
 
 /// Error code at the start of a refused frame's message.
@@ -108,7 +111,7 @@ pub fn unsupported_message(method: &str) -> String {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details, setTitle, setStatusMessage, setStatusImage and setAgentName through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -153,6 +156,7 @@ mod tests {
             "workspace.setStatusMessage",
             "workspace.setStatusImage",
             "workspace.setAgentName",
+            "workspace.proposeSibling",
         ] {
             assert_eq!(route(method), Route::Forward, "{method}");
             assert_eq!(
@@ -164,7 +168,6 @@ mod tests {
         for method in [
             "workspace.archive",
             "workspace.unarchive",
-            "workspace.proposeSibling",
             "workspace.applyProposal",
             "workspace.timeline",
         ] {
@@ -173,7 +176,7 @@ mod tests {
         let message = unsupported_message("workspace.archive");
         assert!(
             message.contains("ws.workspace.info on their own checkout")
-                && message.contains("ws.workspace.details, setTitle, setStatusMessage, setStatusImage and setAgentName through head"),
+                && message.contains("ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head"),
             "{message}"
         );
     }

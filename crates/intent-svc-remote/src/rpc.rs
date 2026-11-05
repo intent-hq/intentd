@@ -161,7 +161,16 @@ impl HeadCalls {
             "args": request.params.get("args").cloned().unwrap_or(Value::Null),
         });
         match host(frame).await {
-            Ok(value) => LinkOutcome::Ok(value),
+            Ok(mut value) => {
+                // A card (a sibling proposal) attaches to the agent's
+                // message on head, as for a local agent's call.
+                intent_acp::register_forwarded_attachments(
+                    &self.services.turn_attachments(),
+                    &record.agent_id,
+                    &mut value,
+                );
+                LinkOutcome::Ok(value)
+            }
             Err(message) => refusal(CALL_FAILED, message),
         }
     }

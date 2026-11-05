@@ -59,7 +59,7 @@ pub use bindings::prelude_for_workspace as bindings_prelude_for_workspace;
 /// The `ws.script.<method>` binding dispatch, for the backend's handling of a
 /// remote agent's forwarded script calls.
 pub use bindings::script::dispatch as dispatch_script_method;
-pub use dispatch::make_workspace_host_for_bridge;
+pub use dispatch::{make_workspace_host_for_bridge, register_forwarded_attachments};
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";

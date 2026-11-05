@@ -933,6 +933,27 @@ fn make_workspace_host_with_pending(
     })
 }
 
+/// Register the resource items of a frame `value` served for a remote
+/// agent's machine (intent-hq/intent#8593): the nonce-stamped canonical
+/// payloads go to the backend's `registry` for `agent_id`, as a local
+/// agent's `workspace_api` call registers them, and the stamped items stay
+/// in `value` for the machine to return unchanged (it has no registry and
+/// stamps nothing). The relayed tool result then claims them, so a remote
+/// proposal becomes a pending card on the agent's message.
+pub fn register_forwarded_attachments(
+    registry: &TurnAttachmentRegistry,
+    agent_id: &AgentId,
+    value: &mut Value,
+) {
+    let Some(items) = value
+        .get_mut("__mcpContentItems")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    registry.register_all(agent_id, stamp_and_collect(items, &HashSet::new()));
+}
+
 /// Binding-time collection (monorepo#2637): when a host frame's result
 /// carries `__mcpContentItems`, stamp a fresh nonce into each resource item
 /// (mutating the value the agent's JS will see, so a returned envelope
