@@ -689,8 +689,12 @@ pub(crate) async fn fetch_cursor_models_at(binary: Option<PathBuf>) -> ProviderM
     let Some(bin) = binary else {
         return ProviderModelsFetch::unavailable("cursor", "cursor-agent binary not found");
     };
+    let mut cmd = AcpProbeCommand::binary(bin, vec!["acp".to_string()]);
+    for (key, value) in intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV {
+        cmd = cmd.env(*key, *value);
+    }
     let outcome = probe::run_acp_method_probe(
-        AcpProbeCommand::binary(bin, vec!["acp".to_string()]),
+        cmd,
         CURSOR_LIST_MODELS_METHOD,
         parse::parse_cursor_available_models,
     )

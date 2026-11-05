@@ -3825,10 +3825,21 @@ impl AgentManager {
         // Refuse the Grok agent host channel posing as `cursor-agent` (its
         // `--version` answers `grok …`). Blocking probe (≤3s), off the runtime.
         if opts.provider.id == "cursor" {
+            // A `providers.paths.cursor` override that is the Grok agent host
+            // is refused with the discovery row's reason — never replaced by
+            // another `cursor-agent` found on PATH.
+            let override_path = self
+                .services
+                .effective_settings()
+                .providers
+                .paths
+                .get("cursor")
+                .cloned();
+            crate::cursor_cli::check_cursor_override_for_spawn(override_path.as_deref())?;
             let binary = opts.provider_binary.map(Path::to_path_buf);
             let status = tokio::task::spawn_blocking(move || match binary {
                 Some(path) => crate::cursor_cli::probe_cursor_cli_at(Some(path)),
-                None => crate::cursor_cli::probe_cursor_cli(None),
+                None => crate::cursor_cli::probe_cursor_cli(override_path.as_deref()),
             })
             .await
             .map_err(|e| Error::Internal(format!("Cursor CLI probe task failed: {e}")))?;

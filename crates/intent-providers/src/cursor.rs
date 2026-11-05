@@ -28,6 +28,47 @@ use std::path::{Path, PathBuf};
 
 use intent_core::path_utils::is_executable_file;
 
+/// Environment the daemon sets on every Cursor CLI probe so output stays
+/// plain text even when the daemon runs with `FORCE_COLOR=1` (which beats
+/// `NO_COLOR` in the CLI's color library, so both are set).
+pub const CURSOR_PLAIN_OUTPUT_ENV: &[(&str, &str)] = &[("FORCE_COLOR", "0"), ("NO_COLOR", "1")];
+
+/// Remove ANSI escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL|ST`,
+/// and two-byte `ESC x`) from CLI output before parsing.
+#[must_use]
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The Cursor CLI command. Never the bare `agent` alias.
 pub const CURSOR_COMMAND: &str = "cursor-agent";
 
@@ -161,7 +202,7 @@ pub enum CursorCliIdentity {
 /// Classify the first line of `--version` output.
 #[must_use]
 pub fn classify_cursor_version(first_line: &str) -> CursorCliIdentity {
-    let line = first_line.trim().to_owned();
+    let line = strip_ansi(first_line).trim().to_owned();
     if line.starts_with("grok ") {
         return CursorCliIdentity::GrokAgentHost(line);
     }
@@ -251,6 +292,8 @@ pub fn parse_cursor_models_command_output(
     stderr: &str,
     success: bool,
 ) -> CursorModelsOutput {
+    let stdout = &strip_ansi(stdout);
+    let stderr = &strip_ansi(stderr);
     if is_cursor_auth_required(stdout) || is_cursor_auth_required(stderr) {
         return CursorModelsOutput {
             authenticated: Some(false),
@@ -585,6 +628,34 @@ mod tests {
             assert_eq!(parsed.authenticated, Some(false));
             assert!(parsed.models.is_empty());
         }
+    }
+
+    /// `FORCE_COLOR=1` output (bold header, colored ids/names, OSC link)
+    /// parses the same as plain output.
+    #[test]
+    fn colored_output_parses_like_plain_output() {
+        let colored = "\u{1b}[1mAvailable models\u{1b}[22m\n\n\u{1b}[36mauto\u{1b}[39m - \u{1b}[2mAuto (current, default)\u{1b}[22m\n\u{1b}[36mgpt-5.2\u{1b}[39m - GPT-5.2\n\u{1b}]8;;https://cursor.com\u{7}Tip\u{1b}]8;;\u{7}: use --model <id>\n";
+        let parsed = parse_cursor_models_command_output(colored, "", true);
+        assert_eq!(parsed.authenticated, Some(true));
+        assert_eq!(
+            parsed
+                .models
+                .iter()
+                .map(|m| (m.id.as_str(), m.name.as_str(), m.is_default))
+                .collect::<Vec<_>>(),
+            vec![("auto", "Auto", true), ("gpt-5.2", "GPT-5.2", false)]
+        );
+        let out = parse_cursor_models_command_output(
+            "",
+            "\u{1b}[31mError: Authentication required.\u{1b}[39m Run 'agent login'",
+            false,
+        );
+        assert_eq!(out.authenticated, Some(false));
+        assert_eq!(
+            classify_cursor_version("\u{1b}[32m2026.11.05-86047df\u{1b}[39m"),
+            CursorCliIdentity::Cursor("2026.11.05-86047df".into())
+        );
+        assert_eq!(strip_ansi("a\u{1b}]0;title\u{1b}\\b"), "ab");
     }
 
     #[test]

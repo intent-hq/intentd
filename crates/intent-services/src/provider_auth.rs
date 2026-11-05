@@ -302,6 +302,11 @@ async fn check_provider_auth_cli_with(
         }
         "cursor" => {
             let mut cmd = probe_command(program);
+            cmd.envs(
+                intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
+                    .iter()
+                    .copied(),
+            );
             cmd.args(auth_check_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -561,6 +566,11 @@ async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
     }
     let mut cmd = probe_command(program);
     gap_fill_credentials(&mut cmd, captured);
+    cmd.envs(
+        intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
+            .iter()
+            .copied(),
+    );
     cmd.args(["status", "--format", "json"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -577,7 +587,7 @@ async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
 /// present and the status JSON reports a stored access token. Never log the
 /// payload (it carries the account email).
 fn cursor_status_note(key_present: bool, status_json: &str) -> Option<String> {
-    let stored = serde_json::from_str::<Value>(status_json)
+    let stored = serde_json::from_str::<Value>(&intent_providers::cursor::strip_ansi(status_json))
         .ok()?
         .get("hasAccessToken")
         .and_then(Value::as_bool)?;

@@ -249,6 +249,8 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
                 ("MOCK_CURSOR_PID_FILE", pid_file.to_str().unwrap()),
                 // Mixed credentials: a stored login and an API key.
                 ("CURSOR_API_KEY", "crsr-e2e-placeholder"),
+                // Colored CLI output must not break the probes.
+                ("FORCE_COLOR", "1"),
             ],
         ),
     };
@@ -311,6 +313,19 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
     );
     assert_eq!(rows[1]["id"], "gpt-5.2", "{models}");
     assert_eq!(rows[2]["name"], "Grok 4.7 Low Fast", "{models}");
+
+    // Every `models` probe ran with plain-output env despite FORCE_COLOR=1.
+    let cli_models: Vec<Value> = rpc_log(&log)
+        .into_iter()
+        .filter(|f| f["dir"] == "cli" && f["msg"]["args"][0] == "models")
+        .collect();
+    assert!(!cli_models.is_empty());
+    assert!(
+        cli_models
+            .iter()
+            .all(|f| f["msg"]["FORCE_COLOR"] == "0" && f["msg"]["NO_COLOR"] == "1"),
+        "{cli_models:?}"
+    );
 
     // No ACP session was opened by discovery, auth or the model list.
     assert!(

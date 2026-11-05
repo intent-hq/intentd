@@ -39581,16 +39581,9 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
     // An override pointing at the Grok agent host is refused everywhere, so
     // the row is unavailable with that reason even when an auto-discovered
     // Cursor exists.
-    let cursor_override_reason = provider_paths.get("cursor").and_then(|path| {
-        intent_providers::cursor::grok_host_override_reason(
-            path,
-            &intent_providers::cursor::CursorHostDirs::from_env(
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .as_deref(),
-            ),
-        )
-    });
+    let cursor_override_reason = crate::cursor_cli::grok_host_override_reason(
+        provider_paths.get("cursor").map(String::as_str),
+    );
     let cursor_cli_status = providers
         .iter()
         .any(|p| {

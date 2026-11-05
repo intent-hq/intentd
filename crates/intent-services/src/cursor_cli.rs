@@ -76,6 +76,32 @@ pub fn probe_cursor_cli_at(resolved_path: Option<PathBuf>) -> CursorCliStatus {
     }
 }
 
+/// The refusal reason when `providers.paths.cursor` points at the Grok
+/// agent host (see [`intent_providers::cursor::grok_host_override_reason`]).
+/// Shared by discovery and spawn so a refused override is never silently
+/// replaced by another `cursor-agent`.
+#[must_use]
+pub fn grok_host_override_reason(override_path: Option<&str>) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    override_path.and_then(|path| {
+        intent_providers::cursor::grok_host_override_reason(
+            path,
+            &intent_providers::cursor::CursorHostDirs::from_env(home.as_deref()),
+        )
+    })
+}
+
+/// Spawn-time refusal of a Grok agent host override (the same actionable
+/// reason the discovery row shows).
+pub(crate) fn check_cursor_override_for_spawn(override_path: Option<&str>) -> crate::Result<()> {
+    match grok_host_override_reason(override_path) {
+        Some(reason) => Err(crate::Error::InvalidInput(format!(
+            "cannot start Cursor agent: {reason}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Spawn-time fail-fast: refuse to launch the Grok agent host as Cursor.
 pub(crate) fn check_cursor_cli_for_spawn(status: &CursorCliStatus) -> crate::Result<()> {
     match status.unavailable_reason() {
@@ -202,6 +228,29 @@ mod tests {
             intent_providers::find_provider_binary("cursor", "cursor-agent", host.to_str()),
             None
         );
+    }
+
+    /// Spawn refuses a Grok agent host override with the discovery reason
+    /// instead of falling back to another `cursor-agent`.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_refuses_a_grok_host_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("agent-host-0.3.1-linux-x64");
+        std::fs::write(&host, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = check_cursor_override_for_spawn(host.to_str()).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidInput(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("cannot start Cursor agent"), "{msg}");
+        assert!(msg.contains("Grok agent host"), "{msg}");
+        assert!(msg.contains("providers.paths.cursor"), "{msg}");
+        assert!(check_cursor_override_for_spawn(None).is_ok());
+        let cursor = dir.path().join("cursor-agent");
+        std::fs::write(&cursor, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_cursor_override_for_spawn(cursor.to_str()).is_ok());
     }
 
     /// End to end over a fake `cursor-agent` on an explicit override path:

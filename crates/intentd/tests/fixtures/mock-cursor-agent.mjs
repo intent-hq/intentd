@@ -44,8 +44,19 @@ if (args[0] === 'status') {
   process.exit(0);
 }
 
+// Like the real CLI's color library: FORCE_COLOR=1 wins over NO_COLOR, and
+// the colored output breaks a naive parser.
+const colorize = process.env.FORCE_COLOR === '1';
+const tint = (text) => (colorize ? `\u001b[36m${text}\u001b[39m` : text);
+
 if (args[0] === 'models') {
-  log('cli', { args });
+  log('cli', { args, FORCE_COLOR: process.env.FORCE_COLOR ?? null, NO_COLOR: process.env.NO_COLOR ?? null });
+  if (colorize) {
+    // Without the daemon's FORCE_COLOR=0 the ids carry escapes and auth
+    // detection / parsing would degrade to unknown.
+    process.stdout.write(`${tint('auto')} - Auto (current, default)\n`);
+    process.exit(0);
+  }
   if (signedOut) {
     process.stderr.write(AUTH_ERROR + '\n');
     process.exit(1);
