@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.133] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- *(acp)* Report earlier ws.* call outcomes when a workspace_api script fails ([#3052](https://github.com/intent-hq/intentd/pull/3052))
+- *(remote)* Give remote agents the same workspace_api reference as local ones ([#3058](https://github.com/intent-hq/intentd/pull/3058))
+- *(remote)* Forward remote agents' backend-data calls and placement help ([#3059](https://github.com/intent-hq/intentd/pull/3059))
+- *(remote)* Forward remote agents' hooks, questions, browser and desktop calls ([#3060](https://github.com/intent-hq/intentd/pull/3060))
+- *(remote)* Check out a remote agent's submodules on the machine and push them back ([#3062](https://github.com/intent-hq/intentd/pull/3062))
+
+
 ## [0.11.132] - 2026-11-05
 
 ### 🐛 Bug Fixes
