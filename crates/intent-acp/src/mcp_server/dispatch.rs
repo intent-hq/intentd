@@ -168,11 +168,9 @@ impl WorkspaceMcpServer {
         // Binding-time attachment collection (monorepo#2637): only when both
         // the registry and a caller agent are wired — otherwise host-time
         // stamping would mint nonces that never register.
-        let pending: Option<PendingAttachments> =
-            match (&self.turn_attachments, &self.caller_agent_id) {
-                (Some(_), Some(_)) => Some(Arc::new(Mutex::new(PendingAttachmentState::default()))),
-                _ => None,
-            };
+        let pending: Option<PendingAttachments> = self
+            .publishes_attachments()
+            .then(|| Arc::new(Mutex::new(PendingAttachmentState::default())));
         let host = make_workspace_host_with_pending(
             self.api.clone(),
             self.workspace_id.clone(),
@@ -576,18 +574,48 @@ impl WorkspaceMcpServer {
         pending_batch: Vec<TurnAttachment>,
         output: Option<&SealedPrivateOutput>,
     ) -> Result<Vec<Value>, ()> {
-        let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
-        else {
+        if !self.publishes_attachments() {
             return Ok(items.to_vec());
-        };
+        }
         let known: HashSet<String> = pending_batch.iter().map(|a| a.id.clone()).collect();
         let mut out = items.to_vec();
         let new_entries = stamp_and_collect(&mut out, &known);
         let mut batch = pending_batch;
         batch.extend(new_entries);
-        let batch = prepare_attachment_publication(batch, output).await?;
-        registry.register_all(agent_id, batch);
+        self.publish_attachments(batch, output).await?;
         Ok(out)
+    }
+
+    /// Whether this bridge publishes a call's cards: to the daemon-wide
+    /// registry for its caller agent, or (a remote agent's node, which has
+    /// no registry) through its frame router to head.
+    fn publishes_attachments(&self) -> bool {
+        self.caller_agent_id.is_some()
+            && (self.turn_attachments.is_some()
+                || self
+                    .frame_router
+                    .as_ref()
+                    .is_some_and(|router| router.publishes_attachments()))
+    }
+
+    /// Publish one call's cards as one batch, before the call answers.
+    async fn publish_attachments(
+        &self,
+        batch: Vec<TurnAttachment>,
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<(), ()> {
+        let Some(agent_id) = &self.caller_agent_id else {
+            return Ok(());
+        };
+        let batch = prepare_attachment_publication(batch, output).await?;
+        if let Some(registry) = &self.turn_attachments {
+            registry.register_all(agent_id, batch);
+        } else if let Some(router) = &self.frame_router {
+            if !batch.is_empty() && router.publishes_attachments() {
+                router.publish_attachments(batch).await;
+            }
+        }
+        Ok(())
     }
 
     /// Register the binding-time attachment batch on the result paths that do
@@ -599,11 +627,10 @@ impl WorkspaceMcpServer {
         pending_batch: Vec<TurnAttachment>,
         output: Option<&SealedPrivateOutput>,
     ) -> Result<(), ()> {
-        if let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id) {
-            let pending_batch = prepare_attachment_publication(pending_batch, output).await?;
-            registry.register_all(agent_id, pending_batch);
+        if !self.publishes_attachments() {
+            return Ok(());
         }
-        Ok(())
+        self.publish_attachments(pending_batch, output).await
     }
 }
 

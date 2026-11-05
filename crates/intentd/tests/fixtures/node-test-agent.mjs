@@ -25,7 +25,9 @@
 // "wsapi <code>" instead runs <code> through the session's workspace MCP
 // server (the `--connect` address of its `workspace-mcp` entry in
 // session/new) and streams "wsapi: <result text>" (or "wsapi-error: ...").
-// A `<system>` block in the prompt is ignored.
+// "wsapi-tool <code>" does the same and also reports the call as a
+// `workspace_api` tool_call / tool_call_update carrying the MCP content
+// items, as a real provider does. A `<system>` block in the prompt is ignored.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -147,10 +149,44 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
-      if (text.startsWith('wsapi ')) {
+      const asTool = text.startsWith('wsapi-tool ');
+      if (asTool || text.startsWith('wsapi ')) {
+        const code = text.slice(asTool ? 'wsapi-tool '.length : 'wsapi '.length);
+        const toolCallId = `tc_${process.hrtime.bigint()}`;
+        if (asTool) {
+          send({
+            method: 'session/update',
+            params: {
+              sessionId: SESSION,
+              update: {
+                sessionUpdate: 'tool_call',
+                toolCallId,
+                title: 'workspace_api',
+                name: 'workspace_api',
+                kind: 'mcp',
+                status: 'in_progress',
+                rawInput: { code, summary: 'node test agent call' },
+              },
+            },
+          });
+        }
         let line;
         try {
-          const result = await workspaceApi(text.slice('wsapi '.length));
+          const result = await workspaceApi(code);
+          if (asTool) {
+            send({
+              method: 'session/update',
+              params: {
+                sessionId: SESSION,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId,
+                  status: result.isError ? 'failed' : 'completed',
+                  rawOutput: result.content ?? [],
+                },
+              },
+            });
+          }
           const body = (result.content?.[0]?.text ?? '').replace(/\s+/g, ' ');
           line = `${result.isError ? 'wsapi-error' : 'wsapi'}: ${body}`;
         } catch (error) {

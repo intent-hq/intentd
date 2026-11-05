@@ -528,6 +528,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         notes.to_string().contains("From the node"),
         "the forwarded note is on head: {notes}"
     );
+    remote_workspace_setters_and_proposal(&mut rpc_ws, &mut events, (&ws_id, &agent_id)).await;
     // Saved scripts (`remoteScripts: 1`): the agent's runs are machine runs.
     let service_id = machine_runs(
         &mut rpc_ws,
@@ -651,6 +652,95 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             .starts_with("remote-script-lost:"),
         "{lost}"
     );
+}
+
+/// intent-hq/intent#8593: a remote agent sets the workspace status, status
+/// image and title and its own name through head (the explicit name and
+/// the seeded title are kept, as for a local agent), and proposes a
+/// sibling workspace. Its code discards the card, so only the batch the
+/// machine publishes to head can put it on the agent's message in head's
+/// history as a pending, Apply-able card.
+async fn remote_workspace_setters_and_proposal(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+) {
+    let setters = wsapi_turn(
+        rpc_ws,
+        events,
+        (ws_id, agent_id),
+        r#"wsapi const name = await ws.workspace.setAgentName("Remote namer"); const status = await ws.workspace.setStatusMessage("Working on the machine."); const image = await ws.workspace.setStatusImage({ data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", mimeType: "image/png" }); const title = await ws.workspace.setTitle("Remote title"); return JSON.stringify({ marker: "turn-setters", name, status, image, title });"#,
+        "turn-setters",
+        600,
+    )
+    .await;
+    let value = wsapi_value(&setters);
+    assert_eq!(
+        value["status"]["statusMessage"], "Working on the machine.",
+        "{value}"
+    );
+    assert_eq!(
+        value["title"]["skipped"], true,
+        "the seeded title is kept: {value}"
+    );
+    assert_eq!(value["name"]["success"], true, "{value}");
+    assert_eq!(
+        value["name"]["skipped"], true,
+        "the explicit name is kept: {value}"
+    );
+    let image = value["image"]["statusImageAssetId"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!image.is_empty(), "{value}");
+    let workspace = ok(
+        rpc_ws,
+        610,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        workspace["workspace"]["statusMessage"], "Working on the machine.",
+        "{workspace}"
+    );
+    assert_eq!(
+        workspace["workspace"]["statusImageAssetId"], image,
+        "{workspace}"
+    );
+
+    let proposed = wsapi_turn(
+        rpc_ws,
+        events,
+        (ws_id, agent_id),
+        r#"wsapi-tool const p = await ws.workspace.proposeSibling({ title: "Remote follow-up", initialPrompt: "Continue the remote work." }); return JSON.stringify({ marker: "turn-proposal", id: p.proposalId });"#,
+        "turn-proposal",
+        620,
+    )
+    .await;
+    let returned = wsapi_value(&proposed);
+    let pending = timeout(wait(), async {
+        let mut id = 630;
+        loop {
+            let agent = ok(
+                rpc_ws,
+                id,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            id += 1;
+            let pending = &agent["agent"]["metadata"]["pendingProposals"];
+            if pending.as_array().is_some_and(|p| !p.is_empty()) {
+                return pending.clone();
+            }
+            // timing-guard: poll interval for the turn's message to be recorded with its card
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the remote proposal is pending on head");
+    assert_eq!(pending[0]["proposalId"], returned["id"], "{pending}");
+    assert!(pending[0]["messageId"].is_string(), "{pending}");
 }
 
 /// [`turn`] for a `wsapi` prompt whose reply carries `marker`. Monitor

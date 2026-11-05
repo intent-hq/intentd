@@ -4,10 +4,11 @@
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
-//! agent's machine), plus `workspace.details`, is forwarded to head over the node link (head checks the agent
-//! is on the link's lease and routes the frame again, never trusting the
-//! node), and everything else is refused with an explicit error instead of
-//! running on the wrong host.
+//! agent's machine), plus `workspace.details`, the workspace setters and
+//! `workspace.proposeSibling` ([`FORWARDED_METHODS`]), is forwarded to head over the node link (head
+//! checks the agent is on the link's lease and routes the frame again, never
+//! trusting the node), and everything else is refused with an explicit error
+//! instead of running on the wrong host.
 
 /// The link request method that carries one forwarded frame. Its params are
 /// `{ "method": <frame method>, "args": <frame args> }`.
@@ -17,6 +18,17 @@ pub const CALL_METHOD: &str = "workspace.call";
 /// refuses it there) to read the workspace's effective auto-commit policy
 /// before an agent-initiated `git.commit`. Head answers `{ "autoCommit": bool }`.
 pub const COMMIT_POLICY_METHOD: &str = "git.commitPolicy";
+
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) when one of the agent's `workspace_api` calls produced
+/// cards (such as a sibling proposal), before the call answers the provider.
+/// Args `{ "attachments": [{ "id", "mimeType", "uri", "name", "text" }] }`,
+/// at most [`MAX_FORWARDED_ATTACHMENTS`]. Head registers them as one batch
+/// for the agent's turn, as a local agent's call does, and answers `{}`.
+pub const ATTACHMENTS_METHOD: &str = "turn.attachments";
+
+/// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
+pub const MAX_FORWARDED_ATTACHMENTS: usize = 32;
 
 /// Namespaces forwarded to head.
 pub const FORWARDED_NAMESPACES: &[&str] = &[
@@ -37,8 +49,21 @@ pub const LOCAL_METHODS: &[&str] = &[
 ];
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
-/// read-only workspace details. The other `workspace.*` stay refused.
-pub const FORWARDED_METHODS: &[&str] = &["workspace.details"];
+/// workspace details, the setters an agent names its workspace and itself
+/// with, and the sibling-workspace proposal. Head runs them as the agent
+/// with a local agent's checks, so `setAgentName` renames only the caller
+/// and a sub-agent cannot propose; the node publishes a proposal's card
+/// with [`ATTACHMENTS_METHOD`]. They ride `workspace.call` on every protocol: an older
+/// machine refuses them itself, an older backend refuses them by its own
+/// table. The other `workspace.*` stay refused.
+pub const FORWARDED_METHODS: &[&str] = &[
+    "workspace.details",
+    "workspace.setTitle",
+    "workspace.setStatusMessage",
+    "workspace.setStatusImage",
+    "workspace.setAgentName",
+    "workspace.proposeSibling",
+];
 
 /// Error code at the start of a refused frame's message.
 pub const UNSUPPORTED_CODE: &str = "remote-agent-unsupported";
@@ -97,7 +122,7 @@ pub fn unsupported_message(method: &str) -> String {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{} and ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -129,28 +154,40 @@ mod tests {
         }
     }
 
-    /// Remote agents read their workspace's details through head; the
-    /// workspace setters stay refused (route is per method, not namespace).
+    /// Remote agents read their workspace's details and set its title,
+    /// status and their own name through head (intent-hq/intent#8593); the
+    /// other workspace calls stay refused (route is per method, not
+    /// namespace). They ride `workspace.call` with no protocol gate: an
+    /// older machine refuses them itself, an older backend refuses them.
     #[test]
-    fn workspace_details_are_forwarded_and_the_setters_refused() {
+    fn workspace_details_and_setters_are_forwarded_and_the_rest_refused() {
         assert_eq!(route("workspace.details"), Route::Forward);
         for method in [
             "workspace.setTitle",
             "workspace.setStatusMessage",
             "workspace.setStatusImage",
             "workspace.setAgentName",
+            "workspace.proposeSibling",
+        ] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::NODE_LINK_PROTOCOLS.min,
+                "{method}"
+            );
+        }
+        for method in [
             "workspace.archive",
             "workspace.unarchive",
-            "workspace.proposeSibling",
             "workspace.applyProposal",
             "workspace.timeline",
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method}");
         }
-        let message = unsupported_message("workspace.setTitle");
+        let message = unsupported_message("workspace.archive");
         assert!(
             message.contains("ws.workspace.info on their own checkout")
-                && message.contains("ws.workspace.details through head"),
+                && message.contains("ws.workspace.details, setTitle, setStatusMessage, setStatusImage, setAgentName and proposeSibling through head"),
             "{message}"
         );
     }
@@ -184,6 +221,7 @@ mod tests {
             "file.getAttachment",
             "git.registerRoot",
             COMMIT_POLICY_METHOD,
+            ATTACHMENTS_METHOD,
             "note",
             "note.",
             "",
